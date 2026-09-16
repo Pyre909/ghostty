@@ -513,7 +513,10 @@ pub fn add(
     }
 
     // Other dependencies, mostly pure Zig
-    if (b.lazyDependency("opengl", .{})) |dep| {
+    if (b.lazyDependency("opengl", .{
+        .target = target,
+        .optimize = optimize,
+    })) |dep| {
         step.root_module.addImport("opengl", dep.module("opengl"));
     }
     if (b.lazyDependency("vaxis", .{
