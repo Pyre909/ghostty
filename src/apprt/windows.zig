@@ -3,40 +3,39 @@
 //!
 //! ## What this is
 //!
-//! This is a *foundation*, and the doc comments below are written to say so
-//! plainly rather than to imply more than exists:
-//!
 //!   * `App` owns the process lifecycle: the Win32 message loop, a
 //!     message-only window used as the wakeup and timer target, the loaded
 //!     configuration, and the WGL entry points harvested from a bootstrap
 //!     context.
 //!   * `Surface` owns an `HWND`, its `HDC` and a real OpenGL 4.3 core-profile
-//!     `HGLRC`. It also *reserves storage* for a `CoreSurface` by value, as
-//!     the apprt contract requires, but that storage has **not** been through
-//!     `CoreSurface.init` and `core()` therefore returns memory that is not
-//!     yet a terminal.
+//!     `HGLRC`, and hosts a real, initialized `CoreSurface`: a terminal with
+//!     its own renderer and IO threads.
 //!
-//! The reason is a single hard edge: `renderer.Renderer` for a Windows exe is
-//! `GenericRenderer(OpenGL)` (src/renderer.zig), and `src/renderer/OpenGL.zig`
-//! is unconditionally EGL — it calls `egl.load()` and `egl.Display.init` in
-//! `init`. There is no libEGL on Windows. Zig only analyzes function bodies it
-//! reaches, so naming the `CoreSurface` type is free while *calling*
-//! `CoreSurface.init` would pull `eglGetProcAddress` into the link. A WGL
-//! renderer backend is the next project; until it lands, this runtime creates
-//! windows and contexts but hosts no terminal.
+//! The renderer is `GenericRenderer(OpenGL)` with the WGL half of
+//! src/renderer/OpenGL.zig (src/renderer/opengl/wgl.zig). The apprt creates
+//! and deletes the GL context; the render thread borrows it and presents on
+//! its own. The main thread therefore makes **no** GL calls once a surface
+//! exists: WM_PAINT only asks the core for a frame.
 //!
-//! ## What that means for the contract
+//! ## Invariants this file depends on
 //!
-//! Every method the core calls on an apprt is implemented here for real,
-//! against Win32, not stubbed. Most of them are structurally unreachable today
-//! because their only caller is a `CoreSurface` that is never initialized;
-//! they are still written and still type-checked (see the `comptime` block at
-//! the bottom of this file, which exists precisely because Zig would otherwise
-//! never analyze them).
+//!   * **No window is destroyed from inside a core frame.** The core calls
+//!     `Surface.close` from its own stack (src/Surface.zig:1316, :2848), and
+//!     `CoreSurface.deinit` would free memory those frames still use. Every
+//!     close therefore posts `WM_GHOSTTY_DESTROY` and the teardown runs later,
+//!     from a message loop (`Surface.destroyPosted`).
+//!   * **`core_app.tick` never reenters itself**, and never runs while a
+//!     modal confirmation prompt is up (`App.canReenterCore`).
+//!   * **The GL context is current on at most one thread.** The render thread
+//!     releases it in `threadExit`, which `CoreSurface.deinit` joins before
+//!     `Surface.releaseContext` deletes it.
 //!
-//! Actions are refused honestly: `performAction` names the actions it really
-//! performs and returns `false` for everything else. It never claims an action
-//! it did not carry out.
+//! ## What is still missing
+//!
+//! Mouse input, IME composition windows, `.new_window` and every other
+//! action `performAction` does not name. Those return `false`, the
+//! contract's word for "unsupported"; this runtime never claims an action it
+//! did not carry out.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -101,6 +100,10 @@ const win32 = struct {
     const UINT_PTR = usize;
     const LONG_PTR = isize;
     const HGLOBAL = *anyopaque;
+    const SHORT = w.SHORT;
+
+    /// Keyboard layout handle. Only ever passed back to user32.
+    const HKL = *opaque {};
 
     const WNDPROC = *const fn (
         hwnd: HWND,
@@ -185,15 +188,6 @@ const win32 = struct {
         dwDamageMask: DWORD,
     };
 
-    const PAINTSTRUCT = extern struct {
-        hdc: ?HDC,
-        fErase: BOOL,
-        rcPaint: RECT,
-        fRestore: BOOL,
-        fIncUpdate: BOOL,
-        rgbReserved: [32]BYTE,
-    };
-
     // Window class styles. CS_OWNDC is required: a WGL context is bound to the
     // device context it was created against, so the window must keep one DC
     // for its whole life instead of handing out a fresh one per GetDC.
@@ -220,16 +214,70 @@ const win32 = struct {
 
     const WM_DESTROY: UINT = 0x0002;
     const WM_SIZE: UINT = 0x0005;
+    const WM_SETFOCUS: UINT = 0x0007;
+    const WM_KILLFOCUS: UINT = 0x0008;
     const WM_CLOSE: UINT = 0x0010;
     const WM_QUIT: UINT = 0x0012;
     const WM_ERASEBKGND: UINT = 0x0014;
     const WM_PAINT: UINT = 0x000F;
     const WM_NCCREATE: UINT = 0x0081;
+    const WM_KEYDOWN: UINT = 0x0100;
+    const WM_KEYUP: UINT = 0x0101;
+    const WM_CHAR: UINT = 0x0102;
+    const WM_DEADCHAR: UINT = 0x0103;
+    const WM_SYSKEYDOWN: UINT = 0x0104;
+    const WM_SYSKEYUP: UINT = 0x0105;
+    const WM_SYSCHAR: UINT = 0x0106;
+    const WM_SYSDEADCHAR: UINT = 0x0107;
+    const WM_SYSCOMMAND: UINT = 0x0112;
     const WM_TIMER: UINT = 0x0113;
+    const WM_ENTERMENULOOP: UINT = 0x0211;
+    const WM_EXITMENULOOP: UINT = 0x0212;
+    const WM_ENTERSIZEMOVE: UINT = 0x0231;
+    const WM_EXITSIZEMOVE: UINT = 0x0232;
     const WM_DPICHANGED: UINT = 0x02E0;
     const WM_APP: UINT = 0x8000;
 
+    const PM_NOREMOVE: UINT = 0x0000;
     const PM_REMOVE: UINT = 0x0001;
+
+    /// WM_SIZE wParam.
+    const SIZE_MINIMIZED: WPARAM = 1;
+
+    /// WM_SYSCOMMAND wParam (low four bits are reserved and must be masked).
+    const SC_KEYMENU: WPARAM = 0xF100;
+
+    // Virtual-key codes.
+    const VK_SPACE: WPARAM = 0x20;
+    const VK_PROCESSKEY: WPARAM = 0xE5;
+    const VK_PACKET: WPARAM = 0xE7;
+    const VK_CONTROL: WPARAM = 0x11;
+    const VK_MENU: WPARAM = 0x12;
+    const VK_CAPITAL: c_int = 0x14;
+    const VK_NUMLOCK: c_int = 0x90;
+    const VK_LWIN: c_int = 0x5B;
+    const VK_RWIN: c_int = 0x5C;
+    const VK_LSHIFT: c_int = 0xA0;
+    const VK_RSHIFT: c_int = 0xA1;
+    const VK_LCONTROL: c_int = 0xA2;
+    const VK_RCONTROL: c_int = 0xA3;
+    const VK_LMENU: c_int = 0xA4;
+    const VK_RMENU: c_int = 0xA5;
+
+    /// MapVirtualKeyW mode: VK -> scan code, with the 0xE0/0xE1 prefix
+    /// in the high byte for extended keys.
+    const MAPVK_VK_TO_VSC_EX: UINT = 4;
+
+    /// ToUnicodeEx flag: do not change the keyboard state, in particular
+    /// the pending dead key. Honored from Windows 10 1607.
+    const TOUNICODE_NO_STATE_CHANGE: UINT = 0x4;
+
+    // MsgWaitForMultipleObjectsEx.
+    const QS_ALLINPUT: DWORD = 0x04FF;
+    const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
+    const WAIT_OBJECT_0: DWORD = 0x00000000;
+    const WAIT_TIMEOUT: DWORD = 0x00000102;
+    const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
     const SWP_NOZORDER: UINT = 0x0004;
     const SWP_NOACTIVATE: UINT = 0x0010;
@@ -260,8 +308,6 @@ const win32 = struct {
     const WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB: c_int = 0x0002;
     const WGL_CONTEXT_DEBUG_BIT_ARB: c_int = 0x0001;
     const WGL_CONTEXT_CORE_PROFILE_BIT_ARB: c_int = 0x00000001;
-
-    const GL_COLOR_BUFFER_BIT: c_uint = 0x00004000;
 
     /// GetDeviceCaps index for horizontal DPI. Used as the pre-1607 fallback
     /// for GetDpiForWindow, where it is the correct answer: those versions
@@ -339,6 +385,7 @@ const win32 = struct {
         remove: UINT,
     ) callconv(.winapi) BOOL;
     extern "user32" fn TranslateMessage(msg: *const MSG) callconv(.winapi) BOOL;
+    extern "user32" fn GetMessageTime() callconv(.winapi) LONG;
     extern "user32" fn DispatchMessageW(msg: *const MSG) callconv(.winapi) LRESULT;
     extern "user32" fn PostMessageW(
         hwnd: ?HWND,
@@ -369,13 +416,27 @@ const win32 = struct {
     ) callconv(.winapi) BOOL;
     extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: LPCWSTR) callconv(.winapi) ?HCURSOR;
     extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
-    extern "user32" fn InvalidateRect(
-        hwnd: ?HWND,
-        rect: ?*const RECT,
-        erase: BOOL,
-    ) callconv(.winapi) BOOL;
-    extern "user32" fn BeginPaint(hwnd: HWND, ps: *PAINTSTRUCT) callconv(.winapi) ?HDC;
-    extern "user32" fn EndPaint(hwnd: HWND, ps: *const PAINTSTRUCT) callconv(.winapi) BOOL;
+    extern "user32" fn ValidateRect(hwnd: ?HWND, rect: ?*const RECT) callconv(.winapi) BOOL;
+    extern "user32" fn ReleaseDC(hwnd: ?HWND, hdc: HDC) callconv(.winapi) c_int;
+    extern "user32" fn MsgWaitForMultipleObjectsEx(
+        count: DWORD,
+        handles: ?[*]const HANDLE,
+        timeout_ms: DWORD,
+        wake_mask: DWORD,
+        flags: DWORD,
+    ) callconv(.winapi) DWORD;
+    extern "user32" fn GetKeyState(vk: c_int) callconv(.winapi) SHORT;
+    extern "user32" fn MapVirtualKeyW(code: UINT, map_type: UINT) callconv(.winapi) UINT;
+    extern "user32" fn GetKeyboardLayout(thread_id: DWORD) callconv(.winapi) ?HKL;
+    extern "user32" fn ToUnicodeEx(
+        vk: UINT,
+        scan_code: UINT,
+        key_state: *const [256]BYTE,
+        buf: [*]WCHAR,
+        buf_len: c_int,
+        flags: UINT,
+        layout: ?HKL,
+    ) callconv(.winapi) c_int;
     extern "user32" fn SetTimer(
         hwnd: ?HWND,
         id: UINT_PTR,
@@ -407,7 +468,6 @@ const win32 = struct {
         format: c_int,
         pfd: *const PIXELFORMATDESCRIPTOR,
     ) callconv(.winapi) BOOL;
-    extern "gdi32" fn SwapBuffers(hdc: HDC) callconv(.winapi) BOOL;
     extern "gdi32" fn GetDeviceCaps(hdc: HDC, index: c_int) callconv(.winapi) c_int;
 
     extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
@@ -415,12 +475,17 @@ const win32 = struct {
     extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, ctx: ?HGLRC) callconv(.winapi) BOOL;
     extern "opengl32" fn wglGetProcAddress(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 
-    // OpenGL 1.1 entry points are exported by opengl32.dll directly (unlike
-    // anything newer, which must come through wglGetProcAddress). These three
-    // are all the foundation needs to prove the context is live.
-    extern "opengl32" fn glClearColor(r: f32, g: f32, b: f32, a: f32) callconv(.winapi) void;
-    extern "opengl32" fn glClear(mask: c_uint) callconv(.winapi) void;
-    extern "opengl32" fn glViewport(x: c_int, y: c_int, w: c_int, h: c_int) callconv(.winapi) void;
+    // No GL entry points are declared here on purpose: the main thread makes
+    // no GL calls once the renderer owns presentation. The render thread's
+    // declarations live in src/renderer/opengl/wgl.zig.
+
+    fn loword(v: LPARAM) u16 {
+        return @truncate(@as(usize, @bitCast(v)));
+    }
+
+    fn hiword(v: anytype) u16 {
+        return @truncate(@as(usize, @bitCast(v)) >> 16);
+    }
 };
 
 /// UTF-16 string literal helper for the many `LPCWSTR` constants below.
@@ -438,6 +503,11 @@ const bootstrap_class_name = "GhosttyWglBootstrapClass";
 /// its block so `run` reaches the next `core_app.tick`.
 const WM_GHOSTTY_WAKEUP: win32.UINT = win32.WM_APP + 1;
 
+/// Posted to a surface window by `Surface.close`. Its handler tears the
+/// surface down; see `Surface.destroyPosted`. Posting rather than destroying
+/// in place is what keeps teardown out of core stack frames.
+const WM_GHOSTTY_DESTROY: win32.UINT = win32.WM_APP + 2;
+
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
 const quit_timer_id: win32.UINT_PTR = 1;
@@ -447,10 +517,10 @@ pub const App = struct {
 
     /// The configuration. Owned by this struct, freed in `terminate`.
     ///
-    /// This exists because the app-scoped key path (`CoreApp.keyEvent`,
-    /// src/App.zig:359) reads `rt_app.config.keybind`. Nothing routes keys yet
-    /// (there is no CoreSurface to route them to), but the field is part of
-    /// the documented rt_app contract and `terminate` must own its lifetime.
+    /// Every surface's config is derived from this one
+    /// (`apprt.surface.newConfig` in `Surface.create`), and the app-scoped key
+    /// path (`CoreApp.keyEvent`, src/App.zig:359) reads
+    /// `rt_app.config.keybind`.
     config: Config,
 
     hinstance: win32.HINSTANCE,
@@ -472,9 +542,11 @@ pub const App = struct {
     /// running on a 1.1 compatibility context.
     create_context_attribs: ?win32.PFNWGLCREATECONTEXTATTRIBSARB,
 
-    /// The windows this runtime owns. These are foundation windows: they hold
-    /// an HWND and a GL context but no initialized CoreSurface, so they are
-    /// deliberately *not* registered with `CoreApp.addSurface`.
+    /// The windows this runtime owns. See `surfaceDestroyed` for the
+    /// ownership invariant. Each one whose `CoreSurface` is initialized is
+    /// also registered with `CoreApp.addSurface`, which is what drives the
+    /// quit timer; this list and the core's can differ only while a surface
+    /// is being created or torn down.
     surfaces: std.ArrayListUnmanaged(*Surface),
 
     /// Set when the loop should stop. Written only on the main thread.
@@ -504,6 +576,27 @@ pub const App = struct {
     /// cursor invisible for the rest of the session. Tracking the state here
     /// keeps the counter in {0, -1} and lets teardown unwind it.
     cursor_hidden: bool,
+
+    /// True while `core_app.tick` is on the stack. See `tick`.
+    ticking: bool,
+
+    /// Number of modal confirmation prompts (`confirm`) currently open.
+    ///
+    /// A prompt runs a nested message loop, often with a core frame beneath
+    /// it (`Surface.close` from `keyCallback`, a clipboard confirmation from
+    /// `tick`). Neither ticking nor surface teardown may run inside that loop;
+    /// see `canReenterCore`.
+    prompt_depth: u32,
+
+    /// Number of system modal loops (window size/move, window menu) the main
+    /// thread is currently inside. `run` does not get control back until such
+    /// a loop ends, so while this is non-zero the wakeup handler ticks
+    /// instead; see `wndProc`.
+    modal_loop_depth: u32,
+
+    /// Set for the whole of `terminate`. Teardown is driven from there
+    /// synchronously, so posted closes and destroys are ignored meanwhile.
+    terminating: bool,
 
     pub const Error = error{
         Win32ClassRegistrationFailed,
@@ -626,6 +719,10 @@ pub const App = struct {
             .quit_timer_active = false,
             .quit_pending = false,
             .cursor_hidden = false,
+            .ticking = false,
+            .prompt_depth = 0,
+            .modal_loop_depth = 0,
+            .terminating = false,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -641,6 +738,19 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
+        // Every remaining surface is torn down in the same order as
+        // Surface.destroyPosted (stop and wait for the core's threads, deinit
+        // the core surface, delete the GL context, destroy the window), so
+        // that CoreApp.deinit -- which runs after this
+        // (main_ghostty.zig:104-105) -- finds an empty surface list and its
+        // `font_grid_set.count() == 0` assert holds (src/App.zig:141).
+        //
+        // `terminating` makes destroyPosted and close ignore anything still
+        // queued: stopCore pumps messages, and a WM_GHOSTTY_DESTROY or
+        // WM_CLOSE dispatched there must not start a second teardown (or a
+        // confirmation prompt) for a surface this loop is about to handle.
+        self.terminating = true;
+
         // Windows are destroyed before the classes they belong to are
         // unregistered; UnregisterClassW fails while a window of the class
         // still exists.
@@ -653,6 +763,8 @@ pub const App = struct {
         self.surfaces = .empty;
         defer surfaces.deinit(self.core_app.alloc);
         for (surfaces.items) |surface| {
+            surface.stopCore();
+            surface.releaseContext();
             surface.destroy();
             surface.deinit();
             self.core_app.alloc.destroy(surface);
@@ -675,14 +787,14 @@ pub const App = struct {
 
     /// The Win32 message loop.
     pub fn run(self: *App) !void {
-        // Create the foundation window.
+        // Create the initial window.
         //
         // In a complete runtime this belongs in the `.new_window` action,
-        // driven by `CoreApp.newWindow` through the mailbox. That path needs
-        // `CoreSurface.init`, which this build cannot call (see the module
-        // doc comment), so the initial window is created directly here and
-        // `.new_window` is refused. When the WGL renderer backend lands, this
-        // block moves into `performAction`.
+        // driven by `CoreApp.newWindow` through the mailbox. `.new_window` is
+        // still refused by this runtime (multi-window lifecycle, placement
+        // and the quit policy for it are not implemented), so the initial
+        // window is created directly here. When `.new_window` is supported,
+        // this block moves into `performAction`.
         if (self.config.@"initial-window") {
             _ = self.newSurface() catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
@@ -736,7 +848,137 @@ pub const App = struct {
             // drainMailbox returns early after dispatching `.quit`, so the
             // queue is not necessarily empty here. The next loop iteration
             // ticks again; `.quit` will have set self.quit if it was seen.
-            try self.core_app.tick(self);
+            //
+            // `run` is never itself inside a core frame, so `ticking` is
+            // always false here and this tick always runs.
+            try self.tick();
+
+            // Teardowns that were refused while a core frame or a prompt was
+            // on the stack are retried now that neither is.
+            self.repostDeferredDestroys();
+        }
+    }
+
+    /// Tick the core, unless a tick is already on the stack.
+    ///
+    /// Reentrancy is possible because a tick can open a modal prompt
+    /// (a clipboard confirmation, `Surface.close`), and a prompt's nested
+    /// message loop dispatches WM_GHOSTTY_WAKEUP and WM_GHOSTTY_DESTROY.
+    /// `drainMailbox` is not written to be reentered, so a nested request is
+    /// dropped; the outer tick, or the next one, drains whatever it wanted.
+    fn tick(self: *App) !void {
+        if (self.ticking) return;
+        self.ticking = true;
+        defer self.ticking = false;
+        try self.core_app.tick(self);
+    }
+
+    /// Tick from inside a message handler, where there is no caller to
+    /// return an error to. Does nothing unless `canReenterCore`.
+    fn tickFromHandler(self: *App) void {
+        if (!self.canReenterCore()) return;
+        self.tick() catch |err| log.warn("core tick failed err={}", .{err});
+    }
+
+    /// Whether a message handler may tick the core or tear a surface down
+    /// right now.
+    ///
+    /// Not while a tick is on the stack (see `tick`). Not while a
+    /// confirmation prompt is open either: a prompt usually has a core frame
+    /// beneath it, and the teardown a tick can start would free that frame's
+    /// surface. The cost is a stall, not a deadlock: output pauses until the
+    /// user answers, because nothing drains the app mailbox meanwhile. Surface
+    /// teardown is deferred rather than refused (`Surface.destroyPosted`), so
+    /// it cannot wait on threads that are blocked on that undrained mailbox.
+    fn canReenterCore(self: *const App) bool {
+        return !self.ticking and self.prompt_depth == 0;
+    }
+
+    /// Re-post WM_GHOSTTY_DESTROY for every surface whose teardown was
+    /// deferred. Called by `run` at a point where `canReenterCore` holds.
+    fn repostDeferredDestroys(self: *App) void {
+        for (self.surfaces.items) |surface| {
+            if (!surface.destroy_deferred) continue;
+            surface.destroy_deferred = false;
+            surface.postDestroy();
+        }
+    }
+
+    /// Wait until every thread in `handles` has exited, while keeping the
+    /// main thread responsive: messages are dispatched and the core ticked
+    /// between wakeups.
+    ///
+    /// Pumping is required, not cosmetic. The render and IO threads push into
+    /// the app mailbox with `.forever` (e.g. src/renderer/generic.zig:1996),
+    /// and only a tick on this thread drains it; a plain WaitForSingleObject
+    /// here could wait on a thread that is waiting on us.
+    ///
+    /// A WM_QUIT pulled out of the queue while pumping is re-posted
+    /// afterwards, so a quit requested meanwhile still ends `run`.
+    fn waitForThreads(self: *App, handles_in: []const win32.HANDLE) void {
+        var handles: [2]win32.HANDLE = undefined;
+        std.debug.assert(handles_in.len <= handles.len);
+        @memcpy(handles[0..handles_in.len], handles_in);
+        var remaining: win32.DWORD = @intCast(handles_in.len);
+
+        var quit_seen = false;
+        defer if (quit_seen) win32.PostQuitMessage(0);
+
+        // One-second slices only so that a stuck thread is reported once;
+        // the wait itself is unbounded, as the join after it would be.
+        var slices: u32 = 0;
+        while (remaining > 0) {
+            const r = win32.MsgWaitForMultipleObjectsEx(
+                remaining,
+                &handles,
+                1000,
+                win32.QS_ALLINPUT,
+                // Return for input already in the queue too, not only for
+                // input that arrives after the call. Without it a message
+                // that was peeked but not removed would not wake us.
+                win32.MWMO_INPUTAVAILABLE,
+            );
+
+            if (r >= win32.WAIT_OBJECT_0 and r < win32.WAIT_OBJECT_0 + remaining) {
+                // That thread has exited. Swap-remove it and keep waiting
+                // for the rest.
+                const i = r - win32.WAIT_OBJECT_0;
+                handles[i] = handles[remaining - 1];
+                remaining -= 1;
+                continue;
+            }
+
+            if (r == win32.WAIT_OBJECT_0 + remaining) {
+                var msg: win32.MSG = undefined;
+                while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE).toBool()) {
+                    if (msg.message == win32.WM_QUIT) {
+                        quit_seen = true;
+                        continue;
+                    }
+                    _ = win32.TranslateMessage(&msg);
+                    _ = win32.DispatchMessageW(&msg);
+                }
+                self.tickFromHandler();
+                continue;
+            }
+
+            if (r == win32.WAIT_TIMEOUT) {
+                slices += 1;
+                if (slices == 5) log.warn(
+                    "surface threads have not exited after 5s; still waiting",
+                    .{},
+                );
+                continue;
+            }
+
+            // WAIT_FAILED (a bad handle). There is nothing to wait on
+            // reliably any more; the joins in CoreSurface.deinit that follow
+            // will block or fail loudly on their own.
+            log.err(
+                "MsgWaitForMultipleObjectsEx failed r={x} err={}",
+                .{ r, std.os.windows.GetLastError() },
+            );
+            return;
         }
     }
 
@@ -798,8 +1040,10 @@ pub const App = struct {
                 break :ring_bell true;
             },
 
-            // Everything else, including `.new_window` (no CoreSurface can be
-            // hosted yet) and `.open_url` (whose `false` is a supported path:
+            // Everything else, including `.new_window` (see `run`),
+            // `.cell_size`, `.size_limit` and `.initial_size` (sent during
+            // CoreSurface.init; `false` is a valid answer to each), and
+            // `.open_url` (whose `false` is a supported path:
             // src/Surface.zig:4471 falls back to internal_os.open).
             else => false,
         };
@@ -821,11 +1065,21 @@ pub const App = struct {
         _ = self;
         return switch (target) {
             .app => false,
-            // Ask the window manager to close it. The actual teardown
-            // happens on WM_DESTROY so that every close path -- the title bar
-            // button, Alt+F4 and this action -- converges. DestroyWindow's
-            // BOOL is a real success flag, so it is what gets reported.
-            .surface => |v| win32.DestroyWindow(v.rt_surface.hwnd).toBool(),
+            // Never DestroyWindow here: this runs inside a core frame (a
+            // keybinding, src/Surface.zig keyCallback -> performBindingAction),
+            // and destroying synchronously would free the CoreSurface under
+            // it. Surface.close confirms if needed and posts the teardown, so
+            // every close path -- the title bar button, Alt+F4 (a default
+            // binding to this action, src/config/Config.zig:6775-6777) and a
+            // child exit -- converges on Surface.destroyPosted.
+            //
+            // `true` means the request was handled. The user may still decline
+            // the confirmation; that is a completed close request, not an
+            // unsupported action.
+            .surface => |v| close: {
+                v.rt_surface.close(v.needsConfirmQuit());
+                break :close true;
+            },
         };
     }
 
@@ -860,10 +1114,15 @@ pub const App = struct {
         };
     }
 
+    /// Nothing to do: the render thread presents its own frames
+    /// (src/renderer/opengl/Frame.zig, WGL branch), and the WGL path does not
+    /// even send this action. An InvalidateRect here would only start a
+    /// WM_PAINT -> refreshCallback -> frame cycle for a frame already on
+    /// screen.
     fn render(target: apprt.Target) bool {
         return switch (target) {
             .app => false,
-            .surface => |v| win32.InvalidateRect(v.rt_surface.hwnd, null, .FALSE).toBool(),
+            .surface => true,
         };
     }
 
@@ -913,8 +1172,8 @@ pub const App = struct {
                 //
                 // `quit-after-last-window-closed` is `builtin.os.tag == .linux`
                 // (src/config/Config.zig:2639), i.e. false on Windows. But
-                // `.new_window` is refused by this runtime -- no CoreSurface
-                // can be hosted yet -- so a process that reaches zero windows
+                // `.new_window` is refused by this runtime (see `run`), so a
+                // process that reaches zero windows
                 // has no UI left and no way to get one back. Honoring `false`
                 // would leave an invisible process with a message-only window
                 // that receives nothing and a GetMessageW that blocks forever,
@@ -970,28 +1229,20 @@ pub const App = struct {
         );
     }
 
-    /// Create a foundation window. See `run` for why this is not driven by
+    /// Create a terminal window. See `run` for why this is not driven by
     /// the `.new_window` action.
     fn newSurface(self: *App) !*Surface {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
 
+        // Surface.create registers the surface with the core, and
+        // CoreApp.addSurface cancels the startup quit timer
+        // (src/App.zig:203), so there is no quit-timer handling here.
         const surface = try Surface.create(self);
 
-        // No errdefer between here and the return: appendAssumeCapacity cannot
-        // fail (the capacity was reserved above) and setQuitTimer returns
-        // rather than errors, so one would be dead code -- and a dead errdefer
-        // that calls only `destroy()` would leak the allocation anyway, since
-        // surfaceDestroyed declines to free a surface that is not yet in the
-        // list.
+        // No errdefer after this point: appendAssumeCapacity cannot fail (the
+        // capacity was reserved above), so one would be dead code.
         self.surfaces.appendAssumeCapacity(surface);
-
-        // The core cancels the quit timer from addSurface (src/App.zig:202).
-        // These windows are deliberately not registered with the core, so the
-        // cancel has to happen here; without it the startup timer outlives the
-        // window it was waiting for and the app quits with a terminal on
-        // screen.
-        _ = self.setQuitTimer(.stop);
 
         return surface;
     }
@@ -1021,15 +1272,13 @@ pub const App = struct {
         surface.deinit();
         self.core_app.alloc.destroy(surface);
 
+        // The quit timer is not handled here: CoreApp.deleteSurface, which
+        // Surface.stopCore calls before the window is destroyed, starts it
+        // when the core's last surface goes (src/App.zig:237).
         if (self.surfaces.items.len == 0) {
             // A hide owned by a window that no longer exists can never be
             // undone by the core, and ShowCursor's counter is per input queue.
             self.showCursor();
-
-            // The core normally drives quit_timer through
-            // addSurface/deleteSurface. These windows are not registered with
-            // the core, so the apprt applies the policy itself.
-            _ = self.setQuitTimer(.start);
         }
     }
 
@@ -1047,9 +1296,21 @@ pub const App = struct {
         };
 
         switch (msg) {
-            // Nothing to do but return: the message existing is the point.
-            // `run` ticks the core after every dispatched message.
-            WM_GHOSTTY_WAKEUP => return 0,
+            // Normally there is nothing to do but return: the message
+            // existing is the point, and `run` ticks the core after every
+            // dispatched message.
+            //
+            // Inside a system modal loop (a size/move drag, the window menu)
+            // `run` does not get control back until the loop ends, so the
+            // mailbox would go undrained for the whole drag -- output stops,
+            // and the render and IO threads can block on `.forever` pushes.
+            // Those loops are entered from DefWindowProcW, never from inside
+            // a core frame, so ticking here is safe; canReenterCore still
+            // guards against the one exception, a prompt beneath the loop.
+            WM_GHOSTTY_WAKEUP => {
+                if (self.modal_loop_depth > 0) self.tickFromHandler();
+                return 0;
+            },
 
             win32.WM_TIMER => if (wparam == quit_timer_id) {
                 _ = win32.KillTimer(hwnd, quit_timer_id);
@@ -1100,14 +1361,15 @@ fn logEffectiveDpiAwareness(user32: win32.HINSTANCE) void {
 pub const Surface = struct {
     app: *App,
 
-    /// Storage for the core surface, embedded by value because the core
-    /// requires `core()` to return `&self.core_surface` and because
+    /// The core surface, embedded by value because the core requires
+    /// `core()` to return `&self.core_surface` and because
     /// `apprt.Target.cval` round-trips through `rt_surface`.
     ///
-    /// **This storage is `undefined`.** Nothing calls `CoreSurface.init` yet;
-    /// see the module doc comment. It is reserved rather than omitted so the
-    /// shape of this struct does not have to change when the renderer lands.
+    /// Initialized only while `core_state != .none`; see `CoreState`. Use
+    /// `liveCore` from message handlers rather than this field directly.
     core_surface: CoreSurface,
+
+    core_state: CoreState,
 
     /// The window handle. Written from WM_NCCREATE, which is the first
     /// message this window receives, so it is valid in every other handler.
@@ -1119,6 +1381,11 @@ pub const Surface = struct {
     /// Both are optional because the window procedure starts running *inside*
     /// CreateWindowExW, before either exists: WM_SIZE and WM_PAINT can arrive
     /// while `create` is still between CreateWindowExW and createContext.
+    ///
+    /// The render thread presents on this DC (src/renderer/opengl/wgl.zig),
+    /// so the main thread must not use it for GDI work: with CS_OWNDC,
+    /// BeginPaint would hand back this same DC and change its clip region
+    /// under the render thread. See `paint` and `dpi`.
     hdc: ?win32.HDC,
     hglrc: ?win32.HGLRC,
 
@@ -1129,12 +1396,51 @@ pub const Surface = struct {
     /// Tracked so `.toggle_maximize` knows which way to toggle.
     maximized: bool,
 
+    /// A close has been requested and WM_GHOSTTY_DESTROY posted (or its
+    /// confirmation is on screen). Stops a second WM_CLOSE or close_window
+    /// from prompting or posting twice. Cleared only when the user declines
+    /// the confirmation.
+    closing: bool,
+
+    /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
+    /// (`App.canReenterCore` was false). `App.run` re-posts it.
+    destroy_deferred: bool,
+
+    /// A dead key's preedit is on screen and the next committed text must
+    /// clear it first. See `keyEvent`.
+    preedit_active: bool,
+
     /// Number of WM_PAINTs handled, for the debug log in `paint`.
     paint_count: u64,
 
-    /// Heap-allocate and initialize. The address must be stable: the core
-    /// stores raw `*apprt.Surface` pointers (src/Surface.zig:465-466), and the
-    /// wndproc recovers this pointer from GWLP_USERDATA.
+    /// This window's share of `App.modal_loop_depth`: system modal loops
+    /// (size/move, menu) it has entered and not yet reported leaving. A
+    /// window destroyed inside its own loop never receives the matching
+    /// WM_EXIT*, so WM_DESTROY hands this back to the app instead.
+    modal_loops: u32,
+
+    /// The lifecycle of `core_surface`.
+    ///
+    /// A three-state enum rather than a single `initialized` flag because
+    /// teardown pumps messages (`App.waitForThreads`): between
+    /// `deleteSurface` and `CoreSurface.deinit` the core surface is still
+    /// initialized memory, but its threads are stopping and the app no longer
+    /// knows it, so message handlers must not call into it. `.stopping` makes
+    /// that state distinct instead of an implied combination of flags.
+    const CoreState = enum {
+        /// `core_surface` is undefined memory: before `CoreSurface.init` in
+        /// `create`, or after `CoreSurface.deinit` in `stopCore`.
+        none,
+        /// Initialized and registered with the core app. Callbacks allowed.
+        live,
+        /// `stopCore` is running. Initialized, not registered, no callbacks.
+        stopping,
+    };
+
+    /// Heap-allocate and initialize, including the core surface. The address
+    /// must be stable: the core stores raw `*apprt.Surface` pointers
+    /// (src/Surface.zig:465-466), and the wndproc recovers this pointer from
+    /// GWLP_USERDATA.
     fn create(app: *App) !*Surface {
         const alloc = app.core_app.alloc;
         const self = try alloc.create(Surface);
@@ -1143,6 +1449,7 @@ pub const Surface = struct {
         self.* = .{
             .app = app,
             .core_surface = undefined,
+            .core_state = .none,
             // `hwnd` is written from WM_NCCREATE, the first message this
             // window receives, so it is set before anything can read it.
             .hwnd = undefined,
@@ -1150,7 +1457,11 @@ pub const Surface = struct {
             .hglrc = null,
             .title = null,
             .maximized = false,
+            .closing = false,
+            .destroy_deferred = false,
+            .preedit_active = false,
             .paint_count = 0,
+            .modal_loops = 0,
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -1179,7 +1490,35 @@ pub const Surface = struct {
         const hdc = win32.GetDC(hwnd) orelse return App.Error.Win32WindowCreationFailed;
         self.hdc = hdc;
         self.hglrc = try createContext(app, hdc);
+        // Runs before the DestroyWindow errdefer above, which is the order
+        // WM_DESTROY would use anyway.
+        errdefer self.releaseContext();
 
+        // Registration comes before init: every surface message the core
+        // routes is checked with hasSurface (src/App.zig:514-529), so a
+        // message queued before registration would be dropped. addSurface
+        // also cancels the startup quit timer.
+        try app.core_app.addSurface(self);
+        errdefer app.core_app.deleteSurface(self);
+
+        // Preconditions CoreSurface.init relies on, all true here: the HWND
+        // exists at CW_USEDEFAULT size so getSize is non-zero
+        // (src/Surface.zig:529), getContentScale works on it (:501), and no
+        // thread has the GL context current -- the renderer's main-thread
+        // probe (wgl.State.init) makes it current and releases it again
+        // before the render thread is spawned (:717).
+        var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
+        defer config.deinit();
+        try self.core_surface.init(alloc, &config, app.core_app, app, self);
+
+        // Nothing after this point can fail, so there is no errdefer for the
+        // core surface. (If CoreSurface.init itself fails after spawning its
+        // threads, those threads are not stopped by init's own errdefers;
+        // that is a core limitation this runtime cannot repair.)
+        self.core_state = .live;
+
+        // The first WM_SIZE, WM_SETFOCUS and WM_PAINT reach the core from
+        // here, now that `core_state` is `.live`.
         _ = win32.ShowWindow(hwnd, win32.SW_SHOWNORMAL);
         _ = win32.UpdateWindow(hwnd);
 
@@ -1190,7 +1529,8 @@ pub const Surface = struct {
     ///
     /// Public because `CoreApp.deinit` calls it on every surface the core
     /// still tracks (src/App.zig:134) -- an apprt contract method the
-    /// rt_surface list does not name.
+    /// rt_surface list does not name. In this runtime the core's list is
+    /// empty by then (`App.terminate` runs `stopCore` on every surface first).
     pub fn deinit(self: *Surface) void {
         if (self.title) |v| self.app.core_app.alloc.free(v);
         self.title = null;
@@ -1202,15 +1542,134 @@ pub const Surface = struct {
         _ = win32.DestroyWindow(self.hwnd);
     }
 
-    /// Release the GL context. Called from WM_DESTROY, before the HWND dies.
+    /// Release the GL context. Only valid once no other thread has it
+    /// current, i.e. after `stopCore` has joined the render thread.
     fn releaseContext(self: *Surface) void {
         const hglrc = self.hglrc orelse return;
         self.hglrc = null;
 
         // Unbind before deleting: wglDeleteContext on a context that is still
-        // current only marks it for deletion.
+        // current only marks it for deletion. The render thread released it
+        // in its threadExit, so on the normal path this is a no-op for this
+        // thread; it matters when create fails after the renderer's probe.
         _ = win32.wglMakeCurrent(null, null);
         _ = win32.wglDeleteContext(hglrc);
+    }
+
+    /// The core surface, if message handlers may call into it.
+    fn liveCore(self: *Surface) ?*CoreSurface {
+        return switch (self.core_state) {
+            .live => &self.core_surface,
+            .none, .stopping => null,
+        };
+    }
+
+    /// Stop and deinitialize the core surface, keeping the main thread
+    /// responsive while its threads wind down. A no-op unless `.live`.
+    ///
+    /// The order is load-bearing:
+    ///
+    ///   1. `deleteSurface` first, so the ticks in steps 3-4 drop any message
+    ///      still addressed to this surface instead of calling into it
+    ///      (src/App.zig:514-529). It also starts the quit timer when this was
+    ///      the last surface.
+    ///   2. Stop the search thread, if any, while the render thread is still
+    ///      draining its mailbox. `CoreSurface.deinit` would do this first
+    ///      too (src/Surface.zig:794), but with an unpumped join, and by then
+    ///      the render thread is gone: a search thread blocked on a
+    ///      `.forever` push into the full renderer mailbox
+    ///      (src/renderer/Thread.zig:27) would never return and the main
+    ///      thread would hang. Clearing `search` makes deinit skip it.
+    ///   3. Stop the IO thread and wait for it (`App.waitForThreads`, which
+    ///      pumps messages and ticks), still before the renderer. Its reader
+    ///      can also block on a `.forever` renderer mailbox push
+    ///      (src/termio/stream_handler.zig:177), and `Exec.threadExit`
+    ///      cannot cancel a thread that is not in I/O. Upstream
+    ///      `CoreSurface.deinit` stops the renderer first
+    ///      (src/Surface.zig:797-807); this order is deliberately the
+    ///      reverse. Nothing the render thread does waits on the IO thread
+    ///      (it only pushes to the app mailbox, which the ticks drain), and
+    ///      the terminal state both share is freed only in step 5.
+    ///   4. Stop the render thread and wait for it the same way. Its exit
+    ///      releases the GL context.
+    ///   5. `CoreSurface.deinit`. Its notifications repeat harmlessly (an
+    ///      xev Async notify on a stopped loop only posts an unread
+    ///      completion) and its joins return at once.
+    ///
+    /// Steps 2-4 reach into CoreSurface fields rather than adding a core
+    /// API. That duplicates a few statements of `CoreSurface.deinit`, which
+    /// is the least invasive option: the alternative, joining inside deinit
+    /// on the main thread, is exactly the unpumped wait steps 3-4 exist to
+    /// avoid. If those fields are renamed this stops compiling, which is the
+    /// desired failure.
+    ///
+    /// The search join in step 2 is itself unpumped, as upstream's is; it
+    /// is bounded because the render thread is still draining.
+    fn stopCore(self: *Surface) void {
+        if (self.core_state != .live) return;
+        self.core_state = .stopping;
+
+        const app = self.app;
+        const cs = &self.core_surface;
+
+        app.core_app.deleteSurface(self);
+
+        if (cs.search) |*s| {
+            s.deinit();
+            cs.search = null;
+        }
+
+        cs.io_thread.stop.notify() catch |err|
+            log.err("error notifying io thread to stop err={}", .{err});
+        app.waitForThreads(&.{cs.io_thr.getHandle()});
+
+        cs.renderer_thread.stop.notify() catch |err|
+            log.err("error notifying renderer thread to stop err={}", .{err});
+        app.waitForThreads(&.{cs.renderer_thr.getHandle()});
+
+        cs.deinit();
+        self.core_state = .none;
+    }
+
+    /// Ask for this window to be torn down from a message loop.
+    fn postDestroy(self: *Surface) void {
+        if (!win32.PostMessageW(self.hwnd, WM_GHOSTTY_DESTROY, 0, 0).toBool()) {
+            // Only fails when the queue is full (10,000 messages). The window
+            // stays open; the user can close it again.
+            log.err("failed to post the surface teardown err={}", .{
+                std.os.windows.GetLastError(),
+            });
+            self.closing = false;
+        }
+    }
+
+    /// WM_GHOSTTY_DESTROY: the one place a live surface is torn down.
+    ///
+    /// Runs from a message loop -- `run`'s, a system modal loop's, or
+    /// `App.waitForThreads` -- never directly inside a core frame, because
+    /// the message is only ever posted. When a core frame or prompt is
+    /// nonetheless beneath that loop (`App.canReenterCore`), the teardown is
+    /// deferred to `run` instead: its pump would tick, and waiting there
+    /// could wait on threads blocked behind the undrained mailbox.
+    ///
+    /// **`self` is freed by the DestroyWindow at the end** (WM_DESTROY ->
+    /// App.surfaceDestroyed). Nothing may touch it afterwards, which is why
+    /// `hwnd` is copied first and the function ends at that call.
+    fn destroyPosted(self: *Surface) void {
+        const app = self.app;
+
+        // terminate drives teardown itself; see App.terminate.
+        if (app.terminating) return;
+
+        if (!app.canReenterCore()) {
+            self.destroy_deferred = true;
+            return;
+        }
+
+        const hwnd = self.hwnd;
+        self.stopCore();
+        self.releaseContext();
+        _ = win32.DestroyWindow(hwnd);
     }
 
     // ---------------------------------------------------------------------
@@ -1227,23 +1686,35 @@ pub const Surface = struct {
 
     /// The core asks the runtime to close this surface. `process_alive` means
     /// a child process is still running and the user should be asked.
-    pub fn close(self: *const Surface, process_alive: bool) void {
-        // Read before the prompt, deliberately. `confirm` runs a nested modal
-        // loop; a message dispatched inside it that reaches this window's
-        // WM_DESTROY frees `self`, and every field read after that point would
-        // be a use-after-free. The HWND stays valid because DestroyWindow on
-        // an already-destroyed window fails harmlessly.
-        const hwnd = self.hwnd;
+    ///
+    /// This is called from inside core frames (src/Surface.zig:1316 from
+    /// `childExited`, :2848 from `keyCallback`) and so must never destroy
+    /// anything itself: it posts WM_GHOSTTY_DESTROY and returns. That is also
+    /// why a `.closed` InputEffect leaves `self` valid in `keyEvent`.
+    ///
+    /// `*Surface` rather than `*const`: the core calls this through a mutable
+    /// `rt_surface` (src/Surface.zig:841-843).
+    pub fn close(self: *Surface, process_alive: bool) void {
+        if (self.app.terminating) return;
 
-        if (process_alive) {
-            const ok = confirm(
-                hwnd,
-                L("A process is still running in this terminal. Close it anyway?"),
-            );
-            if (!ok) return;
+        // A second WM_CLOSE while the prompt below is up, or a close_window
+        // binding after the teardown was already posted.
+        if (self.closing) return;
+        self.closing = true;
+
+        if (process_alive and !confirm(
+            self.app,
+            self.hwnd,
+            L("A process is still running in this terminal. Close it anyway?"),
+        )) {
+            // `self` is still valid: `confirm` raises `prompt_depth`, so no
+            // teardown can run inside its modal loop (destroyPosted defers),
+            // and nothing but destroyPosted destroys a surface window.
+            self.closing = false;
+            return;
         }
 
-        _ = win32.DestroyWindow(hwnd);
+        self.postDestroy();
     }
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
@@ -1268,8 +1739,13 @@ pub const Surface = struct {
         // Pre-1607 fallback. This is the *correct* answer on those versions:
         // they have no per-monitor DPI, so the system-wide value is the only
         // one there is.
-        if (self.hdc) |hdc| {
-            const v = win32.GetDeviceCaps(hdc, win32.LOGPIXELSX);
+        //
+        // The screen DC, not `self.hdc`: that one is the window's CS_OWNDC,
+        // which the render thread presents on, and GDI on it from this thread
+        // would race the render thread.
+        if (win32.GetDC(null)) |screen| {
+            defer _ = win32.ReleaseDC(null, screen);
+            const v = win32.GetDeviceCaps(screen, win32.LOGPIXELSX);
             if (v > 0) return @intCast(v);
         }
 
@@ -1375,17 +1851,17 @@ pub const Surface = struct {
             // confirmation flow.
             //
             // MessageBoxW runs a nested modal loop. Win32 messages keep
-            // pumping, but `core_app.tick` does not -- it runs only in `run`'s
-            // loop -- so the mailbox goes undrained for as long as the prompt
-            // is up and renderer and IO messages stall behind it. The same
-            // reentrancy is a memory hazard: a dispatched message that reaches
-            // this window's WM_DESTROY frees `self`, and the
-            // completeClipboardRequest calls below would then run against freed
-            // memory. MessageBoxW disabling its owner window makes that hard to
-            // reach, not impossible. Both problems go away when this becomes an
-            // in-window prompt driven from the core's own confirmation UI.
+            // pumping, but `core_app.tick` does not (`confirm` raises
+            // App.prompt_depth), so the mailbox goes undrained for as long as
+            // the prompt is up and renderer and IO output stalls behind it.
+            // That is deliberate: this runs inside a tick, and the same guard
+            // defers any surface teardown dispatched meanwhile, so `self` is
+            // still valid for the completeClipboardRequest calls below. The
+            // stall goes away when this becomes an in-window prompt driven
+            // from the core's own confirmation UI.
             error.UnsafePaste, error.UnauthorizedPaste => {
                 if (confirm(
+                    self.app,
                     self.hwnd,
                     L("Pasting this text could be unsafe. Paste anyway?"),
                 )) {
@@ -1429,6 +1905,7 @@ pub const Surface = struct {
         };
 
         if (confirm_write and !confirm(
+            self.app,
             self.hwnd,
             L("An application wants to write to the clipboard. Allow it?"),
         )) return;
@@ -1537,60 +2014,41 @@ pub const Surface = struct {
         return true;
     }
 
-    /// Paint. Without a renderer there is nothing to draw, so the foundation
-    /// clears to the configured background. This is not a placeholder for the
-    /// renderer -- it is the cheapest proof that the WGL context is live, and
-    /// it goes away when the renderer takes over presentation.
+    /// WM_PAINT. The render thread draws and presents on its own; all the
+    /// main thread does is clear the update region and ask the core for a
+    /// frame.
     fn paint(self: *Surface) void {
-        // BeginPaint/EndPaint must bracket every WM_PAINT even when we draw
-        // nothing: they clear the update region, and without them Windows
-        // re-posts WM_PAINT forever and the loop spins at 100% CPU.
-        var ps: win32.PAINTSTRUCT = undefined;
-        _ = win32.BeginPaint(self.hwnd, &ps);
-        defer _ = win32.EndPaint(self.hwnd, &ps);
+        // ValidateRect, not BeginPaint/EndPaint. The update region still has
+        // to be cleared -- otherwise Windows re-posts WM_PAINT forever and the
+        // loop spins at 100% CPU -- but with CS_OWNDC, BeginPaint returns the
+        // very DC the render thread presents on and changes its clip region
+        // from this thread. ValidateRect clears the region and touches no DC.
+        _ = win32.ValidateRect(self.hwnd, null);
 
         // Every paint is logged at debug level, which is compiled out of
         // release builds (main_ghostty.zig:208). Without it a stale frame on
-        // screen cannot be told apart from a repaint that never ran.
+        // screen cannot be told apart from a repaint that never ran. The
+        // present side (count, dropped stale frames, blit path) is logged by
+        // src/renderer/opengl/wgl.zig.
         self.paint_count += 1;
         const n = self.paint_count;
         const id = @intFromPtr(self.hwnd);
 
-        // A paint can arrive from inside CreateWindowExW, before the context
-        // exists. Nothing to do then; the window is repainted after create.
-        const hdc = self.hdc orelse {
-            log.debug("paint #{d} hwnd={x}: skipped, no device context yet", .{ n, id });
-            return;
-        };
-        const hglrc = self.hglrc orelse {
-            log.debug("paint #{d} hwnd={x}: skipped, no GL context yet", .{ n, id });
+        // A paint can arrive from inside CreateWindowExW, before the core
+        // surface exists; `create` shows the window only after it does.
+        const core_surface = self.liveCore() orelse {
+            log.debug("paint #{d} hwnd={x}: validated, no live core surface", .{ n, id });
             return;
         };
 
-        if (!win32.wglMakeCurrent(hdc, hglrc).toBool()) {
-            log.warn("paint #{d} hwnd={x}: wglMakeCurrent failed", .{ n, id });
-            return;
-        }
-
-        const size = self.getSize() catch |err| {
-            log.warn("paint #{d} hwnd={x}: client size unavailable err={}", .{ n, id, err });
+        // refreshCallback, never CoreSurface.draw: draw renders synchronously
+        // on the calling thread (src/Surface.zig:883), and this thread must
+        // not make GL calls. refreshCallback only wakes the render thread.
+        core_surface.refreshCallback() catch |err| {
+            log.warn("paint #{d} hwnd={x}: refresh failed err={}", .{ n, id, err });
             return;
         };
-        win32.glViewport(0, 0, @intCast(size.width), @intCast(size.height));
-
-        const bg = self.app.config.background;
-        win32.glClearColor(
-            @as(f32, @floatFromInt(bg.r)) / 255.0,
-            @as(f32, @floatFromInt(bg.g)) / 255.0,
-            @as(f32, @floatFromInt(bg.b)) / 255.0,
-            1.0,
-        );
-        win32.glClear(win32.GL_COLOR_BUFFER_BIT);
-        if (!win32.SwapBuffers(hdc).toBool()) {
-            log.warn("paint #{d} hwnd={x}: SwapBuffers failed", .{ n, id });
-            return;
-        }
-        log.debug("paint #{d} hwnd={x}: {d}x{d}", .{ n, id, size.width, size.height });
+        log.debug("paint #{d} hwnd={x}: refresh requested", .{ n, id });
     }
 
     fn handleMessage(
@@ -1600,32 +2058,106 @@ pub const Surface = struct {
         wparam: win32.WPARAM,
         lparam: win32.LPARAM,
     ) win32.LRESULT {
+        // Until `core_state` is `.live` every handler below keeps the
+        // pre-core behaviour. That matters: messages arrive inside
+        // CreateWindowExW, long before CoreSurface.init. Callback errors are
+        // logged and never propagated; there is no caller to take them.
         switch (msg) {
             win32.WM_CLOSE => {
-                // The core's close path (CoreSurface.close -> rt_surface.close)
-                // handles the "process still running" confirmation. Without a
-                // CoreSurface there is nothing to confirm, so this goes
-                // straight to teardown.
-                _ = win32.DestroyWindow(hwnd);
+                // The title bar button, Alt+F4 when no binding consumed it,
+                // and the window menu's Close.
+                if (self.app.terminating) return 0;
+                switch (self.core_state) {
+                    // CoreSurface.close -> Surface.close applies
+                    // needsConfirmQuit and posts the teardown.
+                    .live => self.core_surface.close(),
+                    // Already going away.
+                    .stopping => {},
+                    // No core surface, so nothing to confirm or stop. This
+                    // frees `self` (WM_DESTROY); nothing follows it.
+                    .none => _ = win32.DestroyWindow(hwnd),
+                }
+                return 0;
+            },
+
+            WM_GHOSTTY_DESTROY => {
+                // Frees `self` unless deferred; nothing may follow it.
+                self.destroyPosted();
                 return 0;
             },
 
             win32.WM_DESTROY => {
-                // The GL context must die before its window does.
+                // Every path that destroys a live surface stops the core
+                // first (destroyPosted, App.terminate), so this is only
+                // defensive: tear down now, late but in the right order,
+                // rather than delete a context the render thread still has
+                // current. `.stopping` cannot be seen here: nothing destroys
+                // the window while stopCore is pumping.
+                if (self.core_state == .live) {
+                    log.warn("surface window destroyed with a live core surface", .{});
+                    self.stopCore();
+                }
+
+                // Destroyed inside its own size/move or menu loop (e.g. the
+                // child exited mid-drag): the WM_EXIT* for that loop will not
+                // come, so return this window's share of the depth now.
+                // Otherwise every later wakeup would tick from whatever loop
+                // dispatched it.
+                self.app.modal_loop_depth -|= self.modal_loops;
+                self.modal_loops = 0;
+
+                // The GL context must die before its window does, and only
+                // after the render thread has let go of it (stopCore).
                 self.releaseContext();
                 self.app.surfaceDestroyed(self);
                 return 0;
             },
 
             win32.WM_SIZE => {
-                // This is where CoreSurface.sizeCallback goes
-                // (src/Surface.zig:2502) once a core surface is hosted. Until
-                // then a resize only needs a repaint.
-                _ = win32.InvalidateRect(hwnd, null, .FALSE);
+                const core_surface = self.liveCore() orelse return 0;
+
+                // Minimized: report occluded and do NOT resize. A minimized
+                // window reports a 0x0 client area, and the grid is clamped
+                // to at least 1x1 (src/renderer/size.zig:260-261), so passing
+                // it on would reflow every line to one column and back on
+                // restore.
+                if (wparam == win32.SIZE_MINIMIZED) {
+                    core_surface.occlusionCallback(false) catch |err|
+                        log.warn("occlusion callback failed err={}", .{err});
+                    return 0;
+                }
+
+                // Every other WM_SIZE means visible. Sent unconditionally;
+                // the core ignores repeats (src/Surface.zig:3344-3345).
+                core_surface.occlusionCallback(true) catch |err|
+                    log.warn("occlusion callback failed err={}", .{err});
+
+                // Client size in physical pixels (PerMonitorV2). A zero
+                // dimension can also occur without minimizing (a window
+                // dragged to zero height); it would clamp the grid the same
+                // way, so it is skipped too.
+                const width = win32.loword(lparam);
+                const height = win32.hiword(lparam);
+                if (width == 0 or height == 0) return 0;
+
+                core_surface.sizeCallback(.{
+                    .width = width,
+                    .height = height,
+                }) catch |err| log.warn("size callback failed err={}", .{err});
                 return 0;
             },
 
             win32.WM_DPICHANGED => {
+                // The new scale first: SetWindowPos below sends WM_SIZE
+                // synchronously, so the core sees the scale before the size
+                // computed for it. wParam carries the new DPI in both words;
+                // they are always equal for a window.
+                if (self.liveCore()) |core_surface| {
+                    const scale = @as(f32, @floatFromInt(win32.hiword(wparam))) / 96.0;
+                    core_surface.contentScaleCallback(.{ .x = scale, .y = scale }) catch |err|
+                        log.warn("content scale callback failed err={}", .{err});
+                }
+
                 // lParam carries the suggested new window rect. Not honoring
                 // it leaves the window the wrong physical size on the new
                 // monitor, so it is applied verbatim.
@@ -1639,9 +2171,112 @@ pub const Surface = struct {
                     rect.bottom - rect.top,
                     win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
                 );
-                // CoreSurface.contentScaleCallback (src/Surface.zig:3667) goes
-                // here alongside the reposition.
                 return 0;
+            },
+
+            win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
+                if (self.liveCore()) |core_surface| {
+                    core_surface.focusCallback(msg == win32.WM_SETFOCUS) catch |err|
+                        log.warn("focus callback failed err={}", .{err});
+                }
+                return 0;
+            },
+
+            // The system modal loops. See App.wndProc's WM_GHOSTTY_WAKEUP.
+            win32.WM_ENTERSIZEMOVE, win32.WM_ENTERMENULOOP => {
+                self.modal_loops += 1;
+                self.app.modal_loop_depth += 1;
+                return 0;
+            },
+            win32.WM_EXITSIZEMOVE, win32.WM_EXITMENULOOP => {
+                // Only undo what this window added, so a stray EXIT can
+                // never take another window's loop out of the count.
+                if (self.modal_loops > 0) {
+                    self.modal_loops -= 1;
+                    self.app.modal_loop_depth -|= 1;
+                }
+                return 0;
+            },
+
+            win32.WM_KEYDOWN,
+            win32.WM_SYSKEYDOWN,
+            win32.WM_KEYUP,
+            win32.WM_SYSKEYUP,
+            => {
+                const core_surface = self.liveCore() orelse
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+                // IME-owned keystroke: the IME consumes it, not the terminal.
+                if (wparam == win32.VK_PROCESSKEY) {
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+
+                // The synthetic Left Ctrl of AltGr. The core still sees Ctrl
+                // held (GetKeyState) and keyEvent's AltGr rule handles that.
+                if (isAltGrFakeCtrl(wparam, lparam)) {
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+
+                const mods = currentMods();
+
+                // Alt+Space (Alt alone) opens the window menu, as in every
+                // Windows app. It must bypass the core entirely: DefWindowProcW
+                // opens the menu from the WM_SYSCHAR ' ' that TranslateMessage
+                // posted, so keyEvent must not remove that message either.
+                if (wparam == win32.VK_SPACE and
+                    mods.binding().equal(.{ .alt = true }))
+                {
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+
+                const effect = self.keyEvent(core_surface, msg, wparam, lparam, mods) catch |err| {
+                    log.warn("key callback failed err={}", .{err});
+                    return 0;
+                };
+                return switch (effect) {
+                    // `.closed` only posted WM_GHOSTTY_DESTROY (Surface.close),
+                    // so `self` is still valid -- but nothing here needs it.
+                    .consumed, .closed => 0,
+                    // Unhandled keys keep their system meaning: Alt and F10
+                    // reach WM_SYSCOMMAND (suppressed below), Alt+F4 becomes
+                    // SC_CLOSE if no binding took it.
+                    .ignored => win32.DefWindowProcW(hwnd, msg, wparam, lparam),
+                };
+            },
+
+            win32.WM_CHAR,
+            win32.WM_DEADCHAR,
+            win32.WM_SYSCHAR,
+            win32.WM_SYSDEADCHAR,
+            => {
+                // Normally never seen: keyEvent removes the characters its
+                // keydown produced. What arrives here was posted by someone
+                // else (SendMessage/PostMessage from another program, or a
+                // keydown the core surface did not exist for yet).
+
+                // Alt+Space's WM_SYSCHAR, deliberately left in the queue by
+                // the keydown handler: DefWindowProcW turns it into
+                // SC_KEYMENU with lParam ' ', which opens the window menu.
+                if (msg == win32.WM_SYSCHAR and wparam == ' ') {
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+
+                if (self.liveCore()) |core_surface| {
+                    self.strayChar(core_surface, msg, wparam);
+                }
+
+                // Always handled. For WM_SYSCHAR this is also what stops
+                // DefWindowProcW from beeping about a missing menu mnemonic.
+                return 0;
+            },
+
+            win32.WM_SYSCOMMAND => {
+                // A bare Alt or F10 released without being consumed arrives
+                // as SC_KEYMENU with lParam 0 and would put the window into
+                // menu mode, swallowing the next keystroke. The window has no
+                // menu bar, so that mode is never wanted. Alt+Space arrives
+                // with lParam ' ' and still opens the window menu.
+                if (wparam & 0xFFF0 == win32.SC_KEYMENU and lparam == 0) return 0;
             },
 
             win32.WM_PAINT => {
@@ -1649,8 +2284,12 @@ pub const Surface = struct {
                 return 0;
             },
 
-            // We paint every pixel of the client area in WM_PAINT, so letting
-            // GDI erase first only produces a flash of the class background.
+            // The render thread presents every pixel of the client area, so
+            // letting GDI erase first only produces a flash of the class
+            // background -- and would be GDI on the render thread's DC. (Its
+            // one early clear, wgl.State.clearAndPresent, is best-effort: it
+            // usually runs before the window is shown. The first real frame
+            // follows the first WM_PAINT's refresh.)
             win32.WM_ERASEBKGND => return 1,
 
             else => {},
@@ -1658,6 +2297,204 @@ pub const Surface = struct {
 
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+
+    /// Translate a key message into a core KeyEvent and deliver it.
+    ///
+    /// Win32 splits one keystroke across two messages: the WM_(SYS)KEYDOWN
+    /// being handled, and the WM_(SYS)CHAR / WM_(SYS)DEADCHAR that
+    /// TranslateMessage posted *before* that keydown was dispatched
+    /// (App.run, waitForThreads). The core wants both in one event, so the
+    /// characters are pulled out of the queue here.
+    fn keyEvent(
+        self: *Surface,
+        core_surface: *CoreSurface,
+        msg: win32.UINT,
+        wparam: win32.WPARAM,
+        lparam: win32.LPARAM,
+        mods_in: input.Mods,
+    ) !CoreSurface.InputEffect {
+        const vk: win32.UINT = @truncate(wparam);
+        const scan = scanCode(vk, lparam);
+        const release = msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP;
+
+        // lParam bit 30: the key was already down, i.e. autorepeat.
+        const action: input.Action = if (release)
+            .release
+        else if ((@as(usize, @bitCast(lparam)) >> 30) & 1 != 0)
+            .repeat
+        else
+            .press;
+
+        // VK_PACKET is injected text (SendInput with KEYEVENTF_UNICODE: on-
+        // screen keyboards, some remote-desktop clients). It is not a
+        // physical key, and its lParam scan field is not guaranteed to be
+        // zero, so it must not be matched against the keycode table, where
+        // it could alias a real key and fire that key's bindings. Its text
+        // still arrives through the WM_CHAR collected below.
+        const is_packet = wparam == win32.VK_PACKET;
+
+        const key: input.Key = if (is_packet) .unidentified else key: for (input.keycodes.entries) |entry| {
+            if (entry.native == scan) break :key entry.key;
+        } else .unidentified;
+
+        var mods = mods_in;
+        var text: Text = .{};
+        if (!release) text.collect(self.hwnd);
+
+        // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord
+        // that produces a character is AltGr by definition on Windows (it is
+        // the documented substitute on keyboards without the key). Left in
+        // place, the encoder would treat the character as a Ctrl sequence
+        // (src/input/key_encode.zig:332, :450) and German AltGr+Q ('@') would
+        // be sent as NUL (:814). Only characters that came through WM_CHAR
+        // count: Alt without Ctrl produces WM_SYSCHAR, and Alt+letter must
+        // keep its Alt so the encoder prefixes ESC.
+        if (text.from_char and mods.ctrl and mods.alt and text.utf8().len > 0) {
+            mods.ctrl = false;
+            mods.alt = false;
+        }
+
+        const unshifted: u21 = if (is_packet) 0 else unshiftedCodepoint(vk, scan);
+
+        // Win32 has no consumed-modifiers report. Shift is the only one that
+        // can be inferred: it was consumed if it changed the character.
+        var consumed: input.Mods = .{};
+        if (mods.shift and text.len > 0) {
+            var buf: [4]u8 = undefined;
+            const n = if (unshifted != 0)
+                std.unicode.utf8Encode(unshifted, &buf) catch 0
+            else
+                0;
+            consumed.shift = !std.mem.eql(u8, buf[0..n], text.utf8());
+        }
+
+        // A dead key shows its accent as preedit until the next committed
+        // text replaces it. The core does not track this itself
+        // (src/Surface.zig:2565-2568).
+        if (text.composing) {
+            try core_surface.preeditCallback(text.utf8());
+            self.preedit_active = true;
+        } else if (self.preedit_active and text.len > 0) {
+            try core_surface.preeditCallback(null);
+            self.preedit_active = false;
+        }
+
+        return try core_surface.keyCallback(.{
+            .action = action,
+            .key = key,
+            .mods = mods,
+            .consumed_mods = consumed,
+            .composing = text.composing,
+            .utf8 = text.utf8(),
+            .unshifted_codepoint = unshifted,
+        });
+    }
+
+    /// A character message with no keydown in this process to attach it to.
+    /// Delivered as a text-only key event with no physical key.
+    fn strayChar(
+        self: *Surface,
+        core_surface: *CoreSurface,
+        msg: win32.UINT,
+        wparam: win32.WPARAM,
+    ) void {
+        var text: Text = .{};
+        text.add(msg, @truncate(wparam));
+        text.finish();
+        if (text.len == 0) return;
+
+        if (text.composing) {
+            core_surface.preeditCallback(text.utf8()) catch |err|
+                log.warn("preedit callback failed err={}", .{err});
+            self.preedit_active = true;
+        } else if (self.preedit_active) {
+            core_surface.preeditCallback(null) catch |err|
+                log.warn("preedit callback failed err={}", .{err});
+            self.preedit_active = false;
+        }
+
+        _ = core_surface.keyCallback(.{
+            .action = .press,
+            .key = .unidentified,
+            .mods = currentMods(),
+            .composing = text.composing,
+            .utf8 = text.utf8(),
+        }) catch |err| log.warn("key callback failed err={}", .{err});
+    }
+
+    /// The text a keystroke produced, collected from WM_(SYS)(DEAD)CHAR.
+    const Text = struct {
+        /// UTF-16 code units as received. One keystroke yields at most a few
+        /// (a surrogate pair, or a layout's ligature); extra units past the
+        /// buffer are still removed from the queue, just not kept.
+        units: [16]u16 = undefined,
+        units_len: usize = 0,
+
+        /// The UTF-8 result, valid after `finish`.
+        bytes: [64]u8 = undefined,
+        len: usize = 0,
+
+        /// A WM_DEADCHAR / WM_SYSDEADCHAR was seen: this is preedit.
+        composing: bool = false,
+
+        /// At least one unit came from WM_CHAR / WM_DEADCHAR (as opposed to
+        /// the WM_SYS* variants, which mean Alt without Ctrl).
+        from_char: bool = false,
+
+        fn utf8(self: *const Text) []const u8 {
+            return self.bytes[0..self.len];
+        }
+
+        /// Remove every pending character message for `hwnd` and convert.
+        ///
+        /// Two separate peeks, never one over 0x0102-0x0107: that range
+        /// also contains WM_SYSKEYDOWN (0x0104) and WM_SYSKEYUP (0x0105),
+        /// which a single peek would swallow.
+        fn collect(self: *Text, hwnd: win32.HWND) void {
+            const ranges = [_][2]win32.UINT{
+                .{ win32.WM_CHAR, win32.WM_DEADCHAR },
+                .{ win32.WM_SYSCHAR, win32.WM_SYSDEADCHAR },
+            };
+            var m: win32.MSG = undefined;
+            for (ranges) |r| {
+                while (win32.PeekMessageW(&m, hwnd, r[0], r[1], win32.PM_REMOVE).toBool()) {
+                    self.add(m.message, @truncate(m.wParam));
+                }
+            }
+            self.finish();
+        }
+
+        fn add(self: *Text, msg: win32.UINT, unit: u16) void {
+            if (msg == win32.WM_DEADCHAR or msg == win32.WM_SYSDEADCHAR) {
+                self.composing = true;
+            }
+            if (msg == win32.WM_CHAR or msg == win32.WM_DEADCHAR) {
+                self.from_char = true;
+            }
+            if (self.units_len == self.units.len) return;
+            self.units[self.units_len] = unit;
+            self.units_len += 1;
+        }
+
+        /// Decode the units, dropping C0 controls and DEL as GTK does
+        /// (src/apprt/gtk/class/surface.zig:1428-1436): the encoder derives
+        /// Ctrl+letter, Enter, Tab, Backspace and Esc from the physical key
+        /// and the unshifted codepoint, and would double them otherwise.
+        /// Unpaired surrogates are dropped rather than failing the keystroke.
+        fn finish(self: *Text) void {
+            self.len = 0;
+            var it = std.unicode.Utf16LeIterator.init(self.units[0..self.units_len]);
+            while (true) {
+                const cp = it.nextCodepoint() catch continue orelse break;
+                if (cp < 0x20 or cp == 0x7F) continue;
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch continue;
+                if (self.len + n > self.bytes.len) break;
+                @memcpy(self.bytes[self.len..][0..n], buf[0..n]);
+                self.len += n;
+            }
+        }
+    };
 
     fn wndProc(
         hwnd: win32.HWND,
@@ -1698,6 +2535,128 @@ pub const Surface = struct {
 // -------------------------------------------------------------------------
 // Win32 helpers
 // -------------------------------------------------------------------------
+
+/// The modifier state for the key message being handled.
+///
+/// GetKeyState, not GetAsyncKeyState: it reports the state as of the message
+/// being processed, which is what a queued keystroke must be judged by. The
+/// high bit is "down", the low bit is the toggle state for the lock keys.
+fn currentMods() input.Mods {
+    const down = struct {
+        fn f(vk: c_int) bool {
+            return win32.GetKeyState(vk) < 0;
+        }
+    }.f;
+    const toggled = struct {
+        fn f(vk: c_int) bool {
+            return win32.GetKeyState(vk) & 1 != 0;
+        }
+    }.f;
+
+    const lshift = down(win32.VK_LSHIFT);
+    const rshift = down(win32.VK_RSHIFT);
+    const lctrl = down(win32.VK_LCONTROL);
+    const rctrl = down(win32.VK_RCONTROL);
+    const lalt = down(win32.VK_LMENU);
+    const ralt = down(win32.VK_RMENU);
+    const lwin = down(win32.VK_LWIN);
+    const rwin = down(win32.VK_RWIN);
+
+    // `sides` only means something for a modifier that is down
+    // (src/input/key_mods.zig:55-59). With both keys of a pair down, left is
+    // reported.
+    return .{
+        .shift = lshift or rshift,
+        .ctrl = lctrl or rctrl,
+        .alt = lalt or ralt,
+        .super = lwin or rwin,
+        .caps_lock = toggled(win32.VK_CAPITAL),
+        .num_lock = toggled(win32.VK_NUMLOCK),
+        .sides = .{
+            .shift = if (rshift and !lshift) .right else .left,
+            .ctrl = if (rctrl and !lctrl) .right else .left,
+            .alt = if (ralt and !lalt) .right else .left,
+            .super = if (rwin and !lwin) .right else .left,
+        },
+    };
+}
+
+/// True for the Left Ctrl message Windows synthesizes in front of AltGr.
+///
+/// On layouts with AltGr, pressing (or releasing) it sends a Left Ctrl
+/// down (up) immediately followed by the Right Alt down (up), both stamped
+/// with the same message time. Reported as-is, the core would see a real
+/// Left Ctrl press and release, which the kitty keyboard protocol's
+/// report-all-keys mode forwards to the application. The check is GLFW's
+/// (win32_window.c, WM_KEYDOWN handling): a non-extended VK_CONTROL whose
+/// next queued message is an extended VK_MENU key message with the same
+/// time. Only a peek, so the Right Alt is still delivered normally.
+fn isAltGrFakeCtrl(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
+    if (wparam != win32.VK_CONTROL) return false;
+    const l: usize = @bitCast(lparam);
+    // lParam bit 24: extended key, i.e. Right Ctrl, which is always real.
+    if ((l >> 24) & 1 != 0) return false;
+
+    var next: win32.MSG = undefined;
+    if (!win32.PeekMessageW(&next, null, 0, 0, win32.PM_NOREMOVE).toBool()) return false;
+    switch (next.message) {
+        win32.WM_KEYDOWN,
+        win32.WM_SYSKEYDOWN,
+        win32.WM_KEYUP,
+        win32.WM_SYSKEYUP,
+        => {},
+        else => return false,
+    }
+    const nl: usize = @bitCast(next.lParam);
+    // GetMessageTime is the time of the message being handled; MSG.time is
+    // the same clock (a DWORD of the LONG value).
+    const time: win32.DWORD = @bitCast(win32.GetMessageTime());
+    return next.wParam == win32.VK_MENU and
+        (nl >> 24) & 1 != 0 and
+        next.time == time;
+}
+
+/// The key's scan code in the form of the Windows column of
+/// src/input/keycodes.zig: the 8-bit code from lParam bits 16-23, with 0xE0
+/// in the high byte when lParam bit 24 (extended key) is set. Keys injected
+/// without a scan code (lParam 0, e.g. some SendInput callers) fall back to
+/// the layout's mapping of the virtual key.
+fn scanCode(vk: win32.UINT, lparam: win32.LPARAM) u32 {
+    const l: usize = @bitCast(lparam);
+    var sc: u32 = @intCast((l >> 16) & 0xFF);
+    if (sc == 0) return win32.MapVirtualKeyW(vk, win32.MAPVK_VK_TO_VSC_EX);
+    if ((l >> 24) & 1 != 0) sc |= 0xE000;
+    return sc;
+}
+
+/// The character the key produces with no modifiers in the current layout,
+/// or 0. Used by the encoder for Ctrl/Alt sequences and by bindings.
+///
+/// TOUNICODE_NO_STATE_CHANGE keeps this query from consuming a pending dead
+/// key; on Windows before 10 1607, which ignores the flag, a dead key
+/// followed by another key can lose its accent.
+fn unshiftedCodepoint(vk: win32.UINT, scan: u32) u21 {
+    const empty_state = std.mem.zeroes([256]win32.BYTE);
+    var buf: [4]win32.WCHAR = undefined;
+    const n = win32.ToUnicodeEx(
+        vk,
+        // Only the low byte. ToUnicodeEx reads bit 15 of the scan code as
+        // "key is up", and the 0xE0 extended prefix sets exactly that bit.
+        scan & 0xFF,
+        &empty_state,
+        &buf,
+        buf.len,
+        win32.TOUNICODE_NO_STATE_CHANGE,
+        win32.GetKeyboardLayout(0),
+    );
+    // Negative: a dead key, whose spacing form is in buf[0]. Zero: nothing.
+    if (n == 0) return 0;
+    const unit = buf[0];
+    if (std.unicode.utf16IsHighSurrogate(unit) or std.unicode.utf16IsLowSurrogate(unit)) {
+        return 0;
+    }
+    return unit;
+}
 
 fn registerClasses(hinstance: win32.HINSTANCE) !void {
     const arrow = win32.LoadCursorW(null, win32.IDC_ARROW);
@@ -1959,7 +2918,14 @@ fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
 }
 
 /// A modal yes/no prompt. This is the only confirmation UI this runtime has.
-fn confirm(hwnd: win32.HWND, text: win32.LPCWSTR) bool {
+///
+/// MessageBoxW runs a nested message loop. `prompt_depth` tells every
+/// handler dispatched inside it that a core frame is probably beneath: no
+/// ticks and no surface teardown until it returns (`App.canReenterCore`).
+/// Output from every surface pauses while a prompt is open.
+fn confirm(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) bool {
+    app.prompt_depth += 1;
+    defer app.prompt_depth -= 1;
     return win32.MessageBoxW(
         hwnd,
         text,
@@ -1969,11 +2935,12 @@ fn confirm(hwnd: win32.HWND, text: win32.LPCWSTR) bool {
 }
 
 comptime {
-    // Zig only analyzes function bodies it reaches. Nothing in this build
-    // reaches most of the apprt contract -- the rt_surface methods are called
-    // only by a CoreSurface, and this runtime hosts none (see the module doc
-    // comment) -- so without these references the contract would never be
-    // type-checked and would rot silently against core changes.
+    // Zig only analyzes function bodies it reaches. A Windows exe reaches
+    // the contract through CoreSurface, but only for the methods and action
+    // keys the core actually calls in that configuration; these references
+    // keep the whole contract type-checked (and every performAction key
+    // instantiated) whenever this file is the selected runtime, so it cannot
+    // rot silently against core changes.
     //
     // Guarded on this file being the selected runtime, not merely on the
     // target. src/apprt.zig imports it unconditionally on every platform,
