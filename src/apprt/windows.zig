@@ -696,6 +696,7 @@ pub const App = struct {
             // recorded (see `quit_pending`): only here is it known both that
             // the loop has started and that no window is on screen.
             if (self.quit_pending and self.surfaces.items.len == 0) {
+                self.logQuitOverride();
                 self.quit = true;
                 break;
             }
@@ -921,13 +922,11 @@ pub const App = struct {
                 //
                 // Delete this override -- not the config read -- as soon as
                 // `.new_window` can actually create a window.
-                if (!self.config.@"quit-after-last-window-closed") {
-                    log.info(
-                        "quitting despite quit-after-last-window-closed=false: " ++
-                            "this runtime cannot open a new window",
-                        .{},
-                    );
-                }
+                //
+                // The override is reported by logQuitOverride where the quit is
+                // carried out, not here: `.start` also arrives at launch, from
+                // startQuitTimer, for a quit that newSurface cancels, so
+                // logging here would report quits that never happen.
 
                 const delay_ms: u64 = if (self.config.@"quit-after-last-window-closed-delay") |v|
                     v.asMilliseconds()
@@ -957,6 +956,18 @@ pub const App = struct {
                 return true;
             },
         }
+    }
+
+    /// Report that the process is quitting because of the override in
+    /// setQuitTimer rather than because the configuration asked for it.
+    /// Called only at the two points where that quit is carried out.
+    fn logQuitOverride(self: *const App) void {
+        if (self.config.@"quit-after-last-window-closed") return;
+        log.info(
+            "quitting despite quit-after-last-window-closed=false: " ++
+                "this runtime cannot open a new window",
+            .{},
+        );
     }
 
     /// Create a foundation window. See `run` for why this is not driven by
@@ -1043,6 +1054,7 @@ pub const App = struct {
             win32.WM_TIMER => if (wparam == quit_timer_id) {
                 _ = win32.KillTimer(hwnd, quit_timer_id);
                 self.quit_timer_active = false;
+                self.logQuitOverride();
                 self.quit = true;
                 win32.PostQuitMessage(0);
                 return 0;
