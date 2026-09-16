@@ -12,6 +12,21 @@ const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 const Dmabuf = @import("Dmabuf.zig");
+const wglpkg = @import("opengl/wgl.zig");
+
+/// WGL (Win32) instead of EGL, i.e. the Win32 apprt is hosting this renderer.
+///
+/// Every EGL/WGL difference in this file (and in opengl/Frame.zig) is an
+/// explicit `if (comptime wgl_enabled) ... else ...`, so exactly one side is
+/// ever analysed. On Windows no `egl.*` extern is referenced, which is what
+/// lets the exe link without libEGL (SharedDeps.zig links it for GTK only);
+/// everywhere else the else side is the pre-existing code, unchanged.
+///
+/// Keyed on the apprt rather than `builtin.os.tag` because the WGL path
+/// reads `rt_surface.hwnd/hdc/hglrc`, which only `apprt.windows.Surface`
+/// has (Metal.zig switches on `apprt.runtime` the same way). A Windows
+/// library artifact resolves to the embedded apprt and keeps the EGL path.
+pub const wgl_enabled = apprt.runtime == apprt.windows;
 
 pub const GraphicsAPI = OpenGL;
 pub const Target = @import("opengl/Target.zig");
@@ -30,7 +45,12 @@ pub const custom_shader_y_is_down = false;
 
 /// Triple-buffering gives the GPU room to pipeline renders without
 /// having to wait on the apprt consuming previous frames.
-pub const swap_chain_count = 3;
+///
+/// WGL presents synchronously inside `Frame.complete` (SwapBuffers on the
+/// render thread), so at most one frame is ever in flight and extra swap
+/// chain entries would only multiply the per-surface targets and atlas
+/// copies (generic.zig SwapChain allows a count of 1).
+pub const swap_chain_count = if (wgl_enabled) 1 else 3;
 
 const log = std.log.scoped(.opengl);
 
@@ -43,10 +63,46 @@ alloc: std.mem.Allocator,
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
-egl_display: *gl.egl.Display,
-egl_context: *gl.egl.Context,
+egl_display: if (wgl_enabled) void else *gl.egl.Display,
+egl_context: if (wgl_enabled) void else *gl.egl.Context,
+
+/// The borrowed WGL context (see opengl/wgl.zig). Zero-sized, and defaulted
+/// so the EGL code never has to name it, when WGL is not in use. On WGL it
+/// is always set explicitly by `initWgl`; the `undefined` default is never
+/// observed.
+wgl: if (wgl_enabled) wglpkg.State else void = if (wgl_enabled) undefined else {},
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
+    return if (comptime wgl_enabled)
+        initWgl(alloc, opts)
+    else
+        initEgl(alloc, opts);
+}
+
+/// Main thread, inside `CoreSurface.init`. The apprt owns the context; this
+/// only copies its handles and probes it (wgl.State.init), leaving it
+/// current nowhere.
+fn initWgl(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
+    return .{
+        .alloc = alloc,
+        .blending = opts.config.blending,
+        .egl_display = {},
+        .egl_context = {},
+        .wgl = try wglpkg.State.init(opts.rt_surface, .{
+            .background = .{
+                opts.config.background.r,
+                opts.config.background.g,
+                opts.config.background.b,
+            },
+            .background_opacity = opts.config.background_opacity,
+            .linear_blending = opts.config.blending.isLinear(),
+            .min_major = MIN_VERSION_MAJOR,
+            .min_minor = MIN_VERSION_MINOR,
+        }),
+    };
+}
+
+fn initEgl(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
     try egl.load();
 
     const display: *egl.Display = try .init(egl.c.EGL_DEFAULT_DISPLAY);
@@ -100,6 +156,16 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !OpenGL {
 }
 
 pub fn deinit(self: *OpenGL) void {
+    if (comptime wgl_enabled) deinitWgl(self) else deinitEgl(self);
+}
+
+/// Nothing to release: the apprt deletes the context after the render
+/// thread (which released it in `threadExit`) has been joined.
+fn deinitWgl(self: *OpenGL) void {
+    self.* = undefined;
+}
+
+fn deinitEgl(self: *OpenGL) void {
     self.egl_display.releaseCurrent();
     self.egl_context.destroy(self.egl_display) catch {};
 
@@ -213,6 +279,32 @@ fn prepareContext(getProcAddress: anytype) !void {
 /// here we (re)bind it to this thread and load the thread-local glad
 /// function pointers so all subsequent GL work on this thread is valid.
 pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
+    return if (comptime wgl_enabled)
+        self.threadEnterWgl()
+    else
+        self.threadEnterEgl(surface);
+}
+
+/// Render thread. Takes the context over from the main thread (which
+/// released it at the end of `initWgl`) and loads this thread's glad table.
+fn threadEnterWgl(self: *OpenGL) !void {
+    try self.wgl.makeCurrent();
+    errdefer wglpkg.State.releaseCurrent();
+
+    // The threadlocal glad context starts `undefined`; zero it so the
+    // `unload`s in prepareContext's errdefer and in threadExit never
+    // FreeLibrary a garbage handle (see wgl.resetGladContext).
+    wglpkg.resetGladContext();
+    errdefer wglpkg.resetGladContext();
+    try prepareContext(&wglpkg.getProcAddress);
+
+    wglpkg.setSwapInterval(1);
+
+    // Show the background until the first real frame arrives.
+    self.wgl.clearAndPresent();
+}
+
+fn threadEnterEgl(self: *OpenGL, surface: *apprt.Surface) !void {
     _ = surface;
     try self.egl_display.makeCurrent(null, null, self.egl_context);
     // Load our function pointers for this thread's threadlocal.
@@ -223,6 +315,19 @@ pub fn threadEnter(self: *OpenGL, surface: *apprt.Surface) !void {
 /// thread; unbinds the context from this thread so it can be destroyed on
 /// the main thread.
 pub fn threadExit(self: *OpenGL) void {
+    if (comptime wgl_enabled) threadExitWgl() else self.threadExitEgl();
+}
+
+/// Render thread, after generic.zig freed every GPU object. Releasing here
+/// is what allows the apprt to delete the context once the thread is
+/// joined. glad's loader handle is NULL (reset in threadEnterWgl), so
+/// `unload` only discards the table.
+fn threadExitWgl() void {
+    wglpkg.State.releaseCurrent();
+    gl.glad.unload();
+}
+
+fn threadExitEgl(self: *OpenGL) void {
     self.egl_display.releaseCurrent();
     gl.glad.unload();
 }
@@ -284,11 +389,26 @@ pub fn initTarget(self: *const OpenGL, width: usize, height: usize) !Target {
     });
 }
 
+/// What `present` hands back: nothing on WGL, which puts the frame on screen
+/// itself, otherwise the exported frame.
+const PresentResult = if (wgl_enabled) void else ExportedFrame;
+
+/// Present a rendered target. This runs on the render thread.
+///
+/// WGL: blit to the window and SwapBuffers (opengl/wgl.zig).
+/// EGL: see `presentEgl`.
+pub fn present(self: *OpenGL, target: Target) !PresentResult {
+    return if (comptime wgl_enabled)
+        self.wgl.present(target)
+    else
+        self.presentEgl(target);
+}
+
 /// Export a rendered target. Caller takes ownership
 /// of the frame and is responsible for freeing it.
 ///
 /// This runs on the render thread.
-pub fn present(self: *OpenGL, target: Target) !ExportedFrame {
+fn presentEgl(self: *OpenGL, target: Target) !ExportedFrame {
     if (target.exportDmabuf(self.egl_display, self.egl_context)) |dmabuf| {
         return .{ .dmabuf = dmabuf };
     } else |_| {
@@ -303,7 +423,10 @@ pub fn present(self: *OpenGL, target: Target) !ExportedFrame {
 }
 
 /// A finished frame exported for presentation by the apprt.
-pub const ExportedFrame = union(enum) {
+///
+/// `void` on WGL: nothing is exported, so generic.zig's `LatestFrame`
+/// compiles to no-ops and no Dmabuf code is analysed.
+pub const ExportedFrame = if (wgl_enabled) void else union(enum) {
     dmabuf: Dmabuf,
     memory: Memory,
 

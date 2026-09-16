@@ -128,6 +128,46 @@ pub fn blitFramebuffer(
     try errors.getError();
 }
 
+/// glCopyImageSubData (GL 4.3 / ARB_copy_image). A raw texel copy: unlike a
+/// blit it never converts between color encodings, so an sRGB source copied
+/// into a linear destination keeps its encoded bytes.
+pub fn copyImageSubData(
+    src: Texture,
+    src_target: Texture.Target,
+    src_level: c.GLint,
+    src_x: c.GLint,
+    src_y: c.GLint,
+    src_z: c.GLint,
+    dst: Texture,
+    dst_target: Texture.Target,
+    dst_level: c.GLint,
+    dst_x: c.GLint,
+    dst_y: c.GLint,
+    dst_z: c.GLint,
+    width: c.GLsizei,
+    height: c.GLsizei,
+    depth: c.GLsizei,
+) !void {
+    glad.context.CopyImageSubData.?(
+        src.id,
+        @intFromEnum(src_target),
+        src_level,
+        src_x,
+        src_y,
+        src_z,
+        dst.id,
+        @intFromEnum(dst_target),
+        dst_level,
+        dst_x,
+        dst_y,
+        dst_z,
+        width,
+        height,
+        depth,
+    );
+    try errors.getError();
+}
+
 pub fn pixelStore(mode: c.GLenum, value: anytype) !void {
     switch (@typeInfo(@TypeOf(value))) {
         .comptime_int, .int => glad.context.PixelStorei.?(mode, value),

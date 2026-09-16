@@ -54,26 +54,48 @@ pub inline fn renderPass(
 ///
 /// NOTE: For OpenGL, `sync` is ignored and we never block, instead
 /// pushing the newly presented and exported frame to the frame queue.
+///
+/// On WGL (`OpenGL.wgl_enabled`) there is no queue: the frame is put on the
+/// window right here, as metal/Frame.zig does, and `sync` is ignored too.
 pub fn complete(self: *const Self, sync: bool) void {
     _ = sync;
 
     // If there are any GL errors, consider the frame unhealthy.
     const health: Health = if (gl.errors.getError()) .healthy else |_| .unhealthy;
 
-    // If the frame is healthy, export it and push to the present queue.
-    // The apprt pulls from this queue in its snapshot handler.
-    if (health == .healthy) frame: {
-        const frame = self.renderer.api.present(self.target.*) catch |err| {
-            log.warn("failed to present render target: err={}", .{err});
-            break :frame;
-        };
+    if (comptime OpenGL.wgl_enabled) {
+        // Direct present: blit + SwapBuffers on this (the render) thread.
+        // No pushFrame (ExportedFrame is void) and no `.redraw` push, since
+        // the apprt has nothing to pull. No glFinish either: SwapBuffers
+        // already flushes, and a dropped or unhealthy frame's commands are
+        // flushed by the next swap.
+        if (health == .healthy) {
+            self.renderer.api.present(self.target.*) catch |err| {
+                log.warn("failed to present render target: err={}", .{err});
+            };
+        } else {
+            // The health check above popped one error flag. GL keeps one
+            // flag per error kind, so any left over would make the next
+            // frame unhealthy too, and here an unhealthy frame is not
+            // presented at all. Drop them so one bad frame costs one frame.
+            @import("wgl.zig").drainErrors();
+        }
+    } else {
+        // If the frame is healthy, export it and push to the present queue.
+        // The apprt pulls from this queue in its snapshot handler.
+        if (health == .healthy) frame: {
+            const frame = self.renderer.api.present(self.target.*) catch |err| {
+                log.warn("failed to present render target: err={}", .{err});
+                break :frame;
+            };
 
-        self.renderer.pushFrame(frame);
+            self.renderer.pushFrame(frame);
 
-        // Notify the surface that it should redraw
-        _ = self.renderer.surface_mailbox.push(.redraw, .{ .forever = {} });
+            // Notify the surface that it should redraw
+            _ = self.renderer.surface_mailbox.push(.redraw, .{ .forever = {} });
+        }
+        gl.finish();
     }
-    gl.finish();
 
     // Report the health to the renderer.
     self.renderer.frameCompleted(health);
