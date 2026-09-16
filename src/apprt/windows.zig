@@ -1129,6 +1129,9 @@ pub const Surface = struct {
     /// Tracked so `.toggle_maximize` knows which way to toggle.
     maximized: bool,
 
+    /// Number of WM_PAINTs handled, for the debug log in `paint`.
+    paint_count: u64,
+
     /// Heap-allocate and initialize. The address must be stable: the core
     /// stores raw `*apprt.Surface` pointers (src/Surface.zig:465-466), and the
     /// wndproc recovers this pointer from GWLP_USERDATA.
@@ -1147,6 +1150,7 @@ pub const Surface = struct {
             .hglrc = null,
             .title = null,
             .maximized = false,
+            .paint_count = 0,
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -1545,17 +1549,33 @@ pub const Surface = struct {
         _ = win32.BeginPaint(self.hwnd, &ps);
         defer _ = win32.EndPaint(self.hwnd, &ps);
 
+        // Every paint is logged at debug level, which is compiled out of
+        // release builds (main_ghostty.zig:208). Without it a stale frame on
+        // screen cannot be told apart from a repaint that never ran.
+        self.paint_count += 1;
+        const n = self.paint_count;
+        const id = @intFromPtr(self.hwnd);
+
         // A paint can arrive from inside CreateWindowExW, before the context
         // exists. Nothing to do then; the window is repainted after create.
-        const hdc = self.hdc orelse return;
-        const hglrc = self.hglrc orelse return;
+        const hdc = self.hdc orelse {
+            log.debug("paint #{d} hwnd={x}: skipped, no device context yet", .{ n, id });
+            return;
+        };
+        const hglrc = self.hglrc orelse {
+            log.debug("paint #{d} hwnd={x}: skipped, no GL context yet", .{ n, id });
+            return;
+        };
 
         if (!win32.wglMakeCurrent(hdc, hglrc).toBool()) {
-            log.warn("wglMakeCurrent failed during paint", .{});
+            log.warn("paint #{d} hwnd={x}: wglMakeCurrent failed", .{ n, id });
             return;
         }
 
-        const size = self.getSize() catch return;
+        const size = self.getSize() catch |err| {
+            log.warn("paint #{d} hwnd={x}: client size unavailable err={}", .{ n, id, err });
+            return;
+        };
         win32.glViewport(0, 0, @intCast(size.width), @intCast(size.height));
 
         const bg = self.app.config.background;
@@ -1566,7 +1586,11 @@ pub const Surface = struct {
             1.0,
         );
         win32.glClear(win32.GL_COLOR_BUFFER_BIT);
-        _ = win32.SwapBuffers(hdc);
+        if (!win32.SwapBuffers(hdc).toBool()) {
+            log.warn("paint #{d} hwnd={x}: SwapBuffers failed", .{ n, id });
+            return;
+        }
+        log.debug("paint #{d} hwnd={x}: {d}x{d}", .{ n, id, size.width, size.height });
     }
 
     fn handleMessage(
