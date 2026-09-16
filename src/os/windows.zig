@@ -24,6 +24,7 @@ pub const HINSTANCE = windows.HINSTANCE;
 pub const HPCON = windows.LPVOID;
 pub const HRESULT = c_long;
 pub const LARGE_INTEGER = windows.LARGE_INTEGER;
+pub const LPCVOID = windows.LPCVOID;
 pub const LPCWSTR = windows.LPCWSTR;
 pub const LPSTR = windows.LPSTR;
 pub const LPVOID = windows.LPVOID;
@@ -108,6 +109,8 @@ pub const S_OK = 0;
 pub const SYNCHRONIZE = 0x00100000;
 pub const VOLUME_NAME_DOS = 0x0;
 pub const WAIT_FAILED = 0xFFFFFFFF;
+pub const WAIT_OBJECT_0 = 0x00000000;
+pub const WAIT_TIMEOUT = 0x00000102;
 
 /// IOCTL that fills the output buffer with bytes from the kernel CSPRNG
 /// behind `\Device\CNG` (what ProcessPrng and BCryptGenRandom draw from).
@@ -260,11 +263,26 @@ pub const exp = struct {
             hFile: HANDLE,
             lpOverlapped: ?*OVERLAPPED,
         ) callconv(.winapi) BOOL;
+        /// Cancels pending *synchronous* I/O issued by `hThread` (the
+        /// thread handle needs THREAD_TERMINATE access). Fails with
+        /// ERROR_NOT_FOUND when that thread has no I/O in progress.
+        /// https://learn.microsoft.com/en-us/windows/win32/fileio/cancelsynchronousio-func
+        pub extern "kernel32" fn CancelSynchronousIo(
+            hThread: HANDLE,
+        ) callconv(.winapi) BOOL;
         pub extern "kernel32" fn ReadFile(
             hFile: HANDLE,
             lpBuffer: LPVOID,
             nNumberOfBytesToRead: DWORD,
             lpNumberOfBytesRead: ?*DWORD,
+            lpOverlapped: ?*OVERLAPPED,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-writefile
+        pub extern "kernel32" fn WriteFile(
+            hFile: HANDLE,
+            lpBuffer: LPCVOID,
+            nNumberOfBytesToWrite: DWORD,
+            lpNumberOfBytesWritten: ?*DWORD,
             lpOverlapped: ?*OVERLAPPED,
         ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew

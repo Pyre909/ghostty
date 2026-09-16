@@ -123,8 +123,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closeQuitPipeEnd(pipe[0]);
+    errdefer closeQuitPipeEnd(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -203,30 +203,143 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
-        .SUCCESS => {},
-
-        // EPIPE means that our read thread is closed already, which is
-        // completely fine since that is what we were trying to achieve.
-        .PIPE => {},
-
-        else => |e| log.warn(
-            "error writing to read thread quit pipe err=E{s}",
-            .{@tagName(e)},
-        ),
-    }
-
     if (comptime builtin.os.tag == .windows) {
-        // Interrupt the blocking read so the thread can see the quit message
-        if (windows.exp.kernel32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
-            switch (windows.GetLastError()) {
-                .NOT_FOUND => {},
-                else => |err| log.warn("error interrupting read thread err={}", .{err}),
-            }
+        stopReadThreadWindows(exec);
+    } else {
+        switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+            .SUCCESS => {},
+
+            // EPIPE means that our read thread is closed already, which is
+            // completely fine since that is what we were trying to achieve.
+            .PIPE => {},
+
+            else => |e| log.warn(
+                "error writing to read thread quit pipe err=E{s}",
+                .{@tagName(e)},
+            ),
         }
     }
 
     exec.read_thread.join();
+}
+
+/// Close one end of the read thread quit pipe created by
+/// `internal_os.pipe()`. On Windows the ends are `CreatePipe` HANDLEs
+/// (os/pipe.zig), not CRT file descriptors: with libc linked,
+/// `posix.system.close` is the CRT `_close`, which expects an int fd
+/// and would never close the HANDLE (leaking it, and keeping the pipe
+/// alive so the other end never sees ERROR_BROKEN_PIPE).
+fn closeQuitPipeEnd(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = windows.exp.kernel32.CloseHandle(fd);
+    } else {
+        _ = posix.system.close(fd);
+    }
+}
+
+/// Signal the Windows read thread to quit and interrupt it until it has
+/// actually exited, so the `join` that follows cannot block forever.
+///
+/// The reader does a *synchronous* `ReadFile` on the ConPTY output pipe
+/// (an anonymous `CreatePipe` pipe, which cannot do overlapped I/O).
+/// A single cancel is not enough, because cancellation only affects I/O
+/// that is in progress at the instant of the call:
+///
+///   - If the reader is between reads (inside `processOutput` or
+///     `yieldToDemand`) the cancel finds nothing (ERROR_NOT_FOUND) and
+///     the next `ReadFile` blocks. `subprocess.stop()` killed the child
+///     but the pseudoconsole stays open until `pty.deinit`, which runs
+///     after this join, so no more output may ever arrive to wake it.
+///   - The reader checks the quit pipe before every `ReadFile`, but the
+///     quit byte can land between that check and the read.
+///
+/// So cancel, wait briefly for the thread, and repeat. Every cancel
+/// issued after the quit byte is written sends the reader back to its
+/// quit check, which then sees the byte and returns.
+fn stopReadThreadWindows(exec: *ThreadData) void {
+    const k32 = windows.exp.kernel32;
+
+    // The quit end is a HANDLE, so write with WriteFile. The CRT `write`
+    // that the POSIX path uses expects an int fd and fails here, which
+    // left the reader with no quit byte to find after the cancel.
+    var written: windows.DWORD = 0;
+    if (k32.WriteFile(exec.read_thread_pipe, "x", 1, &written, null) == windows.FALSE) {
+        switch (windows.GetLastError()) {
+            // The read end is closed, so the read thread has already
+            // exited (the EPIPE case of the POSIX path). The wait loop
+            // below returns immediately.
+            .BROKEN_PIPE, .NO_DATA => {},
+
+            else => |err| log.warn(
+                "error writing to read thread quit pipe err={}",
+                .{err},
+            ),
+        }
+    }
+
+    const thread = exec.read_thread.getHandle();
+
+    // Two waits of 10ms bound how long a quit that raced a ReadFile can go
+    // unnoticed (CancelSynchronousIo is only issued from the second pass).
+    // The loop normally finishes on its first wait.
+    const wait_ms = 10;
+    // Warn once if the thread is still alive after about a second: it is
+    // then stuck somewhere a cancel cannot reach (not in I/O), and the
+    // log is the only trace of which surface is hanging.
+    const warn_after = 100;
+
+    var attempts: usize = 0;
+    while (true) : (attempts += 1) {
+        // CancelIoEx is scoped to the pty pipe handle, so it can only
+        // ever abort the reader's ReadFile. It fails with ERROR_NOT_FOUND
+        // when there is nothing to cancel, which is expected here.
+        if (k32.CancelIoEx(exec.read_thread_fd, null) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                .NOT_FOUND => {},
+                else => |err| if (attempts == 0) log.warn(
+                    "error interrupting read thread err={}",
+                    .{err},
+                ),
+            }
+        }
+
+        // CancelSynchronousIo is the documented cancel for synchronous
+        // I/O issued by another thread, but it is scoped to the whole
+        // thread: it would equally abort unrelated synchronous I/O the
+        // reader does inside processOutput, such as a log write to
+        // stderr. So it is held back for the first wait, which is where
+        // a reader that was merely busy between reads returns on its own
+        // (it checks the quit pipe before every read), and only used
+        // once the thread has had its chance.
+        if (attempts > 0 and k32.CancelSynchronousIo(thread) == windows.FALSE) {
+            switch (windows.GetLastError()) {
+                .NOT_FOUND => {},
+                else => |err| if (attempts == 1) log.warn(
+                    "error cancelling read thread io err={}",
+                    .{err},
+                ),
+            }
+        }
+
+        switch (k32.WaitForSingleObject(thread, wait_ms)) {
+            windows.WAIT_OBJECT_0 => return,
+            windows.WAIT_TIMEOUT => {},
+            else => {
+                // Only an invalid handle gets here, which the join
+                // below reports with a panic. Waiting more cannot help.
+                log.err(
+                    "error waiting for read thread err={}",
+                    .{windows.GetLastError()},
+                );
+                return;
+            },
+        }
+
+        if (attempts == warn_after) log.warn(
+            "read thread has not exited after {d}ms, still waiting",
+            .{warn_after * wait_ms},
+        );
+    }
 }
 
 pub fn focusGained(
@@ -547,7 +660,7 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closeQuitPipeEnd(self.read_thread_pipe);
 
         // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
@@ -1774,9 +1887,13 @@ pub const ReadThread = struct {
         return true;
     }
 
+    /// The Windows reader. Exiting is always safe: `threadExit` waits for
+    /// this thread with `stopReadThreadWindows` before joining it, and
+    /// the quit pipe write end outlives the join (ThreadData.deinit).
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
-        // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        // Always close our end of the pipe when we exit. It is a
+        // CreatePipe HANDLE, not a CRT fd (see closeQuitPipeEnd).
+        defer _ = windows.exp.kernel32.CloseHandle(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1787,40 +1904,80 @@ pub const ReadThread = struct {
 
         var buf: [1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
-                    const err = windows.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
-
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-
-                // See threadMainPosix: hand the renderer state mutex
-                // off if the renderer is waiting, since this loop
-                // would otherwise starve it under heavy output.
-                io.renderer_state.yieldToDemand(global.io());
-            }
-
-            var quit_bytes: windows.DWORD = 0;
-            if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
-                const err = windows.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
-            }
-
-            if (quit_bytes > 0) {
+            // Check for the quit signal before EVERY read, not only after
+            // a cancelled one. A cancel that arrives while this thread is
+            // in processOutput/yieldToDemand has no read to abort, and
+            // the next ReadFile could then block forever (the child is
+            // dead but the pseudoconsole stays open until after the
+            // join). threadExit re-cancels until we return, and each
+            // cancel lands us back here.
+            if (quitRequestedWindows(quit)) {
                 log.info("read thread got quit signal", .{});
                 return;
             }
+
+            var n: windows.DWORD = 0;
+            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
+                const err = windows.GetLastError();
+                switch (err) {
+                    // Cancelled by threadExit: go back to the quit check.
+                    .OPERATION_ABORTED => continue,
+
+                    // Every write end of the output pipe is closed. For a
+                    // pipe this is how Windows reports end of stream
+                    // (HANDLE_EOF is the file equivalent), so it is the
+                    // EOF case of threadMainPosix, not an error.
+                    .BROKEN_PIPE, .HANDLE_EOF => {
+                        log.info("io reader reached end of stream", .{});
+                        return;
+                    },
+
+                    else => {
+                        log.err("io reader error err={}", .{err});
+                        unreachable;
+                    },
+                }
+            }
+
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+
+            // See threadMainPosix: hand the renderer state mutex
+            // off if the renderer is waiting, since this loop
+            // would otherwise starve it under heavy output.
+            io.renderer_state.yieldToDemand(global.io());
+        }
+    }
+
+    /// Returns true if threadExit has written to the quit pipe.
+    /// PeekNamedPipe works on anonymous pipes and never blocks.
+    fn quitRequestedWindows(quit: posix.fd_t) bool {
+        while (true) {
+            var quit_bytes: windows.DWORD = 0;
+            if (windows.exp.kernel32.PeekNamedPipe(
+                quit,
+                null,
+                0,
+                null,
+                &quit_bytes,
+                null,
+            ) == windows.FALSE) {
+                const err = windows.GetLastError();
+                switch (err) {
+                    // The peek is itself synchronous I/O, so threadExit's
+                    // CancelSynchronousIo can abort it. Just peek again.
+                    .OPERATION_ABORTED => continue,
+
+                    // Anything else means the quit pipe is unusable, so
+                    // we could never see a quit signal. Stop reading
+                    // rather than risk a read that nothing can end.
+                    else => {
+                        log.err("quit pipe reader error err={}", .{err});
+                        return true;
+                    },
+                }
+            }
+
+            return quit_bytes > 0;
         }
     }
 };
