@@ -221,6 +221,7 @@ const win32 = struct {
     const WM_ERASEBKGND: UINT = 0x0014;
     const WM_PAINT: UINT = 0x000F;
     const WM_NCCREATE: UINT = 0x0081;
+    const WM_KEYFIRST: UINT = 0x0100;
     const WM_KEYDOWN: UINT = 0x0100;
     const WM_KEYUP: UINT = 0x0101;
     const WM_CHAR: UINT = 0x0102;
@@ -229,6 +230,8 @@ const win32 = struct {
     const WM_SYSKEYUP: UINT = 0x0105;
     const WM_SYSCHAR: UINT = 0x0106;
     const WM_SYSDEADCHAR: UINT = 0x0107;
+    /// Windows XP and later; 0x0108 before WM_UNICHAR (0x0109) existed.
+    const WM_KEYLAST: UINT = 0x0109;
     const WM_SYSCOMMAND: UINT = 0x0112;
     const WM_TIMER: UINT = 0x0113;
     const WM_ENTERMENULOOP: UINT = 0x0211;
@@ -2587,18 +2590,47 @@ fn currentMods() input.Mods {
 /// down (up) immediately followed by the Right Alt down (up), both stamped
 /// with the same message time. Reported as-is, the core would see a real
 /// Left Ctrl press and release, which the kitty keyboard protocol's
-/// report-all-keys mode forwards to the application. The check is GLFW's
+/// report-all-keys mode forwards to the application. The test is GLFW's
 /// (win32_window.c, WM_KEYDOWN handling): a non-extended VK_CONTROL whose
-/// next queued message is an extended VK_MENU key message with the same
-/// time. Only a peek, so the Right Alt is still delivered normally.
+/// next key message is an extended VK_MENU with the same time. Only a peek,
+/// so the Right Alt is still delivered normally.
+///
+/// Two details matter, both measured on Windows 11 with SendInput pairs
+/// carrying explicit timestamps:
+///
+///   * The time is read before peeking. A PM_NOREMOVE peek sets
+///     GetMessageTime to the peeked message's time, so reading it afterwards
+///     compares that time with itself, and a real Left Ctrl release with a
+///     Right Alt queued behind it was taken for AltGr in every trial.
+///   * The peek is limited to the key messages. An unfiltered peek returns
+///     posted messages before input, so a message posted in the meantime
+///     (here, a WM_GHOSTTY_WAKEUP from the render or IO thread) hid the
+///     Right Alt in every trial. PM_QS_INPUT is no substitute: it found no
+///     input in half of the handler calls although the Right Alt was still
+///     queued. Posted character messages are inside the range, but none can
+///     be pending here: posted messages are retrieved before input, and
+///     TranslateMessage posts nothing for Ctrl.
+///
+/// A PM_NOREMOVE peek leaves GetKeyState unchanged, so the currentMods call
+/// that follows still sees the state as of this message.
 fn isAltGrFakeCtrl(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
     if (wparam != win32.VK_CONTROL) return false;
     const l: usize = @bitCast(lparam);
     // lParam bit 24: extended key, i.e. Right Ctrl, which is always real.
     if ((l >> 24) & 1 != 0) return false;
 
+    // GetMessageTime is the time of the message being handled; MSG.time is
+    // the same clock (a DWORD of the LONG value).
+    const time: win32.DWORD = @bitCast(win32.GetMessageTime());
+
     var next: win32.MSG = undefined;
-    if (!win32.PeekMessageW(&next, null, 0, 0, win32.PM_NOREMOVE).toBool()) return false;
+    if (!win32.PeekMessageW(
+        &next,
+        null,
+        win32.WM_KEYFIRST,
+        win32.WM_KEYLAST,
+        win32.PM_NOREMOVE,
+    ).toBool()) return false;
     switch (next.message) {
         win32.WM_KEYDOWN,
         win32.WM_SYSKEYDOWN,
@@ -2608,9 +2640,6 @@ fn isAltGrFakeCtrl(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
         else => return false,
     }
     const nl: usize = @bitCast(next.lParam);
-    // GetMessageTime is the time of the message being handled; MSG.time is
-    // the same clock (a DWORD of the LONG value).
-    const time: win32.DWORD = @bitCast(win32.GetMessageTime());
     return next.wParam == win32.VK_MENU and
         (nl >> 24) & 1 != 0 and
         next.time == time;
