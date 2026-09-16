@@ -9,6 +9,7 @@
 //! implementations.
 pub const Dmabuf = @This();
 pub const std = @import("std");
+const builtin = @import("builtin");
 
 /// The maximum number of planes in a DMABUF that we support.
 /// This matches the maximum found in apprts such as GTK.
@@ -41,7 +42,7 @@ pub const Planes = struct {
     count: u8,
 
     /// File descriptor for each plane.
-    fds: [max_planes]std.posix.fd_t = @splat(-1),
+    fds: [max_planes]c_int = @splat(-1),
 
     /// Offset into the DMABUF where each plane starts, in bytes.
     offsets: [max_planes]c_int = @splat(0),
@@ -51,6 +52,7 @@ pub const Planes = struct {
 
     /// Close all valid fds.
     pub fn deinit(self: Planes) void {
+        if (comptime builtin.os.tag != .linux) return;
         for (self.fds[0..self.count]) |fd| {
             if (fd >= 0) _ = std.posix.system.close(fd);
         }
@@ -60,6 +62,7 @@ pub const Planes = struct {
     /// and has an invalid FD, we close all the known valid FDs
     /// and bail.
     pub fn validate(self: Planes) error{BadDmabuf}!void {
+        if (comptime builtin.os.tag != .linux) return;
         var n_valid: usize = 0;
         while (n_valid < self.count) : (n_valid += 1) {
             if (self.fds[n_valid] < 0) {
