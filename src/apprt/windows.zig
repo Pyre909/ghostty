@@ -1975,9 +1975,12 @@ comptime {
     // comment) -- so without these references the contract would never be
     // type-checked and would rot silently against core changes.
     //
-    // Guarded on the target because src/apprt.zig imports this file
-    // unconditionally on every platform.
-    if (builtin.os.tag == .windows) {
+    // Guarded on this file being the selected runtime, not merely on the
+    // target. src/apprt.zig imports it unconditionally on every platform,
+    // and a Windows library build resolves it as soon as anything names
+    // `apprt.windows`, while that build's surfaces are
+    // `apprt.embedded.Surface`, which this contract does not describe.
+    if (apprt.runtime == @This()) {
         _ = &App.performIpc;
         _ = &App.keyboardLayout;
         _ = &App.wakeup;
