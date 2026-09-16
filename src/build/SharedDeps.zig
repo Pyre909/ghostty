@@ -698,6 +698,7 @@ pub fn add(
 
         switch (self.config.app_runtime) {
             .none => {},
+            .windows => try self.addWin32(step),
             .gtk => try self.addGtkNg(step),
         }
     }
@@ -707,6 +708,28 @@ pub fn add(
     self.framedata.addImport(step);
 
     return static_libs;
+}
+
+/// Setup the dependencies for the Win32 apprt build.
+///
+/// Zig auto-links the import library named by an `extern "user32"`-style
+/// declaration on Windows targets, so these are strictly redundant. They are
+/// spelled out anyway for one load-bearing reason: linking the `opengl32`
+/// import library makes the loader map `opengl32.dll` at process start, and
+/// the ICD is only hooked into a window's pixel format if `opengl32.dll` is
+/// already resident before the first `SetPixelFormat` call. Without that,
+/// `wglCreateContext` fails with ERROR_INVALID_PIXEL_FORMAT (2000).
+///
+/// Note that this deliberately does NOT take the `glad_egl.c` +
+/// `linkSystemLibrary("egl")` path above: there is no libEGL on Windows.
+fn addWin32(
+    self: *const SharedDeps,
+    step: *std.Build.Step.Compile,
+) !void {
+    _ = self;
+    for ([_][]const u8{ "user32", "gdi32", "opengl32" }) |lib| {
+        step.root_module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
+    }
 }
 
 /// Setup the dependencies for the GTK apprt build.

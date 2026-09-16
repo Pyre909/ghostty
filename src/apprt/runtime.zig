@@ -11,11 +11,18 @@ pub const Runtime = enum {
     /// approach to building the application.
     gtk,
 
+    /// Win32. Native Windows application built directly on the Win32 API
+    /// (user32/gdi32) with an OpenGL context supplied by WGL. This runtime
+    /// is a foundation: it manages windows, input and the clipboard, but it
+    /// does not yet host a core surface. See src/apprt/windows.zig.
+    windows,
+
     pub fn default(target: std.Target) Runtime {
         return switch (target.os.tag) {
             // The Linux and FreeBSD default is GTK because it is a full
             // featured application.
             .linux, .freebsd => .gtk,
+            .windows => .windows,
             // Otherwise, we do NONE so we don't create an exe and we create
             // libghostty. On macOS, Xcode is used to build the app that links
             // to libghostty.
