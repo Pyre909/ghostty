@@ -280,6 +280,8 @@ const win32 = struct {
         ctx: HANDLE,
     ) callconv(.winapi) BOOL;
     const GetDpiForWindowFn = *const fn (hwnd: HWND) callconv(.winapi) UINT;
+    const GetThreadDpiAwarenessContextFn = *const fn () callconv(.winapi) ?HANDLE;
+    const AreDpiAwarenessContextsEqualFn = *const fn (a: HANDLE, b: HANDLE) callconv(.winapi) BOOL;
 
     const PFNWGLCREATECONTEXTATTRIBSARB = *const fn (
         hdc: HDC,
@@ -560,11 +562,22 @@ pub const App = struct {
             if (win32.GetProcAddress(m, "SetProcessDpiAwarenessContext")) |p| {
                 const f: win32.SetProcessDpiAwarenessContextFn = @ptrCast(@alignCast(p));
                 if (!f(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).toBool()) {
-                    log.info("per-monitor DPI awareness unavailable, using system DPI", .{});
+                    // FALSE alone does not mean per-monitor awareness is unavailable.
+                    // ERROR_ACCESS_DENIED means the awareness was already set
+                    // before this call -- in a normal build by the manifest
+                    // embedded from dist/windows/ghostty.manifest, which
+                    // declares PerMonitorV2. That is the expected path, so it
+                    // is not reported; logEffectiveDpiAwareness states what is
+                    // actually in effect either way.
+                    const err = std.os.windows.GetLastError();
+                    if (err != .ACCESS_DENIED) {
+                        log.warn("SetProcessDpiAwarenessContext failed err={}", .{err});
+                    }
                 }
             } else {
                 log.info("SetProcessDpiAwarenessContext missing (pre-1703 Windows)", .{});
             }
+            logEffectiveDpiAwareness(m);
         }
 
         const get_dpi_for_window: ?win32.GetDpiForWindowFn = dpi: {
@@ -1041,6 +1054,36 @@ pub const App = struct {
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     }
 };
+
+/// Log the DPI awareness actually in effect for this thread.
+///
+/// SetProcessDpiAwarenessContext's return value cannot distinguish a manifest
+/// that already selected PerMonitorV2 from a genuine failure, so the effective
+/// context is queried instead of inferred. Both functions exist only from
+/// Windows 10 1607 and are resolved by name for the same reason as the other
+/// DPI entry points; see win32.SetProcessDpiAwarenessContextFn.
+fn logEffectiveDpiAwareness(user32: win32.HINSTANCE) void {
+    const get_p = win32.GetProcAddress(user32, "GetThreadDpiAwarenessContext") orelse return;
+    const eq_p = win32.GetProcAddress(user32, "AreDpiAwarenessContextsEqual") orelse return;
+    const get_ctx: win32.GetThreadDpiAwarenessContextFn = @ptrCast(@alignCast(get_p));
+    const ctx_eq: win32.AreDpiAwarenessContextsEqualFn = @ptrCast(@alignCast(eq_p));
+
+    // Documented never to return NULL; the optional return type and this
+    // branch are defensive, since the declaration is ours rather than the SDK's.
+    const current = get_ctx() orelse {
+        log.warn("could not query the effective DPI awareness", .{});
+        return;
+    };
+    if (ctx_eq(current, win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2).toBool()) {
+        log.debug("DPI awareness is per-monitor v2", .{});
+    } else {
+        log.warn(
+            "DPI awareness is not per-monitor v2; the system will scale this " ++
+                "window's contents on high-DPI displays",
+            .{},
+        );
+    }
+}
 
 pub const Surface = struct {
     app: *App,
