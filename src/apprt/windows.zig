@@ -228,6 +228,7 @@ const win32 = struct {
     const WM_CLOSE: UINT = 0x0010;
     const WM_QUIT: UINT = 0x0012;
     const WM_ERASEBKGND: UINT = 0x0014;
+    const WM_SETCURSOR: UINT = 0x0020;
     const WM_MOUSEACTIVATE: UINT = 0x0021;
     const WM_PAINT: UINT = 0x000F;
     const WM_NCCREATE: UINT = 0x0081;
@@ -330,7 +331,23 @@ const win32 = struct {
     const SWP_NOZORDER: UINT = 0x0004;
     const SWP_NOACTIVATE: UINT = 0x0010;
 
-    const IDC_ARROW: LPCWSTR = @ptrFromInt(32512);
+    /// A resource name that may be an integer id (MAKEINTRESOURCEW): the
+    /// same pointer as LPCWSTR, but without its alignment, since the ids are
+    /// odd as often as even. An LPCWSTR still coerces to it.
+    const ResourceW = [*:0]align(1) const u16;
+    const IDC_ARROW: ResourceW = @ptrFromInt(32512);
+    const IDC_IBEAM: ResourceW = @ptrFromInt(32513);
+    const IDC_WAIT: ResourceW = @ptrFromInt(32514);
+    const IDC_CROSS: ResourceW = @ptrFromInt(32515);
+    const IDC_SIZENWSE: ResourceW = @ptrFromInt(32642);
+    const IDC_SIZENESW: ResourceW = @ptrFromInt(32643);
+    const IDC_SIZEWE: ResourceW = @ptrFromInt(32644);
+    const IDC_SIZENS: ResourceW = @ptrFromInt(32645);
+    const IDC_SIZEALL: ResourceW = @ptrFromInt(32646);
+    const IDC_NO: ResourceW = @ptrFromInt(32648);
+    const IDC_HAND: ResourceW = @ptrFromInt(32649);
+    const IDC_APPSTARTING: ResourceW = @ptrFromInt(32650);
+    const IDC_HELP: ResourceW = @ptrFromInt(32651);
 
     const CF_UNICODETEXT: UINT = 13;
     const GMEM_MOVEABLE: UINT = 0x0002;
@@ -466,7 +483,7 @@ const win32 = struct {
         cy: c_int,
         flags: UINT,
     ) callconv(.winapi) BOOL;
-    extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: LPCWSTR) callconv(.winapi) ?HCURSOR;
+    extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HCURSOR;
     extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
     extern "user32" fn ValidateRect(hwnd: ?HWND, rect: ?*const RECT) callconv(.winapi) BOOL;
     extern "user32" fn ReleaseDC(hwnd: ?HWND, hdc: HDC) callconv(.winapi) c_int;
@@ -496,7 +513,7 @@ const win32 = struct {
         proc: ?*const anyopaque,
     ) callconv(.winapi) UINT_PTR;
     extern "user32" fn KillTimer(hwnd: ?HWND, id: UINT_PTR) callconv(.winapi) BOOL;
-    extern "user32" fn ShowCursor(show: BOOL) callconv(.winapi) c_int;
+    extern "user32" fn SetCursor(cursor: ?HCURSOR) callconv(.winapi) ?HCURSOR;
     extern "user32" fn MessageBeep(type_: UINT) callconv(.winapi) BOOL;
     extern "user32" fn MessageBoxW(
         hwnd: ?HWND,
@@ -636,14 +653,6 @@ pub const App = struct {
     ///
     /// `run` acts on this only when there are genuinely no surfaces left.
     quit_pending: bool,
-
-    /// Whether this runtime currently has the cursor hidden.
-    ///
-    /// ShowCursor keeps a counter per input queue, not a flag per window, so
-    /// an unbalanced hide outlives the window that asked for it and leaves the
-    /// cursor invisible for the rest of the session. Tracking the state here
-    /// keeps the counter in {0, -1} and lets teardown unwind it.
-    cursor_hidden: bool,
 
     /// True while `core_app.tick` is on the stack. See `tick`.
     ticking: bool,
@@ -786,7 +795,6 @@ pub const App = struct {
             .quit = false,
             .quit_timer_active = false,
             .quit_pending = false,
-            .cursor_hidden = false,
             .ticking = false,
             .prompt_depth = 0,
             .modal_loop_depth = 0,
@@ -842,11 +850,6 @@ pub const App = struct {
             _ = win32.KillTimer(self.msg_hwnd, quit_timer_id);
             self.quit_timer_active = false;
         }
-
-        // Unwind an outstanding cursor hide. ShowCursor's counter belongs to
-        // the input queue, not to the process, so leaving it negative would
-        // outlive us in a terminal that launched this one.
-        self.showCursor();
 
         _ = win32.DestroyWindow(self.msg_hwnd);
         unregisterClasses(self.hinstance);
@@ -1119,7 +1122,8 @@ pub const App = struct {
             .present_terminal => presentTerminal(target),
             .toggle_maximize => toggleMaximize(target),
             .render => render(target),
-            .mouse_visibility => self.mouseVisibility(value),
+            .mouse_visibility => mouseVisibility(target, value),
+            .mouse_shape => mouseShape(target, value),
 
             .ring_bell => ring_bell: {
                 _ = win32.MessageBeep(win32.MB_ICONASTERISK);
@@ -1128,9 +1132,12 @@ pub const App = struct {
 
             // Everything else, including `.new_window` (see `run`),
             // `.cell_size`, `.size_limit` and `.initial_size` (sent during
-            // CoreSurface.init; `false` is a valid answer to each), and
+            // CoreSurface.init; `false` is a valid answer to each),
             // `.open_url` (whose `false` is a supported path:
-            // src/Surface.zig:4471 falls back to internal_os.open).
+            // src/Surface.zig:4471 falls back to internal_os.open), and
+            // `.mouse_over_link` (a link-preview UI this runtime lacks; the
+            // core tracks the link itself and ignores the result,
+            // src/Surface.zig:1668, :4585).
             else => false,
         };
     }
@@ -1212,27 +1219,25 @@ pub const App = struct {
         };
     }
 
-    fn mouseVisibility(self: *App, value: apprt.action.MouseVisibility) bool {
-        // ShowCursor maintains a counter, not a flag. The core does send this
-        // action only on transitions -- hideMouse/showMouse both guard on
-        // `self.mouse.hidden` (src/Surface.zig:4791-4812) -- but that balances
-        // hides and shows *per surface*, while the counter belongs to the
-        // whole input queue. A surface destroyed while it had the cursor
-        // hidden would never send the matching `.visible`. Mirroring the state
-        // here keeps the counter in {0, -1} and gives teardown something to
-        // unwind (see showCursor).
-        const hide = value == .hidden;
-        if (hide == self.cursor_hidden) return true;
-        self.cursor_hidden = hide;
-        _ = win32.ShowCursor(.fromBool(!hide));
-        return true;
+    /// `.mouse_visibility`, per window: the core hides the pointer while
+    /// typing and shows it on the next mouse event (src/Surface.zig:4791).
+    /// Applied in the window's WM_SETCURSOR rather than with ShowCursor,
+    /// whose counter covers the whole thread: it would also hide the pointer
+    /// over the title bar and borders, where the core never sees a move that
+    /// could show it again, and outlive a window destroyed while hidden.
+    fn mouseVisibility(target: apprt.Target, value: apprt.action.MouseVisibility) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| v.rt_surface.setMouseVisibility(value),
+        };
     }
 
-    /// Undo an outstanding cursor hide. A no-op when nothing is hidden.
-    fn showCursor(self: *App) void {
-        if (!self.cursor_hidden) return;
-        self.cursor_hidden = false;
-        _ = win32.ShowCursor(.fromBool(true));
+    /// `.mouse_shape`: the pointer shape over the terminal, per window.
+    fn mouseShape(target: apprt.Target, shape: terminal.MouseShape) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| v.rt_surface.setMouseShape(shape),
+        };
     }
 
     /// Arm or cancel the quit-after-last-window timer. Returns whether the
@@ -1361,11 +1366,6 @@ pub const App = struct {
         // The quit timer is not handled here: CoreApp.deleteSurface, which
         // Surface.stopCore calls before the window is destroyed, starts it
         // when the core's last surface goes (src/App.zig:237).
-        if (self.surfaces.items.len == 0) {
-            // A hide owned by a window that no longer exists can never be
-            // undone by the core, and ShowCursor's counter is per input queue.
-            self.showCursor();
-        }
     }
 
     /// The message-only window's procedure.
@@ -1553,6 +1553,13 @@ pub const Surface = struct {
         left_press_pos: apprt.CursorPos,
         wheel_x: Notches,
         wheel_y: Notches,
+        /// The last `.mouse_shape` and its stock cursor, applied in
+        /// WM_SETCURSOR. `cursor` is null only if LoadCursorW failed; the
+        /// class arrow shows then.
+        shape: terminal.MouseShape,
+        cursor: ?win32.HCURSOR,
+        /// `.mouse_visibility`: hidden while typing.
+        hidden: bool,
 
         /// "Not over the surface" to cursorPosCallback and link hover, which
         /// treat any negative coordinate that way (src/Surface.zig:4573-4575,
@@ -1570,6 +1577,12 @@ pub const Surface = struct {
                 .left_press_pos = outside,
                 .wheel_x = .{},
                 .wheel_y = .{},
+                // The core starts at `.text` and never sends that first
+                // shape (src/terminal/Terminal.zig:89); the GTK runtime
+                // starts there too.
+                .shape = .text,
+                .cursor = win32.LoadCursorW(null, cursorId(.text)),
+                .hidden = false,
             };
         }
 
@@ -1837,6 +1850,12 @@ pub const Surface = struct {
         }
         self.mouse.owed = .empty;
         self.mouse.leave_owed = false;
+
+        // No mouse event reaches the core from here on, so the core cannot
+        // show a pointer it hid while typing; WM_SETCURSOR would keep it
+        // hidden over the window for the rest of the teardown.
+        self.mouse.hidden = false;
+        self.applyCursor();
 
         const app = self.app;
         const cs = &self.core_surface;
@@ -2628,6 +2647,19 @@ pub const Surface = struct {
                 return 0;
             },
 
+            win32.WM_SETCURSOR => {
+                // Client area only. Elsewhere DefWindowProcW sets the arrow
+                // or a resize arrow, which also keeps a pointer hidden while
+                // typing visible over the frame. Over the client area it
+                // would restore the class arrow on every move.
+                if (win32.loword(lparam) == win32.HTCLIENT and
+                    (self.mouse.hidden or self.mouse.cursor != null))
+                {
+                    _ = win32.SetCursor(self.clientCursor());
+                    return 1;
+                }
+            },
+
             win32.WM_MOUSEACTIVATE => {
                 // A click on an inactive window only activates it, as on
                 // macOS: it must not clear the selection, move the prompt
@@ -2992,6 +3024,58 @@ pub const Surface = struct {
         return capture == self.hwnd;
     }
 
+    /// `.mouse_shape`. Called while the core may hold the renderer mutex
+    /// (src/Surface.zig:1661, from mouseRefreshLinks), so this must not call
+    /// back into the core or run a message loop, and must not fail: an error
+    /// would abort cursorPosCallback. It does neither.
+    fn setMouseShape(self: *Surface, shape: terminal.MouseShape) bool {
+        const m = &self.mouse;
+        // Modifier keys resend the current shape on every key event
+        // (src/Surface.zig:2804-2815).
+        if (shape == m.shape and m.cursor != null) return true;
+        const cursor = win32.LoadCursorW(null, cursorId(shape)) orelse {
+            log.warn("LoadCursorW failed shape={}", .{shape});
+            return false;
+        };
+        m.shape = shape;
+        m.cursor = cursor;
+        self.applyCursor();
+        return true;
+    }
+
+    /// `.mouse_visibility`. Same constraints as `setMouseShape`.
+    fn setMouseVisibility(self: *Surface, value: apprt.action.MouseVisibility) bool {
+        const hidden = value == .hidden;
+        if (hidden == self.mouse.hidden) return true;
+        self.mouse.hidden = hidden;
+        self.applyCursor();
+        return true;
+    }
+
+    /// The pointer this window wants over its client area: none while
+    /// hidden, otherwise the current shape.
+    fn clientCursor(self: *const Surface) ?win32.HCURSOR {
+        return if (self.mouse.hidden) null else self.mouse.cursor;
+    }
+
+    /// Apply `clientCursor` now if the pointer is this window's: over its
+    /// client area (leave tracking is armed) or captured for its own drag.
+    /// WM_SETCURSOR would otherwise apply it only on the next move, and is
+    /// not sent at all while the mouse is captured. SetCursor is documented
+    /// for exactly these two cases.
+    ///
+    /// Not during a system size/move or menu loop: that loop holds the
+    /// capture on this window and sets its own cursor, which nothing would
+    /// restore while captured.
+    fn applyCursor(self: *Surface) void {
+        if (self.modal_loops != 0) return;
+        const own_drag = self.mouse.held.count() != 0 and self.hasCapture();
+        if (!self.mouse.tracking and !own_drag) return;
+        if (self.mouse.hidden or self.mouse.cursor != null) {
+            _ = win32.SetCursor(self.clientCursor());
+        }
+    }
+
     /// Modifiers for a mouse message, binding modifiers only.
     ///
     /// Shift and Ctrl come from the message's own MK_ flags, which describe
@@ -3146,6 +3230,28 @@ fn clientPos(lparam: win32.LPARAM) apprt.CursorPos {
     return .{
         .x = @floatFromInt(win32.xLparam(lparam)),
         .y = @floatFromInt(win32.yLparam(lparam)),
+    };
+}
+
+/// The stock cursor for a W3C cursor shape. Win32 has no cell,
+/// vertical-text, alias, copy, grab, zoom or context-menu cursor; those use
+/// the nearest stock cursor or the arrow. An exhaustive switch, so a new
+/// shape does not compile until it is mapped.
+fn cursorId(shape: terminal.MouseShape) win32.ResourceW {
+    return switch (shape) {
+        .default, .context_menu, .alias, .copy, .zoom_in, .zoom_out => win32.IDC_ARROW,
+        .text, .vertical_text => win32.IDC_IBEAM,
+        .pointer, .grab, .grabbing => win32.IDC_HAND,
+        .help => win32.IDC_HELP,
+        .progress => win32.IDC_APPSTARTING,
+        .wait => win32.IDC_WAIT,
+        .crosshair, .cell => win32.IDC_CROSS,
+        .move, .all_scroll => win32.IDC_SIZEALL,
+        .no_drop, .not_allowed => win32.IDC_NO,
+        .col_resize, .ew_resize, .e_resize, .w_resize => win32.IDC_SIZEWE,
+        .row_resize, .ns_resize, .n_resize, .s_resize => win32.IDC_SIZENS,
+        .ne_resize, .sw_resize, .nesw_resize => win32.IDC_SIZENESW,
+        .nw_resize, .se_resize, .nwse_resize => win32.IDC_SIZENWSE,
     };
 }
 
