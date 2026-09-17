@@ -32,10 +32,13 @@
 //!
 //! ## What is still missing
 //!
-//! Mouse input, IME composition windows, `.new_window` and every other
-//! action `performAction` does not name. Those return `false`, the
-//! contract's word for "unsupported"; this runtime never claims an action it
-//! did not carry out.
+//! Not implemented: IME composition windows, more than one window
+//! (`.new_window`), a context menu, link previews and precision-touchpad
+//! scrolling. Without a menu, a right click with the default
+//! `right-click-action` only selects the word or link under the pointer.
+//! `performAction` returns `false`, the contract's word for "unsupported",
+//! for `.new_window`, `.mouse_over_link` and every other action it does not
+//! name; this runtime never claims an action it did not carry out.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -113,6 +116,12 @@ const win32 = struct {
     ) callconv(.winapi) LRESULT;
 
     const POINT = extern struct { x: LONG, y: LONG };
+    const TRACKMOUSEEVENT = extern struct {
+        cbSize: DWORD,
+        dwFlags: DWORD,
+        hwndTrack: HWND,
+        dwHoverTime: DWORD,
+    };
     const RECT = extern struct {
         left: LONG,
         top: LONG,
@@ -219,6 +228,7 @@ const win32 = struct {
     const WM_CLOSE: UINT = 0x0010;
     const WM_QUIT: UINT = 0x0012;
     const WM_ERASEBKGND: UINT = 0x0014;
+    const WM_MOUSEACTIVATE: UINT = 0x0021;
     const WM_PAINT: UINT = 0x000F;
     const WM_NCCREATE: UINT = 0x0081;
     const WM_KEYFIRST: UINT = 0x0100;
@@ -234,10 +244,22 @@ const win32 = struct {
     const WM_KEYLAST: UINT = 0x0109;
     const WM_SYSCOMMAND: UINT = 0x0112;
     const WM_TIMER: UINT = 0x0113;
+    const WM_MOUSEMOVE: UINT = 0x0200;
+    const WM_LBUTTONDOWN: UINT = 0x0201;
+    const WM_LBUTTONUP: UINT = 0x0202;
+    const WM_RBUTTONDOWN: UINT = 0x0204;
+    const WM_RBUTTONUP: UINT = 0x0205;
+    const WM_MBUTTONDOWN: UINT = 0x0207;
+    const WM_MBUTTONUP: UINT = 0x0208;
+    const WM_MOUSEWHEEL: UINT = 0x020A;
+    const WM_XBUTTONDOWN: UINT = 0x020B;
+    const WM_XBUTTONUP: UINT = 0x020C;
+    const WM_MOUSEHWHEEL: UINT = 0x020E;
     const WM_ENTERMENULOOP: UINT = 0x0211;
     const WM_EXITMENULOOP: UINT = 0x0212;
     const WM_ENTERSIZEMOVE: UINT = 0x0231;
     const WM_EXITSIZEMOVE: UINT = 0x0232;
+    const WM_MOUSELEAVE: UINT = 0x02A3;
     const WM_DPICHANGED: UINT = 0x02E0;
     const WM_APP: UINT = 0x8000;
 
@@ -246,6 +268,29 @@ const win32 = struct {
 
     /// WM_SIZE wParam.
     const SIZE_MINIMIZED: WPARAM = 1;
+
+    /// Mouse message wParam (the low word for the wheel and X-button
+    /// messages): the buttons down and the Shift/Ctrl state at the time of
+    /// the event. There is no Alt or Windows-key flag. The button bits
+    /// follow the left/right swap setting, as the button messages do.
+    const MK_LBUTTON: WPARAM = 0x0001;
+    const MK_RBUTTON: WPARAM = 0x0002;
+    const MK_SHIFT: WPARAM = 0x0004;
+    const MK_CONTROL: WPARAM = 0x0008;
+    const MK_MBUTTON: WPARAM = 0x0010;
+    const MK_XBUTTON1: WPARAM = 0x0020;
+    const MK_XBUTTON2: WPARAM = 0x0040;
+    /// WM_XBUTTON* wParam high word (GET_XBUTTON_WPARAM).
+    const XBUTTON1: u16 = 0x0001;
+    const XBUTTON2: u16 = 0x0002;
+    /// One wheel notch. High-resolution wheels send fractions of it.
+    const WHEEL_DELTA: i32 = 120;
+    const TME_LEAVE: DWORD = 0x00000002;
+    /// The client-area hit-test code (WM_NCHITTEST), which is the low word
+    /// of WM_MOUSEACTIVATE's and WM_SETCURSOR's lParam.
+    const HTCLIENT: u16 = 1;
+    /// WM_MOUSEACTIVATE: activate the window and discard the mouse message.
+    const MA_ACTIVATEANDEAT: LRESULT = 2;
 
     /// WM_SYSCOMMAND wParam (low four bits are reserved and must be masked).
     const SC_KEYMENU: WPARAM = 0xF100;
@@ -405,7 +450,11 @@ const win32 = struct {
     extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) LONG_PTR;
     extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
     extern "user32" fn GetClientRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
-    extern "user32" fn GetCursorPos(pt: *POINT) callconv(.winapi) BOOL;
+    extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
+    extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
+    extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
+    extern "user32" fn TrackMouseEvent(tme: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
+    extern "user32" fn WindowFromPoint(pt: POINT) callconv(.winapi) ?HWND;
     extern "user32" fn ScreenToClient(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
     extern "user32" fn SetWindowTextW(hwnd: HWND, text: LPCWSTR) callconv(.winapi) BOOL;
     extern "user32" fn SetWindowPos(
@@ -488,6 +537,22 @@ const win32 = struct {
 
     fn hiword(v: anytype) u16 {
         return @truncate(@as(usize, @bitCast(v)) >> 16);
+    }
+
+    /// GET_X_LPARAM / GET_Y_LPARAM (windowsx.h). Signed: while the mouse is
+    /// captured, positions above or left of the client area are negative,
+    /// which loword/hiword would turn into values near 65535.
+    fn xLparam(v: LPARAM) i16 {
+        return @bitCast(loword(v));
+    }
+
+    fn yLparam(v: LPARAM) i16 {
+        return @bitCast(hiword(v));
+    }
+
+    /// GET_WHEEL_DELTA_WPARAM: the signed high word.
+    fn wheelDelta(v: WPARAM) i16 {
+        return @bitCast(hiword(v));
     }
 };
 
@@ -859,6 +924,10 @@ pub const App = struct {
             // Teardowns that were refused while a core frame or a prompt was
             // on the stack are retried now that neither is.
             self.repostDeferredDestroys();
+
+            // Likewise mouse events a prompt held back, and capture that was
+            // lost without a message (Surface.syncMouse).
+            self.syncDeferredMouse();
         }
     }
 
@@ -904,6 +973,20 @@ pub const App = struct {
             if (!surface.destroy_deferred) continue;
             surface.destroy_deferred = false;
             surface.postDestroy();
+        }
+    }
+
+    /// Bring every live core surface up to date with the mouse
+    /// (`Surface.syncMouse`). A prompt answered from the keyboard then does
+    /// not leave a button pressed until the next mouse message, and a drag
+    /// whose capture ended without a message ends here. Called by `run`,
+    /// where `canReenterCore` holds. The list cannot change during the loop:
+    /// no mouse callback creates or destroys a surface (`Surface.close` only
+    /// posts).
+    fn syncDeferredMouse(self: *App) void {
+        for (self.surfaces.items) |surface| {
+            const core_surface = surface.liveCore() orelse continue;
+            _ = surface.syncMouse(core_surface, null);
         }
     }
 
@@ -1422,6 +1505,12 @@ pub const Surface = struct {
     /// WM_EXIT*, so WM_DESTROY hands this back to the app instead.
     modal_loops: u32,
 
+    /// Keyboard focus, from WM_SETFOCUS / WM_KILLFOCUS. See `mouseMods`.
+    focused: bool,
+
+    /// Mouse state, and what the core is still owed. See `Mouse`.
+    mouse: Mouse,
+
     /// The lifecycle of `core_surface`.
     ///
     /// A three-state enum rather than a single `initialized` flag because
@@ -1438,6 +1527,131 @@ pub const Surface = struct {
         live,
         /// `stopCore` is running. Initialized, not registered, no callbacks.
         stopping,
+    };
+
+    /// What the core has been told about the mouse.
+    ///
+    /// Invariants:
+    ///   * `held`: buttons the core has seen pressed and not released. Only
+    ///     non-empty after this window asked for the capture (`mouseButton`).
+    ///   * `owed`: disjoint from `held`. Buttons that are no longer down, or
+    ///     whose release may not come here, while the core still has them
+    ///     pressed. Only `syncMouse` delivers it; `stopCore` discards it with
+    ///     the core.
+    ///   * `pos`: the last position given to cursorPosCallback, or
+    ///     `outside`. `getCursorPos` returns it.
+    const Mouse = struct {
+        pos: apprt.CursorPos,
+        held: Button.Set,
+        owed: Button.Set,
+        /// A WM_MOUSELEAVE the core has not been told about.
+        leave_owed: bool,
+        /// TrackMouseEvent(TME_LEAVE) is armed.
+        tracking: bool,
+        /// Where the left button last went down. `syncMouse` places a
+        /// release it has to invent away from it.
+        left_press_pos: apprt.CursorPos,
+        wheel_x: Notches,
+        wheel_y: Notches,
+
+        /// "Not over the surface" to cursorPosCallback and link hover, which
+        /// treat any negative coordinate that way (src/Surface.zig:4573-4575,
+        /// :1592). Paths that map a position to a cell clamp it to the
+        /// nearest cell instead (src/renderer/size.zig:142-147).
+        const outside: apprt.CursorPos = .{ .x = -1, .y = -1 };
+
+        fn init() Mouse {
+            return .{
+                .pos = outside,
+                .held = .empty,
+                .owed = .empty,
+                .leave_owed = false,
+                .tracking = false,
+                .left_press_pos = outside,
+                .wheel_x = .{},
+                .wheel_y = .{},
+            };
+        }
+
+        /// The buttons this runtime reports: a separate enum from
+        /// input.MouseButton, so nothing else can be sent.
+        ///   * `.unknown` would mask motion reports;
+        ///   * `.four`-`.seven` are the wheel, which scrollCallback reports;
+        ///   * `.eleven` indexes past the end of the core's click_state
+        ///     (src/Surface.zig:226, :3838).
+        /// The last point is checked at comptime at the end of the file.
+        const Button = enum {
+            left,
+            right,
+            middle,
+            x1,
+            x2,
+
+            const Set = std.EnumSet(Button);
+
+            fn fromMessage(msg: win32.UINT, wparam: win32.WPARAM) ?Button {
+                return switch (msg) {
+                    win32.WM_LBUTTONDOWN, win32.WM_LBUTTONUP => .left,
+                    win32.WM_RBUTTONDOWN, win32.WM_RBUTTONUP => .right,
+                    win32.WM_MBUTTONDOWN, win32.WM_MBUTTONUP => .middle,
+                    // GET_XBUTTON_WPARAM. Any other value is left to
+                    // DefWindowProcW.
+                    win32.WM_XBUTTONDOWN, win32.WM_XBUTTONUP => switch (win32.hiword(wparam)) {
+                        win32.XBUTTON1 => .x1,
+                        win32.XBUTTON2 => .x2,
+                        else => null,
+                    },
+                    else => null,
+                };
+            }
+
+            /// The buttons a mouse message's wParam reports as down.
+            fn downIn(wparam: win32.WPARAM) Set {
+                var set: Set = .empty;
+                if (wparam & win32.MK_LBUTTON != 0) set.insert(.left);
+                if (wparam & win32.MK_RBUTTON != 0) set.insert(.right);
+                if (wparam & win32.MK_MBUTTON != 0) set.insert(.middle);
+                if (wparam & win32.MK_XBUTTON1 != 0) set.insert(.x1);
+                if (wparam & win32.MK_XBUTTON2 != 0) set.insert(.x2);
+                return set;
+            }
+
+            /// Back and forward are X11 buttons 8 and 9, as GTK and macOS
+            /// map them.
+            fn core(self: Button) input.MouseButton {
+                return switch (self) {
+                    .left => .left,
+                    .right => .right,
+                    .middle => .middle,
+                    .x1 => .eight,
+                    .x2 => .nine,
+                };
+            }
+        };
+
+        /// Whole notches out of wheel deltas.
+        ///
+        /// The core cannot take fractions of a notch: for x it rounds each
+        /// event and keeps no remainder (src/Surface.zig:3561), and for y it
+        /// drops the remainder whenever an event crosses a row
+        /// (src/Surface.zig:3549 stores `poff - amount * cell_size` with
+        /// the untruncated `amount`). A high-resolution wheel's small deltas
+        /// would lose rows either way, so only whole notches are passed on.
+        /// A change of direction drops the remainder, so a reversal counts
+        /// from its own first delta.
+        const Notches = struct {
+            rem: i32 = 0,
+
+            fn add(self: *Notches, delta: i32) ?i32 {
+                if (delta == 0) return null;
+                if (self.rem != 0 and (self.rem < 0) != (delta < 0)) self.rem = 0;
+                self.rem += delta;
+                const whole = @divTrunc(self.rem, win32.WHEEL_DELTA);
+                if (whole == 0) return null;
+                self.rem -= whole * win32.WHEEL_DELTA;
+                return whole;
+            }
+        };
     };
 
     /// Heap-allocate and initialize, including the core surface. The address
@@ -1465,6 +1679,8 @@ pub const Surface = struct {
             .preedit_active = false,
             .paint_count = 0,
             .modal_loops = 0,
+            .focused = false,
+            .mouse = .init(),
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -1611,6 +1827,16 @@ pub const Surface = struct {
     fn stopCore(self: *Surface) void {
         if (self.core_state != .live) return;
         self.core_state = .stopping;
+
+        // A drag in progress ends with the core. Button messages for a
+        // `.stopping` surface are not handled, so nothing else would release
+        // the capture while this pumps messages (App.waitForThreads).
+        if (self.mouse.held.count() != 0) {
+            self.mouse.held = .empty;
+            if (self.hasCapture()) _ = win32.ReleaseCapture();
+        }
+        self.mouse.owed = .empty;
+        self.mouse.leave_owed = false;
 
         const app = self.app;
         const cs = &self.core_surface;
@@ -1768,17 +1994,20 @@ pub const Surface = struct {
         };
     }
 
-    /// Cursor position in client-relative physical pixels. Negative values are
-    /// meaningful: the core reads them as "outside the viewport"
-    /// (src/Surface.zig:4575), so they are passed through unclamped.
+    /// The pointer position of the mouse event being delivered, in client
+    /// device pixels: the last position given to cursorPosCallback, or
+    /// `Mouse.outside`. Negative values mean "outside the viewport" to
+    /// cursorPosCallback (src/Surface.zig:4573-4575) and are passed through
+    /// unclamped.
+    ///
+    /// Cached rather than read live, because the core reads a button or
+    /// wheel event's position back through here (e.g. src/Surface.zig:3634,
+    /// :3892) after the live pointer may have moved on. After a leave, a
+    /// live read would also give a point beyond the window, which the core
+    /// clamps to an edge cell instead of treating as outside. The embedded
+    /// runtime caches it the same way.
     pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
-        var pt: win32.POINT = undefined;
-        if (!win32.GetCursorPos(&pt).toBool()) return App.Error.Win32CallFailed;
-        if (!win32.ScreenToClient(self.hwnd, &pt).toBool()) {
-            return App.Error.Win32CallFailed;
-        }
-
-        return .{ .x = @floatFromInt(pt.x), .y = @floatFromInt(pt.y) };
+        return self.mouse.pos;
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -2178,6 +2407,18 @@ pub const Surface = struct {
             },
 
             win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
+                self.focused = msg == win32.WM_SETFOCUS;
+
+                // A drag does not survive losing focus (Alt+Tab, a dialog,
+                // the Start menu). The capture may outlive the focus change,
+                // and the button-up then goes to another window. Releasing it
+                // lets the next syncMouse send the core that release. Only a
+                // Win32 call here: this message is sent, possibly from inside
+                // a core frame (a paste confirmation taking focus).
+                if (!self.focused and self.mouse.held.count() != 0 and self.hasCapture()) {
+                    _ = win32.ReleaseCapture();
+                }
+
                 if (self.liveCore()) |core_surface| {
                     core_surface.focusCallback(msg == win32.WM_SETFOCUS) catch |err|
                         log.warn("focus callback failed err={}", .{err});
@@ -2280,6 +2521,121 @@ pub const Surface = struct {
                 // menu bar, so that mode is never wanted. Alt+Space arrives
                 // with lParam ' ' and still opens the window menu.
                 if (wparam & 0xFFF0 == win32.SC_KEYMENU and lparam == 0) return 0;
+            },
+
+            win32.WM_MOUSEMOVE => {
+                const core_surface = self.liveCore() orelse
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                if (!self.syncMouse(core_surface, Mouse.Button.downIn(wparam))) return 0;
+
+                // Arm leave tracking on entry, but not during a drag: the
+                // pointer may be outside then, and arming there posts a
+                // WM_MOUSELEAVE at once, on every move. The final release
+                // arms it instead (mouseButton).
+                if (!self.mouse.tracking and self.mouse.held.count() == 0) self.trackLeave();
+
+                self.movePointer(core_surface, clientPos(lparam), self.mouseMods(wparam));
+                return 0;
+            },
+
+            win32.WM_MOUSELEAVE => {
+                // Win32 has cancelled the tracking.
+                self.mouse.tracking = false;
+                if (self.liveCore()) |core_surface| {
+                    // During a drag the captured moves keep the core
+                    // informed, negative positions included, which drag
+                    // autoscroll needs. The release re-arms tracking to learn
+                    // where the drag ended.
+                    if (self.mouse.held.count() == 0) self.mouse.leave_owed = true;
+                    _ = self.syncMouse(core_surface, null);
+                }
+                return 0;
+            },
+
+            win32.WM_LBUTTONDOWN,
+            win32.WM_LBUTTONUP,
+            win32.WM_RBUTTONDOWN,
+            win32.WM_RBUTTONUP,
+            win32.WM_MBUTTONDOWN,
+            win32.WM_MBUTTONUP,
+            win32.WM_XBUTTONDOWN,
+            win32.WM_XBUTTONUP,
+            => {
+                const button = Mouse.Button.fromMessage(msg, wparam) orelse
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                const core_surface = self.liveCore() orelse
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                const state: input.MouseButtonState = switch (msg) {
+                    win32.WM_LBUTTONDOWN,
+                    win32.WM_RBUTTONDOWN,
+                    win32.WM_MBUTTONDOWN,
+                    win32.WM_XBUTTONDOWN,
+                    => .press,
+                    else => .release,
+                };
+                self.mouseButton(
+                    core_surface,
+                    button,
+                    state,
+                    wparam,
+                    clientPos(lparam),
+                    self.mouseMods(wparam),
+                );
+
+                // Never DefWindowProcW once a button is handled: for X
+                // buttons it sends WM_APPCOMMAND (browser back/forward), and
+                // a handled X button must return TRUE; for WM_RBUTTONUP its
+                // only default is WM_CONTEXTMENU, and there is no menu. The
+                // class has no CS_DBLCLKS, so no *BUTTONDBLCLK arrives: the
+                // core counts clicks itself.
+                const is_x = msg == win32.WM_XBUTTONDOWN or msg == win32.WM_XBUTTONUP;
+                return @intFromBool(is_x);
+            },
+
+            win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
+                const core_surface = self.liveCore() orelse
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                if (!self.syncMouse(core_surface, Mouse.Button.downIn(wparam))) return 0;
+
+                // The core reads the report position from getCursorPos. When
+                // the pointer is over this client area, refresh the cache from
+                // the message first: after a capture loss it says `outside`
+                // until the next move, and reports there would be dropped.
+                // Otherwise (the wheel routed by focus while the pointer is
+                // elsewhere, or covered) the cache stays, `outside` after a
+                // leave.
+                if (self.wheelPoint(lparam)) |pos| {
+                    if (!self.mouse.tracking and self.mouse.held.count() == 0) self.trackLeave();
+                    self.movePointer(core_surface, pos, self.mouseMods(wparam));
+                }
+
+                const delta: i32 = win32.wheelDelta(wparam);
+                if (msg == win32.WM_MOUSEWHEEL) {
+                    // Positive is away from the user: the core's "up"
+                    // (src/Surface.zig:3481).
+                    if (self.mouse.wheel_y.add(delta)) |notches| {
+                        core_surface.scrollCallback(0, @floatFromInt(notches), .{}) catch |err|
+                            log.warn("scroll callback failed err={}", .{err});
+                    }
+                } else if (self.mouse.wheel_x.add(delta)) |notches| {
+                    // Positive is to the right here. The core's positive x
+                    // is reported as button 6, X11's scroll-left
+                    // (src/Surface.zig:3641-3645), and GTK negates its
+                    // rightward delta to match; so does this.
+                    core_surface.scrollCallback(@floatFromInt(-notches), 0, .{}) catch |err|
+                        log.warn("scroll callback failed err={}", .{err});
+                }
+                return 0;
+            },
+
+            win32.WM_MOUSEACTIVATE => {
+                // A click on an inactive window only activates it, as on
+                // macOS: it must not clear the selection, move the prompt
+                // cursor, or reach a program that reads the mouse. Client
+                // area only, so an inactive window can still be dragged by
+                // its caption. The button-up that may follow is dropped by
+                // mouseButton, because the press was never recorded.
+                if (win32.loword(lparam) == win32.HTCLIENT) return win32.MA_ACTIVATEANDEAT;
             },
 
             win32.WM_PAINT => {
@@ -2425,6 +2781,236 @@ pub const Surface = struct {
         }) catch |err| log.warn("key callback failed err={}", .{err});
     }
 
+    /// Bring the core up to date with what Win32 could not tell it in time,
+    /// and report whether a mouse event may reach the core now.
+    ///
+    /// Owed events are:
+    ///   * a release for each held button that is no longer down according
+    ///     to the current message (`down`), or whose capture is gone: its
+    ///     WM_*BUTTONUP may then go to another window, and if it does come
+    ///     here, mouseButton drops it;
+    ///   * a WM_MOUSELEAVE that arrived while a prompt was open.
+    ///
+    /// Capture ends without a button-up when a message box takes it
+    /// (WM_CANCELMODE -> DefWindowProcW), for instance the paste
+    /// confirmation inside mouseButtonCallback, or when focus moves away
+    /// (WM_KILLFOCUS). `down` covers a capture that survives while the
+    /// button was released elsewhere. `null` when there is no message to
+    /// read it from.
+    ///
+    /// Nothing reaches the core unless App.canReenterCore: while a prompt is
+    /// open, a core frame may be beneath us. Returns false when the caller
+    /// must drop its own event for that reason.
+    fn syncMouse(self: *Surface, core_surface: *CoreSurface, down: ?Mouse.Button.Set) bool {
+        if (!self.app.canReenterCore()) return false;
+        const m = &self.mouse;
+
+        if (m.held.count() != 0) {
+            const gone = if (!self.hasCapture())
+                m.held
+            else if (down) |d|
+                m.held.differenceWith(d)
+            else
+                Mouse.Button.Set.empty;
+            if (gone.count() != 0) {
+                m.owed.setUnion(gone);
+                m.held = m.held.differenceWith(gone);
+                if (m.held.count() == 0 and self.hasCapture()) _ = win32.ReleaseCapture();
+            }
+        }
+        if (m.owed.count() == 0 and !m.leave_owed) return true;
+
+        if (m.owed.count() != 0) {
+            // Where the user let go is unknown, and the click must not
+            // complete. The core treats a release on another cell than the
+            // press as the end of a drag (SelectionGesture.release), so no
+            // link opens and the prompt cursor does not move. The release is
+            // therefore placed beyond the client corner farthest from the
+            // left press, which the core clamps to that corner's cell: a
+            // different cell unless the grid is one row or one column.
+            // Programs with mouse reporting receive the release at that
+            // edge cell.
+            const last = m.pos;
+            m.pos = releasePoint(core_surface, m.left_press_pos);
+
+            // The mods the core already has, so the release is judged like
+            // the events before it: a Shift drag in a program with mouse
+            // reporting stays a Ghostty selection (src/Surface.zig:3966).
+            const mods = core_surface.mouse.mods;
+            const owed = m.owed;
+            m.owed = .empty;
+            var it = owed.iterator();
+            while (it.next()) |button| {
+                _ = core_surface.mouseButtonCallback(.release, button.core(), mods) catch |err|
+                    log.warn("mouse button callback failed err={}", .{err});
+            }
+
+            // With a button still held (only some were released), no leave:
+            // a position outside would drag to an edge cell. The next
+            // captured move supplies the real position.
+            if (m.held.count() != 0) {
+                m.pos = last;
+                return true;
+            }
+        }
+
+        // Then the leave. If the pointer is in fact over the window, the
+        // next WM_MOUSEMOVE re-enters and re-arms tracking.
+        m.pos = Mouse.outside;
+        m.leave_owed = false;
+        m.tracking = false;
+        core_surface.cursorPosCallback(Mouse.outside, null) catch |err|
+            log.warn("cursor pos callback failed err={}", .{err});
+        return true;
+    }
+
+    /// The client position of a wheel message's screen point, if the pointer
+    /// is over this window's client area and nothing covers it there.
+    fn wheelPoint(self: *const Surface, lparam: win32.LPARAM) ?apprt.CursorPos {
+        var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+        const under = win32.WindowFromPoint(pt) orelse return null;
+        if (under != self.hwnd) return null;
+        if (!win32.ScreenToClient(self.hwnd, &pt).toBool()) return null;
+        var rect: win32.RECT = undefined;
+        if (!win32.GetClientRect(self.hwnd, &rect).toBool()) return null;
+        if (pt.x < rect.left or pt.y < rect.top or pt.x >= rect.right or pt.y >= rect.bottom) {
+            return null;
+        }
+        return .{ .x = @floatFromInt(pt.x), .y = @floatFromInt(pt.y) };
+    }
+
+    /// Give the core a real pointer position, unless it already has it.
+    ///
+    /// Repeats are dropped, as GTK drops sub-pixel moves: Win32 sends
+    /// WM_MOUSEMOVE without movement when windows appear, disappear or move,
+    /// and every cursorPosCallback shows a mouse hidden while typing
+    /// (src/Surface.zig:4605).
+    fn movePointer(
+        self: *Surface,
+        core_surface: *CoreSurface,
+        pos: apprt.CursorPos,
+        mods: input.Mods,
+    ) void {
+        const m = &self.mouse;
+        // A real position replaces a leave that could not be delivered.
+        m.leave_owed = false;
+        if (pos.x == m.pos.x and pos.y == m.pos.y) return;
+        m.pos = pos;
+        core_surface.cursorPosCallback(pos, mods) catch |err|
+            log.warn("cursor pos callback failed err={}", .{err});
+    }
+
+    /// A client-area button message, after handleMessage has mapped it.
+    fn mouseButton(
+        self: *Surface,
+        core_surface: *CoreSurface,
+        button: Mouse.Button,
+        state: input.MouseButtonState,
+        wparam: win32.WPARAM,
+        pos: apprt.CursorPos,
+        mods: input.Mods,
+    ) void {
+        const m = &self.mouse;
+        const down = Mouse.Button.downIn(wparam);
+        switch (state) {
+            .press => {
+                // Dropped entirely, capture included, so its release is
+                // dropped too (below).
+                if (!self.syncMouse(core_surface, down)) return;
+
+                // Capture on the first button, so the release comes here
+                // even when it happens outside the window. Without it the
+                // core would keep the button pressed and report every later
+                // move as a drag.
+                if (m.held.count() == 0) _ = win32.SetCapture(self.hwnd);
+                m.held.insert(button);
+                if (button == .left) m.left_press_pos = pos;
+            },
+            .release => {
+                // The core never saw this press: an activation click eaten
+                // by WM_MOUSEACTIVATE, a press dropped above, one from before
+                // the core existed, or one whose release syncMouse already
+                // sent. A lone release is not harmless: a left one can open
+                // a link (src/Surface.zig:3938).
+                if (!m.held.contains(button)) return;
+                m.held.remove(button);
+                if (m.held.count() == 0) _ = win32.ReleaseCapture();
+
+                if (!self.syncMouse(core_surface, down)) {
+                    m.owed.insert(button);
+                    return;
+                }
+            },
+        }
+
+        // The core reads the event position back through getCursorPos, so it
+        // must be current first. Link hover and the drag state also change
+        // only in cursorPosCallback.
+        self.movePointer(core_surface, pos, mods);
+
+        // The result (false = "show your context menu" for a right press)
+        // has no consumer: there is no menu. With the default
+        // right-click-action, a right click therefore only selects the word
+        // or link under the pointer (src/Surface.zig:4124-4148).
+        _ = core_surface.mouseButtonCallback(state, button.core(), mods) catch |err|
+            log.warn("mouse button callback failed err={}", .{err});
+
+        // `self` and `core_surface` are still valid here. A press can open a
+        // paste confirmation (clipboardRequest -> confirm), but a prompt only
+        // defers teardown (destroyPosted), and no mouse callback closes the
+        // surface. If that prompt took the capture, `held` still names the
+        // button and the next syncMouse releases it.
+
+        if (state == .release and m.held.count() == 0) {
+            // Released outside the window: arming now posts WM_MOUSELEAVE at
+            // once, and its handler reports the leave. Released inside: this
+            // is the tracking the drag skipped.
+            self.trackLeave();
+        }
+    }
+
+    /// Ask for WM_MOUSELEAVE when the pointer leaves the client area.
+    /// One-shot: Win32 cancels tracking when it posts the leave, and posts it
+    /// at once if the pointer is not over the window now.
+    fn trackLeave(self: *Surface) void {
+        var tme: win32.TRACKMOUSEEVENT = .{
+            .cbSize = @sizeOf(win32.TRACKMOUSEEVENT),
+            .dwFlags = win32.TME_LEAVE,
+            .hwndTrack = self.hwnd,
+            .dwHoverTime = 0,
+        };
+        if (!win32.TrackMouseEvent(&tme).toBool()) {
+            log.warn("TrackMouseEvent failed err={}", .{std.os.windows.GetLastError()});
+        }
+        // Set even on failure: retrying on every move cannot help, and a
+        // missed leave only leaves hover state stale until the next one.
+        self.mouse.tracking = true;
+    }
+
+    fn hasCapture(self: *const Surface) bool {
+        const capture = win32.GetCapture() orelse return false;
+        return capture == self.hwnd;
+    }
+
+    /// Modifiers for a mouse message, binding modifiers only.
+    ///
+    /// Shift and Ctrl come from the message's own MK_ flags, which describe
+    /// the state at the time of the event. Alt and the Windows key have no
+    /// flag and come from GetKeyState, which only follows key messages this
+    /// thread has read: with the keyboard focus elsewhere it can report a
+    /// key as still down (an Alt+Tab whose Alt-up went to another window),
+    /// so they are left out then.
+    ///
+    /// binding() because the core compares its stored mods with each event's
+    /// (src/Surface.zig:1554): lock and side bits would make every mouse
+    /// event a mods change, which redraws every row.
+    fn mouseMods(self: *const Surface, wparam: win32.WPARAM) input.Mods {
+        var mods: input.Mods = if (self.focused) currentMods().binding() else .{};
+        mods.shift = wparam & win32.MK_SHIFT != 0;
+        mods.ctrl = wparam & win32.MK_CONTROL != 0;
+        return mods;
+    }
+
     /// The text a keystroke produced, collected from WM_(SYS)(DEAD)CHAR.
     const Text = struct {
         /// UTF-16 code units as received. One keystroke yields at most a few
@@ -2538,6 +3124,30 @@ pub const Surface = struct {
 // -------------------------------------------------------------------------
 // Win32 helpers
 // -------------------------------------------------------------------------
+
+/// A point beyond the client area, past the corner farthest from `press`
+/// on each axis. The core clamps it to that corner's cell
+/// (src/renderer/size.zig:142-147).
+fn releasePoint(core_surface: *const CoreSurface, press: apprt.CursorPos) apprt.CursorPos {
+    const screen = core_surface.size.screen;
+    const w: f32 = @floatFromInt(screen.width);
+    const h: f32 = @floatFromInt(screen.height);
+    return .{
+        .x = if (press.x < w / 2) w + 1 else -1,
+        .y = if (press.y < h / 2) h + 1 else -1,
+    };
+}
+
+/// The client-area position in a mouse message's lParam. These are already
+/// device pixels, because the process is per-monitor-v2 DPI aware
+/// (dist/windows/ghostty.manifest), and that is the unit the core expects
+/// (the GTK runtime scales to it).
+fn clientPos(lparam: win32.LPARAM) apprt.CursorPos {
+    return .{
+        .x = @floatFromInt(win32.xLparam(lparam)),
+        .y = @floatFromInt(win32.yLparam(lparam)),
+    };
+}
 
 /// The modifier state for the key message being handled.
 ///
@@ -2994,6 +3604,18 @@ comptime {
         _ = &Surface.setClipboard;
         _ = &Surface.defaultTermioEnv;
 
+        // Every button this runtime reports must index the core's
+        // click_state (src/Surface.zig:226, :3838); input.MouseButton.eleven
+        // does not, since the array has `max` (= 11) entries.
+        const click_states = @typeInfo(
+            @FieldType(@FieldType(CoreSurface, "mouse"), "click_state"),
+        ).array.len;
+        for (std.enums.values(Surface.Mouse.Button)) |b| {
+            if (@intFromEnum(b.core()) >= click_states) {
+                @compileError("mouse button " ++ @tagName(b) ++ " is outside the core's click_state");
+            }
+        }
+
         // performAction is comptime-dispatched per key, so each of the 69
         // keys is a separate instantiation and a separate chance to be wrong.
         for (@typeInfo(apprt.Action.Key).@"enum".fields) |field| {
@@ -3009,4 +3631,38 @@ comptime {
             }.thunk;
         }
     }
+}
+
+test "win32: mouse lParam coordinates are signed" {
+    // (-5, -7) as the system packs it: MAKELPARAM of two shorts.
+    const pos = clientPos(@bitCast(@as(usize, 0xFFF9_FFFB)));
+    try std.testing.expectEqual(@as(f32, -5), pos.x);
+    try std.testing.expectEqual(@as(f32, -7), pos.y);
+}
+
+test "win32: wheel deltas add up to whole notches" {
+    const thirds = [_]i32{40} ** 9;
+    const ones = [_]i32{1} ** 360;
+    const cases = [_][]const i32{ &.{ 120, 120, 120 }, &thirds, &.{ 90, 90, 90, 90 }, &ones };
+    for (cases) |deltas| {
+        for ([_]i32{ 1, -1 }) |sign| {
+            var n: Surface.Mouse.Notches = .{};
+            var total: i32 = 0;
+            for (deltas) |d| total += n.add(sign * d) orelse 0;
+            try std.testing.expectEqual(3 * sign, total);
+            try std.testing.expectEqual(0, n.rem);
+        }
+    }
+
+    // A reversal is not absorbed by the other direction's remainder.
+    var n: Surface.Mouse.Notches = .{};
+    try std.testing.expectEqual(null, n.add(60));
+    try std.testing.expectEqual(-1, n.add(-120));
+}
+
+test "win32: mouse message button bits" {
+    const Set = Surface.Mouse.Button.Set;
+    try std.testing.expect(Surface.Mouse.Button.downIn(0).eql(Set.empty));
+    const both = Surface.Mouse.Button.downIn(win32.MK_LBUTTON | win32.MK_XBUTTON2 | win32.MK_SHIFT);
+    try std.testing.expect(both.eql(Set.initMany(&.{ .left, .x2 })));
 }
