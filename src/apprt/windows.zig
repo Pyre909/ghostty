@@ -39,6 +39,10 @@
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for `.new_window`, `.mouse_over_link` and every other action it does not
 //! name; this runtime never claims an action it did not carry out.
+//!
+//! Links open through the shell (`ShellExecuteW`). An OSC 8 target is
+//! program output, so only a well-formed http, https or mailto link is
+//! opened from one; anything else is refused with a notice (`osc8Allowed`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -79,6 +83,7 @@ const win32 = struct {
     const BYTE = w.BYTE;
     const WORD = w.WORD;
     const DWORD = w.DWORD;
+    const HRESULT = c_long;
     const UINT = w.UINT;
     const LONG = w.LONG;
     const WCHAR = w.WCHAR;
@@ -352,6 +357,7 @@ const win32 = struct {
     const CF_UNICODETEXT: UINT = 13;
     const GMEM_MOVEABLE: UINT = 0x0002;
 
+    const MB_OK: UINT = 0x00000000;
     const MB_OKCANCEL: UINT = 0x00000001;
     const MB_ICONWARNING: UINT = 0x00000030;
     const IDOK: c_int = 1;
@@ -484,6 +490,20 @@ const win32 = struct {
         flags: UINT,
     ) callconv(.winapi) BOOL;
     extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HCURSOR;
+    /// Returns an HINSTANCE in name only: a value of 32 or below is an
+    /// SE_ERR_* code (0 means out of memory), so it is read as an integer.
+    extern "shell32" fn ShellExecuteW(
+        hwnd: ?HWND,
+        operation: ?LPCWSTR,
+        file: LPCWSTR,
+        parameters: ?LPCWSTR,
+        directory: ?LPCWSTR,
+        show: c_int,
+    ) callconv(.winapi) usize;
+    const COINIT_APARTMENTTHREADED: DWORD = 0x2;
+    const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
+    extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
+    extern "ole32" fn CoUninitialize() callconv(.winapi) void;
     extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
     extern "user32" fn ValidateRect(hwnd: ?HWND, rect: ?*const RECT) callconv(.winapi) BOOL;
     extern "user32" fn ReleaseDC(hwnd: ?HWND, hdc: HDC) callconv(.winapi) c_int;
@@ -592,6 +612,10 @@ const WM_GHOSTTY_WAKEUP: win32.UINT = win32.WM_APP + 1;
 /// surface down; see `Surface.destroyPosted`. Posting rather than destroying
 /// in place is what keeps teardown out of core stack frames.
 const WM_GHOSTTY_DESTROY: win32.UINT = win32.WM_APP + 2;
+
+/// Posted to a surface window by `App.openUrl` for a refused OSC 8 link.
+/// Its handler shows the notice; `App.openUrl` says why it is posted.
+const WM_GHOSTTY_LINK_REFUSED: win32.UINT = win32.WM_APP + 3;
 
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
@@ -1124,6 +1148,7 @@ pub const App = struct {
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
+            .open_url => self.openUrl(target, value),
 
             .ring_bell => ring_bell: {
                 _ = win32.MessageBeep(win32.MB_ICONASTERISK);
@@ -1132,9 +1157,7 @@ pub const App = struct {
 
             // Everything else, including `.new_window` (see `run`),
             // `.cell_size`, `.size_limit` and `.initial_size` (sent during
-            // CoreSurface.init; `false` is a valid answer to each),
-            // `.open_url` (whose `false` is a supported path:
-            // src/Surface.zig:4471 falls back to internal_os.open), and
+            // CoreSurface.init; `false` is a valid answer to each), and
             // `.mouse_over_link` (a link-preview UI this runtime lacks; the
             // core tracks the link itself and ignores the result,
             // src/Surface.zig:1668, :4585).
@@ -1238,6 +1261,50 @@ pub const App = struct {
             .app => false,
             .surface => |v| v.rt_surface.setMouseShape(shape),
         };
+    }
+
+    /// Open a link with its registered handler, the shell's `open` verb.
+    ///
+    /// An OSC 8 target is program output, and the shell would pass any
+    /// scheme on: `file:` runs executables and a custom scheme starts
+    /// whatever registered it. Only a well-formed http, https or mailto
+    /// link is opened from one (`osc8Allowed`); anything else is refused
+    /// with a notice. The refusal reports `true`: `false` would send the
+    /// same link to the core's generic opener (src/Surface.zig:4471-4483)
+    /// and bypass the policy. The other kinds are link text the user can
+    /// see, or paths the core resolved from it, and open unchanged.
+    ///
+    /// Nothing here may dispatch messages: the core calls this while
+    /// holding its renderer lock (src/Surface.zig:3939-3941), and the next
+    /// mouse move dispatched on this thread would take that lock again in
+    /// cursorPosCallback. The notice is therefore posted and shown once
+    /// this frame has returned, and ShellExecuteW, which blocks until the
+    /// handler has started and may dispatch messages while it waits, runs
+    /// on its own thread, as the core's opener does (src/os/open.zig).
+    fn openUrl(self: *App, target: apprt.Target, value: apprt.action.OpenUrl) bool {
+        const hwnd = switch (target) {
+            .app => return false,
+            .surface => |v| v.rt_surface.hwnd,
+        };
+
+        if (value.kind == .osc8 and !osc8Allowed(value.url)) {
+            log.warn("refused an OSC 8 link: not a well-formed http, https or mailto target", .{});
+            _ = win32.PostMessageW(hwnd, WM_GHOSTTY_LINK_REFUSED, 0, 0);
+            return true;
+        }
+
+        const alloc = self.core_app.alloc;
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, value.url) catch |err| {
+            log.warn("open url: cannot convert the target err={}", .{err});
+            return false;
+        };
+        const thread = std.Thread.spawn(.{}, openUrlThread, .{ alloc, wide }) catch |err| {
+            alloc.free(wide);
+            log.warn("open url: cannot start the opener thread err={}", .{err});
+            return false;
+        };
+        thread.detach();
+        return true;
     }
 
     /// Arm or cancel the quit-after-last-window timer. Returns whether the
@@ -2327,6 +2394,18 @@ pub const Surface = struct {
                     // No core surface, so nothing to confirm or stop. This
                     // frees `self` (WM_DESTROY); nothing follows it.
                     .none => _ = win32.DestroyWindow(hwnd),
+                }
+                return 0;
+            },
+
+            WM_GHOSTTY_LINK_REFUSED => {
+                // Dropped once the surface is going away: the notice would
+                // only hold up the teardown that pumps this message.
+                if (self.core_state == .live) {
+                    notice(self.app, hwnd, L(
+                        "Ghostty did not open this link.\n\n" ++
+                            "A link printed by a program is only opened when it is an http, https or mailto link.",
+                    ));
                 }
                 return 0;
             },
@@ -3679,6 +3758,67 @@ fn confirm(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) bool {
     ) == win32.IDOK;
 }
 
+/// The OK-only form of `confirm`, with the same nesting rules.
+fn notice(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) void {
+    app.prompt_depth += 1;
+    defer app.prompt_depth -= 1;
+    _ = win32.MessageBoxW(hwnd, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);
+}
+
+/// Opens `wide` with the shell, then frees it. COM is initialized for the
+/// thread first, as ShellExecuteW documents: a shell extension it delegates
+/// to may need a single-threaded apartment.
+fn openUrlThread(alloc: Allocator, wide: [:0]u16) void {
+    defer alloc.free(wide);
+    const hr = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED | win32.COINIT_DISABLE_OLE1DDE);
+    defer if (hr >= 0) win32.CoUninitialize();
+    const rc = win32.ShellExecuteW(null, L("open"), wide.ptr, null, null, win32.SW_SHOWNORMAL);
+    if (rc <= 32) log.warn("ShellExecuteW failed code={}", .{rc});
+}
+
+/// Whether an OSC 8 target may be opened: an http or https link with a
+/// host, or a mailto link with an address, containing nothing that could
+/// display differently from what the handler receives. This is the allow
+/// branch of the macOS policy (macos/Sources/Helpers/UntrustedURL.swift);
+/// what that policy confirms or inspects (`file:`, custom schemes) is
+/// refused here outright.
+fn osc8Allowed(url: []const u8) bool {
+    // Control, bidirectional and zero-width code points can hide part of
+    // the target or add a display line; invalid UTF-8 cannot be shown.
+    var it = (std.unicode.Utf8View.init(url) catch return false).iterator();
+    while (it.nextCodepoint()) |cp| {
+        const unsafe = switch (cp) {
+            0x00...0x1F, 0x7F...0x9F => true, // C0 and C1 controls
+            0x061C, 0x200B...0x200F, 0x202A...0x202E, 0x2066...0x2069 => true, // bidi, zero width
+            0x2028, 0x2029, 0x2060, 0xFEFF => true, // line separators, word joiner, BOM
+            else => false,
+        };
+        if (unsafe) return false;
+    }
+
+    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return false;
+    const scheme = url[0..colon];
+    const rest = url[colon + 1 ..];
+
+    if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https")) {
+        // "https:relative" has a scheme but no authority, and consumers
+        // resolve it against different bases.
+        if (!std.mem.startsWith(u8, rest, "//")) return false;
+        const authority = rest[2 .. 2 + (std.mem.indexOfAny(u8, rest[2..], "/?#") orelse rest.len - 2)];
+        // The host follows the user info and precedes the port.
+        const after_user = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| authority[i + 1 ..] else authority;
+        const host = if (std.mem.indexOfScalar(u8, after_user, ':')) |i| after_user[0..i] else after_user;
+        return host.len != 0;
+    }
+
+    if (std.ascii.eqlIgnoreCase(scheme, "mailto")) {
+        // The address is the path; a bare "mailto:" opens an empty message.
+        return (std.mem.indexOfScalar(u8, rest, '?') orelse rest.len) != 0;
+    }
+
+    return false;
+}
+
 comptime {
     // Zig only analyzes function bodies it reaches. A Windows exe reaches
     // the contract through CoreSurface, but only for the methods and action
@@ -3771,4 +3911,33 @@ test "win32: mouse message button bits" {
     try std.testing.expect(Surface.Mouse.Button.downIn(0).eql(Set.empty));
     const both = Surface.Mouse.Button.downIn(win32.MK_LBUTTON | win32.MK_XBUTTON2 | win32.MK_SHIFT);
     try std.testing.expect(both.eql(Set.initMany(&.{ .left, .x2 })));
+}
+
+test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
+    const allowed = [_][]const u8{
+        "https://example.com/path?q=1#f",
+        "HTTP://user:pw@example.com:8080/",
+        "http://[::1]:8080/",
+        "mailto:someone@example.com?subject=hi",
+    };
+    for (allowed) |url| try std.testing.expect(osc8Allowed(url));
+
+    const refused = [_][]const u8{
+        "",
+        "example.com",
+        "https:relative",
+        "https://",
+        "https:///path",
+        "https://user@/path",
+        "https://:8080/",
+        "mailto:",
+        "mailto:?subject=hi",
+        "file:///C:/Windows/System32/calc.exe",
+        "ms-settings:display",
+        "ftp://example.com/",
+        "https://example.com/\u{200B}hidden",
+        "https://example.com/\r\n",
+        "https://example.com/\xff",
+    };
+    for (refused) |url| try std.testing.expect(!osc8Allowed(url));
 }
