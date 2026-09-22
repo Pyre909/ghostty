@@ -688,17 +688,23 @@ test "windows: path conversion" {
     try testing.expect(p.isNt());
     try testing.expect(std.mem.endsWith(u16, p.span(), L("\\up.txt")));
 
+    // The expected parent is the normalized final path pathToNt anchors
+    // with, read through the handle std opened for it. std's realPath is
+    // not an oracle here: it reads the NT object name, which keeps the
+    // spelling the directory was opened with, so a working directory
+    // reached through an 8.3 alias (`%TEMP%` is `C:\Users\STEPHE~1\...`
+    // for a user name longer than eight characters) would never match
+    // the long names GetFinalPathNameByHandleW produces.
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = dir_buf[0..try tmp_dir.dir.realPath(testing.io, &dir_buf)];
-    const parent = std.fs.path.dirname(dir_path).?;
+    var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent = parent_buf[0..try realPathHandle(tmp_dir.parent_dir.handle, &parent_buf)];
     try pathToNt(tmp_dir.dir.handle, "..\\up.txt", &p);
     var got_buf: [std.fs.max_path_bytes]u8 = undefined;
     const got = got_buf[0..std.unicode.wtf16LeToWtf8(&got_buf, p.span())];
-    try testing.expect(std.mem.startsWith(u8, got, "\\??\\"));
-    try testing.expectEqualStrings(parent, got[4 .. 4 + parent.len]);
-    try testing.expectEqualStrings("\\up.txt", got[4 + parent.len ..]);
+    var want_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    const want = try std.fmt.bufPrint(&want_buf, "\\??\\{s}\\up.txt", .{parent});
+    try testing.expectEqualStrings(want, got);
 
     // Encoding errors are path errors.
     try testing.expectError(error.BadPathName, pathToNt(cwd, "bad\xff", &p));
@@ -716,9 +722,12 @@ test "windows: realPath resolves through symlinks" {
         .sub_path = "target.txt",
         .data = "target",
     });
-    // Needs SeCreateSymbolicLinkPrivilege, which plain users and CI lack.
+    // Needs SeCreateSymbolicLinkPrivilege, which plain users and CI lack;
+    // std reports the missing privilege as PermissionDenied.
     tmp_dir.dir.symLink(testing.io, "target.txt", "link.txt", .{}) catch |err| switch (err) {
-        error.AccessDenied => return error.SkipZigTest,
+        error.AccessDenied,
+        error.PermissionDenied,
+        => return error.SkipZigTest,
         else => return err,
     };
     const dir: Dir = .{ .handle = tmp_dir.dir.handle };
