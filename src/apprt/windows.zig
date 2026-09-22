@@ -32,10 +32,10 @@
 //!
 //! ## What is still missing
 //!
-//! Not implemented: IME composition windows, more than one window
-//! (`.new_window`), a context menu, link previews and precision-touchpad
-//! scrolling. Without a menu, a right click with the default
-//! `right-click-action` only selects the word or link under the pointer.
+//! Not implemented: more than one window (`.new_window`), a context menu,
+//! link previews and precision-touchpad scrolling. Without a menu, a right
+//! click with the default `right-click-action` only selects the word or
+//! link under the pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for `.new_window`, `.mouse_over_link` and every other action it does not
 //! name; this runtime never claims an action it did not carry out.
@@ -43,6 +43,13 @@
 //! Links open through the shell (`ShellExecuteW`). An OSC 8 target is
 //! program output, so only a well-formed http, https or mailto link is
 //! opened from one; anything else is refused with a notice (`osc8Allowed`).
+//!
+//! An IME composition is drawn inline as the core's preedit. The IME's own
+//! composition window is therefore turned off (WM_IME_SETCONTEXT), and
+//! WM_IME_COMPOSITION is consumed: its result is read once and sent to the
+//! core as a text-only key event, and DefWindowProcW never turns it into
+//! WM_CHARs. The candidate window is placed at the cursor cell
+//! (`Surface.imePlace`). See `Surface.Ime`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -473,6 +480,7 @@ const win32 = struct {
     extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) LONG_PTR;
     extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
     extern "user32" fn GetClientRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
+    extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
     extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
     extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
     extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
@@ -504,6 +512,42 @@ const win32 = struct {
     const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
     extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
     extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+
+    // IMM32. Both forms are in client coordinates of the context's window.
+    const HIMC = *opaque {};
+    const COMPOSITIONFORM = extern struct { dwStyle: DWORD, ptCurrentPos: POINT, rcArea: RECT };
+    const CANDIDATEFORM = extern struct { dwIndex: DWORD, dwStyle: DWORD, ptCurrentPos: POINT, rcArea: RECT };
+    const WM_INPUTLANGCHANGE: UINT = 0x0051;
+    const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
+    const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
+    const WM_IME_COMPOSITION: UINT = 0x010F;
+    const WM_IME_SETCONTEXT: UINT = 0x0281;
+    const WM_IME_CHAR: UINT = 0x0286;
+    const WM_IME_REQUEST: UINT = 0x0288;
+    const ISC_SHOWUICOMPOSITIONWINDOW: usize = 0x80000000;
+    const GCS_COMPSTR: u32 = 0x0008;
+    const GCS_RESULTSTR: u32 = 0x0800;
+    /// Every GCS_* flag. A WM_IME_COMPOSITION with none of them set means
+    /// the composition was cancelled.
+    const GCS_ALL: u32 = 0x1FBF;
+    const CFS_POINT: DWORD = 0x0002;
+    const CFS_EXCLUDE: DWORD = 0x0080;
+    const NI_COMPOSITIONSTR: DWORD = 0x0015;
+    const CPS_COMPLETE: DWORD = 0x0001;
+    const CPS_CANCEL: DWORD = 0x0004;
+    const LANG_KOREAN: u16 = 0x12;
+    extern "imm32" fn ImmGetContext(hwnd: HWND) callconv(.winapi) ?HIMC;
+    extern "imm32" fn ImmReleaseContext(hwnd: HWND, himc: HIMC) callconv(.winapi) BOOL;
+    /// Sizes are in bytes, also for the W form; negative is an error.
+    extern "imm32" fn ImmGetCompositionStringW(
+        himc: HIMC,
+        index: DWORD,
+        buf: ?*anyopaque,
+        len: DWORD,
+    ) callconv(.winapi) LONG;
+    extern "imm32" fn ImmSetCompositionWindow(himc: HIMC, form: *COMPOSITIONFORM) callconv(.winapi) BOOL;
+    extern "imm32" fn ImmSetCandidateWindow(himc: HIMC, form: *CANDIDATEFORM) callconv(.winapi) BOOL;
+    extern "imm32" fn ImmNotifyIME(himc: HIMC, action: DWORD, index: DWORD, value: DWORD) callconv(.winapi) BOOL;
     extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
     extern "user32" fn ValidateRect(hwnd: ?HWND, rect: ?*const RECT) callconv(.winapi) BOOL;
     extern "user32" fn ReleaseDC(hwnd: ?HWND, hdc: HDC) callconv(.winapi) c_int;
@@ -955,6 +999,9 @@ pub const App = struct {
             // Likewise mouse events a prompt held back, and capture that was
             // lost without a message (Surface.syncMouse).
             self.syncDeferredMouse();
+
+            // And IME work that could not run where it arose (Surface.syncIme).
+            self.syncDeferredIme();
         }
     }
 
@@ -1014,6 +1061,17 @@ pub const App = struct {
         for (self.surfaces.items) |surface| {
             const core_surface = surface.liveCore() orelse continue;
             _ = surface.syncMouse(core_surface, null);
+        }
+    }
+
+    /// Finish the IME work of every live core surface (`Surface.syncIme`).
+    /// Called by `run`, where `canReenterCore` holds. A result delivered
+    /// here can close a surface, but `Surface.close` only posts, so the
+    /// list does not change during the loop.
+    fn syncDeferredIme(self: *App) void {
+        for (self.surfaces.items) |surface| {
+            const core_surface = surface.liveCore() orelse continue;
+            surface.syncIme(core_surface);
         }
     }
 
@@ -1559,9 +1617,13 @@ pub const Surface = struct {
     /// (`App.canReenterCore` was false). `App.run` re-posts it.
     destroy_deferred: bool,
 
-    /// A dead key's preedit is on screen and the next committed text must
-    /// clear it first. See `keyEvent`.
-    preedit_active: bool,
+    /// Who put the text that is in the core's preedit slot: a dead key
+    /// (`keyEvent`) or an IME composition. The core has one slot, keeps no
+    /// owner and never clears it itself (src/Surface.zig:2562-2570), so each
+    /// source must only clear what it set. Written by `setPreedit` alone.
+    preedit: Ime.Preedit,
+
+    ime: Ime,
 
     /// Number of WM_PAINTs handled, for the debug log in `paint`.
     paint_count: u64,
@@ -1594,6 +1656,189 @@ pub const Surface = struct {
         live,
         /// `stopCore` is running. Initialized, not registered, no callbacks.
         stopping,
+    };
+
+    /// IME composition state and the decisions that need no window.
+    ///
+    /// The composition string is drawn by the core as preedit, so the
+    /// runtime consumes WM_IME_COMPOSITION instead of letting DefWindowProcW
+    /// translate it: the result string is then read exactly once here, and
+    /// no WM_IME_CHAR or WM_CHAR is ever generated from it.
+    const Ime = struct {
+        /// Between WM_IME_STARTCOMPOSITION (or the first composition
+        /// string) and WM_IME_ENDCOMPOSITION. It decides whether a
+        /// composition has to be ended on focus loss and whether an `.ime`
+        /// preedit is stale. It never decides whether a result is
+        /// delivered: Korean IMEs can send the last result after the end.
+        composing: bool = false,
+
+        /// The forms last given to the IME, or null to issue them again.
+        /// Each Imm call sends WM_IME_NOTIFY back into the window
+        /// procedure, so unchanged forms are not sent again.
+        form: ?Form = null,
+
+        /// Result text, as UTF-8, that arrived while the core could not be
+        /// entered (`imeCore`). `flushIme` delivers it before any later
+        /// input. Owned; freed in `stopCore` and `deinit`.
+        pending: std.ArrayListUnmanaged(u8) = .empty,
+
+        /// Keys whose key-down the IME claimed (VK_PROCESSKEY), by
+        /// `scanSlot`. The core never saw those presses, so a key-up that
+        /// arrives with the real virtual key is kept from it as well.
+        swallow_up: std.StaticBitSet(512) = .initEmpty(),
+
+        const Preedit = enum { none, dead_key, ime };
+
+        const Action = enum {
+            /// preeditCallback(null).
+            clear_preedit,
+            /// Read GCS_RESULTSTR and send it to the core as text.
+            commit_result,
+            /// Read GCS_RESULTSTR and keep it in `pending`.
+            defer_result,
+            /// Read GCS_COMPSTR: show it as the preedit, or clear the
+            /// preedit if it is empty.
+            update_preedit,
+        };
+
+        const Plan = struct {
+            buf: [3]Action = undefined,
+            len: usize = 0,
+
+            fn add(self: *Plan, action: Action) void {
+                self.buf[self.len] = action;
+                self.len += 1;
+            }
+
+            fn actions(self: *const Plan) []const Action {
+                return self.buf[0..self.len];
+            }
+        };
+
+        /// What a WM_IME_COMPOSITION asks for, in order. `bits` is its
+        /// lParam, `owner` the current preedit owner, and `core_safe`
+        /// whether the core may be entered (`imeCore`).
+        ///
+        /// `composing` is deliberately not an input: a result is delivered
+        /// whether or not a composition is thought to be open.
+        ///
+        /// Only a message with no GCS flag at all is a cancellation. One
+        /// with other flags but neither string flag (a caret or clause
+        /// change) is a live update, and IMEs are known to misreport
+        /// GCS_COMPSTR, so the string is read again for every message that
+        /// is not a bare result, as Firefox and WezTerm do.
+        fn plan(bits: u32, owner: Preedit, core_safe: bool) Plan {
+            var p: Plan = .{};
+            const gcs = bits & win32.GCS_ALL;
+            if (gcs == 0) {
+                if (core_safe and owner == .ime) p.add(.clear_preedit);
+                return p;
+            }
+
+            // The result first: it precedes the composition string that
+            // may follow it in the same message (Korean commits a syllable
+            // and starts the next one at once).
+            const result = gcs & win32.GCS_RESULTSTR != 0;
+            if (result) {
+                if (core_safe) {
+                    // A commit replaces whatever preedit is showing, as in
+                    // GTK (src/apprt/gtk/class/surface.zig imCommit).
+                    if (owner != .none) p.add(.clear_preedit);
+                    p.add(.commit_result);
+                } else {
+                    p.add(.defer_result);
+                }
+            }
+
+            // Without the core the composition string is dropped: the
+            // window has lost the focus to a prompt, and the next update
+            // after it shows the string again.
+            const bare_result = result and gcs & win32.GCS_COMPSTR == 0;
+            if (!bare_result and core_safe) p.add(.update_preedit);
+            return p;
+        }
+
+        const Form = struct {
+            /// Bottom-left of the cursor cell, for the composition form: an
+            /// IME that anchors its candidate list there opens it below the
+            /// row (winit does the same).
+            pt: win32.POINT,
+            /// The cells of the preedit, for the candidate form: the list
+            /// must not cover them.
+            rc: win32.RECT,
+        };
+
+        /// The forms for the core's IME position. `pos` is in 96-DPI
+        /// pixels except for its width, which the core leaves in physical
+        /// pixels (src/Surface.zig:2168-2183); `scale` is DPI / 96 and
+        /// `client` the client rectangle, in physical pixels like the
+        /// result. Clamping guards against rounding and against a client
+        /// size the core has not caught up with yet.
+        fn formFor(pos: apprt.IMEPos, scale: f64, cell_w: u32, client: win32.RECT) Form {
+            const cw: f64 = @floatFromInt(cell_w);
+            // The core reports the middle of the cursor cell and its bottom.
+            const left = @round(pos.x * scale - cw / 2);
+            const bottom = @round(pos.y * scale);
+            const top = bottom - @round(pos.height * scale);
+            const right = left + @max(@round(pos.width), cw);
+            // Never inverted, whatever the core reports.
+            const l = clampLong(left, client.left, client.right);
+            const b = clampLong(bottom, client.top, client.bottom);
+            const rc: win32.RECT = .{
+                .left = l,
+                .top = @min(b, clampLong(top, client.top, client.bottom)),
+                .right = @max(l, clampLong(right, client.left, client.right)),
+                .bottom = b,
+            };
+            return .{ .pt = .{ .x = rc.left, .y = rc.bottom }, .rc = rc };
+        }
+
+        fn clampLong(v: f64, lo: win32.LONG, hi: win32.LONG) win32.LONG {
+            // Written so that NaN takes the first branch.
+            if (!(v > @as(f64, @floatFromInt(lo)))) return lo;
+            if (v >= @as(f64, @floatFromInt(hi))) return hi;
+            return @intFromFloat(v);
+        }
+
+        /// A key message's scan code and extended-key flag (lParam bits
+        /// 16-24), which identify the physical key on both its messages.
+        fn scanSlot(lparam: win32.LPARAM) usize {
+            return (@as(usize, @bitCast(lparam)) >> 16) & 0x1FF;
+        }
+
+        /// WM_IME_SETCONTEXT's lParam without the request to show the
+        /// IME's composition window. The flag is bit 31 of a value that
+        /// arrives sign-extended.
+        fn setContextLparam(lparam: win32.LPARAM) win32.LPARAM {
+            return @bitCast(@as(usize, @bitCast(lparam)) & ~win32.ISC_SHOWUICOMPOSITIONWINDOW);
+        }
+
+        /// UTF-8 for an IME string. Unpaired surrogates are dropped: they
+        /// have no UTF-8 form, and the core's preedit rejects invalid
+        /// input. Nothing else is filtered, as in the GTK and macOS
+        /// runtimes.
+        fn utf8FromUtf16(alloc: Allocator, units: []const u16) Allocator.Error![]u8 {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer out.deinit(alloc);
+            try out.ensureTotalCapacity(alloc, units.len * 3);
+
+            var i: usize = 0;
+            while (i < units.len) : (i += 1) {
+                const unit = units[i];
+                var cp: u21 = unit;
+                if (std.unicode.utf16IsHighSurrogate(unit)) {
+                    if (i + 1 >= units.len or !std.unicode.utf16IsLowSurrogate(units[i + 1])) continue;
+                    cp = std.unicode.utf16DecodeSurrogatePair(&[_]u16{ unit, units[i + 1] }) catch continue;
+                    i += 1;
+                } else if (std.unicode.utf16IsLowSurrogate(unit)) {
+                    continue;
+                }
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch continue;
+                out.appendSliceAssumeCapacity(buf[0..n]);
+            }
+            return out.toOwnedSlice(alloc);
+        }
     };
 
     /// What the core has been told about the mouse.
@@ -1756,7 +2001,8 @@ pub const Surface = struct {
             .maximized = false,
             .closing = false,
             .destroy_deferred = false,
-            .preedit_active = false,
+            .preedit = .none,
+            .ime = .{},
             .paint_count = 0,
             .modal_loops = 0,
             .focused = false,
@@ -1833,6 +2079,7 @@ pub const Surface = struct {
     pub fn deinit(self: *Surface) void {
         if (self.title) |v| self.app.core_app.alloc.free(v);
         self.title = null;
+        self.ime.pending.clearAndFree(self.app.core_app.alloc);
     }
 
     /// Tear down the OS window. The allocation itself is not freed here; see
@@ -1923,6 +2170,15 @@ pub const Surface = struct {
         // hidden over the window for the rest of the teardown.
         self.mouse.hidden = false;
         self.applyCursor();
+
+        // A composition ends with the core too: nothing is left to draw its
+        // preedit or to take its result. The IME is not told; the window is
+        // about to be destroyed, and ImmNotifyIME would send its messages
+        // back into this teardown.
+        self.ime.pending.clearAndFree(self.app.core_app.alloc);
+        self.ime.composing = false;
+        self.ime.form = null;
+        self.preedit = .none;
 
         const app = self.app;
         const cs = &self.core_surface;
@@ -2444,6 +2700,7 @@ pub const Surface = struct {
             },
 
             win32.WM_SIZE => {
+                self.ime.form = null;
                 const core_surface = self.liveCore() orelse return 0;
 
                 // Minimized: report occluded and do NOT resize. A minimized
@@ -2478,6 +2735,7 @@ pub const Surface = struct {
             },
 
             win32.WM_DPICHANGED => {
+                self.ime.form = null;
                 // The new scale first: SetWindowPos below sends WM_SIZE
                 // synchronously, so the core sees the scale before the size
                 // computed for it. wParam carries the new DPI in both words;
@@ -2517,6 +2775,16 @@ pub const Surface = struct {
                     _ = win32.ReleaseCapture();
                 }
 
+                // An open composition does not survive it either, but
+                // ending one makes the IME send its messages straight back
+                // into this window procedure. That waits for `App.run`
+                // (syncIme); the wakeup makes `run` come round, since a
+                // sent message does not.
+                if (!self.focused and (self.ime.composing or self.preedit == .ime)) {
+                    _ = win32.PostMessageW(self.app.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
+                }
+                self.ime.form = null;
+
                 if (self.liveCore()) |core_surface| {
                     core_surface.focusCallback(msg == win32.WM_SETFOCUS) catch |err|
                         log.warn("focus callback failed err={}", .{err});
@@ -2540,6 +2808,43 @@ pub const Surface = struct {
                 return 0;
             },
 
+            win32.WM_IME_SETCONTEXT => {
+                // The composition string is drawn as the core's preedit, so
+                // the IME must not show its own composition window. The
+                // message is still forwarded: the default IME window needs
+                // it to activate the context, and keeps the candidate list.
+                log.debug("ime setcontext active={} lang=0x{x}", .{ wparam != 0, inputLanguage() });
+                return win32.DefWindowProcW(hwnd, msg, wparam, Ime.setContextLparam(lparam));
+            },
+
+            // Not forwarded: DefWindowProcW would open the composition
+            // window (start) and turn the result into WM_IME_CHARs and
+            // then WM_CHARs (composition), delivering the text twice.
+            win32.WM_IME_STARTCOMPOSITION => {
+                self.imeStart();
+                return 0;
+            },
+            win32.WM_IME_COMPOSITION => {
+                self.imeComposition(lparam);
+                return 0;
+            },
+
+            // Forwarded, so the default IME window releases what it holds.
+            // A change of input language ends a composition too, and the
+            // outgoing IME is not required to say so.
+            win32.WM_IME_ENDCOMPOSITION, win32.WM_INPUTLANGCHANGE => {
+                self.imeEnd();
+            },
+
+            // Neither is answered: WM_IME_CHAR only comes from a forwarded
+            // WM_IME_COMPOSITION, which never happens here, and the
+            // Microsoft IMEs work without WM_IME_REQUEST answers even though
+            // they send one (IMR_* in wParam) on nearly every keystroke.
+            // Logged to learn whether another IME disagrees.
+            win32.WM_IME_CHAR, win32.WM_IME_REQUEST => {
+                log.debug("ime message=0x{x} wparam=0x{x}", .{ msg, wparam });
+            },
+
             win32.WM_KEYDOWN,
             win32.WM_SYSKEYDOWN,
             win32.WM_KEYUP,
@@ -2549,8 +2854,20 @@ pub const Surface = struct {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
                 // IME-owned keystroke: the IME consumes it, not the terminal.
+                // The core never sees that press, so if the key-up arrives
+                // with the real virtual key it is withheld as well: a
+                // release without a press would be reported to programs
+                // that ask for key releases.
+                const slot = Ime.scanSlot(lparam);
                 if (wparam == win32.VK_PROCESSKEY) {
+                    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.ime.swallow_up.set(slot);
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                if (self.ime.swallow_up.isSet(slot)) {
+                    self.ime.swallow_up.unset(slot);
+                    if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
+                        return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                    }
                 }
 
                 // The synthetic Left Ctrl of AltGr. The core still sees Ctrl
@@ -2811,6 +3128,11 @@ pub const Surface = struct {
         var text: Text = .{};
         if (!release) text.collect(self.hwnd);
 
+        // Text the IME committed earlier comes first. This key's own text
+        // is collected before the flush so that nothing the flush triggers
+        // can dispatch the queued WM_CHAR out of turn.
+        if (self.app.canReenterCore()) self.flushIme(core_surface);
+
         // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord
         // that produces a character is AltGr by definition on Windows (it is
         // the documented substitute on keyboards without the key). Left in
@@ -2842,11 +3164,9 @@ pub const Surface = struct {
         // text replaces it. The core does not track this itself
         // (src/Surface.zig:2565-2568).
         if (text.composing) {
-            try core_surface.preeditCallback(text.utf8());
-            self.preedit_active = true;
-        } else if (self.preedit_active and text.len > 0) {
-            try core_surface.preeditCallback(null);
-            self.preedit_active = false;
+            try self.setPreedit(core_surface, text.utf8(), .dead_key);
+        } else if (self.preedit == .dead_key and text.len > 0) {
+            try self.setPreedit(core_surface, null, .none);
         }
 
         return try core_surface.keyCallback(.{
@@ -2858,6 +3178,263 @@ pub const Surface = struct {
             .utf8 = text.utf8(),
             .unshifted_codepoint = unshifted,
         });
+    }
+
+    /// Set or clear the core's preedit and record its owner, together.
+    fn setPreedit(
+        self: *Surface,
+        core_surface: *CoreSurface,
+        text: ?[]const u8,
+        owner: Ime.Preedit,
+    ) !void {
+        std.debug.assert((text == null) == (owner == .none));
+
+        // The core drops the old preedit before anything in it can fail
+        // (src/Surface.zig:2593-2596), so a failure leaves none.
+        self.preedit = .none;
+        try core_surface.preeditCallback(text);
+        self.preedit = owner;
+    }
+
+    /// The core, if an IME handler may call into it.
+    ///
+    /// Stricter than the key path, which only asks for `liveCore`. IME
+    /// messages are mostly *sent*, so they also arrive inside a prompt's
+    /// message loop with a core frame beneath it: the composition ends
+    /// because the prompt took the focus. Key messages are posted to a
+    /// window the prompt has disabled, and never get there.
+    fn imeCore(self: *Surface) ?*CoreSurface {
+        if (!self.app.canReenterCore()) return null;
+        return self.liveCore();
+    }
+
+    fn imeStart(self: *Surface) void {
+        log.debug("ime start lang=0x{x}", .{inputLanguage()});
+        self.ime.composing = true;
+        self.ime.form = null;
+
+        const core_surface = self.imeCore() orelse return;
+        self.flushIme(core_surface);
+
+        // The IME takes the preedit slot from a pending dead key. The
+        // system's own dead-key state cannot be reset from here; the next
+        // key the IME declines still combines with it.
+        if (self.preedit == .dead_key) {
+            self.setPreedit(core_surface, null, .none) catch |err|
+                log.warn("preedit callback failed err={}", .{err});
+        }
+
+        const himc = win32.ImmGetContext(self.hwnd) orelse return;
+        defer _ = win32.ImmReleaseContext(self.hwnd, himc);
+        self.imePlace(core_surface, himc);
+    }
+
+    fn imeComposition(self: *Surface, lparam: win32.LPARAM) void {
+        // Without a core there is no pty to write a result to.
+        const core_surface = self.liveCore() orelse return;
+        const core_safe = self.app.canReenterCore();
+        const bits: u32 = @truncate(@as(usize, @bitCast(lparam)));
+        log.debug("ime composition gcs=0x{x} core_safe={}", .{ bits, core_safe });
+
+        // The context's strings are gone once it is released, so it is held
+        // for the whole plan. Setting the forms below sends WM_IME_NOTIFY
+        // back into the window procedure; nothing here is borrowed then.
+        const hwnd = self.hwnd;
+        const himc = win32.ImmGetContext(hwnd) orelse return;
+        defer _ = win32.ImmReleaseContext(hwnd, himc);
+        const alloc = self.app.core_app.alloc;
+
+        // The result is read before the core is entered: it is this
+        // message's, whatever the flush below causes the context to report.
+        const result: ?[]u8 = if (bits & win32.GCS_RESULTSTR != 0)
+            self.imeString(himc, win32.GCS_RESULTSTR)
+        else
+            null;
+        defer if (result) |v| alloc.free(v);
+
+        // Results keep their order: earlier deferred text goes first.
+        if (core_safe) self.flushIme(core_surface);
+
+        for (Ime.plan(bits, self.preedit, core_safe).actions()) |action| switch (action) {
+            .clear_preedit => self.setPreedit(core_surface, null, .none) catch |err|
+                log.warn("preedit callback failed err={}", .{err}),
+
+            .commit_result => if (result) |v| imeCommit(core_surface, v),
+
+            .defer_result => if (result) |v| self.ime.pending.appendSlice(alloc, v) catch |err|
+                log.warn("ime result dropped err={}", .{err}),
+
+            .update_preedit => {
+                const text = self.imeString(himc, win32.GCS_COMPSTR);
+                defer if (text) |v| alloc.free(v);
+                if (text) |v| {
+                    self.setPreedit(core_surface, v, .ime) catch |err|
+                        log.warn("preedit callback failed err={}", .{err});
+                    // Not every input service announces a composition.
+                    self.ime.composing = true;
+                    self.imePlace(core_surface, himc);
+                } else if (self.preedit == .ime) {
+                    // Backspaced to nothing. Never the empty string: the
+                    // core would keep an empty preedit and hide the cursor.
+                    self.setPreedit(core_surface, null, .none) catch |err|
+                        log.warn("preedit callback failed err={}", .{err});
+                }
+            },
+        };
+    }
+
+    /// WM_IME_ENDCOMPOSITION, or anything else that ends a composition.
+    /// The preedit is cleared by `flushIme`, here or as soon as the core
+    /// can be entered again.
+    fn imeEnd(self: *Surface) void {
+        log.debug("ime end", .{});
+        self.ime.composing = false;
+        self.ime.form = null;
+        if (self.imeCore()) |core_surface| self.flushIme(core_surface);
+    }
+
+    /// Deliver deferred result text and clear a preedit whose composition
+    /// has ended. Requires `imeCore`'s conditions. Called before every
+    /// input that reaches the core, so text keeps its order, and from
+    /// `syncIme`.
+    fn flushIme(self: *Surface, core_surface: *CoreSurface) void {
+        if (self.ime.pending.items.len != 0) {
+            const alloc = self.app.core_app.alloc;
+            // The preedit shown is what this text replaces.
+            if (self.preedit == .ime) {
+                self.setPreedit(core_surface, null, .none) catch |err|
+                    log.warn("preedit callback failed err={}", .{err});
+            }
+            // Taken out first: the commit can reach a prompt, whose
+            // message loop may bring the next result here.
+            var pending = self.ime.pending;
+            self.ime.pending = .empty;
+            defer pending.deinit(alloc);
+            imeCommit(core_surface, pending.items);
+        }
+
+        if (self.preedit == .ime and !self.ime.composing) {
+            self.setPreedit(core_surface, null, .none) catch |err|
+                log.warn("preedit callback failed err={}", .{err});
+        }
+    }
+
+    /// Send committed text to the core the way the other runtimes do: a
+    /// text-only key press with no physical key. `textCallback` is the
+    /// paste path and is not for this (it would bracket and confirm).
+    fn imeCommit(core_surface: *CoreSurface, utf8: []const u8) void {
+        log.debug("ime commit bytes={d}", .{utf8.len});
+        // `.closed` only posted WM_GHOSTTY_DESTROY (Surface.close), so the
+        // surface stays valid for the caller.
+        _ = core_surface.keyCallback(.{
+            .action = .press,
+            .key = .unidentified,
+            .mods = .{},
+            .consumed_mods = .{},
+            .composing = false,
+            .utf8 = utf8,
+        }) catch |err| log.warn("key callback failed err={}", .{err});
+    }
+
+    /// One of the input context's strings as UTF-8, or null if it is empty
+    /// or cannot be read. The caller frees it.
+    fn imeString(self: *Surface, himc: win32.HIMC, index: win32.DWORD) ?[]u8 {
+        const alloc = self.app.core_app.alloc;
+
+        // Sizes are in bytes, and the string is not terminated.
+        const size = win32.ImmGetCompositionStringW(himc, index, null, 0);
+        if (size <= 0 or @rem(size, 2) != 0) return null;
+        const units = alloc.alloc(u16, @intCast(@divExact(size, 2))) catch |err| {
+            log.warn("ime string dropped err={}", .{err});
+            return null;
+        };
+        defer alloc.free(units);
+
+        const got = win32.ImmGetCompositionStringW(himc, index, units.ptr, @intCast(size));
+        if (got <= 0) return null;
+        const len: usize = @intCast(@divTrunc(@min(got, size), 2));
+
+        const utf8 = Ime.utf8FromUtf16(alloc, units[0..len]) catch |err| {
+            log.warn("ime string dropped err={}", .{err});
+            return null;
+        };
+        if (utf8.len == 0) {
+            alloc.free(utf8);
+            return null;
+        }
+        return utf8;
+    }
+
+    /// Put the IME's candidate window at the cursor cell. `imePoint` takes
+    /// the renderer lock, so this needs `imeCore`'s conditions.
+    ///
+    /// Two forms, as in winit: the candidate form keeps the list off the
+    /// preedit, and the composition form is what some IMEs anchor the list
+    /// to instead. Which one a given IME honours is not documented.
+    fn imePlace(self: *Surface, core_surface: *CoreSurface, himc: win32.HIMC) void {
+        if (win32.GetFocus() != self.hwnd) return;
+
+        var client: win32.RECT = undefined;
+        if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
+        const pos = core_surface.imePoint();
+        const scale: f64 = @as(f64, @floatFromInt(self.dpi())) / 96.0;
+        const form = Ime.formFor(pos, scale, core_surface.size.cell.width, client);
+        if (self.ime.form) |last| if (std.meta.eql(last, form)) return;
+        self.ime.form = form;
+        log.debug("ime place dpi={d} pos={d:.1},{d:.1} {d:.1}x{d:.1} rc={d},{d},{d},{d}", .{
+            self.dpi(),   pos.x,       pos.y,         pos.width,      pos.height,
+            form.rc.left, form.rc.top, form.rc.right, form.rc.bottom,
+        });
+
+        var candidate: win32.CANDIDATEFORM = .{
+            .dwIndex = 0,
+            .dwStyle = win32.CFS_EXCLUDE,
+            .ptCurrentPos = .{ .x = form.rc.left, .y = form.rc.top },
+            .rcArea = form.rc,
+        };
+        _ = win32.ImmSetCandidateWindow(himc, &candidate);
+
+        var composition: win32.COMPOSITIONFORM = .{
+            .dwStyle = win32.CFS_POINT,
+            .ptCurrentPos = form.pt,
+            .rcArea = std.mem.zeroes(win32.RECT),
+        };
+        _ = win32.ImmSetCompositionWindow(himc, &composition);
+    }
+
+    /// Finish what the IME handlers could not do where they ran. Called
+    /// from `App.run`, never inside a core frame or a prompt.
+    ///
+    /// A composition does not outlive the focus: its preedit would stay
+    /// drawn over the cursor of a window the user has left. Korean is
+    /// completed, because a Hangul composition string is text the user
+    /// already sees as typed, with no conversion step to confirm; other
+    /// languages are cancelled, so that half-converted text does not reach
+    /// a shell the user is no longer looking at. Nothing is done while one
+    /// of this thread's own windows has the focus (a prompt): the user
+    /// returns to the composition.
+    fn syncIme(self: *Surface, core_surface: *CoreSurface) void {
+        self.flushIme(core_surface);
+
+        if (self.focused or win32.GetFocus() != null) return;
+        if (!self.ime.composing and self.preedit != .ime) return;
+
+        if (win32.ImmGetContext(self.hwnd)) |himc| {
+            const how = if (inputLanguage() & 0x3FF == win32.LANG_KOREAN)
+                win32.CPS_COMPLETE
+            else
+                win32.CPS_CANCEL;
+            log.debug("ime ends with the focus how={d}", .{how});
+            // Sends the IME's messages to this window before it returns.
+            _ = win32.ImmNotifyIME(himc, win32.NI_COMPOSITIONSTR, how, 0);
+            _ = win32.ImmReleaseContext(self.hwnd, himc);
+        }
+
+        // No document promises an end message on this path. A completion
+        // above may also have closed the surface.
+        const core_now = self.liveCore() orelse return;
+        self.ime.composing = false;
+        self.flushIme(core_now);
     }
 
     /// A character message with no keydown in this process to attach it to.
@@ -2873,14 +3450,15 @@ pub const Surface = struct {
         text.finish();
         if (text.len == 0) return;
 
+        // Text the IME committed earlier comes first.
+        if (self.app.canReenterCore()) self.flushIme(core_surface);
+
         if (text.composing) {
-            core_surface.preeditCallback(text.utf8()) catch |err|
+            self.setPreedit(core_surface, text.utf8(), .dead_key) catch |err|
                 log.warn("preedit callback failed err={}", .{err});
-            self.preedit_active = true;
-        } else if (self.preedit_active) {
-            core_surface.preeditCallback(null) catch |err|
+        } else if (self.preedit == .dead_key) {
+            self.setPreedit(core_surface, null, .none) catch |err|
                 log.warn("preedit callback failed err={}", .{err});
-            self.preedit_active = false;
         }
 
         _ = core_surface.keyCallback(.{
@@ -3758,6 +4336,12 @@ fn confirm(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) bool {
     ) == win32.IDOK;
 }
 
+/// The LANGID of this thread's input language, or 0.
+fn inputLanguage() u16 {
+    const hkl = win32.GetKeyboardLayout(0) orelse return 0;
+    return @truncate(@intFromPtr(hkl));
+}
+
 /// The OK-only form of `confirm`, with the same nesting rules.
 fn notice(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) void {
     app.prompt_depth += 1;
@@ -3940,4 +4524,118 @@ test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
         "https://example.com/\xff",
     };
     for (refused) |url| try std.testing.expect(!osc8Allowed(url));
+}
+
+test "win32: ime plan for a composition message" {
+    const Ime = Surface.Ime;
+    const A = Ime.Action;
+    const comp = win32.GCS_COMPSTR;
+    const result = win32.GCS_RESULTSTR;
+    const cursor_pos: u32 = 0x0080; // GCS_CURSORPOS
+    const attr_clause: u32 = 0x0030; // GCS_COMPATTR | GCS_COMPCLAUSE
+    const result_clause: u32 = 0x1000; // GCS_RESULTCLAUSE
+
+    const Case = struct { bits: u32, owner: Ime.Preedit, safe: bool, want: []const A };
+    const cases = [_]Case{
+        // No flag at all: cancelled. Only the IME's own preedit is cleared.
+        .{ .bits = 0, .owner = .ime, .safe = true, .want = &.{.clear_preedit} },
+        .{ .bits = 0, .owner = .dead_key, .safe = true, .want = &.{} },
+        .{ .bits = 0, .owner = .none, .safe = true, .want = &.{} },
+        // Flags outside GCS_ALL do not make it a live update.
+        .{ .bits = 0x4000, .owner = .ime, .safe = true, .want = &.{.clear_preedit} },
+
+        // A caret or clause change is a live update, never a cancel.
+        .{ .bits = cursor_pos, .owner = .ime, .safe = true, .want = &.{.update_preedit} },
+        .{ .bits = attr_clause, .owner = .ime, .safe = true, .want = &.{.update_preedit} },
+        .{ .bits = comp, .owner = .none, .safe = true, .want = &.{.update_preedit} },
+
+        // A result is delivered whatever the owner says, preedit cleared first.
+        .{ .bits = result, .owner = .none, .safe = true, .want = &.{.commit_result} },
+        .{ .bits = result | result_clause, .owner = .ime, .safe = true, .want = &.{ .clear_preedit, .commit_result } },
+        .{ .bits = result, .owner = .dead_key, .safe = true, .want = &.{ .clear_preedit, .commit_result } },
+        // Korean: a syllable is committed and the next one starts at once.
+        .{ .bits = result | comp, .owner = .ime, .safe = true, .want = &.{ .clear_preedit, .commit_result, .update_preedit } },
+
+        // Without the core nothing calls it: results wait, the rest is dropped.
+        .{ .bits = 0, .owner = .ime, .safe = false, .want = &.{} },
+        .{ .bits = comp, .owner = .ime, .safe = false, .want = &.{} },
+        .{ .bits = result, .owner = .ime, .safe = false, .want = &.{.defer_result} },
+        .{ .bits = result | comp, .owner = .none, .safe = false, .want = &.{.defer_result} },
+    };
+    for (cases) |c| {
+        const got = Ime.plan(c.bits, c.owner, c.safe);
+        try std.testing.expectEqualSlices(A, c.want, got.actions());
+    }
+
+    // Every result is either committed or deferred, for every input.
+    for ([_]Ime.Preedit{ .none, .dead_key, .ime }) |owner| {
+        for ([_]bool{ false, true }) |safe| {
+            for ([_]u32{ result, result | comp, result | cursor_pos, win32.GCS_ALL }) |bits| {
+                var delivered: usize = 0;
+                for (Ime.plan(bits, owner, safe).actions()) |a| {
+                    if (a == .commit_result or a == .defer_result) delivered += 1;
+                }
+                try std.testing.expectEqual(1, delivered);
+            }
+        }
+    }
+}
+
+test "win32: ime strings become UTF-8 without unpaired surrogates" {
+    const alloc = std.testing.allocator;
+    const Case = struct { units: []const u16, want: []const u8 };
+    const cases = [_]Case{
+        .{ .units = &.{}, .want = "" },
+        .{ .units = &.{ 0x65E5, 0x672C }, .want = "\u{65E5}\u{672C}" },
+        .{ .units = &.{ 0xD83D, 0xDE00 }, .want = "\u{1F600}" },
+        // A control character is kept: only what has no UTF-8 form is dropped.
+        .{ .units = &.{ 'a', 0x000A, 'b' }, .want = "a\nb" },
+        .{ .units = &.{ 'a', 0xD83D }, .want = "a" },
+        .{ .units = &.{ 0xDE00, 'a' }, .want = "a" },
+        .{ .units = &.{ 0xD83D, 'a', 0xDE00 }, .want = "a" },
+        .{ .units = &.{ 0xD83D, 0xD83D, 0xDE00 }, .want = "\u{1F600}" },
+    };
+    for (cases) |c| {
+        const got = try Surface.Ime.utf8FromUtf16(alloc, c.units);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "win32: ime forms follow the cursor cell" {
+    const Ime = Surface.Ime;
+    const client: win32.RECT = .{ .left = 0, .top = 0, .right = 2000, .bottom = 1000 };
+
+    // 200% DPI, 20x40 px cells, cursor at column 3, row 2, two cells of
+    // preedit. The core reports the cell's middle and bottom in 96-DPI
+    // pixels, and the width in physical pixels.
+    const pos: apprt.IMEPos = .{ .x = (3 * 20 + 10) / 2.0, .y = (3 * 40) / 2.0, .width = 40, .height = 40 / 2.0 };
+    const form = Ime.formFor(pos, 2.0, 20, client);
+    try std.testing.expectEqual(win32.RECT{ .left = 60, .top = 80, .right = 100, .bottom = 120 }, form.rc);
+    try std.testing.expectEqual(win32.POINT{ .x = 60, .y = 120 }, form.pt);
+
+    // No preedit yet: one cell wide.
+    var none = pos;
+    none.width = 0;
+    try std.testing.expectEqual(@as(win32.LONG, 80), Ime.formFor(none, 2.0, 20, client).rc.right);
+
+    // Never outside the client area, whatever the core reports.
+    const wild: apprt.IMEPos = .{ .x = 5000, .y = -50, .width = std.math.nan(f64), .height = 1e12 };
+    const clamped = Ime.formFor(wild, 2.0, 20, client).rc;
+    try std.testing.expect(clamped.left >= 0 and clamped.right <= 2000 and clamped.left <= clamped.right);
+    try std.testing.expect(clamped.top >= 0 and clamped.bottom <= 1000 and clamped.top <= clamped.bottom);
+}
+
+test "win32: ime message fields" {
+    const Ime = Surface.Ime;
+
+    // ISC_SHOWUICOMPOSITIONWINDOW is bit 31 of a sign-extended value.
+    const all: win32.LPARAM = @bitCast(@as(usize, 0xFFFF_FFFF_C000_000F));
+    const want: win32.LPARAM = @bitCast(@as(usize, 0xFFFF_FFFF_4000_000F));
+    try std.testing.expectEqual(want, Ime.setContextLparam(all));
+    try std.testing.expectEqual(@as(win32.LPARAM, 0x4000_000F), Ime.setContextLparam(0x4000_000F));
+
+    // Scan code 0x1E, not extended; then the same with the extended flag.
+    try std.testing.expectEqual(@as(usize, 0x01E), Ime.scanSlot(0x001E_0001));
+    try std.testing.expectEqual(@as(usize, 0x11E), Ime.scanSlot(@bitCast(@as(usize, 0xC11E_0001))));
 }
