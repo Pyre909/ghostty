@@ -64,6 +64,11 @@ pub const Options = struct {
     /// a fallback to static.
     link_system_libs: []const []const u8 = &.{},
 
+    /// The libraries that you want to link against using `linkLibrary`. These
+    /// will likely be C/C++ libraries compiled with the Zig build system that
+    /// install headers alongside their other artifacts.
+    link_libs: []const *std.Build.Step.Compile = &.{},
+
     /// Any additional include paths. These will be added using `-I` to the
     /// translation process, and made available to the translated code, in the
     /// order they are specified.
@@ -81,6 +86,11 @@ pub const Options = struct {
     /// You likely don't need this if you are not building for an Apple
     /// platform.
     link_frameworks: []const []const u8 = &.{},
+
+    /// Whether or not struct fields should be initialized by default. This
+    /// passes the `default-init` flag directly to the translate-c process in
+    /// its literal form (null means no flag added).
+    default_init: ?bool = null,
 
     /// Supply an external libc file. The expected format here is exactly what
     /// you would get if you ran `zig libc` and can be used if the toolchain on
@@ -136,6 +146,7 @@ pub fn addImportToModule(
 /// `addImportToModule`.
 pub fn init(b: *std.Build, options: Options) !Translator {
     const translated = try initTranslator(b, options);
+    for (options.link_libs) |lib| translated.linkLibrary(lib);
     for (options.include_paths) |path| translated.addIncludePath(path);
     for (options.system_include_paths) |path| translated.addSystemIncludePath(path);
     for (options.link_frameworks) |framework| translated.mod.linkFramework(framework, .{});
@@ -149,7 +160,23 @@ pub fn init(b: *std.Build, options: Options) !Translator {
 pub fn initTranslator(b: *std.Build, options: Options) !Translator {
     const this_dep = b.dependency(options.dependency_name, .{});
     const translate_c_dep = this_dep.builder.dependency("translate_c", .{});
-    return .init(translate_c_dep, .{
+
+    // In ReleaseSafe translate-c passes the preprocessor -O2 and
+    // _FORTIFY_SOURCE=2, after any argument a caller adds, and mingw's
+    // headers then expose their fortified string wrappers in a form the
+    // translator cannot express (__builtin_object_size with a bool
+    // argument, unused extern locals), so no *-windows-gnu translation
+    // that reaches string.h builds in that mode. The wrappers are inline
+    // conveniences for C callers that translated code never calls, so
+    // Windows translates as Debug there. The module built from the
+    // translation keeps the requested optimize mode below.
+    const translate_optimize: std.builtin.OptimizeMode = if (options.target.result.os.tag == .windows and
+        options.optimize == .ReleaseSafe)
+        .Debug
+    else
+        options.optimize;
+
+    var translator: Translator = .init(translate_c_dep, .{
         .c_source_file = switch (options.source) {
             .file => |f| f,
             .includes => |includes| b.addWriteFiles().add(
@@ -158,9 +185,10 @@ pub fn initTranslator(b: *std.Build, options: Options) !Translator {
             ),
         },
         .target = options.target,
-        .optimize = options.optimize,
+        .optimize = translate_optimize,
         .link_libc = options.link_libc,
         .link_system_libs = try marshalSystemLibs(b, options.link_system_libs),
+        .default_init = options.default_init,
         .libc_file = switch (options.libc_file) {
             .detect_darwin => if (options.target.result.os.tag.isDarwin()) libc_file: {
                 switch (try apple_sdk.pathsForTarget(this_dep.builder, options.target.result)) {
@@ -171,6 +199,8 @@ pub fn initTranslator(b: *std.Build, options: Options) !Translator {
         },
         .extra_args = options.extra_args,
     });
+    translator.mod.optimize = options.optimize;
+    return translator;
 }
 
 /// Marshals linked system libraries into the `Translator.LinkSystemLib`
