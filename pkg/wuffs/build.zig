@@ -35,15 +35,21 @@ pub fn build(b: *std.Build) !void {
 
     translate: {
         const wuffs_dep = b.lazyDependency("wuffs", .{}) orelse break :translate;
-        const include_paths: []const std.Build.LazyPath = switch (windows) {
-            true => &.{wuffs_dep.path("release/c")},
 
-            // Wuffs only needs stdlib.h and string.h from libc, and only for
-            // a handful of declarations. We provide minimal versions of these
-            // headers so that wuffs can be translated and compiled without
-            // libc, notably for freestanding targets (wasm32) but this also
-            // avoids requiring an Apple SDK for translate-c on macOS.
-            false => &.{ b.path("include"), wuffs_dep.path("release/c") },
+        // Wuffs only needs stdlib.h and string.h from libc, and only for
+        // a handful of declarations. We provide minimal versions of these
+        // headers so that wuffs can be translated and compiled without
+        // libc, notably for freestanding targets (wasm32) but this also
+        // avoids requiring an Apple SDK for translate-c on macOS.
+        //
+        // Windows links libc but translates against them as well: in
+        // ReleaseSafe translate-c defines _FORTIFY_SOURCE=2 after any
+        // flag we pass, and mingw's fortified string wrappers then come
+        // out in a form translate-c cannot express (__builtin_object_size
+        // with a bool argument), so the unit would not build.
+        const include_paths: []const std.Build.LazyPath = &.{
+            b.path("include"),
+            wuffs_dep.path("release/c"),
         };
 
         // Split up macro flags so that we can add them to translation
