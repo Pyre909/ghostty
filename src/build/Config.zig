@@ -411,15 +411,38 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "Build a Position Independent Executable. Default true for system packages.",
     ) orelse system_package;
 
-    config.strip = b.option(
+    const strip_requested = b.option(
         bool,
         "strip",
         "Strip the final executable. Default true for fast and small releases",
-    ) orelse switch (optimize) {
+    );
+    config.strip = strip_requested orelse switch (optimize) {
         .Debug => false,
         .ReleaseSafe => false,
         .ReleaseFast, .ReleaseSmall => true,
     };
+
+    // A stripped build is miscompiled on aarch64-windows, so it is never
+    // stripped there. With -fstrip, Zig gives internal globals private
+    // linkage, and for a private `threadlocal` LLVM's COFF backend bakes
+    // the variable's raw section offset into the
+    // IMAGE_REL_ARM64_SECREL_HIGH12A `add` where the offset >> 12 belongs,
+    // so the low twelve bits of the offset are added a second time,
+    // shifted up by twelve. Zeroing glad's threadlocal context (4352 bytes
+    // at offset 0x10) then lands 64 KiB past the thread's TLS block, in the
+    // process heap, and the process dies at startup with a heap corruption.
+    // A named symbol is relocated directly and is unaffected. The debug
+    // info goes to the PDB, so the executable itself does not grow.
+    if (config.strip and
+        config.target.result.os.tag == .windows and
+        config.target.result.cpu.arch == .aarch64)
+    {
+        if (strip_requested == true) std.log.warn(
+            "-Dstrip is ignored for aarch64-windows: a stripped build is miscompiled",
+            .{},
+        );
+        config.strip = false;
+    }
 
     //---------------------------------------------------------------
     // Artifacts to Emit
