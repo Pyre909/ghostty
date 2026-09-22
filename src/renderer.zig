@@ -57,6 +57,9 @@ test {
     // Our comptime-chosen renderer
     _ = Renderer;
 
+    // The D3D11 bindings carry layout tests that run on every host.
+    _ = @import("renderer/d3d11/api.zig");
+
     _ = cursor;
     _ = message;
     _ = shadertoy;
