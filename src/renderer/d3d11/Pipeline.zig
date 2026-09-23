@@ -4,8 +4,7 @@
 //! Shaders compile at runtime with D3DCompile from the HLSL source the
 //! backend embeds, as the OpenGL backend compiles its GLSL at runtime. A
 //! pipeline given no source stays a placeholder: `ready` is false and render
-//! steps skip it, which is how the pipelines that are not ported yet coexist
-//! with the ones that are.
+//! steps skip it.
 const Self = @This();
 
 const std = @import("std");

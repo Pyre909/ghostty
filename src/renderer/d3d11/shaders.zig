@@ -6,9 +6,8 @@
 //! scalars, so the u32-packed bit fields are what the shaders will read.
 //!
 //! The HLSL sources under shaders/hlsl/ are embedded at build time with
-//! their `#include`s expanded and compiled at runtime by D3DCompile. The
-//! pipelines that are not ported yet are built without sources and stay
-//! placeholders that render steps skip.
+//! their `#include`s expanded and compiled at runtime by D3DCompile. A
+//! pipeline built without sources stays a placeholder that render steps skip.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
@@ -39,10 +38,14 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
         } },
         .{ "image", .{
             .vertex_attributes = Image,
+            .vertex_fn = loadShaderCode("../shaders/hlsl/image.vs.hlsl"),
+            .fragment_fn = loadShaderCode("../shaders/hlsl/image.ps.hlsl"),
             .blending_enabled = true,
         } },
         .{ "bg_image", .{
             .vertex_attributes = BgImage,
+            .vertex_fn = loadShaderCode("../shaders/hlsl/bg_image.vs.hlsl"),
+            .fragment_fn = loadShaderCode("../shaders/hlsl/bg_image.ps.hlsl"),
             .blending_enabled = true,
         } },
     };

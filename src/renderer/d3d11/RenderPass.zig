@@ -10,7 +10,9 @@
 //! are t0, t1, ... with their samplers at s0, s1, ...; storage buffers
 //! (`buffers[1..]` of a step) are t8, t9, .... Buffers, textures and
 //! samplers are bound to both the vertex and the pixel stage, as Metal binds
-//! them to both stages.
+//! them to both stages. A pass begins with the default linear, clamping
+//! sampler at s0, which is what the image steps, which name no sampler,
+//! sample with.
 const Self = @This();
 
 const std = @import("std");
@@ -33,6 +35,9 @@ pub const Options = struct {
 
     /// Color attachments for this render pass.
     attachments: []const Attachment,
+
+    /// Bound at s0 before any step runs.
+    default_sampler: *api.ID3D11SamplerState,
 
     /// Describes a color attachment.
     pub const Attachment = struct {
@@ -112,6 +117,10 @@ pub fn begin(opts: Options) Self {
         .MaxDepth = 1,
     };
     opts.context.vtable.RSSetViewports(opts.context, 1, @ptrCast(&viewport));
+
+    const samplers = [_]?*api.ID3D11SamplerState{opts.default_sampler};
+    opts.context.vtable.VSSetSamplers(opts.context, 0, 1, &samplers);
+    opts.context.vtable.PSSetSamplers(opts.context, 0, 1, &samplers);
 
     return self;
 }

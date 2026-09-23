@@ -16,9 +16,13 @@ const log = std.log.scoped(.d3d11);
 
 pub const Options = struct {
     context: *api.ID3D11DeviceContext,
+
+    /// Every render pass of the frame begins with this sampler at s0.
+    default_sampler: *api.ID3D11SamplerState,
 };
 
 context: *api.ID3D11DeviceContext,
+default_sampler: *api.ID3D11SamplerState,
 renderer: *Renderer,
 target: *Target,
 
@@ -32,6 +36,7 @@ pub fn begin(
 ) !Self {
     return .{
         .context = opts.context,
+        .default_sampler = opts.default_sampler,
         .renderer = renderer,
         .target = target,
     };
@@ -46,6 +51,7 @@ pub inline fn renderPass(
     return RenderPass.begin(.{
         .context = self.context,
         .attachments = attachments,
+        .default_sampler = self.default_sampler,
     });
 }
 

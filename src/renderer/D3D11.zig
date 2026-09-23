@@ -101,6 +101,10 @@ feature_level: api.D3D_FEATURE_LEVEL,
 /// the first frame.
 compile: api.D3DCompileFn,
 
+/// Bound at s0 when a render pass begins, for the steps that sample a
+/// texture without naming a sampler: the image steps.
+default_sampler: Sampler,
+
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
@@ -252,6 +256,15 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         log.warn("MakeWindowAssociation failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
     }
 
+    // The linear, clamping state the other backends give their image
+    // textures.
+    const default_sampler = try Sampler.init(.{
+        .device = device,
+        .filter = .MIN_MAG_MIP_LINEAR,
+        .address = .CLAMP,
+    });
+    errdefer default_sampler.deinit();
+
     log.info("D3D11 swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_discard", .{
         @intFromPtr(hwnd),
     });
@@ -263,6 +276,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         .swap_chain = swap_chain,
         .feature_level = level,
         .compile = compile,
+        .default_sampler = default_sampler,
         .blending = opts.config.blending,
     };
 }
@@ -311,6 +325,7 @@ fn logAdapter(adapter: *api.IDXGIAdapter, level: api.D3D_FEATURE_LEVEL) void {
 pub fn deinit(self: *D3D11) void {
     self.context.vtable.ClearState(self.context);
     self.context.vtable.Flush(self.context);
+    self.default_sampler.deinit();
     api.release(self.swap_chain);
     api.release(self.context);
     api.release(self.device);
@@ -588,5 +603,8 @@ pub fn beginFrame(
     renderer: *Renderer,
     target: *Target,
 ) !Frame {
-    return try Frame.begin(.{ .context = self.context }, renderer, target);
+    return try Frame.begin(.{
+        .context = self.context,
+        .default_sampler = self.default_sampler.sampler,
+    }, renderer, target);
 }
