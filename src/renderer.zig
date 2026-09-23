@@ -17,6 +17,7 @@ pub const Backend = @import("renderer/backend.zig").Backend;
 pub const GenericRenderer = @import("renderer/generic.zig").Renderer;
 pub const Metal = @import("renderer/Metal.zig");
 pub const OpenGL = @import("renderer/OpenGL.zig");
+pub const D3D11 = @import("renderer/D3D11.zig");
 pub const WebGL = @import("renderer/WebGL.zig");
 pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
@@ -39,6 +40,7 @@ pub const Renderer = switch (build_config.renderer) {
     .metal => GenericRenderer(Metal),
     .opengl => GenericRenderer(OpenGL),
     .webgl => WebGL,
+    .d3d11 => GenericRenderer(D3D11),
 };
 
 /// The health status of a renderer. These must be shared across all
@@ -57,8 +59,11 @@ test {
     // Our comptime-chosen renderer
     _ = Renderer;
 
-    // The D3D11 bindings carry layout tests that run on every host.
+    // The D3D11 backend's bindings and data layouts carry tests that
+    // run on every host.
     _ = @import("renderer/d3d11/api.zig");
+    _ = @import("renderer/d3d11/buffer.zig");
+    _ = @import("renderer/d3d11/shaders.zig");
 
     _ = cursor;
     _ = message;

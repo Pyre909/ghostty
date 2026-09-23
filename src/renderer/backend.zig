@@ -6,6 +6,7 @@ pub const Backend = enum {
     opengl,
     metal,
     webgl,
+    d3d11,
 
     pub fn default(
         target: std.Target,
