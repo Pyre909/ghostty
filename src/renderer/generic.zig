@@ -1752,11 +1752,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             errdefer swap_chain.releaseFrame();
             // log.debug("drawing frame index={}", .{swap_chain.frame_index});
 
-            // If we need to reinitialize our shaders, do so.
+            // If we need to reinitialize our shaders, do so. The flag
+            // clears only once that succeeded: a failure leaves the
+            // shaders defunct, and the next frame must try again rather
+            // than reach the assertion below.
             if (self.reinitialize_shaders) {
-                self.reinitialize_shaders = false;
                 self.shaders.deinit(self.alloc);
                 try self.initShaders();
+                self.reinitialize_shaders = false;
             }
 
             // Our shaders should not be defunct at this point.

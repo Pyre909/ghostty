@@ -105,6 +105,20 @@ compile: api.D3DCompileFn,
 /// texture without naming a sampler: the image steps.
 default_sampler: Sampler,
 
+/// Present parameters: the sync interval and the flags. `window-vsync =
+/// false` presents with interval 0, and with tearing allowed when DXGI
+/// reports support, so the frame rate is not tied to the display.
+sync_interval: api.UINT,
+present_flags: api.UINT,
+
+/// The debug layer's message queue, Debug builds only; its messages go to
+/// the log after every present.
+info_queue: ?*api.ID3D11InfoQueue = null,
+
+/// Set once the device was lost. Later frames are refused without
+/// touching the device, which stays lost until the surface is recreated.
+lost: bool = false,
+
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
@@ -186,6 +200,13 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     const context = context_ptr orelse return error.D3D11DeviceFailed;
     errdefer api.release(context);
 
+    // The debug layer queues its messages; drainDebugMessages logs them.
+    const info_queue: ?*api.ID3D11InfoQueue = if (flags & api.D3D11_CREATE_DEVICE_DEBUG != 0)
+        api.queryInterface(device, api.ID3D11InfoQueue) catch null
+    else
+        null;
+    errdefer if (info_queue) |q| api.release(q);
+
     // The factory that made the adapter that made the device is the one
     // that may create swap chains for it: device -> adapter -> factory.
     const dxgi_device = api.queryInterface(device, api.IDXGIDevice) catch {
@@ -210,6 +231,28 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     };
     defer api.release(factory);
 
+    // `window-vsync = false` presents without waiting for a vblank. In
+    // windowed flip model only tearing unlocks the rate, and DXGI must
+    // be asked whether it can tear; without it interval 0 still presents
+    // as soon as the queue has room.
+    const sync_interval: api.UINT = if (opts.config.vsync) 1 else 0;
+    var swap_chain_flags: api.UINT = 0;
+    var present_flags: api.UINT = 0;
+    if (!opts.config.vsync) tearing: {
+        const factory5 = api.queryInterface(factory, api.IDXGIFactory5) catch break :tearing;
+        defer api.release(factory5);
+        var allow: api.BOOL = 0;
+        const check = factory5.vtable.CheckFeatureSupport(
+            factory5,
+            .PRESENT_ALLOW_TEARING,
+            @ptrCast(&allow),
+            @sizeOf(api.BOOL),
+        );
+        if (api.failed(check) or allow == 0) break :tearing;
+        swap_chain_flags |= api.DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        present_flags |= api.DXGI_PRESENT_ALLOW_TEARING;
+    }
+
     // Width and height 0 size the chain to the client area. The format is
     // the same either way: the target texture carries the sRGB view when
     // blending is linear and its bytes are copied over as they are.
@@ -224,7 +267,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         .Scaling = .NONE,
         .SwapEffect = .FLIP_DISCARD,
         .AlphaMode = .IGNORE,
-        .Flags = 0,
+        .Flags = swap_chain_flags,
     };
     var swap_chain_ptr: ?*api.IDXGISwapChain1 = null;
     hr = factory.vtable.CreateSwapChainForHwnd(
@@ -265,8 +308,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     });
     errdefer default_sampler.deinit();
 
-    log.info("D3D11 swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_discard", .{
+    log.info("D3D11 swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_discard sync_interval={d} tearing={}", .{
         @intFromPtr(hwnd),
+        sync_interval,
+        present_flags & api.DXGI_PRESENT_ALLOW_TEARING != 0,
     });
 
     return .{
@@ -277,6 +322,9 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         .feature_level = level,
         .compile = compile,
         .default_sampler = default_sampler,
+        .sync_interval = sync_interval,
+        .present_flags = present_flags,
+        .info_queue = info_queue,
         .blending = opts.config.blending,
     };
 }
@@ -328,6 +376,7 @@ pub fn deinit(self: *D3D11) void {
     self.default_sampler.deinit();
     api.release(self.swap_chain);
     api.release(self.context);
+    if (self.info_queue) |q| api.release(q);
     api.release(self.device);
 }
 
@@ -410,6 +459,8 @@ pub const PresentError = error{
 /// `setViewport`, so every reference to a back buffer lives inside this
 /// function and ResizeBuffers never finds one outstanding.
 pub fn present(self: *D3D11, target: Target) PresentError!void {
+    if (self.lost) return error.DeviceLost;
+
     var rc: win32.RECT = undefined;
     if (win32.GetClientRect(self.hwnd, &rc) != 0) {
         const cw: i64 = rc.right - rc.left;
@@ -461,7 +512,8 @@ pub fn present(self: *D3D11, target: Target) PresentError!void {
     // on the target changes nothing about the bytes.
     self.context.vtable.CopyResource(self.context, back.resource(), target.texture.resource());
 
-    const hr = self.swap_chain.present(1, 0);
+    const hr = self.swap_chain.present(self.sync_interval, self.present_flags);
+    self.drainDebugMessages();
     self.present_count += 1;
     if (self.present_count == 1) {
         log.info("first present hwnd={x} {d}x{d}", .{ @intFromPtr(self.hwnd), w, h });
@@ -486,9 +538,40 @@ fn presentError(self: *D3D11, hr: api.HRESULT) PresentError {
             @as(u32, @bitCast(hr)),
             @as(u32, @bitCast(reason)),
         });
+        self.lost = true;
         return error.DeviceLost;
     }
     return error.PresentFailed;
+}
+
+/// Log what the debug layer queued since the last drain. Debug builds
+/// only: `info_queue` is null otherwise. Corruption and errors log as
+/// errors, warnings as warnings, the rest at debug level.
+fn drainDebugMessages(self: *D3D11) void {
+    const queue = self.info_queue orelse return;
+    const count = queue.vtable.GetNumStoredMessages(queue);
+    if (count == 0) return;
+    defer queue.vtable.ClearStoredMessages(queue);
+
+    // A message is the struct followed by its text in one allocation.
+    var buf: [4096]u8 align(@alignOf(api.D3D11_MESSAGE)) = undefined;
+    var i: api.UINT64 = 0;
+    while (i < count) : (i += 1) {
+        var len: api.SIZE_T = 0;
+        if (api.failed(queue.vtable.GetMessage(queue, i, null, &len))) continue;
+        if (len > buf.len) {
+            log.warn("debug layer message #{d} is {d} bytes, too long to log", .{ i, len });
+            continue;
+        }
+        if (api.failed(queue.vtable.GetMessage(queue, i, @ptrCast(&buf), &len))) continue;
+        const msg: *const api.D3D11_MESSAGE = @ptrCast(&buf);
+        const text: []const u8 = if (msg.pDescription) |d| std.mem.sliceTo(d, 0) else "";
+        switch (msg.Severity) {
+            .CORRUPTION, .ERROR => log.err("debug layer: {s}", .{text}),
+            .WARNING => log.warn("debug layer: {s}", .{text}),
+            else => log.debug("debug layer: {s}", .{text}),
+        }
+    }
 }
 
 fn bufferOptions(self: D3D11, kind: bufferpkg.Kind) bufferpkg.Options {

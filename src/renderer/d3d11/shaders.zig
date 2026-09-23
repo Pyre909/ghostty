@@ -185,6 +185,11 @@ pub const Shaders = struct {
 /// vertex shader with a converted shadertoy shader as its pixel shader,
 /// without blending, as on Metal.
 ///
+/// A shader the HLSL compiler rejects is logged and left out rather than
+/// failing every shader: glslang has accepted it by now, so what remains
+/// is a construct this backend's compiler does not take, and the terminal
+/// stays usable without that effect.
+///
 /// The shaders argument is a set of shader source code, not file paths.
 fn initPostPipelines(
     alloc: Allocator,
@@ -205,8 +210,8 @@ fn initPostPipelines(
         alloc.free(pipelines);
     }
 
-    for (shaders) |source| {
-        pipelines[i] = try Pipeline.init(.{
+    for (shaders, 0..) |source, n| {
+        pipelines[i] = Pipeline.init(.{
             .device = device,
             .compile = compile,
             .format = format,
@@ -214,11 +219,19 @@ fn initPostPipelines(
             .vertex_source = full_screen_vertex,
             .fragment_source = source,
             .blending_enabled = false,
-        });
+        }) catch |err| switch (err) {
+            error.ShaderCompileFailed => {
+                log.warn("custom shader {d} skipped: it did not compile", .{n});
+                continue;
+            },
+            else => return err,
+        };
         i += 1;
     }
 
-    return pipelines;
+    // Shrunk to the ones that compiled; an empty result frees the
+    // allocation, and deinit frees nothing for an empty slice.
+    return try alloc.realloc(pipelines, i);
 }
 
 /// The uniforms that are passed to our shaders.
