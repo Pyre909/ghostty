@@ -43,9 +43,9 @@ pub const Sampler = @import("d3d11/Sampler.zig");
 pub const Texture = @import("d3d11/Texture.zig");
 pub const shaders = @import("d3d11/shaders.zig");
 
-/// Custom shaders are not translated for this backend yet, so the target is
-/// a placeholder; `shaders.Shaders.init` builds no post pipelines.
-pub const custom_shader_target: shadertoy.Target = .glsl;
+/// Custom shaders arrive as HLSL from shadertoy.zig and compile like the
+/// built-in ones; `shaders.Shaders.init` builds one post pipeline each.
+pub const custom_shader_target: shadertoy.Target = .hlsl;
 /// SV_Position is +Y = down, like Metal's fragment position.
 pub const custom_shader_y_is_down = true;
 

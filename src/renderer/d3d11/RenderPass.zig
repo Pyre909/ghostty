@@ -105,6 +105,13 @@ pub fn begin(opts: Options) Self {
         opts.context.vtable.ClearRenderTargetView(opts.context, view, &c);
     }
 
+    // A custom shader pass draws into the texture the previous pass read,
+    // so release the texture slots first; Direct3D would otherwise unbind
+    // the conflicting view itself and log a warning.
+    const no_views = [_]?*api.ID3D11ShaderResourceView{ null, null };
+    opts.context.vtable.VSSetShaderResources(opts.context, 0, no_views.len, &no_views);
+    opts.context.vtable.PSSetShaderResources(opts.context, 0, no_views.len, &no_views);
+
     const views = [_]?*api.ID3D11RenderTargetView{view};
     opts.context.vtable.OMSetRenderTargets(opts.context, 1, &views, null);
 

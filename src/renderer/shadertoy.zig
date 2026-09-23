@@ -42,7 +42,7 @@ pub const Uniforms = extern struct {
 };
 
 /// The target to load shaders for.
-pub const Target = enum { glsl, msl };
+pub const Target = enum { glsl, msl, hlsl };
 
 /// Load a set of shaders from files and convert them to the target
 /// format. The shader order is preserved.
@@ -131,12 +131,13 @@ pub fn loadFromFile(
         break :spirv list.items;
     };
 
-    // Convert to MSL
+    // Convert to the target language
     return switch (target) {
         // Important: using the alloc_gpa here on purpose because this
         // is the final result that will be returned to the caller.
         .glsl => try glslFromSpv(alloc_gpa, spirv),
         .msl => try mslFromSpv(alloc_gpa, spirv),
+        .hlsl => try hlslFromSpv(alloc_gpa, spirv),
     };
 }
 
@@ -250,6 +251,25 @@ pub fn mslFromSpv(alloc: Allocator, spv: []const u8) ![:0]const u8 {
                 options,
                 c.SPVC_COMPILER_OPTION_MSL_ENABLE_DECORATION_BINDING,
                 c.SPVC_TRUE,
+            ) != c.SPVC_SUCCESS) {
+                return error.SpvcFailed;
+            }
+        }
+    }).setOptions);
+}
+
+/// Convert SPIR-V binary to HLSL for shader model 5.0, which is what the
+/// Direct3D 11 backend compiles at runtime. The bindings carry over as
+/// registers: the Globals block is b1, iChannel0 is t0 with its sampler
+/// at s0, which is how that backend's render pass binds them.
+pub fn hlslFromSpv(alloc: Allocator, spv: []const u8) ![:0]const u8 {
+    const c = spvcross.c;
+    return try spvCross(alloc, c.SPVC_BACKEND_HLSL, spv, (struct {
+        fn setOptions(options: c.spvc_compiler_options) error{SpvcFailed}!void {
+            if (c.spvc_compiler_options_set_uint(
+                options,
+                c.SPVC_COMPILER_OPTION_HLSL_SHADER_MODEL,
+                50,
             ) != c.SPVC_SUCCESS) {
                 return error.SpvcFailed;
             }
@@ -422,6 +442,31 @@ test "shadertoy to glsl" {
     defer alloc.free(glsl);
 
     // log.warn("glsl={s}", .{glsl});
+}
+
+test "shadertoy to hlsl" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const src = try testGlslZ(alloc, test_crt);
+    defer alloc.free(src);
+
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+    try spirvFromGlsl(&buf.writer, null, src);
+
+    var spvlist: std.ArrayListAligned(u8, .of(u32)) = .empty;
+    defer spvlist.deinit(alloc);
+    try spvlist.appendSlice(alloc, buf.written());
+
+    const hlsl = try hlslFromSpv(alloc, spvlist.items);
+    defer alloc.free(hlsl);
+
+    // The Direct3D 11 render pass binds the uniforms at b1 and the
+    // source texture with its sampler at t0 and s0.
+    try testing.expect(std.mem.indexOf(u8, hlsl, "register(b1)") != null);
+    try testing.expect(std.mem.indexOf(u8, hlsl, "register(t0)") != null);
+    try testing.expect(std.mem.indexOf(u8, hlsl, "register(s0)") != null);
 }
 
 const test_crt = @embedFile("shaders/test_shadertoy_crt.glsl");

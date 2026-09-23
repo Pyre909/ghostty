@@ -18,15 +18,19 @@ const Pipeline = @import("Pipeline.zig");
 
 const log = std.log.scoped(.d3d11);
 
+/// The vertex shader of every full-screen pipeline, the custom shader
+/// pipelines included.
+const full_screen_vertex = loadShaderCode("../shaders/hlsl/full_screen.vs.hlsl");
+
 const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
     &.{
         .{ "bg_color", .{
-            .vertex_fn = loadShaderCode("../shaders/hlsl/full_screen.vs.hlsl"),
+            .vertex_fn = full_screen_vertex,
             .fragment_fn = loadShaderCode("../shaders/hlsl/bg_color.ps.hlsl"),
             .blending_enabled = false,
         } },
         .{ "cell_bg", .{
-            .vertex_fn = loadShaderCode("../shaders/hlsl/full_screen.vs.hlsl"),
+            .vertex_fn = full_screen_vertex,
             .fragment_fn = loadShaderCode("../shaders/hlsl/cell_bg.ps.hlsl"),
             .blending_enabled = true,
         } },
@@ -125,8 +129,6 @@ pub const Shaders = struct {
         post_shaders: []const [:0]const u8,
         format: api.DXGI_FORMAT,
     ) !Shaders {
-        _ = alloc;
-
         var pipelines: PipelineCollection = undefined;
         var initialized_pipelines: usize = 0;
 
@@ -146,15 +148,21 @@ pub const Shaders = struct {
             initialized_pipelines += 1;
         }
 
-        if (post_shaders.len > 0) {
-            log.warn("custom shaders are not supported by the Direct3D 11 backend yet; {d} ignored", .{
-                post_shaders.len,
-            });
-        }
+        const post_pipelines: []const Pipeline = try initPostPipelines(
+            alloc,
+            device,
+            compile,
+            post_shaders,
+            format,
+        );
+        errdefer if (post_pipelines.len > 0) {
+            for (post_pipelines) |pipeline| pipeline.deinit();
+            alloc.free(post_pipelines);
+        };
 
         return .{
             .pipelines = pipelines,
-            .post_pipelines = &.{},
+            .post_pipelines = post_pipelines,
         };
     }
 
@@ -172,6 +180,46 @@ pub const Shaders = struct {
         }
     }
 };
+
+/// Initialize our custom shader pipelines: each one runs the full-screen
+/// vertex shader with a converted shadertoy shader as its pixel shader,
+/// without blending, as on Metal.
+///
+/// The shaders argument is a set of shader source code, not file paths.
+fn initPostPipelines(
+    alloc: Allocator,
+    device: *api.ID3D11Device,
+    compile: api.D3DCompileFn,
+    shaders: []const [:0]const u8,
+    format: api.DXGI_FORMAT,
+) ![]const Pipeline {
+    // If we have no shaders, do nothing.
+    if (shaders.len == 0) return &.{};
+
+    // Keeps track of how many pipelines we successfully built, so
+    // that an error undoes exactly those.
+    var i: usize = 0;
+    var pipelines = try alloc.alloc(Pipeline, shaders.len);
+    errdefer {
+        for (pipelines[0..i]) |pipeline| pipeline.deinit();
+        alloc.free(pipelines);
+    }
+
+    for (shaders) |source| {
+        pipelines[i] = try Pipeline.init(.{
+            .device = device,
+            .compile = compile,
+            .format = format,
+            .name = "custom shader",
+            .vertex_source = full_screen_vertex,
+            .fragment_source = source,
+            .blending_enabled = false,
+        });
+        i += 1;
+    }
+
+    return pipelines;
+}
 
 /// The uniforms that are passed to our shaders.
 pub const Uniforms = extern struct {
