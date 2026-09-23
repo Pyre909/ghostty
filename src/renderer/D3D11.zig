@@ -15,10 +15,9 @@
 //! The target cannot be the back buffer itself: on resize the generic
 //! renderer creates the new target before it drops the old one.
 //!
-//! This is the skeleton: the device, the swap chain and every resource type
-//! exist and have working lifecycles, but no shader is compiled yet, so a
-//! render pass leaves only its clear on the target and the window shows
-//! black. It is reachable only with `-Drenderer=d3d11`.
+//! The backend is reachable only with `-Drenderer=d3d11` while it grows
+//! toward parity with the WGL path; pipelines not ported yet are skipped by
+//! the render pass.
 pub const D3D11 = @This();
 
 const std = @import("std");
@@ -81,6 +80,9 @@ const win32 = struct {
     ) callconv(.winapi) api.HRESULT;
 
     extern "user32" fn GetClientRect(hwnd: api.HWND, rect: *RECT) callconv(.winapi) api.BOOL;
+
+    extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?api.HMODULE;
+    extern "kernel32" fn GetProcAddress(module: api.HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 };
 
 /// The window this renderer presents to. Borrowed from the apprt, which
@@ -93,6 +95,11 @@ swap_chain: *api.IDXGISwapChain1,
 
 /// The feature level the device came up with.
 feature_level: api.D3D_FEATURE_LEVEL,
+
+/// D3DCompile from d3dcompiler_47.dll, which is loaded once per process
+/// at init so that a missing compiler fails surface creation rather than
+/// the first frame.
+compile: api.D3DCompileFn,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -119,6 +126,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         apprt.windows => opts.rt_surface.hwnd,
         else => @compileError("unsupported apprt for Direct3D 11"),
     };
+
+    const compile = try loadCompiler();
 
     // BGRA support is required for the B8G8R8A8 swap chain format. The
     // debug layer needs the Graphics Tools optional feature; without it
@@ -253,8 +262,26 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
         .context = context,
         .swap_chain = swap_chain,
         .feature_level = level,
+        .compile = compile,
         .blending = opts.config.blending,
     };
+}
+
+/// d3dcompiler_47.dll ships with Windows 8.1 and later; loading it by hand
+/// rather than linking it keeps its absence an error this function can
+/// report. The module is never freed: LoadLibrary counts references, and
+/// every surface in the process shares it.
+fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("d3dcompiler_47.dll");
+    const module = win32.LoadLibraryW(name) orelse {
+        log.err("d3dcompiler_47.dll could not be loaded err={}", .{std.os.windows.GetLastError()});
+        return error.D3DCompilerMissing;
+    };
+    const proc = win32.GetProcAddress(module, "D3DCompile") orelse {
+        log.err("d3dcompiler_47.dll has no D3DCompile export", .{});
+        return error.D3DCompilerMissing;
+    };
+    return @ptrCast(@alignCast(proc));
 }
 
 fn logAdapter(adapter: *api.IDXGIAdapter, level: api.D3D_FEATURE_LEVEL) void {
@@ -321,6 +348,7 @@ pub fn initShaders(
     return try shaders.Shaders.init(
         alloc,
         self.device,
+        self.compile,
         custom_shaders,
         self.targetFormat(),
     );

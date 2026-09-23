@@ -5,11 +5,13 @@
 //! into 32-bit slots like std140, and shader model 5 has no 8- or 16-bit
 //! scalars, so the u32-packed bit fields are what the shaders will read.
 //!
-//! No shader is compiled yet. `Shaders.init` builds the pipeline set with
-//! its fixed state and no post pipelines, so the renderer's frame machinery
-//! runs end to end and every pass leaves only its clear.
+//! The HLSL sources under shaders/hlsl/ are embedded at build time with
+//! their `#include`s expanded and compiled at runtime by D3DCompile. The
+//! pipelines that are not ported yet are built without sources and stay
+//! placeholders that render steps skip.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const assert = @import("../../quirks.zig").inlineAssert;
 const math = @import("../../math.zig");
 
 const api = @import("api.zig");
@@ -20,24 +22,25 @@ const log = std.log.scoped(.d3d11);
 const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
     &.{
         .{ "bg_color", .{
+            .vertex_fn = loadShaderCode("../shaders/hlsl/full_screen.vs.hlsl"),
+            .fragment_fn = loadShaderCode("../shaders/hlsl/bg_color.ps.hlsl"),
             .blending_enabled = false,
         } },
         .{ "cell_bg", .{
+            .vertex_fn = loadShaderCode("../shaders/hlsl/full_screen.vs.hlsl"),
+            .fragment_fn = loadShaderCode("../shaders/hlsl/cell_bg.ps.hlsl"),
             .blending_enabled = true,
         } },
         .{ "cell_text", .{
             .vertex_attributes = CellText,
-            .step_fn = .per_instance,
             .blending_enabled = true,
         } },
         .{ "image", .{
             .vertex_attributes = Image,
-            .step_fn = .per_instance,
             .blending_enabled = true,
         } },
         .{ "bg_image", .{
             .vertex_attributes = BgImage,
-            .step_fn = .per_instance,
             .blending_enabled = true,
         } },
     };
@@ -46,18 +49,27 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
 /// we can define them ahead-of-time in an ergonomic way.
 const PipelineDescription = struct {
     vertex_attributes: ?type = null,
-    step_fn: Pipeline.Options.StepFunction = .per_vertex,
+    /// HLSL sources; a pipeline without them is a placeholder.
+    vertex_fn: ?[:0]const u8 = null,
+    fragment_fn: ?[:0]const u8 = null,
     blending_enabled: bool,
 
     fn initPipeline(
         self: PipelineDescription,
+        name: []const u8,
         device: *api.ID3D11Device,
+        compile: api.D3DCompileFn,
         format: api.DXGI_FORMAT,
     ) !Pipeline {
-        return try .init(self.vertex_attributes, .{
+        return try .init(.{
             .device = device,
+            .compile = compile,
             .format = format,
-            .step_fn = self.step_fn,
+            .name = name,
+            .vertex_source = self.vertex_fn,
+            .fragment_source = self.fragment_fn,
+            .input_elements = if (self.vertex_attributes) |V| inputElements(V) else &.{},
+            .stride = if (self.vertex_attributes) |V| @sizeOf(V) else 0,
             .blending_enabled = self.blending_enabled,
         });
     }
@@ -104,6 +116,7 @@ pub const Shaders = struct {
     pub fn init(
         alloc: Allocator,
         device: *api.ID3D11Device,
+        compile: api.D3DCompileFn,
         post_shaders: []const [:0]const u8,
         format: api.DXGI_FORMAT,
     ) !Shaders {
@@ -119,7 +132,12 @@ pub const Shaders = struct {
         };
 
         inline for (pipeline_descs) |pipeline| {
-            @field(pipelines, pipeline[0]) = try pipeline[1].initPipeline(device, format);
+            @field(pipelines, pipeline[0]) = try pipeline[1].initPipeline(
+                pipeline[0],
+                device,
+                compile,
+                format,
+            );
             initialized_pipelines += 1;
         }
 
@@ -283,6 +301,135 @@ pub const BgImage = extern struct {
         };
     };
 };
+
+/// The input-assembler layout of an instance type, as an explicit table
+/// rather than one derived from the fields: the two trailing bytes of
+/// CellText become a single two-component element so that every offset is
+/// a multiple of four, and the semantic names are what the vertex shaders
+/// declare. The layout tests below pin the offsets to the Zig types.
+pub fn inputElements(comptime V: type) []const api.D3D11_INPUT_ELEMENT_DESC {
+    return switch (V) {
+        CellText => &cell_text_elements,
+        Image => &image_elements,
+        BgImage => &bg_image_elements,
+        else => @compileError("no input layout for " ++ @typeName(V)),
+    };
+}
+
+// Container-level so the tables live in static memory; an anonymous array
+// built inside the function would be a stack temporary.
+const cell_text_elements = [_]api.D3D11_INPUT_ELEMENT_DESC{
+    element("GLYPH_POS", .R32G32_UINT, 0),
+    element("GLYPH_SIZE", .R32G32_UINT, 8),
+    element("BEARINGS", .R16G16_SINT, 16),
+    element("GRID_POS", .R16G16_UINT, 20),
+    element("COLOR", .R8G8B8A8_UINT, 24),
+    element("ATLAS_BOOLS", .R8G8_UINT, 28),
+};
+
+const image_elements = [_]api.D3D11_INPUT_ELEMENT_DESC{
+    element("GRID_POS", .R32G32_FLOAT, 0),
+    element("CELL_OFFSET", .R32G32_FLOAT, 8),
+    element("SOURCE_RECT", .R32G32B32A32_FLOAT, 16),
+    element("DEST_SIZE", .R32G32_FLOAT, 32),
+};
+
+const bg_image_elements = [_]api.D3D11_INPUT_ELEMENT_DESC{
+    element("OPACITY", .R32_FLOAT, 0),
+    element("INFO", .R8_UINT, 4),
+};
+
+/// One per-instance element in vertex buffer slot 0.
+fn element(
+    comptime name: [:0]const u8,
+    comptime format: api.DXGI_FORMAT,
+    comptime offset: u32,
+) api.D3D11_INPUT_ELEMENT_DESC {
+    return .{
+        .SemanticName = name,
+        .SemanticIndex = 0,
+        .Format = format,
+        .InputSlot = 0,
+        .AlignedByteOffset = offset,
+        .InputSlotClass = .PER_INSTANCE_DATA,
+        .InstanceDataStepRate = 1,
+    };
+}
+
+/// Load shader code from the target path, processing `#include` directives.
+///
+/// Comptime only, and as sloppy as its OpenGL twin: it assumes well-formed
+/// `#include "file"` lines and file names without quote marks.
+fn loadShaderCode(comptime path: []const u8) [:0]const u8 {
+    return comptime processIncludes(@embedFile(path), std.fs.path.dirname(path).?);
+}
+
+fn processIncludes(contents: [:0]const u8, basedir: []const u8) [:0]const u8 {
+    @setEvalBranchQuota(100_000);
+    var i: usize = 0;
+    while (i < contents.len) {
+        if (std.mem.startsWith(u8, contents[i..], "#include")) {
+            assert(std.mem.startsWith(u8, contents[i..], "#include \""));
+            const start = i + "#include \"".len;
+            const end = std.mem.indexOfScalarPos(u8, contents, start, '"').?;
+            return std.fmt.comptimePrint(
+                "{s}{s}{s}",
+                .{
+                    contents[0..i],
+                    @embedFile(basedir ++ "/" ++ contents[start..end]),
+                    processIncludes(contents[end + 1 ..], basedir),
+                },
+            );
+        }
+        if (std.mem.indexOfPos(u8, contents, i, "\n#")) |j| {
+            i = (j + 1);
+        } else {
+            break;
+        }
+    }
+    return contents;
+}
+
+test "d3d11 shaders: uniform offsets match the cbuffer packoffsets" {
+    // common.hlsl pins every field to a register with packoffset; these
+    // are the byte offsets those annotations mean (16 bytes per register).
+    const testing = std.testing;
+    try testing.expectEqual(0, @offsetOf(Uniforms, "projection_matrix"));
+    try testing.expectEqual(64, @offsetOf(Uniforms, "screen_size"));
+    try testing.expectEqual(72, @offsetOf(Uniforms, "cell_size"));
+    try testing.expectEqual(80, @offsetOf(Uniforms, "grid_size"));
+    try testing.expectEqual(96, @offsetOf(Uniforms, "grid_padding"));
+    try testing.expectEqual(112, @offsetOf(Uniforms, "padding_extend"));
+    try testing.expectEqual(116, @offsetOf(Uniforms, "min_contrast"));
+    try testing.expectEqual(120, @offsetOf(Uniforms, "cursor_pos"));
+    try testing.expectEqual(124, @offsetOf(Uniforms, "cursor_color"));
+    try testing.expectEqual(128, @offsetOf(Uniforms, "bg_color"));
+    try testing.expectEqual(132, @offsetOf(Uniforms, "bools"));
+    try testing.expectEqual(144, @sizeOf(Uniforms));
+}
+
+test "d3d11 shaders: input element offsets match the instance types" {
+    const testing = std.testing;
+    const cell = inputElements(CellText);
+    try testing.expectEqual(@offsetOf(CellText, "glyph_pos"), cell[0].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(CellText, "glyph_size"), cell[1].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(CellText, "bearings"), cell[2].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(CellText, "grid_pos"), cell[3].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(CellText, "color"), cell[4].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(CellText, "atlas"), cell[5].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(CellText, "atlas") + 1, @offsetOf(CellText, "bools"));
+    const image = inputElements(Image);
+    try testing.expectEqual(@offsetOf(Image, "grid_pos"), image[0].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(Image, "cell_offset"), image[1].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(Image, "source_rect"), image[2].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(Image, "dest_size"), image[3].AlignedByteOffset);
+    const bg = inputElements(BgImage);
+    try testing.expectEqual(@offsetOf(BgImage, "opacity"), bg[0].AlignedByteOffset);
+    try testing.expectEqual(@offsetOf(BgImage, "info"), bg[1].AlignedByteOffset);
+    inline for (.{ cell, image, bg }) |elements| {
+        for (elements) |e| try testing.expectEqual(0, e.AlignedByteOffset % 4);
+    }
+}
 
 test "d3d11 shaders: data layouts" {
     const testing = std.testing;

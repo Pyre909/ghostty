@@ -4,6 +4,13 @@
 //! Device context state persists across steps within a pass on purpose: the
 //! image step passes no uniforms and reads the ones the background step
 //! bound, exactly as on Metal and OpenGL.
+//!
+//! Register conventions, shared with every HLSL shader: the vertex buffer
+//! is input-assembler slot 0; the uniforms are constant buffer b1; textures
+//! are t0, t1, ... with their samplers at s0, s1, ...; storage buffers
+//! (`buffers[1..]` of a step) are t8, t9, .... Buffers, textures and
+//! samplers are bound to both the vertex and the pixel stage, as Metal binds
+//! them to both stages.
 const Self = @This();
 
 const std = @import("std");
@@ -17,6 +24,9 @@ const Texture = @import("Texture.zig");
 const Target = @import("Target.zig");
 
 const log = std.log.scoped(.d3d11);
+
+/// The first t register of the storage buffers.
+pub const storage_register_base: api.UINT = 8;
 
 pub const Options = struct {
     context: *api.ID3D11DeviceContext,
@@ -38,6 +48,13 @@ pub const Options = struct {
 pub const Primitive = enum {
     triangle,
     triangle_strip,
+
+    fn topology(self: Primitive) api.D3D11_PRIMITIVE_TOPOLOGY {
+        return switch (self) {
+            .triangle => .TRIANGLELIST,
+            .triangle_strip => .TRIANGLESTRIP,
+        };
+    }
 };
 
 /// Describes a step in a render pass.
@@ -99,12 +116,68 @@ pub fn begin(opts: Options) Self {
     return self;
 }
 
-/// Add a step to this render pass. Nothing is drawn until the pipelines
-/// carry shaders; the pass then consists of its clear alone.
+/// Add a step to this render pass. A pipeline without shaders is skipped.
 pub fn step(self: *const Self, s: Step) void {
     if (s.draw.instance_count == 0) return;
     if (self.rtv == null) return;
     if (!s.pipeline.ready) return;
+
+    const ctx = self.context;
+    const vt = ctx.vtable;
+
+    vt.IASetInputLayout(ctx, s.pipeline.input_layout);
+    vt.VSSetShader(ctx, s.pipeline.vs, null, 0);
+    vt.PSSetShader(ctx, s.pipeline.ps, null, 0);
+
+    if (s.buffers.len > 0) {
+        // Index 0 is the vertex buffer, as on the other backends.
+        if (s.buffers[0]) |h| {
+            const buffers = [_]?*api.ID3D11Buffer{h.buffer};
+            const strides = [_]api.UINT{s.pipeline.stride};
+            const offsets = [_]api.UINT{0};
+            vt.IASetVertexBuffers(ctx, 0, 1, &buffers, &strides, &offsets);
+        }
+
+        // The rest are storage buffers, read through their views.
+        for (s.buffers[1..], 0..) |b, i| if (b) |h| {
+            const views = [_]?*api.ID3D11ShaderResourceView{h.srv};
+            const slot: api.UINT = storage_register_base + @as(api.UINT, @intCast(i));
+            vt.VSSetShaderResources(ctx, slot, 1, &views);
+            vt.PSSetShaderResources(ctx, slot, 1, &views);
+        };
+    }
+
+    if (s.uniforms) |h| {
+        const buffers = [_]?*api.ID3D11Buffer{h.buffer};
+        vt.VSSetConstantBuffers(ctx, 1, 1, &buffers);
+        vt.PSSetConstantBuffers(ctx, 1, 1, &buffers);
+    }
+
+    for (s.textures, 0..) |t, i| if (t) |tex| {
+        const views = [_]?*api.ID3D11ShaderResourceView{tex.srv};
+        const slot: api.UINT = @intCast(i);
+        vt.VSSetShaderResources(ctx, slot, 1, &views);
+        vt.PSSetShaderResources(ctx, slot, 1, &views);
+    };
+
+    for (s.samplers, 0..) |smp, i| if (smp) |sampler| {
+        const samplers = [_]?*api.ID3D11SamplerState{sampler.sampler};
+        const slot: api.UINT = @intCast(i);
+        vt.VSSetSamplers(ctx, slot, 1, &samplers);
+        vt.PSSetSamplers(ctx, slot, 1, &samplers);
+    };
+
+    vt.OMSetBlendState(ctx, s.pipeline.blend_state, null, 0xffffffff);
+    vt.RSSetState(ctx, s.pipeline.rasterizer_state);
+    vt.IASetPrimitiveTopology(ctx, s.draw.type.topology());
+
+    vt.DrawInstanced(
+        ctx,
+        @intCast(s.draw.vertex_count),
+        @intCast(s.draw.instance_count),
+        0,
+        0,
+    );
 }
 
 /// Complete this render pass.
