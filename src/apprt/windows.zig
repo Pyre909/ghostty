@@ -1,24 +1,18 @@
 //! Application runtime for Windows, built directly on the Win32 API
-//! (user32/gdi32), rendering with Direct3D 11 by default.
+//! (user32/gdi32), rendering with Direct3D 11.
 //!
 //! ## What this is
 //!
 //!   * `App` owns the process lifecycle: the Win32 message loop, a
-//!     message-only window used as the wakeup and timer target, the loaded
-//!     configuration, and the WGL entry points harvested from a bootstrap
-//!     context.
-//!   * `Surface` owns an `HWND`, its `HDC` and a real OpenGL 4.3 core-profile
-//!     `HGLRC`, and hosts a real, initialized `CoreSurface`: a terminal with
-//!     its own renderer and IO threads.
+//!     message-only window used as the wakeup and timer target, and the
+//!     loaded configuration.
+//!   * `Surface` owns an `HWND` and hosts a real, initialized `CoreSurface`:
+//!     a terminal with its own renderer and IO threads.
 //!
-//! The default renderer is `GenericRenderer(D3D11)` (src/renderer/D3D11.zig),
-//! which takes only the `HWND` and creates, resizes and presents its swap
-//! chain itself. `-Drenderer=opengl` still selects `GenericRenderer(OpenGL)`
-//! with the WGL half of src/renderer/OpenGL.zig (src/renderer/opengl/wgl.zig);
-//! the apprt creates and deletes a GL context either way for now, the
-//! render thread borrows it and presents on its own. The main thread
-//! therefore makes **no** GL calls once a surface exists: WM_PAINT only
-//! asks the core for a frame.
+//! The renderer is `GenericRenderer(D3D11)` (src/renderer/D3D11.zig). It
+//! takes only the `HWND` and creates, resizes and presents its swap chain
+//! on the render thread. The main thread makes no graphics calls once a
+//! surface exists: WM_PAINT only asks the core for a frame.
 //!
 //! ## Invariants this file depends on
 //!
@@ -29,9 +23,6 @@
 //!     from a message loop (`Surface.destroyPosted`).
 //!   * **`core_app.tick` never reenters itself**, and never runs while a
 //!     modal confirmation prompt is up (`App.canReenterCore`).
-//!   * **The GL context is current on at most one thread.** The render thread
-//!     releases it in `threadExit`, which `CoreSurface.deinit` joins before
-//!     `Surface.releaseContext` deletes it.
 //!
 //! ## What is still missing
 //!
@@ -82,9 +73,9 @@ const text_mime = "text/plain;charset=utf-8";
 // std.os.windows is in the middle of having most of its Windows API surface
 // removed (see the note at the top of src/os/windows.zig). Types that survive
 // there are aliased; everything else is declared here. Zig auto-links the
-// import library named by an `extern "user32"`-style declaration, which is why
-// src/build/SharedDeps.zig's explicit `linkSystemLibrary` calls are redundant
-// for correctness but load-bearing for `opengl32` ordering.
+// import library named by an `extern "user32"`-style declaration, so the
+// explicit `linkSystemLibrary` calls in src/build/SharedDeps.zig only list
+// the same libraries in one place.
 // -------------------------------------------------------------------------
 const win32 = struct {
     const w = std.os.windows;
@@ -101,7 +92,6 @@ const win32 = struct {
     const HANDLE = w.HANDLE;
     const HWND = w.HWND;
     const HDC = w.HDC;
-    const HGLRC = w.HGLRC;
     const HINSTANCE = w.HINSTANCE;
     const HICON = w.HICON;
     const HCURSOR = w.HCURSOR;
@@ -183,41 +173,9 @@ const win32 = struct {
         dwExStyle: DWORD,
     };
 
-    const PIXELFORMATDESCRIPTOR = extern struct {
-        nSize: WORD,
-        nVersion: WORD,
-        dwFlags: DWORD,
-        iPixelType: BYTE,
-        cColorBits: BYTE,
-        cRedBits: BYTE,
-        cRedShift: BYTE,
-        cGreenBits: BYTE,
-        cGreenShift: BYTE,
-        cBlueBits: BYTE,
-        cBlueShift: BYTE,
-        cAlphaBits: BYTE,
-        cAlphaShift: BYTE,
-        cAccumBits: BYTE,
-        cAccumRedBits: BYTE,
-        cAccumGreenBits: BYTE,
-        cAccumBlueBits: BYTE,
-        cAccumAlphaBits: BYTE,
-        cDepthBits: BYTE,
-        cStencilBits: BYTE,
-        cAuxBuffers: BYTE,
-        iLayerType: BYTE,
-        bReserved: BYTE,
-        dwLayerMask: DWORD,
-        dwVisibleMask: DWORD,
-        dwDamageMask: DWORD,
-    };
-
-    // Window class styles. CS_OWNDC is required: a WGL context is bound to the
-    // device context it was created against, so the window must keep one DC
-    // for its whole life instead of handing out a fresh one per GetDC.
+    // Window class styles.
     const CS_VREDRAW: UINT = 0x0001;
     const CS_HREDRAW: UINT = 0x0002;
-    const CS_OWNDC: UINT = 0x0020;
 
     const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
     const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
@@ -374,22 +332,6 @@ const win32 = struct {
 
     const MB_ICONASTERISK: UINT = 0x00000040;
 
-    // Pixel format descriptor flags/values.
-    const PFD_DOUBLEBUFFER: DWORD = 0x00000001;
-    const PFD_DRAW_TO_WINDOW: DWORD = 0x00000004;
-    const PFD_SUPPORT_OPENGL: DWORD = 0x00000020;
-    const PFD_TYPE_RGBA: BYTE = 0;
-    const PFD_MAIN_PLANE: BYTE = 0;
-
-    // WGL_ARB_create_context / _profile attribute names.
-    const WGL_CONTEXT_MAJOR_VERSION_ARB: c_int = 0x2091;
-    const WGL_CONTEXT_MINOR_VERSION_ARB: c_int = 0x2092;
-    const WGL_CONTEXT_FLAGS_ARB: c_int = 0x2094;
-    const WGL_CONTEXT_PROFILE_MASK_ARB: c_int = 0x9126;
-    const WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB: c_int = 0x0002;
-    const WGL_CONTEXT_DEBUG_BIT_ARB: c_int = 0x0001;
-    const WGL_CONTEXT_CORE_PROFILE_BIT_ARB: c_int = 0x00000001;
-
     /// GetDeviceCaps index for horizontal DPI. Used as the pre-1607 fallback
     /// for GetDpiForWindow, where it is the correct answer: those versions
     /// have no per-monitor DPI at all.
@@ -410,14 +352,7 @@ const win32 = struct {
     const GetThreadDpiAwarenessContextFn = *const fn () callconv(.winapi) ?HANDLE;
     const AreDpiAwarenessContextsEqualFn = *const fn (a: HANDLE, b: HANDLE) callconv(.winapi) BOOL;
 
-    const PFNWGLCREATECONTEXTATTRIBSARB = *const fn (
-        hdc: HDC,
-        share: ?HGLRC,
-        attribs: [*]const c_int,
-    ) callconv(.winapi) ?HGLRC;
-
     extern "kernel32" fn GetModuleHandleW(name: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
-    extern "kernel32" fn LoadLibraryW(name: LPCWSTR) callconv(.winapi) ?HINSTANCE;
     extern "kernel32" fn GetProcAddress(
         module: HINSTANCE,
         name: [*:0]const u8,
@@ -595,25 +530,7 @@ const win32 = struct {
     extern "user32" fn GetClipboardData(format: UINT) callconv(.winapi) ?HANDLE;
     extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi) BOOL;
 
-    extern "gdi32" fn ChoosePixelFormat(
-        hdc: HDC,
-        pfd: *const PIXELFORMATDESCRIPTOR,
-    ) callconv(.winapi) c_int;
-    extern "gdi32" fn SetPixelFormat(
-        hdc: HDC,
-        format: c_int,
-        pfd: *const PIXELFORMATDESCRIPTOR,
-    ) callconv(.winapi) BOOL;
     extern "gdi32" fn GetDeviceCaps(hdc: HDC, index: c_int) callconv(.winapi) c_int;
-
-    extern "opengl32" fn wglCreateContext(hdc: HDC) callconv(.winapi) ?HGLRC;
-    extern "opengl32" fn wglDeleteContext(ctx: HGLRC) callconv(.winapi) BOOL;
-    extern "opengl32" fn wglMakeCurrent(hdc: ?HDC, ctx: ?HGLRC) callconv(.winapi) BOOL;
-    extern "opengl32" fn wglGetProcAddress(name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
-
-    // No GL entry points are declared here on purpose: the main thread makes
-    // no GL calls once the renderer owns presentation. The render thread's
-    // declarations live in src/renderer/opengl/wgl.zig.
 
     fn loword(v: LPARAM) u16 {
         return @truncate(@as(usize, @bitCast(v)));
@@ -649,7 +566,6 @@ fn L(comptime s: []const u8) win32.LPCWSTR {
 /// in `App.init` and unregistered in `App.terminate`.
 const surface_class_name = "GhosttySurfaceClass";
 const app_class_name = "GhosttyAppClass";
-const bootstrap_class_name = "GhosttyWglBootstrapClass";
 
 /// Posted by `App.wakeup` from arbitrary threads to break `GetMessageW` out of
 /// its block so `run` reaches the next `core_app.tick`.
@@ -691,12 +607,6 @@ pub const App = struct {
     /// Win32 runs during window drags, menus and dialogs, so a wakeup could be
     /// lost exactly when the mailbox needs draining.
     msg_hwnd: win32.HWND,
-
-    /// Harvested from the bootstrap context in `init`. Null means the driver
-    /// does not advertise WGL_ARB_create_context, in which case no modern
-    /// context can be created and surfaces fail loudly rather than silently
-    /// running on a 1.1 compatibility context.
-    create_context_attribs: ?win32.PFNWGLCREATECONTEXTATTRIBSARB,
 
     /// The windows this runtime owns. See `surfaceDestroyed` for the
     /// ownership invariant. Each one whose `CoreSurface` is initialized is
@@ -752,8 +662,6 @@ pub const App = struct {
         Win32MessageLoopFailed,
         /// A Win32 call that should not fail for a live window did.
         Win32CallFailed,
-        WglBootstrapFailed,
-        WglContextCreationFailed,
     };
 
     /// Always false: this runtime has no IPC channel to an already-running
@@ -776,15 +684,6 @@ pub const App = struct {
         _ = opts;
 
         const alloc = core_app.alloc;
-
-        // Make opengl32.dll resident before anything can call SetPixelFormat.
-        // The ICD is only hooked into a window's pixel format if opengl32.dll
-        // is already loaded at that point; otherwise wglCreateContext fails
-        // with ERROR_INVALID_PIXEL_FORMAT (2000). SharedDeps.addWin32 links
-        // the import library for the same reason, which makes this redundant
-        // in a normal build -- it is spelled out anyway so the ordering
-        // survives a build-system change that drops the explicit link.
-        _ = win32.LoadLibraryW(L("opengl32.dll"));
 
         const hinstance = win32.GetModuleHandleW(null) orelse
             return Error.Win32WindowCreationFailed;
@@ -861,7 +760,6 @@ pub const App = struct {
             .hinstance = hinstance,
             .get_dpi_for_window = get_dpi_for_window,
             .msg_hwnd = msg_hwnd,
-            .create_context_attribs = bootstrapWgl(hinstance),
             .surfaces = .empty,
             .quit = false,
             .quit_timer_active = false,
@@ -911,7 +809,6 @@ pub const App = struct {
         defer surfaces.deinit(self.core_app.alloc);
         for (surfaces.items) |surface| {
             surface.stopCore();
-            surface.releaseContext();
             surface.destroy();
             surface.deinit();
             self.core_app.alloc.destroy(surface);
@@ -1292,10 +1189,9 @@ pub const App = struct {
     }
 
     /// Nothing to do: the render thread presents its own frames
-    /// (src/renderer/opengl/Frame.zig, WGL branch), and the WGL path does not
-    /// even send this action. An InvalidateRect here would only start a
-    /// WM_PAINT -> refreshCallback -> frame cycle for a frame already on
-    /// screen.
+    /// (src/renderer/d3d11/Frame.zig), and the backend does not even send
+    /// this action. An InvalidateRect here would only start a WM_PAINT ->
+    /// refreshCallback -> frame cycle for a frame already on screen.
     fn render(target: apprt.Target) bool {
         return switch (target) {
             .app => false,
@@ -1588,20 +1484,6 @@ pub const Surface = struct {
     /// The window handle. Written from WM_NCCREATE, which is the first
     /// message this window receives, so it is valid in every other handler.
     hwnd: win32.HWND,
-
-    /// The window's own DC (CS_OWNDC), valid for the window's lifetime and
-    /// never released, and the GL context bound to it.
-    ///
-    /// Both are optional because the window procedure starts running *inside*
-    /// CreateWindowExW, before either exists: WM_SIZE and WM_PAINT can arrive
-    /// while `create` is still between CreateWindowExW and createContext.
-    ///
-    /// The render thread presents on this DC (src/renderer/opengl/wgl.zig),
-    /// so the main thread must not use it for GDI work: with CS_OWNDC,
-    /// BeginPaint would hand back this same DC and change its clip region
-    /// under the render thread. See `paint` and `dpi`.
-    hdc: ?win32.HDC,
-    hglrc: ?win32.HGLRC,
 
     /// The current window title, owned by this struct. `getTitle` reads it
     /// back to answer CSI 21 t; a native runtime has to store it itself.
@@ -1998,8 +1880,6 @@ pub const Surface = struct {
             // `hwnd` is written from WM_NCCREATE, the first message this
             // window receives, so it is set before anything can read it.
             .hwnd = undefined,
-            .hdc = null,
-            .hglrc = null,
             .title = null,
             .maximized = false,
             .closing = false,
@@ -2034,14 +1914,6 @@ pub const Surface = struct {
         // will not free a surface that is not yet in App.surfaces.
         errdefer _ = win32.DestroyWindow(hwnd);
 
-        // CS_OWNDC means this DC belongs to the window for its whole life.
-        const hdc = win32.GetDC(hwnd) orelse return App.Error.Win32WindowCreationFailed;
-        self.hdc = hdc;
-        self.hglrc = try createContext(app, hdc);
-        // Runs before the DestroyWindow errdefer above, which is the order
-        // WM_DESTROY would use anyway.
-        errdefer self.releaseContext();
-
         // Registration comes before init: every surface message the core
         // routes is checked with hasSurface (src/App.zig:514-529), so a
         // message queued before registration would be dropped. addSurface
@@ -2049,12 +1921,9 @@ pub const Surface = struct {
         try app.core_app.addSurface(self);
         errdefer app.core_app.deleteSurface(self);
 
-        // Preconditions CoreSurface.init relies on, all true here: the HWND
+        // Preconditions CoreSurface.init relies on, both true here: the HWND
         // exists at CW_USEDEFAULT size so getSize is non-zero
-        // (src/Surface.zig:529), getContentScale works on it (:501), and no
-        // thread has the GL context current -- the renderer's main-thread
-        // probe (wgl.State.init) makes it current and releases it again
-        // before the render thread is spawned (:717).
+        // (src/Surface.zig:529), and getContentScale works on it (:501).
         var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
         defer config.deinit();
         try self.core_surface.init(alloc, &config, app.core_app, app, self);
@@ -2089,20 +1958,6 @@ pub const Surface = struct {
     /// the ownership invariant on `App.surfaceDestroyed`.
     fn destroy(self: *Surface) void {
         _ = win32.DestroyWindow(self.hwnd);
-    }
-
-    /// Release the GL context. Only valid once no other thread has it
-    /// current, i.e. after `stopCore` has joined the render thread.
-    fn releaseContext(self: *Surface) void {
-        const hglrc = self.hglrc orelse return;
-        self.hglrc = null;
-
-        // Unbind before deleting: wglDeleteContext on a context that is still
-        // current only marks it for deletion. The render thread released it
-        // in its threadExit, so on the normal path this is a no-op for this
-        // thread; it matters when create fails after the renderer's probe.
-        _ = win32.wglMakeCurrent(null, null);
-        _ = win32.wglDeleteContext(hglrc);
     }
 
     /// The core surface, if message handlers may call into it.
@@ -2140,8 +1995,8 @@ pub const Surface = struct {
     ///      (it only pushes to the app mailbox, which the ticks drain), and
     ///      the terminal state both share is freed only in step 5.
     ///   4. Unrealize the display, then stop the render thread and wait for
-    ///      it the same way. Its exit releases the shaders, the swap chain
-    ///      and the GL context.
+    ///      it the same way. Its exit releases the shaders and the swap
+    ///      chain.
     ///   5. `CoreSurface.deinit`. Its notifications repeat harmlessly (an
     ///      xev Async notify on a stopped loop only posts an unread
     ///      completion) and its joins return at once.
@@ -2250,7 +2105,6 @@ pub const Surface = struct {
 
         const hwnd = self.hwnd;
         self.stopCore();
-        self.releaseContext();
         _ = win32.DestroyWindow(hwnd);
     }
 
@@ -2321,10 +2175,6 @@ pub const Surface = struct {
         // Pre-1607 fallback. This is the *correct* answer on those versions:
         // they have no per-monitor DPI, so the system-wide value is the only
         // one there is.
-        //
-        // The screen DC, not `self.hdc`: that one is the window's CS_OWNDC,
-        // which the render thread presents on, and GDI on it from this thread
-        // would race the render thread.
         if (win32.GetDC(null)) |screen| {
             defer _ = win32.ReleaseDC(null, screen);
             const v = win32.GetDeviceCaps(screen, win32.LOGPIXELSX);
@@ -2603,18 +2453,17 @@ pub const Surface = struct {
     /// main thread does is clear the update region and ask the core for a
     /// frame.
     fn paint(self: *Surface) void {
-        // ValidateRect, not BeginPaint/EndPaint. The update region still has
+        // ValidateRect, not BeginPaint/EndPaint: the update region still has
         // to be cleared -- otherwise Windows re-posts WM_PAINT forever and the
-        // loop spins at 100% CPU -- but with CS_OWNDC, BeginPaint returns the
-        // very DC the render thread presents on and changes its clip region
-        // from this thread. ValidateRect clears the region and touches no DC.
+        // loop spins at 100% CPU -- and nothing here draws, so no DC is
+        // needed.
         _ = win32.ValidateRect(self.hwnd, null);
 
         // Every paint is logged at debug level, which is compiled out of
         // release builds (main_ghostty.zig:208). Without it a stale frame on
         // screen cannot be told apart from a repaint that never ran. The
-        // present side (count, dropped stale frames, blit path) is logged by
-        // src/renderer/opengl/wgl.zig.
+        // present side (count, dropped stale frames) is logged by
+        // src/renderer/D3D11.zig.
         self.paint_count += 1;
         const n = self.paint_count;
         const id = @intFromPtr(self.hwnd);
@@ -2703,9 +2552,6 @@ pub const Surface = struct {
                 self.app.modal_loop_depth -|= self.modal_loops;
                 self.modal_loops = 0;
 
-                // The GL context must die before its window does, and only
-                // after the render thread has let go of it (stopCore).
-                self.releaseContext();
                 self.app.surfaceDestroyed(self);
                 return 0;
             },
@@ -3083,11 +2929,9 @@ pub const Surface = struct {
             },
 
             // The render thread presents every pixel of the client area, so
-            // letting GDI erase first only produces a flash of the class
-            // background -- and would be GDI on the render thread's DC. (Its
-            // one early clear, wgl.State.clearAndPresent, is best-effort: it
-            // usually runs before the window is shown. The first real frame
-            // follows the first WM_PAINT's refresh.)
+            // letting GDI erase first would only produce a flash of the class
+            // background. The first real frame follows the first WM_PAINT's
+            // refresh.
             win32.WM_ERASEBKGND => return 1,
 
             else => {},
@@ -4076,9 +3920,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
 
     const surface_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
-        // CS_OWNDC is required for WGL: the context is bound to the DC it was
-        // created against, so the window must own one DC permanently.
-        .style = win32.CS_OWNDC | win32.CS_HREDRAW | win32.CS_VREDRAW,
+        .style = win32.CS_HREDRAW | win32.CS_VREDRAW,
         .lpfnWndProc = &Surface.wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -4114,197 +3956,11 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
         log.err("failed to register the app window class", .{});
         return App.Error.Win32ClassRegistrationFailed;
     }
-    errdefer _ = win32.UnregisterClassW(L(app_class_name), hinstance);
-
-    // SetPixelFormat can only ever be called once per HWND, so the legacy
-    // bootstrap context needs a window that is thrown away afterwards. It gets
-    // its own class only so that CS_OWNDC applies to it too.
-    const bootstrap_class: win32.WNDCLASSEXW = .{
-        .cbSize = @sizeOf(win32.WNDCLASSEXW),
-        .style = win32.CS_OWNDC,
-        .lpfnWndProc = &win32.DefWindowProcW,
-        .cbClsExtra = 0,
-        .cbWndExtra = 0,
-        .hInstance = hinstance,
-        .hIcon = null,
-        .hCursor = null,
-        .hbrBackground = null,
-        .lpszMenuName = null,
-        .lpszClassName = L(bootstrap_class_name),
-        .hIconSm = null,
-    };
-    if (win32.RegisterClassExW(&bootstrap_class) == 0) {
-        log.err("failed to register the WGL bootstrap window class", .{});
-        return App.Error.Win32ClassRegistrationFailed;
-    }
 }
 
 fn unregisterClasses(hinstance: win32.HINSTANCE) void {
-    _ = win32.UnregisterClassW(L(bootstrap_class_name), hinstance);
     _ = win32.UnregisterClassW(L(app_class_name), hinstance);
     _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
-}
-
-/// The pixel format every Ghostty window uses. 32-bit RGBA, double buffered,
-/// no depth or stencil: a terminal draws flat.
-const pixel_format: win32.PIXELFORMATDESCRIPTOR = .{
-    .nSize = @sizeOf(win32.PIXELFORMATDESCRIPTOR),
-    .nVersion = 1,
-    .dwFlags = win32.PFD_DRAW_TO_WINDOW |
-        win32.PFD_SUPPORT_OPENGL |
-        win32.PFD_DOUBLEBUFFER,
-    .iPixelType = win32.PFD_TYPE_RGBA,
-    .cColorBits = 32,
-    .cRedBits = 0,
-    .cRedShift = 0,
-    .cGreenBits = 0,
-    .cGreenShift = 0,
-    .cBlueBits = 0,
-    .cBlueShift = 0,
-    .cAlphaBits = 8,
-    .cAlphaShift = 0,
-    .cAccumBits = 0,
-    .cAccumRedBits = 0,
-    .cAccumGreenBits = 0,
-    .cAccumBlueBits = 0,
-    .cAccumAlphaBits = 0,
-    .cDepthBits = 0,
-    .cStencilBits = 0,
-    .cAuxBuffers = 0,
-    .iLayerType = win32.PFD_MAIN_PLANE,
-    .bReserved = 0,
-    .dwLayerMask = 0,
-    .dwVisibleMask = 0,
-    .dwDamageMask = 0,
-};
-
-/// Harvest wglCreateContextAttribsARB.
-///
-/// WGL has a chicken-and-egg problem: the function that creates a modern
-/// context is itself an extension, and extension entry points can only be
-/// resolved while some context is current. So a legacy 1.1 context is created
-/// on a throwaway window, the pointer is read out, and the whole thing is torn
-/// down. The window is throwaway because SetPixelFormat is one-shot per HWND.
-///
-/// It is a real (if 1x1 and never shown) top-level window rather than a
-/// message-only one: a message-only window has no display device behind it, so
-/// ChoosePixelFormat/SetPixelFormat have nothing to describe.
-///
-/// Returns null on any failure; the caller reports it when a surface actually
-/// needs a context, rather than failing app startup for it.
-fn bootstrapWgl(hinstance: win32.HINSTANCE) ?win32.PFNWGLCREATECONTEXTATTRIBSARB {
-    const hwnd = win32.CreateWindowExW(
-        0,
-        L(bootstrap_class_name),
-        null,
-        // WS_OVERLAPPED, i.e. no style bits. Never shown, so never visible.
-        0,
-        0,
-        0,
-        1,
-        1,
-        null,
-        null,
-        hinstance,
-        null,
-    ) orelse {
-        log.warn("failed to create the WGL bootstrap window", .{});
-        return null;
-    };
-    defer _ = win32.DestroyWindow(hwnd);
-
-    const hdc = win32.GetDC(hwnd) orelse {
-        log.warn("failed to get the WGL bootstrap DC", .{});
-        return null;
-    };
-
-    const format = win32.ChoosePixelFormat(hdc, &pixel_format);
-    if (format == 0) {
-        log.warn("ChoosePixelFormat failed for the WGL bootstrap window", .{});
-        return null;
-    }
-    if (!win32.SetPixelFormat(hdc, format, &pixel_format).toBool()) {
-        log.warn("SetPixelFormat failed for the WGL bootstrap window", .{});
-        return null;
-    }
-
-    const ctx = win32.wglCreateContext(hdc) orelse {
-        // If this fails with ERROR_INVALID_PIXEL_FORMAT (2000), opengl32.dll
-        // was not resident before SetPixelFormat and the ICD never got hooked
-        // in. See App.init.
-        log.warn("wglCreateContext failed for the bootstrap context", .{});
-        return null;
-    };
-    defer _ = win32.wglDeleteContext(ctx);
-
-    if (!win32.wglMakeCurrent(hdc, ctx).toBool()) {
-        log.warn("wglMakeCurrent failed for the bootstrap context", .{});
-        return null;
-    }
-    defer _ = win32.wglMakeCurrent(null, null);
-
-    const proc = win32.wglGetProcAddress("wglCreateContextAttribsARB") orelse {
-        log.warn("WGL_ARB_create_context is not available", .{});
-        return null;
-    };
-
-    // wglGetProcAddress does not signal failure with NULL alone: the documented
-    // failure values are 0, 1, 2, 3 and -1. `orelse` catches only the first of
-    // those, and casting any of the rest to a function pointer turns the next
-    // context creation into a call to address 1.
-    switch (@intFromPtr(proc)) {
-        1, 2, 3, std.math.maxInt(usize) => {
-            log.warn("WGL_ARB_create_context is not available", .{});
-            return null;
-        },
-        else => {},
-    }
-
-    // @alignCast is load-bearing, not decoration: wglGetProcAddress is typed
-    // `*const anyopaque`, which is align(1), while a function pointer is
-    // align(4) on AArch64 because its instructions are fixed-width and must be
-    // 4-byte aligned. x86_64 has align(1) function pointers and hides this
-    // entirely -- the aarch64-windows build is what catches it. Any address the
-    // loader hands back for real code satisfies the assertion.
-    return @ptrCast(@alignCast(proc));
-}
-
-/// Create the real context: OpenGL 4.3 core profile, which is what Ghostty's
-/// shaders need (GLSL 4.30, SSBOs with std430, sampler2DRect,
-/// ARB_vertex_attrib_binding).
-fn createContext(app: *App, hdc: win32.HDC) !win32.HGLRC {
-    const create = app.create_context_attribs orelse {
-        log.err("cannot create a modern GL context: WGL_ARB_create_context missing", .{});
-        return App.Error.WglBootstrapFailed;
-    };
-
-    const format = win32.ChoosePixelFormat(hdc, &pixel_format);
-    if (format == 0) {
-        log.err("ChoosePixelFormat failed", .{});
-        return App.Error.WglContextCreationFailed;
-    }
-    if (!win32.SetPixelFormat(hdc, format, &pixel_format).toBool()) {
-        log.err("SetPixelFormat failed", .{});
-        return App.Error.WglContextCreationFailed;
-    }
-
-    const debug_bit: c_int = if (builtin.mode == .Debug)
-        win32.WGL_CONTEXT_DEBUG_BIT_ARB
-    else
-        0;
-
-    const attribs = [_]c_int{
-        win32.WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
-        win32.WGL_CONTEXT_MINOR_VERSION_ARB, 3,
-        win32.WGL_CONTEXT_PROFILE_MASK_ARB,  win32.WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
-        win32.WGL_CONTEXT_FLAGS_ARB,         win32.WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB | debug_bit,
-        0,
-    };
-
-    return create(hdc, null, &attribs) orelse {
-        log.err("wglCreateContextAttribsARB failed for a 4.3 core context", .{});
-        return App.Error.WglContextCreationFailed;
-    };
 }
 
 /// Read CF_UNICODETEXT as UTF-8. Returns null when the clipboard holds no

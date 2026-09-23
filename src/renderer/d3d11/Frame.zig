@@ -58,7 +58,7 @@ pub inline fn renderPass(
 /// Complete this frame and present the target.
 ///
 /// Presentation is synchronous on this thread either way, so `sync` is
-/// ignored, as the WGL backend ignores it. The frame is unhealthy only
+/// ignored. The frame is unhealthy only
 /// when the device was lost; a present that failed for any other reason,
 /// or a frame dropped for a stale size, leaves the renderer healthy.
 pub fn complete(self: *Self, sync: bool) void {

@@ -4,20 +4,19 @@
 //! The renderer owns the device, the immediate context and a DXGI flip-model
 //! swap chain, all created in `init` on the main thread inside
 //! `CoreSurface.init`, so a GPU that cannot do this fails surface creation
-//! where the failure is visible (opengl/wgl.zig explains why a failure on
-//! the render thread is worse than a blank window). Every later call runs on
+//! where the failure is visible, rather than on the render thread, where it
+//! would leave the window blank. Every later call runs on
 //! the render thread under the generic renderer's draw mutex, which is what
 //! the single-threaded immediate context requires.
 //!
 //! Frames render into an offscreen target texture and are copied to the
-//! back buffer and presented synchronously from `Frame.complete`, as the WGL
-//! backend does, so one swap chain slot is enough and nothing is exported.
+//! back buffer and presented synchronously from `Frame.complete`, so one
+//! swap chain slot is enough and nothing is exported.
 //! The target cannot be the back buffer itself: on resize the generic
 //! renderer creates the new target before it drops the old one.
 //!
-//! The backend is reachable only with `-Drenderer=d3d11` while it grows
-//! toward parity with the WGL path; pipelines not ported yet are skipped by
-//! the render pass.
+//! This is the Windows renderer: every pipeline the other backends draw is
+//! here, custom shaders included.
 pub const D3D11 = @This();
 
 const std = @import("std");
@@ -448,7 +447,7 @@ pub const PresentError = error{
 /// thread, from `Frame.complete`.
 ///
 /// Frames rendered at a size the client area no longer has are dropped, as
-/// Metal and WGL do: during a drag the client rectangle runs ahead of the
+/// Metal does: during a drag the client rectangle runs ahead of the
 /// renderer's `.resize` message, and stretching the old frame would show a
 /// smeared grid. The WM_SIZE that made the sizes differ already queued a
 /// `.resize` and a wakeup, so a matching frame follows. GetClientRect only

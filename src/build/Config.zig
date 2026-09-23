@@ -206,6 +206,14 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "The app runtime to use. Not all values supported on all platforms.",
     ) orelse RendererBackend.default(target.result, wasm_target, config.app_runtime);
 
+    // The Win32 runtime renders with Direct3D 11 and nothing else: it has
+    // no EGL, and its WGL path went once the Direct3D backend drew
+    // everything it did.
+    if (config.app_runtime == .windows and config.renderer != .d3d11) {
+        std.log.err("the Win32 app runtime supports only -Drenderer=d3d11", .{});
+        return error.UnsupportedRenderer;
+    }
+
     //---------------------------------------------------------------
     // Feature Flags
 
