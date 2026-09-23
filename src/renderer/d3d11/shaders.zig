@@ -33,6 +33,8 @@ const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
         } },
         .{ "cell_text", .{
             .vertex_attributes = CellText,
+            .vertex_fn = loadShaderCode("../shaders/hlsl/cell_text.vs.hlsl"),
+            .fragment_fn = loadShaderCode("../shaders/hlsl/cell_text.ps.hlsl"),
             .blending_enabled = true,
         } },
         .{ "image", .{
@@ -444,4 +446,19 @@ test "d3d11 shaders: data layouts" {
     try testing.expectEqual(8, @sizeOf(BgImage));
     // Constant buffers are bound in 16-byte slots.
     try testing.expectEqual(0, @sizeOf(Uniforms) % 16);
+}
+
+test "d3d11 shaders: vertex shaders declare every input element" {
+    // CreateInputLayout rejects a layout that lacks an input the vertex
+    // shader declares, so the semantic names of a table must all appear
+    // in the shader that consumes it.
+    const testing = std.testing;
+    inline for (pipeline_descs) |pipeline| {
+        const V = pipeline[1].vertex_attributes orelse continue;
+        const source = pipeline[1].vertex_fn orelse continue;
+        for (inputElements(V)) |e| {
+            const name = std.mem.span(e.SemanticName);
+            try testing.expect(std.mem.indexOf(u8, source, name) != null);
+        }
+    }
 }
