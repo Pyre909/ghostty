@@ -2136,8 +2136,9 @@ pub const Surface = struct {
     ///      reverse. Nothing the render thread does waits on the IO thread
     ///      (it only pushes to the app mailbox, which the ticks drain), and
     ///      the terminal state both share is freed only in step 5.
-    ///   4. Stop the render thread and wait for it the same way. Its exit
-    ///      releases the GL context.
+    ///   4. Unrealize the display, then stop the render thread and wait for
+    ///      it the same way. Its exit releases the shaders, the swap chain
+    ///      and the GL context.
     ///   5. `CoreSurface.deinit`. Its notifications repeat harmlessly (an
     ///      xev Async notify on a stopped loop only posts an unread
     ///      completion) and its joins return at once.
@@ -2193,6 +2194,13 @@ pub const Surface = struct {
         cs.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop err={}", .{err});
         app.waitForThreads(&.{cs.io_thr.getHandle()});
+
+        // The display goes away with the window, and the renderer keeps
+        // its shaders across a thread exit unless it has been told so, for
+        // a re-realize that never comes here. GTK says it from its
+        // unrealize signal; this is the same call, so the thread's exit
+        // releases the shaders and the swap chain too.
+        cs.displayUnrealized();
 
         cs.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop err={}", .{err});
