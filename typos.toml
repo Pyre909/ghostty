@@ -84,6 +84,10 @@ loca = "loca"
 # TinyIo
 tio = "tio"
 WRONLY = "WRONLY"
+# Win32 TrackMouseEvent
+TME = "TME"
+# Direct3D level of detail
+LOD = "LOD"
 
 [type.po]
 extend-glob = ["*.po"]
