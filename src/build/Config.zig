@@ -204,7 +204,7 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         RendererBackend,
         "renderer",
         "The app runtime to use. Not all values supported on all platforms.",
-    ) orelse RendererBackend.default(target.result, wasm_target);
+    ) orelse RendererBackend.default(target.result, wasm_target, config.app_runtime);
 
     //---------------------------------------------------------------
     // Feature Flags

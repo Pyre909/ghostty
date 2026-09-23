@@ -12,9 +12,7 @@ pub const Runtime = enum {
     gtk,
 
     /// Win32. Native Windows application built directly on the Win32 API
-    /// (user32/gdi32) with an OpenGL context supplied by WGL. This runtime
-    /// is a foundation: it manages windows, input and the clipboard, but it
-    /// does not yet host a core surface. See src/apprt/windows.zig.
+    /// (user32/gdi32), rendering with Direct3D 11. See src/apprt/windows.zig.
     windows,
 
     pub fn default(target: std.Target) Runtime {

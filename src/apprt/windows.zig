@@ -1,5 +1,5 @@
 //! Application runtime for Windows, built directly on the Win32 API
-//! (user32/gdi32) with an OpenGL context supplied by WGL.
+//! (user32/gdi32), rendering with Direct3D 11 by default.
 //!
 //! ## What this is
 //!
@@ -11,11 +11,14 @@
 //!     `HGLRC`, and hosts a real, initialized `CoreSurface`: a terminal with
 //!     its own renderer and IO threads.
 //!
-//! The renderer is `GenericRenderer(OpenGL)` with the WGL half of
-//! src/renderer/OpenGL.zig (src/renderer/opengl/wgl.zig). The apprt creates
-//! and deletes the GL context; the render thread borrows it and presents on
-//! its own. The main thread therefore makes **no** GL calls once a surface
-//! exists: WM_PAINT only asks the core for a frame.
+//! The default renderer is `GenericRenderer(D3D11)` (src/renderer/D3D11.zig),
+//! which takes only the `HWND` and creates, resizes and presents its swap
+//! chain itself. `-Drenderer=opengl` still selects `GenericRenderer(OpenGL)`
+//! with the WGL half of src/renderer/OpenGL.zig (src/renderer/opengl/wgl.zig);
+//! the apprt creates and deletes a GL context either way for now, the
+//! render thread borrows it and presents on its own. The main thread
+//! therefore makes **no** GL calls once a surface exists: WM_PAINT only
+//! asks the core for a frame.
 //!
 //! ## Invariants this file depends on
 //!
