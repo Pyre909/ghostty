@@ -162,8 +162,9 @@ pub fn Buffer(comptime T: type) type {
         /// complete contents of the buffer. If the amount of data is larger
         /// than the buffer length, the buffer will be reallocated.
         ///
-        /// If the amount of data is smaller than the buffer length, the
-        /// remaining data in the buffer is left untouched.
+        /// Unlike the other backends, bytes past the data are undefined
+        /// after a sync: the buffer is mapped with WRITE_DISCARD (see
+        /// `map`), and every caller draws only what it synced.
         pub fn sync(self: *Self, data: []const T) !void {
             try self.ensureCapacity(data.len);
             const dst = try self.map();

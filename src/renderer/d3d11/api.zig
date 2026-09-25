@@ -3,17 +3,18 @@
 //!
 //! The COM interfaces are vtable structs in the order of the mingw headers
 //! Zig ships (lib/libc/include/any-windows-any: d3d11.h, dxgi.h, dxgi1_2.h,
-//! dxgi1_3.h, dxgi1_5.h, d3d11sdklayers.h, d3dcommon.h, d3dcompiler.h), the
-//! same headers the C compiler would read. Only the methods the backend
-//! calls are typed; every other slot is an untyped pointer, so a vtable keeps
-//! its size and each typed slot keeps its index. A derived interface embeds
-//! its parent's vtable as its first field, which is how COM lays them out.
+//! dxgi1_3.h, dxgi1_4.h, dxgi1_5.h, d3d11sdklayers.h, d3dcommon.h,
+//! d3dcompiler.h), the same headers the C compiler would read. Only the
+//! methods the backend calls are typed; every other slot is an untyped
+//! pointer, so a vtable keeps its size and each typed slot keeps its index.
+//! A derived interface embeds its parent's vtable as its first field, which
+//! is how COM lays them out.
 //!
 //! The tests check every vtable's slot count and every struct's layout
 //! against the header, so a dropped or shuffled slot fails on any host
 //! instead of calling the wrong function in a Windows run. No extern
 //! function lives here so that those tests link everywhere; D3D11.zig
-//! declares the d3d11 and dxgi entry points and loads D3DCompile at runtime.
+//! declares D3D11CreateDevice and loads D3DCompile at runtime.
 
 const std = @import("std");
 const builtin = @import("builtin");
