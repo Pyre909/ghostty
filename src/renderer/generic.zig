@@ -3622,11 +3622,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: *Texture,
         ) !void {
             if (atlas.size > texture.width) {
-                // Free our old texture
+                // Create the replacement before releasing the old texture,
+                // as FrameState.resize does for the target: a failure here
+                // then returns with a valid texture still in place rather
+                // than a released one that the next frame would release
+                // again.
+                const new = try self.api.initAtlasTexture(atlas);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = new;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
