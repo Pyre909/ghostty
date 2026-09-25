@@ -1699,6 +1699,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.api.drawFrameStart();
             defer self.api.drawFrameEnd();
 
+            // A lost device took every GPU object with it. Direct3D
+            // reports a GPU reset or a driver update this way; the other
+            // APIs have no such state. Release what was created on it,
+            // have the backend replace the device, and rebuild lazily
+            // below as after an unrealize. The kitty images come back
+            // through the next kitty update, the background image is
+            // loaded again here.
+            if (comptime @hasDecl(GraphicsAPI, "deviceLost")) {
+                if (self.api.deviceLost()) {
+                    self.releaseGpuResources();
+                    self.shaders.deinit(self.alloc);
+                    self.images.deinit(self.alloc);
+                    self.images = .empty;
+                    self.images.kitty_rebuild = true;
+                    if (self.bg_image) |*img| {
+                        img.deinit(self.alloc);
+                        self.bg_image = null;
+                    }
+                    self.api.recoverDevice() catch return false;
+                    self.reinitialize_shaders = true;
+                    try self.prepBackgroundImage();
+                }
+            }
+
             // Retrieve the most up-to-date surface size from the Graphics API
             const surface_size = try self.api.surfaceSize();
 

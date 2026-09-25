@@ -37,6 +37,12 @@ pub const State = struct {
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
+    /// Set when the GPU copies of the kitty images were dropped without
+    /// the terminal knowing, as after a lost graphics device: the next
+    /// update rebuilds them from the terminal's storage even though it
+    /// is not dirty.
+    kitty_rebuild: bool,
+
     pub const empty: State = .{
         .images = .empty,
         .kitty_placements = .empty,
@@ -44,6 +50,7 @@ pub const State = struct {
         .kitty_text_end = 0,
         .kitty_virtual = false,
         .overlay_placements = .empty,
+        .kitty_rebuild = false,
     };
 
     pub fn deinit(self: *State, alloc: Allocator) void {
@@ -241,6 +248,9 @@ pub const State = struct {
         // If the terminal kitty image state is dirty, we must update.
         if (t.screens.active.kitty_images.dirty) return true;
 
+        // If our GPU copies are gone, we must rebuild them.
+        if (self.kitty_rebuild) return true;
+
         // If we have any virtual references, we must also rebuild our
         // kitty state on every frame because any cell change can move
         // an image. If the virtual placements were removed, this will
@@ -261,6 +271,7 @@ pub const State = struct {
     ) void {
         const storage = &t.screens.active.kitty_images;
         defer storage.dirty = false;
+        self.kitty_rebuild = false;
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.

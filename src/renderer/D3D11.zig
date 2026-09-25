@@ -15,6 +15,11 @@
 //! The target cannot be the back buffer itself: on resize the generic
 //! renderer creates the new target before it drops the old one.
 //!
+//! A lost device (a GPU reset, a driver update) is reported by Present and
+//! latched. The generic renderer then releases what it created on the
+//! device and `recoverDevice` creates a new one for the same window, after
+//! which everything is rebuilt lazily, as after an unrealize.
+//!
 //! This is the Windows renderer: every pipeline the other backends draw is
 //! here, custom shaders included.
 pub const D3D11 = @This();
@@ -22,6 +27,7 @@ pub const D3D11 = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const assert = @import("../quirks.zig").inlineAssert;
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
@@ -54,6 +60,10 @@ pub const swap_chain_count = 1;
 
 /// Direct3D 11 textures are at most this wide or high.
 const max_texture_dimension: u32 = 16384;
+
+/// Frames to let pass between recovery attempts after one failed, so a
+/// GPU that stays gone is not asked for a device on every wakeup.
+const recovery_backoff_frames: u8 = 16;
 
 const log = std.log.scoped(.d3d11);
 
@@ -115,8 +125,21 @@ present_flags: api.UINT,
 info_queue: ?*api.ID3D11InfoQueue = null,
 
 /// Set once the device was lost. Later frames are refused without
-/// touching the device, which stays lost until the surface is recreated.
+/// touching the device until `recoverDevice` replaces it.
 lost: bool = false,
+
+/// Whether `window-vsync` is on, kept so that `recoverDevice` creates the
+/// new swap chain with the same presentation choice.
+vsync: bool,
+
+/// Set while the GPU objects are released: after `deinit`, and after a
+/// recovery attempt that could not create a replacement device. The
+/// release is skipped then, and the next attempt goes straight to
+/// creating.
+released: bool = false,
+
+/// Frames still to wait before the next recovery attempt.
+recovery_backoff: u8 = 0,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -124,7 +147,8 @@ blending: configpkg.Config.AlphaBlending,
 /// The size the apprt last reported through the `.resize` message, in
 /// pixels. `surfaceSize` answers with it and the swap chain follows it at
 /// present time. Zero until the first resize, which the apprt sends right
-/// after the surface exists, and zero while the window is minimized.
+/// after the surface exists. A minimize does not change it: the apprt
+/// reports occlusion instead, and no frame is drawn while invisible.
 size: struct { width: u32 = 0, height: u32 = 0 } = .{},
 
 /// Debug-log counters. Only the render thread touches these.
@@ -146,6 +170,52 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
 
     const compile = try loadCompiler();
 
+    var self: D3D11 = .{
+        .hwnd = hwnd,
+        .compile = compile,
+        .vsync = opts.config.vsync,
+        .blending = opts.config.blending,
+        // Set by adopt.
+        .device = undefined,
+        .context = undefined,
+        .swap_chain = undefined,
+        .feature_level = undefined,
+        .default_sampler = undefined,
+        .sync_interval = undefined,
+        .present_flags = undefined,
+    };
+    self.adopt(try createGpu(hwnd, opts.config.vsync));
+    return self;
+}
+
+/// The objects that live and die with one device. `init` creates them,
+/// and `recoverDevice` creates them again after the device was lost.
+const Gpu = struct {
+    device: *api.ID3D11Device,
+    context: *api.ID3D11DeviceContext,
+    swap_chain: *api.IDXGISwapChain1,
+    feature_level: api.D3D_FEATURE_LEVEL,
+    default_sampler: Sampler,
+    sync_interval: api.UINT,
+    present_flags: api.UINT,
+    info_queue: ?*api.ID3D11InfoQueue,
+};
+
+fn adopt(self: *D3D11, gpu: Gpu) void {
+    self.device = gpu.device;
+    self.context = gpu.context;
+    self.swap_chain = gpu.swap_chain;
+    self.feature_level = gpu.feature_level;
+    self.default_sampler = gpu.default_sampler;
+    self.sync_interval = gpu.sync_interval;
+    self.present_flags = gpu.present_flags;
+    self.info_queue = gpu.info_queue;
+    self.released = false;
+}
+
+/// Create the device, its immediate context and a swap chain for the
+/// window, plus the sampler and debug queue that go with them.
+fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     // BGRA support is required for the B8G8R8A8 swap chain format. The
     // debug layer needs the Graphics Tools optional feature; without it
     // device creation reports the SDK component missing, and the device is
@@ -234,10 +304,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     // windowed flip model only tearing unlocks the rate, and DXGI must
     // be asked whether it can tear; without it interval 0 still presents
     // as soon as the queue has room.
-    const sync_interval: api.UINT = if (opts.config.vsync) 1 else 0;
+    const sync_interval: api.UINT = if (vsync) 1 else 0;
     var swap_chain_flags: api.UINT = 0;
     var present_flags: api.UINT = 0;
-    if (!opts.config.vsync) tearing: {
+    if (!vsync) tearing: {
         const factory5 = api.queryInterface(factory, api.IDXGIFactory5) catch break :tearing;
         defer api.release(factory5);
         var allow: api.BOOL = 0;
@@ -314,17 +384,14 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
     });
 
     return .{
-        .hwnd = hwnd,
         .device = device,
         .context = context,
         .swap_chain = swap_chain,
         .feature_level = level,
-        .compile = compile,
         .default_sampler = default_sampler,
         .sync_interval = sync_interval,
         .present_flags = present_flags,
         .info_queue = info_queue,
-        .blending = opts.config.blending,
     };
 }
 
@@ -367,9 +434,18 @@ fn logAdapter(adapter: *api.IDXGIAdapter, level: api.D3D_FEATURE_LEVEL) void {
 }
 
 /// Main thread, after the render thread has been joined and has released
-/// every GPU resource. The swap chain goes before the context and device;
-/// nothing else references the back buffer at this point.
+/// every GPU resource.
 pub fn deinit(self: *D3D11) void {
+    self.releaseGpu();
+}
+
+/// Release the device and everything created with it. The swap chain goes
+/// before the context and device; nothing else references the back buffer
+/// at this point. Nothing to do when a failed recovery already released
+/// them.
+fn releaseGpu(self: *D3D11) void {
+    if (self.released) return;
+    self.released = true;
     self.context.vtable.ClearState(self.context);
     self.context.vtable.Flush(self.context);
     self.default_sampler.deinit();
@@ -377,6 +453,35 @@ pub fn deinit(self: *D3D11) void {
     api.release(self.context);
     if (self.info_queue) |q| api.release(q);
     api.release(self.device);
+}
+
+/// Whether the device was lost since the last frame. The generic renderer
+/// asks at the start of every frame and, when so, releases everything it
+/// created on the device before calling `recoverDevice`.
+pub fn deviceLost(self: *const D3D11) bool {
+    return self.lost;
+}
+
+/// Replace a lost device: release it with everything created on it, and
+/// create them again for the same window. Render thread, under the draw
+/// mutex, after the generic renderer released its own resources. On
+/// failure the device stays lost, the caller draws nothing, and a later
+/// frame tries again once the backoff has passed.
+pub fn recoverDevice(self: *D3D11) !void {
+    assert(self.lost);
+    self.releaseGpu();
+    if (self.recovery_backoff > 0) {
+        self.recovery_backoff -= 1;
+        return error.DeviceLost;
+    }
+    const gpu = createGpu(self.hwnd, self.vsync) catch |err| {
+        self.recovery_backoff = recovery_backoff_frames;
+        log.err("D3D11 device recovery failed err={}; retrying later", .{err});
+        return err;
+    };
+    self.adopt(gpu);
+    self.lost = false;
+    log.info("D3D11 device recovered hwnd={x}", .{@intFromPtr(self.hwnd)});
 }
 
 /// Nothing to bracket a frame with; kept for the contract.
