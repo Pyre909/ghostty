@@ -462,8 +462,10 @@ pub fn present(self: *D3D11, target: Target) PresentError!void {
 
     var rc: win32.RECT = undefined;
     if (win32.GetClientRect(self.hwnd, &rc) != 0) {
-        const cw: i64 = rc.right - rc.left;
-        const ch: i64 = rc.bottom - rc.top;
+        // Clamped as surfaceSize clamps, so that a client area larger
+        // than a texture can be still matches the target drawn for it.
+        const cw: i64 = @min(rc.right - rc.left, max_texture_dimension);
+        const ch: i64 = @min(rc.bottom - rc.top, max_texture_dimension);
         if (cw != @as(i64, @intCast(target.width)) or
             ch != @as(i64, @intCast(target.height)))
         {
