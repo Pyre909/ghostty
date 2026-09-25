@@ -2080,7 +2080,9 @@ keybind: Keybinds = .{},
 ///
 /// Changing this value at runtime will only affect new terminals.
 ///
-/// This setting is only supported currently on macOS.
+/// This setting is currently supported on macOS and on Windows. On
+/// Windows, false presents without waiting for the display and allows
+/// tearing when the system supports it.
 @"window-vsync": bool = true,
 
 /// If true, new windows will inherit the working directory of the
