@@ -15,6 +15,7 @@ const math = @import("../../math.zig");
 
 const api = @import("api.zig");
 const Pipeline = @import("Pipeline.zig");
+const RenderPass = @import("RenderPass.zig");
 
 const log = std.log.scoped(.d3d11);
 
@@ -512,17 +513,171 @@ test "d3d11 shaders: data layouts" {
     try testing.expectEqual(0, @sizeOf(Uniforms) % 16);
 }
 
-test "d3d11 shaders: vertex shaders declare every input element" {
+/// The embedded source of a named pipeline, for the tests below.
+fn testSource(
+    comptime name: []const u8,
+    comptime stage: enum { vertex, fragment },
+) [:0]const u8 {
+    return comptime found: {
+        for (pipeline_descs) |pipeline| {
+            if (std.mem.eql(u8, pipeline[0], name)) break :found switch (stage) {
+                .vertex => pipeline[1].vertex_fn.?,
+                .fragment => pipeline[1].fragment_fn.?,
+            };
+        }
+        @compileError("no pipeline named " ++ name);
+    };
+}
+
+test "d3d11 shaders: input element tables match the vertex shader inputs" {
     // CreateInputLayout rejects a layout that lacks an input the vertex
-    // shader declares, so the semantic names of a table must all appear
-    // in the shader that consumes it.
+    // shader declares, and a table entry the shader never names is a
+    // stale one, so the `: NAME;` semantics of `struct VertexIn` and the
+    // table must be the same set. The system-value input (SV_VertexID)
+    // is not part of the layout.
     const testing = std.testing;
     inline for (pipeline_descs) |pipeline| {
         const V = pipeline[1].vertex_attributes orelse continue;
         const source = pipeline[1].vertex_fn orelse continue;
-        for (inputElements(V)) |e| {
-            const name = std.mem.span(e.SemanticName);
-            try testing.expect(std.mem.indexOf(u8, source, name) != null);
+        const elements = inputElements(V);
+
+        const start = std.mem.indexOf(u8, source, "struct VertexIn {") orelse
+            return error.TestUnexpectedResult;
+        const end = std.mem.indexOfPos(u8, source, start, "};") orelse
+            return error.TestUnexpectedResult;
+        const body = source[start..end];
+
+        var declared: usize = 0;
+        var lines = std.mem.tokenizeScalar(u8, body, '\n');
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOf(u8, line, " : ") orelse continue;
+            const semi = std.mem.indexOfScalarPos(u8, line, colon, ';') orelse continue;
+            const name = line[colon + 3 .. semi];
+            if (std.mem.startsWith(u8, name, "SV_")) continue;
+            declared += 1;
+            var found = false;
+            for (elements) |e| {
+                if (std.mem.eql(u8, std.mem.span(e.SemanticName), name)) found = true;
+            }
+            try testing.expect(found);
         }
+        try testing.expectEqual(elements.len, declared);
     }
+}
+
+test "d3d11 shaders: cbuffer packoffsets match the uniform offsets" {
+    // common.hlsl pins every field to a register with packoffset. Each
+    // annotation is derived here from the Zig offset and looked up in the
+    // embedded source, so an edit to either side fails this test.
+    const testing = std.testing;
+    const source = testSource("bg_color", .fragment);
+    const fields = .{
+        .{ "projection_matrix", "projection_matrix" },
+        .{ "screen_size", "screen_size" },
+        .{ "cell_size", "cell_size" },
+        .{ "grid_size", "grid_size_packed_2u16" },
+        .{ "grid_padding", "grid_padding" },
+        .{ "padding_extend", "padding_extend" },
+        .{ "min_contrast", "min_contrast" },
+        .{ "cursor_pos", "cursor_pos_packed_2u16" },
+        .{ "cursor_color", "cursor_color_packed_4u8" },
+        .{ "bg_color", "bg_color_packed_4u8" },
+        .{ "bools", "bools" },
+    };
+    inline for (fields) |f| {
+        const off = @offsetOf(Uniforms, f[0]);
+        const size = @sizeOf(@FieldType(Uniforms, f[0]));
+        // A field that fills whole registers is annotated without a
+        // component.
+        const needle = if (off % 16 == 0 and size >= 16)
+            std.fmt.comptimePrint("{s} : packoffset(c{d});", .{ f[1], off / 16 })
+        else
+            std.fmt.comptimePrint("{s} : packoffset(c{d}.{c});", .{
+                f[1],
+                off / 16,
+                "xyzw"[(off % 16) / 4],
+            });
+        try testing.expect(std.mem.indexOf(u8, source, needle) != null);
+    }
+    // Nothing is declared past the registers the struct covers.
+    const past = std.fmt.comptimePrint("packoffset(c{d}", .{@sizeOf(Uniforms) / 16});
+    try testing.expect(std.mem.indexOf(u8, source, past) == null);
+}
+
+test "d3d11 shaders: bit masks and registers match the Zig side" {
+    // The shaders decode the packed structs with literal masks and name
+    // the storage buffer register; each literal is derived here from the
+    // Zig type or constant and looked up in the embedded source.
+    const testing = std.testing;
+    const print = std.fmt.comptimePrint;
+    const common = testSource("bg_color", .fragment);
+    const text = testSource("cell_text", .vertex);
+    const cell_bg = testSource("cell_bg", .fragment);
+    const bg_image = testSource("bg_image", .vertex);
+
+    const Bools = Uniforms.Bools;
+    const Extend = Uniforms.PaddingExtend;
+    const GlyphBools = @FieldType(CellText, "bools");
+    const Info = BgImage.Info;
+    const pos_shift = @bitOffsetOf(Info, "position");
+    const fit_shift = @bitOffsetOf(Info, "fit");
+    const repeat_shift = @bitOffsetOf(Info, "repeat");
+
+    const masks = .{
+        .{ common, "CURSOR_WIDE", print("{d}u", .{@as(u32, @bitCast(Bools{
+            .cursor_wide = true,
+            .use_display_p3 = false,
+            .use_linear_blending = false,
+        }))}) },
+        .{ common, "USE_DISPLAY_P3", print("{d}u", .{@as(u32, @bitCast(Bools{
+            .cursor_wide = false,
+            .use_display_p3 = true,
+            .use_linear_blending = false,
+        }))}) },
+        .{ common, "USE_LINEAR_BLENDING", print("{d}u", .{@as(u32, @bitCast(Bools{
+            .cursor_wide = false,
+            .use_display_p3 = false,
+            .use_linear_blending = true,
+        }))}) },
+        .{ common, "USE_LINEAR_CORRECTION", print("{d}u", .{@as(u32, @bitCast(Bools{
+            .cursor_wide = false,
+            .use_display_p3 = false,
+            .use_linear_blending = false,
+            .use_linear_correction = true,
+        }))}) },
+        .{ common, "EXTEND_LEFT", print("{d}u", .{@as(u32, @bitCast(Extend{ .left = true }))}) },
+        .{ common, "EXTEND_RIGHT", print("{d}u", .{@as(u32, @bitCast(Extend{ .right = true }))}) },
+        .{ common, "EXTEND_UP", print("{d}u", .{@as(u32, @bitCast(Extend{ .up = true }))}) },
+        .{ common, "EXTEND_DOWN", print("{d}u", .{@as(u32, @bitCast(Extend{ .down = true }))}) },
+        .{ text, "NO_MIN_CONTRAST", print("{d}u", .{@as(u8, @bitCast(GlyphBools{ .no_min_contrast = true }))}) },
+        .{ text, "IS_CURSOR_GLYPH", print("{d}u", .{@as(u8, @bitCast(GlyphBools{ .is_cursor_glyph = true }))}) },
+        .{ text, "ATLAS_GRAYSCALE", print("{d}u", .{@intFromEnum(CellText.Atlas.grayscale)}) },
+        .{ text, "ATLAS_COLOR", print("{d}u", .{@intFromEnum(CellText.Atlas.color)}) },
+        .{ bg_image, "BG_IMAGE_POSITION", print("{d}u", .{((1 << @bitSizeOf(Info.Position)) - 1) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_TL", print("{d}u", .{@intFromEnum(Info.Position.tl) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_TC", print("{d}u", .{@intFromEnum(Info.Position.tc) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_TR", print("{d}u", .{@intFromEnum(Info.Position.tr) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_ML", print("{d}u", .{@intFromEnum(Info.Position.ml) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_MC", print("{d}u", .{@intFromEnum(Info.Position.mc) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_MR", print("{d}u", .{@intFromEnum(Info.Position.mr) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_BL", print("{d}u", .{@intFromEnum(Info.Position.bl) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_BC", print("{d}u", .{@intFromEnum(Info.Position.bc) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_BR", print("{d}u", .{@intFromEnum(Info.Position.br) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_FIT", print("{d}u << {d}", .{ (1 << @bitSizeOf(Info.Fit)) - 1, fit_shift }) },
+        .{ bg_image, "BG_IMAGE_CONTAIN", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.contain), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_COVER", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.cover), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_STRETCH", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.stretch), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_NO_FIT", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.none), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_REPEAT", print("{d}u << {d}", .{ 1, repeat_shift }) },
+    };
+    inline for (masks) |m| {
+        const needle = print("static const uint {s} = {s};", .{ m[1], m[2] });
+        try testing.expect(std.mem.indexOf(u8, m[0], needle) != null);
+    }
+
+    // The cell shaders read the cell backgrounds from the first storage
+    // register.
+    const storage = print("register(t{d})", .{RenderPass.storage_register_base});
+    try testing.expect(std.mem.indexOf(u8, text, storage) != null);
+    try testing.expect(std.mem.indexOf(u8, cell_bg, storage) != null);
 }
