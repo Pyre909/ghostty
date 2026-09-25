@@ -854,16 +854,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 break :err &.{};
             };
 
-            const has_custom_shaders = custom_shaders.len > 0;
-
             var shaders = try self.api.initShaders(
                 self.alloc,
                 custom_shaders,
             );
             errdefer shaders.deinit(self.alloc);
 
+            // Counted from the pipelines rather than the sources: a
+            // backend may leave out a shader its compiler rejects, and
+            // with none left the frame must render straight to the
+            // target rather than into a texture no pass reads.
             self.shaders = shaders;
-            self.has_custom_shaders = has_custom_shaders;
+            self.has_custom_shaders = shaders.post_pipelines.len > 0;
         }
 
         /// Callback called by renderer.Thread when it begins.
