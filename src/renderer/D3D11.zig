@@ -260,6 +260,25 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
             &context_ptr,
         );
     }
+    // A driver that stops short of feature level 11_0, or no adapter at
+    // all: WARP, the software rasterizer every supported Windows ships,
+    // does 11_0. Slow, but a terminal is drawn rather than no window, and
+    // the adapter line below then names the Microsoft Basic Render Driver.
+    if (api.failed(hr)) {
+        log.warn("D3D11CreateDevice on the hardware adapter failed hr=0x{x}; trying WARP", .{@as(u32, @bitCast(hr))});
+        hr = win32.D3D11CreateDevice(
+            null,
+            .WARP,
+            null,
+            flags,
+            &levels,
+            levels.len,
+            api.D3D11_SDK_VERSION,
+            &device_ptr,
+            &level,
+            &context_ptr,
+        );
+    }
     if (api.failed(hr)) {
         log.err("D3D11CreateDevice failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
         return error.D3D11DeviceFailed;
