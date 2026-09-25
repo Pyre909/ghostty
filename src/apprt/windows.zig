@@ -329,6 +329,7 @@ const win32 = struct {
     const MB_OK: UINT = 0x00000000;
     const MB_OKCANCEL: UINT = 0x00000001;
     const MB_ICONWARNING: UINT = 0x00000030;
+    const MB_ICONERROR: UINT = 0x00000010;
     const IDOK: c_int = 1;
 
     const MB_ICONASTERISK: UINT = 0x00000040;
@@ -838,6 +839,7 @@ pub const App = struct {
         if (self.config.@"initial-window") {
             _ = self.newSurface() catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
+                fatalNotice(self.core_app.alloc, err);
                 return err;
             };
         }
@@ -4015,6 +4017,29 @@ fn notice(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) void {
     app.prompt_depth += 1;
     defer app.prompt_depth -= 1;
     _ = win32.MessageBoxW(hwnd, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);
+}
+
+/// A failure that ends the process before any window exists. The
+/// executable runs in the Windows subsystem, where stderr reaches nobody
+/// when it was launched from Explorer or the Start menu, so the error is
+/// shown in a message box as well. Nothing is beneath it yet, so the
+/// nesting rules of `notice` do not apply.
+fn fatalNotice(alloc: Allocator, err: anyerror) void {
+    const what: []const u8 = switch (err) {
+        error.D3D11DeviceFailed => "Direct3D 11 feature level 11_0 is not available, not even through WARP",
+        error.D3D11SwapChainFailed => "Direct3D 11 could not create a swap chain for the window",
+        error.D3DCompilerMissing => "d3dcompiler_47.dll could not be loaded",
+        else => @errorName(err),
+    };
+    var buf: [192]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        &buf,
+        "Ghostty could not create its window: {s}.",
+        .{what},
+    ) catch "Ghostty could not create its window.";
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
+    defer alloc.free(wide);
+    _ = win32.MessageBoxW(null, wide.ptr, L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
 }
 
 /// Opens `wide` with the shell, then frees it. COM is initialized for the
