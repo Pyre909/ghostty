@@ -37,8 +37,9 @@ pub const Uniforms = extern struct {
     foreground_color: [4]f32 align(16),
     cursor_color: [4]f32 align(16),
     cursor_text: [4]f32 align(16),
-    selection_background_color: [4]f32 align(16),
+    // The prefix declares the foreground first; see the layout test.
     selection_foreground_color: [4]f32 align(16),
+    selection_background_color: [4]f32 align(16),
 };
 
 /// The target to load shaders for.
@@ -472,3 +473,26 @@ test "shadertoy to hlsl" {
 const test_crt = @embedFile("shaders/test_shadertoy_crt.glsl");
 const test_invalid = @embedFile("shaders/test_shadertoy_invalid.glsl");
 const test_focus = @embedFile("shaders/test_shadertoy_focus.glsl");
+
+test "shadertoy uniforms match the prefix block layout" {
+    // shaders/shadertoy_prefix.glsl declares the std140 block that the
+    // converted shaders read, and `Uniforms` must match it member for
+    // member. These are the block's offsets, derived by hand from that
+    // declaration: a vec3 takes a 16-byte register and the scalar that
+    // follows packs into its fourth component, arrays have a 16-byte
+    // stride, and iPalette[256] runs from 304 to 4400.
+    const testing = std.testing;
+    try testing.expectEqual(0, @offsetOf(Uniforms, "resolution"));
+    try testing.expectEqual(12, @offsetOf(Uniforms, "time"));
+    try testing.expectEqual(32, @offsetOf(Uniforms, "channel_time"));
+    try testing.expectEqual(192, @offsetOf(Uniforms, "sample_rate"));
+    try testing.expectEqual(208, @offsetOf(Uniforms, "current_cursor"));
+    try testing.expectEqual(304, @offsetOf(Uniforms, "palette"));
+    try testing.expectEqual(4400, @offsetOf(Uniforms, "background_color"));
+    try testing.expectEqual(4416, @offsetOf(Uniforms, "foreground_color"));
+    try testing.expectEqual(4432, @offsetOf(Uniforms, "cursor_color"));
+    try testing.expectEqual(4448, @offsetOf(Uniforms, "cursor_text"));
+    try testing.expectEqual(4464, @offsetOf(Uniforms, "selection_foreground_color"));
+    try testing.expectEqual(4480, @offsetOf(Uniforms, "selection_background_color"));
+    try testing.expectEqual(4496, @sizeOf(Uniforms));
+}
