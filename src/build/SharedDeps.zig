@@ -719,7 +719,8 @@ pub fn add(
 ///
 /// Zig auto-links the import library named by an `extern "user32"`-style
 /// declaration on Windows targets, so these are redundant; they are spelled
-/// out so the runtime's system libraries are listed in one place.
+/// out so the system libraries the runtime and its renderer import are
+/// listed in one place (kernel32 aside, which every Windows binary links).
 ///
 /// Note that this deliberately does NOT take the `glad_egl.c` +
 /// `linkSystemLibrary("egl")` path above: there is no libEGL on Windows,
@@ -729,7 +730,7 @@ fn addWin32(
     step: *std.Build.Step.Compile,
 ) !void {
     _ = self;
-    for ([_][]const u8{ "user32", "gdi32", "d3d11" }) |lib| {
+    for ([_][]const u8{ "user32", "gdi32", "imm32", "ole32", "shell32", "d3d11" }) |lib| {
         step.root_module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
     }
 }

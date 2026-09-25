@@ -10,9 +10,10 @@
 //!     a terminal with its own renderer and IO threads.
 //!
 //! The renderer is `GenericRenderer(D3D11)` (src/renderer/D3D11.zig). It
-//! takes only the `HWND` and creates, resizes and presents its swap chain
-//! on the render thread. The main thread makes no graphics calls once a
-//! surface exists: WM_PAINT only asks the core for a frame.
+//! takes only the `HWND`: it creates its device and swap chain in `init`,
+//! on the main thread inside `CoreSurface.init`, and resizes and presents
+//! the swap chain on the render thread. The main thread makes no graphics
+//! calls once a surface exists: WM_PAINT only asks the core for a frame.
 //!
 //! ## Invariants this file depends on
 //!
@@ -785,7 +786,7 @@ pub const App = struct {
     pub fn terminate(self: *App) void {
         // Every remaining surface is torn down in the same order as
         // Surface.destroyPosted (stop and wait for the core's threads, deinit
-        // the core surface, delete the GL context, destroy the window), so
+        // the core surface, destroy the window), so
         // that CoreApp.deinit -- which runs after this
         // (main_ghostty.zig:104-105) -- finds an empty surface list and its
         // `font_grid_set.count() == 0` assert holds (src/App.zig:141).
