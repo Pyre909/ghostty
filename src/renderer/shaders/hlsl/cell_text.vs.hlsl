@@ -51,7 +51,6 @@ VertexOut main(VertexIn in_data) {
     uint2 grid_size = unpack2u16(grid_size_packed_2u16);
     uint2 cursor_pos = unpack2u16(cursor_pos_packed_2u16);
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
-    bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
     float2 cell_pos = cell_size * float2(in_data.grid_pos);
@@ -147,8 +146,13 @@ VertexOut main(VertexIn in_data) {
 
     // If this cell is the cursor cell, but we're not processing
     // the cursor glyph itself, then we need to change the color.
+    //
+    // Linearized like every other color above, as the Metal shader does:
+    // the pixel shader takes linear input and gamma encodes it itself when
+    // blending is not linear. (The GLSL twin passes use_linear_blending
+    // here, which encodes this one color twice under native blending.)
     if ((glyph_bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos) {
-        out_data.color = load_color(unpack4u8(cursor_color_packed_4u8), use_linear_blending);
+        out_data.color = load_color(unpack4u8(cursor_color_packed_4u8), true);
     }
 
     return out_data;
