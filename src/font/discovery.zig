@@ -1087,10 +1087,14 @@ pub const TraitScore = packed struct {
 pub const DirectWrite = struct {
     dwrite: *directwrite.Shared,
 
+    /// What opens the fonts that are found, which is asked about each
+    /// of them before it is offered.
+    lib: Library,
+
     const api = directwrite.api;
 
     pub fn init(lib: Library) DirectWrite {
-        return .{ .dwrite = lib.dwrite };
+        return .{ .dwrite = lib.dwrite, .lib = lib };
     }
 
     pub fn deinit(self: *DirectWrite) void {
@@ -1166,6 +1170,7 @@ pub const DirectWrite = struct {
 
         return .{
             .alloc = alloc,
+            .lib = self.lib,
             .list = try list.toOwnedSlice(alloc),
             .variations = desc.variations,
             .i = 0,
@@ -1206,6 +1211,7 @@ pub const DirectWrite = struct {
 
         return .{
             .alloc = alloc,
+            .lib = self.lib,
             .list = &.{},
             .variations = desc.variations,
             .i = 0,
@@ -1413,6 +1419,7 @@ pub const DirectWrite = struct {
 
     pub const DiscoverIterator = struct {
         alloc: Allocator,
+        lib: Library,
         list: []const Candidate,
         variations: []const Variation,
         i: usize,
@@ -1465,11 +1472,13 @@ pub const DirectWrite = struct {
         /// or null for a font that cannot be loaded, whose reference is
         /// dropped.
         fn offer(self: *const DiscoverIterator, font: *api.IDWriteFont) ?DeferredFace {
-            // FreeType opens files, by a name it can pass on. A font that
-            // DirectWrite serves from anything else cannot be loaded, so
-            // it is not offered.
+            // What DirectWrite finds, FreeType has to load. A font that
+            // it does not load is not offered: one that is offered and
+            // then fails to load is not a font that was not found, which
+            // has the fonts that are built in to fall back on, but a
+            // font grid that cannot be made.
             if (comptime options.backend.hasFreetype()) {
-                if (!canLoad(font)) {
+                if (!self.canLoad(font)) {
                     api.release(font);
                     return null;
                 }
@@ -1482,20 +1491,29 @@ pub const DirectWrite = struct {
             } };
         }
 
-        fn canLoad(font: *api.IDWriteFont) bool {
-            var out: ?*api.IDWriteFontFace = null;
-            if (api.failed(font.vtable.CreateFontFace(font, &out))) return false;
-            const face = out orelse return false;
-            defer api.release(face);
-            var buf: [directwrite.path_max]u8 = undefined;
-            const file = directwrite.localFile(face, &buf) catch return false;
-            if (!directwrite.freetypeCanOpen(file.path)) {
-                log.info(
-                    "font skipped, its path is outside the process's code page: {s}",
-                    .{file.path},
-                );
+        /// Whether FreeType loads a font. It opens files, by a name it
+        /// can pass on, and takes the characters of a font from a
+        /// Unicode character map, which the symbol fonts of Windows
+        /// (Webdings, Wingdings, Symbol, Marlett) do not have.
+        ///
+        /// The question is put to what loads the font later, so the
+        /// answer is the one that loading gets, whatever the reason.
+        fn canLoad(self: *const DiscoverIterator, font: *api.IDWriteFont) bool {
+            // The font is borrowed for the length of the call.
+            var deferred: DeferredFace = .{ .dw = .{
+                .font = font,
+                .presentation = .text,
+                .variations = self.variations,
+            } };
+            var face = deferred.load(self.lib, .{ .size = .{ .points = 12 } }) catch |err| {
+                var buf: [directwrite.name_max]u8 = undefined;
+                log.info("font skipped, it does not load: {s} err={}", .{
+                    deferred.name(&buf) catch "unknown",
+                    err,
+                });
                 return false;
-            }
+            };
+            face.deinit();
             return true;
         }
 
@@ -2146,12 +2164,16 @@ test "directwrite" {
     // so that the collection synthesizes it, and has no simulated face
     // among its fonts.
     {
-        var it = try dw.discover(alloc, .{ .family = "Webdings", .size = 12, .bold = true });
+        var it = try dw.discover(alloc, .{
+            .family = "Lucida Console",
+            .size = 12,
+            .bold = true,
+        });
         defer it.deinit();
         try testing.expect(try it.next() == null);
     }
     {
-        var it = try dw.discover(alloc, .{ .family = "Webdings", .size = 12 });
+        var it = try dw.discover(alloc, .{ .family = "Lucida Console", .size = 12 });
         defer it.deinit();
         var count: usize = 0;
         while (try it.next()) |deferred| {
@@ -2160,6 +2182,34 @@ test "directwrite" {
             count += 1;
         }
         try testing.expectEqual(1, count);
+    }
+
+    // A symbol font has no Unicode character map, which FreeType takes
+    // the characters of a font from. It is found, and is not offered
+    // to what cannot load it: a family that fails to load fails the
+    // font grid, where a family that is not found leaves the fonts that
+    // are built in.
+    for ([_][:0]const u8{ "Webdings", "Wingdings", "Symbol" }) |family| {
+        var it = try dw.discover(alloc, .{ .family = family, .size = 12 });
+        defer it.deinit();
+        try testing.expectEqual(1, it.list.len);
+        if (comptime !options.backend.hasFreetype()) continue;
+        try testing.expect(try it.next() == null);
+    }
+
+    // Every font that is offered loads.
+    {
+        var it = try dw.discover(alloc, .{ .size = 12 });
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next()) |deferred| {
+            var face = deferred;
+            defer face.deinit();
+            var loaded = try face.load(lib, .{ .size = .{ .points = 12 } });
+            loaded.deinit();
+            count += 1;
+        }
+        try testing.expect(count > 0);
     }
 
     // Every result of a search for a codepoint has the codepoint.
@@ -2345,7 +2395,7 @@ test "directwrite fallback" {
         // A font that cannot be loaded is not offered, the system's
         // answer included, and the search goes on without it.
         const offered = (comptime !options.backend.hasFreetype()) or
-            DirectWrite.DiscoverIterator.canLoad(first);
+            it.canLoad(first);
 
         var count: usize = 0;
         while (try it.next()) |deferred| {

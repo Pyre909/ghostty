@@ -345,6 +345,13 @@ fn loadDirectWriteFreetype(
     var buf: [directwrite.path_max]u8 = undefined;
     const file = try directwrite.localFile(dw_face, &buf);
 
+    // FreeType reads the name in the process's code page, where a name
+    // that is not the same there is the name of another file or of none.
+    if (!directwrite.freetypeCanOpen(file.path)) {
+        log.info("font path is outside the process's code page: {s}", .{file.path});
+        return error.FontPathCantDecode;
+    }
+
     var face = try Face.initFile(lib, file.path, @intCast(file.index), opts);
     errdefer face.deinit();
 
