@@ -138,9 +138,9 @@ language: ?[:0]const u8 = null,
 /// etc.
 ///
 /// Notes on emoji specifically: On macOS, Ghostty by default will always use
-/// Apple Color Emoji and on Linux will always use Noto Emoji. You can
-/// override this behavior by specifying a font family here that contains
-/// emoji glyphs.
+/// Apple Color Emoji and on Linux and Windows will always use Noto Emoji.
+/// You can override this behavior by specifying a font family here that
+/// contains emoji glyphs.
 ///
 /// The specific styles (bold, italic, bold italic) do not need to be
 /// explicitly set. If a style is not set, then the regular style (font-family)
