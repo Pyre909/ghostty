@@ -102,8 +102,9 @@ fn runArgs(alloc_gpa: Allocator, argsIter: anytype) !u8 {
     var map: std.StringHashMap(std.ArrayListUnmanaged([]const u8)) = .init(alloc);
 
     // Look up all available fonts. The library is only used by backends
-    // that need it (the Windows backend opens candidate font files with
-    // FreeType); other backends ignore it.
+    // that need it (on Windows, DirectWrite is reached through it, and
+    // the scanner of the font directories opens candidate font files
+    // with FreeType); other backends ignore it.
     var font_lib = try font.Library.init(alloc);
     defer font_lib.deinit();
     var disco = font.Discover.init(font_lib);

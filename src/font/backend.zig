@@ -52,10 +52,12 @@ pub const Backend = enum {
 
         if (target.os.tag == .windows) {
             // Avoid fontconfig on Windows because its libxml2 dependency
-            // may not unpack due to symlinks. Use the FreeType-based
-            // Windows font-directory scanner for discovery. A future
-            // DirectWrite backend can replace this if needed.
-            return .freetype_windows;
+            // may not unpack due to symlinks. DirectWrite finds the fonts
+            // instead: it knows them by the names and the styles Windows
+            // shows them under, and knows the font the system shows a
+            // character in. The scanner of the font directories stays
+            // available as "freetype_windows".
+            return .directwrite_freetype;
         }
 
         // macOS also supports "coretext_freetype" but there is no scenario
