@@ -12,9 +12,11 @@
 //! switch arms may reference them. The pure helpers below them, and their
 //! tests, compile on every host.
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const global = @import("../../global.zig");
 const font = @import("../main.zig");
 pub const api = @import("api.zig");
+pub const TextAnalysisSource = @import("TextAnalysisSource.zig");
 
 const log = std.log.scoped(.directwrite);
 
@@ -25,6 +27,14 @@ extern "dwrite" fn DWriteCreateFactory(
 ) callconv(.winapi) api.HRESULT;
 
 extern "kernel32" fn GetACP() callconv(.winapi) u32;
+
+extern "kernel32" fn GetUserDefaultLocaleName(
+    name: [*]u16,
+    len: c_int,
+) callconv(.winapi) c_int;
+
+/// LOCALE_NAME_MAX_LENGTH, which counts the terminator.
+const locale_max = 85;
 
 /// The UTF-8 code page.
 const CP_UTF8 = 65001;
@@ -37,6 +47,15 @@ pub const Error = error{
 
 pub const Shared = struct {
     factory: *api.IDWriteFactory,
+
+    /// The system's font fallback, which knows the font Windows shows a
+    /// character in. Null where DirectWrite has none to offer.
+    fallback: ?*api.IDWriteFontFallback,
+
+    /// The user's locale, which decides between the fonts of the
+    /// languages that share characters: the Han of Japanese is not drawn
+    /// like the Han of Chinese.
+    locale: [locale_max:0]u16,
 
     var instance: ?Shared = null;
     var mutex: std.Io.Mutex = .init;
@@ -54,10 +73,76 @@ pub const Shared = struct {
             log.err("DWriteCreateFactory failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
             return error.DirectWriteFailed;
         }
+        const factory: *api.IDWriteFactory =
+            @ptrCast(@alignCast(unk orelse return error.DirectWriteFailed));
+
+        var locale: [locale_max:0]u16 = @splat(0);
+        if (GetUserDefaultLocaleName(&locale, locale_max) <= 0) {
+            const default = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
+            @memcpy(locale[0..default.len], default);
+            locale[default.len] = 0;
+        }
+
+        const fallback: ?*api.IDWriteFontFallback = fallback: {
+            const factory2 = api.queryInterface(factory, api.IDWriteFactory2) catch
+                break :fallback null;
+            defer api.release(factory2);
+            var out: ?*api.IDWriteFontFallback = null;
+            if (api.failed(factory2.vtable.GetSystemFontFallback(factory2, &out)))
+                break :fallback null;
+            break :fallback out;
+        };
+
         instance = .{
-            .factory = @ptrCast(@alignCast(unk orelse return error.DirectWriteFailed)),
+            .factory = factory,
+            .fallback = fallback,
+            .locale = locale,
         };
         return &instance.?;
+    }
+
+    /// The font the system shows a codepoint in, among the fonts of a
+    /// collection: a reference the caller releases, or null when the
+    /// system has no answer.
+    ///
+    /// The allocator holds the text source for the length of the call.
+    pub fn mapCharacter(
+        self: *const Shared,
+        alloc: Allocator,
+        codepoint: u21,
+        collection: *api.IDWriteFontCollection,
+        bold: bool,
+        italic: bool,
+    ) ?*api.IDWriteFont {
+        const fallback = self.fallback orelse return null;
+        const source = TextAnalysisSource.create(alloc, codepoint, &self.locale) catch
+            return null;
+        defer api.release(source);
+
+        var mapped_len: api.UINT = 0;
+        var mapped: ?*api.IDWriteFont = null;
+        var scale: api.FLOAT = 1;
+        const hr = fallback.mapCharacters(
+            source,
+            0,
+            if (codepoint < 0x10000) 1 else 2,
+            collection,
+            null,
+            if (bold) .BOLD else .NORMAL,
+            if (italic) .ITALIC else .NORMAL,
+            .NORMAL,
+            &mapped_len,
+            &mapped,
+            &scale,
+        );
+        if (api.failed(hr)) {
+            log.debug("MapCharacters failed cp={X} hr=0x{x}", .{
+                codepoint,
+                @as(u32, @bitCast(hr)),
+            });
+            return null;
+        }
+        return mapped;
     }
 
     /// The system font collection as it is now, a reference the caller

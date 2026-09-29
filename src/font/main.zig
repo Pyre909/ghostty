@@ -77,6 +77,8 @@ test {
     // backends, but their layout tests run on every host.
     _ = @import("directwrite/api.zig");
     _ = @import("directwrite/main.zig");
+    _ = @import("directwrite/object.zig");
+    _ = @import("directwrite/TextAnalysisSource.zig");
 
     // For non-wasm we want to test everything we can
     if (!comptime builtin.target.cpu.arch.isWasm()) {

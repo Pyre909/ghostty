@@ -1172,6 +1172,12 @@ pub const DirectWrite = struct {
         };
     }
 
+    /// Discover fonts for a codepoint that the fonts in use lack.
+    ///
+    /// The first answer is the system's: the font Windows itself shows
+    /// the character in, for the user's locale. Every other font that
+    /// has the character follows, for the caller that turns the first
+    /// one down, and is only looked for then.
     pub fn discoverFallback(
         self: *const DirectWrite,
         alloc: Allocator,
@@ -1179,7 +1185,33 @@ pub const DirectWrite = struct {
         desc: Descriptor,
     ) !DiscoverIterator {
         _ = collection;
-        return self.discover(alloc, desc);
+
+        // The system is asked about a codepoint, in UTF-16. What is none,
+        // or is beyond the last one that has an encoding, is not a
+        // question for it.
+        if (desc.codepoint == 0 or desc.codepoint > 0x10FFFF) {
+            return self.discover(alloc, desc);
+        }
+        const codepoint: u21 = @intCast(desc.codepoint);
+
+        const system = try self.dwrite.systemFonts();
+        defer api.release(system);
+        const first = self.dwrite.mapCharacter(
+            alloc,
+            codepoint,
+            system,
+            desc.bold,
+            desc.italic,
+        ) orelse return self.discover(alloc, desc);
+
+        return .{
+            .alloc = alloc,
+            .list = &.{},
+            .variations = desc.variations,
+            .i = 0,
+            .first = first,
+            .rest = .{ .discover = self.*, .desc = desc },
+        };
     }
 
     const Candidate = struct {
@@ -1385,37 +1417,69 @@ pub const DirectWrite = struct {
         variations: []const Variation,
         i: usize,
 
+        /// The system's answer to a search for a codepoint, which goes
+        /// before the list. A reference this owns until it is handed on.
+        first: ?*api.IDWriteFont = null,
+
+        /// The search that fills the list once the first answer is gone:
+        /// going through every font is work that the first answer
+        /// usually saves.
+        rest: ?struct {
+            discover: DirectWrite,
+            desc: Descriptor,
+        } = null,
+
         pub fn deinit(self: *DiscoverIterator) void {
+            if (self.first) |font| api.release(font);
             for (self.list[self.i..]) |c| api.release(c.font);
             self.alloc.free(self.list);
             self.* = undefined;
         }
 
         pub fn next(self: *DiscoverIterator) !?DeferredFace {
+            if (self.first) |font| {
+                self.first = null;
+                if (self.offer(font)) |face| return face;
+            }
+
+            if (self.rest) |rest| {
+                self.rest = null;
+                var it = try rest.discover.discover(self.alloc, rest.desc);
+                self.alloc.free(self.list);
+                self.list = it.list;
+                self.i = 0;
+                it.list = &.{};
+                it.deinit();
+            }
+
             while (self.i < self.list.len) {
-                // The reference moves to the deferred face, or is dropped
-                // here.
                 const font = self.list[self.i].font;
                 self.i += 1;
-
-                // FreeType opens files, by a name it can pass on. A font
-                // that DirectWrite serves from anything else cannot be
-                // loaded, so it is not offered.
-                if (comptime options.backend.hasFreetype()) {
-                    if (!canLoad(font)) {
-                        api.release(font);
-                        continue;
-                    }
-                }
-
-                return .{ .dw = .{
-                    .font = font,
-                    .presentation = presentation(font),
-                    .variations = self.variations,
-                } };
+                if (self.offer(font)) |face| return face;
             }
 
             return null;
+        }
+
+        /// The deferred face of a font, which takes the font's reference,
+        /// or null for a font that cannot be loaded, whose reference is
+        /// dropped.
+        fn offer(self: *const DiscoverIterator, font: *api.IDWriteFont) ?DeferredFace {
+            // FreeType opens files, by a name it can pass on. A font that
+            // DirectWrite serves from anything else cannot be loaded, so
+            // it is not offered.
+            if (comptime options.backend.hasFreetype()) {
+                if (!canLoad(font)) {
+                    api.release(font);
+                    return null;
+                }
+            }
+
+            return .{ .dw = .{
+                .font = font,
+                .presentation = presentation(font),
+                .variations = self.variations,
+            } };
         }
 
         fn canLoad(font: *api.IDWriteFont) bool {
@@ -2241,4 +2305,103 @@ test "directwrite instance of a variable font" {
         }
         try testing.expect(found);
     }
+}
+
+test "directwrite fallback" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const api = directwrite.api;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var dw = DirectWrite.init(lib);
+    defer dw.deinit();
+    var c = Collection.init();
+    defer c.deinit(alloc);
+
+    // The system has a font for each of these: Han, Devanagari, a symbol
+    // and an emoji.
+    for ([_]u21{ 0x4E2D, 0x0905, 0x2605, 0x1F600 }) |cp| {
+        // The system's answer is there, and has the codepoint.
+        {
+            const system = try lib.dwrite.systemFonts();
+            defer api.release(system);
+            const font = lib.dwrite.mapCharacter(alloc, cp, system, false, false) orelse
+                return error.TestFontNotFound;
+            defer api.release(font);
+            var exists: api.BOOL = 0;
+            try testing.expect(api.succeeded(font.vtable.HasCharacter(font, cp, &exists)));
+            try testing.expect(exists != 0);
+        }
+
+        // It is the first result, and the others follow for a caller that
+        // turns it down.
+        var it = try dw.discoverFallback(alloc, &c, .{ .codepoint = cp, .size = 12 });
+        defer it.deinit();
+        const first = it.first orelse return error.TestFontNotFound;
+
+        // A font that cannot be loaded is not offered, the system's
+        // answer included, and the search goes on without it.
+        const offered = (comptime !options.backend.hasFreetype()) or
+            DirectWrite.DiscoverIterator.canLoad(first);
+
+        var count: usize = 0;
+        while (try it.next()) |deferred| {
+            var face = deferred;
+            defer face.deinit();
+
+            // The face takes the font that the iterator held, so it is
+            // the same object and not only the same font.
+            if (count == 0 and offered) {
+                try testing.expectEqual(first, face.dw.?.font);
+            }
+            try testing.expect(face.hasCodepoint(cp, null));
+            count += 1;
+        }
+        try testing.expect(count > 1);
+    }
+
+    // An emoji comes in a font that presents as emoji.
+    {
+        var it = try dw.discoverFallback(alloc, &c, .{ .codepoint = 0x1F600, .size = 12 });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.TestFontNotFound;
+        defer face.deinit();
+        try testing.expect(face.hasCodepoint(0x1F600, .emoji));
+    }
+
+    // An iterator that is dropped with the first answer still in it gives
+    // up its reference to the font. The font is DirectWrite's, which the
+    // allocator of the test does not see, so its count is read: between
+    // a reference that the test takes and gives up again, the iterator's
+    // goes, and two are gone. The counts are compared with each other
+    // and not with a number, since DirectWrite holds the font as well.
+    {
+        var it = try dw.discoverFallback(alloc, &c, .{ .codepoint = 0x4E2D, .size = 12 });
+        const font = it.first orelse {
+            it.deinit();
+            return error.TestFontNotFound;
+        };
+        const unk = api.unknown(font);
+        const held = unk.vtable.AddRef(unk);
+        it.deinit();
+        const left = unk.vtable.Release(unk);
+        try testing.expectEqual(held - 2, left);
+    }
+
+    // What is no codepoint is not asked of the system and is in no font:
+    // there is no first answer, and the search ends with nothing.
+    {
+        var it = try dw.discoverFallback(alloc, &c, .{ .codepoint = 0x110000, .size = 12 });
+        defer it.deinit();
+        try testing.expect(it.first == null);
+        try testing.expect(it.rest == null);
+        try testing.expect(try it.next() == null);
+    }
+
+    // DirectWrite had a text source for the length of each call and kept
+    // none of them.
+    try testing.expectEqual(0, directwrite.TextAnalysisSource.live.load(.monotonic));
 }
