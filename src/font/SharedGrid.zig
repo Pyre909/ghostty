@@ -272,6 +272,7 @@ pub const RenderGlyphError = error{
     CouldNotFindContext,
     DebugOpCode,
     DeferredLoadingUnavailable,
+    DirectWriteFailed,
     DivideByZero,
     ENDFInExecStream,
     ExecutionTooLong,

@@ -730,7 +730,7 @@ fn addWin32(
     step: *std.Build.Step.Compile,
 ) !void {
     _ = self;
-    for ([_][]const u8{ "user32", "gdi32", "imm32", "ole32", "shell32", "d3d11" }) |lib| {
+    for ([_][]const u8{ "user32", "gdi32", "imm32", "ole32", "shell32", "d3d11", "dwrite" }) |lib| {
         step.root_module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
     }
 }

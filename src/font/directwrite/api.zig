@@ -1019,3 +1019,163 @@ test "directwrite api: fallback iids" {
     try testing.expect(failed(DWRITE_E_ALREADYREGISTERED));
     try testing.expect(failed(DWRITE_E_NOCOLOR));
 }
+
+// ---------------------------------------------------------------------------
+// The later font faces, dwrite_1.h to dwrite_3.h. An instance of a variable
+// font reports the axis values that make it through IDWriteFontFace5.
+
+pub const IID_IDWriteFontFace1: GUID = GUID.parse("{a71efdb4-9fdb-4838-ad90-cfc3be8c3daf}");
+pub const IID_IDWriteFontFace2: GUID = GUID.parse("{d8b768ff-64bc-4e66-982b-ec8e87f693f7}");
+pub const IID_IDWriteFontFace3: GUID = GUID.parse("{d37d7598-09be-4222-a236-2081341cc1f2}");
+pub const IID_IDWriteFontFace4: GUID = GUID.parse("{27f2a904-4eb8-441d-9678-0563f53e3e2f}");
+pub const IID_IDWriteFontFace5: GUID = GUID.parse("{98eff3a5-b667-479a-b145-e2fa5b9fdc29}");
+
+/// An axis of a variable font and a value on it. The tag is a
+/// DWRITE_FONT_AXIS_TAG: the axis's four characters with the first in the
+/// low byte.
+pub const DWRITE_FONT_AXIS_VALUE = extern struct {
+    axisTag: UINT,
+    value: FLOAT,
+};
+
+pub const IDWriteFontResource = opaque {};
+
+// Overloads carry the interface's name in the header's C vtables, which
+// are flat; the names here are the header's.
+
+pub const IDWriteFontFace1 = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDWriteFontFace1;
+
+    pub const VTable = extern struct {
+        base: IDWriteFontFace.VTable,
+        IDWriteFontFace1_GetMetrics: Slot,
+        IDWriteFontFace1_GetGdiCompatibleMetrics: Slot,
+        GetCaretMetrics: Slot,
+        GetUnicodeRanges: Slot,
+        IsMonospacedFont: Slot,
+        GetDesignGlyphAdvances: Slot,
+        GetGdiCompatibleGlyphAdvances: Slot,
+        GetKerningPairAdjustments: Slot,
+        HasKerningPairs: Slot,
+        IDWriteFontFace1_GetRecommendedRenderingMode: Slot,
+        GetVerticalGlyphVariants: Slot,
+        HasVerticalGlyphVariants: Slot,
+    };
+};
+
+pub const IDWriteFontFace2 = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDWriteFontFace2;
+
+    pub const VTable = extern struct {
+        base: IDWriteFontFace1.VTable,
+        IsColorFont: Slot,
+        GetColorPaletteCount: Slot,
+        GetPaletteEntryCount: Slot,
+        GetPaletteEntries: Slot,
+        IDWriteFontFace2_GetRecommendedRenderingMode: Slot,
+    };
+};
+
+pub const IDWriteFontFace3 = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDWriteFontFace3;
+
+    pub const VTable = extern struct {
+        base: IDWriteFontFace2.VTable,
+        GetFontFaceReference: Slot,
+        GetPanose: Slot,
+        GetWeight: Slot,
+        GetStretch: Slot,
+        GetStyle: Slot,
+        GetFamilyNames: Slot,
+        GetFaceNames: Slot,
+        GetInformationalStrings: Slot,
+        HasCharacter: Slot,
+        IDWriteFontFace3_GetRecommendedRenderingMode: Slot,
+        IsCharacterLocal: Slot,
+        IsGlyphLocal: Slot,
+        AreCharactersLocal: Slot,
+        AreGlyphsLocal: Slot,
+    };
+};
+
+pub const IDWriteFontFace4 = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDWriteFontFace4;
+
+    pub const VTable = extern struct {
+        base: IDWriteFontFace3.VTable,
+        /// The header's name: the overload that takes one glyph.
+        GetGlyphImageFormats_: Slot,
+        GetGlyphImageFormats: Slot,
+        GetGlyphImageData: Slot,
+        ReleaseGlyphImageData: Slot,
+    };
+};
+
+pub const IDWriteFontFace5 = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDWriteFontFace5;
+
+    pub const VTable = extern struct {
+        base: IDWriteFontFace4.VTable,
+        GetFontAxisValueCount: *const fn (*IDWriteFontFace5) callconv(cc) UINT,
+        /// Fills as many values as the count says there are; a smaller
+        /// buffer is an error.
+        GetFontAxisValues: *const fn (*IDWriteFontFace5, [*]DWRITE_FONT_AXIS_VALUE, UINT) callconv(cc) HRESULT,
+        /// Whether any axis has a value other than its default.
+        HasVariations: *const fn (*IDWriteFontFace5) callconv(cc) BOOL,
+        GetFontResource: Slot,
+        Equals: Slot,
+    };
+};
+
+test "directwrite api: later faces vtable slot counts" {
+    const testing = std.testing;
+    const p = @sizeOf(usize);
+    try testing.expectEqual(30 * p, @sizeOf(IDWriteFontFace1.VTable));
+    try testing.expectEqual(35 * p, @sizeOf(IDWriteFontFace2.VTable));
+    try testing.expectEqual(49 * p, @sizeOf(IDWriteFontFace3.VTable));
+    try testing.expectEqual(53 * p, @sizeOf(IDWriteFontFace4.VTable));
+    try testing.expectEqual(58 * p, @sizeOf(IDWriteFontFace5.VTable));
+}
+
+test "directwrite api: later faces typed slot indices" {
+    const testing = std.testing;
+    const p = @sizeOf(usize);
+    try testing.expectEqual(18 * p, @offsetOf(IDWriteFontFace1.VTable, "IDWriteFontFace1_GetMetrics"));
+    try testing.expectEqual(30 * p, @offsetOf(IDWriteFontFace2.VTable, "IsColorFont"));
+    try testing.expectEqual(35 * p, @offsetOf(IDWriteFontFace3.VTable, "GetFontFaceReference"));
+    try testing.expectEqual(49 * p, @offsetOf(IDWriteFontFace4.VTable, "GetGlyphImageFormats_"));
+    try testing.expectEqual(53 * p, @offsetOf(IDWriteFontFace5.VTable, "GetFontAxisValueCount"));
+    try testing.expectEqual(54 * p, @offsetOf(IDWriteFontFace5.VTable, "GetFontAxisValues"));
+    try testing.expectEqual(55 * p, @offsetOf(IDWriteFontFace5.VTable, "HasVariations"));
+}
+
+test "directwrite api: later faces struct layouts" {
+    const testing = std.testing;
+    try testing.expectEqual(8, @sizeOf(DWRITE_FONT_AXIS_VALUE));
+    try testing.expectEqual(4, @offsetOf(DWRITE_FONT_AXIS_VALUE, "value"));
+}
+
+test "directwrite api: later faces iids" {
+    const testing = std.testing;
+    try testing.expectEqual(0xa71efdb4, IID_IDWriteFontFace1.Data1);
+    try testing.expectEqual(0xaf, IID_IDWriteFontFace1.Data4[7]);
+    try testing.expectEqual(0xd8b768ff, IID_IDWriteFontFace2.Data1);
+    try testing.expectEqual(0xf7, IID_IDWriteFontFace2.Data4[7]);
+    try testing.expectEqual(0xd37d7598, IID_IDWriteFontFace3.Data1);
+    try testing.expectEqual(0xf2, IID_IDWriteFontFace3.Data4[7]);
+    try testing.expectEqual(0x27f2a904, IID_IDWriteFontFace4.Data1);
+    try testing.expectEqual(0x2f, IID_IDWriteFontFace4.Data4[7]);
+    try testing.expectEqual(0x98eff3a5, IID_IDWriteFontFace5.Data1);
+    try testing.expectEqual(0xb667, IID_IDWriteFontFace5.Data2);
+    try testing.expectEqual(0x29, IID_IDWriteFontFace5.Data4[7]);
+}

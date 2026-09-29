@@ -12,6 +12,10 @@ pub const Backend = enum {
     /// SFNT name table without any external index.
     freetype_windows,
 
+    /// DirectWrite for font discovery, FreeType for rendering, and
+    /// HarfBuzz for shaping (Windows).
+    directwrite_freetype,
+
     /// Fontconfig for font discovery and FreeType for font rendering.
     fontconfig_freetype,
 
@@ -67,6 +71,7 @@ pub const Backend = enum {
         return switch (self) {
             .freetype,
             .freetype_windows,
+            .directwrite_freetype,
             .fontconfig_freetype,
             .coretext_freetype,
             => true,
@@ -89,6 +94,7 @@ pub const Backend = enum {
 
             .freetype,
             .freetype_windows,
+            .directwrite_freetype,
             .fontconfig_freetype,
             .web_canvas,
             => false,
@@ -101,6 +107,23 @@ pub const Backend = enum {
 
             .freetype,
             .freetype_windows,
+            .directwrite_freetype,
+            .coretext,
+            .coretext_freetype,
+            .coretext_harfbuzz,
+            .coretext_noshape,
+            .web_canvas,
+            => false,
+        };
+    }
+
+    pub fn hasDirectWrite(self: Backend) bool {
+        return switch (self) {
+            .directwrite_freetype => true,
+
+            .freetype,
+            .freetype_windows,
+            .fontconfig_freetype,
             .coretext,
             .coretext_freetype,
             .coretext_harfbuzz,
@@ -114,6 +137,7 @@ pub const Backend = enum {
         return switch (self) {
             .freetype,
             .freetype_windows,
+            .directwrite_freetype,
             .fontconfig_freetype,
             .coretext_freetype,
             .coretext_harfbuzz,

@@ -5,12 +5,14 @@ const Allocator = std.mem.Allocator;
 const options = @import("main.zig").options;
 const freetype = @import("freetype");
 const font = @import("main.zig");
+const directwrite = @import("directwrite/main.zig");
 
 /// Library implementation for the compile options.
 pub const Library = switch (options.backend) {
     // Freetype requires a state library
     .freetype,
     .freetype_windows,
+    .directwrite_freetype,
     .fontconfig_freetype,
     .coretext_freetype,
     => FreetypeLibrary,
@@ -32,16 +34,30 @@ pub const FreetypeLibrary = struct {
     /// being used to create or destroy a face.
     mutex: *std.Io.Mutex,
 
-    pub const InitError = freetype.Error || Allocator.Error;
+    /// The process's DirectWrite state, for the backends that discover
+    /// fonts with it. Borrowed: it belongs to the process.
+    dwrite: if (options.backend.hasDirectWrite()) *directwrite.Shared else void,
+
+    pub const InitError = freetype.Error || Allocator.Error ||
+        if (options.backend.hasDirectWrite()) directwrite.Error else error{};
 
     pub fn init(alloc: Allocator) InitError!Library {
         const lib = try freetype.Library.init();
         errdefer lib.deinit();
 
+        const dwrite = if (comptime options.backend.hasDirectWrite())
+            try directwrite.Shared.get()
+        else {};
+
         const mutex = try alloc.create(std.Io.Mutex);
         mutex.* = .init;
 
-        return Library{ .lib = lib, .alloc = alloc, .mutex = mutex };
+        return Library{
+            .lib = lib,
+            .alloc = alloc,
+            .mutex = mutex,
+            .dwrite = dwrite,
+        };
     }
 
     pub fn deinit(self: *Library) void {

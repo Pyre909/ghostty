@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const fontconfig = @import("fontconfig");
 const macos = @import("macos");
 const font = @import("main.zig");
+const directwrite = @import("directwrite/main.zig");
 const options = @import("main.zig").options;
 const Library = @import("main.zig").Library;
 const Face = @import("main.zig").Face;
@@ -29,6 +30,10 @@ ct: if (font.Discover == font.discovery.CoreText) ?CoreText else void =
 /// Windows (FreeType directory scan)
 win: if (options.backend == .freetype_windows) ?Windows else void =
     if (options.backend == .freetype_windows) null else {},
+
+/// DirectWrite
+dw: if (font.Discover == font.discovery.DirectWrite) ?DirectWrite else void =
+    if (font.Discover == font.discovery.DirectWrite) null else {},
 
 /// Canvas
 wc: if (options.backend == .web_canvas) ?WebCanvas else void =
@@ -91,6 +96,69 @@ pub const Windows = struct {
     }
 };
 
+/// DirectWrite specific data. This is only present when discovering with
+/// DirectWrite.
+pub const DirectWrite = struct {
+    /// The font, as a member of the system font collection. A reference
+    /// this owns. A font is cheap to hold and to ask: a font face, which
+    /// is what costs, is only made when the face is loaded.
+    font: *api.IDWriteFont,
+
+    /// Whether the font presents as emoji (is a color font) or as text.
+    presentation: Presentation,
+
+    /// Variations to apply on load.
+    variations: []const font.face.Variation,
+
+    const api = directwrite.api;
+
+    pub fn deinit(self: *DirectWrite) void {
+        api.release(self.font);
+        self.* = undefined;
+    }
+
+    fn familyName(self: DirectWrite, buf: []u8) ![]const u8 {
+        var family_out: ?*api.IDWriteFontFamily = null;
+        if (api.failed(self.font.vtable.GetFontFamily(self.font, &family_out)))
+            return "unknown";
+        const family = family_out orelse return "unknown";
+        defer api.release(family);
+
+        var strings_out: ?*api.IDWriteLocalizedStrings = null;
+        if (api.failed(family.vtable.GetFamilyNames(family, &strings_out)))
+            return "unknown";
+        const strings = strings_out orelse return "unknown";
+        defer api.release(strings);
+
+        return try directwrite.localizedString(strings, buf);
+    }
+
+    fn name(self: DirectWrite, buf: []u8) ![]const u8 {
+        var strings_out: ?*api.IDWriteLocalizedStrings = null;
+        var exists: api.BOOL = 0;
+        if (api.succeeded(self.font.vtable.GetInformationalStrings(
+            self.font,
+            .FULL_NAME,
+            &strings_out,
+            &exists,
+        ))) {
+            if (strings_out) |strings| {
+                defer api.release(strings);
+                if (exists != 0) return try directwrite.localizedString(strings, buf);
+            }
+        }
+
+        return try self.familyName(buf);
+    }
+
+    fn hasCodepoint(self: DirectWrite, cp: u32) bool {
+        var exists: api.BOOL = 0;
+        if (api.failed(self.font.vtable.HasCharacter(self.font, cp, &exists)))
+            return false;
+        return exists != 0;
+    }
+};
+
 /// CoreText specific data. This is only present when building with CoreText.
 pub const CoreText = struct {
     /// The initialized font
@@ -129,6 +197,7 @@ pub fn deinit(self: *DeferredFace) void {
         .fontconfig_freetype => if (self.fc) |*fc| fc.deinit(),
         .freetype => {},
         .freetype_windows => if (self.win) |*w| w.deinit(),
+        .directwrite_freetype => if (self.dw) |*dw| dw.deinit(),
         .web_canvas => if (self.wc) |*wc| wc.deinit(),
         .coretext,
         .coretext_freetype,
@@ -145,6 +214,8 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
         .freetype => {},
 
         .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
+
+        .directwrite_freetype => if (self.dw) |dw| return try dw.familyName(buf),
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.family, 0)).string,
@@ -175,6 +246,8 @@ pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
         .freetype => {},
 
         .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
+
+        .directwrite_freetype => if (self.dw) |dw| return try dw.name(buf),
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.fullname, 0)).string,
@@ -211,6 +284,7 @@ pub fn load(
     return switch (options.backend) {
         .fontconfig_freetype => try self.loadFontconfig(lib, opts),
         .freetype_windows => try self.loadWindows(lib, opts),
+        .directwrite_freetype => try self.loadDirectWriteFreetype(lib, opts),
         .coretext, .coretext_harfbuzz, .coretext_noshape => try self.loadCoreText(lib, opts),
         .coretext_freetype => try self.loadCoreTextFreetype(lib, opts),
         .web_canvas => try self.loadWebCanvas(opts),
@@ -248,6 +322,40 @@ fn loadWindows(
     var face = try Face.initFile(lib, w.path, w.face_index, opts);
     errdefer face.deinit();
     try face.setVariations(w.variations, opts);
+    return face;
+}
+
+fn loadDirectWriteFreetype(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    const dw = self.dw.?;
+    const api = directwrite.api;
+
+    var face_out: ?*api.IDWriteFontFace = null;
+    if (api.failed(dw.font.vtable.CreateFontFace(dw.font, &face_out)))
+        return error.DirectWriteFailed;
+    const dw_face = face_out orelse return error.DirectWriteFailed;
+    defer api.release(dw_face);
+
+    // FreeType opens the file DirectWrite reads the face from, at the
+    // index DirectWrite has for it: the members of a collection file are
+    // not all at index 0.
+    var buf: [directwrite.path_max]u8 = undefined;
+    const file = try directwrite.localFile(dw_face, &buf);
+
+    var face = try Face.initFile(lib, file.path, @intCast(file.index), opts);
+    errdefer face.deinit();
+
+    // The weights and widths of a variable font are instances of one
+    // file at one index, which FreeType opens at the font's defaults.
+    // The axis values are what makes this font the instance it is; the
+    // variations that were asked for come on top of them.
+    var axes_buf: [32]font.face.Variation = undefined;
+    try face.setVariations(directwrite.instanceAxes(dw_face, &axes_buf), opts);
+    try face.setVariations(dw.variations, opts);
+
     return face;
 }
 
@@ -352,6 +460,14 @@ pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
             if (self.win) |w| {
                 if (p) |desired| if (w.presentation != desired) return false;
                 return w.peek.glyphIndex(cp) != null;
+            }
+        },
+
+        .directwrite_freetype => {
+            // The font answers from its character map without a face.
+            if (self.dw) |dw| {
+                if (p) |desired| if (dw.presentation != desired) return false;
+                return dw.hasCodepoint(cp);
             }
         },
 
@@ -523,6 +639,41 @@ test "coretext" {
     var buf: [1024]u8 = undefined;
     const n = try def.name(&buf);
     try testing.expect(n.len > 0);
+
+    // Load it and verify it works
+    var face = try def.load(lib, .{ .size = .{ .points = 12 } });
+    defer face.deinit();
+    try testing.expect(face.glyphIndex(' ') != null);
+}
+
+test "directwrite" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+
+    const discovery = @import("main.zig").discovery;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    // Get a deferred face from DirectWrite. Arial ships with every
+    // Windows.
+    var def = def: {
+        var dw = discovery.DirectWrite.init(lib);
+        defer dw.deinit();
+        var it = try dw.discover(alloc, .{ .family = "Arial", .size = 12 });
+        defer it.deinit();
+        break :def (try it.next()).?;
+    };
+    defer def.deinit();
+    try testing.expect(def.hasCodepoint(' ', null));
+    try testing.expect(def.hasCodepoint(' ', .text));
+    try testing.expect(!def.hasCodepoint(' ', .emoji));
+
+    // Verify we can get the names
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("Arial", try def.familyName(&buf));
+    try testing.expectEqualStrings("Arial", try def.name(&buf));
 
     // Load it and verify it works
     var face = try def.load(lib, .{ .size = .{ .points = 12 } });

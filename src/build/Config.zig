@@ -194,6 +194,14 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "The font backend to use for discovery and rasterization.",
     ) orelse FontBackend.default(target.result, wasm_target);
 
+    // DirectWrite is part of Windows.
+    if (config.font_backend.hasDirectWrite() and
+        target.result.os.tag != .windows)
+    {
+        std.log.err("the DirectWrite font backends require a Windows target", .{});
+        return error.UnsupportedFontBackend;
+    }
+
     config.app_runtime = b.option(
         ApprtRuntime,
         "app-runtime",

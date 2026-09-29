@@ -76,6 +76,7 @@ test {
     // The DirectWrite declarations are only referenced by the Windows
     // backends, but their layout tests run on every host.
     _ = @import("directwrite/api.zig");
+    _ = @import("directwrite/main.zig");
 
     // For non-wasm we want to test everything we can
     if (!comptime builtin.target.cpu.arch.isWasm()) {

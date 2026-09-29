@@ -13,6 +13,7 @@ const Library = @import("main.zig").Library;
 const Presentation = @import("main.zig").Presentation;
 const Variation = @import("main.zig").face.Variation;
 const global = @import("../global.zig");
+const directwrite = @import("directwrite/main.zig");
 
 const log = std.log.scoped(.discovery);
 
@@ -20,6 +21,7 @@ const log = std.log.scoped(.discovery);
 pub const Discover = switch (options.backend) {
     .freetype => void, // no discovery
     .freetype_windows => Windows,
+    .directwrite_freetype => DirectWrite,
     .fontconfig_freetype => Fontconfig,
     .web_canvas => void, // no discovery
     .coretext,
@@ -951,6 +953,496 @@ pub const CoreText = struct {
     };
 };
 
+/// What a discovery backend knows about a font before it is loaded, in the
+/// terms `TraitScore` ranks by. A backend fills this from whatever its
+/// platform reports; nothing here is platform specific, so the ranking can
+/// be tested on any host against fonts read from memory.
+pub const Traits = struct {
+    /// The font has the descriptor's codepoint. Only meaningful when the
+    /// descriptor asks for one.
+    has_codepoint: bool = false,
+    monospace: bool = false,
+    bold: bool = false,
+    italic: bool = false,
+
+    /// The style name the font advertises, such as "Bold Italic".
+    style: []const u8 = "",
+
+    /// Clamped to what fits.
+    glyph_count: u16 = 0,
+
+    /// Refine `bold` and `italic` from the font's own tables, which are
+    /// more reliable than what a platform derives: a flag either table
+    /// sets is taken, as the CoreText scorer does. Tables that are absent
+    /// or do not parse change nothing.
+    pub fn refine(self: *Traits, head: ?[]const u8, os2: ?[]const u8) void {
+        if (head) |data| {
+            if (opentype.Head.init(data)) |table| {
+                self.bold = self.bold or (table.macStyle & 1 == 1);
+                self.italic = self.italic or (table.macStyle & 2 == 2);
+            } else |err| {
+                log.warn("error parsing head table: {}", .{err});
+            }
+        }
+        if (os2) |data| {
+            if (opentype.OS2.init(data)) |table| {
+                self.bold = self.bold or table.fsSelection.bold;
+                self.italic = self.italic or table.fsSelection.italic;
+            } else |err| {
+                log.warn("error parsing OS/2 table: {}", .{err});
+            }
+        }
+    }
+};
+
+/// A font's rank for a descriptor, from its `Traits`: the precedence and
+/// the style matching of the CoreText scorer, which works on CoreText's
+/// own descriptors and is left as it is.
+///
+/// Packed structs store their fields from least to most significant, so
+/// the fields are in increasing order of precedence and two scores compare
+/// as integers.
+pub const TraitScore = packed struct {
+    const Backing = @typeInfo(@This()).@"struct".backing_integer.?;
+
+    /// More glyphs win when everything else is equal.
+    glyph_count: u16 = 0,
+    /// A fuzzy match on the style string, less important than an exact
+    /// match and than the trait matches.
+    fuzzy_style: u8 = 0,
+    /// Whether the boldness matches the descriptor. Less important than
+    /// italic: the wrong slant is the bigger problem of the two.
+    bold: bool = false,
+    /// Whether the italicness matches the descriptor.
+    italic: bool = false,
+    /// An exact, case-insensitive match on the style string, so that a
+    /// user can override trait matching by naming a style.
+    exact_style: bool = false,
+    /// Monospace matters more than any style, and less than having the
+    /// codepoint that was asked for.
+    monospace: bool = false,
+    codepoint: bool = false,
+
+    pub fn int(self: TraitScore) Backing {
+        return @bitCast(self);
+    }
+
+    pub fn init(desc: *const Descriptor, traits: Traits) TraitScore {
+        var self: TraitScore = .{
+            .glyph_count = traits.glyph_count,
+            .monospace = traits.monospace,
+            .codepoint = desc.codepoint > 0 and traits.has_codepoint,
+            .bold = desc.bold == traits.bold,
+            .italic = desc.italic == traits.italic,
+        };
+
+        // The first string is the one an exact match is made against;
+        // for the fuzzy match every one that occurs raises the rank.
+        const desired_styles: []const [:0]const u8 = desired: {
+            if (desc.style) |s| break :desired &.{s};
+
+            // Without a style name the bold and italic properties stand
+            // in. Fonts name their styles in other ways too, but it
+            // helps in some edge cases.
+            if (desc.bold) {
+                if (desc.italic) break :desired &.{ "bold italic", "bold", "italic", "oblique" };
+                break :desired &.{ "bold", "upright" };
+            } else if (desc.italic) {
+                break :desired &.{ "italic", "regular", "oblique" };
+            }
+            break :desired &.{ "regular", "upright" };
+        };
+
+        self.exact_style = std.ascii.eqlIgnoreCase(traits.style, desired_styles[0]);
+
+        // Zero when no desired style occurs in the string; otherwise
+        // higher the fewer characters of it lie outside the desired ones.
+        const Fuzzy = @TypeOf(self.fuzzy_style);
+        self.fuzzy_style = std.math.cast(Fuzzy, traits.style.len) orelse
+            std.math.maxInt(Fuzzy);
+        for (desired_styles) |s| {
+            if (std.ascii.indexOfIgnoreCase(traits.style, s) != null) {
+                self.fuzzy_style -|= @intCast(s.len);
+            }
+        }
+        self.fuzzy_style = std.math.maxInt(Fuzzy) -| self.fuzzy_style;
+
+        return self;
+    }
+};
+
+/// DirectWrite font discovery: the fonts of the system font collection,
+/// which are the installed ones, for every user and for this one.
+///
+/// A descriptor's family is looked up by name. The fonts of that family,
+/// or every font when there is no family, are ranked by `TraitScore` and
+/// returned best first.
+///
+/// Only fonts that exist are returned. DirectWrite also lists the bold and
+/// the oblique it would simulate for a family that has none, and those
+/// are left out: a style nobody has is synthesized by the collection,
+/// which is where `font-synthetic-style` decides about it. That is also
+/// why a family asked for a bold or an italic it does not have answers
+/// with nothing rather than with its regular face.
+pub const DirectWrite = struct {
+    dwrite: *directwrite.Shared,
+
+    const api = directwrite.api;
+
+    pub fn init(lib: Library) DirectWrite {
+        return .{ .dwrite = lib.dwrite };
+    }
+
+    pub fn deinit(self: *DirectWrite) void {
+        _ = self;
+    }
+
+    /// Build the system font collection ahead of the first discovery.
+    ///
+    /// Enumerating the installed fonts is the expensive part of starting
+    /// DirectWrite; later queries work on the collection this leaves
+    /// behind.
+    pub fn warmup() void {
+        const shared = directwrite.Shared.get() catch return;
+        const collection = shared.systemFonts() catch return;
+        api.release(collection);
+    }
+
+    pub fn discover(
+        self: *const DirectWrite,
+        alloc: Allocator,
+        desc: Descriptor,
+    ) !DiscoverIterator {
+        // The fonts that are taken from the collection keep it alive for
+        // as long as they need it.
+        const collection = try self.dwrite.systemFonts();
+        defer api.release(collection);
+
+        var list: std.ArrayListUnmanaged(Candidate) = .empty;
+        errdefer {
+            for (list.items) |c| api.release(c.font);
+            list.deinit(alloc);
+        }
+
+        if (desc.family) |family| {
+            try collectFamily(alloc, &list, collection, family);
+        } else {
+            try collectAll(alloc, &list, collection);
+        }
+
+        // A family that is asked for a bold or an italic by the trait,
+        // not by a style's name, answers with the faces that are one.
+        const styled = desc.family != null and
+            desc.style == null and
+            desc.codepoint == 0;
+
+        // Rank. A font that lacks a codepoint that was asked for is no
+        // answer at all, whatever else it matches.
+        var i: usize = 0;
+        while (i < list.items.len) {
+            const c = &list.items[i];
+            var style_buf: [128]u8 = undefined;
+            const traits = fontTraits(c.font, &desc, &style_buf);
+            const keep = keep: {
+                if (desc.codepoint > 0 and !traits.has_codepoint) break :keep false;
+                if (styled and desc.bold and !traits.bold) break :keep false;
+                if (styled and desc.italic and !traits.italic) break :keep false;
+                break :keep true;
+            };
+            if (!keep) {
+                api.release(c.font);
+                _ = list.swapRemove(i);
+                continue;
+            }
+            c.score = .init(&desc, traits);
+            i += 1;
+        }
+        std.mem.sort(Candidate, list.items, {}, struct {
+            fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+                // Higher score is "less" (earlier)
+                return lhs.score.int() > rhs.score.int();
+            }
+        }.lessThan);
+
+        return .{
+            .alloc = alloc,
+            .list = try list.toOwnedSlice(alloc),
+            .variations = desc.variations,
+            .i = 0,
+        };
+    }
+
+    pub fn discoverFallback(
+        self: *const DirectWrite,
+        alloc: Allocator,
+        collection: *Collection,
+        desc: Descriptor,
+    ) !DiscoverIterator {
+        _ = collection;
+        return self.discover(alloc, desc);
+    }
+
+    const Candidate = struct {
+        /// A reference the list owns until the iterator hands it on.
+        font: *api.IDWriteFont,
+        score: TraitScore = .{},
+    };
+
+    /// The fonts of the family with this name.
+    fn collectFamily(
+        alloc: Allocator,
+        list: *std.ArrayListUnmanaged(Candidate),
+        collection: *api.IDWriteFontCollection,
+        family: [:0]const u8,
+    ) !void {
+        // UTF-16 never takes more units than UTF-8 takes bytes.
+        var wide: [directwrite.name_max]u16 = undefined;
+        if (family.len >= wide.len) return;
+        const len = std.unicode.utf8ToUtf16Le(&wide, family) catch return;
+        wide[len] = 0;
+
+        var index: api.UINT = 0;
+        var exists: api.BOOL = 0;
+        if (api.succeeded(collection.vtable.FindFamilyName(
+            collection,
+            wide[0..len :0],
+            &index,
+            &exists,
+        )) and exists != 0) {
+            var out: ?*api.IDWriteFontFamily = null;
+            if (api.failed(collection.vtable.GetFontFamily(collection, index, &out)))
+                return error.DirectWriteFailed;
+            const dw_family = out orelse return error.DirectWriteFailed;
+            defer api.release(dw_family);
+            try appendFonts(alloc, list, dw_family.fontList(), null);
+            return;
+        }
+
+        // DirectWrite groups fonts by weight, stretch and style, so a name
+        // that a font carries as its family, such as "Iosevka Heavy", can
+        // be a member of another family here. Those are found by the
+        // names the fonts themselves report.
+        const count = collection.vtable.GetFontFamilyCount(collection);
+        for (0..count) |i| {
+            var out: ?*api.IDWriteFontFamily = null;
+            if (api.failed(collection.vtable.GetFontFamily(collection, @intCast(i), &out))) continue;
+            const dw_family = out orelse continue;
+            defer api.release(dw_family);
+            try appendFonts(alloc, list, dw_family.fontList(), family);
+        }
+    }
+
+    /// Every font of the collection.
+    fn collectAll(
+        alloc: Allocator,
+        list: *std.ArrayListUnmanaged(Candidate),
+        collection: *api.IDWriteFontCollection,
+    ) !void {
+        const count = collection.vtable.GetFontFamilyCount(collection);
+        for (0..count) |i| {
+            var out: ?*api.IDWriteFontFamily = null;
+            if (api.failed(collection.vtable.GetFontFamily(collection, @intCast(i), &out))) continue;
+            const dw_family = out orelse continue;
+            defer api.release(dw_family);
+            try appendFonts(alloc, list, dw_family.fontList(), null);
+        }
+    }
+
+    /// Append the fonts of a family's list: all of them, or the ones
+    /// that carry `named` as a family name of their own. The fonts that
+    /// DirectWrite simulates are never among them.
+    fn appendFonts(
+        alloc: Allocator,
+        list: *std.ArrayListUnmanaged(Candidate),
+        fonts: *api.IDWriteFontList,
+        named: ?[]const u8,
+    ) !void {
+        const count = fonts.vtable.GetFontCount(fonts);
+        for (0..count) |i| {
+            var out: ?*api.IDWriteFont = null;
+            if (api.failed(fonts.vtable.GetFont(fonts, @intCast(i), &out))) continue;
+            const font = out orelse continue;
+            errdefer api.release(font);
+
+            const keep = keep: {
+                if (font.vtable.GetSimulations(font) != api.DWRITE_FONT_SIMULATIONS_NONE)
+                    break :keep false;
+                const name = named orelse break :keep true;
+                break :keep hasFamilyName(font, .WIN32_FAMILY_NAMES, name) or
+                    hasFamilyName(font, .TYPOGRAPHIC_FAMILY_NAMES, name);
+            };
+            if (!keep) {
+                api.release(font);
+                continue;
+            }
+
+            try list.append(alloc, .{ .font = font });
+        }
+    }
+
+    fn hasFamilyName(
+        font: *api.IDWriteFont,
+        id: api.DWRITE_INFORMATIONAL_STRING_ID,
+        name: []const u8,
+    ) bool {
+        var out: ?*api.IDWriteLocalizedStrings = null;
+        var exists: api.BOOL = 0;
+        if (api.failed(font.vtable.GetInformationalStrings(font, id, &out, &exists))) return false;
+        const strings = out orelse return false;
+        defer api.release(strings);
+        if (exists == 0) return false;
+
+        var buf: [directwrite.name_max * 3]u8 = undefined;
+        const value = directwrite.localizedString(strings, &buf) catch return false;
+        return std.ascii.eqlIgnoreCase(value, name);
+    }
+
+    /// What DirectWrite reports about a font, refined by the font's own
+    /// tables when a family narrowed the search: reading tables takes a
+    /// font face, which is too much for every font of the system.
+    fn fontTraits(
+        font: *api.IDWriteFont,
+        desc: *const Descriptor,
+        style_buf: []u8,
+    ) Traits {
+        var traits: Traits = .{
+            // From semi-bold on. A family whose heaviest face is that one
+            // has its bold in it; where there is a bold as well, the
+            // style's name ranks it first.
+            .bold = @intFromEnum(font.vtable.GetWeight(font)) >= 600,
+            .italic = font.vtable.GetStyle(font) != .NORMAL,
+        };
+
+        if (desc.codepoint > 0) {
+            var exists: api.BOOL = 0;
+            if (api.succeeded(font.vtable.HasCharacter(font, desc.codepoint, &exists)))
+                traits.has_codepoint = exists != 0;
+        }
+
+        if (api.queryInterface(font, api.IDWriteFont1)) |font1| {
+            defer api.release(font1);
+            traits.monospace = font1.vtable.IsMonospacedFont(font1) != 0;
+        } else |_| {}
+
+        style: {
+            var out: ?*api.IDWriteLocalizedStrings = null;
+            if (api.failed(font.vtable.GetFaceNames(font, &out))) break :style;
+            const strings = out orelse break :style;
+            defer api.release(strings);
+            traits.style = directwrite.localizedString(strings, style_buf) catch "";
+        }
+
+        if (desc.family != null) tables: {
+            var out: ?*api.IDWriteFontFace = null;
+            if (api.failed(font.vtable.CreateFontFace(font, &out))) break :tables;
+            const face = out orelse break :tables;
+            defer api.release(face);
+
+            const head: Table = .init(face, "head");
+            defer head.deinit();
+            const os2: Table = .init(face, "OS/2");
+            defer os2.deinit();
+            traits.refine(head.data, os2.data);
+        }
+
+        return traits;
+    }
+
+    /// A font table borrowed from a face.
+    const Table = struct {
+        face: *api.IDWriteFontFace,
+        data: ?[]const u8,
+        context: ?*anyopaque,
+
+        fn init(face: *api.IDWriteFontFace, tag: *const [4]u8) Table {
+            var self: Table = .{ .face = face, .data = null, .context = null };
+            var ptr: ?*const anyopaque = null;
+            var size: api.UINT = 0;
+            var exists: api.BOOL = 0;
+            if (api.failed(face.vtable.TryGetFontTable(
+                face,
+                directwrite.tableTag(tag),
+                &ptr,
+                &size,
+                &self.context,
+                &exists,
+            ))) return self;
+            if (exists == 0) return self;
+            const bytes: [*]const u8 = @ptrCast(ptr orelse return self);
+            self.data = bytes[0..size];
+            return self;
+        }
+
+        fn deinit(self: Table) void {
+            if (self.data == null) return;
+            self.face.vtable.ReleaseFontTable(self.face, self.context);
+        }
+    };
+
+    pub const DiscoverIterator = struct {
+        alloc: Allocator,
+        list: []const Candidate,
+        variations: []const Variation,
+        i: usize,
+
+        pub fn deinit(self: *DiscoverIterator) void {
+            for (self.list[self.i..]) |c| api.release(c.font);
+            self.alloc.free(self.list);
+            self.* = undefined;
+        }
+
+        pub fn next(self: *DiscoverIterator) !?DeferredFace {
+            while (self.i < self.list.len) {
+                // The reference moves to the deferred face, or is dropped
+                // here.
+                const font = self.list[self.i].font;
+                self.i += 1;
+
+                // FreeType opens files, by a name it can pass on. A font
+                // that DirectWrite serves from anything else cannot be
+                // loaded, so it is not offered.
+                if (comptime options.backend.hasFreetype()) {
+                    if (!canLoad(font)) {
+                        api.release(font);
+                        continue;
+                    }
+                }
+
+                return .{ .dw = .{
+                    .font = font,
+                    .presentation = presentation(font),
+                    .variations = self.variations,
+                } };
+            }
+
+            return null;
+        }
+
+        fn canLoad(font: *api.IDWriteFont) bool {
+            var out: ?*api.IDWriteFontFace = null;
+            if (api.failed(font.vtable.CreateFontFace(font, &out))) return false;
+            const face = out orelse return false;
+            defer api.release(face);
+            var buf: [directwrite.path_max]u8 = undefined;
+            const file = directwrite.localFile(face, &buf) catch return false;
+            if (!directwrite.freetypeCanOpen(file.path)) {
+                log.info(
+                    "font skipped, its path is outside the process's code page: {s}",
+                    .{file.path},
+                );
+                return false;
+            }
+            return true;
+        }
+
+        fn presentation(font: *api.IDWriteFont) Presentation {
+            const font2 = api.queryInterface(font, api.IDWriteFont2) catch return .text;
+            defer api.release(font2);
+            return if (font2.vtable.IsColorFont(font2) != 0) .emoji else .text;
+        }
+    };
+};
+
 /// Windows font discovery. Enumerates font files in the system and
 /// per-user font directories and matches them to a descriptor via
 /// FreeType's family_name field (with a fallback to the SFNT name
@@ -1413,4 +1905,340 @@ test "windows" {
     var face = (try it.next()) orelse return error.TestFontNotFound;
     defer face.deinit();
     try testing.expect(face.hasCodepoint('A', null));
+}
+
+test "trait score" {
+    // lib-vt source archives intentionally exclude full Ghostty font fixtures.
+    if (comptime @import("terminal_options").artifact == .lib) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const embedded = @import("main.zig").embedded;
+
+    // The four static faces of one family, with what a platform reports
+    // before a table is read: the style name and nothing else.
+    const faces = [_]struct { data: []const u8, style: []const u8 }{
+        .{ .data = embedded.regular, .style = "Regular" },
+        .{ .data = embedded.bold, .style = "Bold" },
+        .{ .data = embedded.italic, .style = "Italic" },
+        .{ .data = embedded.bold_italic, .style = "Bold Italic" },
+    };
+    var traits: [faces.len]Traits = undefined;
+    for (faces, &traits) |face, *t| {
+        const sfnt = try opentype.sfnt.SFNT.init(face.data, alloc);
+        defer sfnt.deinit(alloc);
+        t.* = .{ .style = face.style, .monospace = true };
+        t.refine(sfnt.getTable("head"), sfnt.getTable("OS/2"));
+    }
+
+    // The tables carry the styles.
+    try testing.expect(!traits[0].bold and !traits[0].italic);
+    try testing.expect(traits[1].bold and !traits[1].italic);
+    try testing.expect(!traits[2].bold and traits[2].italic);
+    try testing.expect(traits[3].bold and traits[3].italic);
+
+    const best = struct {
+        fn best(desc: Descriptor, candidates: []const Traits) usize {
+            var result: usize = 0;
+            for (candidates, 0..) |t, i| {
+                const score: TraitScore = .init(&desc, t);
+                const leader: TraitScore = .init(&desc, candidates[result]);
+                if (score.int() > leader.int()) result = i;
+            }
+            return result;
+        }
+    }.best;
+
+    // Each style that is asked for by its traits is the first result.
+    try testing.expectEqual(0, best(.{ .family = "JetBrains Mono" }, &traits));
+    try testing.expectEqual(1, best(.{ .family = "JetBrains Mono", .bold = true }, &traits));
+    try testing.expectEqual(2, best(.{ .family = "JetBrains Mono", .italic = true }, &traits));
+    try testing.expectEqual(3, best(.{
+        .family = "JetBrains Mono",
+        .bold = true,
+        .italic = true,
+    }, &traits));
+
+    // A style that is asked for by name wins over the traits, which are
+    // unset then, in any case of letters.
+    try testing.expectEqual(1, best(.{ .family = "JetBrains Mono", .style = "bold" }, &traits));
+    try testing.expectEqual(3, best(.{
+        .family = "JetBrains Mono",
+        .style = "Bold Italic",
+    }, &traits));
+
+    // Where nothing else differs the style's name decides: the fewer
+    // characters of it lie outside what was asked for, the better.
+    {
+        const desc: Descriptor = .{ .family = "A", .bold = true };
+        const short: TraitScore = .init(&desc, .{ .bold = true, .style = "Bold Condensed" });
+        const long: TraitScore = .init(&desc, .{ .bold = true, .style = "Bold Extended Condensed" });
+        try testing.expect(short.int() > long.int());
+    }
+    {
+        const desc: Descriptor = .{ .family = "A", .style = "semibold" };
+        const hit: TraitScore = .init(&desc, .{ .italic = true, .style = "SemiBold Italic" });
+        const miss: TraitScore = .init(&desc, .{ .italic = true, .style = "Light Italic" });
+        try testing.expect(hit.int() > miss.int());
+    }
+
+    // The exact name outranks a name that contains it.
+    {
+        const desc: Descriptor = .{ .family = "A", .style = "bold" };
+        const exact: TraitScore = .init(&desc, .{ .style = "Bold" });
+        const contains: TraitScore = .init(&desc, .{ .style = "Bold Italic" });
+        try testing.expect(exact.int() > contains.int());
+    }
+
+    // The slant outranks the weight: of two faces that match one of the
+    // two, the one with the right slant is the better.
+    {
+        const desc: Descriptor = .{ .family = "A", .bold = true, .italic = true };
+        const slant: TraitScore = .init(&desc, .{ .italic = true, .style = "x" });
+        const weight: TraitScore = .init(&desc, .{ .bold = true, .style = "x" });
+        try testing.expect(slant.int() > weight.int());
+    }
+
+    // A codepoint that nobody asked for counts for nothing.
+    {
+        const desc: Descriptor = .{ .family = "A" };
+        const has: TraitScore = .init(&desc, .{ .has_codepoint = true, .style = "Regular" });
+        const lacks: TraitScore = .init(&desc, .{ .style = "Regular" });
+        try testing.expectEqual(lacks.int(), has.int());
+    }
+
+    // Having the codepoint outranks every style.
+    {
+        const desc: Descriptor = .{ .codepoint = 'A', .bold = true };
+        var with = traits[0];
+        with.has_codepoint = true;
+        const has: TraitScore = .init(&desc, with);
+        const lacks: TraitScore = .init(&desc, traits[1]);
+        try testing.expect(has.int() > lacks.int());
+    }
+
+    // Monospace outranks a style, and a codepoint outranks monospace.
+    {
+        const desc: Descriptor = .{ .codepoint = 'A', .bold = true };
+        var proportional = traits[1];
+        proportional.monospace = false;
+        const mono_regular: TraitScore = .init(&desc, traits[0]);
+        const proportional_bold: TraitScore = .init(&desc, proportional);
+        try testing.expect(mono_regular.int() > proportional_bold.int());
+        proportional.has_codepoint = true;
+        const proportional_has: TraitScore = .init(&desc, proportional);
+        try testing.expect(proportional_has.int() > mono_regular.int());
+    }
+}
+
+test "directwrite" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+
+    var dw = DirectWrite.init(lib);
+    defer dw.deinit();
+
+    var buf: [256]u8 = undefined;
+
+    // Arial ships with every Windows. Without a style the regular face
+    // is the first result.
+    {
+        var it = try dw.discover(alloc, .{ .family = "Arial", .size = 12 });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.TestFontNotFound;
+        defer face.deinit();
+        try testing.expect(face.hasCodepoint('A', null));
+        try testing.expectEqualStrings("Arial", try face.familyName(&buf));
+        try testing.expectEqualStrings("Arial", try face.name(&buf));
+    }
+
+    // The styles, by their traits and in any case of the family's letters.
+    {
+        var it = try dw.discover(alloc, .{ .family = "arial", .size = 12, .bold = true });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.TestFontNotFound;
+        defer face.deinit();
+        try testing.expectEqualStrings("Arial Bold", try face.name(&buf));
+    }
+    {
+        var it = try dw.discover(alloc, .{
+            .family = "Arial",
+            .size = 12,
+            .bold = true,
+            .italic = true,
+        });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.TestFontNotFound;
+        defer face.deinit();
+        try testing.expectEqualStrings("Arial Bold Italic", try face.name(&buf));
+    }
+
+    // A family that has no bold answers a request for one with nothing,
+    // so that the collection synthesizes it, and has no simulated face
+    // among its fonts.
+    {
+        var it = try dw.discover(alloc, .{ .family = "Webdings", .size = 12, .bold = true });
+        defer it.deinit();
+        try testing.expect(try it.next() == null);
+    }
+    {
+        var it = try dw.discover(alloc, .{ .family = "Webdings", .size = 12 });
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next()) |deferred| {
+            var face = deferred;
+            defer face.deinit();
+            count += 1;
+        }
+        try testing.expectEqual(1, count);
+    }
+
+    // Every result of a search for a codepoint has the codepoint.
+    {
+        var it = try dw.discover(alloc, .{ .codepoint = 0x4E2D, .size = 12 });
+        defer it.deinit();
+        var count: usize = 0;
+        while (try it.next()) |deferred| {
+            var face = deferred;
+            defer face.deinit();
+            try testing.expect(face.hasCodepoint(0x4E2D, null));
+            count += 1;
+        }
+        try testing.expect(count > 0);
+    }
+
+    // A family nobody has yields nothing.
+    {
+        var it = try dw.discover(alloc, .{ .family = "No Such Family 7f3a", .size = 12 });
+        defer it.deinit();
+        try testing.expect(try it.next() == null);
+    }
+}
+
+test "directwrite collection member" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var dw = DirectWrite.init(lib);
+    defer dw.deinit();
+
+    // A face that is not the first of its collection file loads as
+    // itself: the index comes from DirectWrite.
+    var it = try dw.discover(alloc, .{ .family = "Cambria Math", .size = 12 });
+    defer it.deinit();
+    var deferred = (try it.next()) orelse return error.SkipZigTest;
+    defer deferred.deinit();
+
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Cambria Math", try deferred.name(&buf));
+    var face = try deferred.load(lib, .{ .size = .{ .points = 12 } });
+    defer face.deinit();
+
+    // A mathematical bold capital is in Cambria Math and not in Cambria,
+    // which is the first face of the same file.
+    try testing.expect(face.glyphIndex(0x1D400) != null);
+}
+
+test "directwrite family of another family" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var dw = DirectWrite.init(lib);
+    defer dw.deinit();
+
+    // Arial Black carries a family name of its own and is the heaviest
+    // weight of Arial to DirectWrite. Where DirectWrite knows it as a
+    // family this test has nothing to show.
+    const api = directwrite.api;
+    {
+        const collection = try lib.dwrite.systemFonts();
+        defer api.release(collection);
+        var index: api.UINT = 0;
+        var exists: api.BOOL = 0;
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("Arial Black");
+        if (api.succeeded(collection.vtable.FindFamilyName(
+            collection,
+            name,
+            &index,
+            &exists,
+        )) and exists != 0) return error.SkipZigTest;
+    }
+
+    var it = try dw.discover(alloc, .{ .family = "Arial Black", .size = 12 });
+    defer it.deinit();
+    var count: usize = 0;
+    while (try it.next()) |deferred| {
+        var face = deferred;
+        defer face.deinit();
+        var buf: [256]u8 = undefined;
+        try testing.expectEqualStrings("Arial", try face.familyName(&buf));
+        try testing.expectEqualStrings("Arial Black", try face.name(&buf));
+        count += 1;
+    }
+    if (count == 0) return error.SkipZigTest;
+}
+
+test "directwrite instance of a variable font" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+    if (comptime !options.backend.hasFreetype()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var dw = DirectWrite.init(lib);
+    defer dw.deinit();
+
+    // Bahnschrift is one file with a weight axis; its weights are
+    // instances of it that share the file and the index in it. What is
+    // loaded has to be the instance that was found.
+    const Want = struct { bold: bool, weight: i32 };
+    for ([_]Want{
+        .{ .bold = false, .weight = 400 },
+        .{ .bold = true, .weight = 700 },
+    }) |want| {
+        var it = try dw.discover(alloc, .{
+            .family = "Bahnschrift",
+            .size = 12,
+            .bold = want.bold,
+            .style = if (want.bold) "Bold" else "Regular",
+        });
+        defer it.deinit();
+        var deferred = (try it.next()) orelse return error.SkipZigTest;
+        defer deferred.deinit();
+
+        var face = try deferred.load(lib, .{ .size = .{ .points = 12 } });
+        defer face.deinit();
+        if (!face.face.hasMultipleMasters()) return error.SkipZigTest;
+
+        const mm = try face.face.getMMVar();
+        defer lib.lib.doneMMVar(mm);
+        var coords_buf: [32]@TypeOf(mm.axis[0].def) = undefined;
+        const coords = coords_buf[0..@min(coords_buf.len, mm.num_axis)];
+        try face.face.getVarDesignCoordinates(coords);
+
+        const wght: u32 = @bitCast(Variation.Id.init("wght"));
+        var found = false;
+        for (0..coords.len) |i| {
+            if (mm.axis[i].tag != wght) continue;
+            // 16.16 fixed point.
+            try testing.expectEqual(want.weight, @as(i32, @intCast(coords[i] >> 16)));
+            found = true;
+        }
+        try testing.expect(found);
+    }
 }

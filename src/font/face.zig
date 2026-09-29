@@ -11,6 +11,7 @@ pub const web_canvas = @import("face/web_canvas.zig");
 pub const Face = switch (options.backend) {
     .freetype,
     .freetype_windows,
+    .directwrite_freetype,
     .fontconfig_freetype,
     .coretext_freetype,
     => freetype.Face,
