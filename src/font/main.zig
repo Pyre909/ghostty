@@ -73,6 +73,10 @@ pub const sprite_index = Collection.Index.initSpecial(.sprite);
 pub const default_fallback_adjustment: Collection.SizeAdjustment = .ic_width;
 
 test {
+    // The DirectWrite declarations are only referenced by the Windows
+    // backends, but their layout tests run on every host.
+    _ = @import("directwrite/api.zig");
+
     // For non-wasm we want to test everything we can
     if (!comptime builtin.target.cpu.arch.isWasm()) {
         @import("std").testing.refAllDecls(@This());
