@@ -1318,6 +1318,10 @@ pub const DirectWrite = struct {
         }
     }
 
+    /// Whether a font carries a name as a family name of its own, in any
+    /// of the languages it has one in. A family is asked for by the name
+    /// its user knows it by, which is not the English one everywhere,
+    /// and FindFamilyName knows the names in every language as well.
     fn hasFamilyName(
         font: *api.IDWriteFont,
         id: api.DWRITE_INFORMATIONAL_STRING_ID,
@@ -1331,8 +1335,15 @@ pub const DirectWrite = struct {
         if (exists == 0) return false;
 
         var buf: [directwrite.name_max * 3]u8 = undefined;
-        const value = directwrite.localizedString(strings, &buf) catch return false;
-        return std.ascii.eqlIgnoreCase(value, name);
+        for (0..strings.vtable.GetCount(strings)) |i| {
+            const value = directwrite.localizedStringAt(
+                strings,
+                @intCast(i),
+                &buf,
+            ) catch continue;
+            if (std.ascii.eqlIgnoreCase(value, name)) return true;
+        }
+        return false;
     }
 
     /// What DirectWrite reports about a font, refined by the font's own
@@ -2303,6 +2314,39 @@ test "directwrite family of another family" {
         count += 1;
     }
     if (count == 0) return error.SkipZigTest;
+}
+
+test "directwrite family of another family, in another language" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try Library.init(alloc);
+    defer lib.deinit();
+    var dw = DirectWrite.init(lib);
+    defer dw.deinit();
+
+    // The light weight of Microsoft JhengHei carries a family name of its
+    // own, in English and in Chinese. Where the font is not installed,
+    // or loads from no file, this test has nothing to show.
+    var want_buf: [256]u8 = undefined;
+    const want = want: {
+        var it = try dw.discover(alloc, .{ .family = "Microsoft JhengHei Light", .size = 12 });
+        defer it.deinit();
+        var face = (try it.next()) orelse return error.SkipZigTest;
+        defer face.deinit();
+        break :want try face.name(&want_buf);
+    };
+
+    // A name that is not ASCII is compared as it is written.
+    var it = try dw.discover(alloc, .{ .family = "微軟正黑體 Light", .size = 12 });
+    defer it.deinit();
+    var face = (try it.next()) orelse return error.TestFontNotFound;
+    defer face.deinit();
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(want, try face.name(&buf));
+    try testing.expectEqualStrings("Microsoft JhengHei", try face.familyName(&buf));
 }
 
 test "directwrite instance of a variable font" {

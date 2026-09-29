@@ -286,6 +286,15 @@ pub fn localizedString(
         index = 0;
     }
 
+    return localizedStringAt(strings, index, buf);
+}
+
+/// One string of a set of localized strings, as UTF-8 in `buf`.
+pub fn localizedStringAt(
+    strings: *api.IDWriteLocalizedStrings,
+    index: api.UINT,
+    buf: []u8,
+) (Error || error{OutOfMemory})![]const u8 {
     var len: api.UINT = 0;
     if (api.failed(strings.vtable.GetStringLength(strings, index, &len)))
         return error.DirectWriteFailed;
