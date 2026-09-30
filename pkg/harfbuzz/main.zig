@@ -18,6 +18,7 @@ pub const Direction = common.Direction;
 pub const Script = common.Script;
 pub const Language = common.Language;
 pub const Feature = common.Feature;
+pub const Variation = common.Variation;
 pub const Face = face.Face;
 pub const Font = font.Font;
 pub const shape = shapepkg.shape;

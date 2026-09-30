@@ -21,7 +21,7 @@ const log = std.log.scoped(.discovery);
 pub const Discover = switch (options.backend) {
     .freetype => void, // no discovery
     .freetype_windows => Windows,
-    .directwrite_freetype => DirectWrite,
+    .directwrite_freetype, .directwrite => DirectWrite,
     .fontconfig_freetype => Fontconfig,
     .web_canvas => void, // no discovery
     .coretext,
@@ -2204,7 +2204,16 @@ test "directwrite" {
         var it = try dw.discover(alloc, .{ .family = family, .size = 12 });
         defer it.deinit();
         try testing.expectEqual(1, it.list.len);
-        if (comptime !options.backend.hasFreetype()) continue;
+
+        // DirectWrite loads what it finds, so the font is offered and
+        // loads. Which characters it has glyphs for is not tested.
+        if (comptime !options.backend.hasFreetype()) {
+            var face = (try it.next()) orelse return error.TestFontNotFound;
+            defer face.deinit();
+            var loaded = try face.load(lib, .{ .size = .{ .points = 12 } });
+            loaded.deinit();
+            continue;
+        }
         try testing.expect(try it.next() == null);
     }
 
@@ -2351,7 +2360,6 @@ test "directwrite family of another family, in another language" {
 
 test "directwrite instance of a variable font" {
     if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
-    if (comptime !options.backend.hasFreetype()) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -2381,6 +2389,37 @@ test "directwrite instance of a variable font" {
 
         var face = try deferred.load(lib, .{ .size = .{ .points = 12 } });
         defer face.deinit();
+
+        // The face of DirectWrite is the instance, which DirectWrite
+        // says and which HarfBuzz has to have heard: it shapes what
+        // DirectWrite draws. HarfBuzz has a value for each axis of the
+        // font and no names for them; no other axis is at the weight.
+        if (comptime !options.backend.hasFreetype()) {
+            var axes_buf: [32]Variation = undefined;
+            const axes = directwrite.instanceAxes(face.face, &axes_buf);
+            if (axes.len == 0) return error.SkipZigTest;
+            const weight: f64 = @floatFromInt(want.weight);
+            var found = false;
+            for (axes) |axis| {
+                if (axis.id != Variation.Id.init("wght")) continue;
+                try testing.expectEqual(weight, axis.value);
+                found = true;
+            }
+            try testing.expect(found);
+
+            var len: c_uint = 0;
+            const coords = @import("harfbuzz").c.hb_font_get_var_coords_design(
+                face.hb_font.handle,
+                &len,
+            );
+            try testing.expect(len > 0);
+            found = false;
+            for (coords[0..len]) |coord| {
+                if (coord == @as(f32, @floatCast(weight))) found = true;
+            }
+            try testing.expect(found);
+            continue;
+        }
         if (!face.face.hasMultipleMasters()) return error.SkipZigTest;
 
         const mm = try face.face.getMMVar();

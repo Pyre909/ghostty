@@ -79,6 +79,7 @@ test {
     _ = @import("directwrite/main.zig");
     _ = @import("directwrite/object.zig");
     _ = @import("directwrite/TextAnalysisSource.zig");
+    _ = @import("directwrite/FontFileLoader.zig");
 
     // For non-wasm we want to test everything we can
     if (!comptime builtin.target.cpu.arch.isWasm()) {

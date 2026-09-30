@@ -241,7 +241,28 @@ pub const Feature = extern struct {
     }
 };
 
+/// Data type for holding variation data. Registered OpenType variation-axis
+/// tags are listed in OpenType Axis Tag Registry.
+///
+/// This is layout-compatible with hb_variation_t.
+pub const Variation = extern struct {
+    /// The hb_tag_t tag of the variation-axis name
+    tag: c.hb_tag_t,
+
+    /// The value of the variation axis
+    value: f32,
+};
+
 test "feature from string" {
     const testing = std.testing;
     try testing.expect(Feature.fromString("dlig") != null);
+}
+
+test "variation layout" {
+    const testing = std.testing;
+    try testing.expectEqual(@sizeOf(c.hb_variation_t), @sizeOf(Variation));
+    try testing.expectEqual(
+        @offsetOf(c.hb_variation_t, "value"),
+        @offsetOf(Variation, "value"),
+    );
 }

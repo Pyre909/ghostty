@@ -63,6 +63,39 @@ pub const Blob = struct {
         return Blob{ .handle = handle };
     }
 
+    /// Creates a new "blob" object wrapping data like create, with a
+    /// callback to call when data is not needed anymore. The callback
+    /// receives user_data.
+    ///
+    /// The blob owns user_data from the moment of the call: when this
+    /// fails the callback has already been called, so the caller must not
+    /// release user_data again.
+    pub fn createWithDestroy(
+        comptime T: type,
+        data: []const u8,
+        mode: MemoryMode,
+        user_data: ?*T,
+        comptime destroycb: ?*const fn (?*T) callconv(.c) void,
+    ) Error!Blob {
+        const Callback = struct {
+            pub fn callback(ptr: ?*anyopaque) callconv(.c) void {
+                @call(.always_inline, destroycb.?, .{
+                    @as(?*T, @ptrCast(@alignCast(ptr))),
+                });
+            }
+        };
+
+        const handle = c.hb_blob_create_or_fail(
+            data.ptr,
+            @intCast(data.len),
+            @intFromEnum(mode),
+            user_data,
+            if (destroycb != null) Callback.callback else null,
+        ) orelse return Error.HarfbuzzFailed;
+
+        return Blob{ .handle = handle };
+    }
+
     /// Decreases the reference count on blob , and if it reaches zero,
     /// destroys blob , freeing all memory, possibly calling the
     /// destroy-callback the blob was created for if it has not been
@@ -123,4 +156,29 @@ test {
     var key: u8 = 0;
     try testing.expect(blob.setUserData(u8, &key, &userdata, null, false));
     try testing.expect(blob.getUserData(u8, &key).?.* == 127);
+}
+
+test "create with destroy" {
+    const testing = std.testing;
+
+    const Counter = struct {
+        var destroyed: usize = 0;
+
+        fn destroy(ptr: ?*usize) callconv(.c) void {
+            ptr.?.* += 1;
+        }
+    };
+
+    Counter.destroyed = 0;
+    const data = "hello";
+    var blob = try Blob.createWithDestroy(
+        usize,
+        data,
+        .readonly,
+        &Counter.destroyed,
+        Counter.destroy,
+    );
+    try testing.expectEqual(@as(usize, 0), Counter.destroyed);
+    blob.destroy();
+    try testing.expectEqual(@as(usize, 1), Counter.destroyed);
 }

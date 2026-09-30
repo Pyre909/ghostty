@@ -197,7 +197,9 @@ pub fn deinit(self: *DeferredFace) void {
         .fontconfig_freetype => if (self.fc) |*fc| fc.deinit(),
         .freetype => {},
         .freetype_windows => if (self.win) |*w| w.deinit(),
-        .directwrite_freetype => if (self.dw) |*dw| dw.deinit(),
+        .directwrite_freetype,
+        .directwrite,
+        => if (self.dw) |*dw| dw.deinit(),
         .web_canvas => if (self.wc) |*wc| wc.deinit(),
         .coretext,
         .coretext_freetype,
@@ -215,7 +217,9 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
 
         .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
 
-        .directwrite_freetype => if (self.dw) |dw| return try dw.familyName(buf),
+        .directwrite_freetype,
+        .directwrite,
+        => if (self.dw) |dw| return try dw.familyName(buf),
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.family, 0)).string,
@@ -247,7 +251,9 @@ pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
 
         .freetype_windows => if (self.win) |w| return try w.peek.name(buf),
 
-        .directwrite_freetype => if (self.dw) |dw| return try dw.name(buf),
+        .directwrite_freetype,
+        .directwrite,
+        => if (self.dw) |dw| return try dw.name(buf),
 
         .fontconfig_freetype => if (self.fc) |fc|
             return (try fc.pattern.get(.fullname, 0)).string,
@@ -285,6 +291,7 @@ pub fn load(
         .fontconfig_freetype => try self.loadFontconfig(lib, opts),
         .freetype_windows => try self.loadWindows(lib, opts),
         .directwrite_freetype => try self.loadDirectWriteFreetype(lib, opts),
+        .directwrite => try self.loadDirectWrite(lib, opts),
         .coretext, .coretext_harfbuzz, .coretext_noshape => try self.loadCoreText(lib, opts),
         .coretext_freetype => try self.loadCoreTextFreetype(lib, opts),
         .web_canvas => try self.loadWebCanvas(opts),
@@ -363,6 +370,18 @@ fn loadDirectWriteFreetype(
     try face.setVariations(directwrite.instanceAxes(dw_face, &axes_buf), opts);
     try face.setVariations(dw.variations, opts);
 
+    return face;
+}
+
+fn loadDirectWrite(
+    self: *DeferredFace,
+    lib: Library,
+    opts: font.face.Options,
+) !Face {
+    const dw = self.dw.?;
+    var face = try Face.initFont(lib, dw.font, opts);
+    errdefer face.deinit();
+    try face.setVariations(dw.variations, opts);
     return face;
 }
 
@@ -470,7 +489,9 @@ pub fn hasCodepoint(self: DeferredFace, cp: u32, p: ?Presentation) bool {
             }
         },
 
-        .directwrite_freetype => {
+        .directwrite_freetype,
+        .directwrite,
+        => {
             // The font answers from its character map without a face.
             if (self.dw) |dw| {
                 if (p) |desired| if (dw.presentation != desired) return false;

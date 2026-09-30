@@ -17,6 +17,9 @@ pub const Library = switch (options.backend) {
     .coretext_freetype,
     => FreetypeLibrary,
 
+    // DirectWrite keeps a factory for the process
+    .directwrite => DirectWriteLibrary,
+
     // Some backends such as CT and Canvas don't have a "library"
     .coretext,
     .coretext_harfbuzz,
@@ -63,6 +66,23 @@ pub const FreetypeLibrary = struct {
     pub fn deinit(self: *Library) void {
         self.alloc.destroy(self.mutex);
         self.lib.deinit();
+    }
+};
+
+pub const DirectWriteLibrary = struct {
+    /// The process's DirectWrite state. Borrowed: it belongs to the
+    /// process.
+    dwrite: *directwrite.Shared,
+
+    pub const InitError = directwrite.Error;
+
+    pub fn init(alloc: Allocator) InitError!Library {
+        _ = alloc;
+        return .{ .dwrite = try directwrite.Shared.get() };
+    }
+
+    pub fn deinit(self: *Library) void {
+        _ = self;
     }
 };
 

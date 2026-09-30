@@ -17,6 +17,7 @@ const global = @import("../../global.zig");
 const font = @import("../main.zig");
 pub const api = @import("api.zig");
 pub const TextAnalysisSource = @import("TextAnalysisSource.zig");
+pub const FontFileLoader = @import("FontFileLoader.zig");
 
 const log = std.log.scoped(.directwrite);
 
@@ -48,6 +49,16 @@ pub const Error = error{
 pub const Shared = struct {
     factory: *api.IDWriteFactory,
 
+    /// The factory as of Windows 8.1, which is what rasterizes a glyph
+    /// without fitting it to the pixel grid. Null before that.
+    factory2: ?*api.IDWriteFactory2,
+
+    /// What DirectWrite reads a font from memory through, for the backend
+    /// that draws with DirectWrite: the fonts that are built in are bytes
+    /// and not files. A loader is registered with a factory once, so it
+    /// is the process's as the factory is.
+    loader: if (loads_memory) *api.IDWriteFontFileLoader else void,
+
     /// The system's font fallback, which knows the font Windows shows a
     /// character in. Null where DirectWrite has none to offer.
     fallback: ?*api.IDWriteFontFallback,
@@ -56,6 +67,10 @@ pub const Shared = struct {
     /// languages that share characters: the Han of Japanese is not drawn
     /// like the Han of Chinese.
     locale: [locale_max:0]u16,
+
+    /// Whether fonts are loaded from memory by DirectWrite. With FreeType
+    /// for a rasterizer they are loaded by FreeType.
+    const loads_memory = font.options.backend == .directwrite;
 
     var instance: ?Shared = null;
     var mutex: std.Io.Mutex = .init;
@@ -75,6 +90,7 @@ pub const Shared = struct {
         }
         const factory: *api.IDWriteFactory =
             @ptrCast(@alignCast(unk orelse return error.DirectWriteFailed));
+        errdefer api.release(factory);
 
         var locale: [locale_max:0]u16 = @splat(0);
         if (GetUserDefaultLocaleName(&locale, locale_max) <= 0) {
@@ -83,18 +99,41 @@ pub const Shared = struct {
             locale[default.len] = 0;
         }
 
+        const factory2: ?*api.IDWriteFactory2 =
+            api.queryInterface(factory, api.IDWriteFactory2) catch null;
+        errdefer if (factory2) |v| api.release(v);
+
         const fallback: ?*api.IDWriteFontFallback = fallback: {
-            const factory2 = api.queryInterface(factory, api.IDWriteFactory2) catch
-                break :fallback null;
-            defer api.release(factory2);
+            const v = factory2 orelse break :fallback null;
             var out: ?*api.IDWriteFontFallback = null;
-            if (api.failed(factory2.vtable.GetSystemFontFallback(factory2, &out)))
+            if (api.failed(v.vtable.GetSystemFontFallback(v, &out)))
                 break :fallback null;
             break :fallback out;
         };
+        errdefer if (fallback) |v| api.release(v);
+
+        // The loader and its streams live as long as DirectWrite holds
+        // them, which no allocator of a caller is known to outlive.
+        const loader = if (comptime loads_memory) loader: {
+            const v = FontFileLoader.create(std.heap.smp_allocator) catch {
+                log.err("out of memory for the font file loader", .{});
+                return error.DirectWriteFailed;
+            };
+            const loader_hr = factory.vtable.RegisterFontFileLoader(factory, v);
+            if (api.failed(loader_hr)) {
+                log.err("RegisterFontFileLoader failed hr=0x{x}", .{
+                    @as(u32, @bitCast(loader_hr)),
+                });
+                api.release(v);
+                return error.DirectWriteFailed;
+            }
+            break :loader v;
+        } else {};
 
         instance = .{
             .factory = factory,
+            .factory2 = factory2,
+            .loader = loader,
             .fallback = fallback,
             .locale = locale,
         };

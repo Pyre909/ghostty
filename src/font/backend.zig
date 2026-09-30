@@ -16,6 +16,10 @@ pub const Backend = enum {
     /// HarfBuzz for shaping (Windows).
     directwrite_freetype,
 
+    /// DirectWrite for font discovery and rendering, HarfBuzz for
+    /// shaping (Windows).
+    directwrite,
+
     /// Fontconfig for font discovery and FreeType for font rendering.
     fontconfig_freetype,
 
@@ -78,6 +82,7 @@ pub const Backend = enum {
             .coretext_freetype,
             => true,
 
+            .directwrite,
             .coretext,
             .coretext_harfbuzz,
             .coretext_noshape,
@@ -97,6 +102,7 @@ pub const Backend = enum {
             .freetype,
             .freetype_windows,
             .directwrite_freetype,
+            .directwrite,
             .fontconfig_freetype,
             .web_canvas,
             => false,
@@ -110,6 +116,7 @@ pub const Backend = enum {
             .freetype,
             .freetype_windows,
             .directwrite_freetype,
+            .directwrite,
             .coretext,
             .coretext_freetype,
             .coretext_harfbuzz,
@@ -121,7 +128,9 @@ pub const Backend = enum {
 
     pub fn hasDirectWrite(self: Backend) bool {
         return switch (self) {
-            .directwrite_freetype => true,
+            .directwrite_freetype,
+            .directwrite,
+            => true,
 
             .freetype,
             .freetype_windows,
@@ -140,6 +149,7 @@ pub const Backend = enum {
             .freetype,
             .freetype_windows,
             .directwrite_freetype,
+            .directwrite,
             .fontconfig_freetype,
             .coretext_freetype,
             .coretext_harfbuzz,
