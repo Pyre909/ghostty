@@ -83,6 +83,7 @@ cespare
 charliie-dev
 chernetskyi
 chronologos
+clemg
 cmwetherell
 crayxt
 craziestowl
@@ -137,6 +138,7 @@ filip7
 flou
 fornwall
 francescarpi
+francislata
 fru1tworld
 gadgetman6
 gagbo
@@ -148,6 +150,7 @@ gpanders
 guilhermetk
 -guysoft LLM communication (likely automated)
 h3nock
+hackattack
 hakonhagland
 halosatrio
 heaths
@@ -155,6 +158,7 @@ heddxh heddxh
 helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
+howdeploy
 hqnna
 hulet
 i999rri
@@ -250,6 +254,7 @@ neo773
 neoto
 neurosnap
 nicholas-ochoa
+nicolaair
 nicosuave
 nikicat
 nilsherzig
@@ -273,11 +278,13 @@ peterdavehello
 philocalyst
 phush0
 piedrahitac
+pltrz
 pluiedev
 pouwerkerk
 poweruser64
 prakhar54-byte
 preiter93
+pressatojump
 prihlop
 priyans-hu
 pssalman
@@ -312,10 +319,12 @@ seruman
 seyoungjeong
 sghng
 shorsher
+shreeve
 silveirapf
 simonbcn
 slowdub
 slsrepo
+stepankandrushin
 steven-tk
 sunshine-syz
 svector-anu
@@ -332,6 +341,7 @@ thomasfedb
 thoutbeckers
 ticclick
 tnagatomi
+toppk
 tothedarktowercame
 trag1c
 tristan957
@@ -353,6 +363,7 @@ vlsi
 voidnv
 williamhcarter
 wyounas
+xandris
 yabbal
 yak3d
 yamshta

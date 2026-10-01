@@ -38,6 +38,7 @@ const shadertoy = @import("shadertoy.zig");
 const api = @import("d3d11/api.zig");
 
 pub const GraphicsAPI = D3D11;
+pub const Device = @import("d3d11/Device.zig");
 pub const Target = @import("d3d11/Target.zig");
 pub const Frame = @import("d3d11/Frame.zig");
 pub const RenderPass = @import("d3d11/RenderPass.zig");
@@ -155,13 +156,20 @@ size: struct { width: u32 = 0, height: u32 = 0 } = .{},
 present_count: u64 = 0,
 dropped_stale_count: u64 = 0,
 
-pub fn init(alloc: Allocator, opts: rendererpkg.Options) !D3D11 {
+/// The device is the app's, which holds nothing for Direct3D 11, see
+/// `Device`: the renderer creates its own device for its window.
+pub fn init(
+    alloc: Allocator,
+    device: *const Device,
+    opts: rendererpkg.Options,
+) !D3D11 {
     comptime switch (builtin.os.tag) {
         .windows => {},
         else => @compileError("unsupported platform for Direct3D 11"),
     };
 
     _ = alloc;
+    _ = device;
 
     const hwnd: api.HWND = switch (apprt.runtime) {
         apprt.windows => opts.rt_surface.hwnd,

@@ -6,7 +6,6 @@ const Runtime = @import("../apprt/runtime.zig").Runtime;
 pub const Backend = enum {
     opengl,
     metal,
-    webgl,
     d3d11,
 
     pub fn default(
@@ -14,12 +13,7 @@ pub const Backend = enum {
         wasm_target: WasmTarget,
         runtime: Runtime,
     ) Backend {
-        if (target.cpu.arch == .wasm32) {
-            return switch (wasm_target) {
-                .browser => .webgl,
-            };
-        }
-
+        _ = wasm_target;
         if (target.os.tag.isDarwin()) return .metal;
 
         // The Win32 runtime hands the renderer a window. The embedded
