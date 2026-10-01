@@ -253,7 +253,21 @@ pub const IDWriteFactory2 = extern struct {
         base: IDWriteFactory1.VTable,
         GetSystemFontFallback: *const fn (*IDWriteFactory2, *?*IDWriteFontFallback) callconv(cc) HRESULT,
         CreateFontFallbackBuilder: Slot,
-        TranslateColorGlyphRun: Slot,
+        /// The layers of a color glyph run, each a run of one color, to
+        /// draw in order. DWRITE_E_NOCOLOR when no glyph of the run has
+        /// any. The two FLOATs are the origin of the run's baseline; the
+        /// description may be null.
+        TranslateColorGlyphRun: *const fn (
+            *IDWriteFactory2,
+            FLOAT,
+            FLOAT,
+            *const DWRITE_GLYPH_RUN,
+            ?*const anyopaque,
+            DWRITE_MEASURING_MODE,
+            ?*const DWRITE_MATRIX,
+            UINT32,
+            *?*IDWriteColorGlyphRunEnumerator,
+        ) callconv(cc) HRESULT,
         /// Overloads; the header's C vtable spells these two
         /// IDWriteFactory2_CreateCustomRenderingParams and
         /// IDWriteFactory2_CreateGlyphRunAnalysis.
@@ -1219,10 +1233,13 @@ pub const IDWriteFontFace2 = extern struct {
 
     pub const VTable = extern struct {
         base: IDWriteFontFace1.VTable,
-        IsColorFont: Slot,
-        GetColorPaletteCount: Slot,
-        GetPaletteEntryCount: Slot,
-        GetPaletteEntries: Slot,
+        /// Whether the font has any source of color glyphs: a COLR
+        /// table, which is a color glyph's layers, color bitmaps, or an
+        /// SVG table (measured: yes for JuliaMono, which has only that).
+        IsColorFont: *const fn (*IDWriteFontFace2) callconv(cc) BOOL,
+        GetColorPaletteCount: *const fn (*IDWriteFontFace2) callconv(cc) UINT32,
+        GetPaletteEntryCount: *const fn (*IDWriteFontFace2) callconv(cc) UINT32,
+        GetPaletteEntries: *const fn (*IDWriteFontFace2, UINT32, UINT32, UINT32, [*]DWRITE_COLOR_F) callconv(cc) HRESULT,
         IDWriteFontFace2_GetRecommendedRenderingMode: Slot,
     };
 };
@@ -1262,11 +1279,17 @@ pub const IDWriteFontFace4 = extern struct {
 
     pub const VTable = extern struct {
         base: IDWriteFontFace3.VTable,
-        /// The header's name: the overload that takes one glyph.
-        GetGlyphImageFormats_: Slot,
-        GetGlyphImageFormats: Slot,
-        GetGlyphImageData: Slot,
-        ReleaseGlyphImageData: Slot,
+        /// The header's name: the overload that takes one glyph. The
+        /// formats the glyph has in the range of pixels per em, first
+        /// and last inclusive.
+        GetGlyphImageFormats_: *const fn (*IDWriteFontFace4, UINT16, UINT32, UINT32, *DWRITE_GLYPH_IMAGE_FORMATS) callconv(cc) HRESULT,
+        /// The formats any glyph of the font has.
+        GetGlyphImageFormats: *const fn (*IDWriteFontFace4) callconv(cc) DWRITE_GLYPH_IMAGE_FORMATS,
+        /// The image of a glyph in one format, at the size nearest the
+        /// pixels per em that are asked for. The context is given back
+        /// through ReleaseGlyphImageData, after which the data is gone.
+        GetGlyphImageData: *const fn (*IDWriteFontFace4, UINT16, UINT32, DWRITE_GLYPH_IMAGE_FORMATS, *DWRITE_GLYPH_IMAGE_DATA, *?*anyopaque) callconv(cc) HRESULT,
+        ReleaseGlyphImageData: *const fn (*IDWriteFontFace4, ?*anyopaque) callconv(cc) void,
     };
 };
 
@@ -1488,6 +1511,77 @@ pub const DWRITE_GLYPH_RUN = extern struct {
     bidiLevel: UINT32,
 };
 
+/// A color, each channel 0 to 1. D3DCOLORVALUE in the headers.
+pub const DWRITE_COLOR_F = extern struct {
+    r: FLOAT,
+    g: FLOAT,
+    b: FLOAT,
+    a: FLOAT,
+};
+
+/// One layer of a color glyph: a glyph run to draw in one color. The
+/// palette index is 0xFFFF where the layer takes the text's color.
+pub const DWRITE_COLOR_GLYPH_RUN = extern struct {
+    glyphRun: DWRITE_GLYPH_RUN,
+    glyphRunDescription: ?*const anyopaque,
+    baselineOriginX: FLOAT,
+    baselineOriginY: FLOAT,
+    runColor: DWRITE_COLOR_F,
+    paletteIndex: UINT16,
+};
+
+pub const IDWriteColorGlyphRunEnumerator = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        base: IUnknown.VTable,
+        /// Advances to the next layer; the BOOL says whether there is one.
+        MoveNext: *const fn (*IDWriteColorGlyphRunEnumerator, *BOOL) callconv(cc) HRESULT,
+        /// The layer, owned by the enumerator, valid until the next move.
+        GetCurrentRun: *const fn (*IDWriteColorGlyphRunEnumerator, *?*const DWRITE_COLOR_GLYPH_RUN) callconv(cc) HRESULT,
+    };
+};
+
+/// The formats a glyph's image can be in: bit flags, dcommon.h.
+pub const DWRITE_GLYPH_IMAGE_FORMATS = UINT32;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_NONE: DWRITE_GLYPH_IMAGE_FORMATS = 0;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_TRUETYPE: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 0;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_CFF: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 1;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_COLR: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 2;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_SVG: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 3;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_PNG: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 4;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_JPEG: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 5;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_TIFF: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 6;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 7;
+pub const DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE: DWRITE_GLYPH_IMAGE_FORMATS = 1 << 8;
+
+/// D2D1_SIZE_U.
+pub const D2D1_SIZE_U = extern struct {
+    width: UINT32,
+    height: UINT32,
+};
+
+/// POINT, which is D2D1_POINT_2L.
+pub const POINT = extern struct {
+    x: i32,
+    y: i32,
+};
+
+/// A glyph's image as IDWriteFontFace4 gives it: the bytes of the image
+/// in the format that was asked for, its size in pixels, the pixels per
+/// em it was made for, and the glyph's origins in the image's pixels.
+pub const DWRITE_GLYPH_IMAGE_DATA = extern struct {
+    imageData: ?[*]const u8,
+    imageDataSize: UINT32,
+    uniqueDataId: UINT32,
+    pixelsPerEm: UINT32,
+    pixelSize: D2D1_SIZE_U,
+    horizontalLeftOrigin: POINT,
+    horizontalRightOrigin: POINT,
+    verticalTopOrigin: POINT,
+    verticalBottomOrigin: POINT,
+};
+
 pub const IDWriteGlyphRunAnalysis = extern struct {
     vtable: *const VTable,
 
@@ -1560,6 +1654,49 @@ test "directwrite api: rasterization typed slot signatures" {
     try testing.expectEqual(*const RECT, texture.params[2].type.?);
     try testing.expectEqual([*]UINT8, texture.params[3].type.?);
     try testing.expectEqual(UINT, texture.params[4].type.?);
+}
+
+test "directwrite api: color struct layouts" {
+    const testing = std.testing;
+    const p = @sizeOf(usize);
+    try testing.expectEqual(16, @sizeOf(DWRITE_COLOR_F));
+    try testing.expectEqual(8, @offsetOf(DWRITE_COLOR_F, "b"));
+
+    // The color run has the glyph run, a pointer, two FLOATs, the
+    // color and a UINT16, padded to the pointer's alignment.
+    const run = @sizeOf(DWRITE_GLYPH_RUN);
+    try testing.expectEqual(run, @offsetOf(DWRITE_COLOR_GLYPH_RUN, "glyphRunDescription"));
+    try testing.expectEqual(run + p, @offsetOf(DWRITE_COLOR_GLYPH_RUN, "baselineOriginX"));
+    try testing.expectEqual(run + p + 8, @offsetOf(DWRITE_COLOR_GLYPH_RUN, "runColor"));
+    try testing.expectEqual(run + p + 24, @offsetOf(DWRITE_COLOR_GLYPH_RUN, "paletteIndex"));
+    try testing.expectEqual(if (p == 8) 88 else 64, @sizeOf(DWRITE_COLOR_GLYPH_RUN));
+    try testing.expectEqual(2, @sizeOf(@FieldType(DWRITE_COLOR_GLYPH_RUN, "paletteIndex")));
+
+    try testing.expectEqual(5 * p, @sizeOf(IDWriteColorGlyphRunEnumerator.VTable));
+    try testing.expectEqual(3 * p, @offsetOf(IDWriteColorGlyphRunEnumerator.VTable, "MoveNext"));
+    try testing.expectEqual(4 * p, @offsetOf(IDWriteColorGlyphRunEnumerator.VTable, "GetCurrentRun"));
+
+    try testing.expectEqual(4, @sizeOf(DWRITE_GLYPH_IMAGE_FORMATS));
+    try testing.expectEqual(0x10, DWRITE_GLYPH_IMAGE_FORMATS_PNG);
+    try testing.expectEqual(0x100, DWRITE_GLYPH_IMAGE_FORMATS_COLR_PAINT_TREE);
+    try testing.expectEqual(8, @sizeOf(D2D1_SIZE_U));
+    try testing.expectEqual(8, @sizeOf(POINT));
+
+    // A pointer, three UINT32s, a size and four points; on 64 bits the
+    // struct is padded to the pointer's alignment.
+    try testing.expectEqual(p, @offsetOf(DWRITE_GLYPH_IMAGE_DATA, "imageDataSize"));
+    try testing.expectEqual(p + 8, @offsetOf(DWRITE_GLYPH_IMAGE_DATA, "pixelsPerEm"));
+    try testing.expectEqual(p + 12, @offsetOf(DWRITE_GLYPH_IMAGE_DATA, "pixelSize"));
+    try testing.expectEqual(p + 20, @offsetOf(DWRITE_GLYPH_IMAGE_DATA, "horizontalLeftOrigin"));
+    try testing.expectEqual(p + 44, @offsetOf(DWRITE_GLYPH_IMAGE_DATA, "verticalBottomOrigin"));
+    try testing.expectEqual(if (p == 8) 64 else 56, @sizeOf(DWRITE_GLYPH_IMAGE_DATA));
+
+    try testing.expectEqual(28 * p, @offsetOf(IDWriteFactory2.VTable, "TranslateColorGlyphRun"));
+    try testing.expectEqual(31 * p, @offsetOf(IDWriteFontFace2.VTable, "GetColorPaletteCount"));
+    try testing.expectEqual(33 * p, @offsetOf(IDWriteFontFace2.VTable, "GetPaletteEntries"));
+    try testing.expectEqual(50 * p, @offsetOf(IDWriteFontFace4.VTable, "GetGlyphImageFormats"));
+    try testing.expectEqual(51 * p, @offsetOf(IDWriteFontFace4.VTable, "GetGlyphImageData"));
+    try testing.expectEqual(52 * p, @offsetOf(IDWriteFontFace4.VTable, "ReleaseGlyphImageData"));
 }
 
 test "directwrite api: rasterization struct layouts" {

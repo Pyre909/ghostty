@@ -9,6 +9,8 @@ const quirks = @import("../../quirks.zig");
 const directwrite = @import("../directwrite/main.zig");
 const api = directwrite.api;
 const FontFileLoader = directwrite.FontFileLoader;
+const stb = @import("../../stb/main.zig");
+const wuffs = @import("wuffs");
 
 const log = std.log.scoped(.font_face);
 
@@ -394,16 +396,172 @@ pub const Face = struct {
     /// To determine if an individual glyph is colorized you must use
     /// isColorGlyph.
     pub fn hasColor(self: *const Face) bool {
-        // Color glyphs are not drawn yet, so no font has them.
-        _ = self;
-        return false;
+        // DirectWrite says yes to a font with color layers, to one with
+        // color images (both of the emoji fonts that are built in) and to
+        // one with an SVG table, which is not drawn here, as CoreText says
+        // yes to it.
+        const face2 = api.queryInterface(self.face, api.IDWriteFontFace2) catch return false;
+        defer api.release(face2);
+        return face2.vtable.IsColorFont(face2) != 0;
     }
 
-    /// Returns true if the given glyph ID is colorized.
+    /// Returns true if the given glyph ID is colorized, which is when
+    /// it is drawn from an image or from layers, see `glyphSource`.
     pub fn isColorGlyph(self: *const Face, glyph_id: u32) bool {
-        _ = self;
-        _ = glyph_id;
-        return false;
+        // Our font system uses 32-bit glyph IDs for special values but
+        // actual fonts only contain 16-bit glyph IDs.
+        const glyph = std.math.cast(u16, glyph_id) orelse return false;
+        return self.glyphSource(glyph) != .outline;
+    }
+
+    /// What a glyph is drawn from.
+    const Source = union(enum) {
+        /// Its outline, in the color of the text.
+        outline,
+        /// An image the font has of it, in this format: one of
+        /// `image_formats`.
+        image: api.DWRITE_GLYPH_IMAGE_FORMATS,
+        /// The layers of a COLR glyph, each drawn in its own color.
+        layers,
+    };
+
+    /// The formats of an image that are drawn here: PNG, and BGRA that
+    /// is premultiplied, which is what the atlas holds. JPEG and TIFF
+    /// images, SVG and the paint trees of COLR version 1 are not drawn;
+    /// a glyph that has only those is drawn from its outline.
+    const image_formats: api.DWRITE_GLYPH_IMAGE_FORMATS =
+        api.DWRITE_GLYPH_IMAGE_FORMATS_PNG |
+        api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8;
+
+    /// What a glyph is drawn from. The formats of the font are asked
+    /// first, so that a font without color costs a glyph one call. The
+    /// formats of a glyph are not enough for the layers: DirectWrite
+    /// reports no format at all for a glyph of Segoe UI Emoji that has
+    /// them, so the layers themselves are asked for. The formats are
+    /// asked of IDWriteFontFace4, which Windows has since 10 1607; the
+    /// layers need only the factory of 8.1, so without the formats a
+    /// glyph of a color font is still asked for its layers, and images
+    /// are not drawn.
+    fn glyphSource(self: Face, glyph: u16) Source {
+        const face4 = api.queryInterface(self.face, api.IDWriteFontFace4) catch
+            return if (self.hasColor() and self.hasLayers(glyph)) .layers else .outline;
+        defer api.release(face4);
+        const formats = face4.vtable.GetGlyphImageFormats(face4);
+        if (formats & api.DWRITE_GLYPH_IMAGE_FORMATS_COLR != 0 and self.hasLayers(glyph))
+            return .layers;
+        if (formats & image_formats != 0) {
+            var glyph_formats: api.DWRITE_GLYPH_IMAGE_FORMATS = 0;
+            const hr = face4.vtable.GetGlyphImageFormats_(
+                face4,
+                glyph,
+                0,
+                std.math.maxInt(api.UINT32),
+                &glyph_formats,
+            );
+            if (api.succeeded(hr)) {
+                if (glyph_formats & api.DWRITE_GLYPH_IMAGE_FORMATS_PNG != 0)
+                    return .{ .image = api.DWRITE_GLYPH_IMAGE_FORMATS_PNG };
+                if (glyph_formats & api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8 != 0)
+                    return .{ .image = api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8 };
+            }
+        }
+        return .outline;
+    }
+
+    /// Whether DirectWrite has color layers for a glyph. It has none
+    /// without the factory of Windows 8.1, where the glyph is drawn
+    /// from its outline.
+    fn hasLayers(self: Face, glyph: u16) bool {
+        const factory2 = self.dwrite.factory2 orelse return false;
+        const indices = [_]api.UINT16{glyph};
+        const run = self.glyphRun(&indices);
+        var out: ?*api.IDWriteColorGlyphRunEnumerator = null;
+        const hr = factory2.vtable.TranslateColorGlyphRun(
+            factory2,
+            0,
+            0,
+            &run,
+            null,
+            .NATURAL,
+            null,
+            0,
+            &out,
+        );
+        if (out) |e| api.release(e);
+        return api.succeeded(hr);
+    }
+
+    /// One layer of a color glyph: a glyph of the font in one color.
+    const Layer = struct {
+        glyph: api.UINT16,
+        /// sRGB, not premultiplied, 0 to 1.
+        color: api.DWRITE_COLOR_F,
+    };
+
+    /// The layers of a color glyph in the order they are drawn, owned
+    /// by the caller. Null when the glyph has none.
+    fn colorLayers(self: Face, alloc: Allocator, glyph: u16) !?[]Layer {
+        const factory2 = self.dwrite.factory2 orelse return null;
+        const indices = [_]api.UINT16{glyph};
+        const run = self.glyphRun(&indices);
+        var out: ?*api.IDWriteColorGlyphRunEnumerator = null;
+        const hr = factory2.vtable.TranslateColorGlyphRun(
+            factory2,
+            0,
+            0,
+            &run,
+            null,
+            .NATURAL,
+            null,
+            0,
+            &out,
+        );
+        if (hr == api.DWRITE_E_NOCOLOR) return null;
+        if (api.failed(hr)) return fail("IDWriteFactory2.TranslateColorGlyphRun", hr);
+        const layers = out orelse return error.DirectWriteFailed;
+        defer api.release(layers);
+
+        var list: std.ArrayList(Layer) = .empty;
+        errdefer list.deinit(alloc);
+        while (true) {
+            var has: api.BOOL = 0;
+            const next_hr = layers.vtable.MoveNext(layers, &has);
+            if (api.failed(next_hr)) return fail("IDWriteColorGlyphRunEnumerator.MoveNext", next_hr);
+            if (has == 0) break;
+
+            var current: ?*const api.DWRITE_COLOR_GLYPH_RUN = null;
+            const run_hr = layers.vtable.GetCurrentRun(layers, &current);
+            if (api.failed(run_hr)) return fail("IDWriteColorGlyphRunEnumerator.GetCurrentRun", run_hr);
+            const layer = current orelse return error.DirectWriteFailed;
+
+            const color = layerColor(layer);
+            const glyphs = layer.glyphRun.glyphIndices[0..layer.glyphRun.glyphCount];
+            for (glyphs) |g| try list.append(alloc, .{ .glyph = g, .color = color });
+        }
+        return try list.toOwnedSlice(alloc);
+    }
+
+    /// The color a layer is drawn in. A layer that takes the color of
+    /// the text is drawn white, as the CoreText face draws a color
+    /// glyph: the atlas has no color of the text to give it.
+    fn layerColor(layer: *const api.DWRITE_COLOR_GLYPH_RUN) api.DWRITE_COLOR_F {
+        if (layer.paletteIndex == 0xFFFF) return .{ .r = 1, .g = 1, .b = 1, .a = 1 };
+        return layer.runColor;
+    }
+
+    /// A run of these glyphs of the face at its size, each at the
+    /// origin. The indices have to outlive the run.
+    fn glyphRun(self: Face, indices: []const api.UINT16) api.DWRITE_GLYPH_RUN {
+        return .{
+            .fontFace = self.face,
+            .fontEmSize = self.size.pixels(),
+            .glyphCount = @intCast(indices.len),
+            .glyphIndices = indices.ptr,
+            .glyphAdvances = null,
+            .glyphOffsets = null,
+            .isSideways = 0,
+            .bidiLevel = 0,
+        };
     }
 
     /// Returns the glyph index for the given Unicode code point. If this
@@ -430,50 +588,83 @@ pub const Face = struct {
         glyph_index: u32,
         opts: font.Glyph.RenderOptions,
     ) !font.Glyph {
-        const empty: font.Glyph = .{
-            .width = 0,
-            .height = 0,
-            .offset_x = 0,
-            .offset_y = 0,
-            .atlas_x = 0,
-            .atlas_y = 0,
-        };
-
         // Our font system uses 32-bit glyph IDs for special values but
         // actual fonts only contain 16-bit glyph IDs.
-        const glyph = std.math.cast(u16, glyph_index) orelse return empty;
+        const glyph = std.math.cast(u16, glyph_index) orelse return empty_glyph;
 
-        // Get the bounding rect for rendering this glyph.
-        // This is in a coordinate space with (0.0, 0.0)
-        // at the glyph's origin on the baseline and +Y pointing up.
-        const rect = rect: {
-            var gm: [1]api.DWRITE_GLYPH_METRICS = undefined;
-            const hr = self.face.vtable.GetDesignGlyphMetrics(
-                self.face,
-                &[_]api.UINT16{glyph},
-                1,
-                &gm,
-                0,
-            );
-            if (api.failed(hr)) return fail("IDWriteFontFace.GetDesignGlyphMetrics", hr);
-
-            const px_per_em: f64 = self.size.pixels();
-            const px_per_unit = px_per_em / self.unitsPerEm();
-            const ink = inkBox(gm[0]);
-            break :rect font.Glyph.Size{
-                .width = ink.width * px_per_unit,
-                .height = ink.height * px_per_unit,
-                .x = ink.x * px_per_unit,
-                .y = ink.y * px_per_unit,
-            };
+        return switch (self.glyphSource(glyph)) {
+            .outline => try self.renderOutline(alloc, atlas, glyph, opts),
+            .image => |format| try self.renderImage(alloc, atlas, glyph, format, opts),
+            .layers => try self.renderLayers(alloc, atlas, glyph, opts),
         };
+    }
 
-        // If our rect is smaller than a quarter pixel in either axis
-        // then it has no outlines or they're too small to render.
-        //
-        // In this case we just return 0-sized glyph struct.
-        if (rect.width < 0.25 or rect.height < 0.25) return empty;
+    /// The glyph that draws nothing.
+    const empty_glyph: font.Glyph = .{
+        .width = 0,
+        .height = 0,
+        .offset_x = 0,
+        .offset_y = 0,
+        .atlas_x = 0,
+        .atlas_y = 0,
+    };
 
+    /// The box of the ink of these glyphs together, from the origin of
+    /// each, in pixels with +Y up, from the design metrics. Null when
+    /// none of them has ink. `gm` is room for the metrics of each.
+    fn designBox(
+        self: Face,
+        glyphs: []const api.UINT16,
+        gm: []api.DWRITE_GLYPH_METRICS,
+    ) !?font.Glyph.Size {
+        assert(gm.len == glyphs.len);
+        const hr = self.face.vtable.GetDesignGlyphMetrics(
+            self.face,
+            glyphs.ptr,
+            @intCast(glyphs.len),
+            gm.ptr,
+            0,
+        );
+        if (api.failed(hr)) return fail("IDWriteFontFace.GetDesignGlyphMetrics", hr);
+
+        const px_per_em: f64 = self.size.pixels();
+        const px_per_unit = px_per_em / self.unitsPerEm();
+        var box: ?font.Glyph.Size = null;
+        for (gm) |metrics| {
+            const ink = inkBox(metrics);
+            if (ink.width <= 0 or ink.height <= 0) continue;
+            box = if (box) |b| .{
+                .x = @min(b.x, ink.x),
+                .y = @min(b.y, ink.y),
+                .width = @max(b.x + b.width, ink.x + ink.width) - @min(b.x, ink.x),
+                .height = @max(b.y + b.height, ink.y + ink.height) - @min(b.y, ink.y),
+            } else ink;
+        }
+        const b = box orelse return null;
+        return .{
+            .width = b.width * px_per_unit,
+            .height = b.height * px_per_unit,
+            .x = b.x * px_per_unit,
+            .y = b.y * px_per_unit,
+        };
+    }
+
+    /// Where a glyph goes in its cells, after the constraints: the box
+    /// of its ink in the space of the cell, which has its origin at the
+    /// cell's bottom left and +Y up, in pixels, and the scale that put
+    /// it there.
+    const Placement = struct {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        scale_x: f64,
+        scale_y: f64,
+    };
+
+    /// Place a glyph in its cells. `rect` is the box of its ink from
+    /// its origin, in pixels with +Y up.
+    fn place(rect: font.Glyph.Size, opts: font.Glyph.RenderOptions) Placement {
         const metrics = opts.grid_metrics;
         const cell_width: f64 = @floatFromInt(metrics.cell_width);
 
@@ -496,9 +687,6 @@ pub const Face = struct {
         );
 
         var x = glyph_size.x;
-        const y = glyph_size.y;
-        const width = glyph_size.width;
-        const height = glyph_size.height;
 
         // We center all glyphs within the pixel-rounded and adjusted
         // cell width if it's larger than the face width, so that they
@@ -522,20 +710,20 @@ pub const Face = struct {
             }
         }
 
-        // This is just a safety check.
-        if (atlas.format.depth() != 1) {
-            log.warn("font atlas color depth doesn't equal font color depth atlas={} font={}", .{
-                atlas.format.depth(),
-                1,
-            });
-            return error.InvalidAtlasFormat;
-        }
+        return .{
+            .x = x,
+            .y = glyph_size.y,
+            .width = glyph_size.width,
+            .height = glyph_size.height,
+            // Where the constraint resized the glyph, the outline is
+            // scaled about its origin by the same factors.
+            .scale_x = glyph_size.width / rect.width,
+            .scale_y = glyph_size.height / rect.height,
+        };
+    }
 
-        // Where the constraint resized the glyph, the outline is scaled
-        // about its origin by the same factors.
-        const scale_x = width / rect.width;
-        const scale_y = height / rect.height;
-
+    /// The transform that rasterizes a glyph into its place.
+    fn transform(rect: font.Glyph.Size, p: Placement) api.DWRITE_MATRIX {
         // This is the one conversion between the two coordinate spaces.
         //
         // The glyph is now a box in the space of the cell: origin at the
@@ -563,20 +751,58 @@ pub const Face = struct {
         // which is the transform below. The baseline origin given beside
         // the transform is zero so that the result does not depend on
         // which side of the transform it is applied on.
-        const matrix: api.DWRITE_MATRIX = .{
-            .m11 = @floatCast(scale_x),
+        return .{
+            .m11 = @floatCast(p.scale_x),
             .m12 = 0,
             .m21 = 0,
-            .m22 = @floatCast(scale_y),
-            .dx = @floatCast(x - rect.x * scale_x),
-            .dy = @floatCast(-(y - rect.y * scale_y)),
+            .m22 = @floatCast(p.scale_y),
+            .dx = @floatCast(p.x - rect.x * p.scale_x),
+            .dy = @floatCast(-(p.y - rect.y * p.scale_y)),
         };
+    }
+
+    /// Whether the atlas holds pixels of this many bytes, else an error.
+    fn checkAtlas(atlas: *const font.Atlas, depth: u8) !void {
+        if (atlas.format.depth() != depth) {
+            log.warn("font atlas color depth doesn't equal font color depth atlas={} font={}", .{
+                atlas.format.depth(),
+                depth,
+            });
+            return error.InvalidAtlasFormat;
+        }
+    }
+
+    /// Draw a glyph from its outline, in grayscale.
+    fn renderOutline(
+        self: Face,
+        alloc: Allocator,
+        atlas: *font.Atlas,
+        glyph: u16,
+        opts: font.Glyph.RenderOptions,
+    ) !font.Glyph {
+        // Get the bounding rect for rendering this glyph.
+        // This is in a coordinate space with (0.0, 0.0)
+        // at the glyph's origin on the baseline and +Y pointing up.
+        var gm: [1]api.DWRITE_GLYPH_METRICS = undefined;
+        const rect = (try self.designBox(&[_]api.UINT16{glyph}, &gm)) orelse return empty_glyph;
+
+        // If our rect is smaller than a quarter pixel in either axis
+        // then it has no outlines or they're too small to render.
+        //
+        // In this case we just return 0-sized glyph struct.
+        if (rect.width < 0.25 or rect.height < 0.25) return empty_glyph;
+
+        // This is just a safety check.
+        try checkAtlas(atlas, 1);
+
+        const p = place(rect, opts);
+        const matrix = transform(rect, p);
 
         // The pixels DirectWrite drew on are the glyph. They are not cut
         // to the box above: the ink of a simulated bold or oblique is
         // larger than the metrics of the font say, and the edge of any
         // glyph may touch one more pixel than its box.
-        const bitmap = (try self.rasterize(alloc, glyph, matrix)) orelse return empty;
+        const bitmap = (try self.rasterize(alloc, glyph, matrix)) orelse return empty_glyph;
         defer alloc.free(bitmap.data);
 
         // Write our rasterized glyph to the atlas.
@@ -599,6 +825,267 @@ pub const Face = struct {
             .atlas_x = region.x,
             .atlas_y = region.y,
         };
+    }
+
+    /// Draw a color glyph from its layers: each is rasterized as an
+    /// outline is, through the transform that places the glyph, and
+    /// drawn over the ones before it in its color.
+    fn renderLayers(
+        self: Face,
+        alloc: Allocator,
+        atlas: *font.Atlas,
+        glyph: u16,
+        opts: font.Glyph.RenderOptions,
+    ) !font.Glyph {
+        const layers = (try self.colorLayers(alloc, glyph)) orelse return empty_glyph;
+        defer alloc.free(layers);
+        if (layers.len == 0) return empty_glyph;
+
+        // The glyph's box is the box of its layers together. The base
+        // glyph's own outline is not asked, as a COLR font need not have
+        // one that covers the layers.
+        const glyphs = try alloc.alloc(api.UINT16, layers.len);
+        defer alloc.free(glyphs);
+        for (glyphs, layers) |*g, layer| g.* = layer.glyph;
+        const gm = try alloc.alloc(api.DWRITE_GLYPH_METRICS, layers.len);
+        defer alloc.free(gm);
+        const rect = (try self.designBox(glyphs, gm)) orelse return empty_glyph;
+        if (rect.width < 0.25 or rect.height < 0.25) return empty_glyph;
+
+        try checkAtlas(atlas, 4);
+
+        const p = place(rect, opts);
+        const matrix = transform(rect, p);
+
+        // Rasterize every layer. The glyph is the union of their pixels.
+        const Raster = struct {
+            bitmap: Bitmap,
+            color: api.DWRITE_COLOR_F,
+        };
+        var rasters: std.ArrayList(Raster) = .empty;
+        defer {
+            for (rasters.items) |r| alloc.free(r.bitmap.data);
+            rasters.deinit(alloc);
+        }
+        var bounds: ?api.RECT = null;
+        for (layers) |layer| {
+            const bitmap = (try self.rasterize(alloc, layer.glyph, matrix)) orelse continue;
+            errdefer alloc.free(bitmap.data);
+            try rasters.append(alloc, .{ .bitmap = bitmap, .color = layer.color });
+            bounds = if (bounds) |b| .{
+                .left = @min(b.left, bitmap.bounds.left),
+                .top = @min(b.top, bitmap.bounds.top),
+                .right = @max(b.right, bitmap.bounds.right),
+                .bottom = @max(b.bottom, bitmap.bounds.bottom),
+            } else bitmap.bounds;
+        }
+        const box = bounds orelse return empty_glyph;
+        const width: u32 = @intCast(box.right - box.left);
+        const height: u32 = @intCast(box.bottom - box.top);
+
+        const canvas = try alloc.alloc(u8, @as(usize, width) * height * 4);
+        defer alloc.free(canvas);
+        @memset(canvas, 0);
+        for (rasters.items) |r| composite(canvas, width, box, r.bitmap, r.color);
+
+        const region = try atlas.reserve(alloc, width, height);
+        atlas.set(region, canvas);
+
+        return .{
+            .width = width,
+            .height = height,
+            .offset_x = box.left,
+            .offset_y = -box.top,
+            .atlas_x = region.x,
+            .atlas_y = region.y,
+        };
+    }
+
+    /// Draw a layer's coverage in its color over the canvas, source
+    /// over. The canvas is BGRA, premultiplied, with the bytes sRGB as
+    /// the palette's are; the layers of a color font are made for that.
+    fn composite(
+        canvas: []u8,
+        canvas_width: u32,
+        canvas_bounds: api.RECT,
+        layer: Bitmap,
+        color: api.DWRITE_COLOR_F,
+    ) void {
+        const dx: usize = @intCast(layer.bounds.left - canvas_bounds.left);
+        const dy: usize = @intCast(layer.bounds.top - canvas_bounds.top);
+        for (0..layer.height) |row| {
+            for (0..layer.width) |col| {
+                const coverage = layer.data[row * layer.width + col];
+                if (coverage == 0) continue;
+                const alpha: f32 = color.a * @as(f32, @floatFromInt(coverage)) / 255;
+                const src = [4]f32{ color.b * alpha, color.g * alpha, color.r * alpha, alpha };
+                const offset = ((dy + row) * canvas_width + dx + col) * 4;
+                const dst = canvas[offset..][0..4];
+                for (dst, src) |*d, s| {
+                    const under: f32 = @as(f32, @floatFromInt(d.*)) / 255;
+                    const over = s + under * (1 - alpha);
+                    d.* = @intFromFloat(@min(255, @round(over * 255)));
+                }
+            }
+        }
+    }
+
+    /// Draw a glyph from an image the font has of it: the image, at the
+    /// size the font has nearest to the face's, is scaled to the place
+    /// the constraints give the glyph.
+    fn renderImage(
+        self: Face,
+        alloc: Allocator,
+        atlas: *font.Atlas,
+        glyph: u16,
+        format: api.DWRITE_GLYPH_IMAGE_FORMATS,
+        opts: font.Glyph.RenderOptions,
+    ) !font.Glyph {
+        try checkAtlas(atlas, 4);
+
+        const face4 = api.queryInterface(self.face, api.IDWriteFontFace4) catch
+            return error.DirectWriteFailed;
+        defer api.release(face4);
+
+        var data: api.DWRITE_GLYPH_IMAGE_DATA = undefined;
+        var context: ?*anyopaque = null;
+        const ppem: api.UINT32 = @intFromFloat(@round(@max(1, self.size.pixels())));
+        const hr = face4.vtable.GetGlyphImageData(face4, glyph, ppem, format, &data, &context);
+        if (api.failed(hr)) return fail("IDWriteFontFace4.GetGlyphImageData", hr);
+        defer if (context) |c| face4.vtable.ReleaseGlyphImageData(face4, c);
+
+        // A format the glyph does not have comes back as no image at
+        // all, and not as an error.
+        const image_width = data.pixelSize.width;
+        const image_height = data.pixelSize.height;
+        const bytes = (data.imageData orelse return empty_glyph)[0..data.imageDataSize];
+        if (bytes.len == 0 or data.pixelsPerEm == 0 or image_width == 0 or image_height == 0)
+            return empty_glyph;
+
+        // The image as the atlas holds it.
+        const image = try decodeImage(alloc, bytes, format, data.pixelSize);
+        defer alloc.free(image);
+
+        const rect = imageBox(&data, self.size.pixels());
+        const p = place(rect, opts);
+
+        // An image is whole pixels, so its edges go to the nearest ones,
+        // as the FreeType face puts a bitmap glyph.
+        const left = @round(p.x);
+        const right = @round(p.x + p.width);
+        const bottom = @round(p.y);
+        const top = @round(p.y + p.height);
+        if (right <= left or top <= bottom) return empty_glyph;
+        const width: u32 = @intFromFloat(right - left);
+        const height: u32 = @intFromFloat(top - bottom);
+
+        // Scale the image to its place.
+        const scaled = if (width == image_width and height == image_height) image else scaled: {
+            const buf = try alloc.alloc(u8, @as(usize, width) * height * 4);
+            errdefer alloc.free(buf);
+            if (stb.stbir_resize_uint8(
+                image.ptr,
+                @intCast(image_width),
+                @intCast(image_height),
+                @intCast(image_width * 4),
+                buf.ptr,
+                @intCast(width),
+                @intCast(height),
+                @intCast(width * 4),
+                4,
+            ) == 0) return error.GlyphResizeFailed;
+            break :scaled buf;
+        };
+        defer if (scaled.ptr != image.ptr) alloc.free(scaled);
+
+        const region = try atlas.reserve(alloc, width, height);
+        atlas.set(region, scaled);
+
+        return .{
+            .width = width,
+            .height = height,
+            .offset_x = @intFromFloat(left),
+            .offset_y = @intFromFloat(top),
+            .atlas_x = region.x,
+            .atlas_y = region.y,
+        };
+    }
+
+    /// The box of an image of a glyph from the glyph's origin, in the
+    /// face's pixels, +Y up. The image is made for its own pixels per
+    /// em, and its origin is given in its pixels from its top left, +Y
+    /// down.
+    fn imageBox(data: *const api.DWRITE_GLYPH_IMAGE_DATA, px_per_em: f64) font.Glyph.Size {
+        const scale = px_per_em / @as(f64, @floatFromInt(data.pixelsPerEm));
+        const width: f64 = @floatFromInt(data.pixelSize.width);
+        const height: f64 = @floatFromInt(data.pixelSize.height);
+        const origin_x: f64 = @floatFromInt(data.horizontalLeftOrigin.x);
+        const origin_y: f64 = @floatFromInt(data.horizontalLeftOrigin.y);
+        return .{
+            .width = width * scale,
+            .height = height * scale,
+            .x = -origin_x * scale,
+            .y = (origin_y - height) * scale,
+        };
+    }
+
+    /// An image of a glyph as the atlas holds it: BGRA, premultiplied,
+    /// the bytes sRGB, the rows from the top. Owned by the caller.
+    fn decodeImage(
+        alloc: Allocator,
+        bytes: []const u8,
+        format: api.DWRITE_GLYPH_IMAGE_FORMATS,
+        size: api.D2D1_SIZE_U,
+    ) ![]u8 {
+        const len = @as(usize, size.width) * size.height * 4;
+        switch (format) {
+            api.DWRITE_GLYPH_IMAGE_FORMATS_PNG => {
+                const png = wuffs.png.decode(alloc, bytes) catch |err| {
+                    log.warn("glyph image could not be decoded: {}", .{err});
+                    return error.BitmapHandlingError;
+                };
+                errdefer alloc.free(png.data);
+                if (png.width != size.width or png.height != size.height or png.data.len != len) {
+                    log.warn(
+                        "glyph image is {}x{} where the font says {}x{}",
+                        .{ png.width, png.height, size.width, size.height },
+                    );
+                    return error.BitmapHandlingError;
+                }
+
+                // The decoder gives RGBA that is not premultiplied.
+                var i: usize = 0;
+                while (i < png.data.len) : (i += 4) {
+                    const px = png.data[i..][0..4];
+                    const alpha = px[3];
+                    const r = premultiply(px[0], alpha);
+                    const g = premultiply(px[1], alpha);
+                    const b = premultiply(px[2], alpha);
+                    px[0] = b;
+                    px[1] = g;
+                    px[2] = r;
+                }
+                return png.data;
+            },
+
+            api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8 => {
+                if (bytes.len != len) {
+                    log.warn(
+                        "glyph image has {} bytes where {}x{} pixels need {}",
+                        .{ bytes.len, size.width, size.height, len },
+                    );
+                    return error.BitmapHandlingError;
+                }
+                return try alloc.dupe(u8, bytes);
+            },
+
+            else => unreachable,
+        }
+    }
+
+    /// A channel multiplied by an alpha, rounded.
+    fn premultiply(channel: u8, alpha: u8) u8 {
+        return @intCast((@as(u32, channel) * alpha + 127) / 255);
     }
 
     /// The coverage of one rasterized glyph.
@@ -1533,9 +2020,14 @@ test "glyphIndex" {
     const glyph = face.glyphIndex('A').?;
     try testing.expectEqual(4, glyph);
 
-    // No glyph is colored until color glyphs are drawn.
-    try testing.expect(!face.hasColor());
+    // The font has an SVG table, which DirectWrite counts as color, as
+    // CoreText does. An SVG glyph is not drawn here, so no glyph of the
+    // font is a color one, as with FreeType.
+    try testing.expect(face.hasColor());
     try testing.expect(!face.isColorGlyph(glyph));
+    const svg = face.glyphIndex(0xE800).?;
+    try testing.expectEqual(11482, svg);
+    try testing.expect(!face.isColorGlyph(svg));
 
     // Outside the basic plane, and not in this font or any other.
     try testing.expect(face.glyphIndex(0x10FFFF) == null);
@@ -2719,4 +3211,505 @@ test "face gives back what it holds" {
         try testing.expectEqual([3]api.ULONG{ 0, 0, 0 }, last);
         try testing.expectEqual(streams, FontFileLoader.Stream.live.load(.monotonic));
     }
+}
+
+/// The constraint the grid renders every emoji with (SharedGrid.zig).
+const emoji_constraint: font.Glyph.RenderOptions.Constraint = .{
+    .size = .cover,
+    .align_horizontal = .center,
+    .align_vertical = .center,
+    .pad_left = 0.025,
+    .pad_right = 0.025,
+};
+
+/// What the pixels of a color glyph in the atlas say: the most a
+/// channel is over the alpha, which is zero where the pixels are
+/// premultiplied; how many are solid, and of those how many are warm
+/// (red high, blue low) and how many cool (blue high, red low), which
+/// change places when the bytes are read in the other order; and how
+/// many have each of the given colors. `want` is BGRA, matched to
+/// within the tolerance channel by channel.
+const ColorFacts = struct {
+    excess: i32,
+    solid: usize,
+    warm: usize,
+    cool: usize,
+    found: []usize,
+
+    fn deinit(self: ColorFacts, alloc: Allocator) void {
+        alloc.free(self.found);
+    }
+};
+
+fn testColorFacts(
+    alloc: Allocator,
+    atlas: *const font.Atlas,
+    glyph: font.Glyph,
+    want: []const [4]u8,
+    tolerance: u8,
+) !ColorFacts {
+    var facts: ColorFacts = .{
+        .excess = 0,
+        .solid = 0,
+        .warm = 0,
+        .cool = 0,
+        .found = try alloc.alloc(usize, want.len),
+    };
+    @memset(facts.found, 0);
+    for (0..glyph.height) |row| {
+        for (0..glyph.width) |col| {
+            const offset = ((glyph.atlas_y + row) * atlas.size + glyph.atlas_x + col) * 4;
+            const px = atlas.data[offset..][0..4];
+            const alpha = px[3];
+            for (px[0..3]) |c| facts.excess = @max(facts.excess, @as(i32, c) - @as(i32, alpha));
+            if (alpha == 255) {
+                facts.solid += 1;
+                if (px[2] >= 200 and px[0] <= 120) facts.warm += 1;
+                if (px[0] >= 200 and px[2] <= 120) facts.cool += 1;
+            }
+            for (want, facts.found) |w, *f| {
+                var near = true;
+                for (px, w) |have, wanted| {
+                    if (@abs(@as(i32, have) - @as(i32, wanted)) > tolerance) near = false;
+                }
+                if (near) f.* += 1;
+            }
+        }
+    }
+    return facts;
+}
+
+test "color emoji from an image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const testFont = font.embedded.emoji;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .bgra);
+    defer atlas.deinit(alloc);
+
+    var face = try Face.init(lib, testFont, .{ .size = test_size });
+    defer face.deinit();
+
+    // The font has color and the emoji is drawn from an image; glyph 3
+    // has neither an image nor an outline.
+    try testing.expect(face.hasColor());
+    const glyph = face.glyphIndex('🥸').?;
+    try testing.expect(face.isColorGlyph(glyph));
+    try testing.expect(!face.isColorGlyph(3));
+
+    // Rendered as the grid renders an emoji, into two cells of the
+    // grid of the embedded JetBrains Mono, which the test "metrics"
+    // holds to 10x21 with the baseline 5 up.
+    var grid_face = try Face.init(lib, font.embedded.regular, .{ .size = test_size });
+    defer grid_face.deinit();
+    const metrics = font.Metrics.calc(grid_face.getMetrics());
+    try testing.expectEqual(10, metrics.cell_width);
+    try testing.expectEqual(21, metrics.cell_height);
+    try testing.expectEqual(5, metrics.cell_baseline);
+    const g = try face.renderGlyph(alloc, &atlas, glyph, .{
+        .grid_metrics = metrics,
+        .constraint = emoji_constraint,
+        .constraint_width = 2,
+    });
+    errdefer std.debug.print("glyph {}x{} at ({},{}) cell {}x{}\n", .{
+        g.width,
+        g.height,
+        g.offset_x,
+        g.offset_y,
+        metrics.cell_width,
+        metrics.cell_height,
+    });
+
+    // The image, which the font has as 136x128 pixels for 109 pixels
+    // per em, is scaled into the cells, keeps its shape and stays
+    // within them.
+    try testing.expect(g.width > 0 and g.height > 0);
+    try testing.expect(g.width <= 2 * metrics.cell_width);
+    try testing.expect(g.height <= metrics.cell_height);
+    try testing.expectApproxEqAbs(
+        136.0 / 128.0,
+        @as(f64, @floatFromInt(g.width)) / @as(f64, @floatFromInt(g.height)),
+        0.1,
+    );
+    try testing.expect(g.offset_x >= 0);
+    try testing.expect(g.offset_x + @as(i32, @intCast(g.width)) <= 2 * @as(i32, @intCast(metrics.cell_width)));
+    try testing.expect(g.offset_y <= @as(i32, @intCast(metrics.cell_height)));
+    try testing.expect(g.offset_y - @as(i32, @intCast(g.height)) >= 0);
+
+    // Without a constraint the image is drawn at the face's 16 pixels
+    // per em, 136 * 16 / 109 = 19.96 pixels wide, from the origin the
+    // font gives it: 101 of its 128 rows are above the baseline, so
+    // 27 * 16 / 109 = 3.96 pixels of it hang below the baseline, which
+    // is 5 pixels up the cell. The edges go to the nearest pixel, with
+    // the glyph 0.2 pixels into the cell as every glyph of this grid.
+    const plain = try face.renderGlyph(alloc, &atlas, glyph, .{ .grid_metrics = metrics });
+    errdefer std.debug.print("plain glyph {}x{} at ({},{})\n", .{
+        plain.width,
+        plain.height,
+        plain.offset_x,
+        plain.offset_y,
+    });
+    try testing.expectEqual(20, plain.width);
+    try testing.expectEqual(19, plain.height);
+    try testing.expectEqual(0, plain.offset_x);
+    try testing.expectEqual(20, plain.offset_y);
+
+    // The pixels are the image's, premultiplied BGRA, and opaque in the
+    // middle. The face is yellow and shaded, and the glasses' lenses a
+    // light blue, so no color is exactly anywhere once the image is
+    // scaled; but of the solid pixels the warm ones are at least an
+    // eighth and outnumber the cool ones four to one, and with the
+    // bytes in the other order the two change places. The scaler's
+    // filter rings, so a channel can be over the alpha by a little at
+    // an edge (2 of 255 was measured); without the premultiplication
+    // it is over by hundreds.
+    const facts = try testColorFacts(alloc, &atlas, g, &.{}, 0);
+    defer facts.deinit(alloc);
+    errdefer std.debug.print("excess={} solid={} warm={} cool={}\n", .{
+        facts.excess,
+        facts.solid,
+        facts.warm,
+        facts.cool,
+    });
+    try testing.expect(facts.excess <= 4);
+    try testing.expect(facts.solid > g.width * g.height / 4);
+    try testing.expect(facts.warm >= facts.solid / 8);
+    try testing.expect(facts.warm > 4 * facts.cool);
+    const middle = atlas.data[((g.atlas_y + g.height / 2) * atlas.size + g.atlas_x + g.width / 2) * 4 ..][0..4];
+    errdefer std.debug.print("middle={any}\n", .{middle});
+    try testing.expectEqual(255, middle[3]);
+
+    // A glyph the font has neither an image nor an outline for is drawn
+    // from its outline, that is not at all, whatever the atlas.
+    const none = try face.renderGlyph(alloc, &atlas, 3, .{ .grid_metrics = metrics });
+    try testing.expectEqual(0, none.width);
+    try testing.expectEqual(0, none.height);
+}
+
+test "color emoji into a grayscale atlas" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const testFont = font.embedded.emoji;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+    defer atlas.deinit(alloc);
+
+    var face = try Face.init(lib, testFont, .{ .size = test_size });
+    defer face.deinit();
+
+    const modified = atlas.modified.load(.monotonic);
+    try testing.expectError(error.InvalidAtlasFormat, face.renderGlyph(
+        alloc,
+        &atlas,
+        face.glyphIndex('🥸').?,
+        .{ .grid_metrics = font.Metrics.calc(face.getMetrics()) },
+    ));
+    try testing.expectEqual(modified, atlas.modified.load(.monotonic));
+}
+
+test "text emoji font has no color" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var face = try Face.init(lib, font.embedded.emoji_text, .{ .size = test_size });
+    defer face.deinit();
+    try testing.expect(!face.hasColor());
+    try testing.expect(!face.isColorGlyph(face.glyphIndex('🥸').?));
+}
+
+test "color glyph from layers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .bgra);
+    defer atlas.deinit(alloc);
+
+    // Segoe UI Emoji ships with Windows and has its glyphs as COLR
+    // layers, which Segoe UI Symbol has not.
+    const dw_font = (try testSystemFont(lib, "Segoe UI Emoji")) orelse return error.SkipZigTest;
+    defer api.release(dw_font);
+    var face = try Face.initFont(lib, dw_font, .{ .size = test_size });
+    defer face.deinit();
+
+    try testing.expect(face.hasColor());
+    const glyph = face.glyphIndex(0x1F600).?;
+    try testing.expect(face.isColorGlyph(glyph));
+    try testing.expect(!face.isColorGlyph(3));
+
+    var grid_face = try Face.init(lib, font.embedded.regular, .{ .size = test_size });
+    defer grid_face.deinit();
+    const metrics = font.Metrics.calc(grid_face.getMetrics());
+    const g = try face.renderGlyph(alloc, &atlas, glyph, .{
+        .grid_metrics = metrics,
+        .constraint = emoji_constraint,
+        .constraint_width = 2,
+    });
+    errdefer std.debug.print("glyph {}x{} at ({},{}) cell {}x{}\n", .{
+        g.width,
+        g.height,
+        g.offset_x,
+        g.offset_y,
+        metrics.cell_width,
+        metrics.cell_height,
+    });
+    try testing.expect(g.width > 0 and g.height > 0);
+    try testing.expect(g.width <= 2 * metrics.cell_width);
+    try testing.expect(g.height <= metrics.cell_height);
+    try testing.expect(g.offset_x >= 0);
+    try testing.expect(g.offset_y - @as(i32, @intCast(g.height)) >= 0);
+
+    // The layers are drawn in their palette's colors, sRGB, over one
+    // another in order. The first layer's color, the face's (a yellow
+    // on Windows 11), fills most of the glyph, and the last layer's,
+    // the eyes' (a dark), is there too; drawn in the other order it
+    // would be under the face. The colors are taken from the font, as
+    // the palette of Segoe UI Emoji is not the same on every Windows.
+    const layers = (try face.colorLayers(alloc, @intCast(glyph))).?;
+    defer alloc.free(layers);
+    try testing.expect(layers.len >= 2);
+    const first = testLayerBgra(layers[0].color);
+    const last = testLayerBgra(layers[layers.len - 1].color);
+    try testing.expect(!std.mem.eql(u8, &first, &last));
+    const facts = try testColorFacts(alloc, &atlas, g, &.{ first, last }, 2);
+    defer facts.deinit(alloc);
+    errdefer std.debug.print("excess={} solid={} found={any}\n", .{ facts.excess, facts.solid, facts.found });
+    try testing.expectEqual(0, facts.excess);
+    try testing.expect(facts.solid > g.width * g.height / 4);
+    try testing.expect(facts.found[0] >= facts.solid / 8);
+    try testing.expect(facts.found[1] >= 4);
+
+    // The same glyph in one cell is smaller.
+    const one = try face.renderGlyph(alloc, &atlas, glyph, .{
+        .grid_metrics = metrics,
+        .constraint = emoji_constraint,
+        .constraint_width = 1,
+    });
+    try testing.expect(one.width > 0 and one.width < g.width);
+    try testing.expect(one.width <= metrics.cell_width);
+
+    // Into a grayscale atlas it does not go.
+    var gray = try font.Atlas.init(alloc, 512, .grayscale);
+    defer gray.deinit(alloc);
+    try testing.expectError(error.InvalidAtlasFormat, face.renderGlyph(
+        alloc,
+        &gray,
+        glyph,
+        .{ .grid_metrics = metrics },
+    ));
+}
+
+/// A layer's color as the atlas holds it when it is solid: BGRA bytes.
+fn testLayerBgra(color: api.DWRITE_COLOR_F) [4]u8 {
+    return .{
+        @intFromFloat(@round(color.b * 255)),
+        @intFromFloat(@round(color.g * 255)),
+        @intFromFloat(@round(color.r * 255)),
+        @intFromFloat(@round(color.a * 255)),
+    };
+}
+
+/// The references to a face's DirectWrite face: one is taken and given
+/// back, and what is left then is what the face and others hold.
+fn testReferences(face: *const Face) api.ULONG {
+    const unk = api.unknown(face.face);
+    _ = unk.vtable.AddRef(unk);
+    return unk.vtable.Release(unk);
+}
+
+test "layers are drawn over one another" {
+    const testing = std.testing;
+
+    // A canvas of 3x2 pixels at (10,20). The first layer fills the
+    // left 2x2 in orange, the second draws half a blue pixel over the
+    // orange at (11,21), the third a half-transparent white at (12,20).
+    var canvas = [_]u8{0} ** (3 * 2 * 4);
+    const bounds: api.RECT = .{ .left = 10, .top = 20, .right = 13, .bottom = 22 };
+    var orange = [_]u8{255} ** 4;
+    Face.composite(&canvas, 3, bounds, .{
+        .data = &orange,
+        .width = 2,
+        .height = 2,
+        .bounds = .{ .left = 10, .top = 20, .right = 12, .bottom = 22 },
+    }, .{ .r = 1, .g = 0.5, .b = 0, .a = 1 });
+    var blue = [_]u8{128};
+    Face.composite(&canvas, 3, bounds, .{
+        .data = &blue,
+        .width = 1,
+        .height = 1,
+        .bounds = .{ .left = 11, .top = 21, .right = 12, .bottom = 22 },
+    }, .{ .r = 0, .g = 0, .b = 1, .a = 1 });
+    var white = [_]u8{255};
+    Face.composite(&canvas, 3, bounds, .{
+        .data = &white,
+        .width = 1,
+        .height = 1,
+        .bounds = .{ .left = 12, .top = 20, .right = 13, .bottom = 21 },
+    }, .{ .r = 1, .g = 1, .b = 1, .a = 0.5 });
+
+    // Premultiplied BGRA: the blue over the orange keeps half of the
+    // orange, the white with half an alpha is half of everything.
+    try testing.expectEqualSlices(u8, &.{
+        0, 128, 255, 255, 0,   128, 255, 255, 128, 128, 128, 128,
+        0, 128, 255, 255, 128, 64,  127, 255, 0,   0,   0,   0,
+    }, &canvas);
+}
+
+test "layer color" {
+    const testing = std.testing;
+    var layer: api.DWRITE_COLOR_GLYPH_RUN = undefined;
+    layer.runColor = .{ .r = 0.2, .g = 0.4, .b = 0.6, .a = 1 };
+    layer.paletteIndex = 7;
+    try testing.expectEqual(layer.runColor, Face.layerColor(&layer));
+    layer.paletteIndex = 0xFFFF;
+    try testing.expectEqual(api.DWRITE_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 }, Face.layerColor(&layer));
+}
+
+test "image box" {
+    const testing = std.testing;
+
+    // An image like Noto Color Emoji's, 136x128 for 109 pixels per em
+    // with the baseline 101 rows down, but with its origin 5 pixels
+    // into the image, at 16 pixels per em.
+    const data: api.DWRITE_GLYPH_IMAGE_DATA = .{
+        .imageData = null,
+        .imageDataSize = 0,
+        .uniqueDataId = 0,
+        .pixelsPerEm = 109,
+        .pixelSize = .{ .width = 136, .height = 128 },
+        .horizontalLeftOrigin = .{ .x = 5, .y = 101 },
+        .horizontalRightOrigin = .{ .x = 141, .y = 101 },
+        .verticalTopOrigin = .{ .x = 68, .y = 101 },
+        .verticalBottomOrigin = .{ .x = 68, .y = 234 },
+    };
+    const box = Face.imageBox(&data, 16);
+    try testing.expectApproxEqAbs(136.0 * 16.0 / 109.0, box.width, 1e-9);
+    try testing.expectApproxEqAbs(128.0 * 16.0 / 109.0, box.height, 1e-9);
+    try testing.expectApproxEqAbs(-5.0 * 16.0 / 109.0, box.x, 1e-9);
+    try testing.expectApproxEqAbs((101.0 - 128.0) * 16.0 / 109.0, box.y, 1e-9);
+}
+
+test "image is decoded to premultiplied BGRA" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A PNG of one pixel, RGBA (255, 128, 0, 128).
+    const png = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+        0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0xda, 0x63, 0xf8, 0xdf, 0xc0, 0xd0, 0x00, 0x00, 0x06, 0x01, 0x02, 0x00, 0xd2, 0x62,
+        0x9d, 0x39, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+    const decoded = try Face.decodeImage(alloc, &png, api.DWRITE_GLYPH_IMAGE_FORMATS_PNG, .{ .width = 1, .height = 1 });
+    defer alloc.free(decoded);
+    try testing.expectEqualSlices(u8, &.{ 0, 64, 128, 128 }, decoded);
+
+    // A size the font says that the image has not.
+    try testing.expectError(error.BitmapHandlingError, Face.decodeImage(
+        alloc,
+        &png,
+        api.DWRITE_GLYPH_IMAGE_FORMATS_PNG,
+        .{ .width = 2, .height = 1 },
+    ));
+
+    // Premultiplied BGRA is taken as it is, when it is as long as the
+    // size says.
+    const bgra = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const copy = try Face.decodeImage(alloc, &bgra, api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8, .{ .width = 2, .height = 1 });
+    defer alloc.free(copy);
+    try testing.expectEqualSlices(u8, &bgra, copy);
+    try testing.expectError(error.BitmapHandlingError, Face.decodeImage(
+        alloc,
+        &bgra,
+        api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8,
+        .{ .width = 1, .height = 1 },
+    ));
+}
+
+test "color paths take no reference" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .bgra);
+    defer atlas.deinit(alloc);
+
+    var grid_face = try Face.init(lib, font.embedded.regular, .{ .size = test_size });
+    defer grid_face.deinit();
+    const opts: font.Glyph.RenderOptions = .{
+        .grid_metrics = font.Metrics.calc(grid_face.getMetrics()),
+        .constraint = emoji_constraint,
+        .constraint_width = 2,
+    };
+
+    // Every query and every rendering of a color glyph gives back what
+    // it takes: the interfaces it asks the face for, the enumerator of
+    // the layers, the image, and the streams of the font's file.
+    {
+        var face = try Face.init(lib, font.embedded.emoji, .{ .size = test_size });
+        defer face.deinit();
+        const glyph = face.glyphIndex('🥸').?;
+        const references = testReferences(&face);
+        const streams = FontFileLoader.Stream.live.load(.monotonic);
+        for (0..8) |_| {
+            try testing.expect(face.hasColor());
+            try testing.expect(face.isColorGlyph(glyph));
+            _ = try face.renderGlyph(alloc, &atlas, glyph, opts);
+        }
+        try testing.expectEqual(references, testReferences(&face));
+        try testing.expectEqual(streams, FontFileLoader.Stream.live.load(.monotonic));
+    }
+    if (try testSystemFont(lib, "Segoe UI Emoji")) |dw_font| {
+        defer api.release(dw_font);
+        var face = try Face.initFont(lib, dw_font, .{ .size = test_size });
+        defer face.deinit();
+        const glyph = face.glyphIndex(0x1F600).?;
+        const references = testReferences(&face);
+        for (0..8) |_| {
+            try testing.expect(face.isColorGlyph(glyph));
+            _ = try face.renderGlyph(alloc, &atlas, glyph, opts);
+        }
+        try testing.expectEqual(references, testReferences(&face));
+    }
+}
+
+/// The first font of a family of the system, or null when the system
+/// has no such family. The font is the caller's.
+fn testSystemFont(lib: font.Library, comptime family_name: []const u8) !?*api.IDWriteFont {
+    const testing = std.testing;
+    const collection = try lib.dwrite.systemFonts();
+    defer api.release(collection);
+    var index: api.UINT = 0;
+    var exists: api.BOOL = 0;
+    try testing.expect(api.succeeded(collection.vtable.FindFamilyName(
+        collection,
+        std.unicode.utf8ToUtf16LeStringLiteral(family_name),
+        &index,
+        &exists,
+    )));
+    if (exists == 0) return null;
+
+    var family_out: ?*api.IDWriteFontFamily = null;
+    try testing.expect(api.succeeded(collection.vtable.GetFontFamily(collection, index, &family_out)));
+    const family = family_out.?;
+    defer api.release(family);
+
+    const list = family.fontList();
+    var font_out: ?*api.IDWriteFont = null;
+    try testing.expect(api.succeeded(list.vtable.GetFont(list, 0, &font_out)));
+    return font_out.?;
 }
