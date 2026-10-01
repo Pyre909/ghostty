@@ -522,7 +522,10 @@ language: ?[:0]const u8 = null,
 ///
 /// This configuration only applies to Ghostty builds that use FreeType.
 /// This is usually the case only for Linux builds. macOS uses CoreText
-/// and does not have an equivalent configuration.
+/// and Windows uses DirectWrite, and neither has an equivalent
+/// configuration; a Windows build made with
+/// `-Dfont-backend=directwrite_freetype` draws with FreeType and does
+/// apply these flags.
 ///
 /// Available flags:
 ///

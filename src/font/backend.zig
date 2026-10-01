@@ -8,16 +8,23 @@ pub const Backend = enum {
 
     /// FreeType for font rendering with a built-in Windows font directory
     /// scanner (C:\Windows\Fonts + %LOCALAPPDATA%\Microsoft\Windows\Fonts).
-    /// Used when DirectWrite is not available; matches by family_name and
-    /// SFNT name table without any external index.
+    /// Needs nothing of DirectWrite; matches by family_name and SFNT
+    /// name table without any external index.
     freetype_windows,
 
     /// DirectWrite for font discovery, FreeType for rendering, and
-    /// HarfBuzz for shaping (Windows).
+    /// HarfBuzz for shaping (Windows). Needs the DirectWrite of Windows
+    /// 8.1 (IDWriteFactory2, for the system's font fallback); the
+    /// interfaces of later Windows are used where they are and done
+    /// without where they are not.
     directwrite_freetype,
 
     /// DirectWrite for font discovery and rendering, HarfBuzz for
-    /// shaping (Windows).
+    /// shaping (Windows). Needs the DirectWrite of Windows 8.1
+    /// (IDWriteFactory2, which rasterizes glyphs that are not fitted
+    /// to the pixel grid and translates color layers); variable fonts
+    /// and color images need the interfaces of Windows 10 and are done
+    /// without where they are not.
     directwrite,
 
     /// Fontconfig for font discovery and FreeType for font rendering.
@@ -59,9 +66,10 @@ pub const Backend = enum {
             // may not unpack due to symlinks. DirectWrite finds the fonts
             // instead: it knows them by the names and the styles Windows
             // shows them under, and knows the font the system shows a
-            // character in. The scanner of the font directories stays
-            // available as "freetype_windows".
-            return .directwrite_freetype;
+            // character in. It draws them too, as CoreText does on macOS.
+            // FreeType's drawing stays available as "directwrite_freetype",
+            // and the scanner of the font directories as "freetype_windows".
+            return .directwrite;
         }
 
         // macOS also supports "coretext_freetype" but there is no scenario
