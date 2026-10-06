@@ -33,6 +33,7 @@ const clipboard = @import("../clipboard.zig");
 const kitty_clipboard = @import("../kitty/clipboard.zig");
 const c_io = @import("io.zig");
 const snapshot_core = @import("../snapshot/main.zig");
+const terminal_mem = @import("../mem.zig");
 const Result = @import("result.zig").Result;
 const assert = @import("../../quirks.zig").inlineAssert;
 
@@ -1251,6 +1252,8 @@ pub const Option = enum(c_int) {
     render_hold = 41,
     semantic_prompt = 42,
     reset = 43,
+    xt_checksum_report = 44,
+    xt_checksum_extension = 45,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1277,10 +1280,12 @@ pub const Option = enum(c_int) {
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
             .kitty_image_storage_limit => ?*const u64,
+            .xt_checksum_extension => ?*const u8,
             .kitty_image_medium_file,
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             .title_report,
+            .xt_checksum_report,
             .resize_pull_scrollback,
             => ?*const bool,
             .kitty_image_medium_temp_file => ?*const lib.String,
@@ -1366,6 +1371,10 @@ fn setTyped(
                 null;
         },
         .title_report => wrapper.stream.handler.title_report = if (value) |ptr|
+            ptr.*
+        else
+            false,
+        .xt_checksum_report => wrapper.stream.handler.xt_checksum_report = if (value) |ptr|
             ptr.*
         else
             false,
@@ -1512,6 +1521,11 @@ fn setTyped(
             if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
         .resize_pull_scrollback => wrapper.terminal.flags.resize_pull_scrollback =
             if (value) |ptr| ptr.* else true,
+        .xt_checksum_extension => {
+            const bits = if (value) |ptr| ptr.* else 0;
+            const flags = std.math.cast(u5, bits) orelse return .invalid_value;
+            wrapper.terminal.setDefaultXtChecksum(@bitCast(flags));
+        },
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -1608,6 +1622,61 @@ pub const TerminalScreen = ScreenSet.Key;
 /// C: GhosttyTerminalScrollbar
 pub const TerminalScrollbar = PageList.Scrollbar.C;
 
+/// C: GhosttyTerminalMemoryUsage
+///
+/// This is a sized struct, so new fields may only be added to the end.
+/// The figures for each screen are separate fields rather than a nested
+/// struct per screen, because only the outermost struct can grow. Add a
+/// new per-screen field as a primary and alternate pair.
+pub const TerminalMemoryUsage = extern struct {
+    size: usize = @sizeOf(TerminalMemoryUsage),
+    compression_supported: bool = false,
+    primary_pages: u64 = 0,
+    primary_virtual_bytes: u64 = 0,
+    primary_resident_bytes: u64 = 0,
+    primary_compressed_pages: u64 = 0,
+    primary_compressed_bytes: u64 = 0,
+    primary_image_bytes: u64 = 0,
+    alternate_pages: u64 = 0,
+    alternate_virtual_bytes: u64 = 0,
+    alternate_resident_bytes: u64 = 0,
+    alternate_compressed_pages: u64 = 0,
+    alternate_compressed_bytes: u64 = 0,
+    alternate_image_bytes: u64 = 0,
+
+    /// Gather the memory usage of `t`. The size field is set to
+    /// `caller_size` instead of our own size, so that copying the result
+    /// into the caller's struct keeps the size they passed in.
+    fn init(t: *const ZigTerminal, caller_size: usize) TerminalMemoryUsage {
+        var result: TerminalMemoryUsage = .{
+            .size = caller_size,
+            .compression_supported = terminal_mem.canReclaim(.strict),
+        };
+
+        const primary = t.screens.get(.primary).?.memoryUsage();
+        result.primary_pages = primary.pages.pages;
+        result.primary_virtual_bytes = primary.pages.virtual_bytes;
+        result.primary_resident_bytes = primary.pages.resident_bytes;
+        result.primary_compressed_pages = primary.pages.compressed_pages;
+        result.primary_compressed_bytes = primary.pages.compressed_bytes;
+        result.primary_image_bytes = primary.image_bytes;
+
+        // The alternate screen is created on first use. Until then its
+        // fields stay zero.
+        if (t.screens.get(.alternate)) |screen| {
+            const alternate = screen.memoryUsage();
+            result.alternate_pages = alternate.pages.pages;
+            result.alternate_virtual_bytes = alternate.pages.virtual_bytes;
+            result.alternate_resident_bytes = alternate.pages.resident_bytes;
+            result.alternate_compressed_pages = alternate.pages.compressed_pages;
+            result.alternate_compressed_bytes = alternate.pages.compressed_bytes;
+            result.alternate_image_bytes = alternate.image_bytes;
+        }
+
+        return result;
+    }
+};
+
 /// C: GhosttyTerminalData
 pub const TerminalData = enum(c_int) {
     invalid = 0,
@@ -1652,6 +1721,7 @@ pub const TerminalData = enum(c_int) {
     cursor_at_prompt = 39,
     clipboard_write_max_bytes = 40,
     mouse_shape = 41,
+    memory_usage = 42,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
@@ -1696,6 +1766,7 @@ pub const TerminalData = enum(c_int) {
             .kitty_graphics => KittyGraphics,
             .selection => selection_c.CSelection,
             .mode => ModeConfig,
+            .memory_usage => TerminalMemoryUsage,
         };
     }
 };
@@ -1836,6 +1907,19 @@ fn getTyped(
             out.value = t.modes.get(mode);
         },
         .cursor_at_prompt => out.* = t.cursorIsAtPrompt(),
+        .memory_usage => {
+            // A smaller size means the caller doesn't have every field of
+            // the first version of this struct, so reject it. A larger size
+            // means the caller was built against a newer version with more
+            // fields. We write only the fields we know and leave the rest
+            // alone.
+            //
+            // When fields are added later, compare against the size of the
+            // first version here, and copy only min(out.size, current size)
+            // bytes.
+            if (out.size < @sizeOf(TerminalMemoryUsage)) return .invalid_value;
+            out.* = .init(t, out.size);
+        },
     }
 
     return .success;
@@ -2491,6 +2575,138 @@ test "scroll_viewport row alt screen" {
     try testing.expectEqual(@as(u64, 2), scrollbar_data.total);
     try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
     try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
+}
+
+test "get memory_usage" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    var fresh: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&fresh)));
+    try testing.expectEqual(@sizeOf(TerminalMemoryUsage), fresh.size);
+    try testing.expectEqual(terminal_mem.canReclaim(.strict), fresh.compression_supported);
+    try testing.expect(fresh.primary_pages > 0);
+    try testing.expect(fresh.primary_virtual_bytes > 0);
+    try testing.expect(fresh.primary_resident_bytes <= fresh.primary_virtual_bytes);
+    try testing.expectEqual(@as(u64, 0), fresh.primary_compressed_pages);
+    try testing.expectEqual(@as(u64, 0), fresh.primary_compressed_bytes);
+    try testing.expectEqual(@as(u64, 0), fresh.primary_image_bytes);
+
+    // The alternate screen doesn't exist yet.
+    try testing.expectEqual(@as(u64, 0), fresh.alternate_pages);
+    try testing.expectEqual(@as(u64, 0), fresh.alternate_virtual_bytes);
+    try testing.expectEqual(@as(u64, 0), fresh.alternate_resident_bytes);
+    try testing.expectEqual(@as(u64, 0), fresh.alternate_compressed_pages);
+    try testing.expectEqual(@as(u64, 0), fresh.alternate_compressed_bytes);
+    try testing.expectEqual(@as(u64, 0), fresh.alternate_image_bytes);
+
+    // Write compressible history.
+    const line = "repeated and compressible terminal history\r\n";
+    const repeat = 4_000;
+    const input = try testing.allocator.alloc(u8, line.len * repeat);
+    defer testing.allocator.free(input);
+    for (0..repeat) |i|
+        @memcpy(input[i * line.len ..][0..line.len], line);
+    vt_write(t, input.ptr, input.len);
+
+    var history: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&history)));
+    try testing.expect(history.primary_pages > fresh.primary_pages);
+    try testing.expect(history.primary_resident_bytes > fresh.primary_resident_bytes);
+
+    var compression_result: CompressionResult = undefined;
+    try testing.expectEqual(
+        Result.success,
+        compress(t, @intFromEnum(CompressionMode.full), &compression_result),
+    );
+    try testing.expectEqual(
+        history.compression_supported,
+        compression_result == .complete,
+    );
+
+    var compressed: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&compressed)));
+    try testing.expectEqual(history.primary_pages, compressed.primary_pages);
+    try testing.expectEqual(history.primary_virtual_bytes, compressed.primary_virtual_bytes);
+    if (compressed.compression_supported) {
+        try testing.expect(compressed.primary_compressed_pages > 0);
+        try testing.expect(compressed.primary_compressed_bytes > 0);
+        try testing.expect(compressed.primary_resident_bytes < history.primary_resident_bytes);
+    } else {
+        try testing.expectEqual(@as(u64, 0), compressed.primary_compressed_pages);
+    }
+
+    // The query never restores a compressed page.
+    var again: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&again)));
+    try testing.expectEqual(compressed, again);
+
+    // Kitty images are counted separately from pages.
+    if (comptime build_options.kitty_graphics) {
+        // 1x2 RGB image, 6 bytes of pixel data.
+        const transmit = "\x1b_Ga=t,t=d,f=24,i=1,s=1,v=2;////////\x1b\\";
+        vt_write(t, transmit.ptr, transmit.len);
+        var images: TerminalMemoryUsage = .{};
+        try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&images)));
+        try testing.expect(images.primary_image_bytes > 0);
+
+        const delete = "\x1b_Ga=d,d=I,i=1\x1b\\";
+        vt_write(t, delete.ptr, delete.len);
+        try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&images)));
+        try testing.expectEqual(@as(u64, 0), images.primary_image_bytes);
+    }
+
+    // Entering the alternate screen creates it.
+    vt_write(t, "\x1b[?1049h", 8);
+    var alternate: TerminalMemoryUsage = .{};
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&alternate)));
+    try testing.expect(alternate.alternate_pages > 0);
+    try testing.expect(alternate.alternate_virtual_bytes > 0);
+    try testing.expect(alternate.alternate_resident_bytes > 0);
+    try testing.expect(alternate.alternate_resident_bytes <= alternate.alternate_virtual_bytes);
+    try testing.expectEqual(compressed.primary_pages, alternate.primary_pages);
+}
+
+test "get memory_usage size rule" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // A size smaller than the first layout is rejected and nothing is
+    // written.
+    var small: TerminalMemoryUsage = .{
+        .size = @sizeOf(TerminalMemoryUsage) - 1,
+        .primary_pages = 1234,
+    };
+    try testing.expectEqual(Result.invalid_value, get(t, .memory_usage, @ptrCast(&small)));
+    try testing.expectEqual(@sizeOf(TerminalMemoryUsage) - 1, small.size);
+    try testing.expectEqual(@as(u64, 1234), small.primary_pages);
+
+    // A size larger than ours, from a caller built against a newer
+    // layout, gets the known prefix and the rest is left untouched.
+    const Larger = extern struct {
+        usage: TerminalMemoryUsage,
+        extra: u64,
+    };
+    var large: Larger = .{
+        .usage = .{ .size = @sizeOf(Larger) },
+        .extra = 0xDEADBEEF,
+    };
+    try testing.expectEqual(Result.success, get(t, .memory_usage, @ptrCast(&large)));
+    try testing.expectEqual(@sizeOf(Larger), large.usage.size);
+    try testing.expect(large.usage.primary_pages > 0);
+    try testing.expectEqual(@as(u64, 0xDEADBEEF), large.extra);
 }
 
 test "scroll_viewport null" {
@@ -6131,6 +6347,125 @@ test "title report requires explicit opt in" {
     try testing.expect(S.last_data == null);
 }
 
+test "checksum report requires explicit opt in" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = null;
+        }
+
+        fn writePty(
+            _: Terminal,
+            _: ?*anyopaque,
+            ptr: [*]const u8,
+            len: usize,
+        ) callconv(lib.calling_conv) void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    S.last_data = null;
+    defer S.deinit();
+
+    try testing.expectEqual(
+        Result.success,
+        set(t, .write_pty, @ptrCast(&S.writePty)),
+    );
+
+    const text = "hello";
+    const query = "\x1B[1;1;1;1;1;5*y";
+    vt_write(t, text, text.len);
+
+    // WRITE_PTY alone must not enable the security-sensitive response.
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data == null);
+
+    const enabled = true;
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_report, &enabled));
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~FDEC\x1b\\", S.last_data.?);
+
+    // NULL restores the secure default.
+    S.deinit();
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_report, null));
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data == null);
+}
+
+test "checksum extension survives resets" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = null;
+        }
+
+        fn writePty(
+            _: Terminal,
+            _: ?*anyopaque,
+            ptr: [*]const u8,
+            len: usize,
+        ) callconv(lib.calling_conv) void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    S.last_data = null;
+    defer S.deinit();
+
+    const enabled = true;
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_report, &enabled));
+
+    // Don't negate the result.
+    const positive: u8 = 1;
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_extension, &positive));
+
+    const text = "hello";
+    const query = "\x1B[1;1;1;1;1;5*y";
+    vt_write(t, text, text.len);
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~0214\x1b\\", S.last_data.?);
+
+    // A reset restores the configured calculation, not the DEC one.
+    const negate = "\x1B[0#y";
+    const ris = "\x1Bc";
+    vt_write(t, negate, negate.len);
+    vt_write(t, ris, ris.len);
+    vt_write(t, text, text.len);
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~0214\x1b\\", S.last_data.?);
+
+    // NULL restores the DEC calculation.
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_extension, null));
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~FDEC\x1b\\", S.last_data.?);
+
+    const invalid: u8 = 32;
+    try testing.expectEqual(Result.invalid_value, set(t, .xt_checksum_extension, &invalid));
+}
+
 test "resize updates pixel dimensions" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -6608,6 +6943,7 @@ test "get mouse_shape" {
         .{ "\x1b]22;not-a-pointer-shape\x07", mouse.Shape.crosshair },
         // Hyperlinks don't override the application's requested shape.
         .{ "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", mouse.Shape.crosshair },
+        .{ "\x1b]22;\x1b\\", mouse.Shape.text },
         .{ "\x1b]22;default\x07", mouse.Shape.default },
         .{ "\x1b]22;text\x07", mouse.Shape.text },
     };
