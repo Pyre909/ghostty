@@ -328,6 +328,9 @@ const win32 = struct {
     const MB_OKCANCEL: UINT = 0x00000001;
     const MB_ICONWARNING: UINT = 0x00000030;
     const MB_ICONERROR: UINT = 0x00000010;
+    const MB_DEFBUTTON1: UINT = 0x00000000;
+    const MB_DEFBUTTON2: UINT = 0x00000100;
+    const MB_DEFMASK: UINT = 0x00000F00;
     const IDOK: c_int = 1;
 
     const MB_ICONASTERISK: UINT = 0x00000040;
@@ -1141,6 +1144,7 @@ pub const App = struct {
                 self,
                 owner,
                 L("All terminal sessions will be terminated. Quit Ghostty?"),
+                .ok,
             )) return true;
         }
 
@@ -2197,6 +2201,7 @@ pub const Surface = struct {
             self.app,
             self.hwnd,
             L("A process is still running in this terminal. Close it anyway?"),
+            .ok,
         )) {
             // `self` is still valid: `confirm` raises `prompt_depth`, so no
             // teardown can run inside its modal loop (destroyPosted defers),
@@ -2394,7 +2399,8 @@ pub const Surface = struct {
                 if (confirm(
                     self.app,
                     self.hwnd,
-                    L("Pasting this text could be unsafe. Paste anyway?"),
+                    clipboardReadPrompt(state),
+                    .cancel,
                 )) {
                     try self.core_surface.completeClipboardRequest(state, .{
                         .contents = contents,
@@ -2439,6 +2445,7 @@ pub const Surface = struct {
             self.app,
             self.hwnd,
             L("An application wants to write to the clipboard. Allow it?"),
+            .cancel,
         )) return;
 
         const alloc = self.app.core_app.alloc;
@@ -4087,20 +4094,60 @@ fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     return try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(ptr));
 }
 
+/// The text of the prompt for a clipboard read the core would not complete
+/// unasked. A paste puts the text into the terminal; a read hands the
+/// clipboard to whatever program is running, which can send it anywhere.
+/// The two must not share wording, or the user approves the second believing
+/// it is the first. The GTK and macOS confirmation dialogs word them apart
+/// too.
+fn clipboardReadPrompt(state: apprt.ClipboardRequestType) win32.LPCWSTR {
+    return switch (state) {
+        .paste => L("Pasting this text could be unsafe. Paste anyway?"),
+        .osc_52_read, .kitty_read => L("An application wants to read the clipboard. Allow it?"),
+
+        // Writes go to setClipboard and lists never need consent.
+        .osc_52_write, .kitty_write, .list => unreachable,
+    };
+}
+
+/// The button of a `confirm` prompt that Enter and Space press.
+///
+/// Prompts that grant access default to Cancel, as GTK's clipboard
+/// confirmation dialog does (`default-response: "cancel"`): a program can
+/// raise one at any moment, so a key the user was already typing must not
+/// answer it.
+const ConfirmDefault = enum {
+    ok,
+    cancel,
+
+    fn style(self: ConfirmDefault) win32.UINT {
+        // MB_OKCANCEL places OK first and Cancel second.
+        return switch (self) {
+            .ok => win32.MB_DEFBUTTON1,
+            .cancel => win32.MB_DEFBUTTON2,
+        };
+    }
+};
+
 /// A modal yes/no prompt. This is the only confirmation UI this runtime has.
 ///
 /// MessageBoxW runs a nested message loop. `prompt_depth` tells every
 /// handler dispatched inside it that a core frame is probably beneath: no
 /// ticks and no surface teardown until it returns (`App.canReenterCore`).
 /// Output from every surface pauses while a prompt is open.
-fn confirm(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) bool {
+fn confirm(
+    app: *App,
+    hwnd: ?win32.HWND,
+    text: win32.LPCWSTR,
+    default: ConfirmDefault,
+) bool {
     app.prompt_depth += 1;
     defer app.prompt_depth -= 1;
     return win32.MessageBoxW(
         hwnd,
         text,
         L("Ghostty"),
-        win32.MB_OKCANCEL | win32.MB_ICONWARNING,
+        win32.MB_OKCANCEL | win32.MB_ICONWARNING | default.style(),
     ) == win32.IDOK;
 }
 
@@ -4332,6 +4379,24 @@ test "win32: mouse message button bits" {
     try std.testing.expect(Surface.Mouse.Button.downIn(0).eql(Set.empty));
     const both = Surface.Mouse.Button.downIn(win32.MK_LBUTTON | win32.MK_XBUTTON2 | win32.MK_SHIFT);
     try std.testing.expect(both.eql(Set.initMany(&.{ .left, .x2 })));
+}
+
+test "win32: clipboard reads are not worded as pastes and default to Cancel" {
+    const paste = std.mem.span(clipboardReadPrompt(.paste));
+    for ([_]apprt.ClipboardRequestType{ .osc_52_read, .kitty_read }) |state| {
+        const read = std.mem.span(clipboardReadPrompt(state));
+        try std.testing.expect(!std.mem.eql(u16, paste, read));
+        try std.testing.expect(std.mem.indexOf(
+            u16,
+            read,
+            std.unicode.utf8ToUtf16LeStringLiteral("aste"),
+        ) == null);
+    }
+
+    try std.testing.expectEqual(
+        win32.MB_DEFBUTTON2,
+        ConfirmDefault.cancel.style() & win32.MB_DEFMASK,
+    );
 }
 
 test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
