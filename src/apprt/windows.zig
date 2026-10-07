@@ -273,6 +273,9 @@ const win32 = struct {
     const VK_PACKET: WPARAM = 0xE7;
     const VK_CONTROL: WPARAM = 0x11;
     const VK_MENU: WPARAM = 0x12;
+    const VK_NUMPAD0: UINT = 0x60;
+    const VK_NUMPAD9: UINT = 0x69;
+    const VK_DECIMAL: UINT = 0x6E;
     const VK_CAPITAL: c_int = 0x14;
     const VK_NUMLOCK: c_int = 0x90;
     const VK_LWIN: c_int = 0x5B;
@@ -3076,7 +3079,7 @@ pub const Surface = struct {
         // still arrives through the WM_CHAR collected below.
         const is_packet = wparam == win32.VK_PACKET;
 
-        const key: input.Key = if (is_packet) .unidentified else keyFromScan(scan);
+        const key: input.Key = if (is_packet) .unidentified else numpadKey(keyFromScan(scan), vk);
 
         var text: Text = .{};
         if (action != .release) text.collect(self.hwnd);
@@ -4029,6 +4032,36 @@ fn keyFromScan(scan: u32) input.Key {
     return .unidentified;
 }
 
+/// The keypad key for `key`, the `keyFromScan` result of a message for
+/// virtual key `vk`.
+///
+/// The keypad's digit and decimal keys keep their scan codes whatever the
+/// NumLock state, so `keyFromScan` reports them as digits. With NumLock
+/// off, or with Shift held while it is on, Windows sends the navigation
+/// virtual key (VK_END, VK_UP, VK_CLEAR and so on) in place of VK_NUMPAD0
+/// to VK_NUMPAD9 or VK_DECIMAL. The core then expects the navigation key,
+/// which the encoder sends as a cursor or editing key (`pcStyleFunctionKey`
+/// in input/key_encode.zig), as GTK reports it from KP_End and the other
+/// keypad keysyms.
+fn numpadKey(key: input.Key, vk: win32.UINT) input.Key {
+    if (vk >= win32.VK_NUMPAD0 and vk <= win32.VK_NUMPAD9) return key;
+    if (vk == win32.VK_DECIMAL) return key;
+    return switch (key) {
+        .numpad_0 => .numpad_insert,
+        .numpad_1 => .numpad_end,
+        .numpad_2 => .numpad_down,
+        .numpad_3 => .numpad_page_down,
+        .numpad_4 => .numpad_left,
+        .numpad_5 => .numpad_begin,
+        .numpad_6 => .numpad_right,
+        .numpad_7 => .numpad_home,
+        .numpad_8 => .numpad_up,
+        .numpad_9 => .numpad_page_up,
+        .numpad_decimal => .numpad_delete,
+        else => key,
+    };
+}
+
 /// The character the key produces with no modifiers in the current layout,
 /// or 0. Used by the encoder for Ctrl/Alt sequences and by bindings.
 ///
@@ -4461,6 +4494,31 @@ test "win32: key messages decode lParam" {
     try testing.expectEqual(.repeat, keyAction(win32.WM_SYSKEYDOWN, lp(0x601E_0001)));
     try testing.expectEqual(.release, keyAction(win32.WM_KEYUP, lp(0xC01E_0001)));
     try testing.expectEqual(.release, keyAction(win32.WM_SYSKEYUP, lp(0xE01E_0001)));
+}
+
+test "win32: keypad keys follow NumLock" {
+    const testing = std.testing;
+    const Case = struct { scan: u32, vk: win32.UINT, want: input.Key };
+    const cases = [_]Case{
+        // NumLock on: the digit's VK.
+        .{ .scan = 0x0048, .vk = 0x68, .want = .numpad_8 }, // VK_NUMPAD8
+        .{ .scan = 0x0052, .vk = 0x60, .want = .numpad_0 }, // VK_NUMPAD0
+        .{ .scan = 0x0053, .vk = 0x6E, .want = .numpad_decimal }, // VK_DECIMAL
+
+        // NumLock off, or Shift with it on: the navigation VK, same scan.
+        .{ .scan = 0x0048, .vk = 0x26, .want = .numpad_up }, // VK_UP
+        .{ .scan = 0x004F, .vk = 0x23, .want = .numpad_end }, // VK_END
+        .{ .scan = 0x004C, .vk = 0x0C, .want = .numpad_begin }, // VK_CLEAR
+        .{ .scan = 0x0052, .vk = 0x2D, .want = .numpad_insert }, // VK_INSERT
+        .{ .scan = 0x0053, .vk = 0x2E, .want = .numpad_delete }, // VK_DELETE
+
+        // The dedicated arrow and the keypad's other keys stay as they are.
+        .{ .scan = 0xE048, .vk = 0x26, .want = .arrow_up }, // VK_UP
+        .{ .scan = 0x004E, .vk = 0x6B, .want = .numpad_add }, // VK_ADD
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.want, numpadKey(keyFromScan(c.scan), c.vk));
+    }
 }
 
 test "win32: key text drops controls and decodes surrogate pairs" {
