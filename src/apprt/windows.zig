@@ -1570,6 +1570,14 @@ pub const Surface = struct {
 
     ime: Ime,
 
+    /// A high surrogate that ended the last character text, kept for the
+    /// low surrogate the next one starts with. SendInput with
+    /// KEYEVENTF_UNICODE sends a character outside the BMP as one
+    /// VK_PACKET keystroke per UTF-16 unit, and TranslateMessage posts one
+    /// WM_CHAR for each, so the halves arrive with separate keystrokes.
+    /// See `Text.finish`.
+    high_surrogate: ?u16,
+
     /// Number of WM_PAINTs handled, for the debug log in `paint`.
     paint_count: u64,
 
@@ -1950,6 +1958,7 @@ pub const Surface = struct {
             .destroy_deferred = false,
             .preedit = .none,
             .ime = .{},
+            .high_surrogate = null,
             .paint_count = 0,
             .modal_loops = 0,
             .focused = false,
@@ -3098,13 +3107,11 @@ pub const Surface = struct {
 
         const key: input.Key = if (is_packet) .unidentified else numpadKey(keyFromScan(scan), vk);
 
+        // Collected before `keyText` flushes the IME's text, so that
+        // nothing the flush triggers can dispatch the queued WM_CHAR out of
+        // turn.
         var text: Text = .{};
-        if (action != .release) text.collect(self.hwnd);
-
-        // Text the IME committed earlier comes first. This key's own text
-        // is collected before the flush so that nothing the flush triggers
-        // can dispatch the queued WM_CHAR out of turn.
-        if (self.app.canReenterCore()) self.flushIme(core_surface);
+        if (action != .release) text.collect(self.hwnd, &self.high_surrogate);
 
         const unshifted: u21 = if (is_packet) 0 else unshiftedCodepoint(vk, scan);
         const shiftless: u21 = if (is_packet or !mods_in.shift) unshifted else shiftless: {
@@ -3114,7 +3121,28 @@ pub const Surface = struct {
             if (!win32.GetKeyboardState(&state).toBool()) break :shiftless unshifted;
             break :shiftless shiftlessCodepoint(vk, scan, &state);
         };
-        const mods_out = keyMods(mods_in, &text, shiftless);
+
+        return try self.keyText(core_surface, .{
+            .action = action,
+            .key = key,
+            .mods = mods_in,
+            .unshifted_codepoint = unshifted,
+        }, &text, shiftless);
+    }
+
+    /// Send the core a key event carrying `text`, for `keyEvent` and
+    /// `strayChar`. `event.mods` is the state the key was read with; the
+    /// mods reported are `keyMods`'s, given the key's codepoint with Shift
+    /// released (`shiftless`).
+    fn keyText(
+        self: *Surface,
+        core_surface: *CoreSurface,
+        event: input.KeyEvent,
+        text: *const Text,
+        shiftless: u21,
+    ) !CoreSurface.InputEffect {
+        // Text the IME committed earlier comes first.
+        if (self.app.canReenterCore()) self.flushIme(core_surface);
 
         // A dead key shows its accent as preedit until the next committed
         // text replaces it. The core does not track this itself
@@ -3125,15 +3153,13 @@ pub const Surface = struct {
             try self.setPreedit(core_surface, null, .none);
         }
 
-        return try core_surface.keyCallback(.{
-            .action = action,
-            .key = key,
-            .mods = mods_out.mods,
-            .consumed_mods = mods_out.consumed,
-            .composing = text.composing,
-            .utf8 = text.utf8(),
-            .unshifted_codepoint = unshifted,
-        });
+        const mods = keyMods(event.mods, text, shiftless);
+        var ev = event;
+        ev.mods = mods.mods;
+        ev.consumed_mods = mods.consumed;
+        ev.composing = text.composing;
+        ev.utf8 = text.utf8();
+        return try core_surface.keyCallback(ev);
     }
 
     const KeyMods = struct {
@@ -3444,27 +3470,17 @@ pub const Surface = struct {
     ) void {
         var text: Text = .{};
         text.add(msg, @truncate(wparam));
-        text.finish();
+        text.finish(&self.high_surrogate);
         if (text.len == 0) return;
 
-        // Text the IME committed earlier comes first.
-        if (self.app.canReenterCore()) self.flushIme(core_surface);
-
-        if (text.composing) {
-            self.setPreedit(core_surface, text.utf8(), .dead_key) catch |err|
-                log.warn("preedit callback failed err={}", .{err});
-        } else if (self.preedit == .dead_key) {
-            self.setPreedit(core_surface, null, .none) catch |err|
-                log.warn("preedit callback failed err={}", .{err});
-        }
-
-        _ = core_surface.keyCallback(.{
+        // With no key there is no Shift-less character to compare the
+        // text with (0), so a held Shift counts as consumed: the text is
+        // final, as an IME commit's is.
+        _ = self.keyText(core_surface, .{
             .action = .press,
             .key = .unidentified,
             .mods = currentMods(),
-            .composing = text.composing,
-            .utf8 = text.utf8(),
-        }) catch |err| log.warn("key callback failed err={}", .{err});
+        }, &text, 0) catch |err| log.warn("key callback failed err={}", .{err});
     }
 
     /// Bring the core up to date with what Win32 could not tell it in time,
@@ -3778,7 +3794,7 @@ pub const Surface = struct {
         /// Two separate peeks, never one over 0x0102-0x0107: that range
         /// also contains WM_SYSKEYDOWN (0x0104) and WM_SYSKEYUP (0x0105),
         /// which a single peek would swallow.
-        fn collect(self: *Text, hwnd: win32.HWND) void {
+        fn collect(self: *Text, hwnd: win32.HWND, carry: *?u16) void {
             const ranges = [_][2]win32.UINT{
                 .{ win32.WM_CHAR, win32.WM_DEADCHAR },
                 .{ win32.WM_SYSCHAR, win32.WM_SYSDEADCHAR },
@@ -3789,7 +3805,7 @@ pub const Surface = struct {
                     self.add(m.message, @truncate(m.wParam));
                 }
             }
-            self.finish();
+            self.finish(carry);
         }
 
         fn add(self: *Text, msg: win32.UINT, unit: u16) void {
@@ -3808,10 +3824,31 @@ pub const Surface = struct {
         /// (the GTK `Surface.keyEvent` IM filter): the encoder derives
         /// Ctrl+letter, Enter, Tab, Backspace and Esc from the physical key
         /// and the unshifted codepoint, and would double them otherwise.
-        /// Unpaired surrogates are dropped rather than failing the keystroke.
-        fn finish(self: *Text) void {
+        ///
+        /// `carry` holds a surrogate pair split between two texts (see
+        /// `Surface.high_surrogate`): a high surrogate the previous text
+        /// ended with is decoded ahead of these units, and one these units
+        /// end with is left in `carry` for the next text instead. Other
+        /// unpaired surrogates are dropped rather than failing the
+        /// keystroke; a carried one that no low surrogate follows is too.
+        fn finish(self: *Text, carry: *?u16) void {
+            var units: [self.units.len + 1]u16 = undefined;
+            var end: usize = 0;
+            if (carry.*) |unit| {
+                units[0] = unit;
+                end = 1;
+            }
+            @memcpy(units[end..][0..self.units_len], self.units[0..self.units_len]);
+            end += self.units_len;
+
+            carry.* = null;
+            if (end > 0 and std.unicode.utf16IsHighSurrogate(units[end - 1])) {
+                end -= 1;
+                carry.* = units[end];
+            }
+
             self.len = 0;
-            var it = std.unicode.Utf16LeIterator.init(self.units[0..self.units_len]);
+            var it = std.unicode.Utf16LeIterator.init(units[0..end]);
             while (true) {
                 const cp = it.nextCodepoint() catch continue orelse break;
                 if (cp < 0x20 or cp == 0x7F) continue;
@@ -4652,9 +4689,11 @@ test "win32: key text drops controls and decodes surrogate pairs" {
     };
     for (cases) |c| {
         var text: Text = .{};
+        var carry: ?u16 = null;
         for (c.units) |u| text.add(c.msg, u);
-        text.finish();
+        text.finish(&carry);
         try std.testing.expectEqualStrings(c.want, text.utf8());
+        try std.testing.expectEqual(null, carry);
     }
 
     // Dead keys are preedit; only the non-SYS messages mean "not Alt alone".
@@ -4667,11 +4706,40 @@ test "win32: key text drops controls and decodes surrogate pairs" {
     };
     for (flags) |f| {
         var text: Text = .{};
+        var carry: ?u16 = null;
         text.add(f.msg, '^');
-        text.finish();
+        text.finish(&carry);
         try std.testing.expectEqualStrings("^", text.utf8());
         try std.testing.expectEqual(f.composing, text.composing);
         try std.testing.expectEqual(f.from_char, text.from_char);
+    }
+}
+
+test "win32: key text pairs surrogates split between keystrokes" {
+    const Text = Surface.Text;
+    const t = std.testing;
+
+    // SendInput's U+1F600: one VK_PACKET keystroke per UTF-16 unit, each
+    // with its own WM_CHAR. A keystroke with no text in between (a
+    // modifier) keeps the high half waiting.
+    var carry: ?u16 = null;
+    const keystrokes = [_]struct { units: []const u16, want: []const u8, carry: ?u16 }{
+        .{ .units = &.{0xD83D}, .want = "", .carry = 0xD83D },
+        .{ .units = &.{}, .want = "", .carry = 0xD83D },
+        .{ .units = &.{0xDE00}, .want = "\u{1F600}", .carry = null },
+        // A high half that no low half follows is dropped, not the text.
+        .{ .units = &.{0xD83D}, .want = "", .carry = 0xD83D },
+        .{ .units = &.{'a'}, .want = "a", .carry = null },
+        // A pair in one keystroke after text that ended with a high half.
+        .{ .units = &.{ 'b', 0xD83D }, .want = "b", .carry = 0xD83D },
+        .{ .units = &.{ 0xD83D, 0xDE00 }, .want = "\u{1F600}", .carry = null },
+    };
+    for (keystrokes) |k| {
+        var text: Text = .{};
+        for (k.units) |u| text.add(win32.WM_CHAR, u);
+        text.finish(&carry);
+        try t.expectEqualStrings(k.want, text.utf8());
+        try t.expectEqual(k.carry, carry);
     }
 }
 
@@ -4763,8 +4831,9 @@ test "win32: key modifiers for AltGr and consumed Shift" {
     };
     for (cases) |c| {
         var text: Surface.Text = .{};
+        var carry: ?u16 = null;
         for (c.units) |u| text.add(c.msg, u);
-        text.finish();
+        text.finish(&carry);
         const got = Surface.keyMods(c.mods, &text, c.shiftless);
         try std.testing.expectEqual(c.want, got.mods);
         try std.testing.expectEqual(c.consumed, got.consumed);
