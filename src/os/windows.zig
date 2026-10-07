@@ -111,6 +111,9 @@ pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004;
 /// ends, whatever FreeLibrary calls follow.
 pub const GET_MODULE_HANDLE_EX_FLAG_PIN = 0x00000001;
 pub const HANDLE_FLAG_INHERIT = 0x00000001;
+/// LoadLibraryExW dwFlags: search only %windows%\system32 for the DLL and
+/// its dependencies, never the standard search path.
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
 pub const MEM_COMMIT = 0x1000;
 pub const MEM_RELEASE = 0x8000;
 pub const MEM_RESERVE = 0x2000;
@@ -315,6 +318,12 @@ pub const exp = struct {
             lpModuleName: ?LPCWSTR,
             phModule: *?HMODULE,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw
+        pub extern "kernel32" fn LoadLibraryExW(
+            lpLibFileName: LPCWSTR,
+            hFile: ?HANDLE,
+            dwFlags: DWORD,
+        ) callconv(.winapi) ?HMODULE;
         /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
         pub extern "kernel32" fn GetProcAddress(
             hModule: HMODULE,

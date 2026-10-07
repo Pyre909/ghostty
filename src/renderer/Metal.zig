@@ -82,6 +82,8 @@ pub fn init(
             .view = switch (opts.rt_surface.platform) {
                 .macos => |v| v.nsview,
                 .ios => |v| v.uiview,
+                // Platform.init refuses this tag on Darwin.
+                .windows => unreachable,
             },
         },
 

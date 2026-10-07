@@ -1,6 +1,5 @@
 const std = @import("std");
 const WasmTarget = @import("../os/wasm/target.zig").Target;
-const Runtime = @import("../apprt/runtime.zig").Runtime;
 
 /// Possible implementations, used for build options.
 pub const Backend = enum {
@@ -11,15 +10,13 @@ pub const Backend = enum {
     pub fn default(
         target: std.Target,
         wasm_target: WasmTarget,
-        runtime: Runtime,
     ) Backend {
         _ = wasm_target;
         if (target.os.tag.isDarwin()) return .metal;
 
-        // The Win32 runtime hands the renderer a window. The embedded
-        // runtime, which the library builds with, has none to give a
-        // swap chain, so on Windows it keeps the OpenGL backend.
-        if (runtime == .windows) return .d3d11;
+        // OpenGL on Windows would need EGL; every Windows runtime gives
+        // the renderer a window for a Direct3D 11 swap chain instead.
+        if (target.os.tag == .windows) return .d3d11;
 
         return .opengl;
     }

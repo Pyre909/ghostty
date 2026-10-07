@@ -212,12 +212,12 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         RendererBackend,
         "renderer",
         "The app runtime to use. Not all values supported on all platforms.",
-    ) orelse RendererBackend.default(target.result, wasm_target, config.app_runtime);
+    ) orelse RendererBackend.default(target.result, wasm_target);
 
-    // The Win32 runtime renders with Direct3D 11 and nothing else: it has
-    // no EGL, and no other backend takes an HWND.
-    if (config.app_runtime == .windows and config.renderer != .d3d11) {
-        std.log.err("the Win32 app runtime supports only -Drenderer=d3d11", .{});
+    // Direct3D 11 is the only renderer on Windows: there is no EGL for
+    // OpenGL, and every Windows runtime hands the renderer an HWND.
+    if (target.result.os.tag == .windows and config.renderer != .d3d11) {
+        std.log.err("Windows targets support only -Drenderer=d3d11", .{});
         return error.UnsupportedRenderer;
     }
 

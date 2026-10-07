@@ -1,13 +1,16 @@
 //! Graphics API wrapper for Direct3D 11.
 //!
-//! The Win32 runtime hosts this renderer and hands it one thing, the HWND.
+//! The Win32 runtime, or a host embedding libghostty through its Windows
+//! platform, hands this renderer one thing, the HWND.
 //! The renderer owns the device, the immediate context and a DXGI flip-model
 //! swap chain, all created in `init` on the main thread inside
 //! `CoreSurface.init`, so a GPU that cannot do this fails surface creation
 //! where the failure is visible, rather than on the render thread, where it
-//! would leave the window blank. Every later call runs on
-//! the render thread under the generic renderer's draw mutex, which is what
-//! the single-threaded immediate context requires.
+//! would leave the window blank. Every later call runs under the generic
+//! renderer's draw mutex, which is what the single-threaded immediate
+//! context requires: usually on the render thread, but a frame can also be
+//! drawn from the apprt's or host's thread through `Surface.draw`
+//! (ghostty_surface_draw), which renderers must allow.
 //!
 //! Frames render into an offscreen target texture and are copied to the
 //! back buffer and presented synchronously from `Frame.complete`, so one
@@ -31,6 +34,7 @@ const assert = @import("../quirks.zig").inlineAssert;
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
+const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(D3D11);
 const shadertoy = @import("shadertoy.zig");
@@ -66,15 +70,16 @@ const max_texture_dimension: u32 = 16384;
 /// GPU that stays gone is not asked for a device on every wakeup.
 const recovery_backoff_frames: u8 = 16;
 
+/// Stale frames dropped in a row before `present` warns that the window's
+/// size is not being reported. A drag drops a few at a time, each followed
+/// by a matching frame; this many in a row means no resize is coming.
+const stale_warn_after: u32 = 120;
+
 const log = std.log.scoped(.d3d11);
 
 const win32 = struct {
-    const RECT = extern struct {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    };
+    const RECT = internal_os.windows.RECT;
+    const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
 
     extern "d3d11" fn D3D11CreateDevice(
         adapter: ?*api.IDXGIAdapter,
@@ -88,15 +93,10 @@ const win32 = struct {
         feature_level: ?*api.D3D_FEATURE_LEVEL,
         context: ?*?*api.ID3D11DeviceContext,
     ) callconv(.winapi) api.HRESULT;
-
-    extern "user32" fn GetClientRect(hwnd: api.HWND, rect: *RECT) callconv(.winapi) api.BOOL;
-
-    extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?api.HMODULE;
-    extern "kernel32" fn GetProcAddress(module: api.HMODULE, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 };
 
-/// The window this renderer presents to. Borrowed from the apprt, which
-/// destroys it only after the renderer is gone.
+/// The window this renderer presents to. Borrowed from the apprt or the
+/// embedding host, which destroys it only after the renderer is gone.
 hwnd: api.HWND,
 
 device: *api.ID3D11Device,
@@ -152,9 +152,69 @@ blending: configpkg.Config.AlphaBlending,
 /// reports occlusion instead, and no frame is drawn while invisible.
 size: struct { width: u32 = 0, height: u32 = 0 } = .{},
 
-/// Debug-log counters. Only the render thread touches these.
+/// Frames presented, for the first-present log. Guarded by the generic
+/// renderer's draw mutex, like everything `present` touches.
 present_count: u64 = 0,
-dropped_stale_count: u64 = 0,
+
+/// Stale frames dropped in a row (see `present`). Guarded by the draw
+/// mutex.
+stale: StaleFrames = .{},
+
+/// Counts stale frames dropped in a row so that `present` can warn, once,
+/// about a window whose size is not being reported.
+const StaleFrames = struct {
+    streak: u32 = 0,
+    warned: bool = false,
+
+    /// What `present` does with a frame.
+    const Verdict = enum { present, drop, drop_warn };
+
+    /// Decide what `present` does with a frame rendered at `target_w` by
+    /// `target_h` for a client area of `client_w` by `client_h`, and count
+    /// it. The client size is clamped as `surfaceSize` clamps, so that a
+    /// client area larger than a texture can be still matches the target
+    /// drawn for it.
+    fn frame(
+        self: *StaleFrames,
+        client_w: i64,
+        client_h: i64,
+        target_w: i64,
+        target_h: i64,
+    ) Verdict {
+        const cw: i64 = @min(client_w, max_texture_dimension);
+        const ch: i64 = @min(client_h, max_texture_dimension);
+        if (cw == target_w and ch == target_h) {
+            self.presented();
+            return .present;
+        }
+        return if (self.drop(cw, ch)) .drop_warn else .drop;
+    }
+
+    /// Count a frame dropped for a client area of `width` by `height`, and
+    /// return true if this drop is the one to warn about. The host reports
+    /// only nonzero sizes (see ghostty_platform_windows_s), so a client
+    /// area collapsed to zero width or height is not a missing report: the
+    /// host owes occlusion or a refresh there instead, not a size. Like a
+    /// zero-size surface in the generic renderer's drawFrameLocked, it is
+    /// not an error, and it ends the streak.
+    fn drop(self: *StaleFrames, width: i64, height: i64) bool {
+        if (width == 0 or height == 0) {
+            self.streak = 0;
+            return false;
+        }
+
+        self.streak +|= 1;
+        if (self.streak != stale_warn_after or self.warned) return false;
+        self.warned = true;
+        return true;
+    }
+
+    /// A frame was presented, which ends the streak: a drag drops a few
+    /// frames at a time, each run followed by a matching frame.
+    fn presented(self: *StaleFrames) void {
+        self.streak = 0;
+    }
+};
 
 /// The device is the app's, which holds nothing for Direct3D 11, see
 /// `Device`: the renderer creates its own device for its window.
@@ -173,6 +233,11 @@ pub fn init(
 
     const hwnd: api.HWND = switch (apprt.runtime) {
         apprt.windows => opts.rt_surface.hwnd,
+        apprt.embedded => switch (opts.rt_surface.platform) {
+            .windows => |v| v.hwnd,
+            // Platform.init refuses these tags on Windows.
+            .macos, .ios => unreachable,
+        },
         else => @compileError("unsupported apprt for Direct3D 11"),
     };
 
@@ -386,7 +451,7 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     errdefer api.release(swap_chain);
 
     // DXGI would otherwise watch the window for Alt+Enter and window
-    // changes on the app's behalf; the apprt handles those itself.
+    // changes on the app's behalf; the apprt or the host handles those.
     hr = factory.makeWindowAssociation(
         hwnd,
         api.DXGI_MWA_NO_ALT_ENTER | api.DXGI_MWA_NO_WINDOW_CHANGES,
@@ -422,17 +487,26 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     };
 }
 
-/// d3dcompiler_47.dll ships with Windows 8.1 and later; loading it by hand
-/// rather than linking it keeps its absence an error this function can
-/// report. The module is never freed: LoadLibrary counts references, and
-/// every surface in the process shares it.
+/// d3dcompiler_47.dll is loaded by hand rather than linked so that its
+/// absence is an error this function can report. It is searched for in
+/// System32 only, with its dependencies: it is not a KnownDLL, so a bare
+/// name would search the application directory first, and in an embedding
+/// host that is the host's directory. A module of that name the process
+/// already loaded is used as it is, wherever it came from; a WinUI 3 host
+/// loads one before the first surface (see ghostty_platform_windows_s in
+/// ghostty.h). The module is never freed: LoadLibrary counts references,
+/// and every surface in the process shares it.
 fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
     const name = std.unicode.utf8ToUtf16LeStringLiteral("d3dcompiler_47.dll");
-    const module = win32.LoadLibraryW(name) orelse {
+    const module = internal_os.windows.exp.kernel32.LoadLibraryExW(
+        name,
+        null,
+        internal_os.windows.LOAD_LIBRARY_SEARCH_SYSTEM32,
+    ) orelse {
         log.err("d3dcompiler_47.dll could not be loaded err={}", .{std.os.windows.GetLastError()});
         return error.D3DCompilerMissing;
     };
-    const proc = win32.GetProcAddress(module, "D3DCompile") orelse {
+    const proc = internal_os.windows.exp.kernel32.GetProcAddress(module, "D3DCompile") orelse {
         log.err("d3dcompiler_47.dll has no D3DCompile export", .{});
         return error.D3DCompilerMissing;
     };
@@ -490,10 +564,10 @@ pub fn deviceLost(self: *const D3D11) bool {
 }
 
 /// Replace a lost device: release it with everything created on it, and
-/// create them again for the same window. Render thread, under the draw
-/// mutex, after the generic renderer released its own resources. On
-/// failure the device stays lost, the caller draws nothing, and a later
-/// frame tries again once the backoff has passed.
+/// create them again for the same window. Under the draw mutex, on the
+/// thread drawing the frame, after the generic renderer released its own
+/// resources. On failure the device stays lost, the caller draws nothing,
+/// and a later frame tries again once the backoff has passed.
 pub fn recoverDevice(self: *D3D11) !void {
     assert(self.lost);
     self.releaseGpu();
@@ -521,14 +595,27 @@ pub fn drawFrameEnd(self: *D3D11) void {
 }
 
 /// The `.resize` message is the only way the apprt's size reaches this
-/// backend, so it is cached here and answered by `surfaceSize`. Reading the
-/// client rectangle from the render thread would race the window state the
-/// main thread is changing.
+/// backend, so it is cached here and answered by `surfaceSize`. Sizing
+/// frames from the client rectangle instead would let a frame disagree with
+/// the grid the core laid out for the last `.resize`; `present` reads it only
+/// to drop frames that no longer match.
 pub fn setViewport(self: *D3D11, width: u32, height: u32) void {
     self.size = .{ .width = width, .height = height };
 }
 
+/// The cached `.resize` size, except that a client area collapsed to zero
+/// width or height answers 0x0 so the generic renderer skips the frame
+/// before any work, as Metal does by reading its layer's bounds. Zero-size
+/// reports never arrive as a `.resize` (they would reflow the grid), so the
+/// collapse is read live; like `present`, this runs under the draw mutex on
+/// whichever thread draws, and GetClientRect only reads window state.
 pub fn surfaceSize(self: *const D3D11) !struct { width: u32, height: u32 } {
+    var rc: win32.RECT = undefined;
+    if (win32.GetClientRect(self.hwnd, &rc).toBool() and
+        (rc.right <= rc.left or rc.bottom <= rc.top))
+    {
+        return .{ .width = 0, .height = 0 };
+    }
     return .{
         .width = @min(self.size.width, max_texture_dimension),
         .height = @min(self.size.height, max_texture_dimension),
@@ -575,16 +662,24 @@ pub const PresentError = error{
     PresentFailed,
 };
 
-/// Copy a finished target to the back buffer and present it. Render
-/// thread, from `Frame.complete`.
+/// Copy a finished target to the back buffer and present it, from
+/// `Frame.complete` under the draw mutex: usually on the render thread,
+/// but on the apprt's or host's thread when it draws through
+/// `Surface.draw`.
 ///
 /// Frames rendered at a size the client area no longer has are dropped, as
 /// Metal does: during a drag the client rectangle runs ahead of the
 /// renderer's `.resize` message, and stretching the old frame would show a
-/// smeared grid. The WM_SIZE that made the sizes differ already queued a
-/// `.resize` and a wakeup, so a matching frame follows. GetClientRect only
-/// reads window state, so it is safe from this thread while the main thread
-/// sits in a modal size loop.
+/// smeared grid. Under the Win32 runtime the WM_SIZE that made the sizes
+/// differ already queued a `.resize` and a wakeup, so a matching frame
+/// follows. Under the embedded runtime nothing in ghostty sees WM_SIZE: the
+/// host must report the new size with ghostty_surface_set_size, and if it
+/// never does every frame is dropped, so a long run of drops is logged once
+/// as a warning. A client area of zero width or height needs no report, so
+/// its drops do not count toward that run. `StaleFrames.frame` makes these
+/// calls. GetClientRect only reads window state, so it is safe from
+/// whichever thread draws, including while the window's thread sits in a
+/// modal size loop.
 ///
 /// The swap chain follows the target's size here rather than in
 /// `setViewport`, so every reference to a back buffer lives inside this
@@ -592,29 +687,25 @@ pub const PresentError = error{
 pub fn present(self: *D3D11, target: Target) PresentError!void {
     if (self.lost) return error.DeviceLost;
 
+    // Targets are at most max_texture_dimension on a side. A client area
+    // that cannot be read is taken to match the target.
+    const tw: i64 = @intCast(target.width);
+    const th: i64 = @intCast(target.height);
     var rc: win32.RECT = undefined;
-    if (win32.GetClientRect(self.hwnd, &rc) != 0) {
-        // Clamped as surfaceSize clamps, so that a client area larger
-        // than a texture can be still matches the target drawn for it.
-        const cw: i64 = @min(rc.right - rc.left, max_texture_dimension);
-        const ch: i64 = @min(rc.bottom - rc.top, max_texture_dimension);
-        if (cw != @as(i64, @intCast(target.width)) or
-            ch != @as(i64, @intCast(target.height)))
-        {
-            self.dropped_stale_count += 1;
-            log.debug(
-                "present hwnd={x}: dropped stale {d}x{d} frame, client is {d}x{d} (dropped={d})",
-                .{
-                    @intFromPtr(self.hwnd),
-                    target.width,
-                    target.height,
-                    cw,
-                    ch,
-                    self.dropped_stale_count,
-                },
+    const cw: i64, const ch: i64 = if (win32.GetClientRect(self.hwnd, &rc).toBool())
+        .{ rc.right - rc.left, rc.bottom - rc.top }
+    else
+        .{ tw, th };
+    switch (self.stale.frame(cw, ch, tw, th)) {
+        .present => {},
+        .drop => return,
+        .drop_warn => {
+            log.warn(
+                "present hwnd={x}: {d} frames in a row rendered at {d}x{d} for a {d}x{d} client area were dropped; an embedding host must report the client size with ghostty_surface_set_size",
+                .{ @intFromPtr(self.hwnd), stale_warn_after, target.width, target.height, cw, ch },
             );
             return;
-        }
+        },
     }
 
     const w: api.UINT = @intCast(target.width);
@@ -655,13 +746,6 @@ pub fn present(self: *D3D11, target: Target) PresentError!void {
         log.warn("Present failed hwnd={x} hr=0x{x}", .{ @intFromPtr(self.hwnd), @as(u32, @bitCast(hr)) });
         return self.presentError(hr);
     }
-    log.debug("present #{d} hwnd={x} {d}x{d} dropped_stale={d}", .{
-        self.present_count,
-        @intFromPtr(self.hwnd),
-        w,
-        h,
-        self.dropped_stale_count,
-    });
 }
 
 fn presentError(self: *D3D11, hr: api.HRESULT) PresentError {
@@ -823,4 +907,63 @@ pub fn beginFrame(
         .context = self.context,
         .default_sampler = self.default_sampler.sampler,
     }, renderer, target);
+}
+
+test "d3d11: zero-size client area does not count as stale" {
+    const testing = std.testing;
+
+    // A collapsed client area, which the host need not report, never warns.
+    var stale: StaleFrames = .{};
+    for (0..stale_warn_after * 2) |_| {
+        try testing.expectEqual(.drop, stale.frame(800, 0, 640, 480));
+        try testing.expectEqual(.drop, stale.frame(0, 600, 640, 480));
+    }
+
+    // Nor does it add to a run of real stale frames: it ends the run.
+    for (0..stale_warn_after - 1) |_| {
+        try testing.expectEqual(.drop, stale.frame(800, 600, 640, 480));
+    }
+    try testing.expectEqual(.drop, stale.frame(0, 600, 640, 480));
+    for (0..stale_warn_after - 1) |_| {
+        try testing.expectEqual(.drop, stale.frame(800, 600, 640, 480));
+    }
+
+    // A full run warns, once.
+    try testing.expectEqual(.drop_warn, stale.frame(800, 600, 640, 480));
+    for (0..stale_warn_after * 2) |_| {
+        try testing.expectEqual(.drop, stale.frame(800, 600, 640, 480));
+    }
+}
+
+test "d3d11: stale frames warn only when dropped in a row" {
+    const testing = std.testing;
+
+    // A drag drops a few frames at a time, each run ended by a frame that
+    // matches the client area, so however many it drops in all it never
+    // warns.
+    var stale: StaleFrames = .{};
+    for (0..stale_warn_after * 2) |_| {
+        for (0..stale_warn_after - 1) |_| {
+            try testing.expectEqual(.drop, stale.frame(800, 600, 640, 480));
+        }
+        try testing.expectEqual(.present, stale.frame(800, 600, 800, 600));
+    }
+
+    // One unbroken run does.
+    for (0..stale_warn_after - 1) |_| {
+        try testing.expectEqual(.drop, stale.frame(800, 600, 640, 480));
+    }
+    try testing.expectEqual(.drop_warn, stale.frame(800, 600, 640, 480));
+}
+
+test "d3d11: a client area larger than a texture matches the clamped target" {
+    const testing = std.testing;
+
+    // surfaceSize clamps the target to the largest texture, so a frame
+    // drawn at that size is current, however often it comes.
+    var stale: StaleFrames = .{};
+    for (0..stale_warn_after * 2) |_| {
+        try testing.expectEqual(.present, stale.frame(20000, 600, max_texture_dimension, 600));
+        try testing.expectEqual(.present, stale.frame(800, 20000, 800, max_texture_dimension));
+    }
 }

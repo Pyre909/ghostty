@@ -70,6 +70,7 @@ typedef enum {
   GHOSTTY_PLATFORM_INVALID,
   GHOSTTY_PLATFORM_MACOS,
   GHOSTTY_PLATFORM_IOS,
+  GHOSTTY_PLATFORM_WINDOWS,
 } ghostty_platform_e;
 
 typedef enum {
@@ -494,9 +495,86 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
+// The window (HWND) to render the surface on, dedicated to this surface:
+// its whole client area is the surface's swap chain. It may be a top-level
+// window or a child window. The host owns it and must keep it alive until
+// the surface is freed.
+//
+// Size. The host reports the window's client size in pixels with
+// ghostty_surface_set_size after creating the surface and after every
+// resize in which both width and height are nonzero. It skips a size with
+// either dimension zero, which would clamp the terminal to one row or
+// column. Frames rendered at a size other than the client area's are
+// dropped, and so are frames while the client area's width or height is
+// zero, so the host forwards WM_PAINT as ghostty_surface_refresh and
+// validates the region, as ghostty's own Win32 runtime does; otherwise
+// output that arrived while the window was collapsed may stay undrawn when
+// it returns at its old size. On a DPI change the host reports the new
+// scale with ghostty_surface_set_content_scale before the new size, as the
+// Win32 runtime does. A child window gets WM_DPICHANGED_AFTERPARENT rather
+// than WM_DPICHANGED.
+//
+// Occlusion. The host reports minimizing and restoring with
+// ghostty_surface_set_occlusion. That is what stops drawing while the
+// window is hidden (presenting to a minimized window still succeeds),
+// redraws it on restore, and sends visibility reports (DEC mode 2033). A
+// child window is not minimized itself and keeps its size, so a host whose
+// surface window is a child watches its top-level window instead (that
+// window's WM_SIZE with SIZE_MINIMIZED, or its UI framework's window
+// state).
+//
+// Keys. ghostty_input_key_s carries what ghostty's own Win32 runtime
+// derives from the key messages, and a host derives it the same way:
+// - keycode: the key's scan code, lParam bits 16-23 of the key message
+//   with 0xE0 in the high byte when bit 24 (extended key) is set, so Left
+//   Arrow is 0xE04B and Numpad 4 is 0x004B; 0 for VK_PACKET, which is
+//   injected text rather than a key.
+// - text: UTF-8 of the characters the key press produced (WM_CHAR and
+//   WM_SYSCHAR), with C0 controls and DEL removed, since ghostty derives
+//   Ctrl+letter, Enter, Tab, Backspace and Esc from the key itself; none on
+//   release.
+// - unshifted_codepoint: ToUnicodeEx with an all-zero key state, the low
+//   byte of the scan code and TOUNICODE_NO_STATE_CHANGE (so a pending dead
+//   key survives); 0 for no character. Key bindings such as the default
+//   Ctrl+Shift+C and V match through it.
+// - mods: Ctrl and Alt cleared when both are down and the press produced a
+//   WM_CHAR, which is AltGr; consumed_mods: Shift when it changed the
+//   character.
+// - composing: set for WM_DEADCHAR, with the accent shown through
+//   ghostty_surface_preedit until the next text replaces it.
+//
+// Pointer. ghostty_surface_mouse_pos takes a position from the client
+// area's top-left corner divided by the content scale (scale_factor at
+// creation, then the last ghostty_surface_set_content_scale): ghostty
+// multiplies it back, so a host that receives physical pixels divides by
+// that scale first. Without the precision flag,
+// ghostty_surface_mouse_scroll takes whole wheel notches (the WM_MOUSEWHEEL
+// delta over WHEEL_DELTA, carrying any remainder), positive y up;
+// ghostty's positive x scrolls left, so a WM_MOUSEHWHEEL delta is negated,
+// as the Win32 runtime does.
+//
+// Call libghostty, and own the surface's window, on a thread with a large
+// stack; see ghostty_init_wtf16.
+//
+// DLL search. The first surface loads d3dcompiler_47.dll by name,
+// searching only System32 for it and its dependencies, unless the process
+// has already loaded a module of that name, which ghostty then uses. A
+// WinUI 3 host loads it before the first surface, so there the host's own
+// DLL search path decides which file is used. That path, which also
+// resolves the libghostty DLL's own static imports (d3d11.dll and
+// DWrite.dll among them), searches the host's directory before System32. A
+// host that must rule out DLLs planted there can restrict it early, before
+// any UI framework loads, for example with SetDefaultDllDirectories, or by
+// loading the libghostty DLL with LoadLibraryExW and LOAD_LIBRARY_SEARCH_*
+// flags.
+typedef struct {
+  void* hwnd;
+} ghostty_platform_windows_s;
+
 typedef union {
   ghostty_platform_macos_s macos;
   ghostty_platform_ios_s ios;
+  ghostty_platform_windows_s windows;
 } ghostty_platform_u;
 
 typedef enum {

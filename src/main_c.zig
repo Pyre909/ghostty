@@ -4,8 +4,10 @@
 // support).
 //
 // This currently isn't supported as a general purpose embedding API.
-// This is currently used only to embed ghostty within a macOS app. However,
-// it could be expanded to be general purpose in the future.
+// This is currently used to embed ghostty within the macOS app and within
+// Windows hosts that give each surface a window of its own (see
+// ghostty_init_wtf16). However, it could be expanded to be general purpose
+// in the future.
 
 const std = @import("std");
 const assert = @import("quirks.zig").inlineAssert;
