@@ -298,6 +298,7 @@ const win32 = struct {
     const WAIT_TIMEOUT: DWORD = 0x00000102;
     const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
+    const SWP_NOMOVE: UINT = 0x0002;
     const SWP_NOZORDER: UINT = 0x0004;
     const SWP_NOACTIVATE: UINT = 0x0010;
 
@@ -413,6 +414,7 @@ const win32 = struct {
     extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) LONG_PTR;
     extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
     const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
+    extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
     extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
     extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
     extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
@@ -1106,6 +1108,7 @@ pub const App = struct {
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
             .open_url => self.openUrl(target, value),
+            .initial_size => initialSize(target, value),
 
             .ring_bell => ring_bell: {
                 _ = win32.MessageBeep(win32.MB_ICONASTERISK);
@@ -1113,8 +1116,8 @@ pub const App = struct {
             },
 
             // Everything else, including `.new_window` (see `run`),
-            // `.cell_size`, `.size_limit` and `.initial_size` (sent during
-            // CoreSurface.init; `false` is a valid answer to each), and
+            // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
+            // `false` is a valid answer to each), and
             // `.mouse_over_link` (a link-preview UI this runtime lacks; the
             // core tracks the link itself and ignores the result,
             // src/Surface.zig:1668, :4585).
@@ -1165,6 +1168,22 @@ pub const App = struct {
             // hard-coding true here would lie in the common case rather than
             // the rare one.
             .surface => |v| win32.SetForegroundWindow(v.rt_surface.hwnd).toBool(),
+        };
+    }
+
+    /// Records the size `window-width`/`window-height` ask for. The core
+    /// sends it from CoreSurface.init and again whenever the cell size
+    /// changes (`Surface.recomputeInitialSize`); `Surface.create` applies it
+    /// once, before the window is first shown. Later values are stored but
+    /// never resize a live window, as on GTK (`setDefaultSize` in the
+    /// window's surface init) and macOS (`initialSize` on a new window).
+    fn initialSize(target: apprt.Target, value: apprt.action.InitialSize) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| stored: {
+                v.rt_surface.initial_size = value;
+                break :stored true;
+            },
         };
     }
 
@@ -1490,6 +1509,13 @@ pub const Surface = struct {
 
     /// Tracked so `.toggle_maximize` knows which way to toggle.
     maximized: bool,
+
+    /// The client size the core asked for through `.initial_size`, or null
+    /// when `window-width`/`window-height` are unset. The core divides the
+    /// cell area by the content scale but adds the padding in device pixels
+    /// (`CoreSurface.recomputeInitialSize`), so the value is not purely in
+    /// 96-DPI units; see `applyInitialSize`.
+    initial_size: ?apprt.action.InitialSize,
 
     /// A close has been requested and WM_GHOSTTY_DESTROY posted (or its
     /// confirmation is on screen). Stops a second WM_CLOSE or close_window
@@ -1881,6 +1907,7 @@ pub const Surface = struct {
             .hwnd = undefined,
             .title = null,
             .maximized = false,
+            .initial_size = null,
             .closing = false,
             .destroy_deferred = false,
             .preedit = .none,
@@ -1933,8 +1960,13 @@ pub const Surface = struct {
         // that is a core limitation this runtime cannot repair.)
         self.core_state = .live;
 
-        // The first WM_SIZE, WM_SETFOCUS and WM_PAINT reach the core from
-        // here, now that `core_state` is `.live`.
+        // Size the still-hidden window to `window-width`/`window-height`
+        // before it is first shown, so it never appears at the default size.
+        if (self.initial_size) |size| self.applyInitialSize(size);
+
+        // The first WM_SETFOCUS and WM_PAINT (and the first WM_SIZE, unless
+        // applyInitialSize already sent one) reach the core from here, now
+        // that `core_state` is `.live`.
         _ = win32.ShowWindow(hwnd, win32.SW_SHOWNORMAL);
         _ = win32.UpdateWindow(hwnd);
 
@@ -2144,6 +2176,46 @@ pub const Surface = struct {
         }
 
         self.postDestroy();
+    }
+
+    /// Resize the window so its client area is `size` scaled to this
+    /// window's DPI. The whole value is scaled, as macOS and GTK also treat
+    /// it, so the core's device-pixel padding comes out larger by the scale
+    /// factor: the grid is never smaller than requested, at most a little
+    /// larger. The frame is measured from the window itself rather than with
+    /// AdjustWindowRectExForDpi, which does not exist before Windows 10 1607
+    /// (see the dynamic imports in App.init): the window already exists at
+    /// its final DPI, so its window rect minus its client rect is exactly the
+    /// frame. The sizes saturate, since `window-width` is only clamped from
+    /// below; Windows then clamps an oversized request to the maximum track
+    /// size as it does any other.
+    fn applyInitialSize(self: *Surface, size: apprt.action.InitialSize) void {
+        const scale: f32 = @as(f32, @floatFromInt(self.dpi())) / 96.0;
+        const client_w = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.width)) * scale));
+        const client_h = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.height)) * scale));
+        var window: win32.RECT = undefined;
+        var client: win32.RECT = undefined;
+        if (!win32.GetWindowRect(self.hwnd, &window).toBool() or
+            !win32.GetClientRect(self.hwnd, &client).toBool())
+        {
+            log.warn("unable to read the window frame, initial size not applied", .{});
+            return;
+        }
+        const frame_w = (window.right - window.left) - (client.right - client.left);
+        const frame_h = (window.bottom - window.top) - (client.bottom - client.top);
+        // SetWindowPos sends WM_SIZE synchronously; the core is live, so it
+        // sees the new size before the first paint. That WM_SIZE also reports
+        // the window visible (occlusionCallback) while it is still hidden,
+        // which is harmless only because ShowWindow follows immediately.
+        if (!win32.SetWindowPos(
+            self.hwnd,
+            null,
+            0,
+            0,
+            client_w +| frame_w,
+            client_h +| frame_h,
+            win32.SWP_NOMOVE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
+        ).toBool()) log.warn("unable to apply initial window size err={}", .{std.os.windows.GetLastError()});
     }
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
