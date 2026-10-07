@@ -21,9 +21,12 @@ pub const DWORD = windows.DWORD;
 pub const DWORD_PTR = windows.DWORD_PTR;
 pub const HANDLE = windows.HANDLE;
 pub const HINSTANCE = windows.HINSTANCE;
+pub const HMODULE = windows.HMODULE;
+pub const HWND = windows.HWND;
 pub const HPCON = windows.LPVOID;
 pub const HRESULT = c_long;
 pub const LARGE_INTEGER = windows.LARGE_INTEGER;
+pub const LONG = windows.LONG;
 pub const LPCVOID = windows.LPCVOID;
 pub const LPCWSTR = windows.LPCWSTR;
 pub const LPSTR = windows.LPSTR;
@@ -41,6 +44,14 @@ pub const LPPROC_THREAD_ATTRIBUTE_LIST = ?*anyopaque;
 pub const SECURITY_ATTRIBUTES = windows.SECURITY_ATTRIBUTES;
 pub const STARTF_USESTDHANDLES = windows.STARTF_USESTDHANDLES;
 pub const STARTUPINFOW = windows.STARTUPINFOW;
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/windef/ns-windef-rect
+pub const RECT = extern struct {
+    left: LONG,
+    top: LONG,
+    right: LONG,
+    bottom: LONG,
+};
 
 pub const OVERLAPPED = extern struct {
     Internal: ULONG_PTR,
@@ -292,6 +303,18 @@ pub const exp = struct {
             cchFilePath: DWORD,
             dwFlags: DWORD,
         ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
+        pub extern "kernel32" fn GetProcAddress(
+            hModule: HMODULE,
+            lpProcName: [*:0]const u8,
+        ) callconv(.winapi) ?*const anyopaque;
+    };
+    pub const user32 = struct {
+        /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclientrect
+        pub extern "user32" fn GetClientRect(
+            hWnd: HWND,
+            lpRect: *RECT,
+        ) callconv(.winapi) BOOL;
     };
     pub const ntdll = struct {
         pub extern "ntdll" fn NtCreateFile(

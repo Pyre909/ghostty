@@ -94,6 +94,7 @@ const win32 = struct {
     const HWND = w.HWND;
     const HDC = w.HDC;
     const HINSTANCE = w.HINSTANCE;
+    const HMODULE = w.HMODULE;
     const HICON = w.HICON;
     const HCURSOR = w.HCURSOR;
     const HBRUSH = w.HBRUSH;
@@ -128,12 +129,7 @@ const win32 = struct {
         hwndTrack: HWND,
         dwHoverTime: DWORD,
     };
-    const RECT = extern struct {
-        left: LONG,
-        top: LONG,
-        right: LONG,
-        bottom: LONG,
-    };
+    const RECT = internal_os.windows.RECT;
 
     const MSG = extern struct {
         hwnd: ?HWND,
@@ -354,11 +350,8 @@ const win32 = struct {
     const GetThreadDpiAwarenessContextFn = *const fn () callconv(.winapi) ?HANDLE;
     const AreDpiAwarenessContextsEqualFn = *const fn (a: HANDLE, b: HANDLE) callconv(.winapi) BOOL;
 
-    extern "kernel32" fn GetModuleHandleW(name: ?LPCWSTR) callconv(.winapi) ?HINSTANCE;
-    extern "kernel32" fn GetProcAddress(
-        module: HINSTANCE,
-        name: [*:0]const u8,
-    ) callconv(.winapi) ?*const anyopaque;
+    extern "kernel32" fn GetModuleHandleW(name: ?LPCWSTR) callconv(.winapi) ?HMODULE;
+    const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
     extern "kernel32" fn GlobalAlloc(flags: UINT, bytes: usize) callconv(.winapi) ?HGLOBAL;
     extern "kernel32" fn GlobalFree(mem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
     extern "kernel32" fn GlobalLock(mem: HGLOBAL) callconv(.winapi) ?*anyopaque;
@@ -419,7 +412,7 @@ const win32 = struct {
     ) callconv(.winapi) LONG_PTR;
     extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) LONG_PTR;
     extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
-    extern "user32" fn GetClientRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
+    const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
     extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
     extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
     extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
@@ -687,8 +680,11 @@ pub const App = struct {
 
         const alloc = core_app.alloc;
 
-        const hinstance = win32.GetModuleHandleW(null) orelse
-            return Error.Win32WindowCreationFailed;
+        // Win32 defines HMODULE as HINSTANCE (minwindef.h); std types them
+        // as distinct opaques, so the module handle is cast once, here,
+        // where it becomes the window classes' instance.
+        const hinstance: win32.HINSTANCE = @ptrCast(win32.GetModuleHandleW(null) orelse
+            return Error.Win32WindowCreationFailed);
 
         // Per-monitor DPI v2, so the DPI query reports the real value and
         // WM_DPICHANGED arrives with a usable suggested rect.
@@ -1448,7 +1444,7 @@ pub const App = struct {
 /// context is queried instead of inferred. Both functions exist only from
 /// Windows 10 1607 and are resolved by name for the same reason as the other
 /// DPI entry points; see win32.SetProcessDpiAwarenessContextFn.
-fn logEffectiveDpiAwareness(user32: win32.HINSTANCE) void {
+fn logEffectiveDpiAwareness(user32: win32.HMODULE) void {
     const get_p = win32.GetProcAddress(user32, "GetThreadDpiAwarenessContext") orelse return;
     const eq_p = win32.GetProcAddress(user32, "AreDpiAwarenessContextsEqual") orelse return;
     const get_ctx: win32.GetThreadDpiAwarenessContextFn = @ptrCast(@alignCast(get_p));
