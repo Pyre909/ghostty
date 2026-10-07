@@ -18,7 +18,8 @@
 //! ## Invariants this file depends on
 //!
 //!   * **No window is destroyed from inside a core frame.** The core calls
-//!     `Surface.close` from its own stack (src/Surface.zig:1316, :2848), and
+//!     `CoreSurface.close` from its own stack (`Surface.childExited`,
+//!     `Surface.keyCallback`), and
 //!     `CoreSurface.deinit` would free memory those frames still use. Every
 //!     close therefore posts `WM_GHOSTTY_DESTROY` and the teardown runs later,
 //!     from a message loop (`Surface.destroyPosted`).
@@ -588,7 +589,7 @@ pub const App = struct {
     ///
     /// Every surface's config is derived from this one
     /// (`apprt.surface.newConfig` in `Surface.create`), and the app-scoped key
-    /// path (`CoreApp.keyEvent`, src/App.zig:359) reads
+    /// path (`CoreApp.keyEvent`) reads
     /// `rt_app.config.keybind`.
     config: Config,
 
@@ -620,14 +621,14 @@ pub const App = struct {
 
     /// A zero-delay quit request that has been recorded but not acted on.
     ///
-    /// `main_ghostty.zig:111` calls `startQuitTimer` *before*
-    /// `main_ghostty.zig:114` calls `run`, and
-    /// `quit-after-last-window-closed-delay` is unset by default
-    /// (src/config/Config.zig:2680), i.e. zero delay. Quitting synchronously
-    /// at that point would set `quit` before the loop ever began and the
-    /// process would exit with its window still on screen. GTK has the same
-    /// ordering and resolves it the same way, by recording the expiry and
-    /// evaluating it later (apprt/gtk/class/application.zig:864).
+    /// `main` in main_ghostty.zig calls `startQuitTimer` *before* it calls
+    /// `run`, and `quit-after-last-window-closed-delay` is unset by default
+    /// (`Config.@"quit-after-last-window-closed-delay"`), i.e. zero delay.
+    /// Quitting synchronously at that point would set `quit` before the loop
+    /// ever began and the process would exit with its window still on screen.
+    /// GTK has the same ordering and resolves it the same way, by recording the
+    /// expiry and evaluating it later (the GTK `Application`'s quit-timer
+    /// handling).
     ///
     /// `run` acts on this only when there are genuinely no surfaces left.
     quit_pending: bool,
@@ -638,9 +639,9 @@ pub const App = struct {
     /// Number of modal confirmation prompts (`confirm`) currently open.
     ///
     /// A prompt runs a nested message loop, often with a core frame beneath
-    /// it (`Surface.close` from `keyCallback`, a clipboard confirmation from
-    /// `tick`). Neither ticking nor surface teardown may run inside that loop;
-    /// see `canReenterCore`.
+    /// it (`CoreSurface.close` from `keyCallback`, a clipboard confirmation
+    /// from `tick`). Neither ticking nor surface teardown may run inside that
+    /// loop; see `canReenterCore`.
     prompt_depth: u32,
 
     /// Number of system modal loops (window size/move, window menu) the main
@@ -673,10 +674,11 @@ pub const App = struct {
         return false;
     }
 
-    /// `main_ghostty.zig:104` declares `var app_runtime: apprt.App = undefined`
-    /// on its stack, so this initializes in place and never returns a value.
-    /// The App therefore has a stable address for the process lifetime, which
-    /// is what lets `Surface.rtApp` hand out a pointer derived from it.
+    /// `main` in main_ghostty.zig declares `var app_runtime: apprt.App =
+    /// undefined` on its stack, so this initializes in place and never returns
+    /// a value. The App therefore has a stable address for the process
+    /// lifetime, which is what lets `Surface.rtApp` hand out a pointer derived
+    /// from it.
     pub fn init(self: *App, core_app: *CoreApp, opts: struct {}) !void {
         _ = opts;
 
@@ -787,8 +789,8 @@ pub const App = struct {
         // Surface.destroyPosted (stop and wait for the core's threads, deinit
         // the core surface, destroy the window), so
         // that CoreApp.deinit -- which runs after this
-        // (main_ghostty.zig:104-105) -- finds an empty surface list and its
-        // `font_grid_set.count() == 0` assert holds (src/App.zig:141).
+        // (in `main`) -- finds an empty surface list and its
+        // `font_grid_set.count() == 0` assert holds (`CoreApp.deinit`).
         //
         // `terminating` makes destroyPosted and close ignore anything still
         // queued: stopCore pumps messages, and a WM_GHOSTTY_DESTROY or
@@ -981,7 +983,7 @@ pub const App = struct {
     /// between wakeups.
     ///
     /// Pumping is required, not cosmetic. The render and IO threads push into
-    /// the app mailbox with `.forever` (e.g. src/renderer/generic.zig:1996),
+    /// the app mailbox with `.forever` (e.g. the renderer's `frameCompleted`),
     /// and only a tick on this thread drains it; a plain WaitForSingleObject
     /// here could wait on a thread that is waiting on us.
     ///
@@ -1055,24 +1057,25 @@ pub const App = struct {
     }
 
     /// Called from the renderer and IO threads via `App.Mailbox.push`
-    /// (src/App.zig:591), so this must be thread-safe and must not block.
+    /// (`CoreApp.Mailbox.push`), so this must be thread-safe and must not
+    /// block.
     /// PostMessageW is both.
     pub fn wakeup(self: *App) void {
         _ = win32.PostMessageW(self.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
     }
 
-    /// `main_ghostty.zig:111` calls this before `run` because a freshly
+    /// `main` in main_ghostty.zig calls this before `run` because a freshly
     /// started app has no surfaces yet.
     pub fn startQuitTimer(self: *App) void {
-        // The result is dropped because main_ghostty.zig:111 has nothing to do
+        // The result is dropped because `main` has nothing to do
         // with it; a failure to arm is already logged by setQuitTimer.
         _ = self.setQuitTimer(.start);
     }
 
     /// Keyboard layout detection exists only on macOS: `input.Keymap` is
-    /// `KeymapNoop` everywhere else (src/input.zig:41-46). `.unknown` is the
+    /// `KeymapNoop` everywhere else (`input.Keymap`). `.unknown` is the
     /// honest answer, and it maps to option-as-alt `.false` at the one call
-    /// site (src/Surface.zig:3317).
+    /// site (`Surface.encodeKeyOpts`).
     pub fn keyboardLayout(self: *App) input.KeyboardLayout {
         _ = self;
         return .unknown;
@@ -1080,7 +1083,8 @@ pub const App = struct {
 
     /// Actions this runtime actually performs. Anything not named here
     /// returns `false`, which is the contract's word for "unsupported" -- see
-    /// src/apprt/action.zig:75-77. Returning `true` for an action that did not
+    /// the `apprt.Action` docs (actions are OPTIONAL). Returning `true` for an
+    /// action that did not
     /// happen would be a lie the core cannot detect.
     pub fn performAction(
         self: *App,
@@ -1120,7 +1124,7 @@ pub const App = struct {
             // `false` is a valid answer to each), and
             // `.mouse_over_link` (a link-preview UI this runtime lacks; the
             // core tracks the link itself and ignores the result,
-            // src/Surface.zig:1668, :4585).
+            // `Surface.mouseRefreshLinks`, `Surface.cursorPosCallback`).
             else => false,
         };
     }
@@ -1146,7 +1150,7 @@ pub const App = struct {
             // and destroying synchronously would free the CoreSurface under
             // it. Surface.close confirms if needed and posts the teardown, so
             // every close path -- the title bar button, Alt+F4 (a default
-            // binding to this action, src/config/Config.zig:6775-6777) and a
+            // binding to this action, `Config.Keybinds.init`) and a
             // child exit -- converges on Surface.destroyPosted.
             //
             // `true` means the request was handled. The user may still decline
@@ -1218,7 +1222,7 @@ pub const App = struct {
     }
 
     /// `.mouse_visibility`, per window: the core hides the pointer while
-    /// typing and shows it on the next mouse event (src/Surface.zig:4791).
+    /// typing and shows it on the next mouse event (`Surface.hideMouse`).
     /// Applied in the window's WM_SETCURSOR rather than with ShowCursor,
     /// whose counter covers the whole thread: it would also hide the pointer
     /// over the title bar and borders, where the core never sees a move that
@@ -1245,12 +1249,12 @@ pub const App = struct {
     /// whatever registered it. Only a well-formed http, https or mailto
     /// link is opened from one (`osc8Allowed`); anything else is refused
     /// with a notice. The refusal reports `true`: `false` would send the
-    /// same link to the core's generic opener (src/Surface.zig:4471-4483)
+    /// same link to the core's generic opener (`Surface.openUrl`)
     /// and bypass the policy. The other kinds are link text the user can
     /// see, or paths the core resolved from it, and open unchanged.
     ///
     /// Nothing here may dispatch messages: the core calls this while
-    /// holding its renderer lock (src/Surface.zig:3939-3941), and the next
+    /// holding its renderer lock (`Surface.mouseButtonCallback`), and the next
     /// mouse move dispatched on this thread would take that lock again in
     /// cursorPosCallback. The notice is therefore posted and shown once
     /// this frame has returned, and ShellExecuteW, which blocks until the
@@ -1304,13 +1308,13 @@ pub const App = struct {
                 // foundation deliberately overrides the configuration.
                 //
                 // `quit-after-last-window-closed` is `builtin.os.tag == .linux`
-                // (src/config/Config.zig:2639), i.e. false on Windows. But
-                // `.new_window` is refused by this runtime (see `run`), so a
-                // process that reaches zero windows
-                // has no UI left and no way to get one back. Honoring `false`
-                // would leave an invisible process with a message-only window
-                // that receives nothing and a GetMessageW that blocks forever,
-                // endable only from Task Manager.
+                // (`Config.@"quit-after-last-window-closed"`), i.e. false on
+                // Windows. But `.new_window` is refused by this runtime (see
+                // `run`), so a process that reaches zero windows has no UI left
+                // and no way to get one back. Honoring `false` would leave an
+                // invisible process with a message-only window that receives
+                // nothing and a GetMessageW that blocks forever, endable only
+                // from Task Manager.
                 //
                 // Delete this override -- not the config read -- as soon as
                 // `.new_window` can actually create a window.
@@ -1370,7 +1374,7 @@ pub const App = struct {
 
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
-        // (src/App.zig:203), so there is no quit-timer handling here.
+        // itself, so there is no quit-timer handling here.
         const surface = try Surface.create(self);
 
         // No errdefer after this point: appendAssumeCapacity cannot fail (the
@@ -1407,7 +1411,7 @@ pub const App = struct {
 
         // The quit timer is not handled here: CoreApp.deleteSurface, which
         // Surface.stopCore calls before the window is destroyed, starts it
-        // when the core's last surface goes (src/App.zig:237).
+        // when the core's last surface goes (`CoreApp.deleteSurface`).
     }
 
     /// The message-only window's procedure.
@@ -1529,7 +1533,7 @@ pub const Surface = struct {
 
     /// Who put the text that is in the core's preedit slot: a dead key
     /// (`keyEvent`) or an IME composition. The core has one slot, keeps no
-    /// owner and never clears it itself (src/Surface.zig:2562-2570), so each
+    /// owner and never clears it itself (`Surface.preeditCallback`), so each
     /// source must only clear what it set. Written by `setPreedit` alone.
     preedit: Ime.Preedit,
 
@@ -1680,7 +1684,7 @@ pub const Surface = struct {
 
         /// The forms for the core's IME position. `pos` is in 96-DPI
         /// pixels except for its width, which the core leaves in physical
-        /// pixels (src/Surface.zig:2168-2183); `scale` is DPI / 96 and
+        /// pixels (`Surface.imePoint`); `scale` is DPI / 96 and
         /// `client` the client rectangle, in physical pixels like the
         /// result. Clamping guards against rounding and against a client
         /// size the core has not caught up with yet.
@@ -1784,9 +1788,10 @@ pub const Surface = struct {
         hidden: bool,
 
         /// "Not over the surface" to cursorPosCallback and link hover, which
-        /// treat any negative coordinate that way (src/Surface.zig:4573-4575,
-        /// :1592). Paths that map a position to a cell clamp it to the
-        /// nearest cell instead (src/renderer/size.zig:142-147).
+        /// treat any negative coordinate that way
+        /// (`Surface.cursorPosCallback`, `Surface.mouseRefreshLinks`). Paths
+        /// that map a position to a cell clamp it to the nearest cell
+        /// instead (the `.grid` arm of `renderer.size.Coordinate.convert`).
         const outside: apprt.CursorPos = .{ .x = -1, .y = -1 };
 
         fn init() Mouse {
@@ -1800,7 +1805,7 @@ pub const Surface = struct {
                 .wheel_x = .{},
                 .wheel_y = .{},
                 // The core starts at `.text` and never sends that first
-                // shape (src/terminal/Terminal.zig:89); the GTK runtime
+                // shape (`Terminal.mouse_shape`); the GTK runtime
                 // starts there too.
                 .shape = .text,
                 .cursor = win32.LoadCursorW(null, cursorId(.text)),
@@ -1813,7 +1818,8 @@ pub const Surface = struct {
         ///   * `.unknown` would mask motion reports;
         ///   * `.four`-`.seven` are the wheel, which scrollCallback reports;
         ///   * `.eleven` indexes past the end of the core's click_state
-        ///     (src/Surface.zig:226, :3838).
+        ///     (`CoreSurface.Mouse.click_state`, indexed in
+        ///     `Surface.mouseButtonCallback`).
         /// The last point is checked at comptime at the end of the file.
         const Button = enum {
             left,
@@ -1866,11 +1872,11 @@ pub const Surface = struct {
 
         /// Whole notches out of wheel deltas.
         ///
-        /// The core cannot take fractions of a notch: for x it rounds each
-        /// event and keeps no remainder (src/Surface.zig:3561), and for y it
-        /// drops the remainder whenever an event crosses a row
-        /// (src/Surface.zig:3549 stores `poff - amount * cell_size` with
-        /// the untruncated `amount`). A high-resolution wheel's small deltas
+        /// The core cannot take fractions of a notch
+        /// (`Surface.scrollCallback`): for x it rounds each event and keeps
+        /// no remainder, and for y it drops the remainder whenever an event
+        /// crosses a row (it stores `poff - amount * cell_size` with the
+        /// untruncated `amount`). A high-resolution wheel's small deltas
         /// would lose rows either way, so only whole notches are passed on.
         /// A change of direction drops the remainder, so a reversal counts
         /// from its own first delta.
@@ -1891,7 +1897,7 @@ pub const Surface = struct {
 
     /// Heap-allocate and initialize, including the core surface. The address
     /// must be stable: the core stores raw `*apprt.Surface` pointers
-    /// (src/Surface.zig:465-466), and the wndproc recovers this pointer from
+    /// (see `CoreSurface.init`), and the wndproc recovers this pointer from
     /// GWLP_USERDATA.
     fn create(app: *App) !*Surface {
         const alloc = app.core_app.alloc;
@@ -1941,7 +1947,7 @@ pub const Surface = struct {
         errdefer _ = win32.DestroyWindow(hwnd);
 
         // Registration comes before init: every surface message the core
-        // routes is checked with hasSurface (src/App.zig:514-529), so a
+        // routes is checked with `CoreApp.hasSurface`, so a
         // message queued before registration would be dropped. addSurface
         // also cancels the startup quit timer.
         try app.core_app.addSurface(self);
@@ -1949,7 +1955,7 @@ pub const Surface = struct {
 
         // Preconditions CoreSurface.init relies on, both true here: the HWND
         // exists at CW_USEDEFAULT size so getSize is non-zero
-        // (src/Surface.zig:529), and getContentScale works on it (:501).
+        // (`CoreSurface.init` reads it), and getContentScale works on it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
         defer config.deinit();
         try self.core_surface.init(alloc, &config, app.core_app, app, self);
@@ -1976,7 +1982,7 @@ pub const Surface = struct {
     /// Release everything except the allocation itself.
     ///
     /// Public because `CoreApp.deinit` calls it on every surface the core
-    /// still tracks (src/App.zig:134) -- an apprt contract method the
+    /// still tracks -- an apprt contract method the
     /// rt_surface list does not name. In this runtime the core's list is
     /// empty by then (`App.terminate` runs `stopCore` on every surface first).
     pub fn deinit(self: *Surface) void {
@@ -2006,25 +2012,24 @@ pub const Surface = struct {
     ///
     ///   1. `deleteSurface` first, so the ticks in steps 3-4 drop any message
     ///      still addressed to this surface instead of calling into it
-    ///      (src/App.zig:514-529). It also starts the quit timer when this was
+    ///      (`CoreApp.hasSurface`). It also starts the quit timer when this was
     ///      the last surface.
     ///   2. Stop the search thread, if any, while the render thread is still
     ///      draining its mailbox. `CoreSurface.deinit` would do this first
-    ///      too (src/Surface.zig:794), but with an unpumped join, and by then
+    ///      too, but with an unpumped join, and by then
     ///      the render thread is gone: a search thread blocked on a
     ///      `.forever` push into the full renderer mailbox
-    ///      (src/renderer/Thread.zig:27) would never return and the main
+    ///      (`renderer.Thread.Mailbox`) would never return and the main
     ///      thread would hang. Clearing `search` makes deinit skip it.
     ///   3. Stop the IO thread and wait for it (`App.waitForThreads`, which
     ///      pumps messages and ticks), still before the renderer. Its reader
     ///      can also block on a `.forever` renderer mailbox push
-    ///      (src/termio/stream_handler.zig:177), and `Exec.threadExit`
+    ///      (`StreamHandler.rendererMessageWriter`), and `Exec.threadExit`
     ///      cannot cancel a thread that is not in I/O. Upstream
-    ///      `CoreSurface.deinit` stops the renderer first
-    ///      (src/Surface.zig:797-807); this order is deliberately the
-    ///      reverse. Nothing the render thread does waits on the IO thread
-    ///      (it only pushes to the app mailbox, which the ticks drain), and
-    ///      the terminal state both share is freed only in step 5.
+    ///      `CoreSurface.deinit` stops the renderer first; this order is
+    ///      deliberately the reverse. Nothing the render thread does waits on
+    ///      the IO thread (it only pushes to the app mailbox, which the ticks
+    ///      drain), and the terminal state both share is freed only in step 5.
     ///   4. Stop the render thread and wait for it the same way. Its exit
     ///      marks the display unrealized and releases the shaders and the
     ///      swap chain (`threadExit` in src/renderer/generic.zig), so no
@@ -2148,13 +2153,13 @@ pub const Surface = struct {
     /// The core asks the runtime to close this surface. `process_alive` means
     /// a child process is still running and the user should be asked.
     ///
-    /// This is called from inside core frames (src/Surface.zig:1316 from
-    /// `childExited`, :2848 from `keyCallback`) and so must never destroy
+    /// This is called from inside core frames (`Surface.childExited`,
+    /// `Surface.keyCallback`) and so must never destroy
     /// anything itself: it posts WM_GHOSTTY_DESTROY and returns. That is also
     /// why a `.closed` InputEffect leaves `self` valid in `keyEvent`.
     ///
     /// `*Surface` rather than `*const`: the core calls this through a mutable
-    /// `rt_surface` (src/Surface.zig:841-843).
+    /// `rt_surface` (`CoreSurface.close`).
     pub fn close(self: *Surface, process_alive: bool) void {
         if (self.app.terminating) return;
 
@@ -2265,15 +2270,14 @@ pub const Surface = struct {
     /// The pointer position of the mouse event being delivered, in client
     /// device pixels: the last position given to cursorPosCallback, or
     /// `Mouse.outside`. Negative values mean "outside the viewport" to
-    /// cursorPosCallback (src/Surface.zig:4573-4575) and are passed through
-    /// unclamped.
+    /// `Surface.cursorPosCallback` and are passed through unclamped.
     ///
     /// Cached rather than read live, because the core reads a button or
-    /// wheel event's position back through here (e.g. src/Surface.zig:3634,
-    /// :3892) after the live pointer may have moved on. After a leave, a
-    /// live read would also give a point beyond the window, which the core
-    /// clamps to an edge cell instead of treating as outside. The embedded
-    /// runtime caches it the same way.
+    /// wheel event's position back through here (`Surface.scrollCallback`,
+    /// `Surface.mouseButtonCallback`) after the live pointer may have moved
+    /// on. After a leave, a live read would also give a point beyond the
+    /// window, which the core clamps to an edge cell instead of treating as
+    /// outside. The embedded runtime caches it the same way.
     pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
         return self.mouse.pos;
     }
@@ -2301,21 +2305,23 @@ pub const Surface = struct {
         state: apprt.ClipboardRequest,
     ) !apprt.ClipboardReadResult {
         // The Kitty protocol requests own an arena that holds the request
-        // struct itself (src/apprt/structs.zig:161, :207) -- but the apprt does
+        // struct itself (`KittyRead.destroy`, `KittyWrite.destroy` in
+        // apprt/structs.zig) -- but the apprt does
         // NOT own that arena here, and destroying it would be a double free.
         //
         // The core destroys the request itself for every answer other than
-        // `.started`: src/Surface.zig:6365 for reads and :6405 for writes are
-        // both `defer req.destroy()`. Worse, the ENOSYS reply it builds reads
-        // `req.id` and `req.terminator`, which live *in* that arena, after we
-        // return. Ownership only transfers on `.started`, and then only to
-        // completeClipboardRequest (Surface.zig:5946) or denyClipboardRequest
-        // (:6068), which destroy it themselves.
+        // `.started`: `Surface.kittyClipboardRead` and
+        // `Surface.kittyClipboardWrite` both `defer req.destroy()`. Worse,
+        // the ENOSYS reply it builds reads `req.id` and `req.terminator`,
+        // which live *in* that arena, after we return. Ownership only
+        // transfers on `.started`, and then only to
+        // `Surface.completeClipboardRequest` or
+        // `Surface.denyClipboardRequest`, which destroy it themselves.
         switch (state) {
             .kitty_read, .kitty_write => return .unsupported,
 
             // The core routes OSC 52 writes straight to setClipboard; they
-            // never reach this function (src/Surface.zig:6144-6146).
+            // never reach this function (`Surface.startClipboardRequest`).
             .osc_52_write => return .unsupported,
 
             .paste, .osc_52_read, .list => {},
@@ -2421,8 +2427,10 @@ pub const Surface = struct {
         // failures below all happen *after* EmptyClipboard has already wiped
         // the user's clipboard -- reporting success would mean the core
         // believes a copy landed while the clipboard is empty. Every call site
-        // either catches or already returns an error union (Surface.zig:2218,
-        // 2335, 5103, 5839, 5933, 6010), so this costs nothing.
+        // either catches or already returns an error union (in `Surface`:
+        // clipboardWrite, copySelectionToClipboards, performBindingAction,
+        // writeScreenFile and completeClipboardRequest), so this costs
+        // nothing.
         if (!win32.OpenClipboard(self.hwnd).toBool()) {
             log.warn("failed to open the clipboard for writing", .{});
             return App.Error.Win32CallFailed;
@@ -2469,7 +2477,7 @@ pub const Surface = struct {
     }
 
     /// The environment the child process starts from. The caller takes
-    /// ownership and then mutates it (src/Surface.zig:638-643).
+    /// ownership and then mutates it (`CoreSurface.init`).
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
         _ = self;
         return try global.environMap();
@@ -2525,10 +2533,10 @@ pub const Surface = struct {
         _ = win32.ValidateRect(self.hwnd, null);
 
         // Every paint is logged at debug level, which is compiled out of
-        // release builds (main_ghostty.zig:208). Without it a stale frame on
-        // screen cannot be told apart from a repaint that never ran. The
-        // present side (count, dropped stale frames) is logged by
-        // src/renderer/D3D11.zig.
+        // release builds (`std_options.log_level` in main_ghostty.zig). Without
+        // it a stale frame on screen cannot be told apart from a repaint that
+        // never ran. The present side (count, dropped stale frames) is logged
+        // by src/renderer/D3D11.zig.
         self.paint_count += 1;
         const n = self.paint_count;
         const id = @intFromPtr(self.hwnd);
@@ -2540,9 +2548,11 @@ pub const Surface = struct {
             return;
         };
 
-        // refreshCallback, never CoreSurface.draw: draw renders synchronously
-        // on the calling thread (src/Surface.zig:883), and this thread must
-        // not make GL calls. refreshCallback only wakes the render thread.
+        // refreshCallback, not CoreSurface.draw: WM_PAINT only needs the
+        // render thread woken, as embedded's `ghostty_surface_refresh` does.
+        // A synchronous draw from this thread is still allowed, since every
+        // renderer must permit `CoreSurface.draw` from the apprt's thread,
+        // and is what a live-resize path would use.
         core_surface.refreshCallback() catch |err| {
             log.warn("paint #{d} hwnd={x}: refresh failed err={}", .{ n, id, err });
             return;
@@ -2627,7 +2637,7 @@ pub const Surface = struct {
 
                 // Minimized: report occluded and do NOT resize. A minimized
                 // window reports a 0x0 client area, and the grid is clamped
-                // to at least 1x1 (src/renderer/size.zig:260-261), so passing
+                // to at least 1x1 (`renderer.size.GridSize.update`), so passing
                 // it on would reflow every line to one column and back on
                 // restore.
                 if (wparam == win32.SIZE_MINIMIZED) {
@@ -2637,7 +2647,7 @@ pub const Surface = struct {
                 }
 
                 // Every other WM_SIZE means visible. Sent unconditionally;
-                // the core ignores repeats (src/Surface.zig:3344-3345).
+                // the core ignores repeats (`Surface.occlusionCallback`).
                 core_surface.occlusionCallback(true) catch |err|
                     log.warn("occlusion callback failed err={}", .{err});
 
@@ -2949,7 +2959,7 @@ pub const Surface = struct {
                 const delta: i32 = win32.wheelDelta(wparam);
                 if (msg == win32.WM_MOUSEWHEEL) {
                     // Positive is away from the user: the core's "up"
-                    // (src/Surface.zig:3481).
+                    // (`Surface.scrollCallback`'s doc comment).
                     if (self.mouse.wheel_y.add(delta)) |notches| {
                         core_surface.scrollCallback(0, @floatFromInt(notches), .{}) catch |err|
                             log.warn("scroll callback failed err={}", .{err});
@@ -2957,7 +2967,7 @@ pub const Surface = struct {
                 } else if (self.mouse.wheel_x.add(delta)) |notches| {
                     // Positive is to the right here. The core's positive x
                     // is reported as button 6, X11's scroll-left
-                    // (src/Surface.zig:3641-3645), and GTK negates its
+                    // (`Surface.scrollCallback`), and GTK negates its
                     // rightward delta to match; so does this.
                     core_surface.scrollCallback(@floatFromInt(-notches), 0, .{}) catch |err|
                         log.warn("scroll callback failed err={}", .{err});
@@ -3053,14 +3063,14 @@ pub const Surface = struct {
         // can dispatch the queued WM_CHAR out of turn.
         if (self.app.canReenterCore()) self.flushIme(core_surface);
 
-        // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord
-        // that produces a character is AltGr by definition on Windows (it is
-        // the documented substitute on keyboards without the key). Left in
-        // place, the encoder would treat the character as a Ctrl sequence
-        // (src/input/key_encode.zig:332, :450) and German AltGr+Q ('@') would
-        // be sent as NUL (:814). Only characters that came through WM_CHAR
-        // count: Alt without Ctrl produces WM_SYSCHAR, and Alt+letter must
-        // keep its Alt so the encoder prefixes ESC.
+        // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord that
+        // produces a character is AltGr by definition on Windows (it is the
+        // documented substitute on keyboards without the key). Left in place,
+        // the encoder would treat the character as a Ctrl sequence (`legacy`
+        // and `ctrlSeq` in input/key_encode.zig) and German AltGr+Q ('@') would
+        // be sent as NUL (`ctrlSeq` maps '@' to 0). Only characters that came
+        // through WM_CHAR count: Alt without Ctrl produces WM_SYSCHAR, and
+        // Alt+letter must keep its Alt so the encoder prefixes ESC.
         if (text.from_char and mods.ctrl and mods.alt and text.utf8().len > 0) {
             mods.ctrl = false;
             mods.alt = false;
@@ -3082,7 +3092,7 @@ pub const Surface = struct {
 
         // A dead key shows its accent as preedit until the next committed
         // text replaces it. The core does not track this itself
-        // (src/Surface.zig:2565-2568).
+        // (`Surface.preeditCallback`).
         if (text.composing) {
             try self.setPreedit(core_surface, text.utf8(), .dead_key);
         } else if (self.preedit == .dead_key and text.len > 0) {
@@ -3110,7 +3120,7 @@ pub const Surface = struct {
         std.debug.assert((text == null) == (owner == .none));
 
         // The core drops the old preedit before anything in it can fail
-        // (src/Surface.zig:2593-2596), so a failure leaves none.
+        // (`Surface.preeditCallback`), so a failure leaves none.
         self.preedit = .none;
         try core_surface.preeditCallback(text);
         self.preedit = owner;
@@ -3444,7 +3454,8 @@ pub const Surface = struct {
 
             // The mods the core already has, so the release is judged like
             // the events before it: a Shift drag in a program with mouse
-            // reporting stays a Ghostty selection (src/Surface.zig:3966).
+            // reporting stays a Ghostty selection
+            // (`Surface.mouseButtonCallback`).
             const mods = core_surface.mouse.mods;
             const owed = m.owed;
             m.owed = .empty;
@@ -3493,7 +3504,7 @@ pub const Surface = struct {
     /// Repeats are dropped, as GTK drops sub-pixel moves: Win32 sends
     /// WM_MOUSEMOVE without movement when windows appear, disappear or move,
     /// and every cursorPosCallback shows a mouse hidden while typing
-    /// (src/Surface.zig:4605).
+    /// (`Surface.cursorPosCallback`).
     fn movePointer(
         self: *Surface,
         core_surface: *CoreSurface,
@@ -3540,7 +3551,7 @@ pub const Surface = struct {
                 // by WM_MOUSEACTIVATE, a press dropped above, one from before
                 // the core existed, or one whose release syncMouse already
                 // sent. A lone release is not harmless: a left one can open
-                // a link (src/Surface.zig:3938).
+                // a link (`Surface.mouseButtonCallback`).
                 if (!m.held.contains(button)) return;
                 m.held.remove(button);
                 if (m.held.count() == 0) _ = win32.ReleaseCapture();
@@ -3560,7 +3571,7 @@ pub const Surface = struct {
         // The result (false = "show your context menu" for a right press)
         // has no consumer: there is no menu. With the default
         // right-click-action, a right click therefore only selects the word
-        // or link under the pointer (src/Surface.zig:4124-4148).
+        // or link under the pointer (`Surface.mouseButtonCallback`).
         _ = core_surface.mouseButtonCallback(state, button.core(), mods) catch |err|
             log.warn("mouse button callback failed err={}", .{err});
 
@@ -3602,13 +3613,13 @@ pub const Surface = struct {
     }
 
     /// `.mouse_shape`. Called while the core may hold the renderer mutex
-    /// (src/Surface.zig:1661, from mouseRefreshLinks), so this must not call
+    /// (from `Surface.mouseRefreshLinks`), so this must not call
     /// back into the core or run a message loop, and must not fail: an error
     /// would abort cursorPosCallback. It does neither.
     fn setMouseShape(self: *Surface, shape: terminal.MouseShape) bool {
         const m = &self.mouse;
         // Modifier keys resend the current shape on every key event
-        // (src/Surface.zig:2804-2815).
+        // (`Surface.keyCallback`).
         if (shape == m.shape and m.cursor != null) return true;
         const cursor = win32.LoadCursorW(null, cursorId(shape)) orelse {
             log.warn("LoadCursorW failed shape={}", .{shape});
@@ -3663,7 +3674,7 @@ pub const Surface = struct {
     /// so they are left out then.
     ///
     /// binding() because the core compares its stored mods with each event's
-    /// (src/Surface.zig:1554): lock and side bits would make every mouse
+    /// (`Surface.modsChanged`): lock and side bits would make every mouse
     /// event a mods change, which redraws every row.
     fn mouseMods(self: *const Surface, wparam: win32.WPARAM) input.Mods {
         var mods: input.Mods = if (self.focused) currentMods().binding() else .{};
@@ -3727,7 +3738,7 @@ pub const Surface = struct {
         }
 
         /// Decode the units, dropping C0 controls and DEL as GTK does
-        /// (src/apprt/gtk/class/surface.zig:1428-1436): the encoder derives
+        /// (the GTK `Surface.keyEvent` IM filter): the encoder derives
         /// Ctrl+letter, Enter, Tab, Backspace and Esc from the physical key
         /// and the unshifted codepoint, and would double them otherwise.
         /// Unpaired surrogates are dropped rather than failing the keystroke.
@@ -3788,7 +3799,7 @@ pub const Surface = struct {
 
 /// A point beyond the client area, past the corner farthest from `press`
 /// on each axis. The core clamps it to that corner's cell
-/// (src/renderer/size.zig:142-147).
+/// (the `.grid` arm of `renderer.size.Coordinate.convert`).
 fn releasePoint(core_surface: *const CoreSurface, press: apprt.CursorPos) apprt.CursorPos {
     const screen = core_surface.size.screen;
     const w: f32 = @floatFromInt(screen.width);
@@ -3859,7 +3870,7 @@ fn currentMods() input.Mods {
     const rwin = down(win32.VK_RWIN);
 
     // `sides` only means something for a modifier that is down
-    // (src/input/key_mods.zig:55-59). With both keys of a pair down, left is
+    // (`input.Mods.sides`). With both keys of a pair down, left is
     // reported.
     return .{
         .shift = lshift or rshift,
@@ -4190,7 +4201,8 @@ comptime {
         _ = &Surface.defaultTermioEnv;
 
         // Every button this runtime reports must index the core's
-        // click_state (src/Surface.zig:226, :3838); input.MouseButton.eleven
+        // click_state (`CoreSurface.Mouse.click_state`, indexed in
+        // `Surface.mouseButtonCallback`); input.MouseButton.eleven
         // does not, since the array has `max` (= 11) entries.
         const click_states = @typeInfo(
             @FieldType(@FieldType(CoreSurface, "mouse"), "click_state"),
