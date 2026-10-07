@@ -3066,15 +3066,7 @@ pub const Surface = struct {
     ) !CoreSurface.InputEffect {
         const vk: win32.UINT = @truncate(wparam);
         const scan = scanCode(vk, lparam);
-        const release = msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP;
-
-        // lParam bit 30: the key was already down, i.e. autorepeat.
-        const action: input.Action = if (release)
-            .release
-        else if ((@as(usize, @bitCast(lparam)) >> 30) & 1 != 0)
-            .repeat
-        else
-            .press;
+        const action = keyAction(msg, lparam);
 
         // VK_PACKET is injected text (SendInput with KEYEVENTF_UNICODE: on-
         // screen keyboards, some remote-desktop clients). It is not a
@@ -3084,45 +3076,18 @@ pub const Surface = struct {
         // still arrives through the WM_CHAR collected below.
         const is_packet = wparam == win32.VK_PACKET;
 
-        const key: input.Key = if (is_packet) .unidentified else key: for (input.keycodes.entries) |entry| {
-            if (entry.native == scan) break :key entry.key;
-        } else .unidentified;
+        const key: input.Key = if (is_packet) .unidentified else keyFromScan(scan);
 
-        var mods = mods_in;
         var text: Text = .{};
-        if (!release) text.collect(self.hwnd);
+        if (action != .release) text.collect(self.hwnd);
 
         // Text the IME committed earlier comes first. This key's own text
         // is collected before the flush so that nothing the flush triggers
         // can dispatch the queued WM_CHAR out of turn.
         if (self.app.canReenterCore()) self.flushIme(core_surface);
 
-        // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord that
-        // produces a character is AltGr by definition on Windows (it is the
-        // documented substitute on keyboards without the key). Left in place,
-        // the encoder would treat the character as a Ctrl sequence (`legacy`
-        // and `ctrlSeq` in input/key_encode.zig) and German AltGr+Q ('@') would
-        // be sent as NUL (`ctrlSeq` maps '@' to 0). Only characters that came
-        // through WM_CHAR count: Alt without Ctrl produces WM_SYSCHAR, and
-        // Alt+letter must keep its Alt so the encoder prefixes ESC.
-        if (text.from_char and mods.ctrl and mods.alt and text.utf8().len > 0) {
-            mods.ctrl = false;
-            mods.alt = false;
-        }
-
         const unshifted: u21 = if (is_packet) 0 else unshiftedCodepoint(vk, scan);
-
-        // Win32 has no consumed-modifiers report. Shift is the only one that
-        // can be inferred: it was consumed if it changed the character.
-        var consumed: input.Mods = .{};
-        if (mods.shift and text.len > 0) {
-            var buf: [4]u8 = undefined;
-            const n = if (unshifted != 0)
-                std.unicode.utf8Encode(unshifted, &buf) catch 0
-            else
-                0;
-            consumed.shift = !std.mem.eql(u8, buf[0..n], text.utf8());
-        }
+        const mods_out = keyMods(mods_in, &text, unshifted);
 
         // A dead key shows its accent as preedit until the next committed
         // text replaces it. The core does not track this itself
@@ -3136,12 +3101,50 @@ pub const Surface = struct {
         return try core_surface.keyCallback(.{
             .action = action,
             .key = key,
-            .mods = mods,
-            .consumed_mods = consumed,
+            .mods = mods_out.mods,
+            .consumed_mods = mods_out.consumed,
             .composing = text.composing,
             .utf8 = text.utf8(),
             .unshifted_codepoint = unshifted,
         });
+    }
+
+    const KeyMods = struct {
+        mods: input.Mods,
+        consumed: input.Mods = .{},
+    };
+
+    /// The modifiers to report for a keystroke that produced `text`, given
+    /// the state the key message was read with and the key's codepoint with
+    /// no modifiers.
+    fn keyMods(mods_in: input.Mods, text: *const Text, unshifted: u21) KeyMods {
+        var result: KeyMods = .{ .mods = mods_in };
+
+        // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord that
+        // produces a character is AltGr by definition on Windows (it is the
+        // documented substitute on keyboards without the key). Left in place,
+        // the encoder would treat the character as a Ctrl sequence (`legacy`
+        // and `ctrlSeq` in input/key_encode.zig) and German AltGr+Q ('@') would
+        // be sent as NUL (`ctrlSeq` maps '@' to 0). Only characters that came
+        // through WM_CHAR count: Alt without Ctrl produces WM_SYSCHAR, and
+        // Alt+letter must keep its Alt so the encoder prefixes ESC.
+        if (text.from_char and result.mods.ctrl and result.mods.alt and text.len > 0) {
+            result.mods.ctrl = false;
+            result.mods.alt = false;
+        }
+
+        // Win32 has no consumed-modifiers report. Shift is the only one that
+        // can be inferred: it was consumed if it changed the character.
+        if (result.mods.shift and text.len > 0) {
+            var buf: [4]u8 = undefined;
+            const n = if (unshifted != 0)
+                std.unicode.utf8Encode(unshifted, &buf) catch 0
+            else
+                0;
+            result.consumed.shift = !std.mem.eql(u8, buf[0..n], text.utf8());
+        }
+
+        return result;
     }
 
     /// Set or clear the core's preedit and record its owner, together.
@@ -3969,6 +3972,12 @@ fn isAltGrFakeCtrl(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
         win32.WM_KEYLAST,
         win32.PM_NOREMOVE,
     ).toBool()) return false;
+    return isAltGrRightAlt(&next, time);
+}
+
+/// Whether `next`, the key message queued behind a Left Ctrl message read
+/// at `time`, is the Right Alt half of an AltGr press or release.
+fn isAltGrRightAlt(next: *const win32.MSG, time: win32.DWORD) bool {
     switch (next.message) {
         win32.WM_KEYDOWN,
         win32.WM_SYSKEYDOWN,
@@ -3983,17 +3992,41 @@ fn isAltGrFakeCtrl(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
         next.time == time;
 }
 
+/// The core's action for a WM_(SYS)KEYDOWN or WM_(SYS)KEYUP.
+fn keyAction(msg: win32.UINT, lparam: win32.LPARAM) input.Action {
+    if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) return .release;
+
+    // lParam bit 30: the key was already down, i.e. autorepeat.
+    const l: usize = @bitCast(lparam);
+    return if ((l >> 30) & 1 != 0) .repeat else .press;
+}
+
 /// The key's scan code in the form of the Windows column of
 /// src/input/keycodes.zig: the 8-bit code from lParam bits 16-23, with 0xE0
 /// in the high byte when lParam bit 24 (extended key) is set. Keys injected
 /// without a scan code (lParam 0, e.g. some SendInput callers) fall back to
 /// the layout's mapping of the virtual key.
 fn scanCode(vk: win32.UINT, lparam: win32.LPARAM) u32 {
+    return lparamScanCode(lparam) orelse
+        win32.MapVirtualKeyW(vk, win32.MAPVK_VK_TO_VSC_EX);
+}
+
+/// The scan code `lparam` carries, as `scanCode` describes, or null if it
+/// carries none.
+fn lparamScanCode(lparam: win32.LPARAM) ?u32 {
     const l: usize = @bitCast(lparam);
     var sc: u32 = @intCast((l >> 16) & 0xFF);
-    if (sc == 0) return win32.MapVirtualKeyW(vk, win32.MAPVK_VK_TO_VSC_EX);
+    if (sc == 0) return null;
     if ((l >> 24) & 1 != 0) sc |= 0xE000;
     return sc;
+}
+
+/// The physical key for a `scanCode` result.
+fn keyFromScan(scan: u32) input.Key {
+    for (input.keycodes.entries) |entry| {
+        if (entry.native == scan) return entry.key;
+    }
+    return .unidentified;
 }
 
 /// The character the key produces with no modifiers in the current layout,
@@ -4396,6 +4429,201 @@ test "win32: mouse message button bits" {
     try std.testing.expect(Surface.Mouse.Button.downIn(0).eql(Set.empty));
     const both = Surface.Mouse.Button.downIn(win32.MK_LBUTTON | win32.MK_XBUTTON2 | win32.MK_SHIFT);
     try std.testing.expect(both.eql(Set.initMany(&.{ .left, .x2 })));
+}
+
+test "win32: key messages decode lParam" {
+    const testing = std.testing;
+    const lp = struct {
+        fn of(v: usize) win32.LPARAM {
+            return @bitCast(v);
+        }
+    }.of;
+
+    // Right Arrow is scan 0x4D with the extended bit (24); Numpad 6 is the
+    // same scan without it.
+    try testing.expectEqual(0xE04D, lparamScanCode(lp(0x014D_0001)).?);
+    try testing.expectEqual(.arrow_right, keyFromScan(0xE04D));
+    try testing.expectEqual(0x004D, lparamScanCode(lp(0x004D_0001)).?);
+    try testing.expectEqual(.numpad_6, keyFromScan(0x004D));
+    try testing.expectEqual(.control_right, keyFromScan(lparamScanCode(lp(0x011D_0001)).?));
+    try testing.expectEqual(.control_left, keyFromScan(lparamScanCode(lp(0x001D_0001)).?));
+
+    // No scan field, extended or not: the caller asks the layout instead.
+    try testing.expectEqual(null, lparamScanCode(lp(0x0000_0001)));
+    try testing.expectEqual(null, lparamScanCode(lp(0x0100_0001)));
+    try testing.expectEqual(.unidentified, keyFromScan(0));
+
+    // Bit 30 is the previous key state, bit 31 the transition state, which
+    // the message already says. Bit 29 is the Alt context of WM_SYS*.
+    try testing.expectEqual(.press, keyAction(win32.WM_KEYDOWN, lp(0x001E_0001)));
+    try testing.expectEqual(.repeat, keyAction(win32.WM_KEYDOWN, lp(0x401E_0001)));
+    try testing.expectEqual(.press, keyAction(win32.WM_SYSKEYDOWN, lp(0x201E_0001)));
+    try testing.expectEqual(.repeat, keyAction(win32.WM_SYSKEYDOWN, lp(0x601E_0001)));
+    try testing.expectEqual(.release, keyAction(win32.WM_KEYUP, lp(0xC01E_0001)));
+    try testing.expectEqual(.release, keyAction(win32.WM_SYSKEYUP, lp(0xE01E_0001)));
+}
+
+test "win32: key text drops controls and decodes surrogate pairs" {
+    const Text = Surface.Text;
+    const Case = struct { msg: win32.UINT, units: []const u16, want: []const u8 };
+    const cases = [_]Case{
+        .{ .msg = win32.WM_CHAR, .units = &.{'a'}, .want = "a" },
+        .{ .msg = win32.WM_CHAR, .units = &.{ 0xD83D, 0xDE00 }, .want = "\u{1F600}" },
+        // Backspace, Enter, Esc, Ctrl+A and Ctrl+Backspace's DEL: the
+        // encoder derives these from the key.
+        .{ .msg = win32.WM_CHAR, .units = &.{ 0x08, 0x0D, 0x1B, 0x01, 0x7F }, .want = "" },
+        // An unpaired surrogate is dropped, not the rest of the keystroke.
+        .{ .msg = win32.WM_CHAR, .units = &.{ 0xD800, 'a' }, .want = "a" },
+        .{ .msg = win32.WM_CHAR, .units = &.{ 0xDE00, 'a' }, .want = "a" },
+        .{ .msg = win32.WM_SYSCHAR, .units = &.{'x'}, .want = "x" },
+        .{ .msg = win32.WM_CHAR, .units = &([_]u16{'a'} ** 20), .want = "a" ** 16 },
+    };
+    for (cases) |c| {
+        var text: Text = .{};
+        for (c.units) |u| text.add(c.msg, u);
+        text.finish();
+        try std.testing.expectEqualStrings(c.want, text.utf8());
+    }
+
+    // Dead keys are preedit; only the non-SYS messages mean "not Alt alone".
+    const Flags = struct { msg: win32.UINT, composing: bool, from_char: bool };
+    const flags = [_]Flags{
+        .{ .msg = win32.WM_CHAR, .composing = false, .from_char = true },
+        .{ .msg = win32.WM_DEADCHAR, .composing = true, .from_char = true },
+        .{ .msg = win32.WM_SYSCHAR, .composing = false, .from_char = false },
+        .{ .msg = win32.WM_SYSDEADCHAR, .composing = true, .from_char = false },
+    };
+    for (flags) |f| {
+        var text: Text = .{};
+        text.add(f.msg, '^');
+        text.finish();
+        try std.testing.expectEqualStrings("^", text.utf8());
+        try std.testing.expectEqual(f.composing, text.composing);
+        try std.testing.expectEqual(f.from_char, text.from_char);
+    }
+}
+
+test "win32: key modifiers for AltGr and consumed Shift" {
+    const Case = struct {
+        mods: input.Mods,
+        msg: win32.UINT = win32.WM_CHAR,
+        units: []const u16,
+        unshifted: u21,
+        want: input.Mods,
+        consumed: input.Mods = .{},
+    };
+    const cases = [_]Case{
+        // German AltGr+Q: '@' arrives as WM_CHAR under LCtrl+RAlt.
+        .{
+            .mods = .{ .ctrl = true, .alt = true },
+            .units = &.{'@'},
+            .unshifted = 'q',
+            .want = .{},
+        },
+        // Alt+A keeps its Alt, so the encoder prefixes ESC.
+        .{
+            .mods = .{ .alt = true },
+            .msg = win32.WM_SYSCHAR,
+            .units = &.{'a'},
+            .unshifted = 'a',
+            .want = .{ .alt = true },
+        },
+        // Text only from WM_SYSCHAR is Alt's, not AltGr's, even with Ctrl
+        // down: Ctrl+Alt keeps both.
+        .{
+            .mods = .{ .ctrl = true, .alt = true },
+            .msg = win32.WM_SYSCHAR,
+            .units = &.{'a'},
+            .unshifted = 'a',
+            .want = .{ .ctrl = true, .alt = true },
+        },
+        // Ctrl+Alt with no text, or only a dropped control character, is
+        // a chord, not AltGr.
+        .{
+            .mods = .{ .ctrl = true, .alt = true },
+            .units = &.{},
+            .unshifted = 'a',
+            .want = .{ .ctrl = true, .alt = true },
+        },
+        .{
+            .mods = .{ .ctrl = true, .alt = true },
+            .units = &.{0x01},
+            .unshifted = 'a',
+            .want = .{ .ctrl = true, .alt = true },
+        },
+        // Shift that changed the character was consumed; it stays in mods.
+        .{
+            .mods = .{ .shift = true },
+            .units = &.{'A'},
+            .unshifted = 'a',
+            .want = .{ .shift = true },
+            .consumed = .{ .shift = true },
+        },
+        .{
+            .mods = .{ .shift = true },
+            .units = &.{'!'},
+            .unshifted = '1',
+            .want = .{ .shift = true },
+            .consumed = .{ .shift = true },
+        },
+        // Shift that did not change it, or whose text was dropped
+        // (Shift+Enter), was not: the encoder still needs it.
+        .{
+            .mods = .{ .shift = true },
+            .units = &.{' '},
+            .unshifted = ' ',
+            .want = .{ .shift = true },
+        },
+        .{
+            .mods = .{ .shift = true },
+            .units = &.{0x0D},
+            .unshifted = 0x0D,
+            .want = .{ .shift = true },
+        },
+    };
+    for (cases) |c| {
+        var text: Surface.Text = .{};
+        for (c.units) |u| text.add(c.msg, u);
+        text.finish();
+        const got = Surface.keyMods(c.mods, &text, c.unshifted);
+        try std.testing.expectEqual(c.want, got.mods);
+        try std.testing.expectEqual(c.consumed, got.consumed);
+    }
+}
+
+test "win32: AltGr is a Left Ctrl followed by an extended Right Alt" {
+    const time: win32.DWORD = 1000;
+    var next: win32.MSG = std.mem.zeroes(win32.MSG);
+    next.message = win32.WM_KEYDOWN;
+    next.wParam = win32.VK_MENU;
+    next.lParam = @bitCast(@as(usize, 0x0138_0001));
+    next.time = time;
+    try std.testing.expect(isAltGrRightAlt(&next, time));
+
+    // The release half, and the WM_SYS* forms, pair the same way.
+    for ([_]win32.UINT{ win32.WM_SYSKEYDOWN, win32.WM_KEYUP, win32.WM_SYSKEYUP }) |m| {
+        var n = next;
+        n.message = m;
+        try std.testing.expect(isAltGrRightAlt(&n, time));
+    }
+
+    // A Right Alt pressed later is a separate key: the Ctrl is real.
+    var later = next;
+    later.time = time + 1;
+    try std.testing.expect(!isAltGrRightAlt(&later, time));
+
+    // Left Alt (not extended) and other keys never pair.
+    var left_alt = next;
+    left_alt.lParam = @bitCast(@as(usize, 0x0038_0001));
+    try std.testing.expect(!isAltGrRightAlt(&left_alt, time));
+    var other = next;
+    other.wParam = 'A';
+    try std.testing.expect(!isAltGrRightAlt(&other, time));
+
+    // Character messages share the peeked range but are not key messages.
+    var char = next;
+    char.message = win32.WM_CHAR;
+    try std.testing.expect(!isAltGrRightAlt(&char, time));
 }
 
 test "win32: clipboard reads are not worded as pastes and default to Cancel" {
