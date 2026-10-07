@@ -344,6 +344,8 @@ const win32 = struct {
     /// for GetDpiForWindow, where it is the correct answer: those versions
     /// have no per-monitor DPI at all.
     const LOGPIXELSX: c_int = 88;
+    /// The reference DPI: a scale of 1.
+    const USER_DEFAULT_SCREEN_DPI: UINT = 96;
 
     // Entry points that must NOT be statically imported.
     //
@@ -480,17 +482,36 @@ const win32 = struct {
     const WM_IME_CHAR: UINT = 0x0286;
     const WM_IME_REQUEST: UINT = 0x0288;
     const ISC_SHOWUICOMPOSITIONWINDOW: usize = 0x80000000;
+    const GCS_COMPREADSTR: u32 = 0x0001;
+    const GCS_COMPREADATTR: u32 = 0x0002;
+    const GCS_COMPREADCLAUSE: u32 = 0x0004;
     const GCS_COMPSTR: u32 = 0x0008;
+    const GCS_COMPATTR: u32 = 0x0010;
+    const GCS_COMPCLAUSE: u32 = 0x0020;
+    const GCS_CURSORPOS: u32 = 0x0080;
+    const GCS_DELTASTART: u32 = 0x0100;
+    const GCS_RESULTREADSTR: u32 = 0x0200;
+    const GCS_RESULTREADCLAUSE: u32 = 0x0400;
     const GCS_RESULTSTR: u32 = 0x0800;
+    const GCS_RESULTCLAUSE: u32 = 0x1000;
     /// Every GCS_* flag. A WM_IME_COMPOSITION with none of them set means
     /// the composition was cancelled.
-    const GCS_ALL: u32 = 0x1FBF;
+    const GCS_ALL: u32 = GCS_COMPREADSTR | GCS_COMPREADATTR |
+        GCS_COMPREADCLAUSE | GCS_COMPSTR | GCS_COMPATTR | GCS_COMPCLAUSE |
+        GCS_CURSORPOS | GCS_DELTASTART | GCS_RESULTREADSTR |
+        GCS_RESULTREADCLAUSE | GCS_RESULTSTR | GCS_RESULTCLAUSE;
     const CFS_POINT: DWORD = 0x0002;
     const CFS_EXCLUDE: DWORD = 0x0080;
     const NI_COMPOSITIONSTR: DWORD = 0x0015;
     const CPS_COMPLETE: DWORD = 0x0001;
     const CPS_CANCEL: DWORD = 0x0004;
     const LANG_KOREAN: u16 = 0x12;
+
+    /// PRIMARYLANGID (winnt.h): a LANGID without its sublanguage.
+    fn primaryLangId(lgid: u16) u16 {
+        return lgid & 0x3FF;
+    }
+
     extern "imm32" fn ImmGetContext(hwnd: HWND) callconv(.winapi) ?HIMC;
     extern "imm32" fn ImmReleaseContext(hwnd: HWND, himc: HIMC) callconv(.winapi) BOOL;
     /// Sizes are in bytes, also for the W form; negative is an error.
@@ -1750,7 +1771,7 @@ pub const Surface = struct {
 
         /// The forms for the core's IME position. `pos` is in 96-DPI
         /// pixels except for its width, which the core leaves in physical
-        /// pixels (`Surface.imePoint`); `scale` is DPI / 96 and
+        /// pixels (`Surface.imePoint`); `scale` is `getContentScale` and
         /// `client` the client rectangle, in physical pixels like the
         /// result. Clamping guards against rounding and against a client
         /// size the core has not caught up with yet.
@@ -1791,6 +1812,56 @@ pub const Surface = struct {
         /// arrives sign-extended.
         fn setContextLparam(lparam: win32.LPARAM) win32.LPARAM {
             return @bitCast(@as(usize, @bitCast(lparam)) & ~win32.ISC_SHOWUICOMPOSITIONWINDOW);
+        }
+
+        const KeyFilter = enum {
+            /// Not for the core: an IME-owned keystroke (VK_PROCESSKEY), or
+            /// the release of a press the core never saw. A release
+            /// without a press would be reported to programs that ask for
+            /// key releases.
+            withhold,
+            /// For the core.
+            deliver,
+            /// For the core, but the key's previous press was withheld
+            /// (`isAltNumpad` decides a repeat from that).
+            deliver_withheld,
+        };
+
+        /// Whether a key message reaches the core, given `swallow_up`.
+        /// The IME claims a keystroke by sending its key-down as
+        /// VK_PROCESSKEY; the key-up may come with the real virtual key, so
+        /// it is matched by `scanSlot`. A VK_PROCESSKEY key-up leaves the
+        /// slot set, and the key's next key-down clears it.
+        fn filterKey(
+            self: *Ime,
+            msg: win32.UINT,
+            wparam: win32.WPARAM,
+            lparam: win32.LPARAM,
+        ) KeyFilter {
+            const slot = scanSlot(lparam);
+            if (wparam == win32.VK_PROCESSKEY) {
+                if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.swallow_up.set(slot);
+                return .withhold;
+            }
+            if (!self.swallow_up.isSet(slot)) return .deliver;
+            self.swallow_up.unset(slot);
+            return if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP)
+                .withhold
+            else
+                .deliver_withheld;
+        }
+
+        /// How a composition still open when the window loses the focus
+        /// is ended (`syncIme`), for input language `lang`. Korean is
+        /// completed, because a Hangul composition string is text the
+        /// user already sees as typed, with no conversion step to confirm;
+        /// other languages are cancelled, so that half-converted text does
+        /// not reach a shell the user is no longer looking at.
+        fn focusLossAction(lang: u16) win32.DWORD {
+            return if (win32.primaryLangId(lang) == win32.LANG_KOREAN)
+                win32.CPS_COMPLETE
+            else
+                win32.CPS_CANCEL;
         }
     };
 
@@ -2243,7 +2314,7 @@ pub const Surface = struct {
     /// below; Windows then clamps an oversized request to the maximum track
     /// size as it does any other.
     fn applyInitialSize(self: *Surface, size: apprt.action.InitialSize) void {
-        const scale: f32 = @as(f32, @floatFromInt(self.dpi())) / 96.0;
+        const scale = (self.getContentScale() catch unreachable).x;
         const client_w = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.width)) * scale));
         const client_h = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.height)) * scale));
         var window: win32.RECT = undefined;
@@ -2273,7 +2344,8 @@ pub const Surface = struct {
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
-        const scale: f32 = @as(f32, @floatFromInt(self.dpi())) / 96.0;
+        const scale: f32 = @as(f32, @floatFromInt(self.dpi())) /
+            @as(f32, @floatFromInt(win32.USER_DEFAULT_SCREEN_DPI));
         return .{ .x = scale, .y = scale };
     }
 
@@ -2299,7 +2371,7 @@ pub const Surface = struct {
             if (v > 0) return @intCast(v);
         }
 
-        return 96;
+        return win32.USER_DEFAULT_SCREEN_DPI;
     }
 
     /// Client area in physical pixels.
@@ -2665,7 +2737,8 @@ pub const Surface = struct {
                 // computed for it. wParam carries the new DPI in both words;
                 // they are always equal for a window.
                 if (self.liveCore()) |core_surface| {
-                    const scale = @as(f32, @floatFromInt(win32.hiword(wparam))) / 96.0;
+                    const scale = @as(f32, @floatFromInt(win32.hiword(wparam))) /
+                        @as(f32, @floatFromInt(win32.USER_DEFAULT_SCREEN_DPI));
                     core_surface.contentScaleCallback(.{ .x = scale, .y = scale }) catch |err|
                         log.warn("content scale callback failed err={}", .{err});
                 }
@@ -2737,7 +2810,9 @@ pub const Surface = struct {
                 // the IME must not show its own composition window. The
                 // message is still forwarded: the default IME window needs
                 // it to activate the context, and keeps the candidate list.
-                log.debug("ime setcontext active={} lang=0x{x}", .{ wparam != 0, inputLanguage() });
+                if (comptime std.log.logEnabled(.debug, .win32)) {
+                    log.debug("ime setcontext active={} lang=0x{x}", .{ wparam != 0, inputLanguage() });
+                }
                 return win32.DefWindowProcW(hwnd, msg, wparam, Ime.setContextLparam(lparam));
             },
 
@@ -2764,9 +2839,8 @@ pub const Surface = struct {
             // WM_IME_COMPOSITION, which never happens here, and the
             // Microsoft IMEs work without WM_IME_REQUEST answers even though
             // they send one (IMR_* in wParam) on nearly every keystroke.
-            // Logged to learn whether another IME disagrees.
             win32.WM_IME_CHAR, win32.WM_IME_REQUEST => {
-                log.debug("ime message=0x{x} wparam=0x{x}", .{ msg, wparam });
+                // log.debug("ime message=0x{x} wparam=0x{x}", .{ msg, wparam });
             },
 
             win32.WM_KEYDOWN,
@@ -2777,23 +2851,12 @@ pub const Surface = struct {
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
 
-                // IME-owned keystroke: the IME consumes it, not the terminal.
-                // The core never sees that press, so if the key-up arrives
-                // with the real virtual key it is withheld as well: a
-                // release without a press would be reported to programs
-                // that ask for key releases.
                 const slot = Ime.scanSlot(lparam);
-                if (wparam == win32.VK_PROCESSKEY) {
-                    if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.ime.swallow_up.set(slot);
-                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-                }
-                const withheld = self.ime.swallow_up.isSet(slot);
-                if (withheld) {
-                    self.ime.swallow_up.unset(slot);
-                    if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
-                        return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-                    }
-                }
+                const withheld = switch (self.ime.filterKey(msg, wparam, lparam)) {
+                    .withhold => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),
+                    .deliver => false,
+                    .deliver_withheld => true,
+                };
 
                 // The synthetic Left Ctrl of AltGr. The core still sees Ctrl
                 // held (GetKeyState) and keyEvent's AltGr rule handles that.
@@ -3271,7 +3334,9 @@ pub const Surface = struct {
     }
 
     fn imeStart(self: *Surface) void {
-        log.debug("ime start lang=0x{x}", .{inputLanguage()});
+        if (comptime std.log.logEnabled(.debug, .win32)) {
+            log.debug("ime start lang=0x{x}", .{inputLanguage()});
+        }
         self.ime.composing = true;
         self.ime.form = null;
 
@@ -3296,7 +3361,7 @@ pub const Surface = struct {
         const core_surface = self.liveCore() orelse return;
         const core_safe = self.app.canReenterCore();
         const bits: u32 = @truncate(@as(usize, @bitCast(lparam)));
-        log.debug("ime composition gcs=0x{x} core_safe={}", .{ bits, core_safe });
+        // log.debug("ime composition gcs=0x{x} core_safe={}", .{ bits, core_safe });
 
         // The context's strings are gone once it is released, so it is held
         // for the whole plan. Setting the forms below sends WM_IME_NOTIFY
@@ -3384,7 +3449,7 @@ pub const Surface = struct {
     /// text-only key press with no physical key. `textCallback` is the
     /// paste path and is not for this (it would bracket and confirm).
     fn imeCommit(core_surface: *CoreSurface, utf8: []const u8) void {
-        log.debug("ime commit bytes={d}", .{utf8.len});
+        // log.debug("ime commit bytes={d}", .{utf8.len});
         // `.closed` only posted WM_GHOSTTY_DESTROY (Surface.close), so the
         // surface stays valid for the caller.
         _ = core_surface.keyCallback(.{
@@ -3440,12 +3505,13 @@ pub const Surface = struct {
         var client: win32.RECT = undefined;
         if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
         const pos = core_surface.imePoint();
-        const scale: f64 = @as(f64, @floatFromInt(self.dpi())) / 96.0;
+        // The scale imePoint divided by, so that this undoes it exactly.
+        const scale = (self.getContentScale() catch unreachable).x;
         const form = Ime.formFor(pos, scale, core_surface.size.cell.width, client);
         if (self.ime.form) |last| if (std.meta.eql(last, form)) return;
         self.ime.form = form;
-        log.debug("ime place dpi={d} pos={d:.1},{d:.1} {d:.1}x{d:.1} rc={d},{d},{d},{d}", .{
-            self.dpi(),   pos.x,       pos.y,         pos.width,      pos.height,
+        log.debug("ime place scale={d} pos={d:.1},{d:.1} {d:.1}x{d:.1} rc={d},{d},{d},{d}", .{
+            scale,        pos.x,       pos.y,         pos.width,      pos.height,
             form.rc.left, form.rc.top, form.rc.right, form.rc.bottom,
         });
 
@@ -3469,11 +3535,8 @@ pub const Surface = struct {
     /// from `App.run`, never inside a core frame or a prompt.
     ///
     /// A composition does not outlive the focus: its preedit would stay
-    /// drawn over the cursor of a window the user has left. Korean is
-    /// completed, because a Hangul composition string is text the user
-    /// already sees as typed, with no conversion step to confirm; other
-    /// languages are cancelled, so that half-converted text does not reach
-    /// a shell the user is no longer looking at.
+    /// drawn over the cursor of a window the user has left. How it ends
+    /// depends on the language (`Ime.focusLossAction`).
     fn syncIme(self: *Surface, core_surface: *CoreSurface) void {
         self.flushIme(core_surface);
 
@@ -3495,10 +3558,7 @@ pub const Surface = struct {
         }
 
         if (win32.ImmGetContext(self.hwnd)) |himc| {
-            const how = if (inputLanguage() & 0x3FF == win32.LANG_KOREAN)
-                win32.CPS_COMPLETE
-            else
-                win32.CPS_CANCEL;
+            const how = Ime.focusLossAction(inputLanguage());
             log.debug("ime ends with the focus how={d}", .{how});
             // Sends the IME's messages to this window before it returns.
             _ = win32.ImmNotifyIME(himc, win32.NI_COMPOSITIONSTR, how, 0);
@@ -5302,9 +5362,9 @@ test "win32: ime plan for a composition message" {
     const A = Ime.Action;
     const comp = win32.GCS_COMPSTR;
     const result = win32.GCS_RESULTSTR;
-    const cursor_pos: u32 = 0x0080; // GCS_CURSORPOS
-    const attr_clause: u32 = 0x0030; // GCS_COMPATTR | GCS_COMPCLAUSE
-    const result_clause: u32 = 0x1000; // GCS_RESULTCLAUSE
+    const cursor_pos = win32.GCS_CURSORPOS;
+    const attr_clause = win32.GCS_COMPATTR | win32.GCS_COMPCLAUSE;
+    const result_clause = win32.GCS_RESULTCLAUSE;
 
     const Case = struct { bits: u32, owner: Ime.Preedit, safe: bool, want: []const A };
     const cases = [_]Case{
@@ -5430,4 +5490,61 @@ test "win32: ime message fields" {
     // Scan code 0x1E, not extended; then the same with the extended flag.
     try std.testing.expectEqual(@as(usize, 0x01E), Ime.scanSlot(0x001E_0001));
     try std.testing.expectEqual(@as(usize, 0x11E), Ime.scanSlot(@bitCast(@as(usize, 0xC11E_0001))));
+}
+
+test "win32: ime withholds the release of a key it claimed" {
+    const Ime = Surface.Ime;
+    const down = win32.WM_KEYDOWN;
+    const up = win32.WM_KEYUP;
+    const vk_a: win32.WPARAM = 0x41;
+    // Scan code 0x1E (A): its key-down, its key-up, and the same key with
+    // the extended flag, which is another slot.
+    const a_down: win32.LPARAM = 0x001E_0001;
+    const a_up: win32.LPARAM = @bitCast(@as(usize, 0xC01E_0001));
+    const ext_up: win32.LPARAM = @bitCast(@as(usize, 0xC11E_0001));
+
+    // A key the IME never claimed reaches the core both ways.
+    {
+        var ime: Ime = .{};
+        try std.testing.expectEqual(.deliver, ime.filterKey(down, vk_a, a_down));
+        try std.testing.expectEqual(.deliver, ime.filterKey(up, vk_a, a_up));
+    }
+
+    // The IME claims the press; its release comes with the real virtual
+    // key and is withheld once. Alt held makes them WM_SYS* messages.
+    for ([_][2]win32.UINT{
+        .{ win32.WM_KEYDOWN, win32.WM_KEYUP },
+        .{ win32.WM_SYSKEYDOWN, win32.WM_SYSKEYUP },
+    }) |pair| {
+        var ime: Ime = .{};
+        try std.testing.expectEqual(.withhold, ime.filterKey(pair[0], win32.VK_PROCESSKEY, a_down));
+        try std.testing.expectEqual(.deliver, ime.filterKey(pair[1], vk_a, ext_up));
+        try std.testing.expectEqual(.withhold, ime.filterKey(pair[1], vk_a, a_up));
+        try std.testing.expectEqual(.deliver, ime.filterKey(pair[1], vk_a, a_up));
+    }
+
+    // The release comes as VK_PROCESSKEY too: the slot stays set until
+    // the key's next press, which reaches the core with its release.
+    {
+        var ime: Ime = .{};
+        try std.testing.expectEqual(.withhold, ime.filterKey(down, win32.VK_PROCESSKEY, a_down));
+        try std.testing.expectEqual(.withhold, ime.filterKey(up, win32.VK_PROCESSKEY, a_up));
+        try std.testing.expectEqual(.deliver_withheld, ime.filterKey(down, vk_a, a_down));
+        try std.testing.expectEqual(.deliver, ime.filterKey(up, vk_a, a_up));
+    }
+}
+
+test "win32: ime completes Korean on focus loss and cancels the rest" {
+    const Ime = Surface.Ime;
+    // Any Korean sublanguage, or none.
+    try std.testing.expectEqual(win32.CPS_COMPLETE, Ime.focusLossAction(0x0412));
+    try std.testing.expectEqual(win32.CPS_COMPLETE, Ime.focusLossAction(0x0812));
+    try std.testing.expectEqual(win32.CPS_COMPLETE, Ime.focusLossAction(0x0012));
+    // Japanese, Chinese, English, no layout.
+    try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0x0411));
+    try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0x0804));
+    try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0x0409));
+    try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0));
+    // The primary language is 10 bits: 0x212 (custom range) is not Korean.
+    try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0x0212));
 }
