@@ -4180,8 +4180,21 @@ fn keyAction(msg: win32.UINT, lparam: win32.LPARAM) input.Action {
 /// without a scan code (lParam 0, e.g. some SendInput callers) fall back to
 /// the layout's mapping of the virtual key.
 fn scanCode(vk: win32.UINT, lparam: win32.LPARAM) u32 {
-    return lparamScanCode(lparam) orelse
+    const sc = lparamScanCode(lparam) orelse
         win32.MapVirtualKeyW(vk, win32.MAPVK_VK_TO_VSC_EX);
+
+    // Three keys arrive with a scan code that is not their own, and that
+    // keycodes.zig does not list. The corrections are GLFW's
+    // (win32_window.c, WM_KEYDOWN handling).
+    return switch (sc) {
+        // Alt+PrintScreen reports SysRq.
+        0x0054 => 0xE037,
+        // Ctrl+Pause reports Break.
+        0xE046 => 0x0045,
+        // CJK IMEs set the extended bit on Right Shift.
+        0xE036 => 0x0036,
+        else => sc,
+    };
 }
 
 /// The scan code `lparam` carries, as `scanCode` describes, or null if it
@@ -4713,6 +4726,16 @@ test "win32: key messages decode lParam" {
     try testing.expectEqual(null, lparamScanCode(lp(0x0000_0001)));
     try testing.expectEqual(null, lparamScanCode(lp(0x0100_0001)));
     try testing.expectEqual(.unidentified, keyFromScan(0));
+
+    // Scan codes that are not the key's own: Alt+PrintScreen (VK_SNAPSHOT)
+    // reports SysRq 0x54, Ctrl+Pause (VK_CANCEL) an extended 0x46, and Right
+    // Shift (VK_SHIFT) under a CJK IME an extended 0x36. Scroll Lock (0x46)
+    // and Right Shift without the extended bit are unchanged.
+    try testing.expectEqual(.print_screen, keyFromScan(scanCode(0x2C, lp(0x2054_0001))));
+    try testing.expectEqual(.pause, keyFromScan(scanCode(0x03, lp(0x0146_0001))));
+    try testing.expectEqual(.shift_right, keyFromScan(scanCode(0x10, lp(0x0136_0001))));
+    try testing.expectEqual(.scroll_lock, keyFromScan(scanCode(0x91, lp(0x0046_0001))));
+    try testing.expectEqual(.shift_right, keyFromScan(scanCode(0x10, lp(0x0036_0001))));
 
     // Bit 30 is the previous key state, bit 31 the transition state, which
     // the message already says. Bit 29 is the Alt context of WM_SYS*.
