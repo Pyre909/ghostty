@@ -361,6 +361,8 @@ const win32 = struct {
     extern "kernel32" fn GlobalFree(mem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
     extern "kernel32" fn GlobalLock(mem: HGLOBAL) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn GlobalUnlock(mem: HGLOBAL) callconv(.winapi) BOOL;
+    /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalsize
+    extern "kernel32" fn GlobalSize(mem: HGLOBAL) callconv(.winapi) usize;
 
     extern "user32" fn RegisterClassExW(class: *const WNDCLASSEXW) callconv(.winapi) ATOM;
     extern "user32" fn UnregisterClassW(name: LPCWSTR, inst: ?HINSTANCE) callconv(.winapi) BOOL;
@@ -4090,8 +4092,23 @@ fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     const raw = win32.GlobalLock(mem) orelse return null;
     defer _ = win32.GlobalUnlock(mem);
 
-    const ptr: [*:0]const u16 = @ptrCast(@alignCast(raw));
-    return try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(ptr));
+    // Another process wrote this block, so only its size bounds it.
+    const units: [*]const u16 = @ptrCast(@alignCast(raw));
+    return try utf8FromClipboard(alloc, units[0 .. win32.GlobalSize(mem) / @sizeOf(u16)]);
+}
+
+/// UTF-8 for a CF_UNICODETEXT block. The text ends at the first NUL, or at
+/// the end of the block: Windows does not enforce the terminator, so an
+/// owner that leaves it out must not make us read past the block. The text
+/// is WTF-16, so an unpaired surrogate becomes U+FFFD, as
+/// WideCharToMultiByte does, instead of failing the whole paste.
+fn utf8FromClipboard(alloc: Allocator, block: []const u16) Allocator.Error![]u8 {
+    const text = block[0 .. std.mem.indexOfScalar(u16, block, 0) orelse block.len];
+    const buf = try std.unicode.wtf16LeToWtf8Alloc(alloc, text);
+    // In place: a surrogate's WTF-8 and U+FFFD are both three bytes, and
+    // wtf16LeToWtf8 never produces invalid WTF-8.
+    std.unicode.wtf8ToUtf8Lossy(buf, buf) catch unreachable;
+    return buf;
 }
 
 /// The text of the prompt for a clipboard read the core would not complete
@@ -4397,6 +4414,34 @@ test "win32: clipboard reads are not worded as pastes and default to Cancel" {
         win32.MB_DEFBUTTON2,
         ConfirmDefault.cancel.style() & win32.MB_DEFMASK,
     );
+}
+
+test "win32: clipboard text stops at the block and survives bad surrogates" {
+    const alloc = std.testing.allocator;
+    const Case = struct { block: []const u16, want: []const u8 };
+    const cases = [_]Case{
+        .{ .block = &.{}, .want = "" },
+        .{ .block = &.{ 'a', 'b', 0 }, .want = "ab" },
+        // Text after the terminator, such as the rest of an oversized block,
+        // is not part of the text.
+        .{ .block = &.{ 'a', 0, 'b', 'c' }, .want = "a" },
+        .{ .block = &.{ 0xD83D, 0xDE00, 0 }, .want = "\u{1F600}" },
+        .{ .block = &.{ 'a', 'b', 'c', 0xD83D, 0 }, .want = "abc\u{FFFD}" },
+        .{ .block = &.{ 0xDE00, 'a' }, .want = "\u{FFFD}a" },
+        .{ .block = &.{ 0xD83D, 0xD83D, 0xDE00 }, .want = "\u{FFFD}\u{1F600}" },
+    };
+    for (cases) |c| {
+        const got = try utf8FromClipboard(alloc, c.block);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+
+    // No terminator: the block's end is the text's end, even when the
+    // memory after it holds more text.
+    const backing = [_]u16{ 'x', 'y', 'z', 'q' };
+    const got = try utf8FromClipboard(alloc, backing[0..2]);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("xy", got);
 }
 
 test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
