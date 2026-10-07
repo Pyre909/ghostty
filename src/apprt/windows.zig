@@ -1091,11 +1091,7 @@ pub const App = struct {
         value: apprt.Action.Value(action),
     ) !bool {
         return switch (action) {
-            .quit => quit: {
-                self.quit = true;
-                win32.PostQuitMessage(0);
-                break :quit true;
-            },
+            .quit => self.requestQuit(),
 
             // Reports whether the timer actually reached the requested
             // state. A SetTimer that failed means the app will never quit on
@@ -1125,6 +1121,32 @@ pub const App = struct {
             // `Surface.mouseRefreshLinks`, `Surface.cursorPosCallback`).
             else => false,
         };
+    }
+
+    /// The `.quit` action (the `quit` binding, Ctrl+Shift+Q by default).
+    /// As on GTK (`Application.quit`), the user is asked first when any
+    /// surface would ask before closing (`CoreApp.needsConfirmQuit`): a
+    /// running program, `confirm-close-surface = always`, or a read-only
+    /// surface. Declining is still a handled request, so this returns `true`
+    /// either way.
+    fn requestQuit(self: *App) bool {
+        if (self.quit) return true;
+
+        if (self.core_app.needsConfirmQuit()) {
+            const owner: ?win32.HWND = if (self.core_app.focusedSurface()) |s|
+                s.rt_surface.hwnd
+            else
+                null;
+            if (!confirm(
+                self,
+                owner,
+                L("All terminal sessions will be terminated. Quit Ghostty?"),
+            )) return true;
+        }
+
+        self.quit = true;
+        win32.PostQuitMessage(0);
+        return true;
     }
 
     fn setTitle(
@@ -4066,7 +4088,7 @@ fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
 /// handler dispatched inside it that a core frame is probably beneath: no
 /// ticks and no surface teardown until it returns (`App.canReenterCore`).
 /// Output from every surface pauses while a prompt is open.
-fn confirm(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) bool {
+fn confirm(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) bool {
     app.prompt_depth += 1;
     defer app.prompt_depth -= 1;
     return win32.MessageBoxW(
