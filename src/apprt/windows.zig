@@ -1643,9 +1643,9 @@ pub const Surface = struct {
         pending: std.ArrayListUnmanaged(u8) = .empty,
 
         /// Keys whose key-down the core never saw, by `scanSlot`: the IME
-        /// claimed it (VK_PROCESSKEY), or it was a digit of Alt+numpad
-        /// entry (`isAltNumpad`). Their key-up is kept from the core as
-        /// well.
+        /// claimed it (VK_PROCESSKEY), it was a digit of Alt+numpad entry
+        /// (`isAltNumpad`), or it opened the window menu
+        /// (`isWindowMenuKey`). Their key-up is kept from the core as well.
         swallow_up: std.StaticBitSet(512) = .initEmpty(),
 
         const Preedit = enum { none, dead_key, ime };
@@ -2870,12 +2870,27 @@ pub const Surface = struct {
                 const mods = currentMods();
 
                 // Alt+Space (Alt alone) opens the window menu, as in every
-                // Windows app. It must bypass the core entirely: DefWindowProcW
-                // opens the menu from the WM_SYSCHAR ' ' that TranslateMessage
-                // posted, so keyEvent must not remove that message either.
-                if (wparam == win32.VK_SPACE and
-                    mods.binding().equal(.{ .alt = true }))
-                {
+                // Windows app, unless a binding claims it. The menu must
+                // bypass the core entirely: DefWindowProcW opens it from the
+                // WM_SYSCHAR ' ' that TranslateMessage posted, so keyEvent
+                // must not remove that message either. This has to be
+                // decided before keyEvent, not from an `.ignored` result.
+                // The key-up is withheld like an IME key's.
+                menu: {
+                    const vk: win32.UINT = @truncate(wparam);
+                    const action = keyAction(msg, lparam);
+                    if (!isWindowMenuKey(action, vk, mods)) break :menu;
+
+                    const scan = scanCode(vk, lparam);
+                    const bound = core_surface.keyEventIsBinding(.{
+                        .action = action,
+                        .key = keyFromScan(scan),
+                        .mods = mods,
+                        .unshifted_codepoint = unshiftedCodepoint(vk, scan),
+                    });
+                    if (bound != null) break :menu;
+
+                    self.ime.swallow_up.set(slot);
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
 
@@ -4217,6 +4232,19 @@ fn numpadKey(key: input.Key, vk: win32.UINT) input.Key {
     };
 }
 
+/// Whether a key message of virtual key `vk` is Alt+Space, which opens the
+/// window menu if no binding claims it. Presses and repeats only: a release
+/// follows what happened to its press, through `swallow_up`, so that the
+/// core never sees a release without the press or a press without the
+/// release.
+fn isWindowMenuKey(action: input.Action, vk: win32.UINT, mods: input.Mods) bool {
+    if (vk != win32.VK_SPACE) return false;
+    return switch (action) {
+        .press, .repeat => mods.binding().equal(.{ .alt = true }),
+        .release => false,
+    };
+}
+
 /// Whether a key-down of virtual key `vk` is a digit of Alt+numpad entry:
 /// with Alt held alone, the keypad's digit keys type a decimal character
 /// code, and TranslateMessage posts the character as WM_CHAR when Alt is
@@ -4719,6 +4747,28 @@ test "win32: keypad keys follow NumLock" {
     for (cases) |c| {
         try testing.expectEqual(c.want, numpadKey(keyFromScan(c.scan), c.vk));
     }
+}
+
+test "win32: Alt+Space is the window menu on press and repeat" {
+    const testing = std.testing;
+    const alt: input.Mods = .{ .alt = true };
+    const space: win32.UINT = 0x20; // VK_SPACE
+
+    // Either Alt, alone, presses or repeats.
+    try testing.expect(isWindowMenuKey(.press, space, alt));
+    try testing.expect(isWindowMenuKey(.repeat, space, alt));
+    try testing.expect(isWindowMenuKey(.press, space, .{ .alt = true, .sides = .{ .alt = .right } }));
+    try testing.expect(isWindowMenuKey(.press, space, .{ .alt = true, .caps_lock = true }));
+
+    // The release follows its press through `swallow_up` instead, so a
+    // bound press's release reaches the core.
+    try testing.expect(!isWindowMenuKey(.release, space, alt));
+
+    // Not Alt alone (AltGr's Ctrl+Alt among them), or not Space.
+    try testing.expect(!isWindowMenuKey(.press, space, .{}));
+    try testing.expect(!isWindowMenuKey(.press, space, .{ .alt = true, .ctrl = true }));
+    try testing.expect(!isWindowMenuKey(.press, space, .{ .alt = true, .shift = true }));
+    try testing.expect(!isWindowMenuKey(.press, 0x0D, alt)); // VK_RETURN
 }
 
 test "win32: Alt+numpad digits are text entry" {
