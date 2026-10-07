@@ -1578,6 +1578,13 @@ pub const Surface = struct {
     /// See `Text.finish`.
     high_surrogate: ?u16,
 
+    /// Keys whose last press was AltGr's, by `Ime.scanSlot`. See
+    /// `altGrKey`.
+    alt_gr: std.StaticBitSet(512),
+
+    /// See `ShiftKeys`.
+    shift: ShiftKeys,
+
     /// Number of WM_PAINTs handled, for the debug log in `paint`.
     paint_count: u64,
 
@@ -1959,6 +1966,8 @@ pub const Surface = struct {
             .preedit = .none,
             .ime = .{},
             .high_surrogate = null,
+            .alt_gr = .initEmpty(),
+            .shift = .{},
             .paint_count = 0,
             .modal_loops = 0,
             .focused = false,
@@ -3122,24 +3131,49 @@ pub const Surface = struct {
             break :shiftless shiftlessCodepoint(vk, scan, &state);
         };
 
-        return try self.keyText(core_surface, .{
+        const alt_gr = altGrKey(&self.alt_gr, Ime.scanSlot(lparam), action, mods_in, &text);
+        const effect = try self.keyText(core_surface, .{
             .action = action,
             .key = key,
             .mods = mods_in,
             .unshifted_codepoint = unshifted,
-        }, &text, shiftless);
+        }, &text, shiftless, alt_gr);
+        self.shift.sent(key, action);
+
+        // With both Shift keys held, Windows sends no key-up for the first
+        // one released, only for the last (GLFW's win32_window.c releases
+        // both Shift keys on any Shift key-up for this reason). The core is
+        // owed the missing release, or a program that asks for modifier key
+        // events holds that Shift down forever.
+        if (vk == win32.VK_SHIFT and action == .release and effect != .closed) {
+            const owed = self.shift.owed(
+                win32.GetKeyState(win32.VK_LSHIFT) < 0,
+                win32.GetKeyState(win32.VK_RSHIFT) < 0,
+            );
+            if (owed) |other| {
+                _ = try core_surface.keyCallback(.{
+                    .action = .release,
+                    .key = other,
+                    .mods = currentMods(),
+                });
+                self.shift.sent(other, .release);
+            }
+        }
+
+        return effect;
     }
 
     /// Send the core a key event carrying `text`, for `keyEvent` and
     /// `strayChar`. `event.mods` is the state the key was read with; the
     /// mods reported are `keyMods`'s, given the key's codepoint with Shift
-    /// released (`shiftless`).
+    /// released (`shiftless`) and whether the keystroke is AltGr's.
     fn keyText(
         self: *Surface,
         core_surface: *CoreSurface,
         event: input.KeyEvent,
         text: *const Text,
         shiftless: u21,
+        alt_gr: bool,
     ) !CoreSurface.InputEffect {
         // Text the IME committed earlier comes first.
         if (self.app.canReenterCore()) self.flushIme(core_surface);
@@ -3153,7 +3187,7 @@ pub const Surface = struct {
             try self.setPreedit(core_surface, null, .none);
         }
 
-        const mods = keyMods(event.mods, text, shiftless);
+        const mods = keyMods(event.mods, text, shiftless, alt_gr);
         var ev = event;
         ev.mods = mods.mods;
         ev.consumed_mods = mods.consumed;
@@ -3168,20 +3202,19 @@ pub const Surface = struct {
     };
 
     /// The modifiers to report for a keystroke that produced `text`, given
-    /// the state the key message was read with and the key's codepoint in
-    /// that state with Shift released (shiftlessCodepoint).
-    fn keyMods(mods_in: input.Mods, text: *const Text, shiftless: u21) KeyMods {
+    /// the state the key message was read with, the key's codepoint in
+    /// that state with Shift released (shiftlessCodepoint), and whether the
+    /// keystroke is AltGr's (`isAltGr`, `altGrKey`).
+    fn keyMods(mods_in: input.Mods, text: *const Text, shiftless: u21, alt_gr: bool) KeyMods {
         var result: KeyMods = .{ .mods = mods_in };
 
-        // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord that
-        // produces a character is AltGr by definition on Windows (it is the
-        // documented substitute on keyboards without the key). Left in place,
-        // the encoder would treat the character as a Ctrl sequence (`legacy`
-        // and `ctrlSeq` in input/key_encode.zig) and German AltGr+Q ('@') would
-        // be sent as NUL (`ctrlSeq` maps '@' to 0). Only characters that came
-        // through WM_CHAR count: Alt without Ctrl produces WM_SYSCHAR, and
-        // Alt+letter must keep its Alt so the encoder prefixes ESC.
-        if (text.from_char and result.mods.ctrl and result.mods.alt and text.len > 0) {
+        // AltGr's Ctrl+Alt is taken out of mods. Marking it consumed, as
+        // macOS does for Option, would not work: the legacy encoding gives
+        // `ctrlSeq` the full mods and modifyOtherKeys 2 encodes
+        // `event.mods`, so German AltGr+Q ('@') would still be sent as NUL
+        // or CSI 27;7;64~. GTK reaches the same mods because XKB reports
+        // AltGr as a level shift, which `translateMods` does not map.
+        if (alt_gr) {
             result.mods.ctrl = false;
             result.mods.alt = false;
         }
@@ -3202,6 +3235,63 @@ pub const Surface = struct {
 
         return result;
     }
+
+    /// Whether a keystroke read with `mods` that produced `text` is AltGr.
+    ///
+    /// Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord that
+    /// produces a character is AltGr by definition on Windows (it is the
+    /// documented substitute on keyboards without the key). Only characters
+    /// that came through WM_CHAR count: Alt without Ctrl produces
+    /// WM_SYSCHAR, and Alt+letter must keep its Alt so the encoder prefixes
+    /// ESC.
+    fn isAltGr(mods: input.Mods, text: *const Text) bool {
+        return text.from_char and mods.ctrl and mods.alt and text.len > 0;
+    }
+
+    /// Whether a key event is AltGr's, recording the verdict in `held`
+    /// under the key's `Ime.scanSlot`. A release produces no text to judge,
+    /// so it takes the verdict of the key's press: Ctrl+Alt is still down,
+    /// and reported on the release alone it would pair a plain '@' with the
+    /// release of Ctrl+Alt+Q.
+    fn altGrKey(
+        held: *std.StaticBitSet(512),
+        slot: usize,
+        action: input.Action,
+        mods: input.Mods,
+        text: *const Text,
+    ) bool {
+        const alt_gr = switch (action) {
+            .press, .repeat => isAltGr(mods, text),
+            .release => held.isSet(slot),
+        };
+        held.setValue(slot, action != .release and alt_gr);
+        return alt_gr;
+    }
+
+    /// The Shift keys the core was sent a press for and no release since.
+    /// See `keyEvent`, which owes the core the release Windows drops.
+    const ShiftKeys = struct {
+        left: bool = false,
+        right: bool = false,
+
+        /// Record that the core was sent `action` for `key`.
+        fn sent(self: *ShiftKeys, key: input.Key, action: input.Action) void {
+            const down = action != .release;
+            switch (key) {
+                .shift_left => self.left = down,
+                .shift_right => self.right = down,
+                else => {},
+            }
+        }
+
+        /// The Shift key whose release the core is owed, given whether
+        /// each one is down as of the message being handled.
+        fn owed(self: ShiftKeys, left_down: bool, right_down: bool) ?input.Key {
+            if (self.left and !left_down) return .shift_left;
+            if (self.right and !right_down) return .shift_right;
+            return null;
+        }
+    };
 
     /// Set or clear the core's preedit and record its owner, together.
     fn setPreedit(
@@ -3476,11 +3566,12 @@ pub const Surface = struct {
         // With no key there is no Shift-less character to compare the
         // text with (0), so a held Shift counts as consumed: the text is
         // final, as an IME commit's is.
+        const mods = currentMods();
         _ = self.keyText(core_surface, .{
             .action = .press,
             .key = .unidentified,
-            .mods = currentMods(),
-        }, &text, 0) catch |err| log.warn("key callback failed err={}", .{err});
+            .mods = mods,
+        }, &text, 0, isAltGr(mods, &text)) catch |err| log.warn("key callback failed err={}", .{err});
     }
 
     /// Bring the core up to date with what Win32 could not tell it in time,
@@ -4834,10 +4925,69 @@ test "win32: key modifiers for AltGr and consumed Shift" {
         var carry: ?u16 = null;
         for (c.units) |u| text.add(c.msg, u);
         text.finish(&carry);
-        const got = Surface.keyMods(c.mods, &text, c.shiftless);
+        const got = Surface.keyMods(c.mods, &text, c.shiftless, Surface.isAltGr(c.mods, &text));
         try std.testing.expectEqual(c.want, got.mods);
         try std.testing.expectEqual(c.consumed, got.consumed);
     }
+}
+
+test "win32: AltGr's release reports its press's modifiers" {
+    const t = std.testing;
+    const ctrl_alt: input.Mods = .{ .ctrl = true, .alt = true };
+    var held: std.StaticBitSet(512) = .initEmpty();
+    const q = 0x10;
+    const a = 0x1E;
+
+    // German AltGr+Q: '@' on the press and the repeat, no text on the
+    // release, with LCtrl+RAlt down throughout. All three report neither.
+    var at: Surface.Text = .{};
+    var carry: ?u16 = null;
+    at.add(win32.WM_CHAR, '@');
+    at.finish(&carry);
+    const none: Surface.Text = .{};
+    for ([_]struct { input.Action, *const Surface.Text }{
+        .{ .press, &at },
+        .{ .repeat, &at },
+        .{ .release, &none },
+    }) |ev| {
+        const alt_gr = Surface.altGrKey(&held, q, ev[0], ctrl_alt, ev[1]);
+        try t.expect(alt_gr);
+        try t.expectEqual(input.Mods{}, Surface.keyMods(ctrl_alt, ev[1], 'q', alt_gr).mods);
+    }
+    try t.expect(!held.isSet(q));
+
+    // A Ctrl+Alt chord that types nothing keeps both on press and release,
+    // and a release whose press was AltGr does not leak to another key.
+    _ = Surface.altGrKey(&held, q, .press, ctrl_alt, &at);
+    try t.expect(!Surface.altGrKey(&held, a, .press, ctrl_alt, &none));
+    try t.expect(!Surface.altGrKey(&held, a, .release, ctrl_alt, &none));
+    try t.expect(Surface.altGrKey(&held, q, .release, ctrl_alt, &none));
+}
+
+test "win32: the first Shift released of two is owed a release" {
+    const t = std.testing;
+
+    // LShift and RShift pressed, then both released: Windows sends a key-up
+    // for only one of them.
+    var shift: Surface.ShiftKeys = .{};
+    shift.sent(.shift_left, .press);
+    shift.sent(.shift_right, .press);
+    shift.sent(.shift_right, .release);
+    try t.expectEqual(input.Key.shift_left, shift.owed(false, false));
+    shift.sent(.shift_left, .release);
+    try t.expectEqual(null, shift.owed(false, false));
+
+    // Not while that Shift is still down.
+    shift.sent(.shift_left, .press);
+    shift.sent(.shift_right, .press);
+    shift.sent(.shift_right, .release);
+    try t.expectEqual(null, shift.owed(true, false));
+
+    // Never for a Shift whose press the core did not see.
+    shift = .{};
+    shift.sent(.shift_right, .press);
+    shift.sent(.shift_right, .release);
+    try t.expectEqual(null, shift.owed(false, false));
 }
 
 test "win32: Shift is judged with Caps Lock still applied" {
