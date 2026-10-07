@@ -11,9 +11,10 @@
 
         // Zig libs
         .libxev = .{
-            // mitchellh/libxev
-            .url = "https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz",
-            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
+            // mitchellh/libxev 9ce8e8e6 plus the AsyncIOCP copy fix
+            // (Pyre909/libxev fix/async-iocp-copy), until it lands upstream.
+            .url = "https://github.com/Pyre909/libxev/archive/c732e99f5d0c3b67f4c9df60d03e614b8ccec813.tar.gz",
+            .hash = "libxev-0.0.0-86vtczcaFABU5QhThBDbNoT6QbWEsNPbacTLTTXPnmId",
             .lazy = true,
         },
         .vaxis = .{
