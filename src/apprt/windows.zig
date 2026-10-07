@@ -327,6 +327,7 @@ const win32 = struct {
 
     const CF_UNICODETEXT: UINT = 13;
     const GMEM_MOVEABLE: UINT = 0x0002;
+    const CP_UTF8: UINT = 65001;
 
     const MB_OK: UINT = 0x00000000;
     const MB_OKCANCEL: UINT = 0x00000001;
@@ -367,6 +368,15 @@ const win32 = struct {
     extern "kernel32" fn GlobalUnlock(mem: HGLOBAL) callconv(.winapi) BOOL;
     /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalsize
     extern "kernel32" fn GlobalSize(mem: HGLOBAL) callconv(.winapi) usize;
+    /// https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-multibytetowidechar
+    extern "kernel32" fn MultiByteToWideChar(
+        code_page: UINT,
+        flags: DWORD,
+        src: [*]const u8,
+        src_len: c_int,
+        dst: ?[*]u16,
+        dst_len: c_int,
+    ) callconv(.winapi) c_int;
 
     extern "user32" fn RegisterClassExW(class: *const WNDCLASSEXW) callconv(.winapi) ATOM;
     extern "user32" fn UnregisterClassW(name: LPCWSTR, inst: ?HINSTANCE) callconv(.winapi) BOOL;
@@ -2474,64 +2484,9 @@ pub const Surface = struct {
             .cancel,
         )) return;
 
-        const alloc = self.app.core_app.alloc;
-        const wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, text);
-        defer alloc.free(wide);
-
-        // The clipboard is a process-wide lock. Every exit path from here on
-        // must release it, hence the defer immediately after opening.
-        // Every failure from here on returns an error rather than `void`.
-        // A bare `return` is this function reporting success, and the four
-        // failures below all happen *after* EmptyClipboard has already wiped
-        // the user's clipboard -- reporting success would mean the core
-        // believes a copy landed while the clipboard is empty. Every call site
-        // either catches or already returns an error union (in `Surface`:
-        // clipboardWrite, copySelectionToClipboards, performBindingAction,
-        // writeScreenFile and completeClipboardRequest), so this costs
-        // nothing.
-        if (!win32.OpenClipboard(self.hwnd).toBool()) {
-            log.warn("failed to open the clipboard for writing", .{});
-            return App.Error.Win32CallFailed;
-        }
-        defer _ = win32.CloseClipboard();
-
-        if (!win32.EmptyClipboard().toBool()) {
-            log.warn("failed to empty the clipboard", .{});
-            return App.Error.Win32CallFailed;
-        }
-
-        const bytes = (wide.len + 1) * @sizeOf(u16);
-        const mem = win32.GlobalAlloc(win32.GMEM_MOVEABLE, bytes) orelse {
-            log.warn("GlobalAlloc failed for {d} clipboard bytes", .{bytes});
-            return App.Error.Win32CallFailed;
-        };
-
-        // Freed only on the failure paths below: SetClipboardData takes
-        // ownership of the HGLOBAL on success, and freeing it then would be a
-        // double free the moment anything pastes.
-        var owned = true;
-        defer if (owned) {
-            _ = win32.GlobalFree(mem);
-        };
-
-        {
-            const dst_raw = win32.GlobalLock(mem) orelse {
-                log.warn("GlobalLock failed for the clipboard buffer", .{});
-                return App.Error.Win32CallFailed;
-            };
-            defer _ = win32.GlobalUnlock(mem);
-
-            const dst: [*]u16 = @ptrCast(@alignCast(dst_raw));
-            @memcpy(dst[0..wide.len], wide);
-            dst[wide.len] = 0;
-        }
-
-        if (win32.SetClipboardData(win32.CF_UNICODETEXT, mem) == null) {
-            log.warn("SetClipboardData failed", .{});
-            return App.Error.Win32CallFailed;
-        }
-
-        owned = false;
+        // An error, not a bare `return`, on every failure: the core must not
+        // believe a copy landed when it did not.
+        try writeClipboardText(self.hwnd, text);
     }
 
     /// The environment the child process starts from. The caller takes
@@ -4404,6 +4359,81 @@ fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     return try utf8FromClipboard(alloc, units[0 .. win32.GlobalSize(mem) / @sizeOf(u16)]);
 }
 
+/// Replace the clipboard's contents with `text` as CF_UNICODETEXT.
+///
+/// Bytes that are not valid UTF-8 become U+FFFD rather than failing the
+/// write: an OSC 52 payload is whatever the program sent, and macOS stores it
+/// as given.
+fn writeClipboardText(hwnd: win32.HWND, text: []const u8) App.Error!void {
+    const len = std.math.cast(c_int, text.len) orelse {
+        log.warn("clipboard text too long len={d}", .{text.len});
+        return App.Error.Win32CallFailed;
+    };
+
+    // Without MB_ERR_INVALID_CHARS, MultiByteToWideChar replaces invalid
+    // sequences with U+FFFD. std has no lossy UTF-8 to UTF-16 conversion.
+    // A zero length is an error to MultiByteToWideChar, hence the guard.
+    const units: usize = if (len == 0) 0 else units: {
+        const n = win32.MultiByteToWideChar(win32.CP_UTF8, 0, text.ptr, len, null, 0);
+        if (n == 0) {
+            log.warn("MultiByteToWideChar failed err={}", .{std.os.windows.GetLastError()});
+            return App.Error.Win32CallFailed;
+        }
+        break :units @intCast(n);
+    };
+
+    // The buffer is built before the clipboard is opened, so the only failure
+    // after EmptyClipboard is SetClipboardData itself, and the process-wide
+    // clipboard lock is held for as short a time as possible.
+    const bytes = (units + 1) * @sizeOf(u16);
+    const mem = win32.GlobalAlloc(win32.GMEM_MOVEABLE, bytes) orelse {
+        log.warn("GlobalAlloc failed bytes={d} err={}", .{ bytes, std.os.windows.GetLastError() });
+        return App.Error.Win32CallFailed;
+    };
+    // SetClipboardData takes ownership on success; freeing it after that
+    // would be a double free the moment anything pastes.
+    errdefer _ = win32.GlobalFree(mem);
+
+    {
+        const raw = win32.GlobalLock(mem) orelse {
+            log.warn("GlobalLock failed err={}", .{std.os.windows.GetLastError()});
+            return App.Error.Win32CallFailed;
+        };
+        defer _ = win32.GlobalUnlock(mem);
+
+        const dst: [*]u16 = @ptrCast(@alignCast(raw));
+        if (units > 0) {
+            // The same input as the measuring call, so the same count.
+            const n = win32.MultiByteToWideChar(
+                win32.CP_UTF8,
+                0,
+                text.ptr,
+                len,
+                dst,
+                @intCast(units),
+            );
+            std.debug.assert(n == units);
+        }
+        dst[units] = 0;
+    }
+
+    if (!win32.OpenClipboard(hwnd).toBool()) {
+        log.warn("OpenClipboard failed err={}", .{std.os.windows.GetLastError()});
+        return App.Error.Win32CallFailed;
+    }
+    defer _ = win32.CloseClipboard();
+
+    if (!win32.EmptyClipboard().toBool()) {
+        log.warn("EmptyClipboard failed err={}", .{std.os.windows.GetLastError()});
+        return App.Error.Win32CallFailed;
+    }
+
+    if (win32.SetClipboardData(win32.CF_UNICODETEXT, mem) == null) {
+        log.warn("SetClipboardData failed err={}", .{std.os.windows.GetLastError()});
+        return App.Error.Win32CallFailed;
+    }
+}
+
 /// UTF-8 for a CF_UNICODETEXT block. The text ends at the first NUL, or at
 /// the end of the block: Windows does not enforce the terminator, so an
 /// owner that leaves it out must not make us read past the block. The text
@@ -5165,6 +5195,51 @@ test "win32: clipboard text stops at the block and survives bad surrogates" {
     const got = try utf8FromClipboard(alloc, backing[0..2]);
     defer alloc.free(got);
     try std.testing.expectEqualStrings("xy", got);
+}
+
+test "win32: clipboard writes read back, with invalid UTF-8 replaced" {
+    const alloc = std.testing.allocator;
+
+    // SetClipboardData fails for a clipboard opened without an owner window,
+    // so the test needs one. A message-only STATIC window is enough.
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    // Put back whatever text the clipboard held. Other formats are lost,
+    // which is acceptable for a test.
+    const saved = try readClipboardText(alloc, hwnd);
+    defer if (saved) |text| {
+        writeClipboardText(hwnd, text) catch {};
+        alloc.free(text);
+    };
+
+    const Case = struct { text: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .text = "", .want = "" },
+        .{ .text = "caf\u{e9} \u{1F600}", .want = "caf\u{e9} \u{1F600}" },
+        // Latin-1 from a legacy program, as OSC 52 can deliver it.
+        .{ .text = "caf\xe9", .want = "caf\u{FFFD}" },
+    };
+    for (cases) |c| {
+        try writeClipboardText(hwnd, c.text);
+        const got = (try readClipboardText(alloc, hwnd)) orelse
+            return error.TestUnexpectedResult;
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
 }
 
 test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
