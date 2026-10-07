@@ -859,7 +859,7 @@ pub const App = struct {
         if (self.config.@"initial-window") {
             _ = self.newSurface() catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
-                fatalNotice(self.core_app.alloc, err);
+                fatalNotice(err);
                 return err;
             };
         }
@@ -1783,33 +1783,6 @@ pub const Surface = struct {
         fn setContextLparam(lparam: win32.LPARAM) win32.LPARAM {
             return @bitCast(@as(usize, @bitCast(lparam)) & ~win32.ISC_SHOWUICOMPOSITIONWINDOW);
         }
-
-        /// UTF-8 for an IME string. Unpaired surrogates are dropped: they
-        /// have no UTF-8 form, and the core's preedit rejects invalid
-        /// input. Nothing else is filtered, as in the GTK and macOS
-        /// runtimes.
-        fn utf8FromUtf16(alloc: Allocator, units: []const u16) Allocator.Error![]u8 {
-            var out: std.ArrayListUnmanaged(u8) = .empty;
-            errdefer out.deinit(alloc);
-            try out.ensureTotalCapacity(alloc, units.len * 3);
-
-            var i: usize = 0;
-            while (i < units.len) : (i += 1) {
-                const unit = units[i];
-                var cp: u21 = unit;
-                if (std.unicode.utf16IsHighSurrogate(unit)) {
-                    if (i + 1 >= units.len or !std.unicode.utf16IsLowSurrogate(units[i + 1])) continue;
-                    cp = std.unicode.utf16DecodeSurrogatePair(&[_]u16{ unit, units[i + 1] }) catch continue;
-                    i += 1;
-                } else if (std.unicode.utf16IsLowSurrogate(unit)) {
-                    continue;
-                }
-                var buf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cp, &buf) catch continue;
-                out.appendSliceAssumeCapacity(buf[0..n]);
-            }
-            return out.toOwnedSlice(alloc);
-        }
     };
 
     /// What the core has been told about the mouse.
@@ -2502,10 +2475,14 @@ pub const Surface = struct {
 
     /// Set the window title and remember it for `getTitle`. Returns false if
     /// the title could not be applied, which is what `.set_title` reports.
+    ///
+    /// The core validates only OSC titles; one from the `title` config, a
+    /// keybinding or a command's argv[0] can be any bytes. Invalid UTF-8 is
+    /// shown as U+FFFD, as macOS does, and the title is stored as given.
     fn setTitle(self: *Surface, title: [:0]const u8) bool {
         const alloc = self.app.core_app.alloc;
 
-        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, title) catch |err| {
+        const wide = wideFromUtf8(alloc, title) catch |err| {
             log.warn("failed to encode the window title err={}", .{err});
             return false;
         };
@@ -2516,15 +2493,8 @@ pub const Surface = struct {
             return false;
         }
 
-        // The stored copy is allocated last, after the final failure point,
-        // and that ordering is the leak fix: this function returns `bool`, not
-        // an error union, so an `errdefer` guarding an earlier allocation would
-        // compile and simply never run. `.set_title` fires on every OSC 0/2, so
-        // a leak here would be per title change.
-        //
-        // Failing here leaves the window text updated but `getTitle` stale
-        // until the next set. That is strictly better than the alternative,
-        // which is to leak on a path that repeats forever.
+        // Stored only after SetWindowTextW succeeds: this returns bool, so an
+        // errdefer would never run.
         const copy = alloc.dupeZ(u8, title) catch |err| {
             log.warn("failed to store the window title err={}", .{err});
             return false;
@@ -3427,17 +3397,19 @@ pub const Surface = struct {
         // Sizes are in bytes, and the string is not terminated.
         const size = win32.ImmGetCompositionStringW(himc, index, null, 0);
         if (size <= 0 or @rem(size, 2) != 0) return null;
-        const units = alloc.alloc(u16, @intCast(@divExact(size, 2))) catch |err| {
+        var stack = std.heap.stackFallback(512, alloc);
+        const units_alloc = stack.get();
+        const units = units_alloc.alloc(u16, @intCast(@divExact(size, 2))) catch |err| {
             log.warn("ime string dropped err={}", .{err});
             return null;
         };
-        defer alloc.free(units);
+        defer units_alloc.free(units);
 
         const got = win32.ImmGetCompositionStringW(himc, index, units.ptr, @intCast(size));
         if (got <= 0) return null;
         const len: usize = @intCast(@divTrunc(@min(got, size), 2));
 
-        const utf8 = Ime.utf8FromUtf16(alloc, units[0..len]) catch |err| {
+        const utf8 = utf8FromWide(alloc, units[0..len]) catch |err| {
             log.warn("ime string dropped err={}", .{err});
             return null;
         };
@@ -4440,12 +4412,43 @@ fn writeClipboardText(hwnd: win32.HWND, text: []const u8) App.Error!void {
 /// is WTF-16, so an unpaired surrogate becomes U+FFFD, as
 /// WideCharToMultiByte does, instead of failing the whole paste.
 fn utf8FromClipboard(alloc: Allocator, block: []const u16) Allocator.Error![]u8 {
-    const text = block[0 .. std.mem.indexOfScalar(u16, block, 0) orelse block.len];
-    const buf = try std.unicode.wtf16LeToWtf8Alloc(alloc, text);
+    return try utf8FromWide(alloc, block[0 .. std.mem.indexOfScalar(u16, block, 0) orelse block.len]);
+}
+
+/// UTF-8 for text from Windows, which is WTF-16: an unpaired surrogate
+/// becomes U+FFFD, as WideCharToMultiByte does, instead of failing. The
+/// caller frees the result.
+fn utf8FromWide(alloc: Allocator, units: []const u16) Allocator.Error![]u8 {
+    const buf = try std.unicode.wtf16LeToWtf8Alloc(alloc, units);
     // In place: a surrogate's WTF-8 and U+FFFD are both three bytes, and
     // wtf16LeToWtf8 never produces invalid WTF-8.
     std.unicode.wtf8ToUtf8Lossy(buf, buf) catch unreachable;
     return buf;
+}
+
+/// NUL-terminated UTF-16 for `text`: each invalid UTF-8 sequence becomes
+/// U+FFFD instead of failing, as in writeClipboardText. The caller frees
+/// the result.
+fn wideFromUtf8(alloc: Allocator, text: []const u8) (Allocator.Error || App.Error)![:0]u16 {
+    // A zero length is an error to MultiByteToWideChar.
+    if (text.len == 0) return try alloc.allocSentinel(u16, 0, 0);
+    const len = std.math.cast(c_int, text.len) orelse {
+        log.warn("text too long to convert len={d}", .{text.len});
+        return App.Error.Win32CallFailed;
+    };
+
+    // Without MB_ERR_INVALID_CHARS, MultiByteToWideChar replaces invalid
+    // sequences with U+FFFD. std has no lossy UTF-8 to UTF-16 conversion.
+    const n = win32.MultiByteToWideChar(win32.CP_UTF8, 0, text.ptr, len, null, 0);
+    if (n == 0) {
+        log.warn("MultiByteToWideChar failed err={}", .{std.os.windows.GetLastError()});
+        return App.Error.Win32CallFailed;
+    }
+    const wide = try alloc.allocSentinel(u16, @intCast(n), 0);
+    // The same input as the measuring call, so the same count.
+    const written = win32.MultiByteToWideChar(win32.CP_UTF8, 0, text.ptr, len, wide.ptr, n);
+    std.debug.assert(written == n);
+    return wide;
 }
 
 /// The text of the prompt for a clipboard read the core would not complete
@@ -4523,7 +4526,7 @@ fn notice(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) void {
 /// when it was launched from Explorer or the Start menu, so the error is
 /// shown in a message box as well. Nothing is beneath it yet, so the
 /// nesting rules of `notice` do not apply.
-fn fatalNotice(alloc: Allocator, err: anyerror) void {
+fn fatalNotice(err: anyerror) void {
     const what: []const u8 = switch (err) {
         error.D3D11DeviceFailed => "Direct3D 11 feature level 11_0 is not available, not even through WARP",
         error.D3D11SwapChainFailed => "Direct3D 11 could not create a swap chain for the window",
@@ -4536,9 +4539,12 @@ fn fatalNotice(alloc: Allocator, err: anyerror) void {
         "Ghostty could not create its window: {s}.",
         .{what},
     ) catch "Ghostty could not create its window.";
-    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
-    defer alloc.free(wide);
-    _ = win32.MessageBoxW(null, wide.ptr, L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
+    // On the stack, so that OutOfMemory can still be reported. `text` is
+    // valid UTF-8 no longer than `buf`, so its UTF-16 fits and cannot fail.
+    var wide: [buf.len + 1]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, text) catch unreachable;
+    wide[n] = 0;
+    _ = win32.MessageBoxW(null, wide[0..n :0], L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
 }
 
 /// Opens `wide` with the shell, then frees it. COM is initialized for the
@@ -5326,24 +5332,40 @@ test "win32: ime plan for a composition message" {
     }
 }
 
-test "win32: ime strings become UTF-8 without unpaired surrogates" {
+test "win32: wide strings become UTF-8 with unpaired surrogates replaced" {
     const alloc = std.testing.allocator;
     const Case = struct { units: []const u16, want: []const u8 };
     const cases = [_]Case{
         .{ .units = &.{}, .want = "" },
         .{ .units = &.{ 0x65E5, 0x672C }, .want = "\u{65E5}\u{672C}" },
         .{ .units = &.{ 0xD83D, 0xDE00 }, .want = "\u{1F600}" },
-        // A control character is kept: only what has no UTF-8 form is dropped.
         .{ .units = &.{ 'a', 0x000A, 'b' }, .want = "a\nb" },
-        .{ .units = &.{ 'a', 0xD83D }, .want = "a" },
-        .{ .units = &.{ 0xDE00, 'a' }, .want = "a" },
-        .{ .units = &.{ 0xD83D, 'a', 0xDE00 }, .want = "a" },
-        .{ .units = &.{ 0xD83D, 0xD83D, 0xDE00 }, .want = "\u{1F600}" },
+        .{ .units = &.{ 'a', 0xD83D }, .want = "a\u{FFFD}" },
+        .{ .units = &.{ 0xDE00, 'a' }, .want = "\u{FFFD}a" },
+        .{ .units = &.{ 0xD83D, 'a', 0xDE00 }, .want = "\u{FFFD}a\u{FFFD}" },
+        .{ .units = &.{ 0xD83D, 0xD83D, 0xDE00 }, .want = "\u{FFFD}\u{1F600}" },
     };
     for (cases) |c| {
-        const got = try Surface.Ime.utf8FromUtf16(alloc, c.units);
+        const got = try utf8FromWide(alloc, c.units);
         defer alloc.free(got);
         try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "win32: utf-8 becomes wide text with invalid sequences replaced" {
+    const alloc = std.testing.allocator;
+    const Case = struct { text: []const u8, want: []const u16 };
+    const cases = [_]Case{
+        .{ .text = "", .want = &.{} },
+        .{ .text = "\u{65E5}\u{1F600}", .want = &.{ 0x65E5, 0xD83D, 0xDE00 } },
+        // Latin-1, as from a config saved in a legacy code page.
+        .{ .text = "caf\xe9", .want = &.{ 'c', 'a', 'f', 0xFFFD } },
+    };
+    for (cases) |c| {
+        const got = try wideFromUtf8(alloc, c.text);
+        defer alloc.free(got);
+        try std.testing.expectEqualSlices(u16, c.want, got);
+        try std.testing.expectEqual(0, got[got.len]);
     }
 }
 
