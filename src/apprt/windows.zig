@@ -276,6 +276,7 @@ const win32 = struct {
     const VK_NUMPAD0: UINT = 0x60;
     const VK_NUMPAD9: UINT = 0x69;
     const VK_DECIMAL: UINT = 0x6E;
+    const VK_SHIFT: c_int = 0x10;
     const VK_CAPITAL: c_int = 0x14;
     const VK_NUMLOCK: c_int = 0x90;
     const VK_LWIN: c_int = 0x5B;
@@ -503,6 +504,7 @@ const win32 = struct {
         flags: DWORD,
     ) callconv(.winapi) DWORD;
     extern "user32" fn GetKeyState(vk: c_int) callconv(.winapi) SHORT;
+    extern "user32" fn GetKeyboardState(key_state: *[256]BYTE) callconv(.winapi) BOOL;
     extern "user32" fn MapVirtualKeyW(code: UINT, map_type: UINT) callconv(.winapi) UINT;
     extern "user32" fn GetKeyboardLayout(thread_id: DWORD) callconv(.winapi) ?HKL;
     extern "user32" fn ToUnicodeEx(
@@ -3105,7 +3107,14 @@ pub const Surface = struct {
         if (self.app.canReenterCore()) self.flushIme(core_surface);
 
         const unshifted: u21 = if (is_packet) 0 else unshiftedCodepoint(vk, scan);
-        const mods_out = keyMods(mods_in, &text, unshifted);
+        const shiftless: u21 = if (is_packet or !mods_in.shift) unshifted else shiftless: {
+            // The state as of this message, like currentMods. On failure
+            // the unshifted codepoint is the best guess left.
+            var state: [256]win32.BYTE = undefined;
+            if (!win32.GetKeyboardState(&state).toBool()) break :shiftless unshifted;
+            break :shiftless shiftlessCodepoint(vk, scan, &state);
+        };
+        const mods_out = keyMods(mods_in, &text, shiftless);
 
         // A dead key shows its accent as preedit until the next committed
         // text replaces it. The core does not track this itself
@@ -3133,9 +3142,9 @@ pub const Surface = struct {
     };
 
     /// The modifiers to report for a keystroke that produced `text`, given
-    /// the state the key message was read with and the key's codepoint with
-    /// no modifiers.
-    fn keyMods(mods_in: input.Mods, text: *const Text, unshifted: u21) KeyMods {
+    /// the state the key message was read with and the key's codepoint in
+    /// that state with Shift released (shiftlessCodepoint).
+    fn keyMods(mods_in: input.Mods, text: *const Text, shiftless: u21) KeyMods {
         var result: KeyMods = .{ .mods = mods_in };
 
         // AltGr. Windows reports AltGr as LCtrl+RAlt, and a Ctrl+Alt chord that
@@ -3152,11 +3161,14 @@ pub const Surface = struct {
         }
 
         // Win32 has no consumed-modifiers report. Shift is the only one that
-        // can be inferred: it was consumed if it changed the character.
+        // can be inferred: it was consumed if it changed the character. The
+        // comparison is with the rest of the state kept: with Caps Lock on,
+        // Shift+A gives "a", the same as with no modifiers at all, but
+        // Shift still changed it from "A".
         if (result.mods.shift and text.len > 0) {
             var buf: [4]u8 = undefined;
-            const n = if (unshifted != 0)
-                std.unicode.utf8Encode(unshifted, &buf) catch 0
+            const n = if (shiftless != 0)
+                std.unicode.utf8Encode(shiftless, &buf) catch 0
             else
                 0;
             result.consumed.shift = !std.mem.eql(u8, buf[0..n], text.utf8());
@@ -4108,19 +4120,35 @@ fn isAltNumpad(
 
 /// The character the key produces with no modifiers in the current layout,
 /// or 0. Used by the encoder for Ctrl/Alt sequences and by bindings.
+fn unshiftedCodepoint(vk: win32.UINT, scan: u32) u21 {
+    return layoutCodepoint(vk, scan, &std.mem.zeroes([256]win32.BYTE));
+}
+
+/// The character the key produces in the current layout with `state`
+/// (GetKeyboardState) but Shift released, or 0. Unlike unshiftedCodepoint,
+/// Caps Lock and AltGr stay applied, so keyMods can tell what Shift itself
+/// changed.
+fn shiftlessCodepoint(vk: win32.UINT, scan: u32, state: *const [256]win32.BYTE) u21 {
+    var shiftless = state.*;
+    for ([_]c_int{ win32.VK_SHIFT, win32.VK_LSHIFT, win32.VK_RSHIFT }) |shift| {
+        shiftless[@intCast(shift)] = 0;
+    }
+    return layoutCodepoint(vk, scan, &shiftless);
+}
+
+/// The character the key produces with `state` in the current layout, or 0.
 ///
 /// TOUNICODE_NO_STATE_CHANGE keeps this query from consuming a pending dead
 /// key; on Windows before 10 1607, which ignores the flag, a dead key
 /// followed by another key can lose its accent.
-fn unshiftedCodepoint(vk: win32.UINT, scan: u32) u21 {
-    const empty_state = std.mem.zeroes([256]win32.BYTE);
+fn layoutCodepoint(vk: win32.UINT, scan: u32, state: *const [256]win32.BYTE) u21 {
     var buf: [4]win32.WCHAR = undefined;
     const n = win32.ToUnicodeEx(
         vk,
         // Only the low byte. ToUnicodeEx reads bit 15 of the scan code as
         // "key is up", and the 0xE0 extended prefix sets exactly that bit.
         scan & 0xFF,
-        &empty_state,
+        state,
         &buf,
         buf.len,
         win32.TOUNICODE_NO_STATE_CHANGE,
@@ -4652,7 +4680,7 @@ test "win32: key modifiers for AltGr and consumed Shift" {
         mods: input.Mods,
         msg: win32.UINT = win32.WM_CHAR,
         units: []const u16,
-        unshifted: u21,
+        shiftless: u21,
         want: input.Mods,
         consumed: input.Mods = .{},
     };
@@ -4661,7 +4689,7 @@ test "win32: key modifiers for AltGr and consumed Shift" {
         .{
             .mods = .{ .ctrl = true, .alt = true },
             .units = &.{'@'},
-            .unshifted = 'q',
+            .shiftless = 'q',
             .want = .{},
         },
         // Alt+A keeps its Alt, so the encoder prefixes ESC.
@@ -4669,7 +4697,7 @@ test "win32: key modifiers for AltGr and consumed Shift" {
             .mods = .{ .alt = true },
             .msg = win32.WM_SYSCHAR,
             .units = &.{'a'},
-            .unshifted = 'a',
+            .shiftless = 'a',
             .want = .{ .alt = true },
         },
         // Text only from WM_SYSCHAR is Alt's, not AltGr's, even with Ctrl
@@ -4678,7 +4706,7 @@ test "win32: key modifiers for AltGr and consumed Shift" {
             .mods = .{ .ctrl = true, .alt = true },
             .msg = win32.WM_SYSCHAR,
             .units = &.{'a'},
-            .unshifted = 'a',
+            .shiftless = 'a',
             .want = .{ .ctrl = true, .alt = true },
         },
         // Ctrl+Alt with no text, or only a dropped control character, is
@@ -4686,28 +4714,36 @@ test "win32: key modifiers for AltGr and consumed Shift" {
         .{
             .mods = .{ .ctrl = true, .alt = true },
             .units = &.{},
-            .unshifted = 'a',
+            .shiftless = 'a',
             .want = .{ .ctrl = true, .alt = true },
         },
         .{
             .mods = .{ .ctrl = true, .alt = true },
             .units = &.{0x01},
-            .unshifted = 'a',
+            .shiftless = 'a',
             .want = .{ .ctrl = true, .alt = true },
         },
         // Shift that changed the character was consumed; it stays in mods.
         .{
             .mods = .{ .shift = true },
             .units = &.{'A'},
-            .unshifted = 'a',
+            .shiftless = 'a',
             .want = .{ .shift = true },
             .consumed = .{ .shift = true },
         },
         .{
             .mods = .{ .shift = true },
             .units = &.{'!'},
-            .unshifted = '1',
+            .shiftless = '1',
             .want = .{ .shift = true },
+            .consumed = .{ .shift = true },
+        },
+        // Caps Lock+Shift+A gives "a", which Shift changed from "A".
+        .{
+            .mods = .{ .shift = true, .caps_lock = true },
+            .units = &.{'a'},
+            .shiftless = 'A',
+            .want = .{ .shift = true, .caps_lock = true },
             .consumed = .{ .shift = true },
         },
         // Shift that did not change it, or whose text was dropped
@@ -4715,13 +4751,13 @@ test "win32: key modifiers for AltGr and consumed Shift" {
         .{
             .mods = .{ .shift = true },
             .units = &.{' '},
-            .unshifted = ' ',
+            .shiftless = ' ',
             .want = .{ .shift = true },
         },
         .{
             .mods = .{ .shift = true },
             .units = &.{0x0D},
-            .unshifted = 0x0D,
+            .shiftless = 0x0D,
             .want = .{ .shift = true },
         },
     };
@@ -4729,10 +4765,33 @@ test "win32: key modifiers for AltGr and consumed Shift" {
         var text: Surface.Text = .{};
         for (c.units) |u| text.add(c.msg, u);
         text.finish();
-        const got = Surface.keyMods(c.mods, &text, c.unshifted);
+        const got = Surface.keyMods(c.mods, &text, c.shiftless);
         try std.testing.expectEqual(c.want, got.mods);
         try std.testing.expectEqual(c.consumed, got.consumed);
     }
+}
+
+test "win32: Shift is judged with Caps Lock still applied" {
+    // The expected characters are the US layout's.
+    if (inputLanguage() != 0x0409) return error.SkipZigTest;
+
+    const vk_a = 'A';
+    const scan_a = 0x1E;
+    var state = std.mem.zeroes([256]win32.BYTE);
+    state[@intCast(win32.VK_CAPITAL)] = 0x01;
+    state[@intCast(win32.VK_SHIFT)] = 0x80;
+    state[@intCast(win32.VK_LSHIFT)] = 0x80;
+
+    // Caps Lock+Shift+A types "a", the same as A with no modifiers, so only
+    // the state without Shift shows that Shift changed it.
+    try std.testing.expectEqual('a', layoutCodepoint(vk_a, scan_a, &state));
+    try std.testing.expectEqual('a', unshiftedCodepoint(vk_a, scan_a));
+    try std.testing.expectEqual('A', shiftlessCodepoint(vk_a, scan_a, &state));
+
+    // Without Caps Lock, Shift is all that changed it.
+    state[@intCast(win32.VK_CAPITAL)] = 0;
+    try std.testing.expectEqual('A', layoutCodepoint(vk_a, scan_a, &state));
+    try std.testing.expectEqual('a', shiftlessCodepoint(vk_a, scan_a, &state));
 }
 
 test "win32: AltGr is a Left Ctrl followed by an extended Right Alt" {
