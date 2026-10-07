@@ -1658,7 +1658,18 @@ pub const Surface = struct {
         /// (`isWindowMenuKey`). Their key-up is kept from the core as well.
         swallow_up: std.StaticBitSet(512) = .initEmpty(),
 
-        const Preedit = enum { none, dead_key, ime };
+        const Preedit = enum {
+            none,
+            dead_key,
+            ime,
+
+            /// Whether committed text replaces this preedit. Any preedit
+            /// does, as in GTK (src/apprt/gtk/class/surface.zig imCommit):
+            /// a dead key's accent is not left drawn after the IME's text.
+            fn clearedByCommit(self: Preedit) bool {
+                return self != .none;
+            }
+        };
 
         const Action = enum {
             /// preeditCallback(null).
@@ -1712,9 +1723,7 @@ pub const Surface = struct {
             const result = gcs & win32.GCS_RESULTSTR != 0;
             if (result) {
                 if (core_safe) {
-                    // A commit replaces whatever preedit is showing, as in
-                    // GTK (src/apprt/gtk/class/surface.zig imCommit).
-                    if (owner != .none) p.add(.clear_preedit);
+                    if (owner.clearedByCommit()) p.add(.clear_preedit);
                     p.add(.commit_result);
                 } else {
                     p.add(.defer_result);
@@ -3353,8 +3362,7 @@ pub const Surface = struct {
     fn flushIme(self: *Surface, core_surface: *CoreSurface) void {
         if (self.ime.pending.items.len != 0) {
             const alloc = self.app.core_app.alloc;
-            // The preedit shown is what this text replaces.
-            if (self.preedit == .ime) {
+            if (self.preedit.clearedByCommit()) {
                 self.setPreedit(core_surface, null, .none) catch |err|
                     log.warn("preedit callback failed err={}", .{err});
             }
@@ -3465,14 +3473,26 @@ pub const Surface = struct {
     /// completed, because a Hangul composition string is text the user
     /// already sees as typed, with no conversion step to confirm; other
     /// languages are cancelled, so that half-converted text does not reach
-    /// a shell the user is no longer looking at. Nothing is done while one
-    /// of this thread's own windows has the focus (a prompt): the user
-    /// returns to the composition.
+    /// a shell the user is no longer looking at.
     fn syncIme(self: *Surface, core_surface: *CoreSurface) void {
         self.flushIme(core_surface);
 
-        if (self.focused or win32.GetFocus() != null) return;
+        // The fields first: this runs for every surface on every pass of
+        // `App.run`, and almost never has anything to do.
+        if (self.focused) return;
         if (!self.ime.composing and self.preedit != .ime) return;
+
+        // Another of this thread's windows has the focus. No prompt is
+        // open here (`canReenterCore` holds), so it is another surface.
+        // Every window of the thread shares the default input context,
+        // which is that window's now: ending the composition through it
+        // could end one the user is typing there. Only this window's own
+        // state is dropped.
+        if (win32.GetFocus() != null) {
+            self.ime.composing = false;
+            self.flushIme(core_surface);
+            return;
+        }
 
         if (win32.ImmGetContext(self.hwnd)) |himc| {
             const how = if (inputLanguage() & 0x3FF == win32.LANG_KOREAN)
@@ -5317,6 +5337,11 @@ test "win32: ime plan for a composition message" {
         const got = Ime.plan(c.bits, c.owner, c.safe);
         try std.testing.expectEqualSlices(A, c.want, got.actions());
     }
+
+    // A deferred result (`flushIme`) replaces the same preedits.
+    try std.testing.expect(!Ime.Preedit.none.clearedByCommit());
+    try std.testing.expect(Ime.Preedit.dead_key.clearedByCommit());
+    try std.testing.expect(Ime.Preedit.ime.clearedByCommit());
 
     // Every result is either committed or deferred, for every input.
     for ([_]Ime.Preedit{ .none, .dead_key, .ime }) |owner| {
