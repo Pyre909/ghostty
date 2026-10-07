@@ -1625,9 +1625,10 @@ pub const Surface = struct {
         /// input. Owned; freed in `stopCore` and `deinit`.
         pending: std.ArrayListUnmanaged(u8) = .empty,
 
-        /// Keys whose key-down the IME claimed (VK_PROCESSKEY), by
-        /// `scanSlot`. The core never saw those presses, so a key-up that
-        /// arrives with the real virtual key is kept from it as well.
+        /// Keys whose key-down the core never saw, by `scanSlot`: the IME
+        /// claimed it (VK_PROCESSKEY), or it was a digit of Alt+numpad
+        /// entry (`isAltNumpad`). Their key-up is kept from the core as
+        /// well.
         swallow_up: std.StaticBitSet(512) = .initEmpty(),
 
         const Preedit = enum { none, dead_key, ime };
@@ -2832,7 +2833,8 @@ pub const Surface = struct {
                     if (msg == win32.WM_KEYDOWN or msg == win32.WM_SYSKEYDOWN) self.ime.swallow_up.set(slot);
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
-                if (self.ime.swallow_up.isSet(slot)) {
+                const withheld = self.ime.swallow_up.isSet(slot);
+                if (withheld) {
                     self.ime.swallow_up.unset(slot);
                     if (msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP) {
                         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2857,6 +2859,16 @@ pub const Surface = struct {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
 
+                // Alt+numpad entry: TranslateMessage collects the digits and
+                // posts the character as WM_CHAR when Alt is released, which
+                // reaches strayChar. The digits themselves must not reach the
+                // core, or the encoder would send them ahead of the
+                // character. The key-up is withheld like an IME key's.
+                if (isAltNumpad(keyAction(msg, lparam), @truncate(wparam), mods, withheld)) {
+                    self.ime.swallow_up.set(slot);
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+
                 const effect = self.keyEvent(core_surface, msg, wparam, lparam, mods) catch |err| {
                     log.warn("key callback failed err={}", .{err});
                     return 0;
@@ -2878,9 +2890,12 @@ pub const Surface = struct {
             win32.WM_SYSDEADCHAR,
             => {
                 // Normally never seen: keyEvent removes the characters its
-                // keydown produced. What arrives here was posted by someone
-                // else (SendMessage/PostMessage from another program, or a
-                // keydown the core surface did not exist for yet).
+                // keydown produced. What arrives here came without a keydown
+                // to attach it to: a character produced on a key-up (Alt+
+                // numpad entry posts its WM_CHAR when Alt is released, and
+                // keyEvent collects text only for presses), a character
+                // another program posted, or a keydown the core surface did
+                // not exist for yet.
 
                 // Alt+Space's WM_SYSCHAR, deliberately left in the queue by
                 // the keydown handler: DefWindowProcW turns it into
@@ -4062,6 +4077,35 @@ fn numpadKey(key: input.Key, vk: win32.UINT) input.Key {
     };
 }
 
+/// Whether a key-down of virtual key `vk` is a digit of Alt+numpad entry:
+/// with Alt held alone, the keypad's digit keys type a decimal character
+/// code, and TranslateMessage posts the character as WM_CHAR when Alt is
+/// released. The digits produce no character of their own.
+///
+/// A repeat follows its press rather than the modifiers, so that the core
+/// sees every key it is told about from press to release: it is a digit of
+/// the entry when the press was withheld (`withheld`, from `swallow_up`),
+/// even if Alt has since been released, and it is not when the press
+/// reached the core before Alt went down.
+///
+/// Only VK_NUMPAD0 to VK_NUMPAD9 match, so NumLock must be on. With NumLock
+/// off the same keys arrive as VK_INSERT, VK_END and the other navigation
+/// keys (`numpadKey`), which stay Alt-modified navigation keys for the core.
+/// AltGr is Ctrl+Alt and does not start an entry.
+fn isAltNumpad(
+    action: input.Action,
+    vk: win32.UINT,
+    mods: input.Mods,
+    withheld: bool,
+) bool {
+    if (vk < win32.VK_NUMPAD0 or vk > win32.VK_NUMPAD9) return false;
+    return switch (action) {
+        .press => mods.binding().equal(.{ .alt = true }),
+        .repeat => withheld,
+        .release => false,
+    };
+}
+
 /// The character the key produces with no modifiers in the current layout,
 /// or 0. Used by the encoder for Ctrl/Alt sequences and by bindings.
 ///
@@ -4518,6 +4562,48 @@ test "win32: keypad keys follow NumLock" {
     };
     for (cases) |c| {
         try testing.expectEqual(c.want, numpadKey(keyFromScan(c.scan), c.vk));
+    }
+}
+
+test "win32: Alt+numpad digits are text entry" {
+    const testing = std.testing;
+    const alt: input.Mods = .{ .alt = true };
+    const Case = struct {
+        action: input.Action = .press,
+        vk: win32.UINT,
+        mods: input.Mods = alt,
+        withheld: bool = false,
+        want: bool,
+    };
+    const cases = [_]Case{
+        // The digits with NumLock on, from either Alt.
+        .{ .vk = 0x60, .want = true }, // VK_NUMPAD0
+        .{ .vk = 0x69, .want = true }, // VK_NUMPAD9
+        .{ .vk = 0x60, .mods = .{ .alt = true, .num_lock = true }, .want = true },
+        .{ .vk = 0x60, .mods = .{ .alt = true, .sides = .{ .alt = .right } }, .want = true },
+
+        // A repeat follows its press: withheld while the press was, even
+        // after Alt is released, and passed on when the press reached the
+        // core before Alt went down.
+        .{ .vk = 0x61, .action = .repeat, .withheld = true, .want = true },
+        .{ .vk = 0x61, .action = .repeat, .mods = .{}, .withheld = true, .want = true },
+        .{ .vk = 0x61, .action = .repeat, .want = false },
+
+        // Not an entry: the release, no Alt, AltGr, Alt with another
+        // modifier, the keypad with NumLock off, the keypad's other keys,
+        // and the main keyboard's digits.
+        .{ .vk = 0x60, .action = .release, .withheld = true, .want = false },
+        .{ .vk = 0x60, .mods = .{}, .want = false },
+        .{ .vk = 0x60, .mods = .{ .alt = true, .ctrl = true }, .want = false },
+        .{ .vk = 0x60, .mods = .{ .alt = true, .super = true }, .want = false },
+        .{ .vk = 0x2D, .want = false }, // VK_INSERT
+        .{ .vk = 0x23, .want = false }, // VK_END
+        .{ .vk = 0x6E, .want = false }, // VK_DECIMAL
+        .{ .vk = 0x6B, .want = false }, // VK_ADD
+        .{ .vk = 0x30, .want = false }, // 0 on the main keyboard
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.want, isAltNumpad(c.action, c.vk, c.mods, c.withheld));
     }
 }
 
