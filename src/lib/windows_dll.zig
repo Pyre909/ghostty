@@ -16,7 +16,8 @@
 //! `__acrt_initialize`) live in `libvcruntime.lib`/`libucrt.lib`, which are
 //! not linked into libghostty-vt, so calling them is both unnecessary and a
 //! link error. The full libghostty DLL is different: it links the static CRT
-//! and bootstraps it from its own `DllMain` in `main_c.zig`.
+//! and bootstraps it from its own `DllMain` in `main_c.zig`, which for
+//! MinGW calls mingw's `_CRT_INIT` rather than this walker (see below).
 //!
 //! Running the initializers matters because we build the vendored simdutf
 //! with `SIMDUTF_NO_LIBCXX`, which makes simdutf define
@@ -70,10 +71,16 @@ pub fn DllMain(
 fn runGlobalConstructors() void {
     if (comptime builtin.abi != .msvc) {
         // We walk `__CTOR_LIST__` ourselves rather than calling `__main`,
-        // which is what an executable would use. `__main` also performs
-        // atexit and exception-handling registration that is not safe from
-        // `DllMain`; doing it there corrupts the heap before the loader
-        // even returns.
+        // which is what an executable would use. `__main` ends by
+        // registering `__do_global_dtors` with `atexit` (gccmain.c), and in
+        // a DLL mingw's `atexit` writes a per-DLL table (crtdll.c) that
+        // only mingw's `_CRT_INIT` initializes; registering through it
+        // from here corrupts the heap. The same goes for anything else in
+        // the DLL that calls `atexit`, including a function-local static
+        // registering its destructor on first use, so this walker suits
+        // only a DLL whose C++ never does that. libghostty-vt's (simdutf)
+        // doesn't. The full libghostty DLL's (glslang, spirv-cross, imgui)
+        // does, so its `DllMain` in `main_c.zig` calls `_CRT_INIT` instead.
         const list: [*]const ?Initializer = @ptrCast(&__CTOR_LIST__);
         var len: usize = 0;
         while (list[len + 1] != null) len += 1;

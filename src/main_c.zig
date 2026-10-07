@@ -176,21 +176,29 @@ pub export fn ghostty_string_free(str: String) void {
     str.deinit();
 }
 
-// On Windows, Zig's _DllMainCRTStartup does not initialize the MSVC C
-// runtime when targeting MSVC ABI. Without initialization, any C library
-// function that depends on CRT internal state (setlocale, malloc from C
-// dependencies, C++ constructors in glslang) crashes with null pointer
-// dereferences. Declaring DllMain causes Zig's start.zig to call it
-// during DLL_PROCESS_ATTACH/DETACH, and for MSVC we forward to the CRT
-// bootstrap functions from libvcruntime and libucrt (already linked).
-// For other ABIs (MinGW) the handler is a no-op since dllcrt2.obj already
-// handles CRT init; we still need `DllMain` declared so that Zig's
-// start.zig does not fall back to calling a non-function value.
+// On Windows, Zig's _DllMainCRTStartup is this DLL's entry point, and it
+// runs neither C runtime's own DLL initialization. Declaring DllMain makes
+// Zig's start.zig forward every DllMain reason to it, so we do that here.
 //
-// This is a workaround. Zig handles MinGW DLLs correctly (via dllcrt2.obj)
-// but not MSVC. No upstream issue tracks this exact gap as of 2026-03-26.
-// Closest: Codeberg ziglang/zig #30936 (reimplement crt0 code).
-// Remove this DllMain when Zig handles MSVC DLL CRT init natively.
+// For MinGW we forward to mingw's _CRT_INIT, as mingw's DllMainCRTStartup
+// would. It sets up the DLL's atexit table and then runs the C++ global
+// constructors. Both matter. Without the constructors simdutf's
+// implementation pointer stays null, and the first non-ASCII byte the
+// terminal decodes dispatches through it. Without the table, glslang,
+// spirv-cross, libc++ and imgui corrupt the heap the first time a
+// function-local static registers its destructor with atexit (compiling
+// a custom shader does). libghostty-vt's DLL needs only the constructors;
+// see lib/windows_dll.zig.
+//
+// For MSVC we call the CRT bootstrap functions from libvcruntime and
+// libucrt (already linked). That does not run the C++ constructors or set
+// up the module's onexit table, which vcstartup's _CRT_INIT would; whether
+// that links next to Zig's _DllMainCRTStartup needs an MSVC build to
+// settle.
+//
+// This is a workaround. Closest upstream tracking: Codeberg ziglang/zig
+// #30936 (reimplement crt0 code). Remove this DllMain when Zig runs the
+// MSVC and MinGW DLL CRT init natively.
 pub const DllMain = if (builtin.os.tag == .windows) struct {
     const BOOL = windows.BOOL;
     const HINSTANCE = windows.HINSTANCE;
@@ -206,10 +214,10 @@ pub const DllMain = if (builtin.os.tag == .windows) struct {
     const __vcrt_uninitialize = @extern(*const fn (c_int) callconv(.c) c_int, .{ .name = "__vcrt_uninitialize" });
     const __acrt_initialize = @extern(*const fn () callconv(.c) c_int, .{ .name = "__acrt_initialize" });
     const __acrt_uninitialize = @extern(*const fn (c_int) callconv(.c) c_int, .{ .name = "__acrt_uninitialize" });
+    const _CRT_INIT = @extern(*const fn (HINSTANCE, DWORD, LPVOID) callconv(.winapi) BOOL, .{ .name = "_CRT_INIT" });
 
-    pub fn handler(_: HINSTANCE, fdwReason: DWORD, _: LPVOID) callconv(.winapi) BOOL {
-        // Only MSVC needs to bootstrap the CRT; MinGW handles it via dllcrt2.obj.
-        if (builtin.abi != .msvc) return TRUE;
+    pub fn handler(hinst: HINSTANCE, fdwReason: DWORD, reserved: LPVOID) callconv(.winapi) BOOL {
+        if (comptime builtin.target.abi != .msvc) return _CRT_INIT(hinst, fdwReason, reserved);
         switch (fdwReason) {
             DLL_PROCESS_ATTACH => {
                 if (__vcrt_initialize() < 0) return FALSE;
