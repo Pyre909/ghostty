@@ -2030,17 +2030,19 @@ pub const Surface = struct {
     ///
     /// The order is load-bearing:
     ///
-    ///   1. `deleteSurface` first, so the ticks in steps 3-4 drop any message
+    ///   1. `deleteSurface` first, so the ticks in steps 2-4 drop any message
     ///      still addressed to this surface instead of calling into it
     ///      (`CoreApp.hasSurface`). It also starts the quit timer when this was
     ///      the last surface.
-    ///   2. Stop the search thread, if any, while the render thread is still
-    ///      draining its mailbox. `CoreSurface.deinit` would do this first
-    ///      too, but with an unpumped join, and by then
-    ///      the render thread is gone: a search thread blocked on a
-    ///      `.forever` push into the full renderer mailbox
-    ///      (`renderer.Thread.Mailbox`) would never return and the main
-    ///      thread would hang. Clearing `search` makes deinit skip it.
+    ///   2. Stop the search thread, if any, and wait for it as in step 3,
+    ///      while the render thread is still draining its mailbox.
+    ///      `CoreSurface.deinit` would do this first too, but with an
+    ///      unpumped join, and by then the render thread is gone. The search
+    ///      thread pushes with `.forever` into both the renderer mailbox and
+    ///      the app mailbox (`Surface.searchCallback_`, including the `.quit`
+    ///      event it sends on exit), and only a tick on this thread drains the
+    ///      app mailbox, which the still running IO thread can keep full.
+    ///      Clearing `search` makes deinit skip it.
     ///   3. Stop the IO thread and wait for it (`App.waitForThread`, which
     ///      pumps messages and ticks), still before the renderer. Its reader
     ///      can also block on a `.forever` renderer mailbox push
@@ -2061,12 +2063,9 @@ pub const Surface = struct {
     /// Steps 2-4 reach into CoreSurface fields rather than adding a core
     /// API. That duplicates a few statements of `CoreSurface.deinit`, which
     /// is the least invasive option: the alternative, joining inside deinit
-    /// on the main thread, is exactly the unpumped wait steps 3-4 exist to
+    /// on the main thread, is exactly the unpumped wait steps 2-4 exist to
     /// avoid. If those fields are renamed this stops compiling, which is the
     /// desired failure.
-    ///
-    /// The search join in step 2 is itself unpumped, as upstream's is; it
-    /// is bounded because the render thread is still draining.
     fn stopCore(self: *Surface) void {
         if (self.core_state != .live) return;
         self.core_state = .stopping;
@@ -2102,6 +2101,12 @@ pub const Surface = struct {
         app.core_app.deleteSurface(self);
 
         if (cs.search) |*s| {
+            s.state.stop.notify() catch |err|
+                log.err("error notifying search thread to stop err={}", .{err});
+            app.waitForThread(s.thread.getHandle());
+
+            // The thread has exited, so the join in deinit returns at once
+            // and its repeated notify only posts an unread completion.
             s.deinit();
             cs.search = null;
         }
