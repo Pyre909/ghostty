@@ -106,14 +106,86 @@ pub const String = extern struct {
     }
 };
 
-/// Initialize ghostty global state.
-pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
+// Global state initialization. ghostty_init takes a C argv and exists on
+// every target but Windows; ghostty_init_wtf16 is its Windows counterpart,
+// because std's arguments there are a WTF-16 command line that a C argv
+// cannot carry. Exporting each only where it works makes the wrong one a
+// link error rather than a runtime failure.
+const NotWindows = struct {
+    /// Initialize ghostty global state.
+    export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
+        return initC(argv[0..argc]);
+    }
+};
+
+const Windows = struct {
+    /// Initialize ghostty global state on Windows. `cmdline` is a WTF-16
+    /// command line of `len` code units, parsed like the one std reads
+    /// for an executable; pass GetCommandLineW() to give ghostty the
+    /// host process's arguments. The buffer is not copied: ghostty reads
+    /// it again later (for example in ghostty_config_load_cli_args), so
+    /// it must stay valid and unchanged for the life of the process, as
+    /// GetCommandLineW()'s does.
+    export fn ghostty_init_wtf16(cmdline: [*]const u16, len: usize) c_int {
+        // The MSVC arm of DllMain below (upstream's) runs no C++ global
+        // constructors and sets up no onexit table, so simdutf, glslang and
+        // spirv-cross would fault later; refuse rather than crash. A static
+        // library linked into an MSVC program gets both from the program's
+        // own CRT startup, so only the DLL is refused. Nothing can be logged
+        // yet: logging needs the global state initC sets up. Revisit with
+        // the Zig 0.17 port, which changes how the DLL entry point is chosen.
+        if (comptime builtin.target.abi == .msvc and is_dll) return 1;
+
+        const rc = initC(cmdline[0..len]);
+        if (comptime is_dll) {
+            if (rc == 0) pin();
+        }
+        return rc;
+    }
+
+    const is_dll = builtin.output_mode == .Lib and builtin.link_mode == .dynamic;
+
+    /// Any address inside this module, for GetModuleHandleExW.
+    const anchor: u16 = 0;
+
+    /// Keep this DLL loaded until the process ends. A FreeLibrary would
+    /// otherwise unmap it under ghostty's threads, among them detached ones
+    /// that are never joined (the font discovery warmup, URL opening), and
+    /// DLL_PROCESS_DETACH first runs the C++ static destructors that those
+    /// threads may still use. Pinned, the DLL is detached only at process
+    /// exit, after Windows has ended the other threads.
+    fn pin() void {
+        var module: ?windows.HMODULE = null;
+        if (!windows.exp.kernel32.GetModuleHandleExW(
+            windows.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                windows.GET_MODULE_HANDLE_EX_FLAG_PIN,
+            @ptrCast(&anchor),
+            &module,
+        ).toBool()) {
+            std.log.warn(
+                "unable to pin the libghostty DLL, unloading it is unsafe err={}",
+                .{windows.GetLastError()},
+            );
+        }
+    }
+};
+
+// Reference the conditional exports based on target platform so they're
+// included in the C API.
+comptime {
+    if (builtin.target.os.tag == .windows) {
+        _ = Windows;
+    } else {
+        _ = NotWindows;
+    }
+}
+
+fn initC(args: std.process.Args.Vector) c_int {
     assert(builtin.link_libc);
 
     global.init(.{
         .c = .{
-            .argc = argc,
-            .argv = argv,
+            .args = args,
             .environ = if (std.process.Environ.Block == std.process.Environ.PosixBlock)
                 // Asserting libc means that we can fast-path all POSIX blocks
                 .{ .block = .{ .slice = std.c.environ[0..env_len: {

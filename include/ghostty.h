@@ -1136,7 +1136,37 @@ typedef enum {
 //-------------------------------------------------------------------
 // Published API
 
+#ifndef _WIN32
 GHOSTTY_API int ghostty_init(uintptr_t, char**);
+#else
+// Windows hosts pass a WTF-16 command line and its length in code units,
+// for example GetCommandLineW() and wcslen() of it; it must not be NULL.
+// It is parsed as an executable's: the first token is the program name,
+// which config parsing skips. Its tokens are scanned for a ghostty CLI
+// action exactly as ghostty.exe's own command line is: "+name" selects
+// one, and an unknown name or a second action makes this return nonzero;
+// --version selects version at once and ends the scan; --help and -h
+// select help only when no "+name" is given; and an -e before any "+name"
+// ends the scan with no action. ghostty_cli_try_action runs a selected
+// action and then exits the process. The other tokens are configuration
+// that ghostty_config_load_cli_args reads. ghostty does not copy the line
+// and reads it again later, so it must stay valid and unchanged for the
+// life of the process.
+//
+// Call this once, before any other libghostty function. After a nonzero
+// return, call nothing but ghostty_info.
+//
+// libghostty needs a deep stack. Make this and every later call on a
+// thread with at least a 16 MiB stack reserve (ghostty.exe's), for example
+// CreateThread(NULL, 16 << 20, ..., STACK_SIZE_PARAM_IS_A_RESERVATION,
+// NULL); a default host main thread, such as a .NET host's, is too small.
+//
+// Only the <arch>-windows-gnu DLL is supported: an MSVC-built DLL does not
+// run its C++ initialization, so there this returns nonzero. Once this
+// succeeds the DLL pins itself in the process: it cannot be unloaded, and
+// FreeLibrary leaves it in place.
+GHOSTTY_API int ghostty_init_wtf16(const wchar_t*, uintptr_t);
+#endif
 GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);

@@ -30,8 +30,8 @@ comptime {
 pub const xev = @import("xev").Dynamic;
 
 /// Global process state. This is initialized in main() for exe artifacts and
-/// by ghostty_init() for lib artifacts. Most other methods in this file will
-/// retrieve items stored in this state.
+/// by ghostty_init() (ghostty_init_wtf16() on Windows) for lib artifacts.
+/// Most other methods in this file will retrieve items stored in this state.
 var state: ?GlobalState = null;
 
 pub const InitOpts = union(enum) {
@@ -45,8 +45,9 @@ pub const InitOpts = union(enum) {
     tool: std.process.Init.Minimal,
 
     c: struct {
-        argc: usize,
-        argv: [*][*:0]u8,
+        /// The host's arguments in std's per-platform form: a C argv,
+        /// or on Windows the WTF-16 command line (see main_c.zig).
+        args: std.process.Args.Vector,
         environ: std.process.Environ,
     },
 };
@@ -66,16 +67,7 @@ pub fn init(opts: InitOpts) !void {
         },
         .args = switch (opts) {
             .main, .tool => |m| m.args,
-            // TODO: Using the C API from Windows is unsupported at this time.
-            //
-            // When do we plan on supporting Windows, it's recommended to
-            // ensure that the C API can take a UNICODE_STRING (aka []16, a
-            // WTF-16 string) so that it can just be passed into
-            // std.process.Args.Vector directly.
-            .c => |c| .{ .vector = if (builtin.os.tag == .windows)
-                return error.UnsupportedOSForCApi
-            else
-                c.argv[0..c.argc] },
+            .c => |c| .{ .vector = c.args },
         },
         .tmp_dir_path = null,
         .action = null,

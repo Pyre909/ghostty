@@ -104,6 +104,12 @@ pub const FILE_SHARE_READ = 0x00000001;
 pub const FILE_SHARE_WRITE = 0x00000002;
 pub const FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
 pub const GENERIC_READ = 0x80000000;
+/// GetModuleHandleExW dwFlags: lpModuleName is an address inside the
+/// module rather than its name.
+pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004;
+/// GetModuleHandleExW dwFlags: keep the module loaded until the process
+/// ends, whatever FreeLibrary calls follow.
+pub const GET_MODULE_HANDLE_EX_FLAG_PIN = 0x00000001;
 pub const HANDLE_FLAG_INHERIT = 0x00000001;
 pub const MEM_COMMIT = 0x1000;
 pub const MEM_RELEASE = 0x8000;
@@ -303,6 +309,12 @@ pub const exp = struct {
             cchFilePath: DWORD,
             dwFlags: DWORD,
         ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandleexw
+        pub extern "kernel32" fn GetModuleHandleExW(
+            dwFlags: DWORD,
+            lpModuleName: ?LPCWSTR,
+            phModule: *?HMODULE,
+        ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
         pub extern "kernel32" fn GetProcAddress(
             hModule: HMODULE,
