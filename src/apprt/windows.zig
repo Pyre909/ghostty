@@ -2762,23 +2762,27 @@ pub const Surface = struct {
             win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
                 self.focused = msg == win32.WM_SETFOCUS;
 
-                // A drag does not survive losing focus (Alt+Tab, a dialog,
-                // the Start menu). The capture may outlive the focus change,
-                // and the button-up then goes to another window. Releasing it
-                // lets the next syncMouse send the core that release. Only a
-                // Win32 call here: this message is sent, possibly from inside
-                // a core frame (a paste confirmation taking focus).
-                if (!self.focused and self.mouse.held.count() != 0 and self.hasCapture()) {
-                    _ = win32.ReleaseCapture();
-                }
+                if (!self.focused) {
+                    // A drag does not survive losing focus (Alt+Tab, a
+                    // dialog, the Start menu). The capture may outlive the
+                    // focus change, and the button-up then goes to another
+                    // window. Releasing it lets syncMouse send the core that
+                    // release. Only a Win32 call here: this message is sent,
+                    // possibly from inside a core frame (a paste
+                    // confirmation taking focus).
+                    const dragging = self.mouse.held.count() != 0;
+                    if (dragging and self.hasCapture()) _ = win32.ReleaseCapture();
 
-                // An open composition does not survive it either, but
-                // ending one makes the IME send its messages straight back
-                // into this window procedure. That waits for `App.run`
-                // (syncIme); the wakeup makes `run` come round, since a
-                // sent message does not.
-                if (!self.focused and (self.ime.composing or self.preedit == .ime)) {
-                    _ = win32.PostMessageW(self.app.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
+                    // An open composition does not survive it either, but
+                    // ending one makes the IME send its messages straight
+                    // back into this window procedure.
+                    const composing = self.ime.composing or self.preedit == .ime;
+
+                    // Both wait for `App.run` (syncDeferredMouse,
+                    // syncDeferredIme). The wakeup makes `run` come round
+                    // now, since a sent message does not; otherwise the
+                    // release waits for some later message to this thread.
+                    if (dragging or composing) self.app.wakeup();
                 }
                 self.ime.form = null;
 
@@ -5547,4 +5551,66 @@ test "win32: ime completes Korean on focus loss and cancels the rest" {
     try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0));
     // The primary language is 10 bits: 0x212 (custom range) is not Korean.
     try std.testing.expectEqual(win32.CPS_CANCEL, Ime.focusLossAction(0x0212));
+}
+
+test "win32: losing focus mid-drag wakes the app loop" {
+    // WM_KILLFOCUS is sent, so GetMessageW in `App.run` does not return
+    // for it; the release owed for a held button (syncDeferredMouse) is
+    // only sent once something is posted. A message-only window stands in
+    // for both the app's and the surface's: the handler only needs a
+    // queue to post to and a window that does not hold the capture, as
+    // after the system has already taken it away.
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    var app: App = undefined;
+    app.msg_hwnd = hwnd;
+
+    // Only what the focus handler reads, with no core surface. Static
+    // because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var surface: Surface = undefined;
+    };
+    const surface = &s.surface;
+    surface.app = &app;
+    surface.hwnd = hwnd;
+    surface.core_state = .none;
+    surface.ime = .{};
+    surface.preedit = .none;
+
+    const Case = struct { held: Surface.Mouse.Button.Set, want: bool };
+    const cases = [_]Case{
+        .{ .held = .initOne(.left), .want = true },
+        // Nothing is owed, so nothing needs the loop.
+        .{ .held = .empty, .want = false },
+    };
+    for (cases) |c| {
+        surface.focused = true;
+        surface.mouse = .init();
+        surface.mouse.held = c.held;
+        _ = surface.handleMessage(hwnd, win32.WM_KILLFOCUS, 0, 0);
+
+        var msg: win32.MSG = undefined;
+        const woken = win32.PeekMessageW(
+            &msg,
+            hwnd,
+            WM_GHOSTTY_WAKEUP,
+            WM_GHOSTTY_WAKEUP,
+            win32.PM_REMOVE,
+        ).toBool();
+        try std.testing.expectEqual(c.want, woken);
+    }
 }
