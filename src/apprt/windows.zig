@@ -978,8 +978,8 @@ pub const App = struct {
         }
     }
 
-    /// Wait until every thread in `handles` has exited, while keeping the
-    /// main thread responsive: messages are dispatched and the core ticked
+    /// Wait until the thread `handle` has exited, while keeping the main
+    /// thread responsive: messages are dispatched and the core ticked
     /// between wakeups.
     ///
     /// Pumping is required, not cosmetic. The render and IO threads push into
@@ -989,70 +989,68 @@ pub const App = struct {
     ///
     /// A WM_QUIT pulled out of the queue while pumping is re-posted
     /// afterwards, so a quit requested meanwhile still ends `run`.
-    fn waitForThreads(self: *App, handles_in: []const win32.HANDLE) void {
-        var handles: [2]win32.HANDLE = undefined;
-        std.debug.assert(handles_in.len <= handles.len);
-        @memcpy(handles[0..handles_in.len], handles_in);
-        var remaining: win32.DWORD = @intCast(handles_in.len);
-
+    fn waitForThread(self: *App, handle: win32.HANDLE) void {
         var quit_seen = false;
         defer if (quit_seen) win32.PostQuitMessage(0);
 
         // One-second slices only so that a stuck thread is reported once;
         // the wait itself is unbounded, as the join after it would be.
         var slices: u32 = 0;
-        while (remaining > 0) {
-            const r = win32.MsgWaitForMultipleObjectsEx(
-                remaining,
-                &handles,
+        while (true) {
+            // Tick before every wait, not only after new input. A wakeup
+            // may already have been consumed without a tick (`wndProc`
+            // outside a modal loop, or a prompt's message loop), and a
+            // producer blocked in a `.forever` push posts no new one until
+            // the mailbox is drained, so waiting for input alone could wait
+            // forever. An empty mailbox makes this a single locked pop.
+            self.tickFromHandler();
+
+            switch (win32.MsgWaitForMultipleObjectsEx(
+                1,
+                @ptrCast(&handle),
                 1000,
                 win32.QS_ALLINPUT,
                 // Return for input already in the queue too, not only for
                 // input that arrives after the call. Without it a message
                 // that was peeked but not removed would not wake us.
                 win32.MWMO_INPUTAVAILABLE,
-            );
+            )) {
+                // The thread has exited.
+                win32.WAIT_OBJECT_0 => return,
 
-            if (r >= win32.WAIT_OBJECT_0 and r < win32.WAIT_OBJECT_0 + remaining) {
-                // That thread has exited. Swap-remove it and keep waiting
-                // for the rest.
-                const i = r - win32.WAIT_OBJECT_0;
-                handles[i] = handles[remaining - 1];
-                remaining -= 1;
-                continue;
-            }
-
-            if (r == win32.WAIT_OBJECT_0 + remaining) {
-                var msg: win32.MSG = undefined;
-                while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE).toBool()) {
-                    if (msg.message == win32.WM_QUIT) {
-                        quit_seen = true;
-                        continue;
+                // Input. The tick at the top of the loop drains whatever
+                // the dispatched messages left in the mailbox.
+                win32.WAIT_OBJECT_0 + 1 => {
+                    var msg: win32.MSG = undefined;
+                    while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE).toBool()) {
+                        if (msg.message == win32.WM_QUIT) {
+                            quit_seen = true;
+                            continue;
+                        }
+                        _ = win32.TranslateMessage(&msg);
+                        _ = win32.DispatchMessageW(&msg);
                     }
-                    _ = win32.TranslateMessage(&msg);
-                    _ = win32.DispatchMessageW(&msg);
-                }
-                self.tickFromHandler();
-                continue;
-            }
+                },
 
-            if (r == win32.WAIT_TIMEOUT) {
-                slices += 1;
-                if (slices == 5) log.warn(
-                    "surface threads have not exited after 5s; still waiting",
-                    .{},
-                );
-                continue;
-            }
+                win32.WAIT_TIMEOUT => {
+                    slices += 1;
+                    if (slices == 5) log.warn(
+                        "surface thread has not exited after 5s; still waiting",
+                        .{},
+                    );
+                },
 
-            // WAIT_FAILED (a bad handle). There is nothing to wait on
-            // reliably any more; the joins in CoreSurface.deinit that follow
-            // will block or fail loudly on their own.
-            log.err(
-                "MsgWaitForMultipleObjectsEx failed r={x} err={}",
-                .{ r, std.os.windows.GetLastError() },
-            );
-            return;
+                // WAIT_FAILED (a bad handle). There is nothing to wait on
+                // reliably any more; the joins in CoreSurface.deinit that
+                // follow will block or fail loudly on their own.
+                else => |r| {
+                    log.err(
+                        "MsgWaitForMultipleObjectsEx failed r={x} err={}",
+                        .{ r, std.os.windows.GetLastError() },
+                    );
+                    return;
+                },
+            }
         }
     }
 
@@ -1557,7 +1555,7 @@ pub const Surface = struct {
     /// The lifecycle of `core_surface`.
     ///
     /// A three-state enum rather than a single `initialized` flag because
-    /// teardown pumps messages (`App.waitForThreads`): between
+    /// teardown pumps messages (`App.waitForThread`): between
     /// `deleteSurface` and `CoreSurface.deinit` the core surface is still
     /// initialized memory, but its threads are stopping and the app no longer
     /// knows it, so message handlers must not call into it. `.stopping` makes
@@ -2021,7 +2019,7 @@ pub const Surface = struct {
     ///      `.forever` push into the full renderer mailbox
     ///      (`renderer.Thread.Mailbox`) would never return and the main
     ///      thread would hang. Clearing `search` makes deinit skip it.
-    ///   3. Stop the IO thread and wait for it (`App.waitForThreads`, which
+    ///   3. Stop the IO thread and wait for it (`App.waitForThread`, which
     ///      pumps messages and ticks), still before the renderer. Its reader
     ///      can also block on a `.forever` renderer mailbox push
     ///      (`StreamHandler.rendererMessageWriter`), and `Exec.threadExit`
@@ -2053,7 +2051,7 @@ pub const Surface = struct {
 
         // A drag in progress ends with the core. Button messages for a
         // `.stopping` surface are not handled, so nothing else would release
-        // the capture while this pumps messages (App.waitForThreads).
+        // the capture while this pumps messages (App.waitForThread).
         if (self.mouse.held.count() != 0) {
             self.mouse.held = .empty;
             if (self.hasCapture()) _ = win32.ReleaseCapture();
@@ -2088,11 +2086,11 @@ pub const Surface = struct {
 
         cs.io_thread.stop.notify() catch |err|
             log.err("error notifying io thread to stop err={}", .{err});
-        app.waitForThreads(&.{cs.io_thr.getHandle()});
+        app.waitForThread(cs.io_thr.getHandle());
 
         cs.renderer_thread.stop.notify() catch |err|
             log.err("error notifying renderer thread to stop err={}", .{err});
-        app.waitForThreads(&.{cs.renderer_thr.getHandle()});
+        app.waitForThread(cs.renderer_thr.getHandle());
 
         cs.deinit();
         self.core_state = .none;
@@ -2113,7 +2111,7 @@ pub const Surface = struct {
     /// WM_GHOSTTY_DESTROY: the one place a live surface is torn down.
     ///
     /// Runs from a message loop -- `run`'s, a system modal loop's, or
-    /// `App.waitForThreads` -- never directly inside a core frame, because
+    /// `App.waitForThread` -- never directly inside a core frame, because
     /// the message is only ever posted. When a core frame or prompt is
     /// nonetheless beneath that loop (`App.canReenterCore`), the teardown is
     /// deferred to `run` instead: its pump would tick, and waiting there
@@ -3020,7 +3018,7 @@ pub const Surface = struct {
     /// Win32 splits one keystroke across two messages: the WM_(SYS)KEYDOWN
     /// being handled, and the WM_(SYS)CHAR / WM_(SYS)DEADCHAR that
     /// TranslateMessage posted *before* that keydown was dispatched
-    /// (App.run, waitForThreads). The core wants both in one event, so the
+    /// (App.run, waitForThread). The core wants both in one event, so the
     /// characters are pulled out of the queue here.
     fn keyEvent(
         self: *Surface,
@@ -4228,6 +4226,51 @@ comptime {
             }.thunk;
         }
     }
+}
+
+test "win32: waiting for a thread drains a full mailbox without input" {
+    // Only what this tick touches: the mailbox, and the surface list that
+    // `.close` is checked against (empty, so every message is a no-op).
+    var core_app: CoreApp = undefined;
+    core_app.mailbox = .{};
+    core_app.surfaces = .empty;
+
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.ticking = false;
+    app.prompt_depth = 0;
+
+    // Never dereferenced; static so it costs no stack.
+    const gone = struct {
+        var surface: CoreSurface = undefined;
+    };
+
+    // A full mailbox whose wakeups were already consumed by a loop that did
+    // not tick, as a prompt's loop does: nothing is left in the queue.
+    while (core_app.mailbox.push(
+        global.io(),
+        .{ .close = &gone.surface },
+        .instant,
+    ) != 0) {}
+
+    // A producer such as the IO thread's reader, blocked on the full
+    // mailbox and posting no wakeup until its push succeeds. A timeout
+    // rather than `.forever` makes a wait that never drains fail the test
+    // instead of hanging it.
+    const Producer = struct {
+        fn run(mailbox: *CoreApp.Mailbox.Queue, pushed: *bool) void {
+            pushed.* = mailbox.push(
+                global.io(),
+                .{ .close = &gone.surface },
+                .{ .ns = 3 * std.time.ns_per_s },
+            ) != 0;
+        }
+    };
+    var pushed = false;
+    const thread = try std.Thread.spawn(.{}, Producer.run, .{ &core_app.mailbox, &pushed });
+    app.waitForThread(thread.getHandle());
+    thread.join();
+    try std.testing.expect(pushed);
 }
 
 test "win32: mouse lParam coordinates are signed" {
