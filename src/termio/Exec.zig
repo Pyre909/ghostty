@@ -259,23 +259,7 @@ fn closeQuitPipeEnd(fd: posix.fd_t) void {
 fn stopReadThreadWindows(exec: *ThreadData) void {
     const k32 = windows.exp.kernel32;
 
-    // The quit end is a HANDLE, so write with WriteFile. The CRT `write`
-    // that the POSIX path uses expects an int fd and fails here, which
-    // left the reader with no quit byte to find after the cancel.
-    var written: windows.DWORD = 0;
-    if (k32.WriteFile(exec.read_thread_pipe, "x", 1, &written, null) == windows.FALSE) {
-        switch (windows.GetLastError()) {
-            // The read end is closed, so the read thread has already
-            // exited (the EPIPE case of the POSIX path). The wait loop
-            // below returns immediately.
-            .BROKEN_PIPE, .NO_DATA => {},
-
-            else => |err| log.warn(
-                "error writing to read thread quit pipe err={}",
-                .{err},
-            ),
-        }
-    }
+    writeQuitByteWindows(exec.read_thread_pipe);
 
     const thread = exec.read_thread.getHandle();
 
@@ -339,6 +323,27 @@ fn stopReadThreadWindows(exec: *ThreadData) void {
             "read thread has not exited after {d}ms, still waiting",
             .{warn_after * wait_ms},
         );
+    }
+}
+
+/// Write the quit byte that `ReadThread.quitRequestedWindows` looks for.
+/// The quit end is a HANDLE, so write with WriteFile. The CRT `write`
+/// that the POSIX path uses expects an int fd and fails here, which
+/// left the reader with no quit byte to find after the cancel.
+fn writeQuitByteWindows(quit: posix.fd_t) void {
+    var written: windows.DWORD = 0;
+    if (windows.exp.kernel32.WriteFile(quit, "x", 1, &written, null) == windows.FALSE) {
+        switch (windows.GetLastError()) {
+            // The read end is closed, so the read thread has already
+            // exited (the EPIPE case of the POSIX path). The wait loop
+            // in stopReadThreadWindows returns immediately.
+            .BROKEN_PIPE, .NO_DATA => {},
+
+            else => |err| log.warn(
+                "error writing to read thread quit pipe err={}",
+                .{err},
+            ),
+        }
     }
 }
 
@@ -1968,6 +1973,10 @@ pub const ReadThread = struct {
                     // CancelSynchronousIo can abort it. Just peek again.
                     .OPERATION_ABORTED => continue,
 
+                    // Every write end of the quit pipe is closed, so no
+                    // quit byte can ever arrive. Treat it as the quit.
+                    .BROKEN_PIPE => return true,
+
                     // Anything else means the quit pipe is unusable, so
                     // we could never see a quit signal. Stop reading
                     // rather than risk a read that nothing can end.
@@ -2492,4 +2501,31 @@ test "init frees the env when it fails" {
         .rt_pre_exec_info = .init(&config),
         .rt_post_fork_info = .init(&config),
     }));
+}
+
+test "read thread windows: quit byte reaches the reader" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const pipe = try internal_os.pipe();
+    defer closeQuitPipeEnd(pipe[0]);
+    defer closeQuitPipeEnd(pipe[1]);
+
+    try testing.expect(!ReadThread.quitRequestedWindows(pipe[0]));
+    writeQuitByteWindows(pipe[1]);
+    try testing.expect(ReadThread.quitRequestedWindows(pipe[0]));
+}
+
+test "read thread windows: closing the quit pipe ends the reader" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const pipe = try internal_os.pipe();
+    defer closeQuitPipeEnd(pipe[0]);
+
+    // No quit byte is ever written: closing the only write end must
+    // be enough for the reader to stop.
+    try testing.expect(!ReadThread.quitRequestedWindows(pipe[0]));
+    closeQuitPipeEnd(pipe[1]);
+    try testing.expect(ReadThread.quitRequestedWindows(pipe[0]));
 }
