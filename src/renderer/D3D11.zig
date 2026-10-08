@@ -22,7 +22,10 @@
 //! reports it, or at the end of any frame it failed some other way first.
 //! The generic renderer then releases what it created on the device and
 //! `recoverDevice` creates a new one for the same window, after which
-//! everything is rebuilt lazily, as after an unrealize. A device on the
+//! everything is rebuilt lazily, as after an unrealize. That swap chain is
+//! created off the window's thread, which keeps pumping, so DXGI can take
+//! an Alt+Enter on it to full-screen before `createGpu` turns that
+//! handling off; see `fullscreen_chain`. A device on the
 //! software rasterizer is replaced the same way once the adapters change,
 //! so a surface that recovered onto it while a driver was being replaced
 //! moves back to the GPU when the driver returns.
@@ -146,6 +149,23 @@ released: bool = false,
 
 /// When the next recovery attempt may run.
 recovery: Recovery = .{},
+
+/// A swap chain `releaseGpu` found in full-screen, still held.
+///
+/// DXGI handles Alt+Enter for a window from the moment a swap chain is
+/// created for it until MakeWindowAssociation on that chain's factory
+/// says otherwise. Each device brings its own factory, so a chain that
+/// `recoverDevice` creates on the render thread is exposed while the
+/// window's thread dispatches input. DXGI forbids releasing a chain in
+/// full-screen ("Destroying a swap chain" in the DXGI overview), and
+/// leaving full-screen sends the window messages and waits for them,
+/// which must not happen under the draw mutex: a host may draw from the
+/// window's thread (ghostty_surface_draw) and wait on that mutex. So the
+/// chain is kept here and `drawFrameUnlocked` leaves full-screen and
+/// releases it once the mutex is released. Until then the window has a
+/// flip model chain and no other can be created for it, so recovery
+/// waits. Render thread only, like recovery; `deinit` after it joined.
+fullscreen_chain: ?*api.IDXGISwapChain1 = null,
 
 /// The factory that made the device's adapter, kept only while that
 /// adapter is the software rasterizer, to learn when the adapters change.
@@ -446,6 +466,15 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     defer if (!software) api.release(factory);
     errdefer if (software_factory) |f| api.release(f);
 
+    // The linear, clamping state the other backends give their image
+    // textures. Created before the swap chain; see below.
+    const default_sampler = try Sampler.init(.{
+        .device = device,
+        .filter = .MIN_MAG_MIP_LINEAR,
+        .address = .CLAMP,
+    });
+    errdefer default_sampler.deinit();
+
     // `window-vsync = false` presents without waiting for a vblank. In
     // windowed flip model only tearing unlocks the rate, and DXGI must
     // be asked whether it can tear; without it interval 0 still presents
@@ -502,7 +531,8 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
         return error.D3D11SwapChainFailed;
     }
     const swap_chain = swap_chain_ptr orelse return error.D3D11SwapChainFailed;
-    errdefer api.release(swap_chain);
+    // Nothing after this may fail: DXGI may already have taken the chain
+    // full-screen, and only `releaseGpu` releases one safely.
 
     // DXGI would otherwise watch the window for Alt+Enter and window
     // changes on the app's behalf; the apprt or the host handles those.
@@ -513,15 +543,6 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     if (api.failed(hr)) {
         log.warn("MakeWindowAssociation failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
     }
-
-    // The linear, clamping state the other backends give their image
-    // textures.
-    const default_sampler = try Sampler.init(.{
-        .device = device,
-        .filter = .MIN_MAG_MIP_LINEAR,
-        .address = .CLAMP,
-    });
-    errdefer default_sampler.deinit();
 
     log.info("D3D11 swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_discard sync_interval={d} tearing={}", .{
         @intFromPtr(hwnd),
@@ -589,26 +610,62 @@ fn logAdapter(adapter_desc: ?*const api.DXGI_ADAPTER_DESC, level: api.D3D_FEATUR
 }
 
 /// Main thread, after the render thread has been joined and has released
-/// every GPU resource.
+/// every GPU resource. Nothing waits on the draw mutex any more, so a
+/// chain in full-screen leaves it here.
 pub fn deinit(self: *D3D11) void {
     self.releaseGpu();
+    self.drawFrameUnlocked();
 }
 
 /// Release the device and everything created with it. The swap chain goes
 /// before the context and device; nothing else references the back buffer
-/// at this point. Nothing to do when a failed recovery already released
-/// them.
+/// at this point. A chain in full-screen is kept instead, see
+/// `fullscreen_chain`. Nothing to do when a failed recovery already
+/// released them.
 fn releaseGpu(self: *D3D11) void {
     if (self.released) return;
     self.released = true;
     self.context.vtable.ClearState(self.context);
     self.context.vtable.Flush(self.context);
     self.default_sampler.deinit();
-    api.release(self.swap_chain);
+    if (isFullscreen(self.swap_chain)) {
+        assert(self.fullscreen_chain == null);
+        self.fullscreen_chain = self.swap_chain;
+    } else {
+        api.release(self.swap_chain);
+    }
     api.release(self.context);
     if (self.info_queue) |q| api.release(q);
     if (self.software_factory) |f| api.release(f);
     api.release(self.device);
+}
+
+/// Whether DXGI has the chain in full-screen. A state that cannot be read
+/// is taken as windowed. This only reads the state; it sends the window
+/// no messages.
+fn isFullscreen(swap_chain: *api.IDXGISwapChain1) bool {
+    var fullscreen: api.BOOL = 0;
+    if (api.failed(swap_chain.getFullscreenState(&fullscreen))) return false;
+    return fullscreen != 0;
+}
+
+/// Leave full-screen and release the chain `releaseGpu` kept, if any.
+/// Called by the generic renderer after every frame the render thread
+/// drew, once the draw mutex is released, and by `deinit`. A chain that
+/// cannot leave full-screen is kept, and recovery waits for it.
+pub fn drawFrameUnlocked(self: *D3D11) void {
+    const swap_chain = self.fullscreen_chain orelse return;
+    const hr = swap_chain.setFullscreenState(0);
+    if (api.failed(hr) or isFullscreen(swap_chain)) {
+        log.warn("SetFullscreenState(FALSE) failed hr=0x{x}; retrying in {d}ms", .{
+            @as(u32, @bitCast(hr)),
+            recovery_retry_ms,
+        });
+        self.recovery.failed(.now(global.io(), .awake));
+        return;
+    }
+    api.release(swap_chain);
+    self.fullscreen_chain = null;
 }
 
 /// Whether the device was lost since the last frame. The generic renderer
@@ -639,12 +696,24 @@ pub fn recoverDevice(self: *D3D11) !void {
     self.releaseGpu();
     const now: std.Io.Timestamp = .now(global.io(), .awake);
     if (self.recovery.delayMs(now) > 0) return error.DeviceLost;
+    if (self.fullscreen_chain != null) return error.DeviceLost;
     const gpu = createGpu(self.hwnd, self.vsync) catch |err| {
         self.recovery.failed(now);
         log.err("D3D11 device recovery failed err={}; retrying in {d}ms", .{ err, recovery_retry_ms });
         return err;
     };
     self.adopt(gpu);
+
+    // An Alt+Enter dispatched before createGpu made the window
+    // association took this chain full-screen. Give it up for the
+    // generic renderer to leave full-screen after the draw mutex, and
+    // create the next one on the following frame.
+    if (isFullscreen(self.swap_chain)) {
+        log.warn("new D3D11 swap chain is in full-screen; creating another hwnd={x}", .{@intFromPtr(self.hwnd)});
+        self.releaseGpu();
+        return error.DeviceLost;
+    }
+
     self.recovery.succeeded();
     self.lost = false;
     log.info("D3D11 device recovered hwnd={x}", .{@intFromPtr(self.hwnd)});

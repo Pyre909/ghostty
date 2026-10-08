@@ -709,8 +709,8 @@ pub const IDXGISwapChain = extern struct {
         base: IDXGIDeviceSubObject.VTable,
         Present: *const fn (*IDXGISwapChain, UINT, UINT) callconv(cc) HRESULT,
         GetBuffer: *const fn (*IDXGISwapChain, UINT, REFIID, *?*anyopaque) callconv(cc) HRESULT,
-        SetFullscreenState: Slot,
-        GetFullscreenState: Slot,
+        SetFullscreenState: *const fn (*IDXGISwapChain, BOOL, ?*IDXGIOutput) callconv(cc) HRESULT,
+        GetFullscreenState: *const fn (*IDXGISwapChain, *BOOL, ?*?*IDXGIOutput) callconv(cc) HRESULT,
         GetDesc: Slot,
         ResizeBuffers: *const fn (*IDXGISwapChain, UINT, UINT, UINT, DXGI_FORMAT, UINT) callconv(cc) HRESULT,
         ResizeTarget: Slot,
@@ -749,6 +749,16 @@ pub const IDXGISwapChain1 = extern struct {
         var out: ?*anyopaque = null;
         if (failed(self.vtable.base.GetBuffer(@ptrCast(self), index, &T.IID, &out))) return error.QueryInterfaceFailed;
         return @ptrCast(@alignCast(out orelse return error.QueryInterfaceFailed));
+    }
+
+    pub fn getFullscreenState(self: *IDXGISwapChain1, fullscreen: *BOOL) HRESULT {
+        return self.vtable.base.GetFullscreenState(@ptrCast(self), fullscreen, null);
+    }
+
+    /// The output is left for DXGI to choose, which is all leaving
+    /// full-screen needs.
+    pub fn setFullscreenState(self: *IDXGISwapChain1, fullscreen: BOOL) HRESULT {
+        return self.vtable.base.SetFullscreenState(@ptrCast(self), fullscreen, null);
     }
 
     pub fn resizeBuffers(self: *IDXGISwapChain1, buffer_count: UINT, width: UINT, height: UINT, format: DXGI_FORMAT, flags: UINT) HRESULT {
@@ -1215,6 +1225,8 @@ test "d3d11 api: typed slot indices" {
     try testing.expectEqual(50 * p, @offsetOf(ID3D11DeviceContext.VTable, "ClearRenderTargetView"));
     try testing.expectEqual(110 * p, @offsetOf(ID3D11DeviceContext.VTable, "ClearState"));
     try testing.expectEqual(8 * p, @offsetOf(IDXGISwapChain.VTable, "Present"));
+    try testing.expectEqual(10 * p, @offsetOf(IDXGISwapChain.VTable, "SetFullscreenState"));
+    try testing.expectEqual(11 * p, @offsetOf(IDXGISwapChain.VTable, "GetFullscreenState"));
     try testing.expectEqual(13 * p, @offsetOf(IDXGISwapChain.VTable, "ResizeBuffers"));
     try testing.expectEqual(18 * p, @offsetOf(IDXGISwapChain1.VTable, "GetDesc1"));
     try testing.expectEqual(15 * p, @offsetOf(IDXGIFactory2.VTable, "CreateSwapChainForHwnd"));

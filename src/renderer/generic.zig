@@ -1733,6 +1733,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // mutex. The display link is synced only after the mutex is
             // released; see `syncDisplayLink` for why it must never be
             // called with the draw mutex held.
+            //
+            // A graphics API that recovers a lost device may be left
+            // with work that can wait on the window's thread, which
+            // may itself be waiting on the draw mutex in a sync draw.
+            // It does that work here, once the mutex is released. Only
+            // the render thread recovers (see `drawFrameLocked`), so a
+            // sync draw has none.
+            defer if (comptime @hasDecl(GraphicsAPI, "drawFrameUnlocked")) {
+                if (!sync) self.api.drawFrameUnlocked();
+            };
+
             const sync_display_link = locked: {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
