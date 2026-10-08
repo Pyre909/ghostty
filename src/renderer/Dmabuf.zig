@@ -52,7 +52,10 @@ pub const Planes = struct {
 
     /// Close all valid fds.
     pub fn deinit(self: Planes) void {
-        if (comptime builtin.os.tag != .linux) return;
+        // DMABUF fds are POSIX file descriptors (Linux, and the BSDs
+        // via drm-kmod). Windows has no DMABUF, so nothing is exported
+        // and there is nothing to close.
+        if (comptime builtin.os.tag == .windows) return;
         for (self.fds[0..self.count]) |fd| {
             if (fd >= 0) _ = std.posix.system.close(fd);
         }
@@ -62,7 +65,7 @@ pub const Planes = struct {
     /// and has an invalid FD, we close all the known valid FDs
     /// and bail.
     pub fn validate(self: Planes) error{BadDmabuf}!void {
-        if (comptime builtin.os.tag != .linux) return;
+        if (comptime builtin.os.tag == .windows) return;
         var n_valid: usize = 0;
         while (n_valid < self.count) : (n_valid += 1) {
             if (self.fds[n_valid] < 0) {
@@ -75,4 +78,45 @@ pub const Planes = struct {
 
 pub fn deinit(self: Dmabuf) void {
     self.planes.deinit();
+}
+
+/// Whether `fd` is still open in this process.
+fn testIsOpen(fd: c_int) bool {
+    const posix = std.posix;
+    return posix.errno(posix.system.fcntl(fd, posix.F.GETFD)) != .BADF;
+}
+
+test "Planes.validate closes valid fds when a plane failed" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const posix = std.posix;
+
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(.SUCCESS, posix.errno(posix.system.pipe(&fds)));
+
+    // The third plane failed to export, so validate owns and closes
+    // the fds of the planes before it.
+    var planes: Planes = .{ .count = 3 };
+    planes.fds[0] = fds[0];
+    planes.fds[1] = fds[1];
+    try testing.expectError(error.BadDmabuf, planes.validate());
+    try testing.expect(!testIsOpen(fds[0]));
+    try testing.expect(!testIsOpen(fds[1]));
+}
+
+test "Planes.deinit closes all fds" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const posix = std.posix;
+
+    var fds: [2]c_int = undefined;
+    try testing.expectEqual(.SUCCESS, posix.errno(posix.system.pipe(&fds)));
+
+    var planes: Planes = .{ .count = 2 };
+    planes.fds[0] = fds[0];
+    planes.fds[1] = fds[1];
+    try planes.validate();
+    planes.deinit();
+    try testing.expect(!testIsOpen(fds[0]));
+    try testing.expect(!testIsOpen(fds[1]));
 }

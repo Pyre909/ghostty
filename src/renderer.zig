@@ -68,6 +68,9 @@ test {
     _ = @import("renderer/d3d11/buffer.zig");
     _ = @import("renderer/d3d11/shaders.zig");
 
+    // Dmabuf is platform-independent apart from its fd handling.
+    _ = @import("renderer/Dmabuf.zig");
+
     _ = cursor;
     _ = message;
     _ = shadertoy;
