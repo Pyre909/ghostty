@@ -2293,9 +2293,9 @@ test "directwrite family of another family" {
     var dw = DirectWrite.init(lib);
     defer dw.deinit();
 
-    // Arial Black carries a family name of its own and is the heaviest
-    // weight of Arial to DirectWrite. Where DirectWrite knows it as a
-    // family this test has nothing to show.
+    // Arial Black ships with every Windows. It carries a family name of
+    // its own and is the heaviest weight of Arial to DirectWrite. Where
+    // DirectWrite knows it as a family this test has nothing to show.
     const api = directwrite.api;
     {
         const collection = try lib.dwrite.systemFonts();
@@ -2322,7 +2322,7 @@ test "directwrite family of another family" {
         try testing.expectEqualStrings("Arial Black", try face.name(&buf));
         count += 1;
     }
-    if (count == 0) return error.SkipZigTest;
+    try testing.expect(count > 0);
 }
 
 test "directwrite family of another family, in another language" {
@@ -2337,13 +2337,45 @@ test "directwrite family of another family, in another language" {
     defer dw.deinit();
 
     // The light weight of Microsoft JhengHei carries a family name of its
-    // own, in English and in Chinese. Where the font is not installed,
-    // or loads from no file, this test has nothing to show.
+    // own, in English and in Chinese, and is a weight of Microsoft
+    // JhengHei to DirectWrite. Where DirectWrite has no light weight of
+    // that family this test has nothing to show.
+    const api = directwrite.api;
+    {
+        const collection = try lib.dwrite.systemFonts();
+        defer api.release(collection);
+        var index: api.UINT = 0;
+        var exists: api.BOOL = 0;
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("Microsoft JhengHei");
+        if (api.failed(collection.vtable.FindFamilyName(
+            collection,
+            name,
+            &index,
+            &exists,
+        )) or exists == 0) return error.SkipZigTest;
+
+        var out: ?*api.IDWriteFontFamily = null;
+        try testing.expect(api.succeeded(collection.vtable.GetFontFamily(collection, index, &out)));
+        const family = out.?;
+        defer api.release(family);
+        const fonts = family.fontList();
+        const light = for (0..fonts.vtable.GetFontCount(fonts)) |i| {
+            var font_out: ?*api.IDWriteFont = null;
+            if (api.failed(fonts.vtable.GetFont(fonts, @intCast(i), &font_out))) continue;
+            const font = font_out orelse continue;
+            defer api.release(font);
+            if (font.vtable.GetSimulations(font) != api.DWRITE_FONT_SIMULATIONS_NONE) continue;
+            const weight = @intFromEnum(font.vtable.GetWeight(font));
+            if (weight < @intFromEnum(api.DWRITE_FONT_WEIGHT.NORMAL)) break true;
+        } else false;
+        if (!light) return error.SkipZigTest;
+    }
+
     var want_buf: [256]u8 = undefined;
     const want = want: {
         var it = try dw.discover(alloc, .{ .family = "Microsoft JhengHei Light", .size = 12 });
         defer it.deinit();
-        var face = (try it.next()) orelse return error.SkipZigTest;
+        var face = (try it.next()) orelse return error.TestFontNotFound;
         defer face.deinit();
         break :want try face.name(&want_buf);
     };
@@ -2395,9 +2427,15 @@ test "directwrite instance of a variable font" {
         // DirectWrite draws. HarfBuzz has a value for each axis of the
         // font and no names for them; no other axis is at the weight.
         if (comptime !options.backend.hasFreetype()) {
+            // DirectWrite before variable fonts has nothing to show.
+            const api = directwrite.api;
+            const face5 = api.queryInterface(face.face, api.IDWriteFontFace5) catch
+                return error.SkipZigTest;
+            api.release(face5);
+
             var axes_buf: [32]Variation = undefined;
             const axes = directwrite.instanceAxes(face.face, &axes_buf);
-            if (axes.len == 0) return error.SkipZigTest;
+            try testing.expect(axes.len > 0);
             const weight: f64 = @floatFromInt(want.weight);
             var found = false;
             for (axes) |axis| {
@@ -2420,7 +2458,7 @@ test "directwrite instance of a variable font" {
             try testing.expect(found);
             continue;
         }
-        if (!face.face.hasMultipleMasters()) return error.SkipZigTest;
+        try testing.expect(face.face.hasMultipleMasters());
 
         const mm = try face.face.getMMVar();
         defer lib.lib.doneMMVar(mm);
