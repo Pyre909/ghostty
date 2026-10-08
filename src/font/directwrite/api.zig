@@ -85,9 +85,14 @@ pub const Error = error{
 
 /// The one place a failed HRESULT becomes an error: the call and its
 /// HRESULT are logged, which the error cannot carry.
+///
+/// This logs at warn, not err: most callers recover, skipping a font that
+/// will not open during discovery or giving up on a fallback, and an err
+/// for each of those would bury the real ones. A caller that cannot
+/// recover returns the error to whoever reports it.
 fn check(comptime call: []const u8, hr: HRESULT) Error!void {
     if (succeeded(hr)) return;
-    log.err(call ++ " failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+    log.warn(call ++ " failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
     return error.DirectWriteFailed;
 }
 
@@ -1041,6 +1046,28 @@ test "directwrite api: font methods turn BOOL out params into Zig values" {
     try testing.expect(fake.font.hasCharacter('A'));
     try testing.expect(!fake.font.hasCharacter('B'));
     try testing.expect(!fake.font.hasCharacter(0));
+}
+
+test "directwrite api: a failed call is an error without an error log" {
+    const testing = std.testing;
+
+    // Discovery skips a font whose face will not open, so the failure is
+    // an error to the caller but no err in the log; the test runner fails
+    // a test that logs one.
+    const Fake = struct {
+        fn createFontFace(
+            _: *IDWriteFont,
+            out: *?*IDWriteFontFace,
+        ) callconv(cc) HRESULT {
+            out.* = null;
+            return E_FAIL;
+        }
+    };
+
+    var vtable: IDWriteFont.VTable = undefined;
+    vtable.CreateFontFace = &Fake.createFontFace;
+    var font: IDWriteFont = .{ .vtable = &vtable };
+    try testing.expectError(error.DirectWriteFailed, font.createFontFace());
 }
 
 // ---------------------------------------------------------------------------
