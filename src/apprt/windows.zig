@@ -1709,8 +1709,10 @@ pub const Surface = struct {
 
         /// Keys whose key-down the core never saw, by `scanSlot`: the IME
         /// claimed it (VK_PROCESSKEY), it was a digit of Alt+numpad entry
-        /// (`isAltNumpad`), or it opened the window menu
-        /// (`isWindowMenuKey`). Their key-up is kept from the core as well.
+        /// (`isAltNumpad`), it opened the window menu
+        /// (`isWindowMenuKey`), or it arrived while a prompt was open
+        /// (`App.canReenterCore`). Their key-up is kept from the core as
+        /// well.
         swallow_up: std.StaticBitSet(512) = .initEmpty(),
 
         const Preedit = enum {
@@ -2970,6 +2972,18 @@ pub const Surface = struct {
                     .deliver_withheld => true,
                 };
 
+                // Dropped while a prompt is open, as mouse input is
+                // (`syncMouse`): its message loop may have a core frame
+                // beneath it. The prompt disables its owner, which stops
+                // the user's keystrokes but not key messages another
+                // program posts or sends. Not given their system meaning
+                // either, or Alt+F4 would close a window under the prompt.
+                // The core never sees the press, so its key-up is withheld.
+                if (!self.app.canReenterCore()) {
+                    if (keyAction(msg, lparam) == .press) self.ime.swallow_up.set(slot);
+                    return 0;
+                }
+
                 // The synthetic Left Ctrl of AltGr. The core still sees Ctrl
                 // held (GetKeyState) and keyEvent's AltGr rule handles that.
                 if (isAltGrFakeCtrl(wparam, lparam)) {
@@ -3048,8 +3062,11 @@ pub const Surface = struct {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
 
-                if (self.liveCore()) |core_surface| {
-                    self.strayChar(core_surface, msg, wparam);
+                // Dropped while a prompt is open, as key messages are.
+                if (self.app.canReenterCore()) {
+                    if (self.liveCore()) |core_surface| {
+                        self.strayChar(core_surface, msg, wparam);
+                    }
                 }
 
                 // Always handled. For WM_SYSCHAR this is also what stops
@@ -3318,8 +3335,9 @@ pub const Surface = struct {
         shiftless: u21,
         alt_gr: bool,
     ) !CoreSurface.InputEffect {
-        // Text the IME committed earlier comes first.
-        if (self.app.canReenterCore()) self.flushIme(core_surface);
+        // Text the IME committed earlier comes first. Both callers'
+        // handlers only get here when `App.canReenterCore` holds.
+        self.flushIme(core_surface);
 
         // A dead key shows its accent as preedit until the next committed
         // text replaces it. The core does not track this itself
@@ -3454,11 +3472,11 @@ pub const Surface = struct {
 
     /// The core, if an IME handler may call into it.
     ///
-    /// Stricter than the key path, which only asks for `liveCore`. IME
-    /// messages are mostly *sent*, so they also arrive inside a prompt's
-    /// message loop with a core frame beneath it: the composition ends
-    /// because the prompt took the focus. Key messages are posted to a
-    /// window the prompt has disabled, and never get there.
+    /// IME messages are mostly *sent*, so they also arrive inside a
+    /// prompt's message loop with a core frame beneath it: the composition
+    /// ends because the prompt took the focus. The key and character
+    /// handlers apply the same rule: the prompt disables its owner, which
+    /// stops the user's input but not messages posted or sent to it.
     fn imeCore(self: *Surface) ?*CoreSurface {
         if (!self.app.canReenterCore()) return null;
         return self.liveCore();
@@ -6062,6 +6080,65 @@ test "win32: ime withholds the release of a key it claimed" {
         try std.testing.expectEqual(.deliver_withheld, ime.filterKey(down, vk_a, a_down));
         try std.testing.expectEqual(.deliver, ime.filterKey(up, vk_a, a_up));
     }
+}
+
+test "win32: key messages under a prompt never reach the core" {
+    // A prompt disables its owner, but its message loop still dispatches
+    // key messages another program posts or sends to the window. They are
+    // dropped there, so the core surface is left uninitialized: the test
+    // crashes if a handler calls into it. A message-only window stands in
+    // for the surface's.
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    var app: App = undefined;
+    app.ticking = false;
+    app.prompt_depth = 1;
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var surface: Surface = undefined;
+    };
+    const surface = &s.surface;
+    surface.app = &app;
+    surface.hwnd = hwnd;
+    surface.core_state = .live;
+    surface.ime = .{};
+
+    // Scan code 0x1E (A): a press, a repeat and a release.
+    const vk_a: win32.WPARAM = 0x41;
+    const a_down: win32.LPARAM = 0x001E_0001;
+    const a_repeat: win32.LPARAM = 0x401E_0001;
+    const a_up: win32.LPARAM = @bitCast(@as(usize, 0xC01E_0001));
+    const slot = Surface.Ime.scanSlot(a_down);
+
+    // A repeat's press may have reached the core before the prompt, so its
+    // release must not be withheld.
+    try std.testing.expectEqual(0, surface.handleMessage(hwnd, win32.WM_KEYDOWN, vk_a, a_repeat));
+    try std.testing.expect(!surface.ime.swallow_up.isSet(slot));
+
+    try std.testing.expectEqual(0, surface.handleMessage(hwnd, win32.WM_KEYDOWN, vk_a, a_down));
+    try std.testing.expectEqual(0, surface.handleMessage(hwnd, win32.WM_CHAR, 'a', a_down));
+    try std.testing.expect(surface.ime.swallow_up.isSet(slot));
+
+    // Once the prompt is gone the release of the dropped press is
+    // withheld too, so the core never sees a release without its press.
+    app.prompt_depth = 0;
+    _ = surface.handleMessage(hwnd, win32.WM_KEYUP, vk_a, a_up);
+    try std.testing.expect(!surface.ime.swallow_up.isSet(slot));
 }
 
 test "win32: ime completes Korean on focus loss and cancels the rest" {
