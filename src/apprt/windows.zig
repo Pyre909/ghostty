@@ -56,6 +56,7 @@ const configpkg = @import("../config.zig");
 const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
+const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
 const CoreSurface = @import("../Surface.zig");
@@ -1935,6 +1936,51 @@ pub const Surface = struct {
             };
         }
 
+        /// What `syncMouse` sends the core, from `sync`.
+        const Sync = struct {
+            /// Releases to send at `releasePoint`.
+            release: Button.Set = .empty,
+            /// The last held button is now owed while this window still has
+            /// the capture, so the capture is released.
+            release_capture: bool = false,
+            /// A leave, after the releases.
+            leave: bool = false,
+        };
+
+        /// Take what the core is owed (`syncMouse`). `captured` is whether
+        /// this window has the mouse capture, and `down` the buttons the
+        /// current message reports down, or null without a message.
+        ///
+        /// A held button is owed its release once the capture is gone or
+        /// `down` says it is up. A leave follows the releases only when no
+        /// button is still held, since a position outside would drag to an
+        /// edge cell; with no release to send, only an owed leave is sent.
+        fn sync(self: *Mouse, captured: bool, down: ?Button.Set) Sync {
+            var result: Sync = .{};
+            if (self.held.count() != 0) {
+                const gone = if (!captured)
+                    self.held
+                else if (down) |d|
+                    self.held.differenceWith(d)
+                else
+                    Button.Set.empty;
+                if (gone.count() != 0) {
+                    self.owed.setUnion(gone);
+                    self.held = self.held.differenceWith(gone);
+                    result.release_capture = captured and self.held.count() == 0;
+                }
+            }
+
+            result.release = self.owed;
+            self.owed = .empty;
+            result.leave = if (result.release.count() != 0)
+                self.held.count() == 0
+            else
+                self.leave_owed;
+            if (result.leave) self.leave_owed = false;
+            return result;
+        }
+
         /// The buttons this runtime reports: a separate enum from
         /// input.MouseButton, so nothing else can be sent.
         ///   * `.unknown` would mask motion reports;
@@ -2723,35 +2769,19 @@ pub const Surface = struct {
             win32.WM_SIZE => {
                 self.ime.form = null;
                 const core_surface = self.liveCore() orelse return 0;
+                const change: SizeChange = .init(wparam, lparam);
 
-                // Minimized: report occluded and do NOT resize. A minimized
-                // window reports a 0x0 client area, and the grid is clamped
-                // to at least 1x1 (`renderer.size.GridSize.update`), so passing
-                // it on would reflow every line to one column and back on
-                // restore.
-                if (wparam == win32.SIZE_MINIMIZED) {
-                    core_surface.occlusionCallback(false) catch |err|
-                        log.warn("occlusion callback failed err={}", .{err});
-                    return 0;
-                }
-
-                // Every other WM_SIZE means visible. Sent unconditionally;
-                // the core ignores repeats (`Surface.occlusionCallback`).
-                core_surface.occlusionCallback(true) catch |err|
+                // Every WM_SIZE but a minimize means visible. Sent
+                // unconditionally; the core ignores repeats
+                // (`Surface.occlusionCallback`).
+                core_surface.occlusionCallback(change != .minimized) catch |err|
                     log.warn("occlusion callback failed err={}", .{err});
 
-                // Client size in physical pixels (PerMonitorV2). A zero
-                // dimension can also occur without minimizing (a window
-                // dragged to zero height); it would clamp the grid the same
-                // way, so it is skipped too.
-                const width = win32.loword(lparam);
-                const height = win32.hiword(lparam);
-                if (width == 0 or height == 0) return 0;
-
-                core_surface.sizeCallback(.{
-                    .width = width,
-                    .height = height,
-                }) catch |err| log.warn("size callback failed err={}", .{err});
+                switch (change) {
+                    .minimized, .empty => {},
+                    .resize => |size| core_surface.sizeCallback(size) catch |err|
+                        log.warn("size callback failed err={}", .{err}),
+                }
                 return 0;
             },
 
@@ -3668,22 +3698,12 @@ pub const Surface = struct {
         if (!self.app.canReenterCore()) return false;
         const m = &self.mouse;
 
-        if (m.held.count() != 0) {
-            const gone = if (!self.hasCapture())
-                m.held
-            else if (down) |d|
-                m.held.differenceWith(d)
-            else
-                Mouse.Button.Set.empty;
-            if (gone.count() != 0) {
-                m.owed.setUnion(gone);
-                m.held = m.held.differenceWith(gone);
-                if (m.held.count() == 0 and self.hasCapture()) _ = win32.ReleaseCapture();
-            }
-        }
-        if (m.owed.count() == 0 and !m.leave_owed) return true;
+        // The capture only matters while a button is held, and this runs
+        // for every move.
+        const sync = m.sync(m.held.count() != 0 and self.hasCapture(), down);
+        if (sync.release_capture) _ = win32.ReleaseCapture();
 
-        if (m.owed.count() != 0) {
+        if (sync.release.count() != 0) {
             // Where the user let go is unknown, and the click must not
             // complete. The core treats a release on another cell than the
             // press as the end of a drag (SelectionGesture.release), so no
@@ -3694,37 +3714,32 @@ pub const Surface = struct {
             // Programs with mouse reporting receive the release at that
             // edge cell.
             const last = m.pos;
-            m.pos = releasePoint(core_surface, m.left_press_pos);
+            m.pos = releasePoint(core_surface.size.screen, m.left_press_pos);
 
             // The mods the core already has, so the release is judged like
             // the events before it: a Shift drag in a program with mouse
             // reporting stays a Ghostty selection
             // (`Surface.mouseButtonCallback`).
             const mods = core_surface.mouse.mods;
-            const owed = m.owed;
-            m.owed = .empty;
-            var it = owed.iterator();
+            var it = sync.release.iterator();
             while (it.next()) |button| {
                 _ = core_surface.mouseButtonCallback(.release, button.core(), mods) catch |err|
                     log.warn("mouse button callback failed err={}", .{err});
             }
 
-            // With a button still held (only some were released), no leave:
-            // a position outside would drag to an edge cell. The next
-            // captured move supplies the real position.
-            if (m.held.count() != 0) {
-                m.pos = last;
-                return true;
-            }
+            // No leave (`Mouse.sync`): the next captured move supplies the
+            // real position.
+            if (!sync.leave) m.pos = last;
         }
 
         // Then the leave. If the pointer is in fact over the window, the
         // next WM_MOUSEMOVE re-enters and re-arms tracking.
-        m.pos = Mouse.outside;
-        m.leave_owed = false;
-        m.tracking = false;
-        core_surface.cursorPosCallback(Mouse.outside, null) catch |err|
-            log.warn("cursor pos callback failed err={}", .{err});
+        if (sync.leave) {
+            m.pos = Mouse.outside;
+            m.tracking = false;
+            core_surface.cursorPosCallback(Mouse.outside, null) catch |err|
+                log.warn("cursor pos callback failed err={}", .{err});
+        }
         return true;
     }
 
@@ -4080,8 +4095,7 @@ pub const Surface = struct {
 /// A point beyond the client area, past the corner farthest from `press`
 /// on each axis. The core clamps it to that corner's cell
 /// (the `.grid` arm of `renderer.size.Coordinate.convert`).
-fn releasePoint(core_surface: *const CoreSurface, press: apprt.CursorPos) apprt.CursorPos {
-    const screen = core_surface.size.screen;
+fn releasePoint(screen: renderer.ScreenSize, press: apprt.CursorPos) apprt.CursorPos {
     const w: f32 = @floatFromInt(screen.width);
     const h: f32 = @floatFromInt(screen.height);
     return .{
@@ -4100,6 +4114,31 @@ fn clientPos(lparam: win32.LPARAM) apprt.CursorPos {
         .y = @floatFromInt(win32.yLparam(lparam)),
     };
 }
+
+/// What a WM_SIZE tells the core.
+const SizeChange = union(enum) {
+    /// Occluded, and not resized. A minimized window reports a 0x0 client
+    /// area, and the grid is clamped to at least 1x1
+    /// (`renderer.size.GridSize.update`), so passing it on would reflow
+    /// every line to one column and back on restore.
+    minimized,
+
+    /// Visible, but not resized: a zero dimension can also occur without
+    /// minimizing (a window dragged to zero height), and would clamp the
+    /// grid the same way.
+    empty,
+
+    /// Visible, at this client size in physical pixels (PerMonitorV2).
+    resize: apprt.SurfaceSize,
+
+    fn init(wparam: win32.WPARAM, lparam: win32.LPARAM) SizeChange {
+        if (wparam == win32.SIZE_MINIMIZED) return .minimized;
+        const width = win32.loword(lparam);
+        const height = win32.hiword(lparam);
+        if (width == 0 or height == 0) return .empty;
+        return .{ .resize = .{ .width = width, .height = height } };
+    }
+};
 
 /// The point of `rect` nearest to `pt`. A RECT excludes its right and bottom
 /// edges; an empty one gives its top-left corner.
@@ -4942,10 +4981,203 @@ test "win32: wheel points off the client area clamp to its edge" {
 }
 
 test "win32: mouse message button bits" {
-    const Set = Surface.Mouse.Button.Set;
-    try std.testing.expect(Surface.Mouse.Button.downIn(0).eql(Set.empty));
-    const both = Surface.Mouse.Button.downIn(win32.MK_LBUTTON | win32.MK_XBUTTON2 | win32.MK_SHIFT);
-    try std.testing.expect(both.eql(Set.initMany(&.{ .left, .x2 })));
+    // Raw wParams as the system packs them, so a wrong MK_ or XBUTTON
+    // constant fails here: MK_LBUTTON 0x01, MK_RBUTTON 0x02, MK_SHIFT 0x04,
+    // MK_CONTROL 0x08, MK_MBUTTON 0x10, MK_XBUTTON1 0x20, MK_XBUTTON2 0x40.
+    const Button = Surface.Mouse.Button;
+    try std.testing.expect(Button.downIn(0).eql(.empty));
+    try std.testing.expect(Button.downIn(0x0045).eql(.initMany(&.{ .left, .x2 })));
+    try std.testing.expect(Button.downIn(0x003A).eql(.initMany(&.{ .right, .middle, .x1 })));
+
+    // GET_XBUTTON_WPARAM: XBUTTON1 is 1 and XBUTTON2 is 2 in the high
+    // word; the low word holds the MK_ bits.
+    try std.testing.expectEqual(Button.x2, Button.fromMessage(win32.WM_XBUTTONUP, 0x0002_0000).?);
+    try std.testing.expectEqual(Button.x1, Button.fromMessage(win32.WM_XBUTTONDOWN, 0x0001_0020).?);
+    try std.testing.expectEqual(null, Button.fromMessage(win32.WM_XBUTTONDOWN, 0x0003_0000));
+}
+
+test "win32: wheel deltas are the signed high word" {
+    // One notch toward the user is -120 (0xFF88), here with MK_CONTROL in
+    // the low word.
+    try std.testing.expectEqual(-120, win32.wheelDelta(0xFF88_0008));
+    try std.testing.expectEqual(120, win32.wheelDelta(0x0078_0000));
+}
+
+test "win32: mouse sync owes a release for each button no longer down" {
+    const Mouse = Surface.Mouse;
+    const Set = Mouse.Button.Set;
+    const Case = struct {
+        held: Set,
+        owed: Set = .empty,
+        leave_owed: bool = false,
+        captured: bool,
+        down: ?Set,
+        want: Mouse.Sync,
+        held_after: Set,
+    };
+    const cases = [_]Case{
+        // The capture was taken away (a prompt, the focus) with two
+        // buttons held: both are released, then the pointer leaves.
+        .{
+            .held = .initMany(&.{ .left, .right }),
+            .captured = false,
+            .down = null,
+            .want = .{ .release = .initMany(&.{ .left, .right }), .leave = true },
+            .held_after = .empty,
+        },
+        // One of two buttons let go elsewhere: no leave, since the other
+        // button is still dragging.
+        .{
+            .held = .initMany(&.{ .left, .right }),
+            .captured = true,
+            .down = .initOne(.right),
+            .want = .{ .release = .initOne(.left) },
+            .held_after = .initOne(.right),
+        },
+        // The last button let go elsewhere while captured.
+        .{
+            .held = .initOne(.left),
+            .captured = true,
+            .down = .empty,
+            .want = .{ .release = .initOne(.left), .release_capture = true, .leave = true },
+            .held_after = .empty,
+        },
+        // Captured, and no message to say otherwise: still held.
+        .{
+            .held = .initOne(.left),
+            .captured = true,
+            .down = null,
+            .want = .{},
+            .held_after = .initOne(.left),
+        },
+        // A button the core never saw pressed is not released.
+        .{
+            .held = .initOne(.left),
+            .captured = true,
+            .down = .initMany(&.{ .left, .right }),
+            .want = .{},
+            .held_after = .initOne(.left),
+        },
+        // A release and a leave that came while a prompt was open.
+        .{
+            .held = .empty,
+            .owed = .initOne(.middle),
+            .captured = false,
+            .down = .empty,
+            .want = .{ .release = .initOne(.middle), .leave = true },
+            .held_after = .empty,
+        },
+        .{
+            .held = .empty,
+            .leave_owed = true,
+            .captured = false,
+            .down = null,
+            .want = .{ .leave = true },
+            .held_after = .empty,
+        },
+    };
+    for (cases) |c| {
+        var m: Mouse = .init();
+        m.held = c.held;
+        m.owed = c.owed;
+        m.leave_owed = c.leave_owed;
+        const got = m.sync(c.captured, c.down);
+        try std.testing.expect(got.release.eql(c.want.release));
+        try std.testing.expectEqual(c.want.release_capture, got.release_capture);
+        try std.testing.expectEqual(c.want.leave, got.leave);
+        try std.testing.expect(m.held.eql(c.held_after));
+        try std.testing.expect(m.owed.eql(.empty));
+        try std.testing.expectEqual(c.leave_owed and !got.leave, m.leave_owed);
+    }
+
+    // For every held set, every `down` and either capture state: a button
+    // ends up still held or released, never both, never lost, and never
+    // one that was not held.
+    const buttons = comptime std.enums.values(Mouse.Button);
+    const all = 1 << buttons.len;
+    const setOf = struct {
+        fn f(bits: usize) Set {
+            var set: Set = .empty;
+            for (buttons, 0..) |b, i| {
+                if (bits & (@as(usize, 1) << @intCast(i)) != 0) set.insert(b);
+            }
+            return set;
+        }
+    }.f;
+    for (0..all) |held_bits| {
+        // One past the last set stands for no message (`down == null`).
+        for (0..all + 1) |down_bits| {
+            for ([_]bool{ false, true }) |captured| {
+                var m: Mouse = .init();
+                m.held = setOf(held_bits);
+                const down: ?Set = if (down_bits == all) null else setOf(down_bits);
+                const got = m.sync(captured, down);
+                try std.testing.expect(got.release.intersectWith(m.held).eql(.empty));
+                try std.testing.expect(got.release.unionWith(m.held).eql(setOf(held_bits)));
+            }
+        }
+    }
+}
+
+test "win32: an invented release lands on another cell than the press" {
+    // An 80x24 grid of 10x20 cells with 2 px of padding, and the leftover
+    // pixels at the right and bottom, as without padding balance.
+    const size: renderer.Size = .{
+        .screen = .{ .width = 805, .height = 489 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{ .top = 2, .bottom = 2, .left = 2, .right = 2 },
+    };
+    const grid = size.grid();
+    try std.testing.expectEqual(80, grid.columns);
+    try std.testing.expectEqual(24, grid.rows);
+
+    const cell = struct {
+        fn at(pos: apprt.CursorPos, s: renderer.Size) renderer.Coordinate.Grid {
+            const surface: renderer.Coordinate = .{ .surface = .{ .x = pos.x, .y = pos.y } };
+            return surface.convert(.grid, s).grid;
+        }
+    }.at;
+
+    var y: u32 = 0;
+    while (y < size.screen.height) : (y += 1) {
+        var x: u32 = 0;
+        while (x < size.screen.width) : (x += 1) {
+            const press: apprt.CursorPos = .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
+            const release = releasePoint(size.screen, press);
+
+            // Outside the client area on both axes.
+            try std.testing.expect(release.x < 0 or release.x >= 805);
+            try std.testing.expect(release.y < 0 or release.y >= 489);
+
+            // A corner cell, in another column and another row than the
+            // press: the corner farthest from it.
+            const p = cell(press, size);
+            const r = cell(release, size);
+            try std.testing.expect(r.x == 0 or r.x == grid.columns - 1);
+            try std.testing.expect(r.y == 0 or r.y == grid.rows - 1);
+            try std.testing.expect(p.x != r.x);
+            try std.testing.expect(p.y != r.y);
+        }
+    }
+}
+
+test "win32: a minimized or empty window is not resized" {
+    // wParam SIZE_RESTORED 0, SIZE_MINIMIZED 1, SIZE_MAXIMIZED 2; lParam
+    // MAKELPARAM(width, height).
+    try std.testing.expectEqual(SizeChange.minimized, SizeChange.init(1, 0));
+    try std.testing.expectEqual(SizeChange.minimized, SizeChange.init(1, 0x0438_0780));
+    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0, 0x0190_0000));
+    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0, 0x0000_0280));
+    try std.testing.expectEqual(
+        SizeChange{ .resize = .{ .width = 1920, .height = 1080 } },
+        SizeChange.init(2, 0x0438_0780),
+    );
+
+    // Unsigned: a client size is never negative, unlike a mouse position.
+    try std.testing.expectEqual(
+        SizeChange{ .resize = .{ .width = 0x9000, .height = 0x8000 } },
+        SizeChange.init(0, 0x8000_9000),
+    );
 }
 
 test "win32: key messages decode lParam" {
@@ -5736,4 +5968,63 @@ test "win32: losing focus mid-drag wakes the app loop" {
         ).toBool();
         try std.testing.expectEqual(c.want, woken);
     }
+}
+
+test "win32: modal loops are counted per window and returned on destroy" {
+    // The app ticks the core from its window procedure while any window is
+    // in a size/move or menu loop (WM_GHOSTTY_WAKEUP), so the count must
+    // not leak past a loop's end or a window's. One message-only window
+    // stands in for both surfaces' windows: these handlers never use it.
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    var app: App = undefined;
+    app.modal_loop_depth = 0;
+    // Empty, so WM_DESTROY's surfaceDestroyed frees nothing.
+    app.surfaces = .empty;
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var a: Surface = undefined;
+        var b: Surface = undefined;
+    };
+    for ([_]*Surface{ &s.a, &s.b }) |surface| {
+        surface.app = &app;
+        surface.hwnd = hwnd;
+        surface.core_state = .none;
+        surface.modal_loops = 0;
+    }
+
+    _ = s.a.handleMessage(hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    _ = s.a.handleMessage(hwnd, win32.WM_ENTERMENULOOP, 0, 0);
+    try std.testing.expectEqual(2, app.modal_loop_depth);
+
+    // An exit with no loop of its own takes nothing from another window.
+    _ = s.b.handleMessage(hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+    try std.testing.expectEqual(2, app.modal_loop_depth);
+
+    _ = s.b.handleMessage(hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    try std.testing.expectEqual(3, app.modal_loop_depth);
+
+    // Destroyed inside both of its loops, so their exits never come.
+    _ = s.a.handleMessage(hwnd, win32.WM_DESTROY, 0, 0);
+    try std.testing.expectEqual(1, app.modal_loop_depth);
+
+    _ = s.b.handleMessage(hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+    try std.testing.expectEqual(0, app.modal_loop_depth);
+    _ = s.b.handleMessage(hwnd, win32.WM_EXITMENULOOP, 0, 0);
+    try std.testing.expectEqual(0, app.modal_loop_depth);
 }
