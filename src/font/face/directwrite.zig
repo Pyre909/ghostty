@@ -1040,6 +1040,27 @@ pub const Face = struct {
         const len = @as(usize, size.width) * size.height * 4;
         switch (format) {
             api.DWRITE_GLYPH_IMAGE_FORMATS_PNG => {
+                // The decoder allocates for the size in the PNG's own
+                // header, up to 4 GiB, so that size must be the font's
+                // before anything is decoded, as FreeType's
+                // sfnt/pngshim.c checks it. A PNG is an 8-byte
+                // signature and then the IHDR chunk (length, type),
+                // whose data starts with the width and the height.
+                // Ref: https://www.w3.org/TR/png-3/#11IHDR
+                if (bytes.len < 24 or !std.mem.eql(u8, bytes[12..16], "IHDR")) {
+                    log.warn("glyph image has no PNG header", .{});
+                    return error.BitmapHandlingError;
+                }
+                const header_width = std.mem.readInt(u32, bytes[16..20], .big);
+                const header_height = std.mem.readInt(u32, bytes[20..24], .big);
+                if (header_width != size.width or header_height != size.height) {
+                    log.warn(
+                        "glyph image is {}x{} where the font says {}x{}",
+                        .{ header_width, header_height, size.width, size.height },
+                    );
+                    return error.BitmapHandlingError;
+                }
+
                 const png = wuffs.png.decode(alloc, bytes) catch |err| {
                     log.warn("glyph image could not be decoded: {}", .{err});
                     return error.BitmapHandlingError;
@@ -3623,6 +3644,20 @@ test "image is decoded to premultiplied BGRA" {
         api.DWRITE_GLYPH_IMAGE_FORMATS_PNG,
         .{ .width = 2, .height = 1 },
     ));
+
+    // An image whose header gives a size other than the font's is
+    // refused before the decoder allocates anything for it.
+    var huge = png;
+    std.mem.writeInt(u32, huge[16..20], 30000, .big);
+    std.mem.writeInt(u32, huge[20..24], 30000, .big);
+    var failing = testing.FailingAllocator.init(alloc, .{});
+    try testing.expectError(error.BitmapHandlingError, Face.decodeImage(
+        failing.allocator(),
+        &huge,
+        api.DWRITE_GLYPH_IMAGE_FORMATS_PNG,
+        .{ .width = 1, .height = 1 },
+    ));
+    try testing.expectEqual(0, failing.allocations);
 
     // Premultiplied BGRA is taken as it is, when it is as long as the
     // size says.
