@@ -1016,6 +1016,9 @@ palette: Palette = .{},
 /// widgets to show through which isn't generally desirable.
 ///
 /// On macOS, changing this configuration requires restarting Ghostty completely.
+///
+/// This setting is currently not supported on Windows, where the background
+/// is always drawn opaque.
 @"background-opacity": f64 = 1.0,
 
 /// Applies background opacity to cells with an explicit background color

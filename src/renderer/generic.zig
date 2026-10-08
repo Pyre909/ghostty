@@ -648,8 +648,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     config.link.links.items,
                 );
 
+                // A backend whose surface is composed as opaque would show
+                // the premultiplied background, rgb * opacity, as a darker
+                // colour rather than a translucent one, so it gets none.
+                const background_opacity: f64 = if (@hasDecl(GraphicsAPI, "presents_alpha") and
+                    !GraphicsAPI.presents_alpha)
+                    1
+                else
+                    @max(0, @min(1, config.@"background-opacity"));
+
                 return .{
-                    .background_opacity = @max(0, @min(1, config.@"background-opacity")),
+                    .background_opacity = background_opacity,
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
                     .font_thicken_strength = config.@"font-thicken-strength",

@@ -67,6 +67,12 @@ pub const custom_shader_target: shadertoy.Target = .hlsl;
 /// SV_Position is +Y = down, like Metal's fragment position.
 pub const custom_shader_y_is_down = true;
 
+/// The swap chain is an HWND chain, which DXGI only allows with
+/// DXGI_ALPHA_MODE_IGNORE, so DWM composes the window as opaque. The
+/// premultiplied background would show as its colour scaled toward
+/// black, so generic.zig draws it opaque instead; see `DerivedConfig`.
+pub const presents_alpha = false;
+
 /// One slot: presentation is synchronous inside `Frame.complete`, so at
 /// most one frame is ever in flight (generic.zig allows a count of 1).
 pub const swap_chain_count = 1;
@@ -1056,6 +1062,21 @@ pub fn beginFrame(
         .context = self.context,
         .default_sampler = self.default_sampler.sampler,
     }, renderer, target);
+}
+
+test "d3d11: background-opacity draws an opaque background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    config.@"background-opacity" = 0.5;
+
+    // The bg_color uniform's alpha and the cell background multiply both
+    // read this, so 1 keeps #ffffff from presenting as #808080.
+    var derived = try Renderer.DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+    try testing.expectEqual(@as(f64, 1), derived.background_opacity);
 }
 
 test "d3d11: zero-size client area does not count as stale" {
