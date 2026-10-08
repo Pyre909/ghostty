@@ -23,7 +23,9 @@ pub fn open(
     // native apprt applies its allowlist, confirmation, and file safety policy.
     // If a macOS embedder declines the action, fail closed rather than bypassing
     // that policy by handing producer-controlled terminal output to `open`.
-    if (comptime builtin.os.tag == .macos) {
+    // The Windows apprt applies its allowlist the same way, and rundll32 below
+    // would run `file:` targets and any registered scheme.
+    if (comptime builtin.os.tag == .macos or builtin.os.tag == .windows) {
         if (kind == .osc8) return error.UnsafeOSC8Link;
     }
 
@@ -67,8 +69,8 @@ pub fn open(
     thread.detach();
 }
 
-test "macOS OSC 8 links have no generic opener fallback" {
-    if (builtin.os.tag != .macos) return error.SkipZigTest;
+test "macOS and Windows OSC 8 links have no generic opener fallback" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
 
     try std.testing.expectError(
         error.UnsafeOSC8Link,

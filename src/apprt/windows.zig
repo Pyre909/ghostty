@@ -1346,8 +1346,9 @@ pub const App = struct {
     /// whatever registered it. Only a well-formed http, https or mailto
     /// link is opened from one (`osc8Allowed`); anything else is refused
     /// with a notice. The refusal reports `true`: `false` would send the
-    /// same link to the core's generic opener (`Surface.openUrl`)
-    /// and bypass the policy. The other kinds are link text the user can
+    /// same link to the core's generic opener (`Surface.openUrl`), which
+    /// refuses OSC 8 targets on Windows as well (src/os/open.zig) but
+    /// reports that as an error. The other kinds are link text the user can
     /// see, or paths the core resolved from it, and open unchanged.
     ///
     /// Nothing here may dispatch messages: the core calls this while
@@ -4873,9 +4874,10 @@ fn openUrlThread(alloc: Allocator, wide: [:0]u16) void {
 /// Whether an OSC 8 target may be opened: an http or https link with a
 /// host, or a mailto link with an address, containing nothing that could
 /// display differently from what the handler receives. This is the allow
-/// branch of the macOS policy (macos/Sources/Helpers/UntrustedURL.swift);
-/// what that policy confirms or inspects (`file:`, custom schemes) is
-/// refused here outright.
+/// branch of the macOS policy (macos/Sources/Helpers/UntrustedURL.swift),
+/// which likewise leaves the parse to the platform's URL parser (here
+/// std.Uri); what that policy confirms or inspects (`file:`, custom
+/// schemes) is refused here outright.
 fn osc8Allowed(url: []const u8) bool {
     // Control, bidirectional and zero-width code points can hide part of
     // the target or add a display line; invalid UTF-8 cannot be shown.
@@ -4890,25 +4892,21 @@ fn osc8Allowed(url: []const u8) bool {
         if (unsafe) return false;
     }
 
-    const colon = std.mem.indexOfScalar(u8, url, ':') orelse return false;
-    const scheme = url[0..colon];
-    const rest = url[colon + 1 ..];
+    const uri = std.Uri.parse(url) catch return false;
 
-    if (std.ascii.eqlIgnoreCase(scheme, "http") or std.ascii.eqlIgnoreCase(scheme, "https")) {
-        // "https:relative" has a scheme but no authority, and consumers
-        // resolve it against different bases.
-        if (!std.mem.startsWith(u8, rest, "//")) return false;
-        const authority = rest[2 .. 2 + (std.mem.indexOfAny(u8, rest[2..], "/?#") orelse rest.len - 2)];
-        // The host follows the user info and precedes the port.
-        const after_user = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |i| authority[i + 1 ..] else authority;
-        const host = if (std.mem.indexOfScalar(u8, after_user, ':')) |i| after_user[0..i] else after_user;
-        return host.len != 0;
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "http") or
+        std.ascii.eqlIgnoreCase(uri.scheme, "https"))
+    {
+        // "https:relative" and "https:///path" parse with no host, and
+        // consumers resolve them against different bases. std.Uri ends
+        // the user info at the first '@' where browsers take the last, so
+        // "https://a@b@/" leaves the host "b@" here and an empty one there.
+        const host = (uri.host orelse return false).percent_encoded;
+        return host.len > 0 and std.mem.indexOfScalar(u8, host, '@') == null;
     }
 
-    if (std.ascii.eqlIgnoreCase(scheme, "mailto")) {
-        // The address is the path; a bare "mailto:" opens an empty message.
-        return (std.mem.indexOfScalar(u8, rest, '?') orelse rest.len) != 0;
-    }
+    // The address is the path; a bare "mailto:" opens an empty message.
+    if (std.ascii.eqlIgnoreCase(uri.scheme, "mailto")) return !uri.path.isEmpty();
 
     return false;
 }
@@ -5872,6 +5870,7 @@ test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
         "HTTP://user:pw@example.com:8080/",
         "http://[::1]:8080/",
         "mailto:someone@example.com?subject=hi",
+        "MAILTO:a@b",
     };
     for (allowed) |url| try std.testing.expect(osc8Allowed(url));
 
@@ -5883,16 +5882,32 @@ test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
         "https:///path",
         "https://user@/path",
         "https://:8080/",
+        "https://a@b@/",
+        "https://a@@/",
+        "http://[/",
+        "http://[::1/",
+        "http://example.com:abc/",
         "mailto:",
         "mailto:?subject=hi",
         "file:///C:/Windows/System32/calc.exe",
         "ms-settings:display",
         "ftp://example.com/",
-        "https://example.com/\u{200B}hidden",
         "https://example.com/\r\n",
         "https://example.com/\xff",
     };
     for (refused) |url| try std.testing.expect(!osc8Allowed(url));
+
+    // One code point from each arm of the screen, placed as the macOS
+    // policy's test places them (UntrustedURLTests.swift).
+    const unsafe = [_]u21{
+        0x0000, 0x001F, 0x007F, 0x0085, 0x009F, // C0 and C1 controls
+        0x061C, 0x200B, 0x200F, 0x202A, 0x202E, 0x2066, 0x2069, // bidi, zero width
+        0x2028, 0x2029, 0x2060, 0xFEFF, // line separators, word joiner, BOM
+    };
+    inline for (unsafe) |cp| {
+        const url = "https://example.com/before" ++ std.unicode.utf8EncodeComptime(cp) ++ "after";
+        try std.testing.expect(!osc8Allowed(url));
+    }
 }
 
 test "win32: ime plan for a composition message" {
