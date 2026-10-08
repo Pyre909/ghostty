@@ -671,8 +671,7 @@ pub const App = struct {
     ///
     /// Every surface's config is derived from this one
     /// (`apprt.surface.newConfig` in `Surface.create`), and the app-scoped key
-    /// path (`CoreApp.keyEvent`) reads
-    /// `rt_app.config.keybind`.
+    /// path in `CoreApp.keyEvent` reads `rt_app.config.keybind`.
     config: Config,
 
     hinstance: win32.HINSTANCE,
@@ -872,9 +871,9 @@ pub const App = struct {
 
     pub fn terminate(self: *App) void {
         // Every remaining surface is destroyed as destroyPosted does it
-        // (Surface.destroy), so that CoreApp.deinit -- which runs after this
-        // (in `main`) -- finds an empty surface list and its
-        // `font_grid_set.count() == 0` assert holds (`CoreApp.deinit`).
+        // (Surface.destroy), so that CoreApp.deinit, which `main` runs after
+        // this, finds an empty surface list and its
+        // `font_grid_set.count() == 0` assert holds.
         //
         // `terminating` makes destroyPosted and close ignore anything still
         // queued: stopCore pumps messages, and a WM_GHOSTTY_DESTROY or
@@ -1135,10 +1134,8 @@ pub const App = struct {
         }
     }
 
-    /// Called from the renderer and IO threads via `App.Mailbox.push`
-    /// (`CoreApp.Mailbox.push`), so this must be thread-safe and must not
-    /// block.
-    /// PostMessageW is both.
+    /// Called from the renderer and IO threads via `CoreApp.Mailbox.push`, so
+    /// this must be thread-safe and must not block. PostMessageW is both.
     pub fn wakeup(self: *App) void {
         _ = win32.PostMessageW(self.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
     }
@@ -1151,20 +1148,10 @@ pub const App = struct {
         _ = self.setQuitTimer(.start);
     }
 
-    /// Keyboard layout detection exists only on macOS: `input.Keymap` is
-    /// `KeymapNoop` everywhere else (`input.Keymap`). `.unknown` is the
-    /// honest answer, and it maps to option-as-alt `.false` at the one call
-    /// site (`Surface.encodeKeyOpts`).
-    pub fn keyboardLayout(self: *App) input.KeyboardLayout {
-        _ = self;
-        return .unknown;
-    }
-
     /// Actions this runtime actually performs. Anything not named here
     /// returns `false`, which is the contract's word for "unsupported" -- see
     /// the `apprt.Action` docs (actions are OPTIONAL). Returning `true` for an
-    /// action that did not
-    /// happen would be a lie the core cannot detect.
+    /// action that did not happen would be a lie the core cannot detect.
     pub fn performAction(
         self: *App,
         target: apprt.Target,
@@ -4917,7 +4904,6 @@ comptime {
     // `apprt.embedded.Surface`, which this contract does not describe.
     if (apprt.runtime == @This()) {
         _ = &App.performIpc;
-        _ = &App.keyboardLayout;
         _ = &App.wakeup;
         _ = &App.startQuitTimer;
 
