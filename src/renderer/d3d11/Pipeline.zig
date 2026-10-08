@@ -31,12 +31,6 @@ pub const Options = struct {
     vertex_source: ?[:0]const u8 = null,
     fragment_source: ?[:0]const u8 = null,
 
-    /// Vertex input elements, when the pipeline reads a vertex buffer.
-    input_elements: []const api.D3D11_INPUT_ELEMENT_DESC = &.{},
-
-    /// The stride of that vertex buffer.
-    stride: u32 = 0,
-
     /// Whether to enable blending.
     blending_enabled: bool = true,
 };
@@ -60,7 +54,7 @@ blending_enabled: bool,
 /// True once the pipeline holds shaders and can be drawn with.
 ready: bool = false,
 
-pub fn init(opts: Options) Error!Self {
+pub fn init(comptime VertexAttributes: ?type, opts: Options) Error!Self {
     const vertex_source = opts.vertex_source orelse return .{ .blending_enabled = opts.blending_enabled };
     const fragment_source = opts.fragment_source orelse return .{ .blending_enabled = opts.blending_enabled };
 
@@ -93,11 +87,12 @@ pub fn init(opts: Options) Error!Self {
     // The input layout is validated against the vertex shader's input
     // signature, which is why the bytecode is still needed here.
     var input_layout: ?*api.ID3D11InputLayout = null;
-    if (opts.input_elements.len > 0) {
+    if (VertexAttributes) |VA| {
+        const elements = autoInputElements(VA);
         hr = device.vtable.CreateInputLayout(
             device,
-            opts.input_elements.ptr,
-            @intCast(opts.input_elements.len),
+            elements.ptr,
+            @intCast(elements.len),
             vs_bytes.ptr,
             vs_bytes.len,
             &input_layout,
@@ -161,7 +156,7 @@ pub fn init(opts: Options) Error!Self {
         .input_layout = input_layout,
         .blend_state = blend_state,
         .rasterizer_state = rasterizer_state,
-        .stride = opts.stride,
+        .stride = if (VertexAttributes) |VA| @sizeOf(VA) else 0,
         .blending_enabled = opts.blending_enabled,
         .ready = true,
     };
@@ -173,6 +168,112 @@ pub fn deinit(self: *const Self) void {
     if (self.input_layout) |l| api.release(l);
     if (self.ps) |s| api.release(s);
     if (self.vs) |s| api.release(s);
+}
+
+/// The input layout of the instance type T: one per-instance element in
+/// vertex buffer slot 0 for each field, named by the upper-cased field name,
+/// which is the semantic the vertex shader declares.
+///
+/// A field at an offset that is not a multiple of four is folded into the
+/// element before it, as one more component of the same type, and the two
+/// names are joined with an underscore: CellText's `atlas` and `bools` bytes
+/// are read as the two-component ATLAS_BOOLS, so that every element offset
+/// is a multiple of four.
+pub fn autoInputElements(comptime T: type) []const api.D3D11_INPUT_ELEMENT_DESC {
+    return comptime elements: {
+        const fields = @typeInfo(T).@"struct".fields;
+        var result: [fields.len]api.D3D11_INPUT_ELEMENT_DESC = undefined;
+        var names: [fields.len][:0]const u8 = undefined;
+        var len: usize = 0;
+
+        // The component type and count of the last element, to fold into.
+        var last_type: type = void;
+        var last_count: usize = 0;
+
+        for (fields) |field| {
+            const offset = @offsetOf(T, field.name);
+
+            const FT = switch (@typeInfo(field.type)) {
+                .@"struct" => |s| s.backing_integer.?,
+                .@"enum" => |e| e.tag_type,
+                else => field.type,
+            };
+
+            const count, const CT = switch (@typeInfo(FT)) {
+                .array => |a| .{ a.len, a.child },
+                else => .{ 1, FT },
+            };
+
+            var upper: [field.name.len]u8 = undefined;
+            _ = std.ascii.upperString(&upper, field.name);
+
+            if (offset % 4 != 0) {
+                if (len == 0 or
+                    CT != last_type or
+                    result[len - 1].AlignedByteOffset + last_count * @sizeOf(CT) != offset)
+                {
+                    @compileError("cannot fold " ++ @typeName(T) ++ "." ++
+                        field.name ++ " into the element before it");
+                }
+
+                last_count += count;
+                names[len - 1] = std.fmt.comptimePrint("{s}_{s}", .{ names[len - 1], upper });
+                result[len - 1].SemanticName = names[len - 1];
+                result[len - 1].Format = vertexFormat(CT, last_count);
+                continue;
+            }
+
+            names[len] = std.fmt.comptimePrint("{s}", .{upper});
+            result[len] = .{
+                .SemanticName = names[len],
+                .SemanticIndex = 0,
+                .Format = vertexFormat(CT, count),
+                .InputSlot = 0,
+                .AlignedByteOffset = offset,
+                .InputSlotClass = .PER_INSTANCE_DATA,
+                .InstanceDataStepRate = 1,
+            };
+            len += 1;
+            last_type = CT;
+            last_count = count;
+        }
+
+        const final = result[0..len].*;
+        break :elements &final;
+    };
+}
+
+/// The format of an element of `count` components of type T.
+fn vertexFormat(comptime T: type, comptime count: usize) api.DXGI_FORMAT {
+    // Very incomplete list, expand as necessary.
+    return switch (T) {
+        u8 => switch (count) {
+            1 => .R8_UINT,
+            2 => .R8G8_UINT,
+            4 => .R8G8B8A8_UINT,
+            else => comptime unreachable,
+        },
+        u16 => switch (count) {
+            2 => .R16G16_UINT,
+            else => comptime unreachable,
+        },
+        i16 => switch (count) {
+            2 => .R16G16_SINT,
+            else => comptime unreachable,
+        },
+        u32 => switch (count) {
+            1 => .R32_UINT,
+            2 => .R32G32_UINT,
+            else => comptime unreachable,
+        },
+        f32 => switch (count) {
+            1 => .R32_FLOAT,
+            2 => .R32G32_FLOAT,
+            4 => .R32G32B32A32_FLOAT,
+            else => comptime unreachable,
+        },
+        else => comptime unreachable,
+    };
 }
 
 /// Compile one shader stage. Debug builds keep the shader debuggable;

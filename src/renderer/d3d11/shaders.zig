@@ -71,15 +71,13 @@ const PipelineDescription = struct {
         compile: api.D3DCompileFn,
         format: api.DXGI_FORMAT,
     ) !Pipeline {
-        return try .init(.{
+        return try .init(self.vertex_attributes, .{
             .device = device,
             .compile = compile,
             .format = format,
             .name = name,
             .vertex_source = self.vertex_fn,
             .fragment_source = self.fragment_fn,
-            .input_elements = if (self.vertex_attributes) |V| inputElements(V) else &.{},
-            .stride = if (self.vertex_attributes) |V| @sizeOf(V) else 0,
             .blending_enabled = self.blending_enabled,
         });
     }
@@ -212,7 +210,7 @@ fn initPostPipelines(
     }
 
     for (shaders, 0..) |source, n| {
-        pipelines[i] = Pipeline.init(.{
+        pipelines[i] = Pipeline.init(null, .{
             .device = device,
             .compile = compile,
             .format = format,
@@ -369,60 +367,6 @@ pub const BgImage = extern struct {
     };
 };
 
-/// The input-assembler layout of an instance type, as an explicit table
-/// rather than one derived from the fields: the two trailing bytes of
-/// CellText become a single two-component element so that every offset is
-/// a multiple of four, and the semantic names are what the vertex shaders
-/// declare. The layout tests below pin the offsets to the Zig types.
-pub fn inputElements(comptime V: type) []const api.D3D11_INPUT_ELEMENT_DESC {
-    return switch (V) {
-        CellText => &cell_text_elements,
-        Image => &image_elements,
-        BgImage => &bg_image_elements,
-        else => @compileError("no input layout for " ++ @typeName(V)),
-    };
-}
-
-// Container-level so the tables live in static memory; an anonymous array
-// built inside the function would be a stack temporary.
-const cell_text_elements = [_]api.D3D11_INPUT_ELEMENT_DESC{
-    element("GLYPH_POS", .R32G32_UINT, 0),
-    element("GLYPH_SIZE", .R32G32_UINT, 8),
-    element("BEARINGS", .R16G16_SINT, 16),
-    element("GRID_POS", .R16G16_UINT, 20),
-    element("COLOR", .R8G8B8A8_UINT, 24),
-    element("ATLAS_BOOLS", .R8G8_UINT, 28),
-};
-
-const image_elements = [_]api.D3D11_INPUT_ELEMENT_DESC{
-    element("GRID_POS", .R32G32_FLOAT, 0),
-    element("CELL_OFFSET", .R32G32_FLOAT, 8),
-    element("SOURCE_RECT", .R32G32B32A32_FLOAT, 16),
-    element("DEST_SIZE", .R32G32_FLOAT, 32),
-};
-
-const bg_image_elements = [_]api.D3D11_INPUT_ELEMENT_DESC{
-    element("OPACITY", .R32_FLOAT, 0),
-    element("INFO", .R8_UINT, 4),
-};
-
-/// One per-instance element in vertex buffer slot 0.
-fn element(
-    comptime name: [:0]const u8,
-    comptime format: api.DXGI_FORMAT,
-    comptime offset: u32,
-) api.D3D11_INPUT_ELEMENT_DESC {
-    return .{
-        .SemanticName = name,
-        .SemanticIndex = 0,
-        .Format = format,
-        .InputSlot = 0,
-        .AlignedByteOffset = offset,
-        .InputSlotClass = .PER_INSTANCE_DATA,
-        .InstanceDataStepRate = 1,
-    };
-}
-
 /// Load shader code from the target path, processing `#include` directives.
 ///
 /// Comptime only, and as sloppy as its OpenGL twin: it assumes well-formed
@@ -475,29 +419,6 @@ test "d3d11 shaders: uniform offsets match the cbuffer packoffsets" {
     try testing.expectEqual(144, @sizeOf(Uniforms));
 }
 
-test "d3d11 shaders: input element offsets match the instance types" {
-    const testing = std.testing;
-    const cell = inputElements(CellText);
-    try testing.expectEqual(@offsetOf(CellText, "glyph_pos"), cell[0].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(CellText, "glyph_size"), cell[1].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(CellText, "bearings"), cell[2].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(CellText, "grid_pos"), cell[3].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(CellText, "color"), cell[4].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(CellText, "atlas"), cell[5].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(CellText, "atlas") + 1, @offsetOf(CellText, "bools"));
-    const image = inputElements(Image);
-    try testing.expectEqual(@offsetOf(Image, "grid_pos"), image[0].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(Image, "cell_offset"), image[1].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(Image, "source_rect"), image[2].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(Image, "dest_size"), image[3].AlignedByteOffset);
-    const bg = inputElements(BgImage);
-    try testing.expectEqual(@offsetOf(BgImage, "opacity"), bg[0].AlignedByteOffset);
-    try testing.expectEqual(@offsetOf(BgImage, "info"), bg[1].AlignedByteOffset);
-    inline for (.{ cell, image, bg }) |elements| {
-        for (elements) |e| try testing.expectEqual(0, e.AlignedByteOffset % 4);
-    }
-}
-
 test "d3d11 shaders: data layouts" {
     const testing = std.testing;
     // The instance layout the text pipeline will declare depends on these.
@@ -511,6 +432,46 @@ test "d3d11 shaders: data layouts" {
     try testing.expectEqual(8, @sizeOf(BgImage));
     // Constant buffers are bound in 16-byte slots.
     try testing.expectEqual(0, @sizeOf(Uniforms) % 16);
+}
+
+test "d3d11 shaders: input layouts derived from the instance types" {
+    // The elements the vertex shaders were written against: the HLSL
+    // types of `struct VertexIn` take these formats, and CellText's two
+    // trailing bytes are read as one element.
+    const testing = std.testing;
+    const Expected = struct { [:0]const u8, api.DXGI_FORMAT, u32 };
+    const layouts = .{
+        .{ CellText, &[_]Expected{
+            .{ "GLYPH_POS", .R32G32_UINT, 0 },
+            .{ "GLYPH_SIZE", .R32G32_UINT, 8 },
+            .{ "BEARINGS", .R16G16_SINT, 16 },
+            .{ "GRID_POS", .R16G16_UINT, 20 },
+            .{ "COLOR", .R8G8B8A8_UINT, 24 },
+            .{ "ATLAS_BOOLS", .R8G8_UINT, 28 },
+        } },
+        .{ Image, &[_]Expected{
+            .{ "GRID_POS", .R32G32_FLOAT, 0 },
+            .{ "CELL_OFFSET", .R32G32_FLOAT, 8 },
+            .{ "SOURCE_RECT", .R32G32B32A32_FLOAT, 16 },
+            .{ "DEST_SIZE", .R32G32_FLOAT, 32 },
+        } },
+        .{ BgImage, &[_]Expected{
+            .{ "OPACITY", .R32_FLOAT, 0 },
+            .{ "INFO", .R8_UINT, 4 },
+        } },
+    };
+    inline for (layouts) |layout| {
+        const elements = Pipeline.autoInputElements(layout[0]);
+        try testing.expectEqual(layout[1].len, elements.len);
+        for (layout[1], elements) |want, e| {
+            try testing.expectEqualStrings(want[0], std.mem.span(e.SemanticName));
+            try testing.expectEqual(want[1], e.Format);
+            try testing.expectEqual(want[2], e.AlignedByteOffset);
+            try testing.expectEqual(0, e.InputSlot);
+            try testing.expectEqual(.PER_INSTANCE_DATA, e.InputSlotClass);
+            try testing.expectEqual(1, e.InstanceDataStepRate);
+        }
+    }
 }
 
 /// The embedded source of a named pipeline, for the tests below.
@@ -529,17 +490,17 @@ fn testSource(
     };
 }
 
-test "d3d11 shaders: input element tables match the vertex shader inputs" {
+test "d3d11 shaders: input layouts match the vertex shader inputs" {
     // CreateInputLayout rejects a layout that lacks an input the vertex
-    // shader declares, and a table entry the shader never names is a
-    // stale one, so the `: NAME;` semantics of `struct VertexIn` and the
-    // table must be the same set. The system-value input (SV_VertexID)
-    // is not part of the layout.
+    // shader declares, and a field the shader never names is a stale
+    // one, so the `: NAME;` semantics of `struct VertexIn` and the layout
+    // derived from the instance type must be the same set. The
+    // system-value input (SV_VertexID) is not part of the layout.
     const testing = std.testing;
     inline for (pipeline_descs) |pipeline| {
         const V = pipeline[1].vertex_attributes orelse continue;
         const source = pipeline[1].vertex_fn orelse continue;
-        const elements = inputElements(V);
+        const elements = Pipeline.autoInputElements(V);
 
         const start = std.mem.indexOf(u8, source, "struct VertexIn {") orelse
             return error.TestUnexpectedResult;

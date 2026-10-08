@@ -3,7 +3,7 @@
 // One instanced quad per glyph; the twin of glsl/cell_text.v.glsl.
 //
 // The instance layout is the CellText struct in d3d11/shaders.zig; the
-// semantic names match its input element table. The atlas index and the
+// semantic names are its upper-cased field names. The atlas index and the
 // glyph bools travel as one two-byte element (x = atlas, y = bools) so that
 // every element offset is a multiple of four.
 
