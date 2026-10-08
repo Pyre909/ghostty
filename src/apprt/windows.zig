@@ -1186,7 +1186,7 @@ pub const App = struct {
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
-            .open_url => self.openUrl(target, value),
+            .open_url => openUrl(target, value),
             .initial_size => initialSize(target, value),
 
             .ring_bell => ring_bell: {
@@ -1358,7 +1358,7 @@ pub const App = struct {
     /// this frame has returned, and ShellExecuteW, which blocks until the
     /// handler has started and may dispatch messages while it waits, runs
     /// on its own thread, as the core's opener does (src/os/open.zig).
-    fn openUrl(self: *App, target: apprt.Target, value: apprt.action.OpenUrl) bool {
+    fn openUrl(target: apprt.Target, value: apprt.action.OpenUrl) bool {
         const hwnd = switch (target) {
             .app => return false,
             .surface => |v| v.rt_surface.hwnd,
@@ -1370,13 +1370,12 @@ pub const App = struct {
             return true;
         }
 
-        const alloc = self.core_app.alloc;
-        const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, value.url) catch |err| {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(open_url_alloc, value.url) catch |err| {
             log.warn("open url: cannot convert the target err={}", .{err});
             return false;
         };
-        const thread = std.Thread.spawn(.{}, openUrlThread, .{ alloc, wide }) catch |err| {
-            alloc.free(wide);
+        const thread = std.Thread.spawn(.{}, openUrlThread, .{wide}) catch |err| {
+            open_url_alloc.free(wide);
             log.warn("open url: cannot start the opener thread err={}", .{err});
             return false;
         };
@@ -4860,11 +4859,20 @@ fn fatalNotice(err: anyerror) void {
     _ = win32.MessageBoxW(null, wide[0..n :0], L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
 }
 
+/// The allocator of the link `openUrl` hands to its opener thread, which
+/// frees it. ShellExecuteW blocks until the handler has started, which can
+/// be a cold browser start or the shell's app picker, and the detached
+/// thread can outlive App.terminate and global.deinit, which deinitializes
+/// the debug allocator. So the link is allocated with an allocator of the
+/// process rather than `core_app.alloc`, as no allocator of the app is
+/// known to outlive the thread.
+const open_url_alloc = std.heap.smp_allocator;
+
 /// Opens `wide` with the shell, then frees it. COM is initialized for the
 /// thread first, as ShellExecuteW documents: a shell extension it delegates
 /// to may need a single-threaded apartment.
-fn openUrlThread(alloc: Allocator, wide: [:0]u16) void {
-    defer alloc.free(wide);
+fn openUrlThread(wide: [:0]u16) void {
+    defer open_url_alloc.free(wide);
     const hr = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED | win32.COINIT_DISABLE_OLE1DDE);
     defer if (hr >= 0) win32.CoUninitialize();
     const rc = win32.ShellExecuteW(null, L("open"), wide.ptr, null, null, win32.SW_SHOWNORMAL);
