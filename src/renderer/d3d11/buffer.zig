@@ -35,11 +35,17 @@ pub const Handle = struct {
     }
 };
 
-/// Direct3D 11 refuses zero-sized buffers, and constant buffers must be a
-/// multiple of 16 bytes.
-fn byteWidth(bytes: usize) api.UINT {
-    const width = @max(bytes, 16);
-    return @intCast((width + 15) & ~@as(usize, 15));
+/// The ByteWidth of a buffer holding `len` elements of `size` bytes.
+/// Direct3D 11 refuses zero-sized buffers, so an empty buffer still holds
+/// one element. Only constant buffers are padded, to a multiple of 16
+/// bytes; the others are exact, which keeps a structured buffer's width a
+/// multiple of its stride.
+fn byteWidth(kind: Kind, size: usize, len: usize) api.UINT {
+    const bytes = @max(len, 1) * size;
+    return @intCast(switch (kind) {
+        .constant => (bytes + 15) & ~@as(usize, 15),
+        .vertex, .structured => bytes,
+    });
 }
 
 pub fn Buffer(comptime T: type) type {
@@ -73,6 +79,17 @@ pub fn Buffer(comptime T: type) type {
         /// Init the buffer filled with the given data, immutable from then
         /// on.
         pub fn initFill(opts: Options, data: []const T) !Self {
+            // CreateBuffer reads ByteWidth bytes from the initial data, so
+            // when the width is padded past the data (an empty slice, or a
+            // constant buffer that is not a multiple of 16 bytes) we fill a
+            // dynamic buffer through a map instead.
+            if (byteWidth(opts.kind, @sizeOf(T), data.len) != data.len * @sizeOf(T)) {
+                var self = try init(opts, data.len);
+                errdefer self.deinit();
+                try self.sync(data);
+                return self;
+            }
+
             const handle = try create(opts, data.len, data);
             return .{
                 .opts = opts,
@@ -88,7 +105,7 @@ pub fn Buffer(comptime T: type) type {
 
         fn create(opts: Options, len: usize, initial: ?[]const T) !Handle {
             const desc: api.D3D11_BUFFER_DESC = .{
-                .ByteWidth = byteWidth(@max(len, 1) * @sizeOf(T)),
+                .ByteWidth = byteWidth(opts.kind, @sizeOf(T), len),
                 .Usage = if (initial != null) .IMMUTABLE else .DYNAMIC,
                 .BindFlags = switch (opts.kind) {
                     .constant => api.D3D11_BIND_CONSTANT_BUFFER,
@@ -229,9 +246,19 @@ pub fn Buffer(comptime T: type) type {
 
 test "d3d11 buffer: byte widths" {
     const testing = std.testing;
-    try testing.expectEqual(16, byteWidth(0));
-    try testing.expectEqual(16, byteWidth(4));
-    try testing.expectEqual(16, byteWidth(16));
-    try testing.expectEqual(32, byteWidth(17));
-    try testing.expectEqual(4096, byteWidth(4096));
+
+    // Constant buffers are padded to 16 bytes.
+    try testing.expectEqual(16, byteWidth(.constant, 4, 0));
+    try testing.expectEqual(16, byteWidth(.constant, 4, 1));
+    try testing.expectEqual(16, byteWidth(.constant, 16, 1));
+    try testing.expectEqual(32, byteWidth(.constant, 17, 1));
+    try testing.expectEqual(4096, byteWidth(.constant, 16, 256));
+
+    // The others are exact, so initFill never hands CreateBuffer less data
+    // than the width, and a structured width is a multiple of its stride.
+    try testing.expectEqual(4, byteWidth(.vertex, 4, 0));
+    try testing.expectEqual(8, byteWidth(.vertex, 8, 1));
+    try testing.expectEqual(48, byteWidth(.vertex, 48, 1));
+    try testing.expectEqual(12, byteWidth(.structured, 4, 3));
+    try testing.expectEqual(60, byteWidth(.structured, 12, 5));
 }
