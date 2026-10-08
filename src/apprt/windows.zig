@@ -480,6 +480,8 @@ const win32 = struct {
         flags: UINT,
     ) callconv(.winapi) BOOL;
     extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HCURSOR;
+    /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadiconw
+    extern "user32" fn LoadIconW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HICON;
     /// Returns an HINSTANCE in name only: a value of 32 or below is an
     /// SE_ERR_* code (0 means out of memory), so it is read as an integer.
     extern "shell32" fn ShellExecuteW(
@@ -4571,8 +4573,17 @@ fn layoutCodepoint(vk: win32.UINT, scan: u32, state: *const [256]win32.BYTE) u21
     return unit;
 }
 
+/// ID_ICON_GHOSTTY in dist/windows/ghostty.rc, which the exe links.
+const icon_resource_id = 1;
+
 fn registerClasses(hinstance: win32.HINSTANCE) !void {
     const arrow = win32.LoadCursorW(null, win32.IDC_ARROW);
+
+    // The exe's own icon for the caption and Alt+Tab. LoadIconW returns a
+    // shared icon, so nothing destroys it. With hIconSm null the system
+    // picks the small size from the same resource (WNDCLASSEXW docs); if
+    // the load fails both stay null and the system default is used.
+    const icon = win32.LoadIconW(hinstance, @ptrFromInt(icon_resource_id));
 
     const surface_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
@@ -4586,7 +4597,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = hinstance,
-        .hIcon = null,
+        .hIcon = icon,
         .hCursor = arrow,
         .hbrBackground = null,
         .lpszMenuName = null,
