@@ -1666,9 +1666,6 @@ pub const Surface = struct {
     /// See `ShiftKeys`.
     shift: ShiftKeys,
 
-    /// Number of WM_PAINTs handled, for the debug log in `paint`.
-    paint_count: u64,
-
     /// This window's share of `App.modal_loop_depth`: system modal loops
     /// (size/move, menu) it has entered and not yet reported leaving. A
     /// window destroyed inside its own loop never receives the matching
@@ -2139,7 +2136,6 @@ pub const Surface = struct {
             .high_surrogate = null,
             .alt_gr = .initEmpty(),
             .shift = .{},
-            .paint_count = 0,
             .modal_loops = 0,
             .focused = false,
             .mouse = .init(),
@@ -2750,21 +2746,9 @@ pub const Surface = struct {
         // needed.
         _ = win32.ValidateRect(self.hwnd, null);
 
-        // Every paint is logged at debug level, which is compiled out of
-        // release builds (`std_options.log_level` in main_ghostty.zig). Without
-        // it a stale frame on screen cannot be told apart from a repaint that
-        // never ran. The present side (count, dropped stale frames) is logged
-        // by src/renderer/D3D11.zig.
-        self.paint_count += 1;
-        const n = self.paint_count;
-        const id = @intFromPtr(self.hwnd);
-
         // A paint can arrive from inside CreateWindowExW, before the core
         // surface exists; `create` shows the window only after it does.
-        const core_surface = self.liveCore() orelse {
-            log.debug("paint #{d} hwnd={x}: validated, no live core surface", .{ n, id });
-            return;
-        };
+        const core_surface = self.liveCore() orelse return;
 
         // refreshCallback, not CoreSurface.draw: WM_PAINT only needs the
         // render thread woken, as embedded's `ghostty_surface_refresh` does.
@@ -2772,10 +2756,9 @@ pub const Surface = struct {
         // renderer must permit `CoreSurface.draw` from the apprt's thread,
         // and is what a live-resize path would use.
         core_surface.refreshCallback() catch |err| {
-            log.warn("paint #{d} hwnd={x}: refresh failed err={}", .{ n, id, err });
+            log.warn("refresh on paint failed id={x} err={}", .{ core_surface.id, err });
             return;
         };
-        log.debug("paint #{d} hwnd={x}: refresh requested", .{ n, id });
     }
 
     fn handleMessage(
@@ -4589,7 +4572,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
         .hIconSm = null,
     };
     if (win32.RegisterClassExW(&surface_class) == 0) {
-        log.err("failed to register the surface window class", .{});
+        log.err("failed to register the surface window class err={}", .{win32.GetLastError()});
         return App.Error.Win32ClassRegistrationFailed;
     }
     errdefer _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
@@ -4609,7 +4592,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
         .hIconSm = null,
     };
     if (win32.RegisterClassExW(&app_class) == 0) {
-        log.err("failed to register the app window class", .{});
+        log.err("failed to register the app window class err={}", .{win32.GetLastError()});
         return App.Error.Win32ClassRegistrationFailed;
     }
 }
@@ -4627,7 +4610,7 @@ fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     // OpenClipboard takes a process-wide lock; the defer guarantees no path
     // out of this function leaves it held.
     if (!win32.OpenClipboard(hwnd).toBool()) {
-        log.warn("failed to open the clipboard for reading", .{});
+        log.warn("failed to open the clipboard for reading err={}", .{win32.GetLastError()});
         return null;
     }
     defer _ = win32.CloseClipboard();
