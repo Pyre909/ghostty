@@ -1269,6 +1269,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (!self.display_realized) {
                 self.shaders.deinit(self.alloc);
             }
+
+            // Let the API free what it still holds of those resources.
+            if (comptime @hasDecl(GraphicsAPI, "gpuResourcesReleased")) {
+                self.api.gpuResourcesReleased();
+            }
         }
 
         /// Create or update the display link and match it to the current

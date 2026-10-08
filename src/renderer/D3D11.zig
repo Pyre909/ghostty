@@ -646,6 +646,22 @@ fn releaseGpu(self: *D3D11) void {
     api.release(self.device);
 }
 
+/// Called by the generic renderer under the draw mutex after it released
+/// the surface's GPU resources, as it does when the surface is hidden.
+/// The immediate context still binds the last frame's target, buffers
+/// and views, which keeps them alive, and D3D11 destroys a released
+/// object only at the next flush ("Deferred Destruction Issues with Flip
+/// Presentation Swap Chains" in the ID3D11DeviceContext::Flush docs). A
+/// hidden surface draws nothing, so without this the memory stays
+/// allocated until it is shown again. Unbind everything and flush, as
+/// `releaseGpu` does, so it is freed now. Nothing to do when the device
+/// is already released.
+pub fn gpuResourcesReleased(self: *D3D11) void {
+    if (self.released) return;
+    self.context.vtable.ClearState(self.context);
+    self.context.vtable.Flush(self.context);
+}
+
 /// Whether DXGI has the chain in full-screen. A state that cannot be read
 /// is taken as windowed. This only reads the state; it sends the window
 /// no messages.
