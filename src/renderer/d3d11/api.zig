@@ -78,6 +78,7 @@ pub const DXGI_STATUS_OCCLUDED: HRESULT = @bitCast(@as(u32, 0x087A0001));
 pub const IID_IUnknown: GUID = GUID.parse("{00000000-0000-0000-C000-000000000046}");
 pub const IID_IDXGIObject: GUID = GUID.parse("{aec22fb8-76f3-4639-9be0-28eb43a67a2e}");
 pub const IID_IDXGIDevice: GUID = GUID.parse("{54ec77fa-1377-44e6-8c32-88fd5f44c84c}");
+pub const IID_IDXGIDevice1: GUID = GUID.parse("{77db970f-6276-48ba-ba28-070143b4392c}");
 pub const IID_IDXGIAdapter: GUID = GUID.parse("{2411e7e1-12ac-4ccf-bd14-9798e8534dc0}");
 pub const IID_IDXGIFactory2: GUID = GUID.parse("{50c83a1c-e072-4c48-87b0-3630fa36a6d0}");
 pub const IID_IDXGIFactory5: GUID = GUID.parse("{7632e1f5-ee65-4dca-87fd-84cd75f8838d}");
@@ -607,6 +608,18 @@ pub const IDXGIDevice = extern struct {
         QueryResourceResidency: Slot,
         SetGPUThreadPriority: Slot,
         GetGPUThreadPriority: Slot,
+    };
+};
+
+pub const IDXGIDevice1 = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDXGIDevice1;
+
+    pub const VTable = extern struct {
+        base: IDXGIDevice.VTable,
+        SetMaximumFrameLatency: *const fn (*IDXGIDevice1, UINT) callconv(cc) HRESULT,
+        GetMaximumFrameLatency: Slot,
     };
 };
 
@@ -1180,6 +1193,7 @@ test "d3d11 api: vtable slot counts" {
     try testing.expectEqual(8 * p, @sizeOf(IDXGIDeviceSubObject.VTable));
     try testing.expectEqual(10 * p, @sizeOf(IDXGIAdapter.VTable));
     try testing.expectEqual(12 * p, @sizeOf(IDXGIDevice.VTable));
+    try testing.expectEqual(14 * p, @sizeOf(IDXGIDevice1.VTable));
     try testing.expectEqual(12 * p, @sizeOf(IDXGIFactory.VTable));
     try testing.expectEqual(14 * p, @sizeOf(IDXGIFactory1.VTable));
     try testing.expectEqual(25 * p, @sizeOf(IDXGIFactory2.VTable));
@@ -1230,6 +1244,7 @@ test "d3d11 api: typed slot indices" {
     try testing.expectEqual(13 * p, @offsetOf(IDXGISwapChain.VTable, "ResizeBuffers"));
     try testing.expectEqual(18 * p, @offsetOf(IDXGISwapChain1.VTable, "GetDesc1"));
     try testing.expectEqual(15 * p, @offsetOf(IDXGIFactory2.VTable, "CreateSwapChainForHwnd"));
+    try testing.expectEqual(12 * p, @offsetOf(IDXGIDevice1.VTable, "SetMaximumFrameLatency"));
 }
 
 test "d3d11 api: struct layouts" {
@@ -1261,6 +1276,8 @@ test "d3d11 api: iids and hresults" {
     try testing.expectEqual(0xac77, IID_ID3D11Device.Data2);
     try testing.expectEqual(0x40, IID_ID3D11Device.Data4[7]);
     try testing.expectEqual(0x46, IID_IUnknown.Data4[7]);
+    try testing.expectEqual(0x77db970f, IID_IDXGIDevice1.Data1);
+    try testing.expectEqual(0x2c, IID_IDXGIDevice1.Data4[7]);
     try testing.expect(failed(DXGI_ERROR_DEVICE_REMOVED));
     try testing.expect(failed(E_FAIL));
     try testing.expect(succeeded(S_OK));

@@ -446,6 +446,21 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     };
     defer api.release(dxgi_device);
 
+    // DXGI lets a device queue up to three frames by default, so under
+    // continuous output a vsync'd Present blocks only once three are
+    // queued and each one shown is a snapshot up to three vblanks old.
+    // A latency of one keeps a single frame ahead of the display. The
+    // limit belongs to the device, so a recreated device sets it again.
+    if (api.queryInterface(dxgi_device, api.IDXGIDevice1)) |dxgi_device1| {
+        defer api.release(dxgi_device1);
+        hr = dxgi_device1.vtable.SetMaximumFrameLatency(dxgi_device1, 1);
+        if (api.failed(hr)) {
+            log.warn("SetMaximumFrameLatency failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+        }
+    } else |_| {
+        log.warn("D3D11 device has no IDXGIDevice1 interface; frame latency stays at the default", .{});
+    }
+
     var adapter_ptr: ?*api.IDXGIAdapter = null;
     hr = dxgi_device.vtable.GetAdapter(dxgi_device, &adapter_ptr);
     const adapter = if (api.succeeded(hr)) adapter_ptr else null;
