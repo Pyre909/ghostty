@@ -842,10 +842,8 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
-        // Every remaining surface is torn down in the same order as
-        // Surface.destroyPosted (stop and wait for the core's threads, deinit
-        // the core surface, destroy the window), so
-        // that CoreApp.deinit -- which runs after this
+        // Every remaining surface is destroyed as destroyPosted does it
+        // (Surface.destroy), so that CoreApp.deinit -- which runs after this
         // (in `main`) -- finds an empty surface list and its
         // `font_grid_set.count() == 0` assert holds (`CoreApp.deinit`).
         //
@@ -859,19 +857,19 @@ pub const App = struct {
         // unregistered; UnregisterClassW fails while a window of the class
         // still exists.
         //
-        // DestroyWindow runs WM_DESTROY synchronously, which reenters
-        // surfaceDestroyed and mutates this list. Moving the list out first
-        // makes the iteration stable: the callback finds no membership,
-        // leaving the free to us.
-        var surfaces = self.surfaces;
-        self.surfaces = .empty;
-        defer surfaces.deinit(self.core_app.alloc);
-        for (surfaces.items) |surface| {
-            surface.stopCore();
-            surface.destroy();
-            surface.deinit();
-            self.core_app.alloc.destroy(surface);
+        // Each destroy removes and frees the surface (WM_DESTROY ->
+        // surfaceDestroyed). A window that could not be destroyed gets no
+        // WM_DESTROY, so it is released here the same way, or this loop
+        // would not end.
+        while (self.surfaces.getLastOrNull()) |surface| {
+            if (!surface.destroy()) {
+                log.err("failed to destroy a surface window err={}", .{
+                    std.os.windows.GetLastError(),
+                });
+                self.surfaceDestroyed(surface);
+            }
         }
+        self.surfaces.deinit(self.core_app.alloc);
 
         self.stopQuitTimer();
 
@@ -1469,15 +1467,14 @@ pub const App = struct {
         // CoreApp.addSurface cancels the startup quit timer
         // itself, so there is no quit-timer handling here.
         const surface = try Surface.create(self);
-
-        // No errdefer after this point: appendAssumeCapacity cannot fail (the
-        // capacity was reserved above), so one would be dead code.
+        errdefer comptime unreachable;
         self.surfaces.appendAssumeCapacity(surface);
 
         return surface;
     }
 
-    /// Called from the surface's WM_DESTROY handler.
+    /// Called from the surface's WM_DESTROY handler, and by `terminate` for
+    /// a window that could not be destroyed.
     ///
     /// Ownership invariant: **membership in `self.surfaces` is ownership of
     /// the heap allocation.** A window whose Surface is not in the list is
@@ -2158,12 +2155,13 @@ pub const Surface = struct {
         // (`CoreSurface.init` reads it), and getContentScale works on it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
         defer config.deinit();
+        // A failing CoreSurface.init joins any thread it started (unpumped,
+        // as CoreSurface.deinit does), so the errdefers above run with no
+        // core thread left using this surface or its window.
         try self.core_surface.init(alloc, &config, app.core_app, app, self);
 
-        // Nothing after this point can fail, so there is no errdefer for the
-        // core surface. (If CoreSurface.init itself fails after spawning its
-        // threads, those threads are not stopped by init's own errdefers;
-        // that is a core limitation this runtime cannot repair.)
+        // Nothing below can fail, so the core surface needs no errdefer.
+        errdefer comptime unreachable;
         self.core_state = .live;
 
         // Size the still-hidden window to `window-width`/`window-height`
@@ -2179,22 +2177,27 @@ pub const Surface = struct {
         return self;
     }
 
-    /// Release everything except the allocation itself.
+    /// Release everything except the window and the allocation itself.
     ///
     /// Public because `CoreApp.deinit` calls it on every surface the core
-    /// still tracks -- an apprt contract method the
-    /// rt_surface list does not name. In this runtime the core's list is
-    /// empty by then (`App.terminate` runs `stopCore` on every surface first).
+    /// still tracks -- an apprt contract method the rt_surface list does not
+    /// name. Like the embedded runtime's deinit, this removes the surface
+    /// from that list while the core iterates it (stopCore's
+    /// `deleteSurface`). In this runtime the list is empty by then, since
+    /// `App.terminate` destroys every surface first.
     pub fn deinit(self: *Surface) void {
+        self.stopCore();
         if (self.title) |v| self.app.core_app.alloc.free(v);
         self.title = null;
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
     }
 
-    /// Tear down the OS window. The allocation itself is not freed here; see
-    /// the ownership invariant on `App.surfaceDestroyed`.
-    fn destroy(self: *Surface) void {
-        _ = win32.DestroyWindow(self.hwnd);
+    /// Stop the core surface, then destroy the window. Returns whether the
+    /// window was destroyed; **when it was, `self` has been freed**
+    /// (WM_DESTROY -> App.surfaceDestroyed) and nothing may touch it.
+    fn destroy(self: *Surface) bool {
+        self.stopCore();
+        return win32.DestroyWindow(self.hwnd).toBool();
     }
 
     /// The core surface, if message handlers may call into it.
@@ -2324,9 +2327,8 @@ pub const Surface = struct {
     /// deferred to `run` instead: its pump would tick, and waiting there
     /// could wait on threads blocked behind the undrained mailbox.
     ///
-    /// **`self` is freed by the DestroyWindow at the end** (WM_DESTROY ->
-    /// App.surfaceDestroyed). Nothing may touch it afterwards, which is why
-    /// `hwnd` is copied first and the function ends at that call.
+    /// **`self` is freed by the `destroy` at the end**. Nothing may touch it
+    /// afterwards, which is why the function ends at that call.
     fn destroyPosted(self: *Surface) void {
         const app = self.app;
 
@@ -2338,9 +2340,7 @@ pub const Surface = struct {
             return;
         }
 
-        const hwnd = self.hwnd;
-        self.stopCore();
-        _ = win32.DestroyWindow(hwnd);
+        _ = self.destroy();
     }
 
     // ---------------------------------------------------------------------
@@ -2760,7 +2760,7 @@ pub const Surface = struct {
 
             win32.WM_DESTROY => {
                 // Every path that destroys a live surface stops the core
-                // first (destroyPosted, App.terminate), so this is only
+                // first (Surface.destroy), so this is only
                 // defensive: tear down now, late but in the right order,
                 // rather than delete a context the render thread still has
                 // current. `.stopping` cannot be seen here: nothing destroys
