@@ -40,7 +40,9 @@ pub const State = struct {
     /// Set when the GPU copies of the kitty images were dropped without
     /// the terminal knowing, as after a lost graphics device: the next
     /// update rebuilds them from the terminal's storage even though it
-    /// is not dirty.
+    /// is not dirty. Like the rest of this state it is only ever
+    /// written on the render thread, which is what lets
+    /// `kittyRequiresUpdate` read it there without the draw mutex.
     kitty_rebuild: bool,
 
     pub const empty: State = .{

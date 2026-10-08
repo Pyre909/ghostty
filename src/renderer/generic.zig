@@ -250,6 +250,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// this is set to true so that we can do that whenever possible.
         reinitialize_shaders: bool = false,
 
+        /// The render thread's wakeup while its loop runs. Only set for
+        /// a graphics API that can lose its device: a sync draw that
+        /// finds the device lost notifies it so the render thread does
+        /// the recovery (see `drawFrameLocked`). Guarded by `draw_mutex`.
+        render_wakeup: ?*xev.Async = null,
+
         /// Whether or not we have custom shaders.
         has_custom_shaders: bool = false,
 
@@ -931,6 +937,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.loopEnter();
             }
 
+            if (comptime @hasDecl(GraphicsAPI, "deviceLost")) {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                self.render_wakeup = &thr.wakeup;
+            }
+
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
@@ -942,6 +954,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If our API has to do things on loop exit, let it.
             if (@hasDecl(GraphicsAPI, "loopExit")) {
                 self.api.loopExit();
+            }
+
+            if (comptime @hasDecl(GraphicsAPI, "deviceLost")) {
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                self.render_wakeup = null;
             }
 
             // If we don't support a display link we have no work to do.
@@ -1103,7 +1121,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// at draw_interval_ms while active, and a running Kitty
         /// graphics animation wants an update wake when its next
         /// frame is due. A graphics API that lost its device wants a
-        /// draw wake when it may next try to replace it. The renderer
+        /// draw wake when it may next try to replace it, and an update
+        /// wake once it has, to upload the kitty images again. The renderer
         /// thread drives its animation timer off this, re-querying
         /// after every wake.
         ///
@@ -1118,6 +1137,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .kind = .draw,
                 };
             }
+
+            // Recovering from a lost device dropped the kitty images,
+            // and only a frame update uploads them again. Without this
+            // an idle surface would stay without them until its next
+            // unrelated wakeup.
+            if (self.images.kitty_rebuild) return .{
+                .delay_ms = draw_interval_ms,
+                .kind = .update,
+            };
 
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
@@ -1745,10 +1773,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // APIs have no such state. Release what was created on it,
             // have the backend replace the device, and rebuild lazily
             // below as after an unrealize. The kitty images come back
-            // through the next kitty update, the background image is
-            // loaded again here.
+            // through the next kitty update, which animationWake
+            // schedules, the background image is loaded again here.
+            //
+            // Recovery releases GPU resources and rewrites the image
+            // state that updateFrame reads without the draw mutex, so
+            // it only runs on the render thread. A sync draw, which is
+            // the only kind that runs anywhere else, draws nothing and
+            // wakes the render thread to recover in case it is idle.
             if (comptime @hasDecl(GraphicsAPI, "deviceLost")) {
                 if (self.api.deviceLost()) {
+                    if (sync) {
+                        if (self.render_wakeup) |wakeup| wakeup.notify() catch |err| {
+                            log.warn("error waking the render thread err={}", .{err});
+                        };
+                        return false;
+                    }
+
                     self.releaseGpuResources();
                     self.shaders.deinit(self.alloc);
                     self.images.deinit(self.alloc);
