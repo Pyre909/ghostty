@@ -40,11 +40,7 @@ const locale_max = 85;
 /// The UTF-8 code page.
 const CP_UTF8 = 65001;
 
-pub const Error = error{
-    /// DirectWrite could not be initialized, or a call on it failed. The
-    /// HRESULT is in the log.
-    DirectWriteFailed,
-};
+pub const Error = api.Error;
 
 pub const Shared = struct {
     factory: *api.IDWriteFactory,
@@ -105,10 +101,7 @@ pub const Shared = struct {
 
         const fallback: ?*api.IDWriteFontFallback = fallback: {
             const v = factory2 orelse break :fallback null;
-            var out: ?*api.IDWriteFontFallback = null;
-            if (api.failed(v.vtable.GetSystemFontFallback(v, &out)))
-                break :fallback null;
-            break :fallback out;
+            break :fallback v.getSystemFontFallback() catch null;
         };
         errdefer if (fallback) |v| api.release(v);
 
@@ -119,14 +112,10 @@ pub const Shared = struct {
                 log.err("out of memory for the font file loader", .{});
                 return error.DirectWriteFailed;
             };
-            const loader_hr = factory.vtable.RegisterFontFileLoader(factory, v);
-            if (api.failed(loader_hr)) {
-                log.err("RegisterFontFileLoader failed hr=0x{x}", .{
-                    @as(u32, @bitCast(loader_hr)),
-                });
+            factory.registerFontFileLoader(v) catch |err| {
                 api.release(v);
-                return error.DirectWriteFailed;
-            }
+                return err;
+            };
             break :loader v;
         } else {};
 
@@ -158,10 +147,7 @@ pub const Shared = struct {
             return null;
         defer api.release(source);
 
-        var mapped_len: api.UINT = 0;
-        var mapped: ?*api.IDWriteFont = null;
-        var scale: api.FLOAT = 1;
-        const hr = fallback.mapCharacters(
+        const mapping = fallback.mapCharacters(
             source,
             0,
             if (codepoint < 0x10000) 1 else 2,
@@ -170,18 +156,8 @@ pub const Shared = struct {
             if (bold) .BOLD else .NORMAL,
             if (italic) .ITALIC else .NORMAL,
             .NORMAL,
-            &mapped_len,
-            &mapped,
-            &scale,
-        );
-        if (api.failed(hr)) {
-            log.debug("MapCharacters failed cp={X} hr=0x{x}", .{
-                codepoint,
-                @as(u32, @bitCast(hr)),
-            });
-            return null;
-        }
-        return mapped;
+        ) catch return null;
+        return mapping.font;
     }
 
     /// The system font collection as it is now, a reference the caller
@@ -192,13 +168,7 @@ pub const Shared = struct {
     /// one until they change. The first call of a process is the slow one,
     /// which is what the warmup thread is for.
     pub fn systemFonts(self: *const Shared) Error!*api.IDWriteFontCollection {
-        var out: ?*api.IDWriteFontCollection = null;
-        const hr = self.factory.vtable.GetSystemFontCollection(self.factory, &out, 0);
-        if (api.failed(hr)) {
-            log.err("GetSystemFontCollection failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
-            return error.DirectWriteFailed;
-        }
-        return out orelse error.DirectWriteFailed;
+        return self.factory.getSystemFontCollection(false);
     }
 };
 
@@ -247,12 +217,12 @@ pub fn instanceAxes(
 ) []const font.face.Variation {
     const face5 = api.queryInterface(face, api.IDWriteFontFace5) catch return &.{};
     defer api.release(face5);
-    if (face5.vtable.HasVariations(face5) == 0) return &.{};
+    if (!face5.hasVariations()) return &.{};
 
     var values: [32]api.DWRITE_FONT_AXIS_VALUE = undefined;
-    const count = face5.vtable.GetFontAxisValueCount(face5);
+    const count = face5.getFontAxisValueCount();
     if (count == 0 or count > values.len or count > buf.len) return &.{};
-    if (api.failed(face5.vtable.GetFontAxisValues(face5, &values, count))) return &.{};
+    face5.getFontAxisValues(values[0..count]) catch return &.{};
 
     for (values[0..count], buf[0..count]) |value, *v| v.* = .{
         .id = @bitCast(@byteSwap(value.axisTag)),
@@ -268,35 +238,25 @@ pub fn localFile(
 ) LocalFileError!LocalFile {
     // A face can in principle span files (Type 1); every format FreeType
     // and this backend share has one.
-    var count: api.UINT = 0;
-    if (api.failed(face.vtable.GetFiles(face, &count, null))) return error.DirectWriteFailed;
-    if (count != 1) return error.FontHasNoFile;
+    if (try face.getFileCount() != 1) return error.FontHasNoFile;
     var files: [1]?*api.IDWriteFontFile = .{null};
-    if (api.failed(face.vtable.GetFiles(face, &count, &files))) return error.DirectWriteFailed;
+    try face.getFiles(&files);
     const file = files[0] orelse return error.FontHasNoFile;
     defer api.release(file);
 
     // The key names the file to its loader; only the local file loader
     // can turn it into a path.
-    var key: ?*const anyopaque = null;
-    var key_size: api.UINT = 0;
-    if (api.failed(file.vtable.GetReferenceKey(file, &key, &key_size))) return error.DirectWriteFailed;
-    var loader: ?*api.IDWriteFontFileLoader = null;
-    if (api.failed(file.vtable.GetLoader(file, &loader))) return error.DirectWriteFailed;
-    const generic = loader orelse return error.FontHasNoFile;
+    const key = try file.getReferenceKey();
+    const generic = try file.getLoader();
     defer api.release(generic);
     const local = api.queryInterface(generic, api.IDWriteLocalFontFileLoader) catch
         return error.FontHasNoFile;
     defer api.release(local);
 
-    var len: api.UINT = 0;
-    const key_ptr = key orelse return error.FontHasNoFile;
-    if (api.failed(local.vtable.GetFilePathLengthFromKey(local, key_ptr, key_size, &len)))
-        return error.DirectWriteFailed;
+    const len = try local.getFilePathLengthFromKey(key);
     var wide: [path_units + 1]u16 = undefined;
     if (len + 1 > wide.len) return error.FontPathCantDecode;
-    if (api.failed(local.vtable.GetFilePathFromKey(local, key_ptr, key_size, &wide, len + 1)))
-        return error.DirectWriteFailed;
+    try local.getFilePathFromKey(key, wide[0 .. len + 1]);
 
     // Room for the terminator FreeType wants.
     if (buf.len == 0) return error.FontPathCantDecode;
@@ -305,7 +265,7 @@ pub fn localFile(
     buf[path.len] = 0;
     return .{
         .path = buf[0..path.len :0],
-        .index = face.vtable.GetIndex(face),
+        .index = face.getIndex(),
     };
 }
 
@@ -315,15 +275,11 @@ pub fn localizedString(
     strings: *api.IDWriteLocalizedStrings,
     buf: []u8,
 ) (Error || error{OutOfMemory})![]const u8 {
-    var index: api.UINT = 0;
-    var exists: api.BOOL = 0;
     const en_us = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
-    if (api.failed(strings.vtable.FindLocaleName(strings, en_us, &index, &exists)) or
-        exists == 0)
-    {
-        if (strings.vtable.GetCount(strings) == 0) return "";
-        index = 0;
-    }
+    const index = (strings.findLocaleName(en_us) catch null) orelse index: {
+        if (strings.getCount() == 0) return "";
+        break :index 0;
+    };
 
     return localizedStringAt(strings, index, buf);
 }
@@ -334,13 +290,10 @@ pub fn localizedStringAt(
     index: api.UINT,
     buf: []u8,
 ) (Error || error{OutOfMemory})![]const u8 {
-    var len: api.UINT = 0;
-    if (api.failed(strings.vtable.GetStringLength(strings, index, &len)))
-        return error.DirectWriteFailed;
+    const len = try strings.getStringLength(index);
     var wide: [name_max]u16 = undefined;
     if (len + 1 > wide.len) return error.OutOfMemory;
-    if (api.failed(strings.vtable.GetString(strings, index, &wide, len + 1)))
-        return error.DirectWriteFailed;
+    try strings.getString(index, wide[0 .. len + 1]);
     return utf16ToUtf8(buf, wide[0..len]) catch error.OutOfMemory;
 }
 

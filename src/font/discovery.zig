@@ -1239,18 +1239,8 @@ pub const DirectWrite = struct {
         const len = std.unicode.utf8ToUtf16Le(&wide, family) catch return;
         wide[len] = 0;
 
-        var index: api.UINT = 0;
-        var exists: api.BOOL = 0;
-        if (api.succeeded(collection.vtable.FindFamilyName(
-            collection,
-            wide[0..len :0],
-            &index,
-            &exists,
-        )) and exists != 0) {
-            var out: ?*api.IDWriteFontFamily = null;
-            if (api.failed(collection.vtable.GetFontFamily(collection, index, &out)))
-                return error.DirectWriteFailed;
-            const dw_family = out orelse return error.DirectWriteFailed;
+        if (collection.findFamilyName(wide[0..len :0]) catch null) |index| {
+            const dw_family = try collection.getFontFamily(index);
             defer api.release(dw_family);
             try appendFonts(alloc, list, dw_family.fontList(), null);
             return;
@@ -1260,11 +1250,9 @@ pub const DirectWrite = struct {
         // that a font carries as its family, such as "Iosevka Heavy", can
         // be a member of another family here. Those are found by the
         // names the fonts themselves report.
-        const count = collection.vtable.GetFontFamilyCount(collection);
+        const count = collection.getFontFamilyCount();
         for (0..count) |i| {
-            var out: ?*api.IDWriteFontFamily = null;
-            if (api.failed(collection.vtable.GetFontFamily(collection, @intCast(i), &out))) continue;
-            const dw_family = out orelse continue;
+            const dw_family = collection.getFontFamily(@intCast(i)) catch continue;
             defer api.release(dw_family);
             try appendFonts(alloc, list, dw_family.fontList(), family);
         }
@@ -1276,11 +1264,9 @@ pub const DirectWrite = struct {
         list: *std.ArrayListUnmanaged(Candidate),
         collection: *api.IDWriteFontCollection,
     ) !void {
-        const count = collection.vtable.GetFontFamilyCount(collection);
+        const count = collection.getFontFamilyCount();
         for (0..count) |i| {
-            var out: ?*api.IDWriteFontFamily = null;
-            if (api.failed(collection.vtable.GetFontFamily(collection, @intCast(i), &out))) continue;
-            const dw_family = out orelse continue;
+            const dw_family = collection.getFontFamily(@intCast(i)) catch continue;
             defer api.release(dw_family);
             try appendFonts(alloc, list, dw_family.fontList(), null);
         }
@@ -1295,15 +1281,13 @@ pub const DirectWrite = struct {
         fonts: *api.IDWriteFontList,
         named: ?[]const u8,
     ) !void {
-        const count = fonts.vtable.GetFontCount(fonts);
+        const count = fonts.getFontCount();
         for (0..count) |i| {
-            var out: ?*api.IDWriteFont = null;
-            if (api.failed(fonts.vtable.GetFont(fonts, @intCast(i), &out))) continue;
-            const font = out orelse continue;
+            const font = fonts.getFont(@intCast(i)) catch continue;
             errdefer api.release(font);
 
             const keep = keep: {
-                if (font.vtable.GetSimulations(font) != api.DWRITE_FONT_SIMULATIONS_NONE)
+                if (font.getSimulations() != api.DWRITE_FONT_SIMULATIONS_NONE)
                     break :keep false;
                 const name = named orelse break :keep true;
                 break :keep hasFamilyName(font, .WIN32_FAMILY_NAMES, name) or
@@ -1327,15 +1311,12 @@ pub const DirectWrite = struct {
         id: api.DWRITE_INFORMATIONAL_STRING_ID,
         name: []const u8,
     ) bool {
-        var out: ?*api.IDWriteLocalizedStrings = null;
-        var exists: api.BOOL = 0;
-        if (api.failed(font.vtable.GetInformationalStrings(font, id, &out, &exists))) return false;
-        const strings = out orelse return false;
+        const strings = (font.getInformationalStrings(id) catch return false) orelse
+            return false;
         defer api.release(strings);
-        if (exists == 0) return false;
 
         var buf: [directwrite.name_max * 3]u8 = undefined;
-        for (0..strings.vtable.GetCount(strings)) |i| {
+        for (0..strings.getCount()) |i| {
             const value = directwrite.localizedStringAt(
                 strings,
                 @intCast(i),
@@ -1358,33 +1339,25 @@ pub const DirectWrite = struct {
             // From semi-bold on. A family whose heaviest face is that one
             // has its bold in it; where there is a bold as well, the
             // style's name ranks it first.
-            .bold = @intFromEnum(font.vtable.GetWeight(font)) >= 600,
-            .italic = font.vtable.GetStyle(font) != .NORMAL,
+            .bold = @intFromEnum(font.getWeight()) >= 600,
+            .italic = font.getStyle() != .NORMAL,
         };
 
-        if (desc.codepoint > 0) {
-            var exists: api.BOOL = 0;
-            if (api.succeeded(font.vtable.HasCharacter(font, desc.codepoint, &exists)))
-                traits.has_codepoint = exists != 0;
-        }
+        if (desc.codepoint > 0) traits.has_codepoint = font.hasCharacter(desc.codepoint);
 
         if (api.queryInterface(font, api.IDWriteFont1)) |font1| {
             defer api.release(font1);
-            traits.monospace = font1.vtable.IsMonospacedFont(font1) != 0;
+            traits.monospace = font1.isMonospacedFont();
         } else |_| {}
 
         style: {
-            var out: ?*api.IDWriteLocalizedStrings = null;
-            if (api.failed(font.vtable.GetFaceNames(font, &out))) break :style;
-            const strings = out orelse break :style;
+            const strings = font.getFaceNames() catch break :style;
             defer api.release(strings);
             traits.style = directwrite.localizedString(strings, style_buf) catch "";
         }
 
         if (desc.family != null) tables: {
-            var out: ?*api.IDWriteFontFace = null;
-            if (api.failed(font.vtable.CreateFontFace(font, &out))) break :tables;
-            const face = out orelse break :tables;
+            const face = font.createFontFace() catch break :tables;
             defer api.release(face);
 
             const head: Table = .init(face, "head");
@@ -1404,27 +1377,14 @@ pub const DirectWrite = struct {
         context: ?*anyopaque,
 
         fn init(face: *api.IDWriteFontFace, tag: *const [4]u8) Table {
-            var self: Table = .{ .face = face, .data = null, .context = null };
-            var ptr: ?*const anyopaque = null;
-            var size: api.UINT = 0;
-            var exists: api.BOOL = 0;
-            if (api.failed(face.vtable.TryGetFontTable(
-                face,
-                directwrite.tableTag(tag),
-                &ptr,
-                &size,
-                &self.context,
-                &exists,
-            ))) return self;
-            if (exists == 0) return self;
-            const bytes: [*]const u8 = @ptrCast(ptr orelse return self);
-            self.data = bytes[0..size];
-            return self;
+            const table = (face.tryGetFontTable(directwrite.tableTag(tag)) catch null) orelse
+                return .{ .face = face, .data = null, .context = null };
+            return .{ .face = face, .data = table.data, .context = table.context };
         }
 
         fn deinit(self: Table) void {
             if (self.data == null) return;
-            self.face.vtable.ReleaseFontTable(self.face, self.context);
+            self.face.releaseFontTable(self.context);
         }
     };
 
@@ -1531,7 +1491,7 @@ pub const DirectWrite = struct {
         fn presentation(font: *api.IDWriteFont) Presentation {
             const font2 = api.queryInterface(font, api.IDWriteFont2) catch return .text;
             defer api.release(font2);
-            return if (font2.vtable.IsColorFont(font2) != 0) .emoji else .text;
+            return if (font2.isColorFont()) .emoji else .text;
         }
     };
 };
@@ -2300,15 +2260,8 @@ test "directwrite family of another family" {
     {
         const collection = try lib.dwrite.systemFonts();
         defer api.release(collection);
-        var index: api.UINT = 0;
-        var exists: api.BOOL = 0;
         const name = std.unicode.utf8ToUtf16LeStringLiteral("Arial Black");
-        if (api.succeeded(collection.vtable.FindFamilyName(
-            collection,
-            name,
-            &index,
-            &exists,
-        )) and exists != 0) return error.SkipZigTest;
+        if (try collection.findFamilyName(name) != null) return error.SkipZigTest;
     }
 
     var it = try dw.discover(alloc, .{ .family = "Arial Black", .size = 12 });
@@ -2344,28 +2297,17 @@ test "directwrite family of another family, in another language" {
     {
         const collection = try lib.dwrite.systemFonts();
         defer api.release(collection);
-        var index: api.UINT = 0;
-        var exists: api.BOOL = 0;
         const name = std.unicode.utf8ToUtf16LeStringLiteral("Microsoft JhengHei");
-        if (api.failed(collection.vtable.FindFamilyName(
-            collection,
-            name,
-            &index,
-            &exists,
-        )) or exists == 0) return error.SkipZigTest;
+        const index = try collection.findFamilyName(name) orelse return error.SkipZigTest;
 
-        var out: ?*api.IDWriteFontFamily = null;
-        try testing.expect(api.succeeded(collection.vtable.GetFontFamily(collection, index, &out)));
-        const family = out.?;
+        const family = try collection.getFontFamily(index);
         defer api.release(family);
         const fonts = family.fontList();
-        const light = for (0..fonts.vtable.GetFontCount(fonts)) |i| {
-            var font_out: ?*api.IDWriteFont = null;
-            if (api.failed(fonts.vtable.GetFont(fonts, @intCast(i), &font_out))) continue;
-            const font = font_out orelse continue;
+        const light = for (0..fonts.getFontCount()) |i| {
+            const font = fonts.getFont(@intCast(i)) catch continue;
             defer api.release(font);
-            if (font.vtable.GetSimulations(font) != api.DWRITE_FONT_SIMULATIONS_NONE) continue;
-            const weight = @intFromEnum(font.vtable.GetWeight(font));
+            if (font.getSimulations() != api.DWRITE_FONT_SIMULATIONS_NONE) continue;
+            const weight = @intFromEnum(font.getWeight());
             if (weight < @intFromEnum(api.DWRITE_FONT_WEIGHT.NORMAL)) break true;
         } else false;
         if (!light) return error.SkipZigTest;
@@ -2502,9 +2444,7 @@ test "directwrite fallback" {
             const font = lib.dwrite.mapCharacter(alloc, cp, system, false, false) orelse
                 return error.TestFontNotFound;
             defer api.release(font);
-            var exists: api.BOOL = 0;
-            try testing.expect(api.succeeded(font.vtable.HasCharacter(font, cp, &exists)));
-            try testing.expect(exists != 0);
+            try testing.expect(font.hasCharacter(cp));
         }
 
         // It is the first result, and the others follow for a caller that

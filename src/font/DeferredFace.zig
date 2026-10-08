@@ -118,44 +118,25 @@ pub const DirectWrite = struct {
     }
 
     fn familyName(self: DirectWrite, buf: []u8) ![]const u8 {
-        var family_out: ?*api.IDWriteFontFamily = null;
-        if (api.failed(self.font.vtable.GetFontFamily(self.font, &family_out)))
-            return "unknown";
-        const family = family_out orelse return "unknown";
+        const family = self.font.getFontFamily() catch return "unknown";
         defer api.release(family);
-
-        var strings_out: ?*api.IDWriteLocalizedStrings = null;
-        if (api.failed(family.vtable.GetFamilyNames(family, &strings_out)))
-            return "unknown";
-        const strings = strings_out orelse return "unknown";
+        const strings = family.getFamilyNames() catch return "unknown";
         defer api.release(strings);
 
         return try directwrite.localizedString(strings, buf);
     }
 
     fn name(self: DirectWrite, buf: []u8) ![]const u8 {
-        var strings_out: ?*api.IDWriteLocalizedStrings = null;
-        var exists: api.BOOL = 0;
-        if (api.succeeded(self.font.vtable.GetInformationalStrings(
-            self.font,
-            .FULL_NAME,
-            &strings_out,
-            &exists,
-        ))) {
-            if (strings_out) |strings| {
-                defer api.release(strings);
-                if (exists != 0) return try directwrite.localizedString(strings, buf);
-            }
+        if (self.font.getInformationalStrings(.FULL_NAME) catch null) |strings| {
+            defer api.release(strings);
+            return try directwrite.localizedString(strings, buf);
         }
 
         return try self.familyName(buf);
     }
 
     fn hasCodepoint(self: DirectWrite, cp: u32) bool {
-        var exists: api.BOOL = 0;
-        if (api.failed(self.font.vtable.HasCharacter(self.font, cp, &exists)))
-            return false;
-        return exists != 0;
+        return self.font.hasCharacter(cp);
     }
 };
 
@@ -340,10 +321,7 @@ fn loadDirectWriteFreetype(
     const dw = self.dw.?;
     const api = directwrite.api;
 
-    var face_out: ?*api.IDWriteFontFace = null;
-    if (api.failed(dw.font.vtable.CreateFontFace(dw.font, &face_out)))
-        return error.DirectWriteFailed;
-    const dw_face = face_out orelse return error.DirectWriteFailed;
+    const dw_face = try dw.font.createFontFace();
     defer api.release(dw_face);
 
     // FreeType opens the file DirectWrite reads the face from, at the

@@ -57,50 +57,27 @@ pub const Face = struct {
         // DirectWrite copies the key, and reads the font through the
         // loader whenever it wants to, from the bytes the key points at.
         const key = FontFileLoader.key(source);
-        var file_out: ?*api.IDWriteFontFile = null;
-        const ref_hr = factory.vtable.CreateCustomFontFileReference(
-            factory,
-            &key,
-            @sizeOf(FontFileLoader.Key),
+        const file = try factory.createCustomFontFileReference(
+            std.mem.asBytes(&key),
             dw.loader,
-            &file_out,
         );
-        if (api.failed(ref_hr)) return fail("CreateCustomFontFileReference", ref_hr);
-        const file = file_out orelse return error.DirectWriteFailed;
         defer api.release(file);
 
-        var supported: api.BOOL = 0;
-        var file_type: api.DWRITE_FONT_FILE_TYPE = .UNKNOWN;
-        var face_type: api.DWRITE_FONT_FACE_TYPE = .UNKNOWN;
-        var count: api.UINT = 0;
-        const analyze_hr = file.vtable.Analyze(
-            file,
-            &supported,
-            &file_type,
-            &face_type,
-            &count,
-        );
-        if (api.failed(analyze_hr)) return fail("IDWriteFontFile.Analyze", analyze_hr);
-        if (supported == 0 or count == 0) {
+        const analysis = try file.analyze();
+        if (!analysis.supported or analysis.faces == 0) {
             log.warn("font in memory is not one DirectWrite reads file_type={} faces={}", .{
-                @intFromEnum(file_type),
-                count,
+                @intFromEnum(analysis.file_type),
+                analysis.faces,
             });
             return error.DirectWriteFailed;
         }
 
-        var face_out: ?*api.IDWriteFontFace = null;
-        const face_hr = factory.vtable.CreateFontFace(
-            factory,
-            face_type,
-            1,
-            &[_]*api.IDWriteFontFile{file},
+        const face = try factory.createFontFace(
+            analysis.face_type,
+            &.{file},
             0,
             api.DWRITE_FONT_SIMULATIONS_NONE,
-            &face_out,
         );
-        if (api.failed(face_hr)) return fail("IDWriteFactory.CreateFontFace", face_hr);
-        const face = face_out orelse return error.DirectWriteFailed;
         errdefer api.release(face);
 
         return try initFace(dw, face, api.DWRITE_FONT_SIMULATIONS_NONE, opts);
@@ -113,20 +90,12 @@ pub const Face = struct {
         dw_font: *api.IDWriteFont,
         opts: font.face.Options,
     ) !Face {
-        var face_out: ?*api.IDWriteFontFace = null;
-        const hr = dw_font.vtable.CreateFontFace(dw_font, &face_out);
-        if (api.failed(hr)) return fail("IDWriteFont.CreateFontFace", hr);
-        const face = face_out orelse return error.DirectWriteFailed;
+        const face = try dw_font.createFontFace();
         errdefer api.release(face);
 
         // A font of a collection can be a simulated one, the bold of a
         // family that has none, and its face is made with the simulation.
-        return try initFace(
-            lib.dwrite,
-            face,
-            face.vtable.GetSimulations(face),
-            opts,
-        );
+        return try initFace(lib.dwrite, face, face.getSimulations(), opts);
     }
 
     /// Initialize a face with a DirectWrite face. This takes ownership of
@@ -207,9 +176,7 @@ pub const Face = struct {
         // resource, with the axis values it has now: the factory below
         // knows files and an index and would make the default instance.
         const face = (try self.createInstance(simulations, null)) orelse face: {
-            var count: api.UINT = 0;
-            const count_hr = self.face.vtable.GetFiles(self.face, &count, null);
-            if (api.failed(count_hr)) return fail("IDWriteFontFace.GetFiles", count_hr);
+            const count = try self.face.getFileCount();
 
             // One file for every format but Type 1, which has two.
             var files_buf: [4]?*api.IDWriteFontFile = @splat(null);
@@ -217,27 +184,19 @@ pub const Face = struct {
                 log.warn("font face has an unexpected number of files count={}", .{count});
                 return error.DirectWriteFailed;
             }
-            const files_hr = self.face.vtable.GetFiles(self.face, &count, &files_buf);
             defer for (files_buf) |file_| if (file_) |file| api.release(file);
-            if (api.failed(files_hr)) return fail("IDWriteFontFace.GetFiles", files_hr);
+            try self.face.getFiles(files_buf[0..count]);
 
             var files: [files_buf.len]*api.IDWriteFontFile = undefined;
             for (files_buf[0..count], files[0..count]) |file_, *file|
                 file.* = file_ orelse return error.DirectWriteFailed;
 
-            const factory = self.dwrite.factory;
-            var out: ?*api.IDWriteFontFace = null;
-            const hr = factory.vtable.CreateFontFace(
-                factory,
-                self.face.vtable.GetType(self.face),
-                count,
-                &files,
-                self.face.vtable.GetIndex(self.face),
+            break :face try self.dwrite.factory.createFontFace(
+                self.face.getType(),
+                files[0..count],
+                self.face.getIndex(),
                 simulations,
-                &out,
             );
-            if (api.failed(hr)) return fail("IDWriteFactory.CreateFontFace", hr);
-            break :face out orelse return error.DirectWriteFailed;
         };
         errdefer api.release(face);
 
@@ -279,22 +238,9 @@ pub const Face = struct {
             }
         };
 
-        var resource_out: ?*api.IDWriteFontResource = null;
-        const resource_hr = face5.vtable.GetFontResource(face5, &resource_out);
-        if (api.failed(resource_hr)) return fail("IDWriteFontFace5.GetFontResource", resource_hr);
-        const resource = resource_out orelse return error.DirectWriteFailed;
+        const resource = try face5.getFontResource();
         defer api.release(resource);
-
-        var out: ?*api.IDWriteFontFace5 = null;
-        const hr = resource.vtable.CreateFontFace(
-            resource,
-            simulations,
-            axes.ptr,
-            @intCast(axes.len),
-            &out,
-        );
-        if (api.failed(hr)) return fail("IDWriteFontResource.CreateFontFace", hr);
-        return (out orelse return error.DirectWriteFailed).face();
+        return (try resource.createFontFace(simulations, axes)).face();
     }
 
     /// Whether the missing variable font support has been logged, which
@@ -316,21 +262,15 @@ pub const Face = struct {
         // are what a font that cannot vary is described by and not
         // something to set, and a face that is made with other values
         // for them is the face it was.
-        if (face5.vtable.HasVariations(face5) == 0) return buf[0..0];
+        if (!face5.hasVariations()) return buf[0..0];
 
-        const count = face5.vtable.GetFontAxisValueCount(face5);
+        const count = face5.getFontAxisValueCount();
         if (count == 0) return buf[0..0];
         if (count > buf.len) {
             log.warn("font has more variation axes than are supported axes={}", .{count});
             return null;
         }
-        const hr = face5.vtable.GetFontAxisValues(face5, buf, count);
-        if (api.failed(hr)) {
-            log.warn("IDWriteFontFace5.GetFontAxisValues failed hr=0x{x}", .{
-                @as(u32, @bitCast(hr)),
-            });
-            return null;
-        }
+        face5.getFontAxisValues(buf[0..count]) catch return null;
         return buf[0..count];
     }
 
@@ -343,9 +283,7 @@ pub const Face = struct {
         const face3 = api.queryInterface(self.face, api.IDWriteFontFace3) catch return "";
         defer api.release(face3);
 
-        var out: ?*api.IDWriteLocalizedStrings = null;
-        if (api.failed(face3.vtable.GetFamilyNames(face3, &out))) return "";
-        const strings = out orelse return "";
+        const strings = face3.getFamilyNames() catch return "";
         defer api.release(strings);
 
         return directwrite.localizedString(strings, buf) catch |err| switch (err) {
@@ -402,7 +340,7 @@ pub const Face = struct {
         // yes to it.
         const face2 = api.queryInterface(self.face, api.IDWriteFontFace2) catch return false;
         defer api.release(face2);
-        return face2.vtable.IsColorFont(face2) != 0;
+        return face2.isColorFont();
     }
 
     /// Returns true if the given glyph ID is colorized, which is when
@@ -446,24 +384,20 @@ pub const Face = struct {
         const face4 = api.queryInterface(self.face, api.IDWriteFontFace4) catch
             return if (self.hasColor() and self.hasLayers(glyph)) .layers else .outline;
         defer api.release(face4);
-        const formats = face4.vtable.GetGlyphImageFormats(face4);
+        const formats = face4.getGlyphImageFormats();
         if (formats & api.DWRITE_GLYPH_IMAGE_FORMATS_COLR != 0 and self.hasLayers(glyph))
             return .layers;
         if (formats & image_formats != 0) {
-            var glyph_formats: api.DWRITE_GLYPH_IMAGE_FORMATS = 0;
-            const hr = face4.vtable.GetGlyphImageFormats_(
-                face4,
+            if (face4.getGlyphImageFormatsOfGlyph(
                 glyph,
                 0,
                 std.math.maxInt(api.UINT32),
-                &glyph_formats,
-            );
-            if (api.succeeded(hr)) {
+            )) |glyph_formats| {
                 if (glyph_formats & api.DWRITE_GLYPH_IMAGE_FORMATS_PNG != 0)
                     return .{ .image = api.DWRITE_GLYPH_IMAGE_FORMATS_PNG };
                 if (glyph_formats & api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8 != 0)
                     return .{ .image = api.DWRITE_GLYPH_IMAGE_FORMATS_PREMULTIPLIED_B8G8R8A8 };
-            }
+            } else |_| {}
         }
         return .outline;
     }
@@ -475,9 +409,7 @@ pub const Face = struct {
         const factory2 = self.dwrite.factory2 orelse return false;
         const indices = [_]api.UINT16{glyph};
         const run = self.glyphRun(&indices);
-        var out: ?*api.IDWriteColorGlyphRunEnumerator = null;
-        const hr = factory2.vtable.TranslateColorGlyphRun(
-            factory2,
+        const layers = (factory2.translateColorGlyphRun(
             0,
             0,
             &run,
@@ -485,10 +417,9 @@ pub const Face = struct {
             .NATURAL,
             null,
             0,
-            &out,
-        );
-        if (out) |e| api.release(e);
-        return api.succeeded(hr);
+        ) catch return false) orelse return false;
+        api.release(layers);
+        return true;
     }
 
     /// One layer of a color glyph: a glyph of the font in one color.
@@ -504,9 +435,7 @@ pub const Face = struct {
         const factory2 = self.dwrite.factory2 orelse return null;
         const indices = [_]api.UINT16{glyph};
         const run = self.glyphRun(&indices);
-        var out: ?*api.IDWriteColorGlyphRunEnumerator = null;
-        const hr = factory2.vtable.TranslateColorGlyphRun(
-            factory2,
+        const layers = try factory2.translateColorGlyphRun(
             0,
             0,
             &run,
@@ -514,25 +443,13 @@ pub const Face = struct {
             .NATURAL,
             null,
             0,
-            &out,
-        );
-        if (hr == api.DWRITE_E_NOCOLOR) return null;
-        if (api.failed(hr)) return fail("IDWriteFactory2.TranslateColorGlyphRun", hr);
-        const layers = out orelse return error.DirectWriteFailed;
+        ) orelse return null;
         defer api.release(layers);
 
         var list: std.ArrayList(Layer) = .empty;
         errdefer list.deinit(alloc);
-        while (true) {
-            var has: api.BOOL = 0;
-            const next_hr = layers.vtable.MoveNext(layers, &has);
-            if (api.failed(next_hr)) return fail("IDWriteColorGlyphRunEnumerator.MoveNext", next_hr);
-            if (has == 0) break;
-
-            var current: ?*const api.DWRITE_COLOR_GLYPH_RUN = null;
-            const run_hr = layers.vtable.GetCurrentRun(layers, &current);
-            if (api.failed(run_hr)) return fail("IDWriteColorGlyphRunEnumerator.GetCurrentRun", run_hr);
-            const layer = current orelse return error.DirectWriteFailed;
+        while (try layers.moveNext()) {
+            const layer = try layers.getCurrentRun();
 
             const color = layerColor(layer);
             const glyphs = layer.glyphRun.glyphIndices[0..layer.glyphRun.glyphCount];
@@ -569,12 +486,7 @@ pub const Face = struct {
     pub fn glyphIndex(self: Face, cp: u32) ?u32 {
         const codepoints = [_]api.UINT{cp};
         var glyphs = [_]api.UINT16{0};
-        if (api.failed(self.face.vtable.GetGlyphIndices(
-            self.face,
-            &codepoints,
-            codepoints.len,
-            &glyphs,
-        ))) return null;
+        self.face.getGlyphIndices(&codepoints, &glyphs) catch return null;
 
         // Glyph zero is the one a font shows for what it doesn't have.
         if (glyphs[0] == 0) return null;
@@ -617,15 +529,7 @@ pub const Face = struct {
         glyphs: []const api.UINT16,
         gm: []api.DWRITE_GLYPH_METRICS,
     ) !?font.Glyph.Size {
-        assert(gm.len == glyphs.len);
-        const hr = self.face.vtable.GetDesignGlyphMetrics(
-            self.face,
-            glyphs.ptr,
-            @intCast(glyphs.len),
-            gm.ptr,
-            0,
-        );
-        if (api.failed(hr)) return fail("IDWriteFontFace.GetDesignGlyphMetrics", hr);
+        try self.face.getDesignGlyphMetrics(glyphs, gm);
 
         const px_per_em: f64 = self.size.pixels();
         const px_per_unit = px_per_em / self.unitsPerEm();
@@ -947,12 +851,10 @@ pub const Face = struct {
             return error.DirectWriteFailed;
         defer api.release(face4);
 
-        var data: api.DWRITE_GLYPH_IMAGE_DATA = undefined;
-        var context: ?*anyopaque = null;
         const ppem: api.UINT32 = @intFromFloat(@round(@max(1, self.size.pixels())));
-        const hr = face4.vtable.GetGlyphImageData(face4, glyph, ppem, format, &data, &context);
-        if (api.failed(hr)) return fail("IDWriteFontFace4.GetGlyphImageData", hr);
-        defer if (context) |c| face4.vtable.ReleaseGlyphImageData(face4, c);
+        const glyph_image = try face4.getGlyphImageData(glyph, ppem, format);
+        defer if (glyph_image.context) |c| face4.releaseGlyphImageData(c);
+        const data = glyph_image.data;
 
         // A format the glyph does not have comes back as no image at
         // all, and not as an error.
@@ -1154,8 +1056,7 @@ pub const Face = struct {
             .bidiLevel = 0,
         };
 
-        var analysis_out: ?*api.IDWriteGlyphRunAnalysis = null;
-        const hr = factory2.createGlyphRunAnalysis(
+        const analysis = try factory2.createGlyphRunAnalysis(
             &run,
             &matrix,
             .NATURAL_SYMMETRIC,
@@ -1164,10 +1065,7 @@ pub const Face = struct {
             .GRAYSCALE,
             0,
             0,
-            &analysis_out,
         );
-        if (api.failed(hr)) return fail("IDWriteFactory2.CreateGlyphRunAnalysis", hr);
-        const analysis = analysis_out orelse return error.DirectWriteFailed;
         defer api.release(analysis);
 
         // An analysis that is antialiased in grayscale has its coverage
@@ -1175,10 +1073,7 @@ pub const Face = struct {
         // for aliased text. The coverage is linear: a stem that is moved
         // by a quarter of a pixel has 191 and 64 where it had 255 and 0.
         const texture: api.DWRITE_TEXTURE_TYPE = .ALIASED_1x1;
-        var bounds: api.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        const bounds_hr = analysis.vtable.GetAlphaTextureBounds(analysis, texture, &bounds);
-        if (api.failed(bounds_hr))
-            return fail("IDWriteGlyphRunAnalysis.GetAlphaTextureBounds", bounds_hr);
+        const bounds = try analysis.getAlphaTextureBounds(texture);
         if (bounds.right <= bounds.left or bounds.bottom <= bounds.top) return null;
 
         const width: u32 = @intCast(bounds.right - bounds.left);
@@ -1190,15 +1085,7 @@ pub const Face = struct {
         const data = try alloc.alloc(u8, width * height);
         errdefer alloc.free(data);
 
-        const texture_hr = analysis.vtable.CreateAlphaTexture(
-            analysis,
-            texture,
-            &bounds,
-            data.ptr,
-            @intCast(data.len),
-        );
-        if (api.failed(texture_hr))
-            return fail("IDWriteGlyphRunAnalysis.CreateAlphaTexture", texture_hr);
+        try analysis.createAlphaTexture(texture, &bounds, data);
 
         return .{
             .data = data,
@@ -1233,8 +1120,7 @@ pub const Face = struct {
     /// The design units of an em, which DirectWrite's glyph metrics are
     /// in. Never zero.
     fn unitsPerEm(self: Face) f64 {
-        var dm: api.DWRITE_FONT_METRICS = undefined;
-        self.face.vtable.GetMetrics(self.face, &dm);
+        const dm = self.face.getMetrics();
         return @floatFromInt(@max(dm.designUnitsPerEm, 1));
     }
 
@@ -1251,13 +1137,9 @@ pub const Face = struct {
 
         if (api.queryInterface(self.face, api.IDWriteFontFace1)) |face1| {
             defer api.release(face1);
-            if (api.succeeded(face1.vtable.GetDesignGlyphAdvances(
-                face1,
-                @intCast(glyphs.len),
-                glyphs.ptr,
-                advances.ptr,
-                0,
-            ))) return;
+            if (face1.getDesignGlyphAdvances(glyphs, advances)) {
+                return;
+            } else |_| {}
         } else |_| {}
 
         for (metrics, advances) |gm, *advance|
@@ -1276,27 +1158,8 @@ pub const Face = struct {
         }
 
         fn initTag(face: *api.IDWriteFontFace, tag: api.UINT) ?Table {
-            var data: ?*const anyopaque = null;
-            var size: api.UINT = 0;
-            var context: ?*anyopaque = null;
-            var exists: api.BOOL = 0;
-            if (api.failed(face.vtable.TryGetFontTable(
-                face,
-                tag,
-                &data,
-                &size,
-                &context,
-                &exists,
-            ))) return null;
-            if (exists == 0) return null;
-
-            const result: Table = .{
-                .data = if (data) |ptr|
-                    @as([*]const u8, @ptrCast(ptr))[0..size]
-                else
-                    &.{},
-                .context = context,
-            };
+            const table = (face.tryGetFontTable(tag) catch return null) orelse return null;
+            const result: Table = .{ .data = table.data, .context = table.context };
             if (result.data.len == 0) {
                 result.deinit(face);
                 return null;
@@ -1305,7 +1168,7 @@ pub const Face = struct {
         }
 
         fn deinit(self: Table, face: *api.IDWriteFontFace) void {
-            face.vtable.ReleaseFontTable(face, self.context);
+            face.releaseFontTable(self.context);
         }
     };
 
@@ -1363,8 +1226,7 @@ pub const Face = struct {
 
         // What DirectWrite makes of the font's metrics, in design units.
         // This is the fallback for what the tables don't have.
-        var dm: api.DWRITE_FONT_METRICS = undefined;
-        face.vtable.GetMetrics(face, &dm);
+        const dm = face.getMetrics();
         const dm_units_per_em: f64 = @floatFromInt(@max(dm.designUnitsPerEm, 1));
 
         const units_per_em: f64 =
@@ -1528,26 +1390,17 @@ pub const Face = struct {
             };
 
             // Get our glyph IDs for the ASCII chars
+            // A codepoint whose glyph cannot be had keeps glyph zero,
+            // whose metrics are those of the font's missing glyph.
             var glyphs: [codepoints.len]api.UINT16 = @splat(0);
-            _ = face.vtable.GetGlyphIndices(
-                face,
-                &codepoints,
-                codepoints.len,
-                &glyphs,
-            );
+            face.getGlyphIndices(&codepoints, &glyphs) catch {};
 
             // Get the metrics of the glyphs, which have the ink of each
             var gms: [codepoints.len]api.DWRITE_GLYPH_METRICS = undefined;
-            if (api.failed(face.vtable.GetDesignGlyphMetrics(
-                face,
-                &glyphs,
-                glyphs.len,
-                &gms,
-                0,
-            ))) {
+            face.getDesignGlyphMetrics(&glyphs, &gms) catch {
                 log.warn("(getMetrics) GetDesignGlyphMetrics failed", .{});
                 @memset(&gms, std.mem.zeroes(api.DWRITE_GLYPH_METRICS));
-            }
+            };
 
             // Get all our advances
             var advances: [codepoints.len]api.INT32 = @splat(0);
@@ -1589,13 +1442,7 @@ pub const Face = struct {
             const glyphs = [_]api.UINT16{@intCast(glyph)};
 
             var gms: [1]api.DWRITE_GLYPH_METRICS = undefined;
-            if (api.failed(face.vtable.GetDesignGlyphMetrics(
-                face,
-                &glyphs,
-                glyphs.len,
-                &gms,
-                0,
-            ))) break :ic_width null;
+            face.getDesignGlyphMetrics(&glyphs, &gms) catch break :ic_width null;
 
             var advances: [1]api.INT32 = .{0};
             self.designAdvances(&glyphs, &gms, &advances);
@@ -1682,8 +1529,8 @@ pub const Face = struct {
         );
         // The font keeps the face.
         defer hb_face.destroy();
-        hb_face.setIndex(face.vtable.GetIndex(face));
-        hb_face.setGlyphCount(face.vtable.GetGlyphCount(face));
+        hb_face.setIndex(face.getIndex());
+        hb_face.setGlyphCount(face.getGlyphCount());
 
         var hb_font = try harfbuzz.Font.create(hb_face);
         errdefer hb_font.destroy();
@@ -1769,12 +1616,6 @@ pub const Face = struct {
             if (face) |v| api.release(v);
         }
     };
-
-    /// Log the call that failed and return the error for it.
-    fn fail(comptime call: []const u8, hr: api.HRESULT) directwrite.Error {
-        log.err(call ++ " failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
-        return error.DirectWriteFailed;
-    }
 };
 
 // The tests below call DirectWrite and so only run on Windows. They are
@@ -2285,7 +2126,7 @@ test "synthetic italic of a variation" {
     // variable font, not the factory that makes the others.
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_OBLIQUE,
-        italic.face.vtable.GetSimulations(italic.face),
+        italic.face.getSimulations(),
     );
 
     var atlas = try font.Atlas.init(alloc, 512, .grayscale);
@@ -2450,11 +2291,11 @@ test "synthetic bold" {
     try testing.expectEqual(api.DWRITE_FONT_SIMULATIONS_BOLD, bold.simulations);
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_NONE,
-        regular.face.vtable.GetSimulations(regular.face),
+        regular.face.getSimulations(),
     );
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_BOLD,
-        bold.face.vtable.GetSimulations(bold.face),
+        bold.face.getSimulations(),
     );
     try testing.expect(regular.face != bold.face);
 
@@ -2513,7 +2354,7 @@ test "synthetic italic" {
     try testing.expectEqual(api.DWRITE_FONT_SIMULATIONS_OBLIQUE, italic.simulations);
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_OBLIQUE,
-        italic.face.vtable.GetSimulations(italic.face),
+        italic.face.getSimulations(),
     );
 
     // The two simulations add up.
@@ -2525,7 +2366,7 @@ test "synthetic italic" {
     );
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_OBLIQUE | api.DWRITE_FONT_SIMULATIONS_BOLD,
-        bold_italic.face.vtable.GetSimulations(bold_italic.face),
+        bold_italic.face.getSimulations(),
     );
 
     // A bar, which is a stem and nothing else. A letter will not do: the
@@ -2593,32 +2434,15 @@ test "discovered font that is simulated" {
     // among the fonts of the family that is the regular one simulated.
     const collection = try lib.dwrite.systemFonts();
     defer api.release(collection);
-    var index: api.UINT = 0;
-    var exists: api.BOOL = 0;
     const family_name = std.unicode.utf8ToUtf16LeStringLiteral("Lucida Console");
-    try testing.expect(api.succeeded(collection.vtable.FindFamilyName(
-        collection,
-        family_name,
-        &index,
-        &exists,
-    )));
-    if (exists == 0) return error.SkipZigTest;
-
-    var family_out: ?*api.IDWriteFontFamily = null;
-    try testing.expect(api.succeeded(collection.vtable.GetFontFamily(
-        collection,
-        index,
-        &family_out,
-    )));
-    const family = family_out.?;
+    const index = try collection.findFamilyName(family_name) orelse return error.SkipZigTest;
+    const family = try collection.getFontFamily(index);
     defer api.release(family);
 
     const list = family.fontList();
-    const dw_font = for (0..list.vtable.GetFontCount(list)) |i| {
-        var font_out: ?*api.IDWriteFont = null;
-        try testing.expect(api.succeeded(list.vtable.GetFont(list, @intCast(i), &font_out)));
-        const candidate = font_out.?;
-        if (candidate.vtable.GetSimulations(candidate) == api.DWRITE_FONT_SIMULATIONS_BOLD)
+    const dw_font = for (0..list.getFontCount()) |i| {
+        const candidate = try list.getFont(@intCast(i));
+        if (candidate.getSimulations() == api.DWRITE_FONT_SIMULATIONS_BOLD)
             break candidate;
         api.release(candidate);
     } else return error.SkipZigTest;
@@ -2632,14 +2456,14 @@ test "discovered font that is simulated" {
     try testing.expectEqual(api.DWRITE_FONT_SIMULATIONS_BOLD, face.simulations);
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_BOLD,
-        face.face.vtable.GetSimulations(face.face),
+        face.face.getSimulations(),
     );
 
     var italic = try face.syntheticItalic(opts);
     defer italic.deinit();
     try testing.expectEqual(
         api.DWRITE_FONT_SIMULATIONS_BOLD | api.DWRITE_FONT_SIMULATIONS_OBLIQUE,
-        italic.face.vtable.GetSimulations(italic.face),
+        italic.face.getSimulations(),
     );
 }
 
@@ -2656,30 +2480,12 @@ test "discovered font" {
     // Consolas ships with every Windows this runs on.
     const collection = try lib.dwrite.systemFonts();
     defer api.release(collection);
-    var index: api.UINT = 0;
-    var exists: api.BOOL = 0;
     const family_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
-    try testing.expect(api.succeeded(collection.vtable.FindFamilyName(
-        collection,
-        family_name,
-        &index,
-        &exists,
-    )));
-    if (exists == 0) return error.SkipZigTest;
-
-    var family_out: ?*api.IDWriteFontFamily = null;
-    try testing.expect(api.succeeded(collection.vtable.GetFontFamily(
-        collection,
-        index,
-        &family_out,
-    )));
-    const family = family_out.?;
+    const index = try collection.findFamilyName(family_name) orelse return error.SkipZigTest;
+    const family = try collection.getFontFamily(index);
     defer api.release(family);
 
-    const list = family.fontList();
-    var font_out: ?*api.IDWriteFont = null;
-    try testing.expect(api.succeeded(list.vtable.GetFont(list, 0, &font_out)));
-    const dw_font = font_out.?;
+    const dw_font = try family.fontList().getFont(0);
     defer api.release(dw_font);
 
     var face = try Face.initFont(lib, dw_font, .{ .size = test_size });
@@ -2896,13 +2702,10 @@ test "constrained glyph" {
     }) |want| {
         const cp, const box = want;
         var gm: [1]api.DWRITE_GLYPH_METRICS = undefined;
-        try testing.expect(api.succeeded(face.face.vtable.GetDesignGlyphMetrics(
-            face.face,
+        try face.face.getDesignGlyphMetrics(
             &[_]api.UINT16{@intCast(face.glyphIndex(cp).?)},
-            1,
             &gm,
-            0,
-        )));
+        );
         const ink = Face.inkBox(gm[0]);
         errdefer std.debug.print("U+{X}: ink {d}x{d} at ({d},{d}), CoreText has {d}x{d} at ({d},{d})\n", .{
             cp,
@@ -2970,13 +2773,7 @@ test "constrained glyph" {
     }) |constraint| for ([_]u2{ 1, 2 }) |cells| {
         const index = face.glyphIndex(0xEA61).?;
         var gm: [1]api.DWRITE_GLYPH_METRICS = undefined;
-        try testing.expect(api.succeeded(face.face.vtable.GetDesignGlyphMetrics(
-            face.face,
-            &[_]api.UINT16{@intCast(index)},
-            1,
-            &gm,
-            0,
-        )));
+        try face.face.getDesignGlyphMetrics(&[_]api.UINT16{@intCast(index)}, &gm);
         const ink = Face.inkBox(gm[0]);
         const box = constraint.constrain(.{
             .width = ink.width * px_per_unit,
@@ -3725,26 +3522,12 @@ test "color paths take no reference" {
 /// The first font of a family of the system, or null when the system
 /// has no such family. The font is the caller's.
 fn testSystemFont(lib: font.Library, comptime family_name: []const u8) !?*api.IDWriteFont {
-    const testing = std.testing;
     const collection = try lib.dwrite.systemFonts();
     defer api.release(collection);
-    var index: api.UINT = 0;
-    var exists: api.BOOL = 0;
-    try testing.expect(api.succeeded(collection.vtable.FindFamilyName(
-        collection,
+    const index = try collection.findFamilyName(
         std.unicode.utf8ToUtf16LeStringLiteral(family_name),
-        &index,
-        &exists,
-    )));
-    if (exists == 0) return null;
-
-    var family_out: ?*api.IDWriteFontFamily = null;
-    try testing.expect(api.succeeded(collection.vtable.GetFontFamily(collection, index, &family_out)));
-    const family = family_out.?;
+    ) orelse return null;
+    const family = try collection.getFontFamily(index);
     defer api.release(family);
-
-    const list = family.fontList();
-    var font_out: ?*api.IDWriteFont = null;
-    try testing.expect(api.succeeded(list.vtable.GetFont(list, 0, &font_out)));
-    return font_out.?;
+    return try family.fontList().getFont(0);
 }

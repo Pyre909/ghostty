@@ -10,6 +10,11 @@
 //! Interfaces the backend implements itself (the text analysis source, the
 //! font file stream) have every slot typed.
 //!
+//! The interfaces the backend calls have a Zig method for each call, so
+//! that no HRESULT or BOOL leaves this file: a failed HRESULT becomes
+//! Error with the call and the HRESULT in the log, an out pointer becomes
+//! the result, and a BOOL becomes a bool.
+//!
 //! The tests check every vtable's slot count and every struct's layout
 //! against the header, so a dropped or shuffled slot fails on any host
 //! instead of calling the wrong function in a Windows run. No extern
@@ -22,6 +27,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
 const windows = std.os.windows;
 
 /// The calling convention of every COM method: the platform convention on
@@ -68,6 +74,22 @@ pub const S_FALSE: HRESULT = 1;
 pub const E_FAIL: HRESULT = @bitCast(@as(u32, 0x80004005));
 pub const E_INVALIDARG: HRESULT = @bitCast(@as(u32, 0x80070057));
 pub const E_NOTIMPL: HRESULT = @bitCast(@as(u32, 0x80004001));
+
+const log = std.log.scoped(.directwrite);
+
+pub const Error = error{
+    /// DirectWrite could not be initialized, or a call on it failed. The
+    /// HRESULT is in the log.
+    DirectWriteFailed,
+};
+
+/// The one place a failed HRESULT becomes an error: the call and its
+/// HRESULT are logged, which the error cannot carry.
+fn check(comptime call: []const u8, hr: HRESULT) Error!void {
+    if (succeeded(hr)) return;
+    log.err(call ++ " failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+    return error.DirectWriteFailed;
+}
 
 // IUnknown's IID is the one GUID every COM header agrees on; the rest come
 // from the DEFINE_GUID lines of the headers named above.
@@ -227,6 +249,69 @@ pub const IDWriteFactory = extern struct {
         CreateNumberSubstitution: Slot,
         CreateGlyphRunAnalysis: Slot,
     };
+
+    /// A reference the caller owns.
+    pub fn getSystemFontCollection(
+        self: *IDWriteFactory,
+        checkForUpdates: bool,
+    ) Error!*IDWriteFontCollection {
+        var out: ?*IDWriteFontCollection = null;
+        try check("IDWriteFactory.GetSystemFontCollection", self.vtable.GetSystemFontCollection(
+            self,
+            &out,
+            @intFromBool(checkForUpdates),
+        ));
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// A reference the caller owns.
+    pub fn createCustomFontFileReference(
+        self: *IDWriteFactory,
+        key: []const u8,
+        loader: *IDWriteFontFileLoader,
+    ) Error!*IDWriteFontFile {
+        var out: ?*IDWriteFontFile = null;
+        try check("IDWriteFactory.CreateCustomFontFileReference", self.vtable.CreateCustomFontFileReference(
+            self,
+            key.ptr,
+            @intCast(key.len),
+            loader,
+            &out,
+        ));
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// A reference the caller owns. `simulations` is a set of
+    /// DWRITE_FONT_SIMULATIONS_* flags.
+    pub fn createFontFace(
+        self: *IDWriteFactory,
+        face_type: DWRITE_FONT_FACE_TYPE,
+        files: []const *IDWriteFontFile,
+        index: UINT,
+        simulations: UINT,
+    ) Error!*IDWriteFontFace {
+        var out: ?*IDWriteFontFace = null;
+        try check("IDWriteFactory.CreateFontFace", self.vtable.CreateFontFace(
+            self,
+            face_type,
+            @intCast(files.len),
+            files.ptr,
+            index,
+            simulations,
+            &out,
+        ));
+        return out orelse error.DirectWriteFailed;
+    }
+
+    pub fn registerFontFileLoader(
+        self: *IDWriteFactory,
+        loader: *IDWriteFontFileLoader,
+    ) Error!void {
+        try check(
+            "IDWriteFactory.RegisterFontFileLoader",
+            self.vtable.RegisterFontFileLoader(self, loader),
+        );
+    }
 };
 
 pub const IDWriteFactory1 = extern struct {
@@ -294,6 +379,50 @@ pub const IDWriteFactory2 = extern struct {
         return @ptrCast(self);
     }
 
+    /// A reference the caller owns.
+    pub fn getSystemFontFallback(self: *IDWriteFactory2) Error!*IDWriteFontFallback {
+        var out: ?*IDWriteFontFallback = null;
+        try check(
+            "IDWriteFactory2.GetSystemFontFallback",
+            self.vtable.GetSystemFontFallback(self, &out),
+        );
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// The layers of a color glyph run, a reference the caller owns, or
+    /// null when no glyph of the run has any (DWRITE_E_NOCOLOR), which is
+    /// not a failure.
+    pub fn translateColorGlyphRun(
+        self: *IDWriteFactory2,
+        baselineOriginX: FLOAT,
+        baselineOriginY: FLOAT,
+        run: *const DWRITE_GLYPH_RUN,
+        runDescription: ?*const anyopaque,
+        measuringMode: DWRITE_MEASURING_MODE,
+        worldToDeviceTransform: ?*const DWRITE_MATRIX,
+        colorPaletteIndex: UINT32,
+    ) Error!?*IDWriteColorGlyphRunEnumerator {
+        var out: ?*IDWriteColorGlyphRunEnumerator = null;
+        const hr = self.vtable.TranslateColorGlyphRun(
+            self,
+            baselineOriginX,
+            baselineOriginY,
+            run,
+            runDescription,
+            measuringMode,
+            worldToDeviceTransform,
+            colorPaletteIndex,
+            &out,
+        );
+        if (hr == DWRITE_E_NOCOLOR) {
+            if (out) |e| release(e);
+            return null;
+        }
+        try check("IDWriteFactory2.TranslateColorGlyphRun", hr);
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// A reference the caller owns.
     pub fn createGlyphRunAnalysis(
         self: *IDWriteFactory2,
         run: *const DWRITE_GLYPH_RUN,
@@ -304,9 +433,9 @@ pub const IDWriteFactory2 = extern struct {
         antialiasMode: DWRITE_TEXT_ANTIALIAS_MODE,
         originX: FLOAT,
         originY: FLOAT,
-        analysis: *?*IDWriteGlyphRunAnalysis,
-    ) HRESULT {
-        return self.vtable.CreateGlyphRunAnalysis(
+    ) Error!*IDWriteGlyphRunAnalysis {
+        var out: ?*IDWriteGlyphRunAnalysis = null;
+        try check("IDWriteFactory2.CreateGlyphRunAnalysis", self.vtable.CreateGlyphRunAnalysis(
             self,
             run,
             transform,
@@ -316,8 +445,9 @@ pub const IDWriteFactory2 = extern struct {
             antialiasMode,
             originX,
             originY,
-            analysis,
-        );
+            &out,
+        ));
+        return out orelse error.DirectWriteFailed;
     }
 };
 
@@ -490,6 +620,32 @@ pub const IDWriteFontCollection = extern struct {
         FindFamilyName: *const fn (*IDWriteFontCollection, [*:0]const WCHAR, *UINT, *BOOL) callconv(cc) HRESULT,
         GetFontFromFontFace: Slot,
     };
+
+    pub fn getFontFamilyCount(self: *IDWriteFontCollection) UINT {
+        return self.vtable.GetFontFamilyCount(self);
+    }
+
+    /// A reference the caller owns.
+    pub fn getFontFamily(self: *IDWriteFontCollection, index: UINT) Error!*IDWriteFontFamily {
+        var out: ?*IDWriteFontFamily = null;
+        try check(
+            "IDWriteFontCollection.GetFontFamily",
+            self.vtable.GetFontFamily(self, index, &out),
+        );
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// The index of the family with this name in any language, or null
+    /// when the collection has no such family.
+    pub fn findFamilyName(self: *IDWriteFontCollection, name: [:0]const WCHAR) Error!?UINT {
+        var index: UINT = 0;
+        var exists: BOOL = 0;
+        try check(
+            "IDWriteFontCollection.FindFamilyName",
+            self.vtable.FindFamilyName(self, name.ptr, &index, &exists),
+        );
+        return if (exists != 0) index else null;
+    }
 };
 
 pub const IDWriteFontList = extern struct {
@@ -503,6 +659,17 @@ pub const IDWriteFontList = extern struct {
         GetFontCount: *const fn (*IDWriteFontList) callconv(cc) UINT,
         GetFont: *const fn (*IDWriteFontList, UINT, *?*IDWriteFont) callconv(cc) HRESULT,
     };
+
+    pub fn getFontCount(self: *IDWriteFontList) UINT {
+        return self.vtable.GetFontCount(self);
+    }
+
+    /// A reference the caller owns.
+    pub fn getFont(self: *IDWriteFontList, index: UINT) Error!*IDWriteFont {
+        var out: ?*IDWriteFont = null;
+        try check("IDWriteFontList.GetFont", self.vtable.GetFont(self, index, &out));
+        return out orelse error.DirectWriteFailed;
+    }
 };
 
 pub const IDWriteFontFamily = extern struct {
@@ -526,6 +693,13 @@ pub const IDWriteFontFamily = extern struct {
     /// The family viewed as the list of its fonts, which it derives from.
     pub inline fn fontList(self: *IDWriteFontFamily) *IDWriteFontList {
         return @ptrCast(self);
+    }
+
+    /// A reference the caller owns.
+    pub fn getFamilyNames(self: *IDWriteFontFamily) Error!*IDWriteLocalizedStrings {
+        var out: ?*IDWriteLocalizedStrings = null;
+        try check("IDWriteFontFamily.GetFamilyNames", self.vtable.GetFamilyNames(self, &out));
+        return out orelse error.DirectWriteFailed;
     }
 };
 
@@ -554,6 +728,68 @@ pub const IDWriteFont = extern struct {
         HasCharacter: *const fn (*IDWriteFont, UINT, *BOOL) callconv(cc) HRESULT,
         CreateFontFace: *const fn (*IDWriteFont, *?*IDWriteFontFace) callconv(cc) HRESULT,
     };
+
+    /// A reference the caller owns.
+    pub fn getFontFamily(self: *IDWriteFont) Error!*IDWriteFontFamily {
+        var out: ?*IDWriteFontFamily = null;
+        try check("IDWriteFont.GetFontFamily", self.vtable.GetFontFamily(self, &out));
+        return out orelse error.DirectWriteFailed;
+    }
+
+    pub fn getWeight(self: *IDWriteFont) DWRITE_FONT_WEIGHT {
+        return self.vtable.GetWeight(self);
+    }
+
+    pub fn getStyle(self: *IDWriteFont) DWRITE_FONT_STYLE {
+        return self.vtable.GetStyle(self);
+    }
+
+    /// A reference the caller owns.
+    pub fn getFaceNames(self: *IDWriteFont) Error!*IDWriteLocalizedStrings {
+        var out: ?*IDWriteLocalizedStrings = null;
+        try check("IDWriteFont.GetFaceNames", self.vtable.GetFaceNames(self, &out));
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// A reference the caller owns, or null when the font has no such
+    /// strings.
+    pub fn getInformationalStrings(
+        self: *IDWriteFont,
+        id: DWRITE_INFORMATIONAL_STRING_ID,
+    ) Error!?*IDWriteLocalizedStrings {
+        var out: ?*IDWriteLocalizedStrings = null;
+        var exists: BOOL = 0;
+        try check(
+            "IDWriteFont.GetInformationalStrings",
+            self.vtable.GetInformationalStrings(self, id, &out, &exists),
+        );
+        const strings = out orelse return null;
+        if (exists == 0) {
+            release(strings);
+            return null;
+        }
+        return strings;
+    }
+
+    /// A set of DWRITE_FONT_SIMULATIONS_* flags.
+    pub fn getSimulations(self: *IDWriteFont) UINT {
+        return self.vtable.GetSimulations(self);
+    }
+
+    /// Whether the font has a glyph for a codepoint; false when that
+    /// cannot be asked either.
+    pub fn hasCharacter(self: *IDWriteFont, cp: UINT) bool {
+        var exists: BOOL = 0;
+        if (failed(self.vtable.HasCharacter(self, cp, &exists))) return false;
+        return exists != 0;
+    }
+
+    /// A reference the caller owns.
+    pub fn createFontFace(self: *IDWriteFont) Error!*IDWriteFontFace {
+        var out: ?*IDWriteFontFace = null;
+        try check("IDWriteFont.CreateFontFace", self.vtable.CreateFontFace(self, &out));
+        return out orelse error.DirectWriteFailed;
+    }
 };
 
 pub const IDWriteFont1 = extern struct {
@@ -574,6 +810,10 @@ pub const IDWriteFont1 = extern struct {
     pub inline fn font(self: *IDWriteFont1) *IDWriteFont {
         return @ptrCast(self);
     }
+
+    pub fn isMonospacedFont(self: *IDWriteFont1) bool {
+        return self.vtable.IsMonospacedFont(self) != 0;
+    }
 };
 
 pub const IDWriteFont2 = extern struct {
@@ -588,6 +828,10 @@ pub const IDWriteFont2 = extern struct {
 
     pub inline fn font(self: *IDWriteFont2) *IDWriteFont {
         return @ptrCast(self);
+    }
+
+    pub fn isColorFont(self: *IDWriteFont2) bool {
+        return self.vtable.IsColorFont(self) != 0;
     }
 };
 
@@ -608,6 +852,41 @@ pub const IDWriteLocalizedStrings = extern struct {
         /// the terminating NUL, one more than GetStringLength reports.
         GetString: *const fn (*IDWriteLocalizedStrings, UINT, [*]WCHAR, UINT) callconv(cc) HRESULT,
     };
+
+    pub fn getCount(self: *IDWriteLocalizedStrings) UINT {
+        return self.vtable.GetCount(self);
+    }
+
+    /// The index of the string in this locale, or null when there is
+    /// none in it.
+    pub fn findLocaleName(self: *IDWriteLocalizedStrings, locale: [:0]const WCHAR) Error!?UINT {
+        var index: UINT = 0;
+        var exists: BOOL = 0;
+        try check(
+            "IDWriteLocalizedStrings.FindLocaleName",
+            self.vtable.FindLocaleName(self, locale.ptr, &index, &exists),
+        );
+        return if (exists != 0) index else null;
+    }
+
+    /// The length excludes the terminating NUL.
+    pub fn getStringLength(self: *IDWriteLocalizedStrings, index: UINT) Error!UINT {
+        var len: UINT = 0;
+        try check(
+            "IDWriteLocalizedStrings.GetStringLength",
+            self.vtable.GetStringLength(self, index, &len),
+        );
+        return len;
+    }
+
+    /// `buf` has to have room for the terminating NUL, one more than
+    /// getStringLength reports.
+    pub fn getString(self: *IDWriteLocalizedStrings, index: UINT, buf: []WCHAR) Error!void {
+        try check(
+            "IDWriteLocalizedStrings.GetString",
+            self.vtable.GetString(self, index, buf.ptr, @intCast(buf.len)),
+        );
+    }
 };
 
 test "directwrite api: fonts vtable slot counts" {
@@ -680,6 +959,88 @@ test "directwrite api: fonts iids" {
     try testing.expectEqual(0x44, IID_IDWriteFont2.Data4[7]);
     try testing.expectEqual(0x08256209, IID_IDWriteLocalizedStrings.Data1);
     try testing.expectEqual(0x71, IID_IDWriteLocalizedStrings.Data4[7]);
+}
+
+test "directwrite api: font methods turn BOOL out params into Zig values" {
+    const testing = std.testing;
+
+    // A font and a set of strings in memory, through the vtables the
+    // methods call: the font hands out the strings for FULL_NAME and
+    // says it has none for any other id, while still handing them out,
+    // and has a glyph for 'A' only. Slots no method here calls stay
+    // undefined.
+    const Fake = struct {
+        font: IDWriteFont,
+        strings: IDWriteLocalizedStrings,
+        refs: ULONG = 1,
+
+        fn fromStrings(unk: *IUnknown) *@This() {
+            const strings: *IDWriteLocalizedStrings = @ptrCast(@alignCast(unk));
+            return @fieldParentPtr("strings", strings);
+        }
+
+        fn addRef(unk: *IUnknown) callconv(cc) ULONG {
+            const self = fromStrings(unk);
+            self.refs += 1;
+            return self.refs;
+        }
+
+        fn release(unk: *IUnknown) callconv(cc) ULONG {
+            const self = fromStrings(unk);
+            self.refs -= 1;
+            return self.refs;
+        }
+
+        fn getInformationalStrings(
+            font: *IDWriteFont,
+            id: DWRITE_INFORMATIONAL_STRING_ID,
+            out: *?*IDWriteLocalizedStrings,
+            exists: *BOOL,
+        ) callconv(cc) HRESULT {
+            const self: *@This() = @fieldParentPtr("font", font);
+            self.refs += 1;
+            out.* = &self.strings;
+            exists.* = @intFromBool(id == .FULL_NAME);
+            return S_OK;
+        }
+
+        fn hasCharacter(_: *IDWriteFont, cp: UINT, exists: *BOOL) callconv(cc) HRESULT {
+            if (cp == 0) {
+                // A failure that leaves the out param saying yes.
+                exists.* = 1;
+                return E_FAIL;
+            }
+            exists.* = @intFromBool(cp == 'A');
+            return S_OK;
+        }
+    };
+
+    var font_vtable: IDWriteFont.VTable = undefined;
+    font_vtable.GetInformationalStrings = &Fake.getInformationalStrings;
+    font_vtable.HasCharacter = &Fake.hasCharacter;
+    var strings_vtable: IDWriteLocalizedStrings.VTable = undefined;
+    strings_vtable.base.AddRef = &Fake.addRef;
+    strings_vtable.base.Release = &Fake.release;
+    var fake: Fake = .{
+        .font = .{ .vtable = &font_vtable },
+        .strings = .{ .vtable = &strings_vtable },
+    };
+
+    // Strings the font says it does not have are not handed on, and the
+    // reference that came with them is given back.
+    try testing.expectEqual(null, try fake.font.getInformationalStrings(.COPYRIGHT_NOTICE));
+    try testing.expectEqual(1, fake.refs);
+
+    // Strings it has are the caller's, with the reference.
+    const strings = (try fake.font.getInformationalStrings(.FULL_NAME)).?;
+    try testing.expectEqual(&fake.strings, strings);
+    try testing.expectEqual(2, fake.refs);
+    release(strings);
+    try testing.expectEqual(1, fake.refs);
+
+    try testing.expect(fake.font.hasCharacter('A'));
+    try testing.expect(!fake.font.hasCharacter('B'));
+    try testing.expect(!fake.font.hasCharacter(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +1140,32 @@ pub const IDWriteLocalFontFileLoader = extern struct {
         ) callconv(cc) HRESULT,
         GetLastWriteTimeFromKey: Slot,
     };
+
+    /// The length is in WCHARs and leaves out the terminating NUL.
+    pub fn getFilePathLengthFromKey(self: *IDWriteLocalFontFileLoader, key: []const u8) Error!UINT {
+        var len: UINT = 0;
+        try check(
+            "IDWriteLocalFontFileLoader.GetFilePathLengthFromKey",
+            self.vtable.GetFilePathLengthFromKey(self, key.ptr, @intCast(key.len), &len),
+        );
+        return len;
+    }
+
+    /// `buf` has to have room for the terminating NUL, one more than
+    /// getFilePathLengthFromKey reports.
+    pub fn getFilePathFromKey(
+        self: *IDWriteLocalFontFileLoader,
+        key: []const u8,
+        buf: []WCHAR,
+    ) Error!void {
+        try check("IDWriteLocalFontFileLoader.GetFilePathFromKey", self.vtable.GetFilePathFromKey(
+            self,
+            key.ptr,
+            @intCast(key.len),
+            buf.ptr,
+            @intCast(buf.len),
+        ));
+    }
 };
 
 pub const IDWriteFontFile = extern struct {
@@ -807,6 +1194,51 @@ pub const IDWriteFontFile = extern struct {
             *UINT,
         ) callconv(cc) HRESULT,
     };
+
+    /// Owned by the file and valid for as long as the file is alive.
+    pub fn getReferenceKey(self: *IDWriteFontFile) Error![]const u8 {
+        var key: ?*const anyopaque = null;
+        var size: UINT = 0;
+        try check("IDWriteFontFile.GetReferenceKey", self.vtable.GetReferenceKey(self, &key, &size));
+        const ptr: [*]const u8 = @ptrCast(key orelse return error.DirectWriteFailed);
+        return ptr[0..size];
+    }
+
+    /// A reference the caller owns.
+    pub fn getLoader(self: *IDWriteFontFile) Error!*IDWriteFontFileLoader {
+        var out: ?*IDWriteFontFileLoader = null;
+        try check("IDWriteFontFile.GetLoader", self.vtable.GetLoader(self, &out));
+        return out orelse error.DirectWriteFailed;
+    }
+
+    /// What Analyze makes of a file.
+    pub const Analysis = struct {
+        /// Whether DirectWrite reads the file at all.
+        supported: bool,
+        file_type: DWRITE_FONT_FILE_TYPE,
+        face_type: DWRITE_FONT_FACE_TYPE,
+        /// The number of faces in the file.
+        faces: UINT,
+    };
+
+    pub fn analyze(self: *IDWriteFontFile) Error!Analysis {
+        var supported: BOOL = 0;
+        var result: Analysis = .{
+            .supported = false,
+            .file_type = .UNKNOWN,
+            .face_type = .UNKNOWN,
+            .faces = 0,
+        };
+        try check("IDWriteFontFile.Analyze", self.vtable.Analyze(
+            self,
+            &supported,
+            &result.file_type,
+            &result.face_type,
+            &result.faces,
+        ));
+        result.supported = supported != 0;
+        return result;
+    }
 };
 
 pub const IDWriteFontFace = extern struct {
@@ -871,6 +1303,109 @@ pub const IDWriteFontFace = extern struct {
         GetGdiCompatibleMetrics: Slot,
         GetGdiCompatibleGlyphMetrics: Slot,
     };
+
+    pub fn getType(self: *IDWriteFontFace) DWRITE_FONT_FACE_TYPE {
+        return self.vtable.GetType(self);
+    }
+
+    /// The number of files the face is read from, which is what
+    /// getFiles fills.
+    pub fn getFileCount(self: *IDWriteFontFace) Error!UINT {
+        var count: UINT = 0;
+        try check("IDWriteFontFace.GetFiles", self.vtable.GetFiles(self, &count, null));
+        return count;
+    }
+
+    /// Fills `files`, which has to be as long as getFileCount says, with
+    /// references the caller owns.
+    pub fn getFiles(self: *IDWriteFontFace, files: []?*IDWriteFontFile) Error!void {
+        var count: UINT = @intCast(files.len);
+        try check("IDWriteFontFace.GetFiles", self.vtable.GetFiles(self, &count, files.ptr));
+    }
+
+    pub fn getIndex(self: *IDWriteFontFace) UINT {
+        return self.vtable.GetIndex(self);
+    }
+
+    /// A set of DWRITE_FONT_SIMULATIONS_* flags.
+    pub fn getSimulations(self: *IDWriteFontFace) UINT {
+        return self.vtable.GetSimulations(self);
+    }
+
+    pub fn getMetrics(self: *IDWriteFontFace) DWRITE_FONT_METRICS {
+        var metrics: DWRITE_FONT_METRICS = undefined;
+        self.vtable.GetMetrics(self, &metrics);
+        return metrics;
+    }
+
+    pub fn getGlyphCount(self: *IDWriteFontFace) UINT16 {
+        return self.vtable.GetGlyphCount(self);
+    }
+
+    /// The metrics of each glyph, set upright, in design units.
+    pub fn getDesignGlyphMetrics(
+        self: *IDWriteFontFace,
+        glyphs: []const UINT16,
+        metrics: []DWRITE_GLYPH_METRICS,
+    ) Error!void {
+        assert(glyphs.len == metrics.len);
+        try check("IDWriteFontFace.GetDesignGlyphMetrics", self.vtable.GetDesignGlyphMetrics(
+            self,
+            glyphs.ptr,
+            @intCast(glyphs.len),
+            metrics.ptr,
+            0,
+        ));
+    }
+
+    /// The glyph index of each codepoint, 0 for one the face has no
+    /// glyph for.
+    pub fn getGlyphIndices(
+        self: *IDWriteFontFace,
+        codepoints: []const UINT,
+        glyphs: []UINT16,
+    ) Error!void {
+        assert(codepoints.len == glyphs.len);
+        try check("IDWriteFontFace.GetGlyphIndices", self.vtable.GetGlyphIndices(
+            self,
+            codepoints.ptr,
+            @intCast(codepoints.len),
+            glyphs.ptr,
+        ));
+    }
+
+    /// A table of the face, valid until releaseFontTable is called with
+    /// its context.
+    pub const FontTable = struct {
+        data: []const u8,
+        context: ?*anyopaque,
+    };
+
+    /// The table with this tag (DWRITE_MAKE_OPENTYPE_TAG), or null when
+    /// the face has none.
+    pub fn tryGetFontTable(self: *IDWriteFontFace, tag: UINT) Error!?FontTable {
+        var data: ?*const anyopaque = null;
+        var size: UINT = 0;
+        var context: ?*anyopaque = null;
+        var exists: BOOL = 0;
+        try check("IDWriteFontFace.TryGetFontTable", self.vtable.TryGetFontTable(
+            self,
+            tag,
+            &data,
+            &size,
+            &context,
+            &exists,
+        ));
+        if (exists == 0) return null;
+        return .{
+            .data = if (data) |ptr| @as([*]const u8, @ptrCast(ptr))[0..size] else &.{},
+            .context = context,
+        };
+    }
+
+    pub fn releaseFontTable(self: *IDWriteFontFace, context: ?*anyopaque) void {
+        self.vtable.ReleaseFontTable(self, context);
+    }
 };
 
 test "directwrite api: face vtable slot counts" {
@@ -1049,6 +1584,17 @@ pub const IDWriteFontFallback = extern struct {
         ) callconv(cc) HRESULT,
     };
 
+    /// What MapCharacters maps the start of a run of text to.
+    pub const Mapping = struct {
+        /// The number of characters the font covers, or the number to
+        /// skip when there is no font.
+        length: UINT,
+        /// A reference the caller owns, or null when no font can render
+        /// the text.
+        font: ?*IDWriteFont,
+        scale: FLOAT,
+    };
+
     pub fn mapCharacters(
         self: *IDWriteFontFallback,
         source: *IDWriteTextAnalysisSource,
@@ -1059,11 +1605,9 @@ pub const IDWriteFontFallback = extern struct {
         baseWeight: DWRITE_FONT_WEIGHT,
         baseStyle: DWRITE_FONT_STYLE,
         baseStretch: DWRITE_FONT_STRETCH,
-        mappedLength: *UINT,
-        mappedFont: *?*IDWriteFont,
-        scale: *FLOAT,
-    ) HRESULT {
-        return self.vtable.MapCharacters(
+    ) Error!Mapping {
+        var result: Mapping = .{ .length = 0, .font = null, .scale = 1 };
+        try check("IDWriteFontFallback.MapCharacters", self.vtable.MapCharacters(
             self,
             source,
             position,
@@ -1073,10 +1617,11 @@ pub const IDWriteFontFallback = extern struct {
             baseWeight,
             baseStyle,
             baseStretch,
-            mappedLength,
-            mappedFont,
-            scale,
-        );
+            &result.length,
+            &result.font,
+            &result.scale,
+        ));
+        return result;
     }
 };
 
@@ -1186,6 +1731,24 @@ pub const IDWriteFontResource = extern struct {
         ) callconv(cc) HRESULT,
         CreateFontFaceReference: Slot,
     };
+
+    /// A reference the caller owns. `simulations` is a set of
+    /// DWRITE_FONT_SIMULATIONS_* flags.
+    pub fn createFontFace(
+        self: *IDWriteFontResource,
+        simulations: UINT,
+        axes: []const DWRITE_FONT_AXIS_VALUE,
+    ) Error!*IDWriteFontFace5 {
+        var out: ?*IDWriteFontFace5 = null;
+        try check("IDWriteFontResource.CreateFontFace", self.vtable.CreateFontFace(
+            self,
+            simulations,
+            axes.ptr,
+            @intCast(axes.len),
+            &out,
+        ));
+        return out orelse error.DirectWriteFailed;
+    }
 };
 
 // Overloads carry the interface's name in the header's C vtables, which
@@ -1224,6 +1787,22 @@ pub const IDWriteFontFace1 = extern struct {
     pub inline fn face(self: *IDWriteFontFace1) *IDWriteFontFace {
         return @ptrCast(self);
     }
+
+    /// The advance of each glyph, set upright, in design units.
+    pub fn getDesignGlyphAdvances(
+        self: *IDWriteFontFace1,
+        glyphs: []const UINT16,
+        advances: []INT32,
+    ) Error!void {
+        assert(glyphs.len == advances.len);
+        try check("IDWriteFontFace1.GetDesignGlyphAdvances", self.vtable.GetDesignGlyphAdvances(
+            self,
+            @intCast(glyphs.len),
+            glyphs.ptr,
+            advances.ptr,
+            0,
+        ));
+    }
 };
 
 pub const IDWriteFontFace2 = extern struct {
@@ -1242,6 +1821,10 @@ pub const IDWriteFontFace2 = extern struct {
         GetPaletteEntries: *const fn (*IDWriteFontFace2, UINT32, UINT32, UINT32, [*]DWRITE_COLOR_F) callconv(cc) HRESULT,
         IDWriteFontFace2_GetRecommendedRenderingMode: Slot,
     };
+
+    pub fn isColorFont(self: *IDWriteFontFace2) bool {
+        return self.vtable.IsColorFont(self) != 0;
+    }
 };
 
 pub const IDWriteFontFace3 = extern struct {
@@ -1270,6 +1853,13 @@ pub const IDWriteFontFace3 = extern struct {
     pub inline fn face(self: *IDWriteFontFace3) *IDWriteFontFace {
         return @ptrCast(self);
     }
+
+    /// A reference the caller owns.
+    pub fn getFamilyNames(self: *IDWriteFontFace3) Error!*IDWriteLocalizedStrings {
+        var out: ?*IDWriteLocalizedStrings = null;
+        try check("IDWriteFontFace3.GetFamilyNames", self.vtable.GetFamilyNames(self, &out));
+        return out orelse error.DirectWriteFailed;
+    }
 };
 
 pub const IDWriteFontFace4 = extern struct {
@@ -1291,6 +1881,61 @@ pub const IDWriteFontFace4 = extern struct {
         GetGlyphImageData: *const fn (*IDWriteFontFace4, UINT16, UINT32, DWRITE_GLYPH_IMAGE_FORMATS, *DWRITE_GLYPH_IMAGE_DATA, *?*anyopaque) callconv(cc) HRESULT,
         ReleaseGlyphImageData: *const fn (*IDWriteFontFace4, ?*anyopaque) callconv(cc) void,
     };
+
+    /// The formats any glyph of the font has.
+    pub fn getGlyphImageFormats(self: *IDWriteFontFace4) DWRITE_GLYPH_IMAGE_FORMATS {
+        return self.vtable.GetGlyphImageFormats(self);
+    }
+
+    /// The formats one glyph has in a range of pixels per em, first and
+    /// last inclusive.
+    pub fn getGlyphImageFormatsOfGlyph(
+        self: *IDWriteFontFace4,
+        glyph: UINT16,
+        pixelsPerEmFirst: UINT32,
+        pixelsPerEmLast: UINT32,
+    ) Error!DWRITE_GLYPH_IMAGE_FORMATS {
+        var formats: DWRITE_GLYPH_IMAGE_FORMATS = DWRITE_GLYPH_IMAGE_FORMATS_NONE;
+        try check("IDWriteFontFace4.GetGlyphImageFormats", self.vtable.GetGlyphImageFormats_(
+            self,
+            glyph,
+            pixelsPerEmFirst,
+            pixelsPerEmLast,
+            &formats,
+        ));
+        return formats;
+    }
+
+    /// A glyph's image, valid until releaseGlyphImageData is called with
+    /// its context.
+    pub const GlyphImage = struct {
+        data: DWRITE_GLYPH_IMAGE_DATA,
+        context: ?*anyopaque,
+    };
+
+    /// The image of a glyph in one format, at the size nearest the
+    /// pixels per em that are asked for.
+    pub fn getGlyphImageData(
+        self: *IDWriteFontFace4,
+        glyph: UINT16,
+        pixelsPerEm: UINT32,
+        format: DWRITE_GLYPH_IMAGE_FORMATS,
+    ) Error!GlyphImage {
+        var result: GlyphImage = .{ .data = undefined, .context = null };
+        try check("IDWriteFontFace4.GetGlyphImageData", self.vtable.GetGlyphImageData(
+            self,
+            glyph,
+            pixelsPerEm,
+            format,
+            &result.data,
+            &result.context,
+        ));
+        return result;
+    }
+
+    pub fn releaseGlyphImageData(self: *IDWriteFontFace4, context: ?*anyopaque) void {
+        self.vtable.ReleaseGlyphImageData(self, context);
+    }
 };
 
 pub const IDWriteFontFace5 = extern struct {
@@ -1316,6 +1961,30 @@ pub const IDWriteFontFace5 = extern struct {
 
     pub inline fn face(self: *IDWriteFontFace5) *IDWriteFontFace {
         return @ptrCast(self);
+    }
+
+    pub fn getFontAxisValueCount(self: *IDWriteFontFace5) UINT {
+        return self.vtable.GetFontAxisValueCount(self);
+    }
+
+    /// `values` has to be as long as getFontAxisValueCount says.
+    pub fn getFontAxisValues(self: *IDWriteFontFace5, values: []DWRITE_FONT_AXIS_VALUE) Error!void {
+        try check(
+            "IDWriteFontFace5.GetFontAxisValues",
+            self.vtable.GetFontAxisValues(self, values.ptr, @intCast(values.len)),
+        );
+    }
+
+    /// Whether the font is a variable one; see VTable.HasVariations.
+    pub fn hasVariations(self: *IDWriteFontFace5) bool {
+        return self.vtable.HasVariations(self) != 0;
+    }
+
+    /// A reference the caller owns.
+    pub fn getFontResource(self: *IDWriteFontFace5) Error!*IDWriteFontResource {
+        var out: ?*IDWriteFontResource = null;
+        try check("IDWriteFontFace5.GetFontResource", self.vtable.GetFontResource(self, &out));
+        return out orelse error.DirectWriteFailed;
     }
 };
 
@@ -1540,6 +2209,23 @@ pub const IDWriteColorGlyphRunEnumerator = extern struct {
         /// The layer, owned by the enumerator, valid until the next move.
         GetCurrentRun: *const fn (*IDWriteColorGlyphRunEnumerator, *?*const DWRITE_COLOR_GLYPH_RUN) callconv(cc) HRESULT,
     };
+
+    /// Advances to the next layer; false when there is none.
+    pub fn moveNext(self: *IDWriteColorGlyphRunEnumerator) Error!bool {
+        var has: BOOL = 0;
+        try check("IDWriteColorGlyphRunEnumerator.MoveNext", self.vtable.MoveNext(self, &has));
+        return has != 0;
+    }
+
+    /// The layer, owned by the enumerator, valid until the next move.
+    pub fn getCurrentRun(self: *IDWriteColorGlyphRunEnumerator) Error!*const DWRITE_COLOR_GLYPH_RUN {
+        var out: ?*const DWRITE_COLOR_GLYPH_RUN = null;
+        try check(
+            "IDWriteColorGlyphRunEnumerator.GetCurrentRun",
+            self.vtable.GetCurrentRun(self, &out),
+        );
+        return out orelse error.DirectWriteFailed;
+    }
 };
 
 /// The formats a glyph's image can be in: bit flags, dcommon.h.
@@ -1604,6 +2290,34 @@ pub const IDWriteGlyphRunAnalysis = extern struct {
         ) callconv(cc) HRESULT,
         GetAlphaBlendParams: Slot,
     };
+
+    pub fn getAlphaTextureBounds(
+        self: *IDWriteGlyphRunAnalysis,
+        texture: DWRITE_TEXTURE_TYPE,
+    ) Error!RECT {
+        var bounds: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        try check(
+            "IDWriteGlyphRunAnalysis.GetAlphaTextureBounds",
+            self.vtable.GetAlphaTextureBounds(self, texture, &bounds),
+        );
+        return bounds;
+    }
+
+    /// Fills `buf`, which has to be as large as the bounds hold.
+    pub fn createAlphaTexture(
+        self: *IDWriteGlyphRunAnalysis,
+        texture: DWRITE_TEXTURE_TYPE,
+        bounds: *const RECT,
+        buf: []UINT8,
+    ) Error!void {
+        try check("IDWriteGlyphRunAnalysis.CreateAlphaTexture", self.vtable.CreateAlphaTexture(
+            self,
+            texture,
+            bounds,
+            buf.ptr,
+            @intCast(buf.len),
+        ));
+    }
 };
 
 test "directwrite api: rasterization vtable slot counts" {
