@@ -817,10 +817,26 @@ pub const App = struct {
             break :dpi @ptrCast(@alignCast(p));
         };
 
-        var config = try Config.load(alloc);
+        // As the GTK runtime does: a configuration that fails to load is
+        // recorded as a diagnostic and the defaults are used, which only
+        // fail for OOM, so that Ghostty still starts.
+        var config = Config.load(alloc) catch |err| err: {
+            log.warn("error loading user configuration err={}", .{err});
+            var def: Config = try .default(alloc);
+            errdefer def.deinit();
+            try def.addDiagnosticFmt(
+                "error loading user configuration: {}",
+                .{err},
+            );
+
+            break :err def;
+        };
         errdefer config.deinit();
 
-        try registerClasses(hinstance);
+        registerClasses(hinstance) catch |err| {
+            fatalNotice(err);
+            return err;
+        };
         errdefer unregisterClasses(hinstance);
 
         const msg_hwnd = win32.CreateWindowExW(
@@ -838,6 +854,7 @@ pub const App = struct {
             null,
         ) orelse {
             log.err("failed to create the message-only window", .{});
+            fatalNotice(Error.Win32WindowCreationFailed);
             return Error.Win32WindowCreationFailed;
         };
         errdefer _ = win32.DestroyWindow(msg_hwnd);
@@ -4836,9 +4853,9 @@ fn fatalNotice(err: anyerror) void {
     var buf: [192]u8 = undefined;
     const text = std.fmt.bufPrint(
         &buf,
-        "Ghostty could not create its window: {s}.",
+        "Ghostty could not start: {s}.",
         .{what},
-    ) catch "Ghostty could not create its window.";
+    ) catch "Ghostty could not start.";
     // On the stack, so that OutOfMemory can still be reported. `text` is
     // valid UTF-8 no longer than `buf`, so its UTF-16 fits and cannot fail.
     var wide: [buf.len + 1]u16 = undefined;
