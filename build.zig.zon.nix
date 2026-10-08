@@ -111,10 +111,10 @@
       url = "https://deps.files.ghostty.org/libpng-1220aa013f0c83da3fb64ea6d327f9173fa008d10e28bc9349eac3463457723b1c66.tar.gz";
       hash = "sha256-Mo1M8TuVaoSIb7Hy2u6zgjZ1DKgpmgNmGRP6dGg/aTs=";
     };
-    "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F" = fetchzip {
+    "libxev-0.0.0-86vtczcaFABU5QhThBDbNoT6QbWEsNPbacTLTTXPnmId" = fetchzip {
       name = "libxev";
-      url = "https://deps.files.ghostty.org/libxev-9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz";
-      hash = "sha256-fOU1oxIxfoEgoLuWz7fVX6M+zmqpo7gqZObWiH/aDE0=";
+      url = "https://github.com/Pyre909/libxev/archive/c732e99f5d0c3b67f4c9df60d03e614b8ccec813.tar.gz";
+      hash = "sha256-jPIXofi37Zi3wz0bhW8jn7B3HflsBzCpp0NjIXI3PCE=";
     };
     "N-V-__8AAG3RoQEyRC2Vw7Qoro5SYBf62IHn3HjqtNVY6aWK" = fetchzip {
       name = "libxml2";
