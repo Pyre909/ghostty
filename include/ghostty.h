@@ -567,6 +567,13 @@ typedef struct {
 // any UI framework loads, for example with SetDefaultDllDirectories, or by
 // loading the libghostty DLL with LoadLibraryExW and LOAD_LIBRARY_SEARCH_*
 // flags.
+//
+// Links. A host whose action callback returns false for
+// GHOSTTY_ACTION_OPEN_URL leaves the link to ghostty, which runs System32's
+// rundll32 url.dll,FileProtocolHandler on it, except for an OSC 8 link
+// (GHOSTTY_ACTION_OPEN_URL_KIND_OSC8): that target is program output, and
+// ghostty never opens it. A host that wants OSC 8 links opened handles the
+// action and applies its own policy, as the Win32 runtime does.
 typedef struct {
   void* hwnd;
 } ghostty_platform_windows_s;

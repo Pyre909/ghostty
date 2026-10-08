@@ -64,6 +64,7 @@ test {
     _ = edit;
     _ = i18n;
     _ = mouse;
+    _ = openpkg;
     _ = path;
     _ = uri;
     _ = shell;

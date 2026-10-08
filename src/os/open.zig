@@ -29,9 +29,22 @@ pub fn open(
         if (kind == .osc8) return error.UnsafeOSC8Link;
     }
 
+    // Holds rundll32's absolute path on Windows; see rundll32Path.
+    var rundll32_buf: [rundll32_buf_len]u8 = undefined;
+
     var spawn_opts: std.process.SpawnOptions = switch (builtin.os.tag) {
         .linux, .freebsd => .{ .argv = &.{ "xdg-open", url } },
-        .windows => .{ .argv = &.{ "rundll32", "url.dll,FileProtocolHandler", url } },
+        .windows => switch (kind) {
+            .text, .html, .unknown => .{ .argv = &.{
+                try rundll32Path(
+                    &rundll32_buf,
+                    std.os.windows.getSystemDirectoryWtf16Le(),
+                ),
+                "url.dll,FileProtocolHandler",
+                url,
+            } },
+            .osc8 => unreachable,
+        },
         .macos => switch (kind) {
             .text => .{ .argv = &.{ "open", "-t", url } },
             .html, .unknown => .{ .argv = &.{ "open", url } },
@@ -67,6 +80,50 @@ pub fn open(
 
     const thread = try std.Thread.spawn(.{}, openThread, .{ global.io(), exe });
     thread.detach();
+}
+
+/// The system directory is at most MAX_PATH UTF-16 code units, and each
+/// becomes at most three bytes of WTF-8.
+const rundll32_buf_len = 260 * 3 + "\\rundll32.exe".len;
+
+/// Returns the absolute path of rundll32.exe in `system_dir`, the System32
+/// directory as GetSystemDirectoryW reports it (std reads it from the same
+/// process data, not from %SystemRoot%, which the environment can change).
+/// A bare "rundll32" would be searched for in the current directory before
+/// PATH, with every PATHEXT extension (.bat and .cmd among them), and the
+/// current directory of a libghostty host may be one an attacker can write
+/// to. std's own cmd.exe path for .bat scripts is built the same way.
+fn rundll32Path(
+    buf: []u8,
+    system_dir: []const u16,
+) error{NameTooLong}![]const u8 {
+    const suffix = "\\rundll32.exe";
+    const dir = std.mem.trimEnd(u16, system_dir, &.{ '/', '\\' });
+    if (std.unicode.calcWtf8Len(dir) + suffix.len > buf.len) return error.NameTooLong;
+    const len = std.unicode.wtf16LeToWtf8(buf, dir);
+    @memcpy(buf[len..][0..suffix.len], suffix);
+    return buf[0 .. len + suffix.len];
+}
+
+test "rundll32Path is absolute in the system directory" {
+    const testing = std.testing;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    var buf: [rundll32_buf_len]u8 = undefined;
+    for ([_][]const u16{
+        L("C:\\WINDOWS\\system32"),
+        L("C:\\WINDOWS\\system32\\"),
+    }) |dir| {
+        const path = try rundll32Path(&buf, dir);
+        try testing.expect(std.fs.path.isAbsoluteWindows(path));
+        try testing.expectEqualStrings("C:\\WINDOWS\\system32\\rundll32.exe", path);
+    }
+
+    var small: [8]u8 = undefined;
+    try testing.expectError(
+        error.NameTooLong,
+        rundll32Path(&small, L("C:\\WINDOWS\\system32")),
+    );
 }
 
 test "macOS and Windows OSC 8 links have no generic opener fallback" {
