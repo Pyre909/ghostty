@@ -629,7 +629,7 @@ pub const IDXGIFactory1 = extern struct {
     pub const VTable = extern struct {
         base: IDXGIFactory.VTable,
         EnumAdapters1: Slot,
-        IsCurrent: Slot,
+        IsCurrent: *const fn (*IDXGIFactory1) callconv(cc) BOOL,
     };
 };
 
@@ -663,6 +663,12 @@ pub const IDXGIFactory2 = extern struct {
 
     pub fn makeWindowAssociation(self: *IDXGIFactory2, hwnd: HWND, flags: UINT) HRESULT {
         return self.vtable.base.base.MakeWindowAssociation(@ptrCast(self), hwnd, flags);
+    }
+
+    /// False once the adapters the factory enumerated have changed, as
+    /// when a GPU or its driver is added or removed.
+    pub fn isCurrent(self: *IDXGIFactory2) bool {
+        return self.vtable.base.IsCurrent(@ptrCast(self)) != 0;
     }
 };
 

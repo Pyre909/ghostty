@@ -1102,11 +1102,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// custom shader animation wants continuous draw-only wakes
         /// at draw_interval_ms while active, and a running Kitty
         /// graphics animation wants an update wake when its next
-        /// frame is due. The renderer thread drives its animation
-        /// timer off this, re-querying after every wake.
+        /// frame is due. A graphics API that lost its device wants a
+        /// draw wake when it may next try to replace it. The renderer
+        /// thread drives its animation timer off this, re-querying
+        /// after every wake.
         ///
         /// Must be called on the render thread.
         pub fn animationWake(self: *const Self) ?AnimationWake {
+            // A lost device is replaced at the start of a frame (see
+            // drawFrameLocked), and an idle surface may not draw one
+            // for a long time. Nothing else can be drawn until then.
+            if (comptime @hasDecl(GraphicsAPI, "recoveryDelayMs")) {
+                if (self.api.recoveryDelayMs()) |delay| return .{
+                    .delay_ms = @max(delay, draw_interval_ms),
+                    .kind = .draw,
+                };
+            }
+
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
             const shader_delay: ?u64 = shader: {

@@ -18,10 +18,14 @@
 //! The target cannot be the back buffer itself: on resize the generic
 //! renderer creates the new target before it drops the old one.
 //!
-//! A lost device (a GPU reset, a driver update) is reported by Present and
-//! latched. The generic renderer then releases what it created on the
-//! device and `recoverDevice` creates a new one for the same window, after
-//! which everything is rebuilt lazily, as after an unrealize.
+//! A lost device (a GPU reset, a driver update) is latched when Present
+//! reports it, or at the end of any frame it failed some other way first.
+//! The generic renderer then releases what it created on the device and
+//! `recoverDevice` creates a new one for the same window, after which
+//! everything is rebuilt lazily, as after an unrealize. A device on the
+//! software rasterizer is replaced the same way once the adapters change,
+//! so a surface that recovered onto it while a driver was being replaced
+//! moves back to the GPU when the driver returns.
 //!
 //! This is the Windows renderer: every pipeline the other backends draw is
 //! here, custom shaders included.
@@ -35,6 +39,7 @@ const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const internal_os = @import("../os/main.zig");
+const global = @import("../global.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(D3D11);
 const shadertoy = @import("shadertoy.zig");
@@ -66,9 +71,9 @@ pub const swap_chain_count = 1;
 /// Direct3D 11 textures are at most this wide or high.
 const max_texture_dimension: u32 = 16384;
 
-/// Frames to let pass between recovery attempts after one failed, so a
-/// GPU that stays gone is not asked for a device on every wakeup.
-const recovery_backoff_frames: u8 = 16;
+/// Time to let pass between recovery attempts after one failed, so a GPU
+/// that stays gone is not asked for a device on every frame.
+const recovery_retry_ms: i64 = 1000;
 
 /// Stale frames dropped in a row before `present` warns that the window's
 /// size is not being reported. A drag drops a few at a time, each followed
@@ -139,8 +144,12 @@ vsync: bool,
 /// creating.
 released: bool = false,
 
-/// Frames still to wait before the next recovery attempt.
-recovery_backoff: u8 = 0,
+/// When the next recovery attempt may run.
+recovery: Recovery = .{},
+
+/// The factory that made the device's adapter, kept only while that
+/// adapter is the software rasterizer, to learn when the adapters change.
+software_factory: ?*api.IDXGIFactory2 = null,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -216,6 +225,37 @@ const StaleFrames = struct {
     }
 };
 
+/// When `recoverDevice` may next try to create a device. The deadline is
+/// on the `.awake` clock, so time spent asleep counts toward it.
+const Recovery = struct {
+    /// Null until an attempt failed: the first one runs at once.
+    retry_at: ?std.Io.Timestamp = null,
+
+    /// Milliseconds until the next attempt may run, rounded up so that a
+    /// wake after this many finds the deadline passed.
+    fn delayMs(self: Recovery, now: std.Io.Timestamp) u64 {
+        const at = self.retry_at orelse return 0;
+        const ns = now.durationTo(at).nanoseconds;
+        if (ns <= 0) return 0;
+        return @intCast(@divFloor(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+
+    fn failed(self: *Recovery, now: std.Io.Timestamp) void {
+        self.retry_at = now.addDuration(.fromMilliseconds(recovery_retry_ms));
+    }
+
+    fn succeeded(self: *Recovery) void {
+        self.retry_at = null;
+    }
+};
+
+/// Whether an adapter is the Microsoft Basic Render Driver, the software
+/// rasterizer behind both the WARP driver type and a hardware request
+/// made while no GPU driver is loaded.
+fn isSoftwareAdapter(desc: *const api.DXGI_ADAPTER_DESC) bool {
+    return desc.VendorId == 0x1414 and desc.DeviceId == 0x8c;
+}
+
 /// The device is the app's, which holds nothing for Direct3D 11, see
 /// `Device`: the renderer creates its own device for its window.
 pub fn init(
@@ -272,6 +312,7 @@ const Gpu = struct {
     sync_interval: api.UINT,
     present_flags: api.UINT,
     info_queue: ?*api.ID3D11InfoQueue,
+    software_factory: ?*api.IDXGIFactory2,
 };
 
 fn adopt(self: *D3D11, gpu: Gpu) void {
@@ -283,6 +324,7 @@ fn adopt(self: *D3D11, gpu: Gpu) void {
     self.sync_interval = gpu.sync_interval;
     self.present_flags = gpu.present_flags;
     self.info_queue = gpu.info_queue;
+    self.software_factory = gpu.software_factory;
     self.released = false;
 }
 
@@ -303,6 +345,7 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     var device_ptr: ?*api.ID3D11Device = null;
     var context_ptr: ?*api.ID3D11DeviceContext = null;
     var level: api.D3D_FEATURE_LEVEL = undefined;
+    var warp = false;
     var hr = win32.D3D11CreateDevice(
         null,
         .HARDWARE,
@@ -339,6 +382,7 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     // the adapter line below then names the Microsoft Basic Render Driver.
     if (api.failed(hr)) {
         log.warn("D3D11CreateDevice on the hardware adapter failed hr=0x{x}; trying WARP", .{@as(u32, @bitCast(hr))});
+        warp = true;
         hr = win32.D3D11CreateDevice(
             null,
             .WARP,
@@ -384,13 +428,23 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
         return error.D3D11DeviceFailed;
     };
     defer api.release(adapter_obj);
-    logAdapter(adapter_obj, level);
+    var adapter_desc: api.DXGI_ADAPTER_DESC = undefined;
+    const described = api.succeeded(adapter_obj.vtable.GetDesc(adapter_obj, &adapter_desc));
+    logAdapter(if (described) &adapter_desc else null, level);
 
     const factory = adapter_obj.getParent(api.IDXGIFactory2) catch {
         log.err("adapter has no IDXGIFactory2 parent; DXGI 1.2 is required", .{});
         return error.D3D11DeviceFailed;
     };
-    defer api.release(factory);
+
+    // A software device may only be standing in for a GPU whose driver is
+    // being replaced, and it is never removed when that driver returns.
+    // Its factory is kept to ask, every frame, whether the adapters have
+    // changed since (see `drawFrameStart`); any other device lets it go.
+    const software = warp or (described and isSoftwareAdapter(&adapter_desc));
+    const software_factory: ?*api.IDXGIFactory2 = if (software) factory else null;
+    defer if (!software) api.release(factory);
+    errdefer if (software_factory) |f| api.release(f);
 
     // `window-vsync = false` presents without waiting for a vblank. In
     // windowed flip model only tearing unlocks the rate, and DXGI must
@@ -484,6 +538,7 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
         .sync_interval = sync_interval,
         .present_flags = present_flags,
         .info_queue = info_queue,
+        .software_factory = software_factory,
     };
 }
 
@@ -513,12 +568,11 @@ fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
     return @ptrCast(@alignCast(proc));
 }
 
-fn logAdapter(adapter: *api.IDXGIAdapter, level: api.D3D_FEATURE_LEVEL) void {
-    var desc: api.DXGI_ADAPTER_DESC = undefined;
-    if (api.failed(adapter.vtable.GetDesc(adapter, &desc))) {
+fn logAdapter(adapter_desc: ?*const api.DXGI_ADAPTER_DESC, level: api.D3D_FEATURE_LEVEL) void {
+    const desc = adapter_desc orelse {
         log.info("D3D11 device feature_level=0x{x} (adapter description unavailable)", .{@intFromEnum(level)});
         return;
-    }
+    };
     const len = std.mem.indexOfScalar(u16, &desc.Description, 0) orelse desc.Description.len;
     var name_buf: [desc.Description.len * 3]u8 = undefined;
     const name: []const u8 = if (std.unicode.utf16LeToUtf8(&name_buf, desc.Description[0..len])) |n|
@@ -553,6 +607,7 @@ fn releaseGpu(self: *D3D11) void {
     api.release(self.swap_chain);
     api.release(self.context);
     if (self.info_queue) |q| api.release(q);
+    if (self.software_factory) |f| api.release(f);
     api.release(self.device);
 }
 
@@ -563,35 +618,60 @@ pub fn deviceLost(self: *const D3D11) bool {
     return self.lost;
 }
 
+/// Milliseconds until `recoverDevice` would try to replace a lost device,
+/// zero if the next frame would, or null while the device is healthy. The
+/// generic renderer's animationWake schedules a frame by it, since nothing
+/// else draws an idle surface. That runs on the render thread without the
+/// draw mutex, which a frame drawn on another thread holds while it writes
+/// this state; a stale answer only moves one wake.
+pub fn recoveryDelayMs(self: *const D3D11) ?u64 {
+    if (!self.lost) return null;
+    return self.recovery.delayMs(.now(global.io(), .awake));
+}
+
 /// Replace a lost device: release it with everything created on it, and
 /// create them again for the same window. Under the draw mutex, on the
 /// thread drawing the frame, after the generic renderer released its own
 /// resources. On failure the device stays lost, the caller draws nothing,
-/// and a later frame tries again once the backoff has passed.
+/// and the first frame after `recovery_retry_ms` tries again.
 pub fn recoverDevice(self: *D3D11) !void {
     assert(self.lost);
     self.releaseGpu();
-    if (self.recovery_backoff > 0) {
-        self.recovery_backoff -= 1;
-        return error.DeviceLost;
-    }
+    const now: std.Io.Timestamp = .now(global.io(), .awake);
+    if (self.recovery.delayMs(now) > 0) return error.DeviceLost;
     const gpu = createGpu(self.hwnd, self.vsync) catch |err| {
-        self.recovery_backoff = recovery_backoff_frames;
-        log.err("D3D11 device recovery failed err={}; retrying later", .{err});
+        self.recovery.failed(now);
+        log.err("D3D11 device recovery failed err={}; retrying in {d}ms", .{ err, recovery_retry_ms });
         return err;
     };
     self.adopt(gpu);
+    self.recovery.succeeded();
     self.lost = false;
     log.info("D3D11 device recovered hwnd={x}", .{@intFromPtr(self.hwnd)});
 }
 
-/// Nothing to bracket a frame with; kept for the contract.
+/// A device on the software rasterizer is given up once the adapters
+/// change, so that the generic renderer, which asks `deviceLost` next,
+/// replaces it with one on the GPU that arrived. If none did, the
+/// replacement is software again and its own factory is current.
 pub fn drawFrameStart(self: *D3D11) void {
-    _ = self;
+    if (self.lost) return;
+    const factory = self.software_factory orelse return;
+    if (factory.isCurrent()) return;
+    log.info("graphics adapters changed; replacing the software device hwnd={x}", .{@intFromPtr(self.hwnd)});
+    self.lost = true;
 }
 
+/// A removed device fails every object created on it, so a frame that
+/// had to create one (a resize, a larger buffer, a new atlas) fails
+/// before `present` can see the removal. Ask the device itself at the end
+/// of every frame, however it ended, so the next one recovers.
 pub fn drawFrameEnd(self: *D3D11) void {
-    _ = self;
+    if (self.lost) return;
+    const reason = self.device.vtable.GetDeviceRemovedReason(self.device);
+    if (api.succeeded(reason)) return;
+    log.err("D3D11 device lost reason=0x{x}", .{@as(u32, @bitCast(reason))});
+    self.lost = true;
 }
 
 /// The `.resize` message is the only way the apprt's size reaches this
@@ -966,4 +1046,44 @@ test "d3d11: a client area larger than a texture matches the clamped target" {
         try testing.expectEqual(.present, stale.frame(20000, 600, max_texture_dimension, 600));
         try testing.expectEqual(.present, stale.frame(800, 20000, 800, max_texture_dimension));
     }
+}
+
+test "d3d11: a failed recovery waits for time to pass, not for frames" {
+    const testing = std.testing;
+    const ms = std.time.ns_per_ms;
+    const t0: std.Io.Timestamp = .fromNanoseconds(5_000 * ms);
+
+    // The first attempt runs at once.
+    var recovery: Recovery = .{};
+    try testing.expectEqual(0, recovery.delayMs(t0));
+
+    // After a failure, however many frames ask, the next attempt waits
+    // for the clock, and the wait shrinks as it runs.
+    recovery.failed(t0);
+    for (0..100) |_| try testing.expectEqual(@as(u64, recovery_retry_ms), recovery.delayMs(t0));
+    try testing.expectEqual(600, recovery.delayMs(.fromNanoseconds(5_400 * ms)));
+    try testing.expectEqual(1, recovery.delayMs(.fromNanoseconds(5_999 * ms + 1)));
+    try testing.expectEqual(0, recovery.delayMs(.fromNanoseconds(6_000 * ms)));
+    try testing.expectEqual(0, recovery.delayMs(.fromNanoseconds(60_000 * ms)));
+
+    // A success forgets the deadline.
+    recovery.failed(t0);
+    recovery.succeeded();
+    try testing.expectEqual(0, recovery.delayMs(t0));
+}
+
+test "d3d11: only the Basic Render Driver is a software adapter" {
+    const testing = std.testing;
+    var desc = std.mem.zeroes(api.DXGI_ADAPTER_DESC);
+
+    desc.VendorId = 0x1414;
+    desc.DeviceId = 0x8c;
+    try testing.expect(isSoftwareAdapter(&desc));
+
+    // Another Microsoft device is not, nor is another vendor's.
+    desc.DeviceId = 0x8d;
+    try testing.expect(!isSoftwareAdapter(&desc));
+    desc.VendorId = 0x10de;
+    desc.DeviceId = 0x8c;
+    try testing.expect(!isSoftwareAdapter(&desc));
 }
