@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const objc = @import("objc");
+const windows = @import("windows.zig");
 
 const log = std.log.scoped(.os);
 
@@ -20,6 +21,14 @@ pub fn clickInterval() ?u32 {
             break :macos ms;
         },
 
+        // Already in milliseconds.
+        .windows => windows.exp.user32.GetDoubleClickTime(),
+
         else => null,
     };
+}
+
+test "clickInterval follows the Windows double-click time" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expectEqual(windows.exp.user32.GetDoubleClickTime(), clickInterval());
 }

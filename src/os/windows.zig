@@ -336,6 +336,8 @@ pub const exp = struct {
             hWnd: HWND,
             lpRect: *RECT,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdoubleclicktime
+        pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) UINT;
     };
     pub const ntdll = struct {
         pub extern "ntdll" fn NtCreateFile(

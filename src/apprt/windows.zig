@@ -257,6 +257,12 @@ const win32 = struct {
     const XBUTTON2: u16 = 0x0002;
     /// One wheel notch. High-resolution wheels send fractions of it.
     const WHEEL_DELTA: i32 = 120;
+    /// SystemParametersInfoW: lines (vertical) and characters (horizontal)
+    /// to scroll per notch, both 3 by default. Lines can instead be
+    /// WHEEL_PAGESCROLL, "one screen at a time".
+    const SPI_GETWHEELSCROLLLINES: UINT = 0x0068;
+    const SPI_GETWHEELSCROLLCHARS: UINT = 0x006C;
+    const WHEEL_PAGESCROLL: UINT = std.math.maxInt(UINT);
     const TME_LEAVE: DWORD = 0x00000002;
     /// The client-area hit-test code (WM_NCHITTEST), which is the low word
     /// of WM_MOUSEACTIVATE's and WM_SETCURSOR's lParam.
@@ -444,6 +450,12 @@ const win32 = struct {
     extern "user32" fn TrackMouseEvent(tme: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
     extern "user32" fn WindowFromPoint(pt: POINT) callconv(.winapi) ?HWND;
     extern "user32" fn ScreenToClient(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
+    extern "user32" fn SystemParametersInfoW(
+        action: UINT,
+        param: UINT,
+        value: ?*anyopaque,
+        win_ini: UINT,
+    ) callconv(.winapi) BOOL;
     extern "user32" fn SetWindowTextW(hwnd: HWND, text: LPCWSTR) callconv(.winapi) BOOL;
     extern "user32" fn SetWindowPos(
         hwnd: HWND,
@@ -1980,26 +1992,39 @@ pub const Surface = struct {
             }
         };
 
-        /// Whole notches out of wheel deltas.
+        /// Whole core scroll ticks out of wheel deltas.
         ///
-        /// The core cannot take fractions of a notch
+        /// A notch (WHEEL_DELTA) scrolls the system's lines per notch, or
+        /// characters per notch for the horizontal wheel (`wheelSetting`).
+        /// Windows' default of 3 is one tick, which the default
+        /// mouse-scroll-multiplier also scrolls as 3 rows
+        /// (`Surface.scrollCallback`), and other settings scale the ticks:
+        /// 6 is two ticks a notch, 1 is one tick every third notch.
+        ///
+        /// The core cannot take fractions of a tick
         /// (`Surface.scrollCallback`): for x it rounds each event and keeps
         /// no remainder, and for y it drops the remainder whenever an event
         /// crosses a row (it stores `poff - amount * cell_size` with the
-        /// untruncated `amount`). A high-resolution wheel's small deltas
-        /// would lose rows either way, so only whole notches are passed on.
-        /// A change of direction drops the remainder, so a reversal counts
-        /// from its own first delta.
+        /// untruncated `amount`). A high-resolution wheel's small deltas, and
+        /// settings that are not a multiple of 3, would lose rows either
+        /// way, so only whole ticks are passed on. A change of direction
+        /// drops the remainder, so a reversal counts from its own first
+        /// delta.
         const Notches = struct {
-            rem: i32 = 0,
+            /// In 1/WHEEL_DELTA of a line (or character).
+            rem: i64 = 0,
 
-            fn add(self: *Notches, delta: i32) ?i32 {
-                if (delta == 0) return null;
+            /// Windows' default lines and characters per notch.
+            const per_tick = 3;
+
+            fn add(self: *Notches, delta: i32, per_notch: u32) ?i64 {
+                if (delta == 0 or per_notch == 0) return null;
                 if (self.rem != 0 and (self.rem < 0) != (delta < 0)) self.rem = 0;
-                self.rem += delta;
-                const whole = @divTrunc(self.rem, win32.WHEEL_DELTA);
+                self.rem += @as(i64, delta) * per_notch;
+                const tick = win32.WHEEL_DELTA * per_tick;
+                const whole = @divTrunc(self.rem, tick);
                 if (whole == 0) return null;
-                self.rem -= whole * win32.WHEEL_DELTA;
+                self.rem -= whole * tick;
                 return whole;
             }
         };
@@ -2962,13 +2987,7 @@ pub const Surface = struct {
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 if (!self.syncMouse(core_surface, Mouse.Button.downIn(wparam))) return 0;
-
-                // Arm leave tracking on entry, but not during a drag: the
-                // pointer may be outside then, and arming there posts a
-                // WM_MOUSELEAVE at once, on every move. The final release
-                // arms it instead (mouseButton).
-                if (!self.mouse.tracking and self.mouse.held.count() == 0) self.trackLeave();
-
+                self.armLeave();
                 self.movePointer(core_surface, clientPos(lparam), self.mouseMods(wparam));
                 return 0;
             },
@@ -3022,7 +3041,9 @@ pub const Surface = struct {
                 // a handled X button must return TRUE; for WM_RBUTTONUP its
                 // only default is WM_CONTEXTMENU, and there is no menu. The
                 // class has no CS_DBLCLKS, so no *BUTTONDBLCLK arrives: the
-                // core counts clicks itself.
+                // core counts clicks itself, within click-repeat-interval,
+                // which defaults to the system double-click time
+                // (`internal_os.clickInterval`).
                 const is_x = msg == win32.WM_XBUTTONDOWN or msg == win32.WM_XBUTTONUP;
                 return @intFromBool(is_x);
             },
@@ -3032,32 +3053,55 @@ pub const Surface = struct {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 if (!self.syncMouse(core_surface, Mouse.Button.downIn(wparam))) return 0;
 
-                // The core reads the report position from getCursorPos. When
-                // the pointer is over this client area, refresh the cache from
-                // the message first: after a capture loss it says `outside`
-                // until the next move, and reports there would be dropped.
-                // Otherwise (the wheel routed by focus while the pointer is
-                // elsewhere, or covered) the cache stays, `outside` after a
-                // leave.
-                if (self.wheelPoint(lparam)) |pos| {
-                    if (!self.mouse.tracking and self.mouse.held.count() == 0) self.trackLeave();
-                    self.movePointer(core_surface, pos, self.mouseMods(wparam));
+                // Programs with mouse reporting get the wheel at the
+                // position getCursorPos returns, and drop a report at
+                // `outside` (`mouse_encode.encode`), while without reporting
+                // the same wheel scrolls the viewport. When the pointer is
+                // over this client area the message is a move like any
+                // other: after a capture loss the cache says `outside` until
+                // the next move. Otherwise (the pointer is over the frame, or
+                // elsewhere and the wheel came by focus) the report goes to
+                // the nearest client cell for this message only. That is not
+                // a move, so link hover and the leave stand.
+                var kept: ?apprt.CursorPos = null;
+                defer if (kept) |pos| {
+                    self.mouse.pos = pos;
+                };
+                if (self.wheelPoint(lparam)) |point| {
+                    if (point.over) {
+                        self.armLeave();
+                        self.movePointer(core_surface, point.pos, self.mouseMods(wparam));
+                    } else {
+                        kept = self.mouse.pos;
+                        self.mouse.pos = point.pos;
+                    }
                 }
 
                 const delta: i32 = win32.wheelDelta(wparam);
                 if (msg == win32.WM_MOUSEWHEEL) {
+                    // "One screen at a time" is as many lines as the screen
+                    // has rows.
+                    const lines = wheelSetting(win32.SPI_GETWHEELSCROLLLINES);
+                    const per_notch: u32 = if (lines == win32.WHEEL_PAGESCROLL)
+                        core_surface.size.grid().rows
+                    else
+                        lines;
+
                     // Positive is away from the user: the core's "up"
                     // (`Surface.scrollCallback`'s doc comment).
-                    if (self.mouse.wheel_y.add(delta)) |notches| {
-                        core_surface.scrollCallback(0, @floatFromInt(notches), .{}) catch |err|
+                    if (self.mouse.wheel_y.add(delta, per_notch)) |ticks| {
+                        core_surface.scrollCallback(0, @floatFromInt(ticks), .{}) catch |err|
                             log.warn("scroll callback failed err={}", .{err});
                     }
-                } else if (self.mouse.wheel_x.add(delta)) |notches| {
+                } else if (self.mouse.wheel_x.add(
+                    delta,
+                    wheelSetting(win32.SPI_GETWHEELSCROLLCHARS),
+                )) |ticks| {
                     // Positive is to the right here. The core's positive x
                     // is reported as button 6, X11's scroll-left
                     // (`Surface.scrollCallback`), and GTK negates its
                     // rightward delta to match; so does this.
-                    core_surface.scrollCallback(@floatFromInt(-notches), 0, .{}) catch |err|
+                    core_surface.scrollCallback(@floatFromInt(-ticks), 0, .{}) catch |err|
                         log.warn("scroll callback failed err={}", .{err});
                 }
                 return 0;
@@ -3684,19 +3728,25 @@ pub const Surface = struct {
         return true;
     }
 
-    /// The client position of a wheel message's screen point, if the pointer
-    /// is over this window's client area and nothing covers it there.
-    fn wheelPoint(self: *const Surface, lparam: win32.LPARAM) ?apprt.CursorPos {
-        var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
-        const under = win32.WindowFromPoint(pt) orelse return null;
-        if (under != self.hwnd) return null;
+    /// A wheel message's screen point as a client position, clamped into
+    /// the client area, and whether the pointer is over this window's
+    /// client area with nothing covering it there. Null only if Win32
+    /// cannot say.
+    fn wheelPoint(self: *const Surface, lparam: win32.LPARAM) ?struct {
+        pos: apprt.CursorPos,
+        over: bool,
+    } {
+        const screen: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+        var pt = screen;
         if (!win32.ScreenToClient(self.hwnd, &pt).toBool()) return null;
         var rect: win32.RECT = undefined;
         if (!win32.GetClientRect(self.hwnd, &rect).toBool()) return null;
-        if (pt.x < rect.left or pt.y < rect.top or pt.x >= rect.right or pt.y >= rect.bottom) {
-            return null;
-        }
-        return .{ .x = @floatFromInt(pt.x), .y = @floatFromInt(pt.y) };
+        const in = clampToRect(pt, rect);
+        const under = win32.WindowFromPoint(screen);
+        return .{
+            .pos = .{ .x = @floatFromInt(in.x), .y = @floatFromInt(in.y) },
+            .over = in.x == pt.x and in.y == pt.y and under == self.hwnd,
+        };
     }
 
     /// Give the core a real pointer position, unless it already has it.
@@ -3787,6 +3837,15 @@ pub const Surface = struct {
             // is the tracking the drag skipped.
             self.trackLeave();
         }
+    }
+
+    /// Arm leave tracking when the pointer comes over the client area, but
+    /// not during a drag: the pointer may be outside then, and arming there
+    /// posts a WM_MOUSELEAVE at once, on every move. The final release arms
+    /// it instead (mouseButton).
+    fn armLeave(self: *Surface) void {
+        if (self.mouse.tracking or self.mouse.held.count() != 0) return;
+        self.trackLeave();
     }
 
     /// Ask for WM_MOUSELEAVE when the pointer leaves the client area.
@@ -4040,6 +4099,30 @@ fn clientPos(lparam: win32.LPARAM) apprt.CursorPos {
         .x = @floatFromInt(win32.xLparam(lparam)),
         .y = @floatFromInt(win32.yLparam(lparam)),
     };
+}
+
+/// The point of `rect` nearest to `pt`. A RECT excludes its right and bottom
+/// edges; an empty one gives its top-left corner.
+fn clampToRect(pt: win32.POINT, rect: win32.RECT) win32.POINT {
+    return .{
+        .x = @max(rect.left, @min(pt.x, rect.right - 1)),
+        .y = @max(rect.top, @min(pt.y, rect.bottom - 1)),
+    };
+}
+
+/// SPI_GETWHEELSCROLLLINES or SPI_GETWHEELSCROLLCHARS, read for every wheel
+/// message so a change in Settings applies at once without tracking
+/// WM_SETTINGCHANGE. Windows' default if the call fails.
+fn wheelSetting(action: win32.UINT) u32 {
+    var value: win32.UINT = Surface.Mouse.Notches.per_tick;
+    if (!win32.SystemParametersInfoW(action, 0, &value, 0).toBool()) {
+        log.warn("SystemParametersInfoW failed action=0x{x} err={}", .{
+            action,
+            std.os.windows.GetLastError(),
+        });
+        return Surface.Mouse.Notches.per_tick;
+    }
+    return value;
 }
 
 /// The stock cursor for a W3C cursor shape. Win32 has no cell,
@@ -4805,8 +4888,8 @@ test "win32: wheel deltas add up to whole notches" {
     for (cases) |deltas| {
         for ([_]i32{ 1, -1 }) |sign| {
             var n: Surface.Mouse.Notches = .{};
-            var total: i32 = 0;
-            for (deltas) |d| total += n.add(sign * d) orelse 0;
+            var total: i64 = 0;
+            for (deltas) |d| total += n.add(sign * d, 3) orelse 0;
             try std.testing.expectEqual(3 * sign, total);
             try std.testing.expectEqual(0, n.rem);
         }
@@ -4814,8 +4897,48 @@ test "win32: wheel deltas add up to whole notches" {
 
     // A reversal is not absorbed by the other direction's remainder.
     var n: Surface.Mouse.Notches = .{};
-    try std.testing.expectEqual(null, n.add(60));
-    try std.testing.expectEqual(-1, n.add(-120));
+    try std.testing.expectEqual(null, n.add(60, 3));
+    try std.testing.expectEqual(-1, n.add(-120, 3));
+}
+
+test "win32: wheel ticks follow the lines to scroll per notch" {
+    const Case = struct { per_notch: u32, ticks: []const ?i64 };
+    const cases = [_]Case{
+        // A tick is three lines, so these scroll 1, 6 and 10 per notch.
+        .{ .per_notch = 1, .ticks = &.{ null, null, 1 } },
+        .{ .per_notch = 6, .ticks = &.{ 2, 2 } },
+        .{ .per_notch = 10, .ticks = &.{ 3, 3, 4 } },
+        // Zero turns the wheel off.
+        .{ .per_notch = 0, .ticks = &.{ null, null, null } },
+    };
+    for (cases) |c| {
+        var n: Surface.Mouse.Notches = .{};
+        for (c.ticks) |ticks| try std.testing.expectEqual(ticks, n.add(120, c.per_notch));
+        try std.testing.expectEqual(0, n.rem);
+    }
+
+    // A screen's worth of lines, or any other UINT, does not overflow.
+    var n: Surface.Mouse.Notches = .{};
+    try std.testing.expectEqual(1_431_655_764, n.add(120, std.math.maxInt(u32) - 1).?);
+}
+
+test "win32: wheel points off the client area clamp to its edge" {
+    const rect: win32.RECT = .{ .left = 0, .top = 0, .right = 800, .bottom = 600 };
+    const Case = struct { pt: win32.POINT, in: win32.POINT };
+    const cases = [_]Case{
+        .{ .pt = .{ .x = 10, .y = 20 }, .in = .{ .x = 10, .y = 20 } },
+        // The caption and the left border: above and left of the client.
+        .{ .pt = .{ .x = 300, .y = -15 }, .in = .{ .x = 300, .y = 0 } },
+        .{ .pt = .{ .x = -4, .y = 200 }, .in = .{ .x = 0, .y = 200 } },
+        // Right and bottom are outside the RECT.
+        .{ .pt = .{ .x = 800, .y = 600 }, .in = .{ .x = 799, .y = 599 } },
+        .{ .pt = .{ .x = 5000, .y = -5000 }, .in = .{ .x = 799, .y = 0 } },
+    };
+    for (cases) |c| try std.testing.expectEqual(c.in, clampToRect(c.pt, rect));
+
+    // A minimized window's empty client area.
+    const empty: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    try std.testing.expectEqual(win32.POINT{ .x = 0, .y = 0 }, clampToRect(.{ .x = 9, .y = -9 }, empty));
 }
 
 test "win32: mouse message button bits" {

@@ -63,6 +63,7 @@ test {
     _ = stderr;
     _ = edit;
     _ = i18n;
+    _ = mouse;
     _ = path;
     _ = uri;
     _ = shell;
