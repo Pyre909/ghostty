@@ -312,6 +312,10 @@ pub const exp = struct {
             cchFilePath: DWORD,
             dwFlags: DWORD,
         ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlew
+        pub extern "kernel32" fn GetModuleHandleW(
+            lpModuleName: ?LPCWSTR,
+        ) callconv(.winapi) ?HMODULE;
         /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandleexw
         pub extern "kernel32" fn GetModuleHandleExW(
             dwFlags: DWORD,

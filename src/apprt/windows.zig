@@ -48,7 +48,6 @@
 //! (`Surface.imePlace`). See `Surface.Ime`.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const apprt = @import("../apprt.zig");
@@ -85,9 +84,8 @@ const win32 = struct {
 
     const BOOL = w.BOOL;
     const BYTE = w.BYTE;
-    const WORD = w.WORD;
     const DWORD = w.DWORD;
-    const HRESULT = c_long;
+    const HRESULT = internal_os.windows.HRESULT;
     const UINT = w.UINT;
     const LONG = w.LONG;
     const WCHAR = w.WCHAR;
@@ -103,14 +101,15 @@ const win32 = struct {
     const HMENU = w.HMENU;
     const ATOM = w.ATOM;
 
-    /// Not in std: the message-parameter and return types. On both 32- and
-    /// 64-bit Windows these are pointer-sized, unsigned for WPARAM and signed
-    /// for LPARAM/LRESULT.
+    const LPARAM = w.LPARAM;
+    const LONG_PTR = w.LONG_PTR;
+
+    /// Not in std: WPARAM, LRESULT, UINT_PTR and HGLOBAL. WPARAM and
+    /// LRESULT are pointer-sized like LPARAM, unsigned for WPARAM and
+    /// signed for LRESULT.
     const WPARAM = usize;
-    const LPARAM = isize;
     const LRESULT = isize;
     const UINT_PTR = usize;
-    const LONG_PTR = isize;
     const HGLOBAL = *anyopaque;
     const SHORT = w.SHORT;
 
@@ -300,12 +299,13 @@ const win32 = struct {
     /// the pending dead key. Honored from Windows 10 1607.
     const TOUNICODE_NO_STATE_CHANGE: UINT = 0x4;
 
-    // MsgWaitForMultipleObjectsEx.
-    const QS_ALLINPUT: DWORD = 0x04FF;
+    // MsgWaitForMultipleObjectsEx. Since Windows 8, winuser.h includes
+    // QS_TOUCH and QS_POINTER in QS_INPUT (0x04FF is the older value);
+    // without them pen and touch input does not end the wait.
+    const QS_TOUCH: DWORD = 0x0800;
+    const QS_POINTER: DWORD = 0x1000;
+    const QS_ALLINPUT: DWORD = 0x04FF | QS_TOUCH | QS_POINTER;
     const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
-    const WAIT_OBJECT_0: DWORD = 0x00000000;
-    const WAIT_TIMEOUT: DWORD = 0x00000102;
-    const WAIT_FAILED: DWORD = 0xFFFFFFFF;
 
     const SWP_NOZORDER: UINT = 0x0004;
     const SWP_NOACTIVATE: UINT = 0x0010;
@@ -365,7 +365,8 @@ const win32 = struct {
     const GetThreadDpiAwarenessContextFn = *const fn () callconv(.winapi) ?HANDLE;
     const AreDpiAwarenessContextsEqualFn = *const fn (a: HANDLE, b: HANDLE) callconv(.winapi) BOOL;
 
-    extern "kernel32" fn GetModuleHandleW(name: ?LPCWSTR) callconv(.winapi) ?HMODULE;
+    const GetLastError = internal_os.windows.GetLastError;
+    const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
     const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
     extern "kernel32" fn GlobalAlloc(flags: UINT, bytes: usize) callconv(.winapi) ?HGLOBAL;
     extern "kernel32" fn GlobalFree(mem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
@@ -431,12 +432,27 @@ const win32 = struct {
         lparam: LPARAM,
     ) callconv(.winapi) BOOL;
     extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
-    extern "user32" fn SetWindowLongPtrW(
-        hwnd: HWND,
-        index: c_int,
-        value: LONG_PTR,
-    ) callconv(.winapi) LONG_PTR;
-    extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) LONG_PTR;
+    /// user32 exports the LONG_PTR forms only on 64-bit Windows. On 32-bit,
+    /// winuser.h defines them as the LONG forms, which have the same
+    /// signature there because LONG_PTR is LONG.
+    const SetWindowLongPtrW = if (@sizeOf(LONG_PTR) == 8)
+        window_long.SetWindowLongPtrW
+    else
+        window_long.SetWindowLongW;
+    const GetWindowLongPtrW = if (@sizeOf(LONG_PTR) == 8)
+        window_long.GetWindowLongPtrW
+    else
+        window_long.GetWindowLongW;
+    const window_long = struct {
+        extern "user32" fn SetWindowLongPtrW(
+            hwnd: HWND,
+            index: c_int,
+            value: LONG_PTR,
+        ) callconv(.winapi) LONG_PTR;
+        extern "user32" fn GetWindowLongPtrW(hwnd: HWND, index: c_int) callconv(.winapi) LONG_PTR;
+        extern "user32" fn SetWindowLongW(hwnd: HWND, index: c_int, value: LONG) callconv(.winapi) LONG;
+        extern "user32" fn GetWindowLongW(hwnd: HWND, index: c_int) callconv(.winapi) LONG;
+    };
     extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
     const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
     extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
@@ -514,7 +530,7 @@ const win32 = struct {
     const NI_COMPOSITIONSTR: DWORD = 0x0015;
     const CPS_COMPLETE: DWORD = 0x0001;
     const CPS_CANCEL: DWORD = 0x0004;
-    const LANG_KOREAN: u16 = 0x12;
+    const LANG_KOREAN = w.LANG.KOREAN;
 
     /// PRIMARYLANGID (winnt.h): a LANGID without its sublanguage.
     fn primaryLangId(lgid: u16) u16 {
@@ -754,11 +770,12 @@ pub const App = struct {
 
         const alloc = core_app.alloc;
 
-        // Win32 defines HMODULE as HINSTANCE (minwindef.h); std types them
-        // as distinct opaques, so the module handle is cast once, here,
-        // where it becomes the window classes' instance.
-        const hinstance: win32.HINSTANCE = @ptrCast(win32.GetModuleHandleW(null) orelse
-            return Error.Win32WindowCreationFailed);
+        // The image base in the PEB is the exe's module handle, the value
+        // GetModuleHandleW(NULL) returns. Win32 defines HMODULE as HINSTANCE
+        // (minwindef.h); std types them as distinct opaques, so the module
+        // handle is cast once, here, where it becomes the window classes'
+        // instance.
+        const hinstance: win32.HINSTANCE = @ptrCast(std.os.windows.peb().ImageBaseAddress);
 
         // Per-monitor DPI v2, so the DPI query reports the real value and
         // WM_DPICHANGED arrives with a usable suggested rect.
@@ -781,7 +798,7 @@ pub const App = struct {
                     // declares PerMonitorV2. That is the expected path, so it
                     // is not reported; logEffectiveDpiAwareness states what is
                     // actually in effect either way.
-                    const err = std.os.windows.GetLastError();
+                    const err = win32.GetLastError();
                     if (err != .ACCESS_DENIED) {
                         log.warn("SetProcessDpiAwarenessContext failed err={}", .{err});
                     }
@@ -876,7 +893,7 @@ pub const App = struct {
         while (self.surfaces.getLastOrNull()) |surface| {
             if (!surface.destroy()) {
                 log.err("failed to destroy a surface window err={}", .{
-                    std.os.windows.GetLastError(),
+                    win32.GetLastError(),
                 });
                 self.surfaceDestroyed(surface);
             }
@@ -1080,11 +1097,11 @@ pub const App = struct {
                 win32.MWMO_INPUTAVAILABLE,
             )) {
                 // The thread has exited.
-                win32.WAIT_OBJECT_0 => return,
+                internal_os.windows.WAIT_OBJECT_0 => return,
 
                 // Input. The tick at the top of the loop drains whatever
                 // the dispatched messages left in the mailbox.
-                win32.WAIT_OBJECT_0 + 1 => {
+                internal_os.windows.WAIT_OBJECT_0 + 1 => {
                     var msg: win32.MSG = undefined;
                     while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE).toBool()) {
                         if (msg.message == win32.WM_QUIT) {
@@ -1096,7 +1113,7 @@ pub const App = struct {
                     }
                 },
 
-                win32.WAIT_TIMEOUT => {
+                internal_os.windows.WAIT_TIMEOUT => {
                     slices += 1;
                     if (slices == 5) log.warn(
                         "surface thread has not exited after 5s; still waiting",
@@ -1110,7 +1127,7 @@ pub const App = struct {
                 else => |r| {
                     log.err(
                         "MsgWaitForMultipleObjectsEx failed r={x} err={}",
-                        .{ r, std.os.windows.GetLastError() },
+                        .{ r, win32.GetLastError() },
                     );
                     return;
                 },
@@ -2319,7 +2336,7 @@ pub const Surface = struct {
             // Only fails when the queue is full (10,000 messages). The window
             // stays open; the user can close it again.
             log.err("failed to post the surface teardown err={}", .{
-                std.os.windows.GetLastError(),
+                win32.GetLastError(),
             });
             self.closing = false;
         }
@@ -2460,7 +2477,7 @@ pub const Surface = struct {
             rect.right - rect.left,
             rect.bottom - rect.top,
             win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
-        ).toBool()) log.warn("unable to apply initial window size err={}", .{std.os.windows.GetLastError()});
+        ).toBool()) log.warn("unable to apply initial window size err={}", .{win32.GetLastError()});
     }
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
@@ -3940,7 +3957,7 @@ pub const Surface = struct {
             .dwHoverTime = 0,
         };
         if (!win32.TrackMouseEvent(&tme).toBool()) {
-            log.warn("TrackMouseEvent failed err={}", .{std.os.windows.GetLastError()});
+            log.warn("TrackMouseEvent failed err={}", .{win32.GetLastError()});
         }
         // Set even on failure: retrying on every move cannot help, and a
         // missed leave only leaves hover state stale until the next one.
@@ -4241,7 +4258,7 @@ fn wheelSetting(action: win32.UINT) u32 {
     if (!win32.SystemParametersInfoW(action, 0, &value, 0).toBool()) {
         log.warn("SystemParametersInfoW failed action=0x{x} err={}", .{
             action,
-            std.os.windows.GetLastError(),
+            win32.GetLastError(),
         });
         return Surface.Mouse.Notches.per_tick;
     }
@@ -4643,7 +4660,7 @@ fn writeClipboardText(hwnd: win32.HWND, text: []const u8) App.Error!void {
     const units: usize = if (len == 0) 0 else units: {
         const n = win32.MultiByteToWideChar(win32.CP_UTF8, 0, text.ptr, len, null, 0);
         if (n == 0) {
-            log.warn("MultiByteToWideChar failed err={}", .{std.os.windows.GetLastError()});
+            log.warn("MultiByteToWideChar failed err={}", .{win32.GetLastError()});
             return App.Error.Win32CallFailed;
         }
         break :units @intCast(n);
@@ -4654,7 +4671,7 @@ fn writeClipboardText(hwnd: win32.HWND, text: []const u8) App.Error!void {
     // clipboard lock is held for as short a time as possible.
     const bytes = (units + 1) * @sizeOf(u16);
     const mem = win32.GlobalAlloc(win32.GMEM_MOVEABLE, bytes) orelse {
-        log.warn("GlobalAlloc failed bytes={d} err={}", .{ bytes, std.os.windows.GetLastError() });
+        log.warn("GlobalAlloc failed bytes={d} err={}", .{ bytes, win32.GetLastError() });
         return App.Error.Win32CallFailed;
     };
     // SetClipboardData takes ownership on success; freeing it after that
@@ -4663,7 +4680,7 @@ fn writeClipboardText(hwnd: win32.HWND, text: []const u8) App.Error!void {
 
     {
         const raw = win32.GlobalLock(mem) orelse {
-            log.warn("GlobalLock failed err={}", .{std.os.windows.GetLastError()});
+            log.warn("GlobalLock failed err={}", .{win32.GetLastError()});
             return App.Error.Win32CallFailed;
         };
         defer _ = win32.GlobalUnlock(mem);
@@ -4685,18 +4702,18 @@ fn writeClipboardText(hwnd: win32.HWND, text: []const u8) App.Error!void {
     }
 
     if (!win32.OpenClipboard(hwnd).toBool()) {
-        log.warn("OpenClipboard failed err={}", .{std.os.windows.GetLastError()});
+        log.warn("OpenClipboard failed err={}", .{win32.GetLastError()});
         return App.Error.Win32CallFailed;
     }
     defer _ = win32.CloseClipboard();
 
     if (!win32.EmptyClipboard().toBool()) {
-        log.warn("EmptyClipboard failed err={}", .{std.os.windows.GetLastError()});
+        log.warn("EmptyClipboard failed err={}", .{win32.GetLastError()});
         return App.Error.Win32CallFailed;
     }
 
     if (win32.SetClipboardData(win32.CF_UNICODETEXT, mem) == null) {
-        log.warn("SetClipboardData failed err={}", .{std.os.windows.GetLastError()});
+        log.warn("SetClipboardData failed err={}", .{win32.GetLastError()});
         return App.Error.Win32CallFailed;
     }
 }
@@ -4736,7 +4753,7 @@ fn wideFromUtf8(alloc: Allocator, text: []const u8) (Allocator.Error || App.Erro
     // sequences with U+FFFD. std has no lossy UTF-8 to UTF-16 conversion.
     const n = win32.MultiByteToWideChar(win32.CP_UTF8, 0, text.ptr, len, null, 0);
     if (n == 0) {
-        log.warn("MultiByteToWideChar failed err={}", .{std.os.windows.GetLastError()});
+        log.warn("MultiByteToWideChar failed err={}", .{win32.GetLastError()});
         return App.Error.Win32CallFailed;
     }
     const wide = try alloc.allocSentinel(u16, @intCast(n), 0);
