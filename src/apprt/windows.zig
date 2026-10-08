@@ -670,22 +670,26 @@ pub const App = struct {
     /// Set when the loop should stop. Written only on the main thread.
     quit: bool,
 
-    /// True while the quit timer is armed on `msg_hwnd`.
-    quit_timer_active: bool,
-
-    /// A zero-delay quit request that has been recorded but not acted on.
+    /// The quit-after-last-window timer, in the GTK `Application`'s form
+    /// (its `quit_timer`). `run` quits once this is `expired` and no surface
+    /// is left.
     ///
-    /// `main` in main_ghostty.zig calls `startQuitTimer` *before* it calls
-    /// `run`, and `quit-after-last-window-closed-delay` is unset by default
+    /// Expiry is recorded rather than acted on where it happens. `main` in
+    /// main_ghostty.zig calls `startQuitTimer` *before* it calls `run`, and
+    /// `quit-after-last-window-closed-delay` is unset by default
     /// (`Config.@"quit-after-last-window-closed-delay"`), i.e. zero delay.
     /// Quitting synchronously at that point would set `quit` before the loop
     /// ever began and the process would exit with its window still on screen.
-    /// GTK has the same ordering and resolves it the same way, by recording the
-    /// expiry and evaluating it later (the GTK `Application`'s quit-timer
-    /// handling).
-    ///
-    /// `run` acts on this only when there are genuinely no surfaces left.
-    quit_pending: bool,
+    quit_timer: enum {
+        off,
+
+        /// Armed on `msg_hwnd` as `quit_timer_id`. GTK's carries the glib
+        /// source; a window timer is named by its fixed id, so this carries
+        /// nothing.
+        active,
+
+        expired,
+    },
 
     /// True while `core_app.tick` is on the stack. See `tick`.
     ticking: bool,
@@ -818,8 +822,7 @@ pub const App = struct {
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
             .quit = false,
-            .quit_timer_active = false,
-            .quit_pending = false,
+            .quit_timer = .off,
             .ticking = false,
             .prompt_depth = 0,
             .modal_loop_depth = 0,
@@ -870,10 +873,7 @@ pub const App = struct {
             self.core_app.alloc.destroy(surface);
         }
 
-        if (self.quit_timer_active) {
-            _ = win32.KillTimer(self.msg_hwnd, quit_timer_id);
-            self.quit_timer_active = false;
-        }
+        self.stopQuitTimer();
 
         _ = win32.DestroyWindow(self.msg_hwnd);
         unregisterClasses(self.hinstance);
@@ -900,10 +900,10 @@ pub const App = struct {
 
         var msg: win32.MSG = undefined;
         while (!self.quit) {
-            // Act on a recorded zero-delay quit here rather than where it was
-            // recorded (see `quit_pending`): only here is it known both that
-            // the loop has started and that no window is on screen.
-            if (self.quit_pending and self.surfaces.items.len == 0) {
+            // Act on an expired quit timer here rather than where it expired
+            // (see `quit_timer`): only here is it known both that the loop
+            // has started and that no window is on screen.
+            if (self.quit_timer == .expired and self.surfaces.items.len == 0) {
                 self.logQuitOverride();
                 self.quit = true;
                 break;
@@ -1367,16 +1367,10 @@ pub const App = struct {
     fn setQuitTimer(self: *App, mode: apprt.action.QuitTimer) bool {
         // Cancel any previous timer first: `.start` can arrive again before
         // `.stop` (the core re-sends it as surfaces come and go).
-        if (self.quit_timer_active) {
-            _ = win32.KillTimer(self.msg_hwnd, quit_timer_id);
-            self.quit_timer_active = false;
-        }
+        self.stopQuitTimer();
 
         switch (mode) {
-            .stop => {
-                self.quit_pending = false;
-                return true;
-            },
+            .stop => return true,
 
             .start => {
                 // The apprt owns the quit-after-last-window policy, and this
@@ -1405,33 +1399,57 @@ pub const App = struct {
                     0;
 
                 // A zero delay must not quit synchronously: startQuitTimer
-                // runs before run() does. Record the intent and let run()
-                // decide; see the `quit_pending` field.
+                // runs before run() does. Record the expiry and let run()
+                // decide; see the `quit_timer` field.
                 if (delay_ms == 0) {
-                    self.quit_pending = true;
+                    self.quit_timer = .expired;
                     return true;
                 }
 
-                const id = win32.SetTimer(
+                if (win32.SetTimer(
                     self.msg_hwnd,
                     quit_timer_id,
                     std.math.cast(win32.UINT, delay_ms) orelse std.math.maxInt(win32.UINT),
                     null,
-                );
-                self.quit_timer_active = id != 0;
-                if (id == 0) {
+                ) == 0) {
                     log.warn("failed to arm the quit timer", .{});
                     return false;
                 }
 
+                self.quit_timer = .active;
                 return true;
             },
         }
     }
 
+    fn stopQuitTimer(self: *App) void {
+        switch (self.quit_timer) {
+            .off => {},
+            .expired => self.quit_timer = .off,
+            .active => {
+                _ = win32.KillTimer(self.msg_hwnd, quit_timer_id);
+                self.quit_timer = .off;
+            },
+        }
+    }
+
+    /// The quit timer's WM_TIMER on `msg_hwnd`.
+    ///
+    /// KillTimer does not remove a WM_TIMER that is already queued, so one
+    /// can still arrive after `stopQuitTimer` (a `.stop` from
+    /// `CoreApp.addSurface`). Only a timer that is still armed expires;
+    /// expiring any other would quit with a window on screen.
+    fn quitTimerFired(self: *App) void {
+        if (self.quit_timer != .active) return;
+
+        // Window timers repeat until killed.
+        _ = win32.KillTimer(self.msg_hwnd, quit_timer_id);
+        self.quit_timer = .expired;
+    }
+
     /// Report that the process is quitting because of the override in
     /// setQuitTimer rather than because the configuration asked for it.
-    /// Called only at the two points where that quit is carried out.
+    /// Called only from `run`, where that quit is carried out.
     fn logQuitOverride(self: *const App) void {
         if (self.config.@"quit-after-last-window-closed") return;
         log.info(
@@ -1519,12 +1537,10 @@ pub const App = struct {
                 return 0;
             },
 
+            // `run` quits once the timer has expired, the next time round
+            // its loop.
             win32.WM_TIMER => if (wparam == quit_timer_id) {
-                _ = win32.KillTimer(hwnd, quit_timer_id);
-                self.quit_timer_active = false;
-                self.logQuitOverride();
-                self.quit = true;
-                win32.PostQuitMessage(0);
+                self.quitTimerFired();
                 return 0;
             },
 
@@ -6027,4 +6043,48 @@ test "win32: modal loops are counted per window and returned on destroy" {
     try std.testing.expectEqual(0, app.modal_loop_depth);
     _ = s.b.handleMessage(hwnd, win32.WM_EXITMENULOOP, 0, 0);
     try std.testing.expectEqual(0, app.modal_loop_depth);
+}
+
+test "win32: only an armed quit timer expires" {
+    // KillTimer leaves a WM_TIMER that is already queued in place, so the
+    // quit timer's can arrive after `.stop` has cancelled it. Expiring the
+    // timer then would make `run` quit with a window on screen. A
+    // message-only window stands in for the app's; the handler only needs
+    // the App behind it.
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    var app: App = undefined;
+    app.msg_hwnd = hwnd;
+    _ = win32.SetWindowLongPtrW(
+        hwnd,
+        win32.GWLP_USERDATA,
+        @bitCast(@intFromPtr(&app)),
+    );
+
+    const State = @TypeOf(app.quit_timer);
+    const Case = struct { from: State, want: State };
+    const cases = [_]Case{
+        .{ .from = .active, .want = .expired },
+        // Stopped after the message was queued.
+        .{ .from = .off, .want = .off },
+    };
+    for (cases) |c| {
+        app.quit_timer = c.from;
+        _ = App.wndProc(hwnd, win32.WM_TIMER, quit_timer_id, 0);
+        try std.testing.expectEqual(c.want, app.quit_timer);
+    }
 }
