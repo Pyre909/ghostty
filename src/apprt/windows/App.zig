@@ -722,15 +722,15 @@ pub const App = struct {
 
     /// Open a link with its registered handler, the shell's `open` verb.
     ///
-    /// An OSC 8 target is program output, and the shell would pass any
-    /// scheme on: `file:` runs executables and a custom scheme starts
-    /// whatever registered it. Only a well-formed http, https or mailto
-    /// link is opened from one (`osc8Allowed`); anything else is refused
-    /// with a notice. The refusal reports `true`: `false` would send the
-    /// same link to the core's generic opener (`Surface.openUrl`), which
-    /// refuses OSC 8 targets on Windows as well (src/os/open.zig) but
-    /// reports that as an error. The other kinds are link text the user can
-    /// see, or paths the core resolved from it, and open unchanged.
+    /// An OSC 8 target and a link found in the terminal's text (`.unknown`)
+    /// are program output, and the shell would pass any scheme on: `file:`
+    /// runs executables and a custom scheme starts whatever registered it.
+    /// Only a well-formed http, https or mailto link is opened from one
+    /// (`linkRefused`); anything else is refused with a notice. The refusal
+    /// reports `true`: `false` would send the same link to the core's generic
+    /// opener (`Surface.openUrl`), which refuses these kinds on Windows as
+    /// well (src/os/open.zig) but reports that as an error. The other kinds
+    /// are paths the core resolved itself, and open unchanged.
     ///
     /// Nothing here may dispatch messages: the core calls this while
     /// holding its renderer lock (`Surface.mouseButtonCallback`), and the next
@@ -745,8 +745,8 @@ pub const App = struct {
             .surface => |v| v.rt_surface.hwnd,
         };
 
-        if (value.kind == .osc8 and !osc8Allowed(value.url)) {
-            log.warn("refused an OSC 8 link: not a well-formed http, https or mailto target", .{});
+        if (linkRefused(value.kind, value.url)) {
+            log.warn("refused a {t} link: not a well-formed http, https or mailto target", .{value.kind});
             _ = win32.PostMessageW(hwnd, WM_GHOSTTY_LINK_REFUSED, 0, 0);
             return true;
         }
@@ -1065,6 +1065,17 @@ fn openUrlThread(wide: [:0]u16) void {
     if (rc <= 32) log.warn("ShellExecuteW failed code={}", .{rc});
 }
 
+/// Whether `openUrl` refuses a link: OSC 8 targets and links found in the
+/// terminal's text come from program output and must pass
+/// `untrustedLinkAllowed`, as the macOS app treats them (upstream
+/// f9e8ef02d); paths the core resolved itself (`.text`, `.html`) are trusted.
+fn linkRefused(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
+    return switch (kind) {
+        .unknown, .osc8 => !untrustedLinkAllowed(url),
+        .text, .html => false,
+    };
+}
+
 /// Whether an OSC 8 target may be opened: an http or https link with a
 /// host, or a mailto link with an address, containing nothing that could
 /// display differently from what the handler receives. This is the allow
@@ -1072,7 +1083,7 @@ fn openUrlThread(wide: [:0]u16) void {
 /// which likewise leaves the parse to the platform's URL parser (here
 /// std.Uri); what that policy confirms or inspects (`file:`, custom
 /// schemes) is refused here outright.
-fn osc8Allowed(url: []const u8) bool {
+fn untrustedLinkAllowed(url: []const u8) bool {
     // Control, bidirectional and zero-width code points can hide part of
     // the target or add a display line; invalid UTF-8 cannot be shown.
     var it = (std.unicode.Utf8View.init(url) catch return false).iterator();
@@ -1150,7 +1161,7 @@ test "win32: waiting for a thread drains a full mailbox without input" {
     try std.testing.expect(pushed);
 }
 
-test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
+test "win32: untrusted links are limited to well-formed http, https and mailto" {
     const allowed = [_][]const u8{
         "https://example.com/path?q=1#f",
         "HTTP://user:pw@example.com:8080/",
@@ -1158,7 +1169,7 @@ test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
         "mailto:someone@example.com?subject=hi",
         "MAILTO:a@b",
     };
-    for (allowed) |url| try std.testing.expect(osc8Allowed(url));
+    for (allowed) |url| try std.testing.expect(untrustedLinkAllowed(url));
 
     const refused = [_][]const u8{
         "",
@@ -1181,7 +1192,7 @@ test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
         "https://example.com/\r\n",
         "https://example.com/\xff",
     };
-    for (refused) |url| try std.testing.expect(!osc8Allowed(url));
+    for (refused) |url| try std.testing.expect(!untrustedLinkAllowed(url));
 
     // One code point from each arm of the screen, placed as the macOS
     // policy's test places them (UntrustedURLTests.swift).
@@ -1192,8 +1203,24 @@ test "win32: OSC 8 links are limited to well-formed http, https and mailto" {
     };
     inline for (unsafe) |cp| {
         const url = "https://example.com/before" ++ std.unicode.utf8EncodeComptime(cp) ++ "after";
-        try std.testing.expect(!osc8Allowed(url));
+        try std.testing.expect(!untrustedLinkAllowed(url));
     }
+}
+
+test "win32: links from program output are checked, resolved paths are not" {
+    const testing = std.testing;
+    const payload = "file:///C:/Windows/System32/calc.exe";
+
+    // A link the URL regex found in the terminal's text is program output,
+    // like an OSC 8 target: neither may launch a local file.
+    try testing.expect(linkRefused(.unknown, payload));
+    try testing.expect(linkRefused(.osc8, payload));
+    try testing.expect(!linkRefused(.unknown, "https://example.com/"));
+    try testing.expect(!linkRefused(.osc8, "https://example.com/"));
+
+    // A path the core resolved itself, such as the config file it opens.
+    try testing.expect(!linkRefused(.text, "C:\\Users\\me\\config.ghostty"));
+    try testing.expect(!linkRefused(.html, "file:///C:/ghostty/help.html"));
 }
 
 test "win32: only an armed quit timer expires" {
