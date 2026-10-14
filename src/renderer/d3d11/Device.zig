@@ -14,11 +14,17 @@ const Device = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub fn init(self: *Device, alloc: Allocator) !void {
-    _ = alloc;
+/// Options used when creating the Direct3D 11 device. There are none:
+/// each renderer creates its own device for its window.
+pub const Options = struct {};
+
+pub fn init(alloc: Allocator, options: Options) !*Device {
+    _ = options;
+    const self = try alloc.create(Device);
     self.* = .{};
+    return self;
 }
 
-pub fn deinit(self: *Device) void {
-    self.* = undefined;
+pub fn deinit(self: *Device, alloc: Allocator) void {
+    alloc.destroy(self);
 }

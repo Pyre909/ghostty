@@ -15,18 +15,22 @@ const log = std.log.scoped(.@"os-open");
 /// This function is purposely simple for the sake of providing some portable
 /// way to open URLs. If you are implementing an apprt for Ghostty, you should
 /// consider doing something special-cased for your platform.
+///
+/// On macOS and Windows, untrusted kinds (`unknown`, `osc8`) return `error.UntrustedLink`
+/// because the apprt must check them first.
 pub fn open(
     kind: apprt.action.OpenUrl.Kind,
     url: []const u8,
 ) !void {
-    // On macOS, the apprt handles OSC 8 targets before this fallback. Ghostty's
-    // native apprt applies its allowlist, confirmation, and file safety policy.
-    // If a macOS embedder declines the action, fail closed rather than bypassing
-    // that policy by handing producer-controlled terminal output to `open`.
-    // The Windows apprt applies its allowlist the same way, and rundll32 below
-    // would run `file:` targets and any registered scheme.
+    // If an embedder declines an untrusted URL, refuse it rather than skip
+    // the apprt's safety checks by passing it to `open`. On Windows, rundll32
+    // below would run `file:` targets and any registered scheme, and the
+    // Windows apprt applies its own allowlist the same way.
     if (comptime builtin.os.tag == .macos or builtin.os.tag == .windows) {
-        if (kind == .osc8) return error.UnsafeOSC8Link;
+        switch (kind) {
+            .unknown, .osc8 => return error.UntrustedLink,
+            .text, .html => {},
+        }
     }
 
     // Holds rundll32's absolute path on Windows; see rundll32Path.
@@ -35,7 +39,7 @@ pub fn open(
     var spawn_opts: std.process.SpawnOptions = switch (builtin.os.tag) {
         .linux, .freebsd => .{ .argv = &.{ "xdg-open", url } },
         .windows => switch (kind) {
-            .text, .html, .unknown => .{ .argv = &.{
+            .text, .html => .{ .argv = &.{
                 try rundll32Path(
                     &rundll32_buf,
                     std.os.windows.getSystemDirectoryWtf16Le(),
@@ -43,12 +47,12 @@ pub fn open(
                 "url.dll,FileProtocolHandler",
                 url,
             } },
-            .osc8 => unreachable,
+            .unknown, .osc8 => unreachable,
         },
         .macos => switch (kind) {
             .text => .{ .argv = &.{ "open", "-t", url } },
-            .html, .unknown => .{ .argv = &.{ "open", url } },
-            .osc8 => unreachable,
+            .html => .{ .argv = &.{ "open", url } },
+            .unknown, .osc8 => unreachable,
         },
         .ios => return error.Unimplemented,
         else => @compileError("unsupported OS"),
@@ -126,12 +130,16 @@ test "rundll32Path is absolute in the system directory" {
     );
 }
 
-test "macOS and Windows OSC 8 links have no generic opener fallback" {
+test "macOS and Windows untrusted links have no generic opener fallback" {
     if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
 
     try std.testing.expectError(
-        error.UnsafeOSC8Link,
+        error.UntrustedLink,
         open(.osc8, "file:///tmp/payload.command"),
+    );
+    try std.testing.expectError(
+        error.UntrustedLink,
+        open(.unknown, "file:///tmp/payload.command"),
     );
 }
 

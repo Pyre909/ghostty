@@ -570,10 +570,10 @@ typedef struct {
 //
 // Links. A host whose action callback returns false for
 // GHOSTTY_ACTION_OPEN_URL leaves the link to ghostty, which runs System32's
-// rundll32 url.dll,FileProtocolHandler on it, except for an OSC 8 link
-// (GHOSTTY_ACTION_OPEN_URL_KIND_OSC8): that target is program output, and
-// ghostty never opens it. A host that wants OSC 8 links opened handles the
-// action and applies its own policy, as the Win32 runtime does.
+// rundll32 url.dll,FileProtocolHandler on it, except for an OSC 8 link or a
+// link found in the terminal's text (GHOSTTY_ACTION_OPEN_URL_KIND_OSC8 and
+// _UNKNOWN): those targets are program output, and ghostty never opens them.
+// A host that wants them opened handles the action and applies its own policy.
 typedef struct {
   void* hwnd;
 } ghostty_platform_windows_s;
@@ -1317,6 +1317,7 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_paste_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,

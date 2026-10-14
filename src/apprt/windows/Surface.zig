@@ -912,6 +912,13 @@ pub const Surface = struct {
         ).toBool()) log.warn("unable to apply initial window size err={}", .{win32.GetLastError()});
     }
 
+    /// The Direct3D 11 device has no options: each renderer creates its
+    /// own device for this window.
+    pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
+        _ = self;
+        return .{};
+    }
+
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
         const scale: f32 = @as(f32, @floatFromInt(self.dpi())) /

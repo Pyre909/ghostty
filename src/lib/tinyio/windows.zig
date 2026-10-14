@@ -697,12 +697,12 @@ test "windows: path conversion" {
     // the long names GetFinalPathNameByHandleW produces.
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var parent_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const parent = parent_buf[0..try realPathHandle(tmp_dir.parent_dir.handle, &parent_buf)];
     try pathToNt(tmp_dir.dir.handle, "..\\up.txt", &p);
-    var got_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var got_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const got = got_buf[0..std.unicode.wtf16LeToWtf8(&got_buf, p.span())];
-    var want_buf: [std.fs.max_path_bytes + 16]u8 = undefined;
+    var want_buf: [std.Io.Dir.max_path_bytes + 16]u8 = undefined;
     const want = try std.fmt.bufPrint(&want_buf, "\\??\\{s}\\up.txt", .{parent});
     try testing.expectEqualStrings(want, got);
 
@@ -738,7 +738,7 @@ test "windows: realPath resolves through symlinks" {
     defer file.close(test_io);
     try testing.expectEqual(@as(u64, "target".len), try file.length(test_io));
     try testing.expectEqual(File.Kind.file, (try file.stat(test_io)).kind);
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = path_buf[0..try file.realPath(test_io, &path_buf)];
     try testing.expect(std.mem.endsWith(u8, path, "target.txt"));
 
@@ -748,7 +748,7 @@ test "windows: realPath resolves through symlinks" {
     try testing.expectEqual(File.Kind.sym_link, (try link.stat(test_io)).kind);
 
     // dirRealPathFile through the link resolves the target too.
-    var path_buf2: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf2: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path2 = path_buf2[0..try dir.realPathFile(test_io, "link.txt", &path_buf2)];
     try testing.expectEqualStrings(path, path2);
 }
