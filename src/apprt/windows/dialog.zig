@@ -47,7 +47,7 @@ pub fn confirm(
 }
 
 /// The OK-only form of `confirm`, with the same nesting rules.
-pub fn notice(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) void {
+pub fn notice(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) void {
     app.beginPrompt(hwnd);
     defer app.endPrompt();
     _ = win32.MessageBoxW(hwnd, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);

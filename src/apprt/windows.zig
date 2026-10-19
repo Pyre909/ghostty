@@ -31,14 +31,22 @@
 //!     is therefore modal to every window, not only its own
 //!     (`App.beginPrompt`).
 //!
+//! ## Windows
+//!
+//! Each window holds one surface. `.new_window` is recorded, and the window
+//! is created by `App.run` once the core frame that asked has returned
+//! (`App.window_requests`). The process quits when its last window closes,
+//! whatever `quit-after-last-window-closed` says: with no window left there
+//! is nothing to open another from (`App.setQuitTimer`).
+//!
 //! ## What is still missing
 //!
-//! Not implemented: more than one window (`.new_window`), a context menu,
+//! Not implemented: tabs and splits, a context menu,
 //! link previews and precision-touchpad scrolling. Without a menu, a right
 //! click with the default `right-click-action` only selects the word or
 //! link under the pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",
-//! for `.new_window`, `.mouse_over_link` and every other action it does not
+//! for `.mouse_over_link` and every other action it does not
 //! name; this runtime never claims an action it did not carry out.
 //!
 //! Links open through the shell (`ShellExecuteW`). An OSC 8 target and a

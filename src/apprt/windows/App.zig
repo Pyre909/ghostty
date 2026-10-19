@@ -16,6 +16,7 @@ const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
+const notice = @import("dialog.zig").notice;
 
 const log = std.log.scoped(.win32);
 
@@ -70,6 +71,20 @@ pub const App = struct {
     /// quit timer; this list and the core's can differ only while a surface
     /// is being created or torn down.
     surfaces: std.ArrayListUnmanaged(*Surface),
+
+    /// Windows the core asked for (`.new_window`) that `run` has not
+    /// created yet, oldest first, each with the core surface that asked,
+    /// if any.
+    ///
+    /// The core asks from inside its own frames: a `new_window` binding
+    /// performs the action from `CoreSurface.keyCallback`
+    /// (`performBindingAction` -> `CoreApp.newWindow`). Creating the window
+    /// there would register a surface with the core in the middle of that
+    /// frame and send the new window's activation, and the old window's
+    /// WM_KILLFOCUS, into a surface whose key callback is still on the
+    /// stack. So the action only records the request, and `run` creates
+    /// the window after its tick (`createRequestedWindows`).
+    window_requests: std.ArrayListUnmanaged(?*CoreSurface),
 
     /// Set when the loop should stop. Written only on the main thread.
     quit: bool,
@@ -253,6 +268,7 @@ pub const App = struct {
             .get_dpi_for_window = get_dpi_for_window,
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
+            .window_requests = .empty,
             .quit = false,
             .quit_timer = .off,
             .ticking = false,
@@ -304,6 +320,9 @@ pub const App = struct {
         }
         self.surfaces.deinit(self.core_app.alloc);
 
+        // Windows asked for and never created: the process is quitting.
+        self.window_requests.deinit(self.core_app.alloc);
+
         self.stopQuitTimer();
 
         _ = win32.DestroyWindow(self.msg_hwnd);
@@ -313,16 +332,13 @@ pub const App = struct {
 
     /// The Win32 message loop.
     pub fn run(self: *App) !void {
-        // Create the initial window.
-        //
-        // In a complete runtime this belongs in the `.new_window` action,
-        // driven by `CoreApp.newWindow` through the mailbox. `.new_window` is
-        // still refused by this runtime (multi-window lifecycle, placement
-        // and the quit policy for it are not implemented), so the initial
-        // window is created directly here. When `.new_window` is supported,
-        // this block moves into `performAction`.
+        // Create the initial window, directly rather than through
+        // `window_requests`: nothing would make the loop below come round
+        // to a request before some message arrived. Failing here is
+        // fatal, as no window would exist; failing to open a later one is
+        // only reported (`createRequestedWindows`).
         if (self.config.@"initial-window") {
-            _ = self.newSurface() catch |err| {
+            _ = self.newWindow() catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
                 fatalNotice(err);
                 return err;
@@ -390,6 +406,9 @@ pub const App = struct {
 
             // And IME work that could not run where it arose (Surface.syncIme).
             self.syncDeferredIme();
+
+            // And the windows the core asked for (`window_requests`).
+            self.createRequestedWindows();
         }
     }
 
@@ -620,7 +639,9 @@ pub const App = struct {
                 break :ring_bell true;
             },
 
-            // Everything else, including `.new_window` (see `run`),
+            .new_window => self.requestWindow(target),
+
+            // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
             // `false` is a valid answer to each), and
             // `.mouse_over_link` (a link-preview UI this runtime lacks; the
@@ -826,19 +847,21 @@ pub const App = struct {
                 //
                 // `quit-after-last-window-closed` is `builtin.os.tag == .linux`
                 // (`Config.@"quit-after-last-window-closed"`), i.e. false on
-                // Windows. But `.new_window` is refused by this runtime (see
-                // `run`), so a process that reaches zero windows has no UI left
-                // and no way to get one back. Honoring `false` would leave an
-                // invisible process with a message-only window that receives
-                // nothing and a GetMessageW that blocks forever, endable only
-                // from Task Manager.
+                // Windows. But once its last window has closed, this runtime
+                // has nothing left to open another from: `.new_window` is
+                // asked for from a window, and there is no tray icon, no
+                // global hotkey and no IPC to a running instance
+                // (`performIpc`). Honoring `false` would leave an invisible
+                // process with a message-only window that receives nothing
+                // and a GetMessageW that blocks forever, endable only from
+                // Task Manager.
                 //
                 // Delete this override -- not the config read -- as soon as
-                // `.new_window` can actually create a window.
+                // a window can be opened with none open.
                 //
                 // The override is reported by logQuitOverride where the quit is
                 // carried out, not here: `.start` also arrives at launch, from
-                // startQuitTimer, for a quit that newSurface cancels, so
+                // startQuitTimer, for a quit that newWindow cancels, so
                 // logging here would report quits that never happen.
 
                 const delay_ms: u64 = if (self.config.@"quit-after-last-window-closed-delay") |v|
@@ -902,14 +925,72 @@ pub const App = struct {
         if (self.config.@"quit-after-last-window-closed") return;
         log.info(
             "quitting despite quit-after-last-window-closed=false: " ++
-                "this runtime cannot open a new window",
+                "this runtime cannot open a window once none is left",
             .{},
         );
     }
 
-    /// Create a terminal window. See `run` for why this is not driven by
-    /// the `.new_window` action.
-    fn newSurface(self: *App) !*Surface {
+    /// `.new_window`: record the request for `run` (see `window_requests`).
+    /// `true` once it is recorded: the window is then created, or its
+    /// failure reported to the user, as soon as the core frame that asked
+    /// has returned, unless the app quits first.
+    fn requestWindow(self: *App, target: apprt.Target) bool {
+        const parent: ?*CoreSurface = switch (target) {
+            .app => null,
+            .surface => |v| v,
+        };
+        self.window_requests.append(self.core_app.alloc, parent) catch |err| {
+            log.warn("cannot record a new window request err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Take the oldest request in `window_requests`. The surface that
+    /// asked is dropped from it unless one of this runtime's windows still
+    /// has it live (`Surface.liveCore`): it may have closed since, or be
+    /// closing.
+    fn nextWindowRequest(self: *App) ?WindowRequest {
+        if (self.window_requests.items.len == 0) return null;
+        const parent = self.window_requests.orderedRemove(0) orelse
+            return .{ .parent = null };
+        for (self.surfaces.items) |surface| {
+            const core_surface = surface.liveCore() orelse continue;
+            if (core_surface == parent) return .{ .parent = parent };
+        }
+        return .{ .parent = null };
+    }
+
+    const WindowRequest = struct {
+        /// The core surface that asked, if it is still open.
+        parent: ?*CoreSurface,
+    };
+
+    /// Create the windows in `window_requests`. Called by `run`, where
+    /// `canReenterCore` holds and no teardown is running.
+    ///
+    /// A request is taken before its window is created, so one added
+    /// meanwhile is still found: the notice for a failure runs a message
+    /// loop.
+    fn createRequestedWindows(self: *App) void {
+        // A window opened now would only be torn down again by `terminate`.
+        if (self.quit) return;
+
+        while (self.nextWindowRequest()) |request| {
+            _ = self.newWindow() catch |err| {
+                log.err("failed to create a window err={}", .{err});
+                notice(
+                    self,
+                    if (request.parent) |p| p.rt_surface.hwnd else null,
+                    L("Ghostty could not open a new window."),
+                );
+            };
+        }
+    }
+
+    /// Create a terminal window: the initial one (`run`), or one the core
+    /// asked for (`createRequestedWindows`).
+    fn newWindow(self: *App) !*Surface {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
 
@@ -1375,4 +1456,48 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
     try std.testing.expectEqual(0, app.prompt_depth);
     try std.testing.expect(win32.IsWindowEnabled(other).toBool());
     try std.testing.expect(!win32.IsWindowEnabled(off).toBool());
+}
+
+test "win32: a new window is recorded where it is asked for, and created later" {
+    // A `new_window` binding performs the action from inside the core's
+    // key callback, so the action only records the request; `run` creates
+    // the window after its tick. By then the surface that asked may be
+    // closing or gone, and the request forgets it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.window_requests = .empty;
+    defer app.window_requests.deinit(alloc);
+    app.surfaces = .empty;
+    defer app.surfaces.deinit(alloc);
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var open: Surface = undefined;
+        var closing: Surface = undefined;
+        var gone: Surface = undefined;
+    };
+    s.open.core_state = .live;
+    s.closing.core_state = .stopping;
+    try app.surfaces.appendSlice(alloc, &.{ &s.open, &s.closing });
+
+    for ([_]apprt.Target{
+        .{ .surface = &s.open.core_surface },
+        .{ .surface = &s.closing.core_surface },
+        .{ .surface = &s.gone.core_surface },
+        .app,
+    }) |target| {
+        try std.testing.expect(try app.performAction(target, .new_window, {}));
+    }
+    try std.testing.expectEqual(2, app.surfaces.items.len);
+
+    const want = [_]?*CoreSurface{ &s.open.core_surface, null, null, null };
+    for (want) |parent| {
+        const request = app.nextWindowRequest() orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(parent, request.parent);
+    }
+    try std.testing.expect(app.nextWindowRequest() == null);
 }
