@@ -336,11 +336,13 @@ pub const App = struct {
 
     /// The Win32 message loop.
     pub fn run(self: *App) !void {
-        // Create the initial window, directly rather than through
-        // `window_requests`: nothing would make the loop below come round
-        // to a request before some message arrived. Failing here is
-        // fatal, as no window would exist; failing to open a later one is
-        // only reported (`createRequestedWindows`).
+        // Create the initial window directly, not through the core's
+        // `.new_window` as GTK's `activate` does. If it cannot open, the
+        // process has no window at all, and this path says why
+        // (`fatalNotice`, e.g. no Direct3D 11) and exits with the error. A
+        // queued window would only be reported as one that could not open
+        // (`createRequestedWindows`), and the launch's quit timer would then
+        // end the process with no reason given.
         if (self.config.@"initial-window") {
             _ = self.newWindow(null) catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
