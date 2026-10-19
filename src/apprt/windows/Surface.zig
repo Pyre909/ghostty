@@ -76,7 +76,7 @@ pub const Surface = struct {
 
     /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
     /// (`App.canReenterCore` was false, or another surface's teardown was
-    /// running, `App.stopping`). `App.run` re-posts it.
+    /// running, `App.teardown_depth`). `App.run` re-posts it.
     destroy_deferred: bool,
 
     /// Who put the text that is in the core's preedit slot: a dead key
@@ -749,8 +749,8 @@ pub const Surface = struct {
         // Counted for the whole teardown, the waits included: they pump
         // messages, and destroyPosted defers any other teardown dispatched
         // meanwhile.
-        self.app.stopping += 1;
-        defer self.app.stopping -= 1;
+        self.app.teardown_depth += 1;
+        defer self.app.teardown_depth -= 1;
 
         // A drag in progress ends with the core. Button messages for a
         // `.stopping` surface are not handled, so nothing else would release
@@ -829,10 +829,10 @@ pub const Surface = struct {
     /// nonetheless beneath that loop (`App.canReenterCore`), the teardown is
     /// deferred to `run` instead: its pump would tick, and waiting there
     /// could wait on threads blocked behind the undrained mailbox. So is a
-    /// teardown dispatched by another surface's teardown (`App.stopping`),
-    /// from the pump in its wait: it would nest a second wait inside the
-    /// first, and with several windows closing at once each would nest
-    /// inside the last.
+    /// teardown dispatched by another surface's teardown
+    /// (`App.teardown_depth`), from the pump in its wait: it would nest a
+    /// second wait inside the first, and with several windows closing at
+    /// once each would nest inside the last.
     ///
     /// **`self` is freed by the `destroy` at the end**. Nothing may touch it
     /// afterwards, which is why the function ends at that call.
@@ -842,7 +842,7 @@ pub const Surface = struct {
         // terminate drives teardown itself; see App.terminate.
         if (app.terminating) return;
 
-        if (!app.canReenterCore() or app.stopping > 0) {
+        if (!app.canReenterCore() or app.teardown_depth > 0) {
             self.destroy_deferred = true;
             return;
         }
@@ -3731,7 +3731,7 @@ test "win32: a teardown dispatched inside another waits for it" {
     surface.app = &app;
     surface.core_state = .none;
 
-    for ([_]u32{ 1, 0 }) |stopping| {
+    for ([_]u32{ 1, 0 }) |depth| {
         const hwnd = win32.CreateWindowExW(
             0,
             L("STATIC"),
@@ -3751,11 +3751,11 @@ test "win32: a teardown dispatched inside another waits for it" {
         };
         surface.hwnd = hwnd;
         surface.destroy_deferred = false;
-        app.stopping = stopping;
+        app.teardown_depth = depth;
 
         _ = surface.handleMessage(hwnd, WM_GHOSTTY_DESTROY, 0, 0);
 
-        const deferred = stopping > 0;
+        const deferred = depth > 0;
         try std.testing.expectEqual(deferred, surface.destroy_deferred);
         try std.testing.expectEqual(deferred, win32.IsWindow(hwnd).toBool());
     }

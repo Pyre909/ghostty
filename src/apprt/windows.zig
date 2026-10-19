@@ -25,7 +25,8 @@
 //!     from a message loop (`Surface.destroyPosted`).
 //!   * **Teardowns do not nest.** A teardown pumps messages while it waits
 //!     for its surface's threads (`App.waitForThread`); another one
-//!     dispatched there waits until the first has finished (`App.stopping`).
+//!     dispatched there waits until the first has finished
+//!     (`App.teardown_depth`).
 //!   * **`core_app.tick` never reenters itself**, and never runs while a
 //!     modal confirmation prompt is up (`App.canReenterCore`). A prompt
 //!     is therefore modal to every window, not only its own

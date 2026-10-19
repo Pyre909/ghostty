@@ -139,7 +139,7 @@ pub const App = struct {
     /// dispatched inside it. `Surface.destroyPosted` defers that one while
     /// this is non-zero, and `run` re-posts it: teardowns run one after
     /// another, never one inside another's wait.
-    stopping: u32,
+    teardown_depth: u32,
 
     /// Set for the whole of `terminate`. Teardown is driven from there
     /// synchronously, so posted closes and destroys are ignored meanwhile.
@@ -278,7 +278,7 @@ pub const App = struct {
             .ticking = false,
             .prompt_depth = 0,
             .modal_loop_depth = 0,
-            .stopping = 0,
+            .teardown_depth = 0,
             .terminating = false,
         };
 
@@ -961,33 +961,24 @@ pub const App = struct {
         }
     }
 
-    /// Take the oldest request in `window_requests`.
-    fn nextWindowRequest(self: *App) ?WindowRequest {
-        if (self.window_requests.items.len == 0) return null;
-        return .{ .parent = self.window_requests.orderedRemove(0) };
-    }
-
-    const WindowRequest = struct {
-        /// The core surface that asked, if it has not started closing.
-        parent: ?*CoreSurface,
-    };
-
-    /// Create the windows in `window_requests`. Called by `run`, where
-    /// `canReenterCore` holds and no teardown is running.
-    ///
-    /// A request is taken before its window is created, so one added
-    /// meanwhile is still found: the notice for a failure runs a message
-    /// loop.
+    /// Create the windows in `window_requests`, oldest first. Called by
+    /// `run`, where `canReenterCore` holds and no teardown is running.
     fn createRequestedWindows(self: *App) void {
         // A window opened now would only be torn down again by `terminate`.
         if (self.quit) return;
 
-        while (self.nextWindowRequest()) |request| {
-            _ = self.newWindow(request.parent) catch |err| {
+        // By index, reading the length again each time round: the notice for
+        // a failure runs a message loop, and a request added meanwhile is
+        // still created here.
+        defer self.window_requests.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < self.window_requests.items.len) : (i += 1) {
+            const parent = self.window_requests.items[i];
+            _ = self.newWindow(parent) catch |err| {
                 log.err("failed to create a window err={}", .{err});
                 notice(
                     self,
-                    if (request.parent) |p| p.rt_surface.hwnd else null,
+                    if (parent) |p| p.rt_surface.hwnd else null,
                     L("Ghostty could not open a new window."),
                 );
             };
@@ -1513,10 +1504,9 @@ test "win32: a new window is recorded where it is asked for, and created later" 
 
     app.forgetWindowParent(&s.closed.core_surface);
 
-    const want = [_]?*CoreSurface{ &s.open.core_surface, null, null };
-    for (want) |parent| {
-        const request = app.nextWindowRequest() orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(parent, request.parent);
-    }
-    try std.testing.expect(app.nextWindowRequest() == null);
+    try std.testing.expectEqualSlices(
+        ?*CoreSurface,
+        &.{ &s.open.core_surface, null, null },
+        app.window_requests.items,
+    );
 }
