@@ -848,6 +848,11 @@ pub const Surface = struct {
         }
 
         _ = self.destroy();
+
+        // `self` is freed. A teardown deferred while this one ran is posted
+        // again now rather than when `run` comes round, which during another
+        // window's size/move loop is only once the user lets go.
+        if (app.teardown_depth == 0 and app.canReenterCore()) app.repostDeferredDestroys();
     }
 
     // ---------------------------------------------------------------------
@@ -3722,6 +3727,8 @@ test "win32: a teardown dispatched inside another waits for it" {
     app.terminating = false;
     app.ticking = false;
     app.prompt_depth = 0;
+    // A teardown that runs posts the deferred ones again; there are none.
+    app.surfaces = .empty;
 
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
@@ -3759,6 +3766,66 @@ test "win32: a teardown dispatched inside another waits for it" {
         try std.testing.expectEqual(deferred, surface.destroy_deferred);
         try std.testing.expectEqual(deferred, win32.IsWindow(hwnd).toBool());
     }
+}
+
+test "win32: a finished teardown posts the ones it deferred again" {
+    // A teardown deferred because another one was running is posted again
+    // as soon as that one is done (`destroyPosted`), not only when `run`
+    // comes round, which inside another window's size/move loop is once the
+    // user lets go. Message-only windows stand in for the surfaces': with no
+    // core surface, a teardown that runs only destroys its window.
+    const alloc = std.testing.allocator;
+    var app: App = undefined;
+    app.terminating = false;
+    app.ticking = false;
+    app.prompt_depth = 0;
+    app.teardown_depth = 0;
+    app.surfaces = .empty;
+    defer app.surfaces.deinit(alloc);
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var done: Surface = undefined;
+        var waiting: Surface = undefined;
+    };
+    const both = [_]*Surface{ &s.done, &s.waiting };
+    for (both) |surface| {
+        surface.app = &app;
+        surface.core_state = .none;
+        surface.closing = true;
+        surface.hwnd = win32.CreateWindowExW(
+            0,
+            L("STATIC"),
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            win32.HWND_MESSAGE,
+            null,
+            null,
+            null,
+        ) orelse return error.TestUnexpectedResult;
+    }
+    defer for (both) |surface| {
+        if (win32.IsWindow(surface.hwnd).toBool()) _ = win32.DestroyWindow(surface.hwnd);
+    };
+    s.done.destroy_deferred = false;
+    s.waiting.destroy_deferred = true;
+    try app.surfaces.append(alloc, &s.waiting);
+
+    _ = s.done.handleMessage(s.done.hwnd, WM_GHOSTTY_DESTROY, 0, 0);
+
+    try std.testing.expect(!s.waiting.destroy_deferred);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        s.waiting.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
 }
 
 test "win32: a new window inherits only an existing working directory" {

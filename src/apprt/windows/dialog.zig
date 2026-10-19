@@ -36,10 +36,11 @@ pub fn confirm(
     text: win32.LPCWSTR,
     default: ConfirmDefault,
 ) bool {
-    app.beginPrompt(hwnd);
+    const owner = app.promptOwner(hwnd);
+    app.beginPrompt(owner);
     defer app.endPrompt();
     return win32.MessageBoxW(
-        hwnd,
+        owner,
         text,
         L("Ghostty"),
         win32.MB_OKCANCEL | win32.MB_ICONWARNING | default.style(),
@@ -48,9 +49,10 @@ pub fn confirm(
 
 /// The OK-only form of `confirm`, with the same nesting rules.
 pub fn notice(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) void {
-    app.beginPrompt(hwnd);
+    const owner = app.promptOwner(hwnd);
+    app.beginPrompt(owner);
     defer app.endPrompt();
-    _ = win32.MessageBoxW(hwnd, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);
+    _ = win32.MessageBoxW(owner, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);
 }
 
 /// A failure that ends the process before any window exists. The

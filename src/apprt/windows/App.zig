@@ -474,6 +474,19 @@ pub const App = struct {
         }
     }
 
+    /// The window a prompt belongs to: `hwnd`, or for a caller that has
+    /// none, the surface window the user was last in, else the first one.
+    /// With no owner, the box would leave every window disabled
+    /// (`beginPrompt`) and the activation would go to another application
+    /// when it closes; MessageBoxW enables its owner again before it
+    /// returns and hands the activation back to it.
+    pub fn promptOwner(self: *const App, hwnd: ?win32.HWND) ?win32.HWND {
+        if (hwnd) |h| return h;
+        if (self.core_app.focusedSurface()) |s| return s.rt_surface.hwnd;
+        if (self.surfaces.items.len > 0) return self.surfaces.items[0].hwnd;
+        return null;
+    }
+
     /// Leave the prompt entered by the matching `beginPrompt`.
     pub fn endPrompt(self: *App) void {
         self.prompt_depth -= 1;
@@ -486,8 +499,9 @@ pub const App = struct {
     }
 
     /// Re-post WM_GHOSTTY_DESTROY for every surface whose teardown was
-    /// deferred. Called by `run` at a point where `canReenterCore` holds.
-    fn repostDeferredDestroys(self: *App) void {
+    /// deferred. Called where `canReenterCore` holds and no teardown runs:
+    /// by `run`, and by `Surface.destroyPosted` once its teardown is done.
+    pub fn repostDeferredDestroys(self: *App) void {
         for (self.surfaces.items) |surface| {
             if (!surface.destroy_deferred) continue;
             surface.destroy_deferred = false;
@@ -1468,6 +1482,44 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
     try std.testing.expectEqual(0, app.prompt_depth);
     try std.testing.expect(win32.IsWindowEnabled(other).toBool());
     try std.testing.expect(!win32.IsWindowEnabled(off).toBool());
+}
+
+test "win32: a prompt with no owner belongs to the last focused window" {
+    // An ownerless MessageBoxW would leave every window disabled and hand
+    // the activation to another application when it closes.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.surfaces = .empty;
+    defer app.surfaces.deinit(alloc);
+
+    // Static because the struct embeds a whole CoreSurface. The handles are
+    // only compared, never used as windows.
+    const s = struct {
+        var a: Surface = undefined;
+        var b: Surface = undefined;
+    };
+    s.a.hwnd = @ptrFromInt(0x10);
+    s.b.hwnd = @ptrFromInt(0x20);
+    s.a.core_surface.rt_surface = &s.a;
+    s.b.core_surface.rt_surface = &s.b;
+
+    try std.testing.expect(app.promptOwner(null) == null);
+
+    try app.surfaces.appendSlice(alloc, &.{ &s.a, &s.b });
+    try std.testing.expectEqual(s.a.hwnd, app.promptOwner(null).?);
+
+    try core_app.surfaces.appendSlice(alloc, &.{ &s.a, &s.b });
+    core_app.focused_surface = &s.b.core_surface;
+    try std.testing.expectEqual(s.b.hwnd, app.promptOwner(null).?);
+
+    // The caller's own window always wins.
+    try std.testing.expectEqual(s.a.hwnd, app.promptOwner(s.a.hwnd).?);
 }
 
 test "win32: a new window is recorded where it is asked for, and created later" {
