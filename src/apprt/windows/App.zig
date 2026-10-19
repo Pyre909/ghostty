@@ -84,6 +84,10 @@ pub const App = struct {
     /// WM_KILLFOCUS, into a surface whose key callback is still on the
     /// stack. So the action only records the request, and `run` creates
     /// the window after its tick (`createRequestedWindows`).
+    ///
+    /// A parent is always live: a surface clears its own entries when its
+    /// teardown starts (`forgetWindowParent`), before its address can be
+    /// reused.
     window_requests: std.ArrayListUnmanaged(?*CoreSurface),
 
     /// Set when the loop should stop. Written only on the main thread.
@@ -946,23 +950,25 @@ pub const App = struct {
         return true;
     }
 
-    /// Take the oldest request in `window_requests`. The surface that
-    /// asked is dropped from it unless one of this runtime's windows still
-    /// has it live (`Surface.liveCore`): it may have closed since, or be
-    /// closing.
+    /// Forget `core_surface` as the parent of the windows it asked for: it
+    /// is closing. Called by `Surface.stopCore` while the address is still
+    /// that surface's, so that a surface created later at the same address
+    /// cannot pass for the parent.
+    pub fn forgetWindowParent(self: *App, core_surface: *CoreSurface) void {
+        for (self.window_requests.items) |*parent| {
+            const p = parent.* orelse continue;
+            if (p == core_surface) parent.* = null;
+        }
+    }
+
+    /// Take the oldest request in `window_requests`.
     fn nextWindowRequest(self: *App) ?WindowRequest {
         if (self.window_requests.items.len == 0) return null;
-        const parent = self.window_requests.orderedRemove(0) orelse
-            return .{ .parent = null };
-        for (self.surfaces.items) |surface| {
-            const core_surface = surface.liveCore() orelse continue;
-            if (core_surface == parent) return .{ .parent = parent };
-        }
-        return .{ .parent = null };
+        return .{ .parent = self.window_requests.orderedRemove(0) };
     }
 
     const WindowRequest = struct {
-        /// The core surface that asked, if it is still open.
+        /// The core surface that asked, if it has not started closing.
         parent: ?*CoreSurface,
     };
 
@@ -997,12 +1003,21 @@ pub const App = struct {
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
         // itself, so there is no quit-timer handling here.
+        // Taken from the asking surface itself (see Surface.Options).
+        const cwd: ?[]const u8 = cwd: {
+            const p = parent orelse break :cwd null;
+            if (!apprt.surface.shouldInheritWorkingDirectory(.window, &self.config)) break :cwd null;
+            break :cwd p.pwd(alloc) catch null;
+        };
+        defer if (cwd) |v| alloc.free(v);
+
         const surface = try Surface.create(self, .{
             .font_size = font_size: {
                 const p = parent orelse break :font_size null;
                 if (!self.config.@"window-inherit-font-size") break :font_size null;
                 break :font_size p.font_size.points;
             },
+            .working_directory = cwd,
         });
         errdefer comptime unreachable;
         self.surfaces.appendAssumeCapacity(surface);
@@ -1467,8 +1482,10 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
 test "win32: a new window is recorded where it is asked for, and created later" {
     // A `new_window` binding performs the action from inside the core's
     // key callback, so the action only records the request; `run` creates
-    // the window after its tick. By then the surface that asked may be
-    // closing or gone, and the request forgets it.
+    // the window after its tick. A surface that starts closing in between
+    // clears itself from its requests (`forgetWindowParent`, called by
+    // Surface.stopCore), so a surface created later at the same address is
+    // not taken for the parent.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -1478,29 +1495,25 @@ test "win32: a new window is recorded where it is asked for, and created later" 
     app.window_requests = .empty;
     defer app.window_requests.deinit(alloc);
     app.surfaces = .empty;
-    defer app.surfaces.deinit(alloc);
 
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
         var open: Surface = undefined;
-        var closing: Surface = undefined;
-        var gone: Surface = undefined;
+        var closed: Surface = undefined;
     };
-    s.open.core_state = .live;
-    s.closing.core_state = .stopping;
-    try app.surfaces.appendSlice(alloc, &.{ &s.open, &s.closing });
 
     for ([_]apprt.Target{
         .{ .surface = &s.open.core_surface },
-        .{ .surface = &s.closing.core_surface },
-        .{ .surface = &s.gone.core_surface },
+        .{ .surface = &s.closed.core_surface },
         .app,
     }) |target| {
         try std.testing.expect(try app.performAction(target, .new_window, {}));
     }
-    try std.testing.expectEqual(2, app.surfaces.items.len);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
 
-    const want = [_]?*CoreSurface{ &s.open.core_surface, null, null, null };
+    app.forgetWindowParent(&s.closed.core_surface);
+
+    const want = [_]?*CoreSurface{ &s.open.core_surface, null, null };
     for (want) |parent| {
         const request = app.nextWindowRequest() orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(parent, request.parent);

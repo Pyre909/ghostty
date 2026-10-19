@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const apprt = @import("../../apprt.zig");
+const configpkg = @import("../../config.zig");
 const global = @import("../../global.zig");
 const input = @import("../../input.zig");
 const renderer = @import("../../renderer.zig");
@@ -552,16 +553,19 @@ pub const Surface = struct {
     };
 
     /// What a new window takes from the window it was asked from.
+    /// Both are taken from the asking window, as on macOS
+    /// (`newSurfaceOptions` in src/apprt/embedded.zig), rather than from
+    /// whichever surface had the focus when `run` created the window.
     pub const Options = struct {
-        /// The font size in points to use instead of the configured one:
-        /// the asking window's, with `window-inherit-font-size`, as on
-        /// macOS (`newSurfaceOptions` in src/apprt/embedded.zig). Null for
-        /// the configured size.
-        ///
-        /// The working directory needs no option: `apprt.surface.newConfig`
-        /// already takes it from the focused surface, which is the asking
-        /// one when a key asked.
+        /// The font size in points to use instead of the configured one,
+        /// with `window-inherit-font-size`. Null for the configured size.
         font_size: ?f32 = null,
+
+        /// The working directory to use instead of the one
+        /// `apprt.surface.newConfig` chose, with
+        /// `window-inherit-working-directory`; see `inheritWorkingDirectory`.
+        /// Borrowed for the duration of `create`. Null keeps newConfig's.
+        working_directory: ?[]const u8 = null,
     };
 
     /// Heap-allocate and initialize, including the core surface. The address
@@ -630,6 +634,7 @@ pub const Surface = struct {
         // (`CoreSurface.init` reads it), and getContentScale works on it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
         defer config.deinit();
+        if (opts.working_directory) |wd| inheritWorkingDirectory(&config, wd);
         // A failing CoreSurface.init joins any thread it started (unpumped,
         // as CoreSurface.deinit does), so the errdefers above run with no
         // core thread left using this surface or its window.
@@ -776,6 +781,10 @@ pub const Surface = struct {
         const cs = &self.core_surface;
 
         app.core_app.deleteSurface(self);
+
+        // A window this surface asked for and `run` has not created yet
+        // loses its parent now, while the address is still this surface's.
+        app.forgetWindowParent(cs);
 
         if (cs.search) |*s| {
             s.state.stop.notify() catch |err|
@@ -2662,6 +2671,42 @@ pub const Surface = struct {
 /// A point beyond the client area, past the corner farthest from `press`
 /// on each axis. The core clamps it to that corner's cell
 /// (the `.grid` arm of `renderer.size.Coordinate.convert`).
+/// Make `wd`, the asking window's working directory, the new window's, as
+/// the macOS runtime does (`Surface.init` in src/apprt/embedded.zig): only
+/// when it is an existing directory, otherwise the directory `config`
+/// already names is kept. The path is copied into the config's arena, since
+/// `finalize` keeps the slice it is given when there is nothing to expand.
+///
+/// No surface on Windows reports a working directory yet (the core's
+/// `reportPwd` ignores OSC 7 here), so today this is reached only once
+/// that changes.
+fn inheritWorkingDirectory(config: *configpkg.Config, wd: []const u8) void {
+    if (wd.len == 0) return;
+    var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
+        log.warn("cannot open the inherited working directory dir={s} err={}", .{ wd, err });
+        return;
+    };
+    defer dir.close(global.io());
+    const stat = dir.stat(global.io()) catch |err| {
+        log.warn("cannot stat the inherited working directory dir={s} err={}", .{ wd, err });
+        return;
+    };
+    if (stat.kind != .directory) {
+        log.warn("the inherited working directory is not a directory dir={s}", .{wd});
+        return;
+    }
+    const path = config.arenaAlloc().dupe(u8, wd) catch |err| {
+        log.warn("cannot keep the inherited working directory err={}", .{err});
+        return;
+    };
+    var value: configpkg.WorkingDirectory = .{ .path = path };
+    value.finalize(config.arenaAlloc()) catch |err| {
+        log.warn("cannot finalize the inherited working directory err={}", .{err});
+        return;
+    };
+    config.@"working-directory" = value;
+}
+
 fn releasePoint(screen: renderer.ScreenSize, press: apprt.CursorPos) apprt.CursorPos {
     const w: f32 = @floatFromInt(screen.width);
     const h: f32 = @floatFromInt(screen.height);
@@ -3714,4 +3759,35 @@ test "win32: a teardown dispatched inside another waits for it" {
         try std.testing.expectEqual(deferred, surface.destroy_deferred);
         try std.testing.expectEqual(deferred, win32.IsWindow(hwnd).toBool());
     }
+}
+
+test "win32: a new window inherits only an existing working directory" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const dir_path = try tmp_dir.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir_path);
+    try tmp_dir.dir.writeFile(testing.io, .{ .sub_path = "file", .data = "" });
+    const file_path = try std.fs.path.join(alloc, &.{ dir_path, "file" });
+    defer alloc.free(file_path);
+    const missing_path = try std.fs.path.join(alloc, &.{ dir_path, "missing" });
+    defer alloc.free(missing_path);
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    const configured = config.@"working-directory";
+
+    // A file, a missing path or nothing: the configured directory stays.
+    for ([_][]const u8{ file_path, missing_path, "" }) |wd| {
+        inheritWorkingDirectory(&config, wd);
+        try testing.expectEqualDeep(configured, config.@"working-directory");
+    }
+
+    inheritWorkingDirectory(&config, dir_path);
+    const got = config.@"working-directory" orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings(dir_path, got.path);
+    // A copy in the config's arena: the caller frees its own after create.
+    try testing.expect(got.path.ptr != dir_path.ptr);
 }
