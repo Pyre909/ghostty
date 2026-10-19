@@ -491,6 +491,11 @@ pub extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow
 pub extern "user32" fn IsWindow(hwnd: HWND) callconv(.winapi) BOOL;
+/// Returns whether the window was disabled *before* the call.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablewindow
+pub extern "user32" fn EnableWindow(hwnd: HWND, enable: BOOL) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowenabled
+pub extern "user32" fn IsWindowEnabled(hwnd: HWND) callconv(.winapi) BOOL;
 
 const HMONITOR = *opaque {};
 pub const MONITOR_DEFAULTTONEAREST: DWORD = 0x00000002;

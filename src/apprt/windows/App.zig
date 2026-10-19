@@ -99,6 +99,7 @@ pub const App = struct {
     ticking: bool,
 
     /// Number of modal confirmation prompts (`confirm`) currently open.
+    /// Changed only by `beginPrompt` and `endPrompt`.
     ///
     /// A prompt runs a nested message loop, often with a core frame beneath
     /// it (`CoreSurface.close` from `keyCallback`, a clipboard confirmation
@@ -425,6 +426,40 @@ pub const App = struct {
     /// it cannot wait on threads that are blocked on that undrained mailbox.
     pub fn canReenterCore(self: *const App) bool {
         return !self.ticking and self.prompt_depth == 0;
+    }
+
+    /// Enter a modal prompt (`dialog.confirm`, `dialog.notice`) owned by
+    /// `owner`, or by no window.
+    ///
+    /// No surface can be used while a prompt is open: ticks stop
+    /// (`canReenterCore`), so every window's output pauses, and input does
+    /// not reach the core. MessageBoxW disables only its owner, though, so
+    /// the outermost prompt disables every other surface window as well,
+    /// and `endPrompt` enables them again. A window that was already
+    /// disabled is left as it was.
+    ///
+    /// Surfaces are not created while a prompt is open (only `run` creates
+    /// them) and their teardown is deferred, so `endPrompt` finds the
+    /// windows disabled here.
+    pub fn beginPrompt(self: *App, owner: ?win32.HWND) void {
+        self.prompt_depth += 1;
+        if (self.prompt_depth > 1) return;
+        for (self.surfaces.items) |surface| {
+            if (owner != null and surface.hwnd == owner.?) continue;
+            if (win32.EnableWindow(surface.hwnd, .FALSE).toBool()) continue;
+            surface.prompt_disabled = true;
+        }
+    }
+
+    /// Leave the prompt entered by the matching `beginPrompt`.
+    pub fn endPrompt(self: *App) void {
+        self.prompt_depth -= 1;
+        if (self.prompt_depth > 0) return;
+        for (self.surfaces.items) |surface| {
+            if (!surface.prompt_disabled) continue;
+            surface.prompt_disabled = false;
+            _ = win32.EnableWindow(surface.hwnd, .TRUE);
+        }
     }
 
     /// Re-post WM_GHOSTTY_DESTROY for every surface whose teardown was
@@ -1275,4 +1310,69 @@ test "win32: only an armed quit timer expires" {
         _ = App.wndProc(hwnd, win32.WM_TIMER, quit_timer_id, 0);
         try std.testing.expectEqual(c.want, app.quit_timer);
     }
+}
+
+test "win32: a prompt disables the other windows until the outermost one ends" {
+    // MessageBoxW disables only its owner; the rest is beginPrompt's.
+    // Hidden top-level windows stand in for the surfaces' windows.
+    const testWindow = struct {
+        fn create() !win32.HWND {
+            return win32.CreateWindowExW(
+                0,
+                L("STATIC"),
+                null,
+                0,
+                0,
+                0,
+                0,
+                0,
+                null,
+                null,
+                null,
+                null,
+            ) orelse error.TestUnexpectedResult;
+        }
+    }.create;
+    const owner = try testWindow();
+    defer _ = win32.DestroyWindow(owner);
+    const other = try testWindow();
+    defer _ = win32.DestroyWindow(other);
+    const off = try testWindow();
+    defer _ = win32.DestroyWindow(off);
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var a: Surface = undefined;
+        var b: Surface = undefined;
+        var c: Surface = undefined;
+    };
+    s.a.hwnd = owner;
+    s.b.hwnd = other;
+    s.c.hwnd = off;
+    for ([_]*Surface{ &s.a, &s.b, &s.c }) |surface| surface.prompt_disabled = false;
+
+    var app: App = undefined;
+    app.prompt_depth = 0;
+    app.surfaces = .empty;
+    defer app.surfaces.deinit(std.testing.allocator);
+    try app.surfaces.appendSlice(std.testing.allocator, &.{ &s.a, &s.b, &s.c });
+
+    // Disabled by something else, so not the prompt's to enable.
+    _ = win32.EnableWindow(off, .FALSE);
+
+    app.beginPrompt(owner);
+    try std.testing.expect(win32.IsWindowEnabled(owner).toBool());
+    try std.testing.expect(!win32.IsWindowEnabled(other).toBool());
+
+    // A nested prompt, here owned by no window, changes nothing, and
+    // neither does its end.
+    app.beginPrompt(null);
+    try std.testing.expect(win32.IsWindowEnabled(owner).toBool());
+    app.endPrompt();
+    try std.testing.expect(!win32.IsWindowEnabled(other).toBool());
+
+    app.endPrompt();
+    try std.testing.expectEqual(0, app.prompt_depth);
+    try std.testing.expect(win32.IsWindowEnabled(other).toBool());
+    try std.testing.expect(!win32.IsWindowEnabled(off).toBool());
 }

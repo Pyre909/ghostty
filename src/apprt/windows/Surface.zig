@@ -110,6 +110,10 @@ pub const Surface = struct {
     /// Keyboard focus, from WM_SETFOCUS / WM_KILLFOCUS. See `mouseMods`.
     focused: bool,
 
+    /// Disabled by `App.beginPrompt` for a prompt in another window, for
+    /// `App.endPrompt` to enable again.
+    prompt_disabled: bool,
+
     /// Mouse state, and what the core is still owed. See `Mouse`.
     mouse: Mouse,
 
@@ -575,6 +579,7 @@ pub const Surface = struct {
             .shift = .{},
             .modal_loops = 0,
             .focused = false,
+            .prompt_disabled = false,
             .mouse = .init(),
         };
 

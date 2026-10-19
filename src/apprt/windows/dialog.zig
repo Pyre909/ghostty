@@ -28,15 +28,16 @@ pub const ConfirmDefault = enum {
 /// MessageBoxW runs a nested message loop. `prompt_depth` tells every
 /// handler dispatched inside it that a core frame is probably beneath: no
 /// ticks and no surface teardown until it returns (`App.canReenterCore`).
-/// Output from every surface pauses while a prompt is open.
+/// Output from every surface pauses while a prompt is open, so the prompt
+/// is modal to every window, not only to `hwnd` (`App.beginPrompt`).
 pub fn confirm(
     app: *App,
     hwnd: ?win32.HWND,
     text: win32.LPCWSTR,
     default: ConfirmDefault,
 ) bool {
-    app.prompt_depth += 1;
-    defer app.prompt_depth -= 1;
+    app.beginPrompt(hwnd);
+    defer app.endPrompt();
     return win32.MessageBoxW(
         hwnd,
         text,
@@ -47,8 +48,8 @@ pub fn confirm(
 
 /// The OK-only form of `confirm`, with the same nesting rules.
 pub fn notice(app: *App, hwnd: win32.HWND, text: win32.LPCWSTR) void {
-    app.prompt_depth += 1;
-    defer app.prompt_depth -= 1;
+    app.beginPrompt(hwnd);
+    defer app.endPrompt();
     _ = win32.MessageBoxW(hwnd, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);
 }
 

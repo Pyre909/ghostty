@@ -27,7 +27,9 @@
 //!     for its surface's threads (`App.waitForThread`); another one
 //!     dispatched there waits until the first has finished (`App.stopping`).
 //!   * **`core_app.tick` never reenters itself**, and never runs while a
-//!     modal confirmation prompt is up (`App.canReenterCore`).
+//!     modal confirmation prompt is up (`App.canReenterCore`). A prompt
+//!     is therefore modal to every window, not only its own
+//!     (`App.beginPrompt`).
 //!
 //! ## What is still missing
 //!
