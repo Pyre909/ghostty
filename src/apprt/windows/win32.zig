@@ -489,6 +489,8 @@ pub extern "imm32" fn ImmNotifyIME(himc: HIMC, action: DWORD, index: DWORD, valu
 pub extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isiconic
 pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow
+pub extern "user32" fn IsWindow(hwnd: HWND) callconv(.winapi) BOOL;
 
 const HMONITOR = *opaque {};
 pub const MONITOR_DEFAULTTONEAREST: DWORD = 0x00000002;

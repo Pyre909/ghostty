@@ -74,7 +74,8 @@ pub const Surface = struct {
     closing: bool,
 
     /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
-    /// (`App.canReenterCore` was false). `App.run` re-posts it.
+    /// (`App.canReenterCore` was false, or another surface's teardown was
+    /// running, `App.stopping`). `App.run` re-posts it.
     destroy_deferred: bool,
 
     /// Who put the text that is in the core's preedit slot: a dead key
@@ -709,6 +710,12 @@ pub const Surface = struct {
         if (self.core_state != .live) return;
         self.core_state = .stopping;
 
+        // Counted for the whole teardown, the waits included: they pump
+        // messages, and destroyPosted defers any other teardown dispatched
+        // meanwhile.
+        self.app.stopping += 1;
+        defer self.app.stopping -= 1;
+
         // A drag in progress ends with the core. Button messages for a
         // `.stopping` surface are not handled, so nothing else would release
         // the capture while this pumps messages (App.waitForThread).
@@ -781,7 +788,11 @@ pub const Surface = struct {
     /// the message is only ever posted. When a core frame or prompt is
     /// nonetheless beneath that loop (`App.canReenterCore`), the teardown is
     /// deferred to `run` instead: its pump would tick, and waiting there
-    /// could wait on threads blocked behind the undrained mailbox.
+    /// could wait on threads blocked behind the undrained mailbox. So is a
+    /// teardown dispatched by another surface's teardown (`App.stopping`),
+    /// from the pump in its wait: it would nest a second wait inside the
+    /// first, and with several windows closing at once each would nest
+    /// inside the last.
     ///
     /// **`self` is freed by the `destroy` at the end**. Nothing may touch it
     /// afterwards, which is why the function ends at that call.
@@ -791,7 +802,7 @@ pub const Surface = struct {
         // terminate drives teardown itself; see App.terminate.
         if (app.terminating) return;
 
-        if (!app.canReenterCore()) {
+        if (!app.canReenterCore() or app.stopping > 0) {
             self.destroy_deferred = true;
             return;
         }
@@ -3622,4 +3633,54 @@ test "win32: modal loops are counted per window and returned on destroy" {
     try std.testing.expectEqual(0, app.modal_loop_depth);
     _ = s.b.handleMessage(hwnd, win32.WM_EXITMENULOOP, 0, 0);
     try std.testing.expectEqual(0, app.modal_loop_depth);
+}
+
+test "win32: a teardown dispatched inside another waits for it" {
+    // A teardown pumps messages while it waits for its surface's threads
+    // (App.waitForThread), so another window's WM_GHOSTTY_DESTROY can be
+    // dispatched inside it. That one is deferred to `run` while the first
+    // is still on the stack, and runs at once otherwise. A message-only
+    // window stands in for the surface's: with no core surface, a teardown
+    // that runs only destroys it.
+    var app: App = undefined;
+    app.terminating = false;
+    app.ticking = false;
+    app.prompt_depth = 0;
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var surface: Surface = undefined;
+    };
+    const surface = &s.surface;
+    surface.app = &app;
+    surface.core_state = .none;
+
+    for ([_]u32{ 1, 0 }) |stopping| {
+        const hwnd = win32.CreateWindowExW(
+            0,
+            L("STATIC"),
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            win32.HWND_MESSAGE,
+            null,
+            null,
+            null,
+        ) orelse return error.TestUnexpectedResult;
+        defer if (win32.IsWindow(hwnd).toBool()) {
+            _ = win32.DestroyWindow(hwnd);
+        };
+        surface.hwnd = hwnd;
+        surface.destroy_deferred = false;
+        app.stopping = stopping;
+
+        _ = surface.handleMessage(hwnd, WM_GHOSTTY_DESTROY, 0, 0);
+
+        const deferred = stopping > 0;
+        try std.testing.expectEqual(deferred, surface.destroy_deferred);
+        try std.testing.expectEqual(deferred, win32.IsWindow(hwnd).toBool());
+    }
 }

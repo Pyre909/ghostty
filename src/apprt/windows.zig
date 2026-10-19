@@ -23,6 +23,9 @@
 //!     `CoreSurface.deinit` would free memory those frames still use. Every
 //!     close therefore posts `WM_GHOSTTY_DESTROY` and the teardown runs later,
 //!     from a message loop (`Surface.destroyPosted`).
+//!   * **Teardowns do not nest.** A teardown pumps messages while it waits
+//!     for its surface's threads (`App.waitForThread`); another one
+//!     dispatched there waits until the first has finished (`App.stopping`).
 //!   * **`core_app.tick` never reenters itself**, and never runs while a
 //!     modal confirmation prompt is up (`App.canReenterCore`).
 //!

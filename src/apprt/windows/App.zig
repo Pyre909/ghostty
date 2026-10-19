@@ -112,6 +112,15 @@ pub const App = struct {
     /// instead; see `wndProc`.
     modal_loop_depth: u32,
 
+    /// Number of surface teardowns (`Surface.stopCore`) on the stack.
+    ///
+    /// A teardown pumps messages while it waits for the surface's threads
+    /// (`waitForThread`), so another window's WM_GHOSTTY_DESTROY can be
+    /// dispatched inside it. `Surface.destroyPosted` defers that one while
+    /// this is non-zero, and `run` re-posts it: teardowns run one after
+    /// another, never one inside another's wait.
+    stopping: u32,
+
     /// Set for the whole of `terminate`. Teardown is driven from there
     /// synchronously, so posted closes and destroys are ignored meanwhile.
     terminating: bool,
@@ -248,6 +257,7 @@ pub const App = struct {
             .ticking = false,
             .prompt_depth = 0,
             .modal_loop_depth = 0,
+            .stopping = 0,
             .terminating = false,
         };
 
