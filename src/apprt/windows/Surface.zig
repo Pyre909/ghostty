@@ -551,11 +551,24 @@ pub const Surface = struct {
         };
     };
 
+    /// What a new window takes from the window it was asked from.
+    pub const Options = struct {
+        /// The font size in points to use instead of the configured one:
+        /// the asking window's, with `window-inherit-font-size`, as on
+        /// macOS (`newSurfaceOptions` in src/apprt/embedded.zig). Null for
+        /// the configured size.
+        ///
+        /// The working directory needs no option: `apprt.surface.newConfig`
+        /// already takes it from the focused surface, which is the asking
+        /// one when a key asked.
+        font_size: ?f32 = null,
+    };
+
     /// Heap-allocate and initialize, including the core surface. The address
     /// must be stable: the core stores raw `*apprt.Surface` pointers
     /// (see `CoreSurface.init`), and the wndproc recovers this pointer from
     /// GWLP_USERDATA.
-    pub fn create(app: *App) !*Surface {
+    pub fn create(app: *App, opts: Options) !*Surface {
         const alloc = app.core_app.alloc;
         const self = try alloc.create(Surface);
         errdefer alloc.destroy(self);
@@ -625,6 +638,19 @@ pub const Surface = struct {
         // Nothing below can fail, so the core surface needs no errdefer.
         errdefer comptime unreachable;
         self.core_state = .live;
+
+        // An inherited font size is applied after init, as the macOS
+        // runtime does, so that `reset_font_size` still goes back to the
+        // configured size (`original_font_size`). Before the window is
+        // sized below: the cell size it changes makes the core send
+        // `.initial_size` again (`CoreSurface.setCellSize`). A failure
+        // leaves the configured size.
+        if (opts.font_size) |points| {
+            var size = self.core_surface.font_size;
+            size.points = points;
+            self.core_surface.setFontSize(size) catch |err|
+                log.warn("unable to apply the inherited font size err={}", .{err});
+        }
 
         // Size the still-hidden window to `window-width`/`window-height`
         // before it is first shown, so it never appears at the default size.

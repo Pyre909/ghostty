@@ -338,7 +338,7 @@ pub const App = struct {
         // fatal, as no window would exist; failing to open a later one is
         // only reported (`createRequestedWindows`).
         if (self.config.@"initial-window") {
-            _ = self.newWindow() catch |err| {
+            _ = self.newWindow(null) catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
                 fatalNotice(err);
                 return err;
@@ -977,7 +977,7 @@ pub const App = struct {
         if (self.quit) return;
 
         while (self.nextWindowRequest()) |request| {
-            _ = self.newWindow() catch |err| {
+            _ = self.newWindow(request.parent) catch |err| {
                 log.err("failed to create a window err={}", .{err});
                 notice(
                     self,
@@ -989,15 +989,21 @@ pub const App = struct {
     }
 
     /// Create a terminal window: the initial one (`run`), or one the core
-    /// asked for (`createRequestedWindows`).
-    fn newWindow(self: *App) !*Surface {
+    /// asked for (`createRequestedWindows`) from `parent`, a live surface.
+    fn newWindow(self: *App, parent: ?*CoreSurface) !*Surface {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
 
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
         // itself, so there is no quit-timer handling here.
-        const surface = try Surface.create(self);
+        const surface = try Surface.create(self, .{
+            .font_size = font_size: {
+                const p = parent orelse break :font_size null;
+                if (!self.config.@"window-inherit-font-size") break :font_size null;
+                break :font_size p.font_size.points;
+            },
+        });
         errdefer comptime unreachable;
         self.surfaces.appendAssumeCapacity(surface);
 
