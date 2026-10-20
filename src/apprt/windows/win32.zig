@@ -429,6 +429,25 @@ pub extern "user32" fn SetWindowPos(
     cy: c_int,
     flags: UINT,
 ) callconv(.winapi) BOOL;
+/// A pending batch of window positions (BeginDeferWindowPos).
+pub const HDWP = *opaque {};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-begindeferwindowpos
+pub extern "user32" fn BeginDeferWindowPos(count: c_int) callconv(.winapi) ?HDWP;
+/// Returns the batch to pass on, possibly a new handle, or null on failure,
+/// when the caller is to abandon the batch and not call EndDeferWindowPos.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-deferwindowpos
+pub extern "user32" fn DeferWindowPos(
+    batch: HDWP,
+    hwnd: HWND,
+    after: ?HWND,
+    x: c_int,
+    y: c_int,
+    cx: c_int,
+    cy: c_int,
+    flags: UINT,
+) callconv(.winapi) ?HDWP;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enddeferwindowpos
+pub extern "user32" fn EndDeferWindowPos(batch: HDWP) callconv(.winapi) BOOL;
 pub extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HCURSOR;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadiconw
 pub extern "user32" fn LoadIconW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HICON;

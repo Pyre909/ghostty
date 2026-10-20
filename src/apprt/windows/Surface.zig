@@ -711,13 +711,35 @@ pub const Surface = struct {
     }
 
     /// Stop the core surface, then destroy the window it is in, its only
-    /// terminal. Returns whether the window was destroyed; **when it was,
-    /// `self` has been freed** (WM_DESTROY -> App.surfaceDestroyed), and so
-    /// has the window (WM_NCDESTROY -> App.windowDestroyed), and nothing may
-    /// touch either.
+    /// terminal until splits can be opened. Returns whether the window was
+    /// destroyed; **when it was, `self` has been freed** (WM_DESTROY ->
+    /// App.surfaceDestroyed), and so has the window (WM_NCDESTROY ->
+    /// App.windowDestroyed), and nothing may touch either.
     pub fn destroy(self: *Surface) bool {
         self.stopCore();
         return win32.DestroyWindow(self.window.hwnd).toBool();
+    }
+
+    /// Undo a `create` that succeeded, for a terminal no window holds yet:
+    /// stop its core, destroy its window, and free it. Its window's
+    /// WM_DESTROY frees nothing, as it is not in `App.surfaces`.
+    pub fn discard(self: *Surface) void {
+        const alloc = self.app.core_app.alloc;
+        self.stopCore();
+        _ = win32.DestroyWindow(self.hwnd);
+        self.deinit();
+        alloc.destroy(self);
+    }
+
+    /// `Window.Tree` holds its terminals by pointer and counts no
+    /// references: a terminal is owned by `App.surfaces` (see Window.zig).
+    pub fn ref(self: *Surface) *Surface {
+        return self;
+    }
+
+    /// See `ref`.
+    pub fn unref(self: *Surface) void {
+        _ = self;
     }
 
     /// The core surface, if message handlers may call into it.
@@ -950,29 +972,9 @@ pub const Surface = struct {
         return .{ .x = scale, .y = scale };
     }
 
-    /// This window's DPI, falling back to the reference 96 when it cannot be
-    /// determined. Never returns 0: scaling by zero would silently produce a
-    /// zero-size grid rather than an error anybody could see.
+    /// This window's DPI (`Window.dpiOf`).
     fn dpi(self: *const Surface) u32 {
-        // Resolved at runtime, not statically imported -- GetDpiForWindow does
-        // not exist before Windows 10 1607 and a static import would stop the
-        // binary loading there at all. See App.init.
-        if (self.app.get_dpi_for_window) |f| {
-            // Returns 0 for an invalid window.
-            const v = f(self.hwnd);
-            if (v != 0) return v;
-        }
-
-        // Pre-1607 fallback. This is the *correct* answer on those versions:
-        // they have no per-monitor DPI, so the system-wide value is the only
-        // one there is.
-        if (win32.GetDC(null)) |screen| {
-            defer _ = win32.ReleaseDC(null, screen);
-            const v = win32.GetDeviceCaps(screen, win32.LOGPIXELSX);
-            if (v > 0) return @intCast(v);
-        }
-
-        return win32.USER_DEFAULT_SCREEN_DPI;
+        return Window.dpiOf(self.app, self.hwnd);
     }
 
     /// Client area in physical pixels.
@@ -1321,6 +1323,7 @@ pub const Surface = struct {
 
             win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
                 self.focused = msg == win32.WM_SETFOCUS;
+                if (self.focused) self.window.focused = self;
 
                 if (!self.focused) {
                     // A drag does not survive losing focus (Alt+Tab, a

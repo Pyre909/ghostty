@@ -1035,7 +1035,7 @@ pub const App = struct {
         });
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
-        self.surfaces.appendAssumeCapacity(window.surface.?);
+        self.surfaces.appendAssumeCapacity(window.focused.?);
 
         // Shown once both are owned, so that its first messages find them.
         window.show();
@@ -1060,7 +1060,9 @@ pub const App = struct {
         _ = win32.SetWindowLongPtrW(surface.hwnd, win32.GWLP_USERDATA, 0);
 
         _ = self.surfaces.swapRemove(idx);
-        if (surface.window.surface == surface) surface.window.surface = null;
+        // Gone once the frame is destroyed (its WM_DESTROY); this only
+        // keeps it from ever dangling.
+        if (surface.window.focused == surface) surface.window.focused = null;
         surface.deinit();
         self.core_app.alloc.destroy(surface);
 
@@ -1069,7 +1071,7 @@ pub const App = struct {
         // when the core's last surface goes (`CoreApp.deleteSurface`).
     }
 
-    /// Called from the frame's WM_NCDESTROY, after its terminal's
+    /// Called from the frame's WM_NCDESTROY, after its terminals'
     /// WM_DESTROY, and by `terminate` for a window that could not be
     /// destroyed. The ownership invariant of `surfaceDestroyed` holds for
     /// `self.windows` too: `Window.create` destroys a frame it has not
@@ -1082,6 +1084,9 @@ pub const App = struct {
         _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_USERDATA, 0);
 
         _ = self.windows.swapRemove(idx);
+        // Empty already unless `terminate` gave up on the frame, which then
+        // had no WM_DESTROY.
+        window.tree.deinit();
         self.core_app.alloc.destroy(window);
     }
 
@@ -1601,38 +1606,35 @@ test "win32: a prompt belongs to a top-level window" {
     try std.testing.expectEqual(frame, app.promptOwner(frame).?);
 }
 
-test "win32: a window's terminal fills it, and both are freed once" {
-    // The real classes and window procedures, with no core surface, so that
-    // a teardown only frees. Both windows stay hidden and are never
-    // activated.
-    const alloc = std.testing.allocator;
-    var core_app: CoreApp = undefined;
-    core_app.alloc = alloc;
-
-    var app: App = undefined;
-    app.core_app = &core_app;
+/// For tests: an app with only what the frame and terminal window
+/// procedures read when nothing has a core surface. `core_app.alloc` must
+/// be set; the caller registers the classes (`registerClasses`).
+fn testApp(app: *App, core_app: *CoreApp) void {
+    app.core_app = core_app;
     app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
+    app.get_dpi_for_window = null;
     app.modal_loop_depth = 0;
+    app.terminating = false;
     app.surfaces = .empty;
-    defer app.surfaces.deinit(alloc);
     app.windows = .empty;
-    defer app.windows.deinit(alloc);
-    try app.surfaces.ensureUnusedCapacity(alloc, 1);
+}
+
+/// For tests: a hidden frame of the real class, owned by `app` as one
+/// `newWindow` made, with no terminal yet.
+fn testFrame(app: *App) !*Window {
+    const alloc = app.core_app.alloc;
     try app.windows.ensureUnusedCapacity(alloc, 1);
-
-    try registerClasses(app.hinstance);
-    defer unregisterClasses(app.hinstance);
-
     const window = try alloc.create(Window);
     window.* = .{
-        .app = &app,
+        .app = app,
         .hwnd = undefined,
-        .surface = null,
+        .tree = .empty,
+        .focused = null,
         .maximized = false,
         .modal_loops = .{},
         .prompt_disabled = false,
     };
-    const frame = win32.CreateWindowExW(
+    _ = win32.CreateWindowExW(
         0,
         L(Window.class_name),
         null,
@@ -1650,19 +1652,25 @@ test "win32: a window's terminal fills it, and both are freed once" {
         return error.TestUnexpectedResult;
     };
     app.windows.appendAssumeCapacity(window);
-    // From here the frame's WM_NCDESTROY frees `window`, and once the
-    // terminal is in `app.surfaces`, its WM_DESTROY frees the terminal.
-    errdefer _ = win32.DestroyWindow(frame);
+    return window;
+}
 
-    // Only what a terminal with no core surface reads while its window is
-    // created, resized and destroyed.
+/// For tests: a hidden terminal window of the real class in `window`,
+/// owned by `app`, with no core surface: a teardown only destroys and
+/// frees it. The caller puts it in the window's tree.
+fn testPane(app: *App, window: *Window) !*Surface {
+    const alloc = app.core_app.alloc;
+    try app.surfaces.ensureUnusedCapacity(alloc, 1);
     const surface = try alloc.create(Surface);
-    surface.app = &app;
+    surface.app = app;
     surface.window = window;
     surface.core_state = .none;
     surface.title = null;
     surface.ime = .{};
-    const pane = win32.CreateWindowExW(
+    surface.closing = false;
+    surface.destroy_deferred = false;
+    surface.focused = false;
+    _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
         null,
@@ -1671,7 +1679,7 @@ test "win32: a window's terminal fills it, and both are freed once" {
         0,
         200,
         100,
-        frame,
+        window.hwnd,
         null,
         app.hinstance,
         surface,
@@ -1679,13 +1687,48 @@ test "win32: a window's terminal fills it, and both are freed once" {
         alloc.destroy(surface);
         return error.TestUnexpectedResult;
     };
-    window.surface = surface;
     app.surfaces.appendAssumeCapacity(surface);
+    return surface;
+}
 
-    // The frame's WM_SIZE, sent even to a hidden window, resizes the
-    // terminal to the frame's new client area.
+/// For tests: destroy whatever `testFrame` and `testPane` left, which
+/// frees it all, then release the lists.
+fn testCleanup(app: *App) void {
+    const alloc = app.core_app.alloc;
+    while (app.windows.getLastOrNull()) |window| {
+        if (!win32.DestroyWindow(window.hwnd).toBool()) break;
+    }
+    app.surfaces.deinit(alloc);
+    app.windows.deinit(alloc);
+}
+
+fn clientRect(hwnd: win32.HWND) !win32.RECT {
+    var rect: win32.RECT = undefined;
+    if (!win32.GetClientRect(hwnd, &rect).toBool()) return error.TestUnexpectedResult;
+    return rect;
+}
+
+test "win32: a window's terminal fills it, and both are freed once" {
+    // The real classes and window procedures; both windows stay hidden and
+    // are never activated.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const surface = try testPane(&app, window);
+    window.tree = try .init(alloc, surface);
+    window.focused = surface;
+
+    // The frame's WM_SIZE, sent even to a hidden window, lays the terminal
+    // out over the frame's new client area.
     try std.testing.expect(win32.SetWindowPos(
-        frame,
+        window.hwnd,
         null,
         0,
         0,
@@ -1693,21 +1736,99 @@ test "win32: a window's terminal fills it, and both are freed once" {
         300,
         win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOMOVE,
     ).toBool());
-    var frame_client: win32.RECT = undefined;
-    var pane_client: win32.RECT = undefined;
-    try std.testing.expect(win32.GetClientRect(frame, &frame_client).toBool());
-    try std.testing.expect(win32.GetClientRect(pane, &pane_client).toBool());
+    const frame_client = try clientRect(window.hwnd);
     try std.testing.expect(frame_client.right > 200);
-    try std.testing.expectEqual(frame_client, pane_client);
+    try std.testing.expectEqual(frame_client, try clientRect(surface.hwnd));
 
     // DestroyWindow on the frame sends WM_DESTROY to the frame, then to the
     // terminal's window, and the frame's WM_NCDESTROY only after its child
-    // windows are gone: the terminal frees itself and leaves the window,
-    // then the window frees itself. A leak or a second free of either
-    // fails the test through the testing allocator.
-    try std.testing.expect(win32.DestroyWindow(frame).toBool());
+    // windows are gone: the frame lets go of the terminal, the terminal
+    // frees itself, then the window frees itself. A leak or a second free
+    // of either fails the test through the testing allocator.
+    try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
     try std.testing.expectEqual(0, app.surfaces.items.len);
     try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+/// For tests: where `pane` is inside its frame's client area.
+fn paneRect(window: *const Window, pane: *const Surface) !win32.RECT {
+    var screen: win32.RECT = undefined;
+    if (!win32.GetWindowRect(pane.hwnd, &screen).toBool()) return error.TestUnexpectedResult;
+    var corners = [2]win32.POINT{
+        .{ .x = screen.left, .y = screen.top },
+        .{ .x = screen.right, .y = screen.bottom },
+    };
+    for (&corners) |*pt| {
+        if (!win32.ScreenToClient(window.hwnd, pt).toBool()) return error.TestUnexpectedResult;
+    }
+    return .{
+        .left = corners[0].x,
+        .top = corners[0].y,
+        .right = corners[1].x,
+        .bottom = corners[1].y,
+    };
+}
+
+/// For tests: `panes` side by side, in this order, as splitting each one
+/// off the last to the right puts them.
+fn testRow(alloc: std.mem.Allocator, panes: []const *Surface) !Window.Tree {
+    var tree: Window.Tree = try .init(alloc, panes[0]);
+    errdefer tree.deinit();
+    for (panes[0 .. panes.len - 1], panes[1..]) |last, pane| {
+        var single: Window.Tree = try .init(alloc, pane);
+        defer single.deinit();
+        const next = try tree.split(alloc, tree.locate(last).?, .right, 0.5, &single);
+        tree.deinit();
+        tree = next;
+    }
+    return tree;
+}
+
+/// For tests: `panes` fill the window's client area side by side, in this
+/// order, a divider apart.
+fn expectRow(window: *const Window, panes: []const *Surface) !void {
+    const client = try clientRect(window.hwnd);
+    const divider = Window.dividerWidth(Window.dpiOf(window.app, window.hwnd));
+    var left: i32 = 0;
+    for (panes) |pane| {
+        const rect = try paneRect(window, pane);
+        try std.testing.expectEqual(left, rect.left);
+        try std.testing.expectEqual(@as(i32, 0), rect.top);
+        try std.testing.expectEqual(client.bottom, rect.bottom);
+        left = rect.right + divider;
+    }
+    try std.testing.expectEqual(client.right, (try paneRect(window, panes[panes.len - 1])).right);
+}
+
+test "win32: a window lays its terminals out side by side" {
+    // Where `Window.layout` says, moved and sized: both terminals start at
+    // the frame's origin, so only a move puts the second beside the first.
+    // The real classes and window procedures, with no core surfaces; the
+    // windows stay hidden.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ left, right });
+    window.focused = left;
+
+    window.relayout();
+    try expectRow(window, &.{ left, right });
+
+    // Half each, give or take the odd pixel.
+    const left_rect = try paneRect(window, left);
+    const right_rect = try paneRect(window, right);
+    const left_width = left_rect.right - left_rect.left;
+    const right_width = right_rect.right - right_rect.left;
+    try std.testing.expect(@abs(left_width - right_width) <= 1);
 }
 
 test "win32: a new window is recorded where it is asked for, and created later" {

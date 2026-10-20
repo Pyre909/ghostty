@@ -1,14 +1,18 @@
 //! A terminal window: the top-level frame, and what belongs to the window
 //! rather than to a terminal -- its size, caption, maximize state, the size
-//! Windows suggests on a DPI change, its system modal loops. The terminal is
-//! a `Surface`, a child window filling the frame's client area; a window
-//! holds exactly one. Splits will put several into one frame.
+//! Windows suggests on a DPI change, its system modal loops. Its terminals
+//! are `Surface`s, child windows the frame lays out from its split tree
+//! (`tree`, `layout`). Until splits can be opened, a window holds one.
 //!
 //! Ownership, as for surfaces (`App.surfaceDestroyed`): membership in
 //! `App.windows` is ownership of the allocation. The frame's WM_NCDESTROY,
 //! which Windows sends after its child windows are destroyed, frees a
 //! window that is in the list; one that is not yet (`create` failing) is
 //! freed by `create` itself.
+//!
+//! The tree holds its terminals by pointer and owns none of them. It never
+//! holds a freed one: the frame's WM_DESTROY, which comes before its child
+//! windows are destroyed, empties it.
 
 const Window = @This();
 
@@ -20,11 +24,16 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
+const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 
 const log = std.log.scoped(.win32);
 
 /// The frame's window class, registered in `App.init`.
 pub const class_name = "GhosttyWindowClass";
+
+/// The terminals of a window. `Surface.ref` and `Surface.unref` do
+/// nothing; see the ownership note above.
+pub const Tree = SplitTree(Surface);
 
 app: *App,
 
@@ -32,10 +41,14 @@ app: *App,
 /// it is valid in every other handler.
 hwnd: win32.HWND,
 
-/// The terminal in this window: null until `create` has made it, and again
-/// once it has been destroyed (`App.surfaceDestroyed`), which happens
-/// before the frame is (see the ownership note above).
-surface: ?*Surface,
+/// This window's terminals: never empty from `create` until the frame's
+/// WM_DESTROY empties it.
+tree: Tree,
+
+/// The terminal with the keyboard focus, or the one to give it to when the
+/// window is next activated: set by each terminal's WM_SETFOCUS. Null only
+/// while the tree is empty.
+focused: ?*Surface,
 
 /// Tracked so `.toggle_maximize` knows which way to toggle.
 maximized: bool,
@@ -59,7 +72,8 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     self.* = .{
         .app = app,
         .hwnd = undefined,
-        .surface = null,
+        .tree = .empty,
+        .focused = null,
         .maximized = false,
         .modal_loops = .{},
         .prompt_disabled = false,
@@ -86,7 +100,13 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     // that is in App.windows, which this one is not yet.
     errdefer _ = win32.DestroyWindow(hwnd);
 
-    self.surface = try Surface.create(app, self, opts);
+    const surface = try Surface.create(app, self, opts);
+    // Nothing owns the terminal until it is in the tree.
+    self.tree = Tree.init(alloc, surface) catch |err| {
+        surface.discard();
+        return err;
+    };
+    self.focused = surface;
     return self;
 }
 
@@ -95,7 +115,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
 /// the size already sent one) reach the terminal from here; its core is
 /// live by now.
 pub fn show(self: *Window) void {
-    if (self.surface) |surface| {
+    if (self.focused) |surface| {
         if (surface.initial_size) |size| {
             applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
         }
@@ -140,10 +160,11 @@ fn handleMessage(
 ) win32.LRESULT {
     switch (msg) {
         // The title bar button, Alt+F4 when no binding consumed it, and the
-        // window menu's Close: the window closes with its terminal.
+        // window menu's Close: the window closes with its terminal, the only
+        // one it holds until splits can be opened.
         win32.WM_CLOSE => {
             if (self.app.terminating) return 0;
-            if (self.surface) |surface| {
+            if (self.focused) |surface| {
                 surface.requestClose();
             } else {
                 // Nothing left inside: frees `self` (WM_NCDESTROY).
@@ -153,49 +174,45 @@ fn handleMessage(
         },
 
         win32.WM_SIZE => {
-            const surface = self.surface orelse return 0;
             const minimized = wparam == win32.SIZE_MINIMIZED;
             // A child window is not resized when its frame is minimized
             // or restored at the same size, so it never sees either:
             // report the visibility from here. The core ignores repeats.
-            surface.occlusionChanged(!minimized);
+            var it = self.tree.iterator();
+            while (it.next()) |entry| entry.view.occlusionChanged(!minimized);
 
-            // A minimized frame reports a 0x0 client area. The terminal
-            // keeps its size, since the core clamps the grid to at least
+            // A minimized frame reports a 0x0 client area. The terminals
+            // keep their sizes, since the core clamps the grid to at least
             // 1x1 and would reflow every line to one column and back.
             if (minimized) return 0;
 
-            // Fill the client area. SetWindowPos sends the terminal its
-            // WM_SIZE synchronously, which resizes its core.
-            var client: win32.RECT = undefined;
-            if (!win32.GetClientRect(hwnd, &client).toBool()) return 0;
-            _ = win32.SetWindowPos(
-                surface.hwnd,
-                null,
-                0,
-                0,
-                client.right - client.left,
-                client.bottom - client.top,
-                win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
-            );
+            // Each terminal gets its WM_SIZE synchronously, which resizes
+            // its core.
+            self.relayout();
             return 0;
         },
 
         win32.WM_DPICHANGED => {
-            // The new scale first: the suggested rect below resizes the
-            // terminal synchronously, and its core must see the scale
-            // before the size computed for it. A child window gets no
-            // WM_DPICHANGED of its own. wParam carries the new DPI in both
-            // words; they are always equal for a window.
-            if (self.surface) |surface| surface.scaleChanged(win32.hiword(wparam));
+            // The new scale first: the suggested rect below lays the
+            // terminals out synchronously, and their cores must see the
+            // scale before the sizes computed for them. A child window gets
+            // no WM_DPICHANGED of its own. wParam carries the new DPI in
+            // both words; they are always equal for a window.
+            var it = self.tree.iterator();
+            while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
             applySuggestedRect(hwnd, lparam);
+
+            // The rect lays the terminals out through WM_SIZE only if it
+            // changes the client size, but the divider width depends on the
+            // DPI too. Terminals already in place get no second WM_SIZE.
+            self.relayout();
             return 0;
         },
 
-        // Keyboard focus belongs to the terminal: the frame gets it on
+        // Keyboard focus belongs to a terminal: the frame gets it on
         // activation (DefWindowProcW's WM_ACTIVATE), and passes it on.
         win32.WM_SETFOCUS => {
-            if (self.surface) |surface| _ = win32.SetFocus(surface.hwnd);
+            if (self.focused) |surface| _ = win32.SetFocus(surface.hwnd);
             return 0;
         },
 
@@ -212,7 +229,7 @@ fn handleMessage(
         // Sent to the top-level window, not to the terminal with the focus.
         win32.WM_SYSCOMMAND => if (isBareKeyMenu(wparam, lparam)) return 0,
 
-        // The terminal covers the whole client area.
+        // The terminals cover the whole client area.
         win32.WM_ERASEBKGND => return 1,
 
         win32.WM_DESTROY => {
@@ -222,6 +239,13 @@ fn handleMessage(
             // Otherwise every later wakeup would tick from whatever loop
             // dispatched it.
             self.modal_loops.release(&self.app.modal_loop_depth);
+
+            // The child windows are destroyed next, and each frees its
+            // terminal (App.surfaceDestroyed): the tree lets go of them
+            // first. Nothing lays the window out after this.
+            self.tree.deinit();
+            self.tree = .empty;
+            self.focused = null;
             return 0;
         },
 
@@ -235,6 +259,149 @@ fn handleMessage(
     }
 
     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/// Lay the terminals out over the client area (`layout`). Not while the
+/// window is minimized and its client area is empty (see WM_SIZE).
+pub fn relayout(self: *Window) void {
+    if (self.tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
+    const divider = dividerWidth(dpiOf(self.app, self.hwnd));
+
+    // One batch, so that the terminals move together.
+    const count = std.math.lossyCast(c_int, self.tree.nodes.len);
+    var placer: Placer = .{ .batch = win32.BeginDeferWindowPos(count) };
+    layout(&self.tree, client, divider, &placer);
+    if (placer.batch) |batch| {
+        if (win32.EndDeferWindowPos(batch).toBool()) return;
+    } else if (!placer.dropped) {
+        // There was no batch, and each terminal is already in place.
+        return;
+    }
+
+    // The batch failed, and none of its positions were applied: each
+    // terminal is placed on its own instead.
+    var direct: Placer = .{ .batch = null };
+    layout(&self.tree, client, divider, &direct);
+}
+
+/// Moves each terminal where `layout` puts it: in a batch while there is
+/// one, else at once.
+const Placer = struct {
+    batch: ?win32.HDWP,
+
+    /// A DeferWindowPos failed. The batch is then abandoned, as its
+    /// documentation says, so none of its positions are applied.
+    dropped: bool = false,
+
+    // Not SWP_NOCOPYBITS: it would repaint a terminal on every step of a
+    // shrink, which the class styles avoid (`App.registerClasses`), and a
+    // flip-model swap chain moves with its window.
+    const flags = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE;
+
+    pub fn pane(self: *Placer, surface: *Surface, rect: win32.RECT) void {
+        if (self.dropped) return;
+        const w = rect.right - rect.left;
+        const h = rect.bottom - rect.top;
+        if (self.batch) |batch| {
+            self.batch = win32.DeferWindowPos(batch, surface.hwnd, null, rect.left, rect.top, w, h, flags);
+            self.dropped = self.batch == null;
+        } else {
+            _ = win32.SetWindowPos(surface.hwnd, null, rect.left, rect.top, w, h, flags);
+        }
+    }
+
+    /// The frame has nothing in the gaps yet: a window holds one terminal.
+    pub fn divider(self: *Placer, rect: win32.RECT) void {
+        _ = self;
+        _ = rect;
+    }
+};
+
+/// Where each terminal of `tree` goes in `area`, and the dividers between
+/// them, in whole pixels: `ctx.pane(view, rect)` for every leaf and
+/// `ctx.divider(rect)` for every split. A split gives `divider` pixels to
+/// the line between its sides, fewer if it is narrower than that, and
+/// divides the rest by its ratio, to the nearest pixel, so that the panes
+/// and dividers tile `area` exactly. `tree.spatial` describes the same
+/// layout without dividers, but normalized to f16, which is up to two
+/// pixels off at 3840 pixels across.
+///
+/// Generic over the tree so that tests can lay out a tree of their own.
+pub fn layout(tree: anytype, area: win32.RECT, divider: i32, ctx: anytype) void {
+    if (tree.isEmpty()) return;
+    layoutNode(tree, .root, area, divider, ctx);
+}
+
+fn layoutNode(
+    tree: anytype,
+    handle: @TypeOf(tree.*).Node.Handle,
+    area: win32.RECT,
+    divider: i32,
+    ctx: anytype,
+) void {
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |view| ctx.pane(view, area),
+        .split => |s| {
+            const across = s.layout == .horizontal;
+            const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
+            const line = std.math.clamp(divider, 0, total);
+            const rest = total - line;
+            const scaled = @round(@as(f32, @floatFromInt(rest)) * @as(f32, s.ratio));
+            const first = std.math.clamp(std.math.lossyCast(i32, scaled), 0, rest);
+
+            var a = area;
+            var d = area;
+            var b = area;
+            if (across) {
+                a.right = area.left + first;
+                d.left = a.right;
+                d.right = d.left + line;
+                b.left = d.right;
+            } else {
+                a.bottom = area.top + first;
+                d.top = a.bottom;
+                d.bottom = d.top + line;
+                b.top = d.bottom;
+            }
+            if (line > 0) ctx.divider(d);
+            layoutNode(tree, s.left, a, divider, ctx);
+            layoutNode(tree, s.right, b, divider, ctx);
+        },
+    }
+}
+
+/// The width of the line between two terminals: a pixel at 96 DPI, scaled
+/// to the nearest whole pixel (halves up) and never less than one.
+pub fn dividerWidth(dpi: u32) i32 {
+    const base = win32.USER_DEFAULT_SCREEN_DPI;
+    return @intCast(@max(1, (dpi +| base / 2) / base));
+}
+
+/// The DPI of `hwnd`, falling back to the reference 96 when it cannot be
+/// determined. Never returns 0: scaling by zero would silently produce a
+/// zero-size grid rather than an error anybody could see.
+pub fn dpiOf(app: *const App, hwnd: win32.HWND) u32 {
+    // Resolved at runtime, not statically imported -- GetDpiForWindow does
+    // not exist before Windows 10 1607 and a static import would stop the
+    // binary loading there at all. See App.init.
+    if (app.get_dpi_for_window) |f| {
+        // Returns 0 for an invalid window.
+        const v = f(hwnd);
+        if (v != 0) return v;
+    }
+
+    // Pre-1607 fallback. This is the *correct* answer on those versions:
+    // they have no per-monitor DPI, so the system-wide value is the only
+    // one there is.
+    if (win32.GetDC(null)) |screen| {
+        defer _ = win32.ReleaseDC(null, screen);
+        const v = win32.GetDeviceCaps(screen, win32.LOGPIXELSX);
+        if (v > 0) return @intCast(v);
+    }
+
+    return win32.USER_DEFAULT_SCREEN_DPI;
 }
 
 /// Resize the window so its client area is `size` scaled by `scale`, the
@@ -454,6 +621,222 @@ test "win32: an initial size is kept inside the monitor work area" {
     );
 }
 
+/// For the layout tests: a view with a name and no reference count.
+const TestPane = struct {
+    name: u8,
+
+    pub fn ref(self: *TestPane) *TestPane {
+        return self;
+    }
+
+    pub fn unref(self: *TestPane) void {
+        _ = self;
+    }
+};
+
+const TestTree = SplitTree(TestPane);
+
+/// What `layout` reports, kept for the layout tests.
+const TestLayout = struct {
+    panes: [8]Pane = undefined,
+    pane_count: usize = 0,
+    dividers: [8]win32.RECT = undefined,
+    divider_count: usize = 0,
+
+    const Pane = struct { view: *TestPane, rect: win32.RECT };
+
+    pub fn pane(self: *TestLayout, view: *TestPane, rect: win32.RECT) void {
+        self.panes[self.pane_count] = .{ .view = view, .rect = rect };
+        self.pane_count += 1;
+    }
+
+    pub fn divider(self: *TestLayout, rect: win32.RECT) void {
+        self.dividers[self.divider_count] = rect;
+        self.divider_count += 1;
+    }
+
+    fn rectOf(self: *const TestLayout, view: *const TestPane) win32.RECT {
+        for (self.panes[0..self.pane_count]) |p| {
+            if (p.view == view) return p.rect;
+        }
+        unreachable;
+    }
+
+    /// The panes and dividers cover `area` exactly once: every rect lies
+    /// inside it, no two overlap, and together they are as large as it.
+    fn expectTiles(self: *const TestLayout, area: win32.RECT) !void {
+        var rects: [16]win32.RECT = undefined;
+        var n: usize = 0;
+        for (self.panes[0..self.pane_count]) |p| {
+            rects[n] = p.rect;
+            n += 1;
+        }
+        for (self.dividers[0..self.divider_count]) |d| {
+            rects[n] = d;
+            n += 1;
+        }
+        var covered: i64 = 0;
+        for (rects[0..n], 0..) |a, i| {
+            try std.testing.expect(a.left >= area.left and a.right <= area.right);
+            try std.testing.expect(a.top >= area.top and a.bottom <= area.bottom);
+            try std.testing.expect(a.left <= a.right and a.top <= a.bottom);
+            covered += @as(i64, a.right - a.left) * (a.bottom - a.top);
+            for (rects[i + 1 .. n]) |b| {
+                const overlap = a.left < b.right and b.left < a.right and
+                    a.top < b.bottom and b.top < a.bottom;
+                try std.testing.expect(!overlap);
+            }
+        }
+        try std.testing.expectEqual(
+            @as(i64, area.right - area.left) * (area.bottom - area.top),
+            covered,
+        );
+    }
+};
+
+/// `tree` with `pane` split off `at` in `direction`.
+fn testSplit(
+    tree: *const TestTree,
+    at: TestTree.Node.Handle,
+    direction: TestTree.Split.Direction,
+    ratio: f16,
+    pane: *TestPane,
+) !TestTree {
+    const alloc = std.testing.allocator;
+    var single: TestTree = try .init(alloc, pane);
+    defer single.deinit();
+    return tree.split(alloc, at, direction, ratio, &single);
+}
+
+test "win32: a divider is a pixel at 96 DPI, scaled to the nearest pixel" {
+    // DPI, width: 125% rounds down, 150% and 250% round up.
+    for ([_][2]u32{
+        .{ 0, 1 },   .{ 96, 1 },  .{ 120, 1 }, .{ 144, 2 },
+        .{ 168, 2 }, .{ 192, 2 }, .{ 240, 3 }, .{ 288, 3 },
+    }) |c| {
+        try std.testing.expectEqual(@as(i32, @intCast(c[1])), dividerWidth(c[0]));
+    }
+}
+
+test "win32: split terminals and their dividers tile the window" {
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a' };
+    var b: TestPane = .{ .name = 'b' };
+    var c: TestPane = .{ .name = 'c' };
+
+    // a | b, then b over c.
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    var ab = try testSplit(&only_a, .root, .right, 0.5, &b);
+    defer ab.deinit();
+    var tree = try testSplit(&ab, ab.locate(&b).?, .down, 0.3, &c);
+    defer tree.deinit();
+
+    // Odd sizes, so that neither split divides evenly.
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 1001, .bottom = 601 };
+    var got: TestLayout = .{};
+    layout(&tree, area, 2, &got);
+    try std.testing.expectEqual(3, got.pane_count);
+    try std.testing.expectEqual(2, got.divider_count);
+    try got.expectTiles(area);
+
+    // 999 pixels left for the panes; half of it rounds up.
+    try std.testing.expectEqual(500, got.rectOf(&a).right);
+    try std.testing.expectEqual(502, got.rectOf(&b).left);
+    // 599 left between b and c; 0.3 of it is 179.7.
+    try std.testing.expectEqual(180, got.rectOf(&b).bottom);
+    try std.testing.expectEqual(182, got.rectOf(&c).top);
+
+    // Within a window that does not start at the origin, too.
+    const moved: win32.RECT = .{ .left = 7, .top = 3, .right = 108, .bottom = 54 };
+    var got_moved: TestLayout = .{};
+    layout(&tree, moved, 1, &got_moved);
+    try got_moved.expectTiles(moved);
+}
+
+test "win32: a split at either end gives one side all of it" {
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a' };
+    var b: TestPane = .{ .name = 'b' };
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    var tree = try testSplit(&only_a, .root, .down, 0.5, &b);
+    defer tree.deinit();
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 80, .bottom = 50 };
+
+    for ([_]f16{ 0, 1 }) |ratio| {
+        tree.resizeInPlace(.root, ratio);
+        var got: TestLayout = .{};
+        layout(&tree, area, 1, &got);
+        try got.expectTiles(area);
+        const a_height = got.rectOf(&a).bottom - got.rectOf(&a).top;
+        const b_height = got.rectOf(&b).bottom - got.rectOf(&b).top;
+        try std.testing.expectEqual(@as(i32, if (ratio == 0) 0 else 49), a_height);
+        try std.testing.expectEqual(@as(i32, if (ratio == 0) 49 else 0), b_height);
+    }
+}
+
+test "win32: a divider wider than its split takes all of it" {
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a' };
+    var b: TestPane = .{ .name = 'b' };
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    var tree = try testSplit(&only_a, .root, .right, 0.5, &b);
+    defer tree.deinit();
+
+    // A window dragged down to almost nothing at a high DPI.
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 3, .bottom = 40 };
+    var got: TestLayout = .{};
+    layout(&tree, area, 10, &got);
+    try got.expectTiles(area);
+    try std.testing.expectEqual(0, got.rectOf(&a).right - got.rectOf(&a).left);
+    try std.testing.expectEqual(0, got.rectOf(&b).right - got.rectOf(&b).left);
+}
+
+test "win32: the pixel layout agrees with the split tree's own" {
+    // tree.spatial() places the same panes in a 1x1 square, without
+    // dividers. Scaled up, each pane must be within its dividers and a
+    // pixel of rounding per split above it.
+    const alloc = std.testing.allocator;
+    var panes: [4]TestPane = .{ .{ .name = 'a' }, .{ .name = 'b' }, .{ .name = 'c' }, .{ .name = 'd' } };
+    var t0: TestTree = try .init(alloc, &panes[0]);
+    defer t0.deinit();
+    var t1 = try testSplit(&t0, .root, .right, 0.6, &panes[1]);
+    defer t1.deinit();
+    var t2 = try testSplit(&t1, t1.locate(&panes[0]).?, .down, 0.25, &panes[2]);
+    defer t2.deinit();
+    var tree = try testSplit(&t2, t2.locate(&panes[1]).?, .left, 0.7, &panes[3]);
+    defer tree.deinit();
+
+    var sp = try tree.spatial(alloc);
+    defer sp.deinit(alloc);
+
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+    const divider = 2;
+    var got: TestLayout = .{};
+    layout(&tree, area, divider, &got);
+    try got.expectTiles(area);
+
+    // Two splits above every pane here.
+    const tolerance: f32 = 2 * (divider + 1);
+    const w: f32 = @floatFromInt(area.right);
+    const h: f32 = @floatFromInt(area.bottom);
+    for (got.panes[0..got.pane_count]) |p| {
+        const slot = sp.slots[tree.locate(p.view).?.idx()];
+        const want = [4]f32{
+            @as(f32, slot.x) * w,
+            @as(f32, slot.y) * h,
+            (@as(f32, slot.x) + @as(f32, slot.width)) * w,
+            (@as(f32, slot.y) + @as(f32, slot.height)) * h,
+        };
+        const have = [4]i32{ p.rect.left, p.rect.top, p.rect.right, p.rect.bottom };
+        for (want, have) |x, y| {
+            try std.testing.expect(@abs(x - @as(f32, @floatFromInt(y))) <= tolerance);
+        }
+    }
+}
+
 test "win32: modal loops are counted per window and returned on destroy" {
     // The app ticks the core from its window procedure while any window is
     // in a size/move or menu loop (WM_GHOSTTY_WAKEUP), so the count must
@@ -483,7 +866,8 @@ test "win32: modal loops are counted per window and returned on destroy" {
     for ([_]*Window{ &a, &b }) |window| {
         window.app = &app;
         window.hwnd = hwnd;
-        window.surface = null;
+        window.tree = .empty;
+        window.focused = null;
         window.modal_loops = .{};
     }
 
