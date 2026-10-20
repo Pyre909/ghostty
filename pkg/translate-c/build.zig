@@ -169,9 +169,9 @@ pub fn initTranslator(b: *std.Build, options: Options) !Translator {
     // conveniences for C callers that translated code never calls, so
     // Windows translates as Debug there. The module built from the
     // translation keeps the requested optimize mode below.
-    const translate_optimize: std.builtin.OptimizeMode = if (options.target.result.os.tag == .windows and
-        options.optimize == .ReleaseSafe)
-        .Debug
+    const translate_optimize: std.lang.Optimize = if (options.target.result.os.tag == .windows and
+        options.optimize == .safe)
+        .debug
     else
         options.optimize;
 

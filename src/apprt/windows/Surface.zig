@@ -98,7 +98,7 @@ pub const Surface = struct {
 
     /// Keys whose last press was AltGr's, by `Ime.scanSlot`. See
     /// `altGrKey`.
-    alt_gr: std.StaticBitSet(512),
+    alt_gr: std.bit_set.Static(512),
 
     /// See `ShiftKeys`.
     shift: ShiftKeys,
@@ -167,7 +167,7 @@ pub const Surface = struct {
         /// (`isWindowMenuKey`), or it arrived while a prompt was open
         /// (`App.canReenterCore`). Their key-up is kept from the core as
         /// well.
-        swallow_up: std.StaticBitSet(512) = .initEmpty(),
+        swallow_up: std.bit_set.Static(512) = .empty,
 
         const Preedit = enum {
             none,
@@ -593,7 +593,7 @@ pub const Surface = struct {
             .preedit = .none,
             .ime = .{},
             .high_surrogate = null,
-            .alt_gr = .initEmpty(),
+            .alt_gr = .empty,
             .shift = .{},
             .modal_loops = 0,
             .focused = false,
@@ -1255,7 +1255,7 @@ pub const Surface = struct {
 
         // Stored only after SetWindowTextW succeeds: this returns bool, so an
         // errdefer would never run.
-        const copy = alloc.dupeZ(u8, title) catch |err| {
+        const copy = alloc.dupeSentinel(u8, title, 0) catch |err| {
             log.warn("failed to store the window title err={}", .{err});
             return false;
         };
@@ -1971,7 +1971,7 @@ pub const Surface = struct {
     /// and reported on the release alone it would pair a plain '@' with the
     /// release of Ctrl+Alt+Q.
     fn altGrKey(
-        held: *std.StaticBitSet(512),
+        held: *std.bit_set.Static(512),
         slot: usize,
         action: input.Action,
         mods: input.Mods,
@@ -2175,8 +2175,9 @@ pub const Surface = struct {
         // Sizes are in bytes, and the string is not terminated.
         const size = win32.ImmGetCompositionStringW(himc, index, null, 0);
         if (size <= 0 or @rem(size, 2) != 0) return null;
-        var stack = std.heap.stackFallback(512, alloc);
-        const units_alloc = stack.get();
+        var stack_buf: [512]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+        const units_alloc = stack.allocator();
         const units = units_alloc.alloc(u16, @intCast(@divExact(size, 2))) catch |err| {
             log.warn("ime string dropped err={}", .{err});
             return null;
@@ -2839,8 +2840,8 @@ test "win32: mouse lParam coordinates are signed" {
 }
 
 test "win32: wheel deltas add up to whole notches" {
-    const thirds = [_]i32{40} ** 9;
-    const ones = [_]i32{1} ** 360;
+    const thirds: [9]i32 = @splat(40);
+    const ones: [360]i32 = @splat(1);
     const cases = [_][]const i32{ &.{ 120, 120, 120 }, &thirds, &.{ 90, 90, 90, 90 }, &ones };
     for (cases) |deltas| {
         for ([_]i32{ 1, -1 }) |sign| {
@@ -3167,6 +3168,8 @@ test "win32: presenting a minimized window restores it" {
 test "win32: key text drops controls and decodes surrogate pairs" {
     const Text = Surface.Text;
     const Case = struct { msg: win32.UINT, units: []const u16, want: []const u8 };
+    const twenty_a: [20]u16 = @splat('a');
+    const sixteen_a: [16]u8 = @splat('a');
     const cases = [_]Case{
         .{ .msg = win32.WM_CHAR, .units = &.{'a'}, .want = "a" },
         .{ .msg = win32.WM_CHAR, .units = &.{ 0xD83D, 0xDE00 }, .want = "\u{1F600}" },
@@ -3177,7 +3180,7 @@ test "win32: key text drops controls and decodes surrogate pairs" {
         .{ .msg = win32.WM_CHAR, .units = &.{ 0xD800, 'a' }, .want = "a" },
         .{ .msg = win32.WM_CHAR, .units = &.{ 0xDE00, 'a' }, .want = "a" },
         .{ .msg = win32.WM_SYSCHAR, .units = &.{'x'}, .want = "x" },
-        .{ .msg = win32.WM_CHAR, .units = &([_]u16{'a'} ** 20), .want = "a" ** 16 },
+        .{ .msg = win32.WM_CHAR, .units = &twenty_a, .want = &sixteen_a },
     };
     for (cases) |c| {
         var text: Text = .{};
@@ -3335,7 +3338,7 @@ test "win32: key modifiers for AltGr and consumed Shift" {
 test "win32: AltGr's release reports its press's modifiers" {
     const t = std.testing;
     const ctrl_alt: input.Mods = .{ .ctrl = true, .alt = true };
-    var held: std.StaticBitSet(512) = .initEmpty();
+    var held: std.bit_set.Static(512) = .empty;
     const q = 0x10;
     const a = 0x1E;
 

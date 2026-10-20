@@ -26,7 +26,7 @@ pub fn open(
     // the apprt's safety checks by passing it to `open`. On Windows, rundll32
     // below would run `file:` targets and any registered scheme, and the
     // Windows apprt applies its own allowlist the same way.
-    if (comptime builtin.os.tag == .macos or builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .macos or builtin.target.os.tag == .windows) {
         switch (kind) {
             .unknown, .osc8 => return error.UntrustedLink,
             .text, .html => {},
@@ -36,7 +36,7 @@ pub fn open(
     // Holds rundll32's absolute path on Windows; see rundll32Path.
     var rundll32_buf: [rundll32_buf_len]u8 = undefined;
 
-    var spawn_opts: std.process.SpawnOptions = switch (builtin.os.tag) {
+    var spawn_opts: std.process.SpawnOptions = switch (builtin.target.os.tag) {
         .linux, .freebsd => .{ .argv = &.{ "xdg-open", url } },
         .windows => switch (kind) {
             .text, .html => .{ .argv = &.{
@@ -131,7 +131,7 @@ test "rundll32Path is absolute in the system directory" {
 }
 
 test "macOS and Windows untrusted links have no generic opener fallback" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     try std.testing.expectError(
         error.UntrustedLink,

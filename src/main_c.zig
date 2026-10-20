@@ -273,7 +273,7 @@ pub export fn ghostty_string_free(str: String) void {
 // This is a workaround. Closest upstream tracking: Codeberg ziglang/zig
 // #30936 (reimplement crt0 code). Remove this DllMain when Zig runs the
 // MSVC and MinGW DLL CRT init natively.
-pub const DllMain = if (builtin.os.tag == .windows) struct {
+pub const DllMain = if (builtin.target.os.tag == .windows) struct {
     const BOOL = windows.BOOL;
     const HINSTANCE = windows.HINSTANCE;
     const DWORD = windows.DWORD;

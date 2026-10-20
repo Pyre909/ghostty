@@ -55,7 +55,7 @@ pub const Planes = struct {
         // DMABUF fds are POSIX file descriptors (Linux, and the BSDs
         // via drm-kmod). Windows has no DMABUF, so nothing is exported
         // and there is nothing to close.
-        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.target.os.tag == .windows) return;
         for (self.fds[0..self.count]) |fd| {
             if (fd >= 0) _ = std.posix.system.close(fd);
         }
@@ -65,7 +65,7 @@ pub const Planes = struct {
     /// and has an invalid FD, we close all the known valid FDs
     /// and bail.
     pub fn validate(self: Planes) error{BadDmabuf}!void {
-        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.target.os.tag == .windows) return;
         var n_valid: usize = 0;
         while (n_valid < self.count) : (n_valid += 1) {
             if (self.fds[n_valid] < 0) {
@@ -87,7 +87,7 @@ fn testIsOpen(fd: c_int) bool {
 }
 
 test "Planes.validate closes valid fds when a plane failed" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const testing = std.testing;
     const posix = std.posix;
 
@@ -105,7 +105,7 @@ test "Planes.validate closes valid fds when a plane failed" {
 }
 
 test "Planes.deinit closes all fds" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     const testing = std.testing;
     const posix = std.posix;
 

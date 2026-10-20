@@ -111,15 +111,15 @@ comptime {
             @FieldType(@FieldType(CoreSurface, "mouse"), "click_state"),
         ).array.len;
         for (std.enums.values(Surface.Mouse.Button)) |b| {
-            if (@intFromEnum(b.core()) >= click_states) {
+            if (@backingInt(b.core()) >= click_states) {
                 @compileError("mouse button " ++ @tagName(b) ++ " is outside the core's click_state");
             }
         }
 
-        // performAction is comptime-dispatched per key, so each of the 69
-        // keys is a separate instantiation and a separate chance to be wrong.
-        for (@typeInfo(apprt.Action.Key).@"enum".fields) |field| {
-            const key = @field(apprt.Action.Key, field.name);
+        // performAction is comptime-dispatched per key, so each key is a
+        // separate instantiation and a separate chance to be wrong.
+        for (@typeInfo(apprt.Action.Key).@"enum".field_names) |name| {
+            const key = @field(apprt.Action.Key, name);
             _ = &struct {
                 fn thunk(
                     app: *App,

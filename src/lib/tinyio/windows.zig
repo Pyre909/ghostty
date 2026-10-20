@@ -703,7 +703,7 @@ test "windows: path conversion" {
     var got_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const got = got_buf[0..std.unicode.wtf16LeToWtf8(&got_buf, p.span())];
     var want_buf: [std.Io.Dir.max_path_bytes + 16]u8 = undefined;
-    const want = try std.fmt.bufPrint(&want_buf, "\\??\\{s}\\up.txt", .{parent});
+    const want = try std.mem.print(&want_buf, "\\??\\{s}\\up.txt", .{parent});
     try testing.expectEqualStrings(want, got);
 
     // Encoding errors are path errors.

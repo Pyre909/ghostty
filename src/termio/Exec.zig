@@ -203,7 +203,7 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         stopReadThreadWindows(exec);
     } else {
         switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
@@ -230,7 +230,7 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
 /// and would never close the HANDLE (leaking it, and keeping the pipe
 /// alive so the other end never sees ERROR_BROKEN_PIPE).
 fn closeQuitPipeEnd(fd: posix.fd_t) void {
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         _ = windows.exp.kernel32.CloseHandle(fd);
     } else {
         _ = posix.system.close(fd);
@@ -2503,7 +2503,7 @@ test "init frees the env when it fails" {
 }
 
 test "read thread windows: quit byte reaches the reader" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
 
     const pipe = try internal_os.pipe();
@@ -2516,7 +2516,7 @@ test "read thread windows: quit byte reaches the reader" {
 }
 
 test "read thread windows: closing the quit pipe ends the reader" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
 
     const pipe = try internal_os.pipe();

@@ -368,7 +368,7 @@ pub const App = struct {
             // inside tick() is not lost: it sits in the queue and makes the
             // next GetMessageW return immediately.
             const ret = win32.GetMessageW(&msg, null, 0, 0);
-            switch (@intFromEnum(ret)) {
+            switch (@backingInt(ret)) {
                 // GetMessageW reports failure as -1, distinct from the 0 that
                 // means WM_QUIT. Treating -1 as "quit" would mask a real bug.
                 -1 => {
@@ -863,7 +863,7 @@ pub const App = struct {
                 // The apprt owns the quit-after-last-window policy, and this
                 // foundation deliberately overrides the configuration.
                 //
-                // `quit-after-last-window-closed` is `builtin.os.tag == .linux`
+                // `quit-after-last-window-closed` is `builtin.target.os.tag == .linux`
                 // (`Config.@"quit-after-last-window-closed"`), i.e. false on
                 // Windows. But once its last window has closed, this runtime
                 // has nothing left to open another from: `.new_window` is

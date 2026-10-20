@@ -68,7 +68,7 @@ pub fn fatalNotice(err: anyerror) void {
         else => @errorName(err),
     };
     var buf: [192]u8 = undefined;
-    const text = std.fmt.bufPrint(
+    const text = std.mem.print(
         &buf,
         "Ghostty could not start: {s}.",
         .{what},

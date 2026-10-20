@@ -150,13 +150,13 @@ pub fn copyImageSubData(
 ) !void {
     glad.context.CopyImageSubData.?(
         src.id,
-        @intFromEnum(src_target),
+        @backingInt(src_target),
         src_level,
         src_x,
         src_y,
         src_z,
         dst.id,
-        @intFromEnum(dst_target),
+        @backingInt(dst_target),
         dst_level,
         dst_x,
         dst_y,
