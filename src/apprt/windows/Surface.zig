@@ -670,6 +670,49 @@ pub const Surface = struct {
         return self;
     }
 
+    /// Make `wd`, the asking window's working directory, the new window's,
+    /// as the macOS runtime does (`Surface.init` in src/apprt/embedded.zig):
+    /// only an absolute path to an existing directory, otherwise the
+    /// directory `config` already names is kept.
+    ///
+    /// Reachable today: a surface's working directory starts as its
+    /// subprocess's (src/termio/Exec.zig, `term.setPwd(cwd)`), which comes
+    /// from `working-directory` and may be relative. A relative one is not
+    /// resolved here, since this process's cwd is not the shell's, and
+    /// `openDirAbsolute` asserts an absolute path. The path is copied into
+    /// the config's arena, since `finalize` keeps the slice it is given
+    /// when there is nothing to expand.
+    fn inheritWorkingDirectory(config: *configpkg.Config, wd: []const u8) void {
+        if (wd.len == 0) return;
+        if (!std.fs.path.isAbsolute(wd)) {
+            log.warn("the inherited working directory is not absolute dir={s}", .{wd});
+            return;
+        }
+        var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
+            log.warn("cannot open the inherited working directory dir={s} err={}", .{ wd, err });
+            return;
+        };
+        defer dir.close(global.io());
+        const stat = dir.stat(global.io()) catch |err| {
+            log.warn("cannot stat the inherited working directory dir={s} err={}", .{ wd, err });
+            return;
+        };
+        if (stat.kind != .directory) {
+            log.warn("the inherited working directory is not a directory dir={s}", .{wd});
+            return;
+        }
+        const path = config.arenaAlloc().dupe(u8, wd) catch |err| {
+            log.warn("cannot keep the inherited working directory err={}", .{err});
+            return;
+        };
+        var value: configpkg.WorkingDirectory = .{ .path = path };
+        value.finalize(config.arenaAlloc()) catch |err| {
+            log.warn("cannot finalize the inherited working directory err={}", .{err});
+            return;
+        };
+        config.@"working-directory" = value;
+    }
+
     /// Release everything except the window and the allocation itself.
     ///
     /// Public because `CoreApp.deinit` calls it on every surface the core
@@ -2676,42 +2719,6 @@ pub const Surface = struct {
 /// A point beyond the client area, past the corner farthest from `press`
 /// on each axis. The core clamps it to that corner's cell
 /// (the `.grid` arm of `renderer.size.Coordinate.convert`).
-/// Make `wd`, the asking window's working directory, the new window's, as
-/// the macOS runtime does (`Surface.init` in src/apprt/embedded.zig): only
-/// when it is an existing directory, otherwise the directory `config`
-/// already names is kept. The path is copied into the config's arena, since
-/// `finalize` keeps the slice it is given when there is nothing to expand.
-///
-/// No surface on Windows reports a working directory yet (the core's
-/// `reportPwd` ignores OSC 7 here), so today this is reached only once
-/// that changes.
-fn inheritWorkingDirectory(config: *configpkg.Config, wd: []const u8) void {
-    if (wd.len == 0) return;
-    var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
-        log.warn("cannot open the inherited working directory dir={s} err={}", .{ wd, err });
-        return;
-    };
-    defer dir.close(global.io());
-    const stat = dir.stat(global.io()) catch |err| {
-        log.warn("cannot stat the inherited working directory dir={s} err={}", .{ wd, err });
-        return;
-    };
-    if (stat.kind != .directory) {
-        log.warn("the inherited working directory is not a directory dir={s}", .{wd});
-        return;
-    }
-    const path = config.arenaAlloc().dupe(u8, wd) catch |err| {
-        log.warn("cannot keep the inherited working directory err={}", .{err});
-        return;
-    };
-    var value: configpkg.WorkingDirectory = .{ .path = path };
-    value.finalize(config.arenaAlloc()) catch |err| {
-        log.warn("cannot finalize the inherited working directory err={}", .{err});
-        return;
-    };
-    config.@"working-directory" = value;
-}
-
 fn releasePoint(screen: renderer.ScreenSize, press: apprt.CursorPos) apprt.CursorPos {
     const w: f32 = @floatFromInt(screen.width);
     const h: f32 = @floatFromInt(screen.height);
@@ -3846,13 +3853,15 @@ test "win32: a new window inherits only an existing working directory" {
     defer config.deinit();
     const configured = config.@"working-directory";
 
-    // A file, a missing path or nothing: the configured directory stays.
-    for ([_][]const u8{ file_path, missing_path, "" }) |wd| {
-        inheritWorkingDirectory(&config, wd);
+    // A file, a missing path, nothing, or a path that is not absolute:
+    // the configured directory stays. A relative one would reach
+    // openDirAbsolute's assert.
+    for ([_][]const u8{ file_path, missing_path, "", "relative\\dir", "C:relative" }) |wd| {
+        Surface.inheritWorkingDirectory(&config, wd);
         try testing.expectEqualDeep(configured, config.@"working-directory");
     }
 
-    inheritWorkingDirectory(&config, dir_path);
+    Surface.inheritWorkingDirectory(&config, dir_path);
     const got = config.@"working-directory" orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings(dir_path, got.path);
     // A copy in the config's arena: the caller frees its own after create.

@@ -1007,9 +1007,6 @@ pub const App = struct {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
 
-        // Surface.create registers the surface with the core, and
-        // CoreApp.addSurface cancels the startup quit timer
-        // itself, so there is no quit-timer handling here.
         // Taken from the asking surface itself (see Surface.Options).
         const cwd: ?[]const u8 = cwd: {
             const p = parent orelse break :cwd null;
@@ -1018,6 +1015,9 @@ pub const App = struct {
         };
         defer if (cwd) |v| alloc.free(v);
 
+        // Surface.create registers the surface with the core, and
+        // CoreApp.addSurface cancels the startup quit timer
+        // itself, so there is no quit-timer handling here.
         const surface = try Surface.create(self, .{
             .font_size = font_size: {
                 const p = parent orelse break :font_size null;
