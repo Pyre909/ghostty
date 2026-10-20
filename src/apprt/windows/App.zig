@@ -1893,6 +1893,12 @@ fn paneRect(window: *const Window, pane: *const Surface) !win32.RECT {
     return rect;
 }
 
+/// For tests: the window's caption, read into `buf`.
+fn testCaption(window: *const Window, buf: []u16) []const u16 {
+    const n = win32.GetWindowTextW(window.hwnd, buf.ptr, @intCast(buf.len));
+    return buf[0..@intCast(n)];
+}
+
 /// For tests: `panes` side by side, in this order, as splitting each one
 /// off the last to the right puts them.
 fn testRow(alloc: std.mem.Allocator, panes: []const *Surface) !Window.Tree {
@@ -1958,8 +1964,8 @@ test "win32: a window lays its terminals out side by side" {
 test "win32: a closing terminal hands its place, and the focus if it had it" {
     // a | b | c | d. Closing a terminal without the focus leaves the focus
     // where it is; closing the one with it hands it to the one before it,
-    // as on GTK. Either way the others take its place, and the last one
-    // takes the window with it. The real classes and window procedures,
+    // as on GTK, and the window is titled after that one. Either way the
+    // others take its place, and the last one takes the window with it. The real classes and window procedures,
     // with no core surfaces; the windows stay hidden and are never
     // activated, so the focus is only remembered.
     const alloc = std.testing.allocator;
@@ -1979,6 +1985,13 @@ test "win32: a closing terminal hands its place, and the focus if it had it" {
     window.relayout();
     try expectRow(window, &panes);
 
+    // Each titled, so that the caption shows which one has the focus.
+    for (panes, [_][:0]const u8{ "a", "b", "c", "d" }) |pane, title| {
+        try std.testing.expect(pane.setTitle(title));
+    }
+    const utf16 = std.unicode.utf8ToUtf16LeStringLiteral;
+    var buf: [8]u16 = undefined;
+
     // The terminal that gets WM_SETFOCUS is the window's. Sent straight to
     // its window procedure: SetFocus would activate the window.
     const focus = struct {
@@ -1996,16 +2009,48 @@ test "win32: a closing terminal hands its place, and the focus if it had it" {
     focus(c);
     try std.testing.expect(c.destroy());
     try std.testing.expect(window.focused == b);
+    try std.testing.expectEqualSlices(u16, utf16("b"), testCaption(window, &buf));
     try expectRow(window, &.{ b, d });
 
     // The first terminal has none before it: the one after it.
     try std.testing.expect(b.destroy());
     try std.testing.expect(window.focused == d);
+    try std.testing.expectEqualSlices(u16, utf16("d"), testCaption(window, &buf));
     try expectRow(window, &.{d});
 
     try std.testing.expect(d.destroy());
     try std.testing.expectEqual(0, app.surfaces.items.len);
     try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+test "win32: a window is titled after its focused terminal" {
+    // A title set on another terminal waits until it gets the focus.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ left, right });
+
+    const caption = testCaption;
+    var buf: [64]u16 = undefined;
+
+    _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(left.setTitle("left"));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("left"), caption(window, &buf));
+
+    try std.testing.expect(right.setTitle("right"));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("left"), caption(window, &buf));
+
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("right"), caption(window, &buf));
 }
 
 test "win32: closing a window takes every terminal in it at once" {

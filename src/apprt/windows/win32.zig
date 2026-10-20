@@ -422,6 +422,8 @@ pub extern "user32" fn SystemParametersInfoW(
     win_ini: UINT,
 ) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowTextW(hwnd: HWND, text: LPCWSTR) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw
+pub extern "user32" fn GetWindowTextW(hwnd: HWND, text: [*]u16, max: c_int) callconv(.winapi) c_int;
 pub extern "user32" fn SetWindowPos(
     hwnd: HWND,
     after: ?HWND,

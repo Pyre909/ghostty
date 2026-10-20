@@ -32,7 +32,6 @@ const text_mime = @import("clipboard.zig").text_mime;
 const readClipboardText = @import("clipboard.zig").readClipboardText;
 const writeClipboardText = @import("clipboard.zig").writeClipboardText;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
-const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const clipboardReadPrompt = @import("clipboard.zig").clipboardReadPrompt;
 const confirm = @import("dialog.zig").confirm;
 const notice = @import("dialog.zig").notice;
@@ -1173,36 +1172,26 @@ pub const Surface = struct {
     // Win32 message handling
     // ---------------------------------------------------------------------
 
-    /// Set the window title and remember it for `getTitle`. Returns false if
-    /// the title could not be applied, which is what `.set_title` reports.
+    /// Remember the title for `getTitle`, and show it as the window's
+    /// caption if this is its focused terminal: a window is titled after
+    /// its focused terminal (`Window.setFocused`), so another terminal's
+    /// shows once it gets the focus. Returns false if the title could not
+    /// be stored or shown, which is what `.set_title` reports.
     ///
     /// The core validates only OSC titles; one from the `title` config, a
     /// keybinding or a command's argv[0] can be any bytes. Invalid UTF-8 is
     /// shown as U+FFFD, as macOS does, and the title is stored as given.
     pub fn setTitle(self: *Surface, title: [:0]const u8) bool {
         const alloc = self.app.core_app.alloc;
-
-        const wide = wideFromUtf8(alloc, title) catch |err| {
-            log.warn("failed to encode the window title err={}", .{err});
-            return false;
-        };
-        defer alloc.free(wide);
-
-        if (!win32.SetWindowTextW(self.window.hwnd, wide.ptr).toBool()) {
-            log.warn("SetWindowTextW failed", .{});
-            return false;
-        }
-
-        // Stored only after SetWindowTextW succeeds: this returns bool, so an
-        // errdefer would never run.
         const copy = alloc.dupeSentinel(u8, title, 0) catch |err| {
             log.warn("failed to store the window title err={}", .{err});
             return false;
         };
-
         if (self.title) |old| alloc.free(old);
         self.title = copy;
-        return true;
+
+        if (self.window.focused != self) return true;
+        return self.window.showTitle(self.title);
     }
 
     /// WM_CLOSE sent to this window: it closes alone. Windows sends the
@@ -1341,7 +1330,7 @@ pub const Surface = struct {
 
             win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
                 self.focused = msg == win32.WM_SETFOCUS;
-                if (self.focused) self.window.focused = self;
+                if (self.focused) self.window.setFocused(self);
 
                 if (!self.focused) {
                     // A drag does not survive losing focus (Alt+Tab, a

@@ -28,6 +28,7 @@ const L = win32.L;
 const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
+const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
 const postTeardown = @import("App.zig").postTeardown;
 const confirm = @import("dialog.zig").confirm;
@@ -52,9 +53,10 @@ hwnd: win32.HWND,
 tree: Tree,
 
 /// The terminal with the keyboard focus, or the one to give it to when the
-/// window is next activated: set by each terminal's WM_SETFOCUS, and moved
-/// off a terminal that closes on its own by `removePane`. Null only while
-/// the tree is empty.
+/// window is next activated, and the one the window is titled after: set
+/// by each terminal's WM_SETFOCUS, and moved off a terminal that closes on
+/// its own by `removePane` (`setFocused`). Null only while the tree is
+/// empty.
 focused: ?*Surface,
 
 /// A close of the whole window is being asked about, or was agreed to and
@@ -128,7 +130,9 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         surface.discard();
         return err;
     };
-    self.focused = surface;
+    // A title the core set while it started is shown, even if the window
+    // is never activated (launched minimized, or behind another).
+    self.setFocused(surface);
 
     // The frame is still hidden, so this shows nothing yet.
     _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
@@ -436,12 +440,38 @@ pub fn showPane(self: *Window, surface: *Surface) void {
     self.giveFocus(surface);
 }
 
-/// Make `surface` the window's focused terminal. Only the active window
-/// sets the keyboard focus at once; another one would be activated by it,
-/// so it hands the focus over when it is activated (WM_SETFOCUS).
+/// Make `surface` the window's focused terminal and give it the keyboard
+/// focus. Only the active window sets the keyboard focus at once; another
+/// one would be activated by it, so it hands the focus over when it is
+/// activated (WM_SETFOCUS).
 pub fn giveFocus(self: *Window, surface: *Surface) void {
-    self.focused = surface;
+    self.setFocused(surface);
     if (win32.GetActiveWindow() == self.hwnd) _ = win32.SetFocus(surface.hwnd);
+}
+
+/// Make `surface` the window's focused terminal, and name the window after
+/// it, as GTK and macOS title a window after its focused split.
+pub fn setFocused(self: *Window, surface: *Surface) void {
+    self.focused = surface;
+    _ = self.showTitle(surface.title);
+}
+
+/// Show `title`, the focused terminal's, as the window's caption, or
+/// "Ghostty" while it has none. Returns whether it is shown.
+///
+/// Invalid UTF-8 is shown as U+FFFD, as macOS does (`Surface.setTitle`).
+pub fn showTitle(self: *Window, title: ?[:0]const u8) bool {
+    const alloc = self.app.core_app.alloc;
+    const wide = wideFromUtf8(alloc, title orelse "Ghostty") catch |err| {
+        log.warn("failed to encode the window title err={}", .{err});
+        return false;
+    };
+    defer alloc.free(wide);
+    if (!win32.SetWindowTextW(self.hwnd, wide.ptr).toBool()) {
+        log.warn("SetWindowTextW failed err={}", .{win32.GetLastError()});
+        return false;
+    }
+    return true;
 }
 
 /// Map `rect`, in screen coordinates, to the frame's client area.
