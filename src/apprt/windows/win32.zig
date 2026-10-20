@@ -115,6 +115,7 @@ pub const WS_CLIPSIBLINGS: DWORD = 0x04000000;
 pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_HIDE: c_int = 0;
 pub const SW_SHOWNORMAL: c_int = 1;
+pub const SW_SHOWNOACTIVATE: c_int = 4;
 pub const SW_SHOWNA: c_int = 8;
 pub const SW_MAXIMIZE: c_int = 3;
 pub const SW_RESTORE: c_int = 9;
@@ -422,6 +423,8 @@ pub extern "user32" fn SystemParametersInfoW(
     win_ini: UINT,
 ) callconv(.winapi) BOOL;
 pub extern "user32" fn SetWindowTextW(hwnd: HWND, text: LPCWSTR) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible
+pub extern "user32" fn IsWindowVisible(hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextw
 pub extern "user32" fn GetWindowTextW(hwnd: HWND, text: [*]u16, max: c_int) callconv(.winapi) c_int;
 pub extern "user32" fn SetWindowPos(

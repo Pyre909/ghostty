@@ -2082,8 +2082,10 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
 }
 
 test "win32: closing a window takes every terminal in it at once" {
-    // One request posts one teardown to the frame, which destroys the
-    // frame and frees it and its terminals; a second request while it is
+    // One request posts one teardown to the frame, and leaves the window
+    // on screen: it runs inside a core call for close_window, where hiding
+    // the window could activate another. The teardown destroys the frame
+    // and frees it and its terminals; a second request while it is
     // pending posts nothing. Dispatched inside another teardown's wait, the
     // teardown waits and is posted again. The terminals have no core
     // surfaces, so there is nothing to ask about and no core to stop: this
@@ -2104,8 +2106,13 @@ test "win32: closing a window takes every terminal in it at once" {
     window.tree = try testRow(alloc, &.{ a, b });
     window.focused = a;
 
+    // Shown without being activated, so that a change is seen.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    try std.testing.expect(win32.IsWindowVisible(window.hwnd).toBool());
+
     window.requestClose();
     window.requestClose();
+    try std.testing.expect(win32.IsWindowVisible(window.hwnd).toBool());
     var msg: win32.MSG = undefined;
     try std.testing.expect(win32.PeekMessageW(
         &msg,

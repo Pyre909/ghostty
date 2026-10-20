@@ -308,7 +308,7 @@ fn handleMessage(
 /// (`CoreSurface.needsConfirmQuit`). The window is then torn down in one
 /// step (`destroyPosted`), as GTK closes a window and as `App.terminate`
 /// does, not one terminal at a time, which would lay the window out again
-/// after each.
+/// after each. It leaves the screen as that teardown starts (`destroyPosted`).
 ///
 /// `close_window` runs inside a core frame, so this only posts, as
 /// `Surface.close` does.
@@ -358,6 +358,13 @@ fn destroyPosted(self: *Window) void {
         return;
     }
 
+    // Off the screen at once, as a GTK window goes: `destroy` waits for
+    // the threads of every terminal in it, one core after another. Here,
+    // not in `requestClose`: that runs inside a core call for
+    // close_window, and hiding the active window there could activate
+    // another Ghostty window and send its terminal a focus change inside
+    // that call. A posted teardown runs from a message loop.
+    _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
     _ = self.destroy();
 
     // As in Surface.destroyPosted.
