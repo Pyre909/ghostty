@@ -88,7 +88,7 @@ pub const Blob = struct {
         const handle = c.hb_blob_create_or_fail(
             data.ptr,
             @intCast(data.len),
-            @intFromEnum(mode),
+            @backingInt(mode),
             user_data,
             if (destroycb != null) Callback.callback else null,
         ) orelse return Error.HarfbuzzFailed;

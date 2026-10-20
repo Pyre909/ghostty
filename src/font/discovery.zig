@@ -1061,7 +1061,7 @@ pub const TraitScore = packed struct {
         self.fuzzy_style = std.math.cast(Fuzzy, traits.style.len) orelse
             std.math.maxInt(Fuzzy);
         for (desired_styles) |s| {
-            if (std.ascii.indexOfIgnoreCase(traits.style, s) != null) {
+            if (std.ascii.findIgnoreCase(traits.style, s) != null) {
                 self.fuzzy_style -|= @intCast(s.len);
             }
         }
@@ -1339,7 +1339,7 @@ pub const DirectWrite = struct {
             // From semi-bold on. A family whose heaviest face is that one
             // has its bold in it; where there is a bold as well, the
             // style's name ranks it first.
-            .bold = @intFromEnum(font.getWeight()) >= 600,
+            .bold = @backingInt(font.getWeight()) >= 600,
             .italic = font.getStyle() != .NORMAL,
         };
 
@@ -2306,8 +2306,8 @@ test "directwrite family of another family, in another language" {
             const font = fonts.getFont(@intCast(i)) catch continue;
             defer api.release(font);
             if (font.getSimulations() != api.DWRITE_FONT_SIMULATIONS_NONE) continue;
-            const weight = @intFromEnum(font.getWeight());
-            if (weight < @intFromEnum(api.DWRITE_FONT_WEIGHT.NORMAL)) break true;
+            const weight = @backingInt(font.getWeight());
+            if (weight < @backingInt(api.DWRITE_FONT_WEIGHT.NORMAL)) break true;
         } else false;
         if (!light) return error.SkipZigTest;
     }

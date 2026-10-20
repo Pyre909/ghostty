@@ -66,7 +66,7 @@ pub const Face = struct {
         const analysis = try file.analyze();
         if (!analysis.supported or analysis.faces == 0) {
             log.warn("font in memory is not one DirectWrite reads file_type={} faces={}", .{
-                @intFromEnum(analysis.file_type),
+                @backingInt(analysis.file_type),
                 analysis.faces,
             });
             return error.DirectWriteFailed;
@@ -121,7 +121,7 @@ pub const Face = struct {
         // In debug mode, we output information about the variation axes,
         // if they exist. DirectWrite gives the values through the face;
         // the ranges are the font resource's, which nothing here needs.
-        if (comptime builtin.mode == .Debug) axes: {
+        if (comptime builtin.mode == .debug) axes: {
             const face5 = api.queryInterface(face, api.IDWriteFontFace5) catch break :axes;
             defer api.release(face5);
             var axes_buf: [max_axes]api.DWRITE_FONT_AXIS_VALUE = undefined;
@@ -3352,9 +3352,9 @@ test "layers are drawn over one another" {
     // A canvas of 3x2 pixels at (10,20). The first layer fills the
     // left 2x2 in orange, the second draws half a blue pixel over the
     // orange at (11,21), the third a half-transparent white at (12,20).
-    var canvas = [_]u8{0} ** (3 * 2 * 4);
+    var canvas: [3 * 2 * 4]u8 = @splat(0);
     const bounds: api.RECT = .{ .left = 10, .top = 20, .right = 13, .bottom = 22 };
-    var orange = [_]u8{255} ** 4;
+    var orange: [4]u8 = @splat(255);
     Face.composite(&canvas, 3, bounds, .{
         .data = &orange,
         .width = 2,

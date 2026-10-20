@@ -35,7 +35,7 @@ const windows = std.os.windows;
 /// other hosts only the layout tests analyze these types, and the Windows
 /// convention is not compilable there, so the C convention stands in; it
 /// never gets called.
-pub const cc: std.builtin.CallingConvention = if (builtin.os.tag == .windows) .winapi else .c;
+pub const cc: std.lang.CallingConvention = if (builtin.target.os.tag == .windows) .winapi else .c;
 
 pub const UINT = u32;
 pub const INT = i32;
@@ -482,8 +482,8 @@ test "directwrite api: factory enums" {
     const testing = std.testing;
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(DWRITE_FACTORY_TYPE));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(DWRITE_FONT_FACE_TYPE));
-    try testing.expectEqual(2, @intFromEnum(DWRITE_FONT_FACE_TYPE.TRUETYPE_COLLECTION));
-    try testing.expectEqual(3, @intFromEnum(DWRITE_FONT_FILE_TYPE.TRUETYPE_COLLECTION));
+    try testing.expectEqual(2, @backingInt(DWRITE_FONT_FACE_TYPE.TRUETYPE_COLLECTION));
+    try testing.expectEqual(3, @backingInt(DWRITE_FONT_FILE_TYPE.TRUETYPE_COLLECTION));
     // The simulations are a C enum in the header, passed as the UINT here.
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(@TypeOf(DWRITE_FONT_SIMULATIONS_NONE)));
     try testing.expectEqual(0, DWRITE_FONT_SIMULATIONS_NONE);
@@ -946,7 +946,7 @@ test "directwrite api: fonts struct layouts" {
     try testing.expectEqual(4, @sizeOf(DWRITE_FONT_STYLE));
     try testing.expectEqual(4, @sizeOf(DWRITE_INFORMATIONAL_STRING_ID));
     try testing.expectEqual(DWRITE_FONT_WEIGHT.NORMAL, DWRITE_FONT_WEIGHT.REGULAR);
-    try testing.expectEqual(13, @intFromEnum(DWRITE_INFORMATIONAL_STRING_ID.PREFERRED_FAMILY_NAMES));
+    try testing.expectEqual(13, @backingInt(DWRITE_INFORMATIONAL_STRING_ID.PREFERRED_FAMILY_NAMES));
 }
 
 test "directwrite api: fonts iids" {
@@ -1683,7 +1683,7 @@ test "directwrite api: fallback iids" {
     try testing.expectEqual(0x09, IID_IDWriteTextAnalysisSource1.Data4[7]);
 
     try testing.expectEqual(4, @sizeOf(DWRITE_READING_DIRECTION));
-    try testing.expectEqual(3, @intFromEnum(DWRITE_READING_DIRECTION.BOTTOM_TO_TOP));
+    try testing.expectEqual(3, @backingInt(DWRITE_READING_DIRECTION.BOTTOM_TO_TOP));
 
     try testing.expect(failed(E_NOINTERFACE));
     try testing.expect(failed(E_POINTER));
@@ -2090,33 +2090,33 @@ test "directwrite api: later faces typed slot signatures" {
     const advances = @typeInfo(@typeInfo(
         @FieldType(IDWriteFontFace1.VTable, "GetDesignGlyphAdvances"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(5, advances.params.len);
-    try testing.expectEqual(UINT, advances.params[1].type.?);
-    try testing.expectEqual([*]const UINT16, advances.params[2].type.?);
-    try testing.expectEqual([*]INT32, advances.params[3].type.?);
+    try testing.expectEqual(5, advances.param_types.len);
+    try testing.expectEqual(UINT, advances.param_types[1].?);
+    try testing.expectEqual([*]const UINT16, advances.param_types[2].?);
+    try testing.expectEqual([*]INT32, advances.param_types[3].?);
     try testing.expectEqual(HRESULT, advances.return_type.?);
 
     const metrics = @typeInfo(@typeInfo(
         @FieldType(IDWriteFontFace.VTable, "GetDesignGlyphMetrics"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(5, metrics.params.len);
-    try testing.expectEqual([*]const UINT16, metrics.params[1].type.?);
-    try testing.expectEqual(UINT, metrics.params[2].type.?);
-    try testing.expectEqual([*]DWRITE_GLYPH_METRICS, metrics.params[3].type.?);
+    try testing.expectEqual(5, metrics.param_types.len);
+    try testing.expectEqual([*]const UINT16, metrics.param_types[1].?);
+    try testing.expectEqual(UINT, metrics.param_types[2].?);
+    try testing.expectEqual([*]DWRITE_GLYPH_METRICS, metrics.param_types[3].?);
 
     const count = @typeInfo(@typeInfo(
         @FieldType(IDWriteFontFace.VTable, "GetGlyphCount"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(1, count.params.len);
+    try testing.expectEqual(1, count.param_types.len);
     try testing.expectEqual(UINT16, count.return_type.?);
 
     const create = @typeInfo(@typeInfo(
         @FieldType(IDWriteFontResource.VTable, "CreateFontFace"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(5, create.params.len);
-    try testing.expectEqual(UINT, create.params[1].type.?);
-    try testing.expectEqual(UINT, create.params[3].type.?);
-    try testing.expectEqual(*?*IDWriteFontFace5, create.params[4].type.?);
+    try testing.expectEqual(5, create.param_types.len);
+    try testing.expectEqual(UINT, create.param_types[1].?);
+    try testing.expectEqual(UINT, create.param_types[3].?);
+    try testing.expectEqual(*?*IDWriteFontFace5, create.param_types[4].?);
 }
 
 // ---------------------------------------------------------------------------
@@ -2368,33 +2368,33 @@ test "directwrite api: rasterization typed slot signatures" {
     const analyze = @typeInfo(@typeInfo(
         @FieldType(IDWriteFactory2.VTable, "CreateGlyphRunAnalysis"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(10, analyze.params.len);
-    try testing.expectEqual(*const DWRITE_GLYPH_RUN, analyze.params[1].type.?);
-    try testing.expectEqual(?*const DWRITE_MATRIX, analyze.params[2].type.?);
-    try testing.expectEqual(DWRITE_RENDERING_MODE, analyze.params[3].type.?);
-    try testing.expectEqual(DWRITE_MEASURING_MODE, analyze.params[4].type.?);
-    try testing.expectEqual(DWRITE_GRID_FIT_MODE, analyze.params[5].type.?);
-    try testing.expectEqual(DWRITE_TEXT_ANTIALIAS_MODE, analyze.params[6].type.?);
-    try testing.expectEqual(FLOAT, analyze.params[7].type.?);
-    try testing.expectEqual(FLOAT, analyze.params[8].type.?);
-    try testing.expectEqual(*?*IDWriteGlyphRunAnalysis, analyze.params[9].type.?);
+    try testing.expectEqual(10, analyze.param_types.len);
+    try testing.expectEqual(*const DWRITE_GLYPH_RUN, analyze.param_types[1].?);
+    try testing.expectEqual(?*const DWRITE_MATRIX, analyze.param_types[2].?);
+    try testing.expectEqual(DWRITE_RENDERING_MODE, analyze.param_types[3].?);
+    try testing.expectEqual(DWRITE_MEASURING_MODE, analyze.param_types[4].?);
+    try testing.expectEqual(DWRITE_GRID_FIT_MODE, analyze.param_types[5].?);
+    try testing.expectEqual(DWRITE_TEXT_ANTIALIAS_MODE, analyze.param_types[6].?);
+    try testing.expectEqual(FLOAT, analyze.param_types[7].?);
+    try testing.expectEqual(FLOAT, analyze.param_types[8].?);
+    try testing.expectEqual(*?*IDWriteGlyphRunAnalysis, analyze.param_types[9].?);
     try testing.expectEqual(HRESULT, analyze.return_type.?);
 
     const bounds = @typeInfo(@typeInfo(
         @FieldType(IDWriteGlyphRunAnalysis.VTable, "GetAlphaTextureBounds"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(3, bounds.params.len);
-    try testing.expectEqual(DWRITE_TEXTURE_TYPE, bounds.params[1].type.?);
-    try testing.expectEqual(*RECT, bounds.params[2].type.?);
+    try testing.expectEqual(3, bounds.param_types.len);
+    try testing.expectEqual(DWRITE_TEXTURE_TYPE, bounds.param_types[1].?);
+    try testing.expectEqual(*RECT, bounds.param_types[2].?);
 
     const texture = @typeInfo(@typeInfo(
         @FieldType(IDWriteGlyphRunAnalysis.VTable, "CreateAlphaTexture"),
     ).pointer.child).@"fn";
-    try testing.expectEqual(5, texture.params.len);
-    try testing.expectEqual(DWRITE_TEXTURE_TYPE, texture.params[1].type.?);
-    try testing.expectEqual(*const RECT, texture.params[2].type.?);
-    try testing.expectEqual([*]UINT8, texture.params[3].type.?);
-    try testing.expectEqual(UINT, texture.params[4].type.?);
+    try testing.expectEqual(5, texture.param_types.len);
+    try testing.expectEqual(DWRITE_TEXTURE_TYPE, texture.param_types[1].?);
+    try testing.expectEqual(*const RECT, texture.param_types[2].?);
+    try testing.expectEqual([*]UINT8, texture.param_types[3].?);
+    try testing.expectEqual(UINT, texture.param_types[4].?);
 }
 
 test "directwrite api: color struct layouts" {
@@ -2484,27 +2484,27 @@ test "directwrite api: rasterization enums" {
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(DWRITE_GRID_FIT_MODE));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(DWRITE_TEXT_ANTIALIAS_MODE));
     try testing.expectEqual(@sizeOf(c_int), @sizeOf(DWRITE_TEXTURE_TYPE));
-    try testing.expectEqual(0, @intFromEnum(DWRITE_RENDERING_MODE.DEFAULT));
-    try testing.expectEqual(1, @intFromEnum(DWRITE_RENDERING_MODE.ALIASED));
-    try testing.expectEqual(2, @intFromEnum(DWRITE_RENDERING_MODE.GDI_CLASSIC));
-    try testing.expectEqual(2, @intFromEnum(DWRITE_RENDERING_MODE.CLEARTYPE_GDI_CLASSIC));
-    try testing.expectEqual(3, @intFromEnum(DWRITE_RENDERING_MODE.GDI_NATURAL));
-    try testing.expectEqual(3, @intFromEnum(DWRITE_RENDERING_MODE.CLEARTYPE_GDI_NATURAL));
-    try testing.expectEqual(4, @intFromEnum(DWRITE_RENDERING_MODE.NATURAL));
-    try testing.expectEqual(4, @intFromEnum(DWRITE_RENDERING_MODE.CLEARTYPE_NATURAL));
-    try testing.expectEqual(5, @intFromEnum(DWRITE_RENDERING_MODE.NATURAL_SYMMETRIC));
-    try testing.expectEqual(5, @intFromEnum(DWRITE_RENDERING_MODE.CLEARTYPE_NATURAL_SYMMETRIC));
-    try testing.expectEqual(6, @intFromEnum(DWRITE_RENDERING_MODE.OUTLINE));
-    try testing.expectEqual(0, @intFromEnum(DWRITE_MEASURING_MODE.NATURAL));
-    try testing.expectEqual(1, @intFromEnum(DWRITE_MEASURING_MODE.GDI_CLASSIC));
-    try testing.expectEqual(2, @intFromEnum(DWRITE_MEASURING_MODE.GDI_NATURAL));
-    try testing.expectEqual(0, @intFromEnum(DWRITE_GRID_FIT_MODE.DEFAULT));
-    try testing.expectEqual(1, @intFromEnum(DWRITE_GRID_FIT_MODE.DISABLED));
-    try testing.expectEqual(2, @intFromEnum(DWRITE_GRID_FIT_MODE.ENABLED));
-    try testing.expectEqual(0, @intFromEnum(DWRITE_TEXT_ANTIALIAS_MODE.CLEARTYPE));
-    try testing.expectEqual(1, @intFromEnum(DWRITE_TEXT_ANTIALIAS_MODE.GRAYSCALE));
-    try testing.expectEqual(0, @intFromEnum(DWRITE_TEXTURE_TYPE.ALIASED_1x1));
-    try testing.expectEqual(1, @intFromEnum(DWRITE_TEXTURE_TYPE.CLEARTYPE_3x1));
+    try testing.expectEqual(0, @backingInt(DWRITE_RENDERING_MODE.DEFAULT));
+    try testing.expectEqual(1, @backingInt(DWRITE_RENDERING_MODE.ALIASED));
+    try testing.expectEqual(2, @backingInt(DWRITE_RENDERING_MODE.GDI_CLASSIC));
+    try testing.expectEqual(2, @backingInt(DWRITE_RENDERING_MODE.CLEARTYPE_GDI_CLASSIC));
+    try testing.expectEqual(3, @backingInt(DWRITE_RENDERING_MODE.GDI_NATURAL));
+    try testing.expectEqual(3, @backingInt(DWRITE_RENDERING_MODE.CLEARTYPE_GDI_NATURAL));
+    try testing.expectEqual(4, @backingInt(DWRITE_RENDERING_MODE.NATURAL));
+    try testing.expectEqual(4, @backingInt(DWRITE_RENDERING_MODE.CLEARTYPE_NATURAL));
+    try testing.expectEqual(5, @backingInt(DWRITE_RENDERING_MODE.NATURAL_SYMMETRIC));
+    try testing.expectEqual(5, @backingInt(DWRITE_RENDERING_MODE.CLEARTYPE_NATURAL_SYMMETRIC));
+    try testing.expectEqual(6, @backingInt(DWRITE_RENDERING_MODE.OUTLINE));
+    try testing.expectEqual(0, @backingInt(DWRITE_MEASURING_MODE.NATURAL));
+    try testing.expectEqual(1, @backingInt(DWRITE_MEASURING_MODE.GDI_CLASSIC));
+    try testing.expectEqual(2, @backingInt(DWRITE_MEASURING_MODE.GDI_NATURAL));
+    try testing.expectEqual(0, @backingInt(DWRITE_GRID_FIT_MODE.DEFAULT));
+    try testing.expectEqual(1, @backingInt(DWRITE_GRID_FIT_MODE.DISABLED));
+    try testing.expectEqual(2, @backingInt(DWRITE_GRID_FIT_MODE.ENABLED));
+    try testing.expectEqual(0, @backingInt(DWRITE_TEXT_ANTIALIAS_MODE.CLEARTYPE));
+    try testing.expectEqual(1, @backingInt(DWRITE_TEXT_ANTIALIAS_MODE.GRAYSCALE));
+    try testing.expectEqual(0, @backingInt(DWRITE_TEXTURE_TYPE.ALIASED_1x1));
+    try testing.expectEqual(1, @backingInt(DWRITE_TEXTURE_TYPE.CLEARTYPE_3x1));
 }
 
 test "directwrite api: rasterization iids" {
