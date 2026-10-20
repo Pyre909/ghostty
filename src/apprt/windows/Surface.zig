@@ -556,22 +556,29 @@ pub const Surface = struct {
     /// whichever surface had the focus when `run` created the window.
     pub const Options = struct {
         /// The font size in points to use instead of the configured one,
-        /// with `window-inherit-font-size`. Null for the configured size.
+        /// with `window-inherit-font-size`, for a window and a split alike
+        /// (`App.inheritedOptions`). Null for the configured size.
         font_size: ?f32 = null,
 
         /// The working directory to use instead of the one
         /// `apprt.surface.newConfig` chose, with
-        /// `window-inherit-working-directory`; see `inheritWorkingDirectory`.
-        /// Borrowed for the duration of `create`. Null keeps newConfig's.
+        /// `window-inherit-working-directory` or
+        /// `split-inherit-working-directory` as `context` says; see
+        /// `inheritWorkingDirectory`. Borrowed for the duration of
+        /// `create`. Null keeps newConfig's.
         working_directory: ?[]const u8 = null,
+
+        /// What the terminal is opened as, for `apprt.surface.newConfig`.
+        context: apprt.surface.NewSurfaceContext = .window,
     };
 
     /// Heap-allocate and initialize, including the core surface, as a child
-    /// window filling `window`'s client area. The address must be stable:
-    /// the core stores raw `*apprt.Surface` pointers (see
-    /// `CoreSurface.init`), and the wndproc recovers this pointer from
-    /// GWLP_USERDATA. The window is still hidden; `Window.show` shows it.
-    pub fn create(app: *App, window: *Window, opts: Options) !*Surface {
+    /// window of `window` at `rect` in its client area, the size the core
+    /// starts at. The address must be stable: the core stores raw
+    /// `*apprt.Surface` pointers (see `CoreSurface.init`), and the wndproc
+    /// recovers this pointer from GWLP_USERDATA. The terminal's window is
+    /// created hidden; `Window.create` and `Window.showPane` show it.
+    pub fn create(app: *App, window: *Window, rect: win32.RECT, opts: Options) !*Surface {
         const alloc = app.core_app.alloc;
         const self = try alloc.create(Surface);
         errdefer alloc.destroy(self);
@@ -597,19 +604,15 @@ pub const Surface = struct {
             .mouse = .init(),
         };
 
-        var client: win32.RECT = undefined;
-        if (!win32.GetClientRect(window.hwnd, &client).toBool()) {
-            return App.Error.Win32CallFailed;
-        }
         const hwnd = win32.CreateWindowExW(
             0,
             L(surface_class_name),
             null,
-            win32.WS_CHILD | win32.WS_VISIBLE | win32.WS_CLIPSIBLINGS,
-            0,
-            0,
-            client.right - client.left,
-            client.bottom - client.top,
+            win32.WS_CHILD | win32.WS_CLIPSIBLINGS,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
             window.hwnd,
             null,
             app.hinstance,
@@ -631,10 +634,12 @@ pub const Surface = struct {
         errdefer app.core_app.deleteSurface(self);
 
         // Preconditions CoreSurface.init relies on, both true here: the HWND
-        // exists at the size of a frame created at CW_USEDEFAULT size, so
-        // getSize is non-zero (`CoreSurface.init` reads it), and
-        // getContentScale works on it.
-        var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
+        // exists at its place in the frame, the client area of a frame
+        // created at CW_USEDEFAULT size for a window's first terminal, and
+        // at least a cell across for a split (`Window.split`), so getSize
+        // is non-zero (`CoreSurface.init` reads it), and getContentScale
+        // works on it.
+        var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
         if (opts.working_directory) |wd| inheritWorkingDirectory(&config, wd);
         // A failing CoreSurface.init joins any thread it started (unpumped,
@@ -662,7 +667,7 @@ pub const Surface = struct {
         return self;
     }
 
-    /// Make `wd`, the asking window's working directory, the new window's,
+    /// Make `wd`, the asking terminal's working directory, the new one's,
     /// as the macOS runtime does (`Surface.init` in src/apprt/embedded.zig):
     /// only an absolute path to an existing directory, otherwise the
     /// directory `config` already names is kept.
@@ -777,7 +782,7 @@ pub const Surface = struct {
     ///      drop any message still addressed to this surface instead of
     ///      calling into it (`CoreApp.hasSurface`), which also starts the quit
     ///      timer when this was the last surface; and the window requests it
-    ///      made forget it (`App.forgetWindowParent`).
+    ///      made forget it (`App.forgetParent`).
     ///   2. Stop the search thread, if any, and wait for it as in step 3,
     ///      while the render thread is still draining its mailbox.
     ///      `CoreSurface.deinit` would do this first too, but with an
@@ -877,10 +882,10 @@ pub const Surface = struct {
     /// core stops routing to this surface (`deleteSurface`, which also
     /// starts the quit timer when it was the last one), and a window it
     /// asked for and `run` has not created yet loses it as its parent while
-    /// the address is still this surface's (`App.forgetWindowParent`).
+    /// the address is still this surface's (`App.forgetParent`).
     fn detachCore(self: *Surface) void {
         self.app.core_app.deleteSurface(self);
-        self.app.forgetWindowParent(&self.core_surface);
+        self.app.forgetParent(&self.core_surface);
     }
 
     /// Ask for this window to be torn down from a message loop.
@@ -3663,8 +3668,8 @@ test "win32: a closing surface leaves the core and its window requests" {
 
     var app: App = undefined;
     app.core_app = &core_app;
-    app.window_requests = .empty;
-    defer app.window_requests.deinit(alloc);
+    app.requests = .empty;
+    defer app.requests.deinit(alloc);
 
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
@@ -3676,15 +3681,26 @@ test "win32: a closing surface leaves the core and its window requests" {
     // Two, so that the core does not start the quit timer.
     try core_app.surfaces.appendSlice(alloc, &.{ &s.closing, &s.other });
     core_app.focused_surface = &s.closing.core_surface;
-    try app.window_requests.appendSlice(alloc, &.{ &s.closing.core_surface, &s.other.core_surface, null });
+    try app.requests.appendSlice(alloc, &.{
+        .{ .window = &s.closing.core_surface },
+        .{ .window = &s.other.core_surface },
+        .{ .window = null },
+        .{ .split = .{ .parent = &s.closing.core_surface, .direction = .right } },
+    });
 
     s.closing.detachCore();
 
     try std.testing.expectEqualSlices(*Surface, &.{&s.other}, core_app.surfaces.items);
     try std.testing.expect(core_app.focused_surface == null);
-    try std.testing.expectEqualSlices(
-        ?*CoreSurface,
-        &.{ null, &s.other.core_surface, null },
-        app.window_requests.items,
-    );
+    // The window it asked for has no parent, and its split is dropped.
+    const want = [_]App.Request{
+        .{ .window = null },
+        .{ .window = &s.other.core_surface },
+        .{ .window = null },
+        .dropped,
+    };
+    try std.testing.expectEqual(want.len, app.requests.items.len);
+    for (want, app.requests.items) |w, got| {
+        try std.testing.expect(std.meta.eql(w, got));
+    }
 }

@@ -2,7 +2,7 @@
 //! rather than to a terminal -- its size, caption, maximize state, the size
 //! Windows suggests on a DPI change, its system modal loops. Its terminals
 //! are `Surface`s, child windows the frame lays out from its split tree
-//! (`tree`, `layout`). Until splits can be opened, a window holds one.
+//! (`tree`, `layout`); `split` opens another beside one.
 //!
 //! Ownership, as for surfaces (`App.surfaceDestroyed`): membership in
 //! `App.windows` is ownership of the allocation. The frame's WM_NCDESTROY,
@@ -120,13 +120,18 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     // that is in App.windows, which this one is not yet.
     errdefer _ = win32.DestroyWindow(hwnd);
 
-    const surface = try Surface.create(app, self, opts);
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(hwnd, &client).toBool()) return App.Error.Win32CallFailed;
+    const surface = try Surface.create(app, self, client, opts);
     // Nothing owns the terminal until it is in the tree.
     self.tree = Tree.init(alloc, surface) catch |err| {
         surface.discard();
         return err;
     };
     self.focused = surface;
+
+    // The frame is still hidden, so this shows nothing yet.
+    _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
     return self;
 }
 
@@ -377,6 +382,86 @@ pub fn destroy(self: *Window) bool {
     return win32.DestroyWindow(self.hwnd).toBool();
 }
 
+/// Open a terminal beside `parent` in `direction`, in the half of
+/// `parent`'s place that `layout` gives it, and created at that size
+/// (`CoreSurface.init` reads it), so that it starts at its final size. It
+/// is still hidden: `showPane` shows it once the app owns it
+/// (`App.newSplit`).
+pub fn split(
+    self: *Window,
+    parent: *Surface,
+    direction: apprt.action.SplitDirection,
+    opts: Surface.Options,
+) !*Surface {
+    const alloc = self.app.core_app.alloc;
+    // A parent leaves the tree only when it closes, and the core's request
+    // is dropped then (`App.forgetParent`).
+    const handle = self.tree.locate(parent) orelse return error.SplitParentGone;
+    const where: Tree.Split.Direction = switch (direction) {
+        .right => .right,
+        .down => .down,
+        .left => .left,
+        .up => .up,
+    };
+
+    var place: win32.RECT = undefined;
+    if (!win32.GetWindowRect(parent.hwnd, &place).toBool()) return App.Error.Win32CallFailed;
+    if (!self.toClient(&place)) return App.Error.Win32CallFailed;
+    const cell = parent.core_surface.size.cell;
+    const min = std.math.lossyCast(i32, if (where == .left or where == .right) cell.width else cell.height);
+    const rect = newPaneArea(
+        place,
+        where,
+        dividerWidth(dpiOf(self.app, self.hwnd)),
+        @max(1, min),
+    ) orelse return error.SplitTooSmall;
+
+    const surface = try Surface.create(self.app, self, rect, opts);
+    // Nothing owns the terminal until it is in the tree.
+    errdefer surface.discard();
+    var single: Tree = try .init(alloc, surface);
+    defer single.deinit();
+    const tree = try self.tree.split(alloc, handle, where, new_split_ratio, &single);
+    errdefer comptime unreachable;
+    self.tree.deinit();
+    self.tree = tree;
+    return surface;
+}
+
+/// Show a terminal `split` opened, now that the app owns it, with room
+/// made for it, and give it the focus.
+pub fn showPane(self: *Window, surface: *Surface) void {
+    self.relayout();
+    _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
+    self.giveFocus(surface);
+}
+
+/// Make `surface` the window's focused terminal. Only the active window
+/// sets the keyboard focus at once; another one would be activated by it,
+/// so it hands the focus over when it is activated (WM_SETFOCUS).
+pub fn giveFocus(self: *Window, surface: *Surface) void {
+    self.focused = surface;
+    if (win32.GetActiveWindow() == self.hwnd) _ = win32.SetFocus(surface.hwnd);
+}
+
+/// Map `rect`, in screen coordinates, to the frame's client area.
+pub fn toClient(self: *const Window, rect: *win32.RECT) bool {
+    var corners = [2]win32.POINT{
+        .{ .x = rect.left, .y = rect.top },
+        .{ .x = rect.right, .y = rect.bottom },
+    };
+    for (&corners) |*pt| {
+        if (!win32.ScreenToClient(self.hwnd, pt).toBool()) return false;
+    }
+    rect.* = .{
+        .left = corners[0].x,
+        .top = corners[0].y,
+        .right = corners[1].x,
+        .bottom = corners[1].y,
+    };
+    return true;
+}
+
 /// Take the terminal at `handle` in the tree out of this window ahead of
 /// its teardown (`Surface.destroy`), when another terminal stays. The others
 /// are laid out again over its place, and if it had the focus, the focus
@@ -405,11 +490,7 @@ pub fn removePane(self: *Window, handle: Tree.Node.Handle) !void {
     self.focused = focus;
 
     // The focus moves first, so that it is never left on a hidden window.
-    // Only in the active window: setting the focus in another one would
-    // activate it.
-    if (focus) |f| {
-        if (win32.GetActiveWindow() == self.hwnd) _ = win32.SetFocus(f.hwnd);
-    }
+    if (focus) |f| self.giveFocus(f);
     _ = win32.ShowWindow(surface.hwnd, win32.SW_HIDE);
     self.relayout();
 }
@@ -498,33 +579,76 @@ fn layoutNode(
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| ctx.pane(view, area),
         .split => |s| {
-            const across = s.layout == .horizontal;
-            const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
-            const line = std.math.clamp(divider, 0, total);
-            const rest = total - line;
-            const scaled = @round(@as(f32, @floatFromInt(rest)) * @as(f32, s.ratio));
-            const first = std.math.clamp(std.math.lossyCast(i32, scaled), 0, rest);
-
-            var a = area;
-            var d = area;
-            var b = area;
-            if (across) {
-                a.right = area.left + first;
-                d.left = a.right;
-                d.right = d.left + line;
-                b.left = d.right;
-            } else {
-                a.bottom = area.top + first;
-                d.top = a.bottom;
-                d.bottom = d.top + line;
-                b.top = d.bottom;
-            }
-            if (line > 0) ctx.divider(d);
-            layoutNode(tree, s.left, a, divider, ctx);
-            layoutNode(tree, s.right, b, divider, ctx);
+            const sides = splitArea(area, s.layout == .horizontal, s.ratio, divider);
+            if (sides.line > 0) ctx.divider(sides.divider);
+            layoutNode(tree, s.left, sides.first, divider, ctx);
+            layoutNode(tree, s.right, sides.second, divider, ctx);
         },
     }
 }
+
+/// How a split divides `area` (`layout`): `divider` pixels for the line
+/// between its sides, fewer if it is narrower than that, and the rest by
+/// `ratio`, to the nearest pixel, for the first side (left or top).
+fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) struct {
+    first: win32.RECT,
+    divider: win32.RECT,
+    second: win32.RECT,
+    line: i32,
+} {
+    const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
+    const line = std.math.clamp(divider, 0, total);
+    const rest = total - line;
+    const scaled = @round(@as(f32, @floatFromInt(rest)) * @as(f32, ratio));
+    const first = std.math.clamp(std.math.lossyCast(i32, scaled), 0, rest);
+
+    var a = area;
+    var d = area;
+    var b = area;
+    if (across) {
+        a.right = area.left + first;
+        d.left = a.right;
+        d.right = d.left + line;
+        b.left = d.right;
+    } else {
+        a.bottom = area.top + first;
+        d.top = a.bottom;
+        d.bottom = d.top + line;
+        b.top = d.bottom;
+    }
+    return .{ .first = a, .divider = d, .second = b, .line = line };
+}
+
+/// Where `split` puts a new terminal beside one at `area`: the side
+/// `where` names of `area` split as `layout` will split it, at
+/// `new_split_ratio`. Null if it, or what it leaves of `area`, would be less
+/// than `min` pixels across the split: a terminal with no room takes the
+/// focus and shows nothing.
+fn newPaneArea(
+    area: win32.RECT,
+    where: Tree.Split.Direction,
+    divider: i32,
+    min: i32,
+) ?win32.RECT {
+    const across = where == .left or where == .right;
+    const sides = splitArea(area, across, new_split_ratio, divider);
+    const new, const left = switch (where) {
+        .left, .up => .{ sides.first, sides.second },
+        .right, .down => .{ sides.second, sides.first },
+    };
+    const extent = struct {
+        fn extent(r: win32.RECT, a: bool) i32 {
+            return if (a) r.right - r.left else r.bottom - r.top;
+        }
+    }.extent;
+    if (extent(new, across) < min or extent(left, across) < min) return null;
+    return new;
+}
+
+/// A new split's share of its parent's place: half, as on GTK, which
+/// says "Always split equally for new splits"
+/// (src/apprt/gtk/class/split_tree.zig).
+pub const new_split_ratio: f16 = 0.5;
 
 /// The colour of the line between two terminals: `split-divider-color`, or
 /// the one macOS derives from the background (`splitDividerColor` in
@@ -1033,6 +1157,51 @@ test "win32: the pixel layout agrees with the split tree's own" {
             try std.testing.expect(@abs(x - @as(f32, @floatFromInt(y))) <= tolerance);
         }
     }
+}
+
+test "win32: a new split starts where the layout puts it" {
+    // `split` creates the new terminal at the size it will have, from the
+    // parent's place alone; the layout of the tree with it, at the ratio
+    // `split` gives it, must agree, or it would be resized as soon as it is
+    // shown.
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a' };
+    var b: TestPane = .{ .name = 'b' };
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    const area: win32.RECT = .{ .left = 3, .top = 5, .right = 1004, .bottom = 606 };
+    const divider = 2;
+
+    for ([_]TestTree.Split.Direction{ .left, .right, .up, .down }) |where| {
+        var tree = try testSplit(&only_a, .root, where, new_split_ratio, &b);
+        defer tree.deinit();
+        var got: TestLayout = .{};
+        layout(&tree, area, divider, &got);
+        try std.testing.expectEqual(got.rectOf(&b), newPaneArea(area, where, divider, 1).?);
+    }
+}
+
+test "win32: a split needs room for a cell on each side" {
+    // A terminal with no room would take the focus and show nothing:
+    // splitting the newest one again and again ends at no width at all.
+    const divider = 2;
+    const cell = 10;
+    // 22 wide: 10 on each side of the divider, just enough.
+    const fits: win32.RECT = .{ .left = 0, .top = 0, .right = 22, .bottom = 300 };
+    for ([_]TestTree.Split.Direction{ .left, .right }) |where| {
+        try std.testing.expect(newPaneArea(fits, where, divider, cell) != null);
+    }
+    // 21 wide: one side gets 9.
+    const narrow: win32.RECT = .{ .left = 0, .top = 0, .right = 21, .bottom = 300 };
+    for ([_]TestTree.Split.Direction{ .left, .right }) |where| {
+        try std.testing.expect(newPaneArea(narrow, where, divider, cell) == null);
+    }
+    // Across the other axis, the height counts.
+    const short: win32.RECT = .{ .left = 0, .top = 0, .right = 300, .bottom = 21 };
+    for ([_]TestTree.Split.Direction{ .up, .down }) |where| {
+        try std.testing.expect(newPaneArea(short, where, divider, cell) == null);
+    }
+    try std.testing.expect(newPaneArea(short, .right, divider, cell) != null);
 }
 
 test "win32: modal loops are counted per window and returned on destroy" {

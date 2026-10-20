@@ -77,23 +77,23 @@ pub const App = struct {
     /// (`windowDestroyed`).
     windows: std.ArrayListUnmanaged(*Window),
 
-    /// Windows the core asked for (`.new_window`) that `run` has not
-    /// created yet, oldest first, each with the core surface that asked,
-    /// if any.
+    /// Windows and splits the core asked for (`.new_window`,
+    /// `.new_split`) that `run` has not created yet, oldest first, each
+    /// with the core surface that asked, if any (`Request`).
     ///
-    /// The core asks from inside its own frames: a `new_window` binding
-    /// performs the action from `CoreSurface.keyCallback`
-    /// (`performBindingAction` -> `CoreApp.newWindow`). Creating the window
-    /// there would register a surface with the core in the middle of that
-    /// frame and send the new window's activation, and the old window's
+    /// The core asks from inside its own frames: a `new_window` or
+    /// `new_split` binding performs the action from
+    /// `CoreSurface.keyCallback` (`performBindingAction`). Creating the
+    /// terminal there would register a surface with the core in the middle
+    /// of that frame and send the new terminal's focus, and the old one's
     /// WM_KILLFOCUS, into a surface whose key callback is still on the
     /// stack. So the action only records the request, and `run` creates
-    /// the window after its tick (`createRequestedWindows`).
+    /// the window or split after its tick (`createRequested`).
     ///
     /// A parent is always live: a surface clears its own entries when its
-    /// teardown starts (`forgetWindowParent`), before its address can be
+    /// teardown starts (`forgetParent`), before its address can be
     /// reused.
-    window_requests: std.ArrayListUnmanaged(?*CoreSurface),
+    requests: std.ArrayListUnmanaged(Request),
 
     /// Set when the loop should stop. Written only on the main thread.
     quit: bool,
@@ -169,6 +169,22 @@ pub const App = struct {
     ) !bool {
         return false;
     }
+
+    /// A window or a split the core asked for and `run` has not created yet
+    /// (`requests`).
+    pub const Request = union(enum) {
+        /// A new window, from the surface that asked, if any.
+        window: ?*CoreSurface,
+
+        /// A new split beside `parent`, in `direction`.
+        split: struct {
+            parent: *CoreSurface,
+            direction: apprt.action.SplitDirection,
+        },
+
+        /// A split whose parent began to close first: it has nowhere to go.
+        dropped,
+    };
 
     /// `main` in main_ghostty.zig declares `var app_runtime: apprt.App =
     /// undefined` on its stack, so this initializes in place and never returns
@@ -278,7 +294,7 @@ pub const App = struct {
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
             .windows = .empty,
-            .window_requests = .empty,
+            .requests = .empty,
             .quit = false,
             .quit_timer = .off,
             .ticking = false,
@@ -341,7 +357,7 @@ pub const App = struct {
         self.surfaces.deinit(self.core_app.alloc);
 
         // Windows asked for and never created: the process is quitting.
-        self.window_requests.deinit(self.core_app.alloc);
+        self.requests.deinit(self.core_app.alloc);
 
         self.stopQuitTimer();
 
@@ -357,7 +373,7 @@ pub const App = struct {
         // process has no window at all, and this path says why
         // (`fatalNotice`, e.g. no Direct3D 11) and exits with the error. A
         // queued window would only be reported as one that could not open
-        // (`createRequestedWindows`), and the launch's quit timer would then
+        // (`createRequested`), and the launch's quit timer would then
         // end the process with no reason given.
         if (self.config.@"initial-window") {
             _ = self.newWindow(null) catch |err| {
@@ -429,8 +445,8 @@ pub const App = struct {
             // And IME work that could not run where it arose (Surface.syncIme).
             self.syncDeferredIme();
 
-            // And the windows the core asked for (`window_requests`).
-            self.createRequestedWindows();
+            // And the windows and splits the core asked for (`requests`).
+            self.createRequested();
         }
     }
 
@@ -696,6 +712,7 @@ pub const App = struct {
             },
 
             .new_window => self.requestWindow(target),
+            .new_split => self.requestSplit(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -977,7 +994,7 @@ pub const App = struct {
         );
     }
 
-    /// `.new_window`: record the request for `run` (see `window_requests`).
+    /// `.new_window`: record the request for `run` (see `requests`).
     /// `true` once it is recorded: the window is then created, or its
     /// failure reported to the user, as soon as the core frame that asked
     /// has returned, unless the app quits first.
@@ -986,74 +1003,131 @@ pub const App = struct {
             .app => null,
             .surface => |v| v,
         };
-        self.window_requests.append(self.core_app.alloc, parent) catch |err| {
+        self.requests.append(self.core_app.alloc, .{ .window = parent }) catch |err| {
             log.warn("cannot record a new window request err={}", .{err});
             return false;
         };
         return true;
     }
 
-    /// Forget `core_surface` as the parent of the windows it asked for: it
-    /// is closing. Called by `Surface.detachCore`, the first step of every
-    /// teardown, while the address is still that surface's, so that a
-    /// surface created later at the same address cannot pass for the parent.
-    pub fn forgetWindowParent(self: *App, core_surface: *CoreSurface) void {
-        for (self.window_requests.items) |*parent| {
-            const p = parent.* orelse continue;
-            if (p == core_surface) parent.* = null;
-        }
+    /// `.new_split`: record the request for `run`, as `requestWindow` does,
+    /// for the same reason: a `new_split` binding performs it inside the
+    /// core's key callback.
+    fn requestSplit(
+        self: *App,
+        target: apprt.Target,
+        direction: apprt.action.SplitDirection,
+    ) bool {
+        const parent = switch (target) {
+            .app => {
+                log.warn("new split to app is unexpected", .{});
+                return false;
+            },
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .split = .{
+            .parent = parent,
+            .direction = direction,
+        } }) catch |err| {
+            log.warn("cannot record a new split request err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
-    /// Create the windows in `window_requests`, oldest first. Called by
-    /// `run`, where `canReenterCore` holds and no teardown is running.
-    fn createRequestedWindows(self: *App) void {
+    /// Forget `core_surface` as the parent of the windows it asked for, and
+    /// drop the splits it asked for: it is closing. Called by
+    /// `Surface.detachCore`, the first step of every teardown, while the
+    /// address is still that surface's, so that a surface created later at
+    /// the same address cannot pass for the parent.
+    pub fn forgetParent(self: *App, core_surface: *CoreSurface) void {
+        for (self.requests.items) |*request| switch (request.*) {
+            .window => |*parent| {
+                if (parent.* == core_surface) parent.* = null;
+            },
+            .split => |split| {
+                if (split.parent == core_surface) request.* = .dropped;
+            },
+            .dropped => {},
+        };
+    }
+
+    /// Create the windows and splits in `requests`, oldest first.
+    /// Called by `run`, where `canReenterCore` holds and no teardown is
+    /// running.
+    fn createRequested(self: *App) void {
         // A window opened now would only be torn down again by `terminate`.
         if (self.quit) return;
 
         // By index, reading the length again each time round: the notice for
         // a failure runs a message loop, and a request added meanwhile is
         // still created here.
-        defer self.window_requests.clearRetainingCapacity();
+        defer self.requests.clearRetainingCapacity();
         var i: usize = 0;
-        while (i < self.window_requests.items.len) : (i += 1) {
-            const parent = self.window_requests.items[i];
-            _ = self.newWindow(parent) catch |err| {
-                log.err("failed to create a window err={}", .{err});
-                notice(
-                    self,
-                    if (parent) |p| p.rt_surface.hwnd else null,
-                    L("Ghostty could not open a new window."),
-                );
-            };
+        while (i < self.requests.items.len) : (i += 1) {
+            switch (self.requests.items[i]) {
+                .window => |parent| _ = self.newWindow(parent) catch |err| {
+                    log.err("failed to create a window err={}", .{err});
+                    notice(
+                        self,
+                        if (parent) |p| p.rt_surface.hwnd else null,
+                        L("Ghostty could not open a new window."),
+                    );
+                },
+                .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
+                    // As when a key has nothing to do: the window is as it was.
+                    error.SplitTooSmall => log.info("no room for a split: a terminal would be smaller than a cell", .{}),
+                    else => {
+                        log.err("failed to create a split err={}", .{err});
+                        notice(
+                            self,
+                            split.parent.rt_surface.hwnd,
+                            L("Ghostty could not open a new split."),
+                        );
+                    },
+                },
+                .dropped => {},
+            }
         }
     }
 
+    /// What a new terminal takes from `parent`, the surface that asked for
+    /// it, as `context`: its font size with `window-inherit-font-size`, for
+    /// a split too, as macOS has it (`newSurfaceOptions` in
+    /// src/apprt/embedded.zig), and its working directory if `context`
+    /// inherits it. The caller frees `working_directory` with the core
+    /// allocator once the terminal is created.
+    fn inheritedOptions(
+        self: *App,
+        parent: ?*CoreSurface,
+        context: apprt.surface.NewSurfaceContext,
+    ) Surface.Options {
+        const p = parent orelse return .{ .context = context };
+        return .{
+            .font_size = if (self.config.@"window-inherit-font-size") p.font_size.points else null,
+            // Taken from the asking surface itself (see Surface.Options).
+            .working_directory = if (apprt.surface.shouldInheritWorkingDirectory(context, &self.config))
+                p.pwd(self.core_app.alloc) catch null
+            else
+                null,
+            .context = context,
+        };
+    }
+
     /// Create a terminal window: the initial one (`run`), or one the core
-    /// asked for (`createRequestedWindows`) from `parent`, a live surface.
+    /// asked for (`createRequested`) from `parent`, a live surface.
     fn newWindow(self: *App, parent: ?*CoreSurface) !*Window {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
         try self.windows.ensureUnusedCapacity(alloc, 1);
 
-        // Taken from the asking surface itself (see Surface.Options).
-        const cwd: ?[]const u8 = cwd: {
-            const p = parent orelse break :cwd null;
-            if (!apprt.surface.shouldInheritWorkingDirectory(.window, &self.config)) break :cwd null;
-            break :cwd p.pwd(alloc) catch null;
-        };
-        defer if (cwd) |v| alloc.free(v);
+        const opts = self.inheritedOptions(parent, .window);
+        defer if (opts.working_directory) |v| alloc.free(v);
 
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
         // itself, so there is no quit-timer handling here.
-        const window = try Window.create(self, .{
-            .font_size = font_size: {
-                const p = parent orelse break :font_size null;
-                if (!self.config.@"window-inherit-font-size") break :font_size null;
-                break :font_size p.font_size.points;
-            },
-            .working_directory = cwd,
-        });
+        const window = try Window.create(self, opts);
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
         self.surfaces.appendAssumeCapacity(window.focused.?);
@@ -1061,6 +1135,28 @@ pub const App = struct {
         // Shown once both are owned, so that its first messages find them.
         window.show();
         return window;
+    }
+
+    /// Open a split beside `parent`, a live surface, in `direction`: a new
+    /// terminal in the parent's window, which takes the focus.
+    fn newSplit(
+        self: *App,
+        parent: *CoreSurface,
+        direction: apprt.action.SplitDirection,
+    ) !void {
+        const alloc = self.core_app.alloc;
+        try self.surfaces.ensureUnusedCapacity(alloc, 1);
+
+        const opts = self.inheritedOptions(parent, .split);
+        defer if (opts.working_directory) |v| alloc.free(v);
+
+        const window = parent.rt_surface.window;
+        const surface = try window.split(parent.rt_surface, direction, opts);
+        errdefer comptime unreachable;
+        self.surfaces.appendAssumeCapacity(surface);
+
+        // Shown once it is owned, as a new window is.
+        window.showPane(surface);
     }
 
     /// Called from the surface's WM_DESTROY handler, and by `terminate` for
@@ -1791,21 +1887,10 @@ test "win32: a window's terminal fills it, and both are freed once" {
 
 /// For tests: where `pane` is inside its frame's client area.
 fn paneRect(window: *const Window, pane: *const Surface) !win32.RECT {
-    var screen: win32.RECT = undefined;
-    if (!win32.GetWindowRect(pane.hwnd, &screen).toBool()) return error.TestUnexpectedResult;
-    var corners = [2]win32.POINT{
-        .{ .x = screen.left, .y = screen.top },
-        .{ .x = screen.right, .y = screen.bottom },
-    };
-    for (&corners) |*pt| {
-        if (!win32.ScreenToClient(window.hwnd, pt).toBool()) return error.TestUnexpectedResult;
-    }
-    return .{
-        .left = corners[0].x,
-        .top = corners[0].y,
-        .right = corners[1].x,
-        .bottom = corners[1].y,
-    };
+    var rect: win32.RECT = undefined;
+    if (!win32.GetWindowRect(pane.hwnd, &rect).toBool()) return error.TestUnexpectedResult;
+    if (!window.toClient(&rect)) return error.TestUnexpectedResult;
+    return rect;
 }
 
 /// For tests: `panes` side by side, in this order, as splitting each one
@@ -2026,21 +2111,22 @@ test "win32: a terminal with no core closes through a posted teardown" {
     try std.testing.expectEqual(0, app.windows.items.len);
 }
 
-test "win32: a new window is recorded where it is asked for, and created later" {
-    // A `new_window` binding performs the action from inside the core's
-    // key callback, so the action only records the request; `run` creates
-    // the window after its tick. A surface that starts closing in between
-    // clears itself from its requests (`forgetWindowParent`, called by
-    // Surface.stopCore), so a surface created later at the same address is
-    // not taken for the parent.
+test "win32: new windows and splits are recorded where they are asked for" {
+    // A `new_window` or `new_split` binding performs the action from inside
+    // the core's key callback, so the action only records the request;
+    // `run` creates it after its tick. A surface that starts closing in
+    // between clears itself from its requests (`forgetParent`, called
+    // by Surface.stopCore): a window it asked for has no parent, and a split
+    // beside it is dropped, so a surface created later at the same address
+    // is not taken for the parent.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
 
     var app: App = undefined;
     app.core_app = &core_app;
-    app.window_requests = .empty;
-    defer app.window_requests.deinit(alloc);
+    app.requests = .empty;
+    defer app.requests.deinit(alloc);
     app.surfaces = .empty;
 
     // Static because the struct embeds a whole CoreSurface.
@@ -2048,21 +2134,29 @@ test "win32: a new window is recorded where it is asked for, and created later" 
         var open: Surface = undefined;
         var closed: Surface = undefined;
     };
+    const open = &s.open.core_surface;
+    const closed = &s.closed.core_surface;
 
-    for ([_]apprt.Target{
-        .{ .surface = &s.open.core_surface },
-        .{ .surface = &s.closed.core_surface },
-        .app,
-    }) |target| {
+    for ([_]apprt.Target{ .{ .surface = open }, .{ .surface = closed }, .app }) |target| {
         try std.testing.expect(try app.performAction(target, .new_window, {}));
     }
+    try std.testing.expect(try app.performAction(.{ .surface = open }, .new_split, .right));
+    try std.testing.expect(try app.performAction(.{ .surface = closed }, .new_split, .down));
+    // A split needs a surface to go beside.
+    try std.testing.expect(!try app.performAction(.app, .new_split, .left));
     try std.testing.expectEqual(0, app.surfaces.items.len);
 
-    app.forgetWindowParent(&s.closed.core_surface);
+    app.forgetParent(closed);
 
-    try std.testing.expectEqualSlices(
-        ?*CoreSurface,
-        &.{ &s.open.core_surface, null, null },
-        app.window_requests.items,
-    );
+    const want = [_]App.Request{
+        .{ .window = open },
+        .{ .window = null },
+        .{ .window = null },
+        .{ .split = .{ .parent = open, .direction = .right } },
+        .dropped,
+    };
+    try std.testing.expectEqual(want.len, app.requests.items.len);
+    for (want, app.requests.items) |w, got| {
+        try std.testing.expect(std.meta.eql(w, got));
+    }
 }
