@@ -89,7 +89,7 @@ pub fn init(
         log.err("CreateTexture2D {d}x{d} format={d} failed hr=0x{x}", .{
             width,
             height,
-            @intFromEnum(opts.format),
+            @backingInt(opts.format),
             @as(u32, @bitCast(hr)),
         });
         return error.D3D11Failed;

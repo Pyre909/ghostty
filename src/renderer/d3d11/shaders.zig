@@ -85,11 +85,11 @@ const PipelineDescription = struct {
 
 /// We create a type for the pipeline collection based on our desc array.
 const PipelineCollection = t: {
-    const StructField = std.builtin.Type.StructField;
-
     var names: [pipeline_descs.len][]const u8 = undefined;
-    var types = [_]type{Pipeline} ** pipeline_descs.len;
-    var attrs = [_]StructField.Attributes{.{ .@"align" = @alignOf(Pipeline) }} ** pipeline_descs.len;
+    var types: [pipeline_descs.len]type = @splat(Pipeline);
+    var attrs: [pipeline_descs.len]std.lang.Type.Struct.FieldAttributes = @splat(.{
+        .@"align" = @alignOf(Pipeline),
+    });
 
     for (pipeline_descs, &names) |pipeline, *name| {
         name.* = pipeline[0];
@@ -237,7 +237,7 @@ fn initPostPipelines(
 pub const Uniforms = extern struct {
     /// The projection matrix for turning world coordinates to normalized.
     /// This is calculated based on the size of the screen.
-    projection_matrix: math.Mat align(16),
+    projection_matrix: [4][4]f32 align(16),
 
     /// Size of the screen (render target) in pixels.
     screen_size: [2]f32 align(8),
@@ -612,23 +612,23 @@ test "d3d11 shaders: bit masks and registers match the Zig side" {
         .{ common, "EXTEND_DOWN", print("{d}u", .{@as(u32, @bitCast(Extend{ .down = true }))}) },
         .{ text, "NO_MIN_CONTRAST", print("{d}u", .{@as(u8, @bitCast(GlyphBools{ .no_min_contrast = true }))}) },
         .{ text, "IS_CURSOR_GLYPH", print("{d}u", .{@as(u8, @bitCast(GlyphBools{ .is_cursor_glyph = true }))}) },
-        .{ text, "ATLAS_GRAYSCALE", print("{d}u", .{@intFromEnum(CellText.Atlas.grayscale)}) },
-        .{ text, "ATLAS_COLOR", print("{d}u", .{@intFromEnum(CellText.Atlas.color)}) },
+        .{ text, "ATLAS_GRAYSCALE", print("{d}u", .{@backingInt(CellText.Atlas.grayscale)}) },
+        .{ text, "ATLAS_COLOR", print("{d}u", .{@backingInt(CellText.Atlas.color)}) },
         .{ bg_image, "BG_IMAGE_POSITION", print("{d}u", .{((1 << @bitSizeOf(Info.Position)) - 1) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_TL", print("{d}u", .{@intFromEnum(Info.Position.tl) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_TC", print("{d}u", .{@intFromEnum(Info.Position.tc) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_TR", print("{d}u", .{@intFromEnum(Info.Position.tr) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_ML", print("{d}u", .{@intFromEnum(Info.Position.ml) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_MC", print("{d}u", .{@intFromEnum(Info.Position.mc) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_MR", print("{d}u", .{@intFromEnum(Info.Position.mr) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_BL", print("{d}u", .{@intFromEnum(Info.Position.bl) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_BC", print("{d}u", .{@intFromEnum(Info.Position.bc) << pos_shift}) },
-        .{ bg_image, "BG_IMAGE_BR", print("{d}u", .{@intFromEnum(Info.Position.br) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_TL", print("{d}u", .{@backingInt(Info.Position.tl) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_TC", print("{d}u", .{@backingInt(Info.Position.tc) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_TR", print("{d}u", .{@backingInt(Info.Position.tr) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_ML", print("{d}u", .{@backingInt(Info.Position.ml) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_MC", print("{d}u", .{@backingInt(Info.Position.mc) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_MR", print("{d}u", .{@backingInt(Info.Position.mr) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_BL", print("{d}u", .{@backingInt(Info.Position.bl) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_BC", print("{d}u", .{@backingInt(Info.Position.bc) << pos_shift}) },
+        .{ bg_image, "BG_IMAGE_BR", print("{d}u", .{@backingInt(Info.Position.br) << pos_shift}) },
         .{ bg_image, "BG_IMAGE_FIT", print("{d}u << {d}", .{ (1 << @bitSizeOf(Info.Fit)) - 1, fit_shift }) },
-        .{ bg_image, "BG_IMAGE_CONTAIN", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.contain), fit_shift }) },
-        .{ bg_image, "BG_IMAGE_COVER", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.cover), fit_shift }) },
-        .{ bg_image, "BG_IMAGE_STRETCH", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.stretch), fit_shift }) },
-        .{ bg_image, "BG_IMAGE_NO_FIT", print("{d}u << {d}", .{ @intFromEnum(Info.Fit.none), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_CONTAIN", print("{d}u << {d}", .{ @backingInt(Info.Fit.contain), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_COVER", print("{d}u << {d}", .{ @backingInt(Info.Fit.cover), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_STRETCH", print("{d}u << {d}", .{ @backingInt(Info.Fit.stretch), fit_shift }) },
+        .{ bg_image, "BG_IMAGE_NO_FIT", print("{d}u << {d}", .{ @backingInt(Info.Fit.none), fit_shift }) },
         .{ bg_image, "BG_IMAGE_REPEAT", print("{d}u << {d}", .{ 1, repeat_shift }) },
     };
     inline for (masks) |m| {

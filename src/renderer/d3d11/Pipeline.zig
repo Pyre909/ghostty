@@ -181,22 +181,22 @@ pub fn deinit(self: *const Self) void {
 /// is a multiple of four.
 pub fn autoInputElements(comptime T: type) []const api.D3D11_INPUT_ELEMENT_DESC {
     return comptime elements: {
-        const fields = @typeInfo(T).@"struct".fields;
-        var result: [fields.len]api.D3D11_INPUT_ELEMENT_DESC = undefined;
-        var names: [fields.len][:0]const u8 = undefined;
+        const info = @typeInfo(T).@"struct";
+        var result: [info.field_names.len]api.D3D11_INPUT_ELEMENT_DESC = undefined;
+        var names: [info.field_names.len][:0]const u8 = undefined;
         var len: usize = 0;
 
         // The component type and count of the last element, to fold into.
         var last_type: type = void;
         var last_count: usize = 0;
 
-        for (fields) |field| {
-            const offset = @offsetOf(T, field.name);
+        for (info.field_names, info.field_types) |field_name, field_type| {
+            const offset = @offsetOf(T, field_name);
 
-            const FT = switch (@typeInfo(field.type)) {
+            const FT = switch (@typeInfo(field_type)) {
                 .@"struct" => |s| s.backing_integer.?,
                 .@"enum" => |e| e.tag_type,
-                else => field.type,
+                else => field_type,
             };
 
             const count, const CT = switch (@typeInfo(FT)) {
@@ -204,8 +204,8 @@ pub fn autoInputElements(comptime T: type) []const api.D3D11_INPUT_ELEMENT_DESC 
                 else => .{ 1, FT },
             };
 
-            var upper: [field.name.len]u8 = undefined;
-            _ = std.ascii.upperString(&upper, field.name);
+            var upper: [field_name.len]u8 = undefined;
+            _ = std.ascii.upperString(&upper, field_name);
 
             if (offset % 4 != 0) {
                 if (len == 0 or
@@ -213,7 +213,7 @@ pub fn autoInputElements(comptime T: type) []const api.D3D11_INPUT_ELEMENT_DESC 
                     result[len - 1].AlignedByteOffset + last_count * @sizeOf(CT) != offset)
                 {
                     @compileError("cannot fold " ++ @typeName(T) ++ "." ++
-                        field.name ++ " into the element before it");
+                        field_name ++ " into the element before it");
                 }
 
                 last_count += count;
@@ -286,7 +286,7 @@ fn compileShader(
     target: [*:0]const u8,
 ) Error!*api.ID3DBlob {
     const flags: api.UINT = api.D3DCOMPILE_ENABLE_STRICTNESS |
-        if (comptime builtin.mode == .Debug)
+        if (comptime builtin.mode == .debug)
             api.D3DCOMPILE_DEBUG | api.D3DCOMPILE_SKIP_OPTIMIZATION
         else
             api.D3DCOMPILE_OPTIMIZATION_LEVEL3;

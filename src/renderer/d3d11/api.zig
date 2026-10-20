@@ -25,7 +25,7 @@ const windows = std.os.windows;
 /// x86_64 and aarch64). On other hosts only the layout tests analyze these
 /// types, and the Windows convention is not compilable there, so the C
 /// convention stands in; it never gets called.
-const cc: std.builtin.CallingConvention = if (builtin.os.tag == .windows) .winapi else .c;
+const cc: std.lang.CallingConvention = if (builtin.target.os.tag == .windows) .winapi else .c;
 
 pub const UINT = u32;
 pub const INT = i32;

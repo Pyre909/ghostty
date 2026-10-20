@@ -289,7 +289,7 @@ pub fn init(
     device: *const Device,
     opts: rendererpkg.Options,
 ) !D3D11 {
-    comptime switch (builtin.os.tag) {
+    comptime switch (builtin.target.os.tag) {
         .windows => {},
         else => @compileError("unsupported platform for Direct3D 11"),
     };
@@ -362,7 +362,7 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     // device creation reports the SDK component missing, and the device is
     // created again without the layer.
     var flags: api.UINT = api.D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    if (comptime builtin.mode == .Debug) flags |= api.D3D11_CREATE_DEVICE_DEBUG;
+    if (comptime builtin.mode == .debug) flags |= api.D3D11_CREATE_DEVICE_DEBUG;
 
     // Only 11_0: asking for 11_1 on an 11.0 runtime fails device creation
     // outright instead of falling back.
@@ -612,7 +612,7 @@ fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
 
 fn logAdapter(adapter_desc: ?*const api.DXGI_ADAPTER_DESC, level: api.D3D_FEATURE_LEVEL) void {
     const desc = adapter_desc orelse {
-        log.info("D3D11 device feature_level=0x{x} (adapter description unavailable)", .{@intFromEnum(level)});
+        log.info("D3D11 device feature_level=0x{x} (adapter description unavailable)", .{@backingInt(level)});
         return;
     };
     const len = std.mem.indexOfScalar(u16, &desc.Description, 0) orelse desc.Description.len;
@@ -625,7 +625,7 @@ fn logAdapter(adapter_desc: ?*const api.DXGI_ADAPTER_DESC, level: api.D3D_FEATUR
         name,
         desc.VendorId,
         desc.DeviceId,
-        @intFromEnum(level),
+        @backingInt(level),
         desc.DedicatedVideoMemory / (1024 * 1024),
     });
 }
