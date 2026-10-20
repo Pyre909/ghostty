@@ -749,10 +749,11 @@ pub const Surface = struct {
     ///
     /// The order is load-bearing:
     ///
-    ///   1. `deleteSurface` first, so the ticks in steps 2-4 drop any message
-    ///      still addressed to this surface instead of calling into it
-    ///      (`CoreApp.hasSurface`). It also starts the quit timer when this was
-    ///      the last surface.
+    ///   1. `detachCore` first: `deleteSurface`, so the ticks in steps 2-4
+    ///      drop any message still addressed to this surface instead of
+    ///      calling into it (`CoreApp.hasSurface`), which also starts the quit
+    ///      timer when this was the last surface; and the window requests it
+    ///      made forget it (`App.forgetWindowParent`).
     ///   2. Stop the search thread, if any, and wait for it as in step 3,
     ///      while the render thread is still draining its mailbox.
     ///      `CoreSurface.deinit` would do this first too, but with an
@@ -823,11 +824,7 @@ pub const Surface = struct {
         const app = self.app;
         const cs = &self.core_surface;
 
-        app.core_app.deleteSurface(self);
-
-        // A window this surface asked for and `run` has not created yet
-        // loses its parent now, while the address is still this surface's.
-        app.forgetWindowParent(cs);
+        self.detachCore();
 
         if (cs.search) |*s| {
             s.state.stop.notify() catch |err|
@@ -850,6 +847,16 @@ pub const Surface = struct {
 
         cs.deinit();
         self.core_state = .none;
+    }
+
+    /// The first step of `stopCore`, apart so that it can be tested: the
+    /// core stops routing to this surface (`deleteSurface`, which also
+    /// starts the quit timer when it was the last one), and a window it
+    /// asked for and `run` has not created yet loses it as its parent while
+    /// the address is still this surface's (`App.forgetWindowParent`).
+    fn detachCore(self: *Surface) void {
+        self.app.core_app.deleteSurface(self);
+        self.app.forgetWindowParent(&self.core_surface);
     }
 
     /// Ask for this window to be torn down from a message loop.
@@ -3866,4 +3873,43 @@ test "win32: a new window inherits only an existing working directory" {
     try testing.expectEqualStrings(dir_path, got.path);
     // A copy in the config's arena: the caller frees its own after create.
     try testing.expect(got.path.ptr != dir_path.ptr);
+}
+
+test "win32: a closing surface leaves the core and its window requests" {
+    // detachCore is the first step of every teardown (stopCore). After it
+    // the core no longer routes to the surface, and a window it asked for
+    // has no parent, so a surface created later at the same address cannot
+    // pass for it.
+    const CoreApp = @import("../../App.zig");
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.window_requests = .empty;
+    defer app.window_requests.deinit(alloc);
+
+    // Static because the struct embeds a whole CoreSurface.
+    const s = struct {
+        var closing: Surface = undefined;
+        var other: Surface = undefined;
+    };
+    s.closing.app = &app;
+    s.other.app = &app;
+    // Two, so that the core does not start the quit timer.
+    try core_app.surfaces.appendSlice(alloc, &.{ &s.closing, &s.other });
+    core_app.focused_surface = &s.closing.core_surface;
+    try app.window_requests.appendSlice(alloc, &.{ &s.closing.core_surface, &s.other.core_surface, null });
+
+    s.closing.detachCore();
+
+    try std.testing.expectEqualSlices(*Surface, &.{&s.other}, core_app.surfaces.items);
+    try std.testing.expect(core_app.focused_surface == null);
+    try std.testing.expectEqualSlices(
+        ?*CoreSurface,
+        &.{ null, &s.other.core_surface, null },
+        app.window_requests.items,
+    );
 }
