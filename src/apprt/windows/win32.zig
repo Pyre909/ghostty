@@ -113,6 +113,7 @@ pub const WS_VISIBLE: DWORD = 0x10000000;
 pub const WS_CLIPCHILDREN: DWORD = 0x02000000;
 pub const WS_CLIPSIBLINGS: DWORD = 0x04000000;
 pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
+pub const SW_HIDE: c_int = 0;
 pub const SW_SHOWNORMAL: c_int = 1;
 pub const SW_MAXIMIZE: c_int = 3;
 pub const SW_RESTORE: c_int = 9;

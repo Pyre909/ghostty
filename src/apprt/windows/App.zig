@@ -301,9 +301,9 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
-        // Every remaining surface is destroyed as destroyPosted does it
-        // (Surface.destroy), so that CoreApp.deinit, which `main` runs after
-        // this, finds an empty surface list and its
+        // Every remaining window is destroyed with its terminals, as a
+        // window close does it (Window.destroy), so that CoreApp.deinit,
+        // which `main` runs after this, finds an empty surface list and its
         // `font_grid_set.count() == 0` assert holds.
         //
         // `terminating` makes destroyPosted and close ignore anything still
@@ -316,26 +316,29 @@ pub const App = struct {
         // unregistered; UnregisterClassW fails while a window of the class
         // still exists.
         //
-        // Each destroy removes and frees the surface and its window
-        // (WM_DESTROY -> surfaceDestroyed, WM_NCDESTROY -> windowDestroyed).
-        // A window that could not be destroyed gets neither, so it is
-        // released here the same way, or these loops would not end.
-        while (self.surfaces.getLastOrNull()) |surface| {
-            if (!surface.destroy()) {
-                log.err("failed to destroy a surface window err={}", .{
-                    win32.GetLastError(),
-                });
-                self.surfaceDestroyed(surface);
-            }
-        }
-        self.surfaces.deinit(self.core_app.alloc);
+        // Each window goes as a window close takes it (Window.destroy): its
+        // terminals' cores stop, then the frame is destroyed, which frees
+        // each terminal and the window (WM_DESTROY -> surfaceDestroyed,
+        // WM_NCDESTROY -> windowDestroyed). A frame that could not be
+        // destroyed gets none of those messages, so its terminals and the
+        // window are released here the same way, or the loop would not end.
         while (self.windows.getLastOrNull()) |window| {
-            if (!win32.DestroyWindow(window.hwnd).toBool()) {
+            if (!window.destroy()) {
                 log.err("failed to destroy a window err={}", .{win32.GetLastError()});
+                // Downwards, as surfaceDestroyed swaps the last one in.
+                var i = self.surfaces.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const surface = self.surfaces.items[i];
+                    if (surface.window == window) self.surfaceDestroyed(surface);
+                }
                 self.windowDestroyed(window);
             }
         }
         self.windows.deinit(self.core_app.alloc);
+
+        // Every terminal is a child window of a frame, so none is left.
+        self.surfaces.deinit(self.core_app.alloc);
 
         // Windows asked for and never created: the process is quitting.
         self.window_requests.deinit(self.core_app.alloc);
@@ -516,14 +519,31 @@ pub const App = struct {
         }
     }
 
-    /// Re-post WM_GHOSTTY_DESTROY for every surface whose teardown was
-    /// deferred. Called where `canReenterCore` holds and no teardown runs:
-    /// by `run`, and by `Surface.destroyPosted` once its teardown is done.
+    /// Whether a posted teardown may run now (`Surface.destroyPosted`,
+    /// `Window.destroyPosted`). Not with a core frame or a prompt beneath
+    /// (`canReenterCore`): the teardown's wait pumps and ticks, and could
+    /// wait on threads blocked behind the undrained mailbox. Nor inside
+    /// another teardown's wait (`teardown_depth`): it would nest a second
+    /// wait in the first, and with several closing at once each would nest
+    /// inside the last.
+    pub fn canTearDown(self: *const App) bool {
+        return self.canReenterCore() and self.teardown_depth == 0;
+    }
+
+    /// Re-post WM_GHOSTTY_DESTROY for every terminal and every window whose
+    /// teardown was deferred. Called where `canTearDown` holds: by `run`,
+    /// and by `Surface.destroyPosted` and `Window.destroyPosted` once their
+    /// own teardown is done.
     pub fn repostDeferredDestroys(self: *App) void {
         for (self.surfaces.items) |surface| {
             if (!surface.destroy_deferred) continue;
             surface.destroy_deferred = false;
             surface.postDestroy();
+        }
+        for (self.windows.items) |window| {
+            if (!window.destroy_deferred) continue;
+            window.destroy_deferred = false;
+            window.postDestroy();
         }
     }
 
@@ -731,16 +751,17 @@ pub const App = struct {
             // Never DestroyWindow here: this runs inside a core frame (a
             // keybinding, src/Surface.zig keyCallback -> performBindingAction),
             // and destroying synchronously would free the CoreSurface under
-            // it. Surface.close confirms if needed and posts the teardown, so
-            // every close path -- the title bar button, Alt+F4 (a default
-            // binding to this action, `Config.Keybinds.init`) and a
-            // child exit -- converges on Surface.destroyPosted.
+            // it. Window.requestClose confirms if needed and posts the
+            // window's teardown, which the title bar button and Alt+F4 (a
+            // default binding to this action, `Config.Keybinds.init`) share.
+            // A terminal closing alone (close_surface, a child exit) posts
+            // its own (Surface.close).
             //
             // `true` means the request was handled. The user may still decline
             // the confirmation; that is a completed close request, not an
             // unsupported action.
             .surface => |v| close: {
-                v.rt_surface.close(v.needsConfirmQuit());
+                v.rt_surface.window.requestClose();
                 break :close true;
             },
         };
@@ -1060,8 +1081,9 @@ pub const App = struct {
         _ = win32.SetWindowLongPtrW(surface.hwnd, win32.GWLP_USERDATA, 0);
 
         _ = self.surfaces.swapRemove(idx);
-        // Gone once the frame is destroyed (its WM_DESTROY); this only
-        // keeps it from ever dangling.
+        // Already moved off a terminal that closed on its own
+        // (`Window.removePane`), and gone once the frame is destroyed
+        // (its WM_DESTROY); this only keeps it from ever dangling.
         if (surface.window.focused == surface) surface.window.focused = null;
         surface.deinit();
         self.core_app.alloc.destroy(surface);
@@ -1162,6 +1184,16 @@ fn logEffectiveDpiAwareness(user32: win32.HMODULE) void {
             .{},
         );
     }
+}
+
+/// Post WM_GHOSTTY_DESTROY to `hwnd`, a terminal's window or a frame, for
+/// a close that has just set `closing`. Posting only fails when the queue
+/// is full (10,000 messages); the close is then undone, so that the user
+/// can ask again.
+pub fn postTeardown(hwnd: win32.HWND, closing: *bool) void {
+    if (win32.PostMessageW(hwnd, WM_GHOSTTY_DESTROY, 0, 0).toBool()) return;
+    log.err("failed to post a teardown err={}", .{win32.GetLastError()});
+    closing.* = false;
 }
 
 /// ID_ICON_GHOSTTY in dist/windows/ghostty.rc, which the exe links.
@@ -1615,6 +1647,9 @@ fn testApp(app: *App, core_app: *CoreApp) void {
     app.get_dpi_for_window = null;
     app.modal_loop_depth = 0;
     app.terminating = false;
+    app.ticking = false;
+    app.prompt_depth = 0;
+    app.teardown_depth = 0;
     app.surfaces = .empty;
     app.windows = .empty;
 }
@@ -1633,6 +1668,8 @@ fn testFrame(app: *App) !*Window {
         .maximized = false,
         .modal_loops = .{},
         .prompt_disabled = false,
+        .closing = false,
+        .destroy_deferred = false,
     };
     _ = win32.CreateWindowExW(
         0,
@@ -1829,6 +1866,162 @@ test "win32: a window lays its terminals out side by side" {
     const left_width = left_rect.right - left_rect.left;
     const right_width = right_rect.right - right_rect.left;
     try std.testing.expect(@abs(left_width - right_width) <= 1);
+}
+
+test "win32: a closing terminal hands its place, and the focus if it had it" {
+    // a | b | c | d. Closing a terminal without the focus leaves the focus
+    // where it is; closing the one with it hands it to the one before it,
+    // as on GTK. Either way the others take its place, and the last one
+    // takes the window with it. The real classes and window procedures,
+    // with no core surfaces; the windows stay hidden and are never
+    // activated, so the focus is only remembered.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    var panes: [4]*Surface = undefined;
+    for (&panes) |*pane| pane.* = try testPane(&app, window);
+    const a, const b, const c, const d = panes;
+    window.tree = try testRow(alloc, &panes);
+    window.relayout();
+    try expectRow(window, &panes);
+
+    // The terminal that gets WM_SETFOCUS is the window's. Sent straight to
+    // its window procedure: SetFocus would activate the window.
+    const focus = struct {
+        fn focus(pane: *Surface) void {
+            _ = Surface.wndProc(pane.hwnd, win32.WM_SETFOCUS, 0, 0);
+        }
+    }.focus;
+    focus(d);
+    try std.testing.expect(window.focused == d);
+
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(window.focused == d);
+    try expectRow(window, &.{ b, c, d });
+
+    focus(c);
+    try std.testing.expect(c.destroy());
+    try std.testing.expect(window.focused == b);
+    try expectRow(window, &.{ b, d });
+
+    // The first terminal has none before it: the one after it.
+    try std.testing.expect(b.destroy());
+    try std.testing.expect(window.focused == d);
+    try expectRow(window, &.{d});
+
+    try std.testing.expect(d.destroy());
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+test "win32: closing a window takes every terminal in it at once" {
+    // One request posts one teardown to the frame, which destroys the
+    // frame and frees it and its terminals; a second request while it is
+    // pending posts nothing. Dispatched inside another teardown's wait, the
+    // teardown waits and is posted again. The terminals have no core
+    // surfaces, so there is nothing to ask about and no core to stop: this
+    // covers the posting and the freeing, not the stopping, which needs a
+    // running core (the VM scenarios close windows with live shells).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.focused = a;
+
+    window.requestClose();
+    window.requestClose();
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        window.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
+    var second: win32.MSG = undefined;
+    try std.testing.expect(!win32.PeekMessageW(
+        &second,
+        window.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_NOREMOVE,
+    ).toBool());
+
+    // Inside another teardown's wait: deferred, the window untouched.
+    app.teardown_depth = 1;
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expect(window.destroy_deferred);
+    try std.testing.expectEqual(2, app.surfaces.items.len);
+
+    // Posted again once no teardown runs, and then it runs.
+    app.teardown_depth = 0;
+    app.repostDeferredDestroys();
+    try std.testing.expect(!window.destroy_deferred);
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        window.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+test "win32: a terminal with no core closes through a posted teardown" {
+    // Not destroyed on the spot: a WM_CLOSE can be dispatched inside
+    // another teardown's wait, which must not change the terminals under
+    // it (`Window.destroy`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+
+    // Both still there: had the close destroyed the terminal, it would
+    // have taken the window and freed both.
+    _ = Surface.wndProc(pane.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(1, app.surfaces.items.len);
+    try std.testing.expect(pane.closing);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        pane.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
+
+    // The teardown it posted takes the window with its only terminal.
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(0, app.windows.items.len);
 }
 
 test "win32: a new window is recorded where it is asked for, and created later" {

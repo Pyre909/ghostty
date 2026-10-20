@@ -11,8 +11,9 @@
 //! freed by `create` itself.
 //!
 //! The tree holds its terminals by pointer and owns none of them. It never
-//! holds a freed one: the frame's WM_DESTROY, which comes before its child
-//! windows are destroyed, empties it.
+//! holds a freed one: a terminal that closes on its own leaves it before it
+//! is destroyed (`removePane`), and the frame's WM_DESTROY, which comes
+//! before its child windows are destroyed, empties it.
 
 const Window = @This();
 
@@ -25,6 +26,9 @@ const L = win32.L;
 const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
+const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
+const postTeardown = @import("App.zig").postTeardown;
+const confirm = @import("dialog.zig").confirm;
 
 const log = std.log.scoped(.win32);
 
@@ -46,9 +50,21 @@ hwnd: win32.HWND,
 tree: Tree,
 
 /// The terminal with the keyboard focus, or the one to give it to when the
-/// window is next activated: set by each terminal's WM_SETFOCUS. Null only
-/// while the tree is empty.
+/// window is next activated: set by each terminal's WM_SETFOCUS, and moved
+/// off a terminal that closes on its own by `removePane`. Null only while
+/// the tree is empty.
 focused: ?*Surface,
+
+/// A close of the whole window is being asked about, or was agreed to and
+/// its teardown posted (`requestClose`). Stops a second WM_CLOSE or
+/// close_window from asking or posting twice. Cleared when the user
+/// declines or the post fails; otherwise the teardown frees the window.
+closing: bool,
+
+/// WM_GHOSTTY_DESTROY arrived while teardown was not allowed; re-posted by
+/// `App.repostDeferredDestroys`, as a terminal's is
+/// (`Surface.destroy_deferred`).
+destroy_deferred: bool,
 
 /// Tracked so `.toggle_maximize` knows which way to toggle.
 maximized: bool,
@@ -77,6 +93,8 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .maximized = false,
         .modal_loops = .{},
         .prompt_disabled = false,
+        .closing = false,
+        .destroy_deferred = false,
     };
 
     const hwnd = win32.CreateWindowExW(
@@ -160,16 +178,15 @@ fn handleMessage(
 ) win32.LRESULT {
     switch (msg) {
         // The title bar button, Alt+F4 when no binding consumed it, and the
-        // window menu's Close: the window closes with its terminal, the only
-        // one it holds until splits can be opened.
+        // window menu's Close.
         win32.WM_CLOSE => {
-            if (self.app.terminating) return 0;
-            if (self.focused) |surface| {
-                surface.requestClose();
-            } else {
-                // Nothing left inside: frees `self` (WM_NCDESTROY).
-                _ = win32.DestroyWindow(hwnd);
-            }
+            self.requestClose();
+            return 0;
+        },
+
+        WM_GHOSTTY_DESTROY => {
+            // Frees `self` unless deferred; nothing may follow it.
+            self.destroyPosted();
             return 0;
         },
 
@@ -259,6 +276,126 @@ fn handleMessage(
     }
 
     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/// WM_CLOSE and `close_window`: close the window and every terminal in it,
+/// asking once if any of them would be asked about on its own
+/// (`CoreSurface.needsConfirmQuit`). The window is then torn down in one
+/// step (`destroyPosted`), as GTK closes a window and as `App.terminate`
+/// does, not one terminal at a time, which would lay the window out again
+/// after each.
+///
+/// `close_window` runs inside a core frame, so this only posts, as
+/// `Surface.close` does.
+pub fn requestClose(self: *Window) void {
+    if (self.app.terminating or self.closing) return;
+    self.closing = true;
+
+    // The tree does not change while the prompt is open: only `run` adds
+    // terminals, and a teardown is deferred (`App.canReenterCore`).
+    const ask = ask: {
+        var it = self.tree.iterator();
+        while (it.next()) |entry| {
+            const core_surface = entry.view.liveCore() orelse continue;
+            if (core_surface.needsConfirmQuit()) break :ask true;
+        }
+        break :ask false;
+    };
+    if (ask and !confirm(
+        self.app,
+        self.hwnd,
+        L("A process is still running in this window. Close it anyway?"),
+        .ok,
+    )) {
+        self.closing = false;
+        return;
+    }
+
+    self.postDestroy();
+}
+
+/// Ask for the window to be torn down from a message loop.
+pub fn postDestroy(self: *Window) void {
+    postTeardown(self.hwnd, &self.closing);
+}
+
+/// WM_GHOSTTY_DESTROY on the frame: the window's teardown, run or deferred
+/// as a terminal's is (`App.canTearDown`). **`self` is freed by
+/// `destroy`**: only `app`, read beforehand, is used after it.
+fn destroyPosted(self: *Window) void {
+    const app = self.app;
+
+    // terminate drives teardown itself; see App.terminate.
+    if (app.terminating) return;
+
+    if (!app.canTearDown()) {
+        self.destroy_deferred = true;
+        return;
+    }
+
+    _ = self.destroy();
+
+    // As in Surface.destroyPosted.
+    if (app.canTearDown()) app.repostDeferredDestroys();
+}
+
+/// Stop the core of every terminal in the window, then destroy the frame,
+/// which destroys their windows. Returns whether the frame was destroyed;
+/// **when it was, `self` and every terminal in it have been freed**
+/// (WM_DESTROY -> App.surfaceDestroyed, WM_NCDESTROY ->
+/// App.windowDestroyed).
+///
+/// Each stopCore pumps messages, and a handler they run may add terminals
+/// to `App.surfaces` or remove them, which can move the list: it is
+/// searched afresh after each, until no terminal of this window has a
+/// live core left.
+pub fn destroy(self: *Window) bool {
+    search: while (true) {
+        for (self.app.surfaces.items) |surface| {
+            if (surface.window != self or surface.liveCore() == null) continue;
+            surface.stopCore();
+            continue :search;
+        }
+        break;
+    }
+    return win32.DestroyWindow(self.hwnd).toBool();
+}
+
+/// Take the terminal at `handle` in the tree out of this window ahead of
+/// its teardown (`Surface.destroy`), when another terminal stays. The others
+/// are laid out again over its place, and if it had the focus, the focus
+/// moves to the terminal before it, else the one after it, as on GTK
+/// (`closeConfirmationClose` in src/apprt/gtk/class/split_tree.zig). It is
+/// hidden, so that nothing shows it while its core stops.
+///
+/// Fails only to allocate the new tree, and then changes nothing.
+pub fn removePane(self: *Window, handle: Tree.Node.Handle) !void {
+    const alloc = self.app.core_app.alloc;
+    const surface = self.tree.nodes[handle.idx()].leaf;
+
+    // From the tree as it is, which still has `handle`. `.previous` and
+    // `.next` allocate nothing.
+    const focus: ?*Surface = if (self.focused != surface) self.focused else focus: {
+        const to = (self.tree.goto(alloc, handle, .previous) catch null) orelse
+            (self.tree.goto(alloc, handle, .next) catch null) orelse
+            break :focus null;
+        break :focus self.tree.nodes[to.idx()].leaf;
+    };
+
+    const tree = try self.tree.remove(alloc, handle);
+    errdefer comptime unreachable;
+    self.tree.deinit();
+    self.tree = tree;
+    self.focused = focus;
+
+    // The focus moves first, so that it is never left on a hidden window.
+    // Only in the active window: setting the focus in another one would
+    // activate it.
+    if (focus) |f| {
+        if (win32.GetActiveWindow() == self.hwnd) _ = win32.SetFocus(f.hwnd);
+    }
+    _ = win32.ShowWindow(surface.hwnd, win32.SW_HIDE);
+    self.relayout();
 }
 
 /// Lay the terminals out over the client area (`layout`). Not while the

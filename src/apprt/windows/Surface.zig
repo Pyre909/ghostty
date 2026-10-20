@@ -15,6 +15,7 @@ const WM_GHOSTTY_WAKEUP = @import("App.zig").WM_GHOSTTY_WAKEUP;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
 const WM_GHOSTTY_LINK_REFUSED = @import("App.zig").WM_GHOSTTY_LINK_REFUSED;
 const App = @import("App.zig").App;
+const postTeardown = @import("App.zig").postTeardown;
 const Window = @import("Window.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
@@ -71,10 +72,13 @@ pub const Surface = struct {
     /// 96-DPI units; see `Window.applyInitialSize`. `Window.show` applies it.
     initial_size: ?apprt.action.InitialSize,
 
-    /// A close has been requested and WM_GHOSTTY_DESTROY posted (or its
-    /// confirmation is on screen). Stops a second WM_CLOSE or close_window
-    /// from prompting or posting twice. Cleared only when the user declines
-    /// the confirmation.
+    /// A close of this terminal alone has been requested and
+    /// WM_GHOSTTY_DESTROY posted (or its confirmation is on screen): a
+    /// close_surface binding, its shell exiting, or a WM_CLOSE sent to its
+    /// own window. Stops a second one from prompting or posting twice.
+    /// Cleared when the user declines the confirmation, the post fails, or
+    /// it cannot leave its window (`destroy`). Closing the whole window
+    /// does not use it (`Window.closing`).
     closing: bool,
 
     /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
@@ -710,14 +714,27 @@ pub const Surface = struct {
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
     }
 
-    /// Stop the core surface, then destroy the window it is in, its only
-    /// terminal until splits can be opened. Returns whether the window was
+    /// Stop the core surface and destroy its window. The last terminal in a
+    /// window takes the window with it (`Window.destroy`); any other leaves
+    /// the window first (`Window.removePane`). Returns whether it was
     /// destroyed; **when it was, `self` has been freed** (WM_DESTROY ->
-    /// App.surfaceDestroyed), and so has the window (WM_NCDESTROY ->
-    /// App.windowDestroyed), and nothing may touch either.
+    /// App.surfaceDestroyed), and so has a window that went with it
+    /// (WM_NCDESTROY -> App.windowDestroyed), and nothing may touch either.
+    ///
+    /// When it cannot leave the window (out of memory), nothing is done and
+    /// the close can be asked for again.
     pub fn destroy(self: *Surface) bool {
+        const window = self.window;
+        if (window.tree.locate(self)) |handle| {
+            if (handle == .root) return window.destroy();
+            window.removePane(handle) catch |err| {
+                log.err("unable to take a closing terminal out of its window err={}", .{err});
+                self.closing = false;
+                return false;
+            };
+        }
         self.stopCore();
-        return win32.DestroyWindow(self.window.hwnd).toBool();
+        return win32.DestroyWindow(self.hwnd).toBool();
     }
 
     /// Undo a `create` that succeeded, for a terminal no window holds yet:
@@ -732,7 +749,8 @@ pub const Surface = struct {
     }
 
     /// `Window.Tree` holds its terminals by pointer and counts no
-    /// references: a terminal is owned by `App.surfaces` (see Window.zig).
+    /// references: a terminal is owned by `App.surfaces`, and leaves the
+    /// tree before it is freed (see Window.zig).
     pub fn ref(self: *Surface) *Surface {
         return self;
     }
@@ -792,7 +810,7 @@ pub const Surface = struct {
     /// on the main thread, is exactly the unpumped wait steps 2-4 exist to
     /// avoid. If those fields are renamed this stops compiling, which is the
     /// desired failure.
-    fn stopCore(self: *Surface) void {
+    pub fn stopCore(self: *Surface) void {
         if (self.core_state != .live) return;
         self.core_state = .stopping;
 
@@ -867,14 +885,7 @@ pub const Surface = struct {
 
     /// Ask for this window to be torn down from a message loop.
     pub fn postDestroy(self: *Surface) void {
-        if (!win32.PostMessageW(self.hwnd, WM_GHOSTTY_DESTROY, 0, 0).toBool()) {
-            // Only fails when the queue is full (10,000 messages). The window
-            // stays open; the user can close it again.
-            log.err("failed to post the surface teardown err={}", .{
-                win32.GetLastError(),
-            });
-            self.closing = false;
-        }
+        postTeardown(self.hwnd, &self.closing);
     }
 
     /// WM_GHOSTTY_DESTROY: the one place a live surface is torn down.
@@ -899,7 +910,7 @@ pub const Surface = struct {
         // terminate drives teardown itself; see App.terminate.
         if (app.terminating) return;
 
-        if (!app.canReenterCore() or app.teardown_depth > 0) {
+        if (!app.canTearDown()) {
             self.destroy_deferred = true;
             return;
         }
@@ -909,7 +920,7 @@ pub const Surface = struct {
         // `self` is freed. A teardown deferred while this one ran is posted
         // again now rather than when `run` comes round, which during another
         // window's size/move loop is only once the user lets go.
-        if (app.teardown_depth == 0 and app.canReenterCore()) app.repostDeferredDestroys();
+        if (app.canTearDown()) app.repostDeferredDestroys();
     }
 
     // ---------------------------------------------------------------------
@@ -1189,8 +1200,9 @@ pub const Surface = struct {
         return true;
     }
 
-    /// WM_CLOSE, of the frame or of this window: the title bar button,
-    /// Alt+F4 when no binding consumed it, and the window menu's Close.
+    /// WM_CLOSE sent to this window: it closes alone. Windows sends the
+    /// title bar button's, Alt+F4's and the window menu's to the frame
+    /// (`Window.requestClose`).
     pub fn requestClose(self: *Surface) void {
         if (self.app.terminating) return;
         switch (self.core_state) {
@@ -1199,10 +1211,13 @@ pub const Surface = struct {
             .live => self.core_surface.close(),
             // Already going away.
             .stopping => {},
-            // No core surface, so nothing to confirm or stop. This frees
-            // `self` and the window (WM_DESTROY, WM_NCDESTROY); nothing may
-            // follow it.
-            .none => _ = win32.DestroyWindow(self.window.hwnd),
+            // No core surface, so nothing to confirm or stop: torn down as
+            // any close is (`destroyPosted`), which a teardown already
+            // running defers.
+            .none => if (!self.closing) {
+                self.closing = true;
+                self.postDestroy();
+            },
         }
     }
 
@@ -1266,8 +1281,6 @@ pub const Surface = struct {
         // CreateWindowExW, long before CoreSurface.init. Callback errors are
         // logged and never propagated; there is no caller to take them.
         switch (msg) {
-            // Windows sends WM_CLOSE to the frame (`Window.handleMessage`);
-            // one sent to this window means the same.
             win32.WM_CLOSE => {
                 self.requestClose();
                 return 0;
@@ -3488,6 +3501,11 @@ test "win32: a teardown dispatched inside another waits for it" {
     surface.app = &app;
     surface.window = &s.window;
     surface.core_state = .none;
+    // The window's only terminal, so a teardown that runs takes the window.
+    s.window.tree = try .init(std.testing.allocator, surface);
+    defer s.window.tree.deinit();
+    s.window.app = &app;
+    app.windows = .empty;
 
     const messageWindow = struct {
         fn create() !win32.HWND {
@@ -3575,6 +3593,14 @@ test "win32: a finished teardown posts the ones it deferred again" {
     defer for (both) |surface| {
         if (win32.IsWindow(surface.hwnd).toBool()) _ = win32.DestroyWindow(surface.hwnd);
     };
+    // Each the only terminal of its window, so a teardown that runs takes
+    // the window.
+    app.windows = .empty;
+    for (&s.windows) |*window| window.app = &app;
+    s.windows[0].tree = try .init(alloc, &s.done);
+    defer s.windows[0].tree.deinit();
+    s.windows[1].tree = try .init(alloc, &s.waiting);
+    defer s.windows[1].tree.deinit();
     s.done.destroy_deferred = false;
     s.waiting.destroy_deferred = true;
     try app.surfaces.append(alloc, &s.waiting);
