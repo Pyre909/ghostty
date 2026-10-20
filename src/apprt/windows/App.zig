@@ -14,6 +14,7 @@ const Config = configpkg.Config;
 const win32 = @import("win32.zig");
 const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
+const Window = @import("Window.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
@@ -733,7 +734,7 @@ pub const App = struct {
     fn presentTerminal(target: apprt.Target) bool {
         return switch (target) {
             .app => false,
-            .surface => |v| v.rt_surface.present(),
+            .surface => |v| Window.present(v.rt_surface.hwnd),
         };
     }
 
@@ -757,16 +758,7 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| maximize: {
-                const surface = v.rt_surface;
-                surface.maximized = !surface.maximized;
-                // ShowWindow's BOOL is the window's *previous* visibility, not
-                // whether the call succeeded, so it deliberately is not
-                // propagated: a window that was hidden returns zero from a
-                // call that worked perfectly.
-                _ = win32.ShowWindow(
-                    surface.hwnd,
-                    if (surface.maximized) win32.SW_MAXIMIZE else win32.SW_RESTORE,
-                );
+                Window.toggleMaximize(v.rt_surface.hwnd, &v.rt_surface.maximized);
                 break :maximize true;
             },
         };

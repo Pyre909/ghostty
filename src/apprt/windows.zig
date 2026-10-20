@@ -137,6 +137,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
     _ = @import("windows/Surface.zig");
+    _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/key.zig");

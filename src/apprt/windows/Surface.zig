@@ -15,6 +15,7 @@ const WM_GHOSTTY_WAKEUP = @import("App.zig").WM_GHOSTTY_WAKEUP;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
 const WM_GHOSTTY_LINK_REFUSED = @import("App.zig").WM_GHOSTTY_LINK_REFUSED;
 const App = @import("App.zig").App;
+const Window = @import("Window.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -65,7 +66,7 @@ pub const Surface = struct {
     /// when `window-width`/`window-height` are unset. The core divides the
     /// cell area by the content scale but adds the padding in device pixels
     /// (`CoreSurface.recomputeInitialSize`), so the value is not purely in
-    /// 96-DPI units; see `applyInitialSize`.
+    /// 96-DPI units; see `Window.applyInitialSize`.
     initial_size: ?apprt.action.InitialSize,
 
     /// A close has been requested and WM_GHOSTTY_DESTROY posted (or its
@@ -103,11 +104,9 @@ pub const Surface = struct {
     /// See `ShiftKeys`.
     shift: ShiftKeys,
 
-    /// This window's share of `App.modal_loop_depth`: system modal loops
-    /// (size/move, menu) it has entered and not yet reported leaving. A
-    /// window destroyed inside its own loop never receives the matching
-    /// WM_EXIT*, so WM_DESTROY hands this back to the app instead.
-    modal_loops: u32,
+    /// This window's share of `App.modal_loop_depth`; see
+    /// `Window.ModalLoops`.
+    modal_loops: Window.ModalLoops,
 
     /// Keyboard focus, from WM_SETFOCUS / WM_KILLFOCUS. See `mouseMods`.
     focused: bool,
@@ -595,7 +594,7 @@ pub const Surface = struct {
             .high_surrogate = null,
             .alt_gr = .empty,
             .shift = .{},
-            .modal_loops = 0,
+            .modal_loops = .{},
             .focused = false,
             .prompt_disabled = false,
             .mouse = .init(),
@@ -660,7 +659,9 @@ pub const Surface = struct {
 
         // Size the still-hidden window to `window-width`/`window-height`
         // before it is first shown, so it never appears at the default size.
-        if (self.initial_size) |size| self.applyInitialSize(size);
+        if (self.initial_size) |size| {
+            Window.applyInitialSize(hwnd, (self.getContentScale() catch unreachable).x, size);
+        }
 
         // The first WM_SETFOCUS and WM_PAINT (and the first WM_SIZE, unless
         // applyInitialSize already sent one) reach the core from here, now
@@ -947,73 +948,6 @@ pub const Surface = struct {
         self.postDestroy();
     }
 
-    /// Resize the window so its client area is `size` scaled to this
-    /// window's DPI. The whole value is scaled, as macOS and GTK also treat
-    /// it, so the core's device-pixel padding comes out larger by the scale
-    /// factor: the grid is never smaller than requested, at most a little
-    /// larger, unless the window would not fit its monitor's work area. The
-    /// frame is measured from the window itself rather than with
-    /// AdjustWindowRectExForDpi, which does not exist before Windows 10 1607
-    /// (see the dynamic imports in App.init): the window already exists at
-    /// its final DPI, so its window rect minus its client rect is exactly the
-    /// frame. The sizes saturate, since `window-width` is only clamped from
-    /// below.
-    fn applyInitialSize(self: *Surface, size: apprt.action.InitialSize) void {
-        const scale = (self.getContentScale() catch unreachable).x;
-        const client_w = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.width)) * scale));
-        const client_h = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.height)) * scale));
-        var window: win32.RECT = undefined;
-        var client: win32.RECT = undefined;
-        var monitor: win32.MONITORINFO = .{
-            .cbSize = @sizeOf(win32.MONITORINFO),
-            .rcMonitor = undefined,
-            .rcWork = undefined,
-            .dwFlags = 0,
-        };
-        const read = read: {
-            if (!win32.GetWindowRect(self.hwnd, &window).toBool()) break :read false;
-            if (!win32.GetClientRect(self.hwnd, &client).toBool()) break :read false;
-            const m = win32.MonitorFromWindow(
-                self.hwnd,
-                win32.MONITOR_DEFAULTTONEAREST,
-            ) orelse break :read false;
-            break :read win32.GetMonitorInfoW(m, &monitor).toBool();
-        };
-        if (!read) {
-            log.warn("unable to read the window frame or work area, initial size not applied", .{});
-            return;
-        }
-        const frame_w = (window.right - window.left) - (client.right - client.left);
-        const frame_h = (window.bottom - window.top) - (client.bottom - client.top);
-
-        // CW_USEDEFAULT placed the default-sized window inside the work
-        // area, but nothing keeps a larger one grown from the same corner
-        // there: SetWindowPos does not move a window back on screen, and
-        // the only size limit Windows applies is the maximum track size,
-        // about the whole virtual screen.
-        const rect = constrainToWorkArea(
-            window.left,
-            window.top,
-            client_w +| frame_w,
-            client_h +| frame_h,
-            monitor.rcWork,
-        );
-
-        // SetWindowPos sends WM_SIZE synchronously; the core is live, so it
-        // sees the new size before the first paint. That WM_SIZE also reports
-        // the window visible (occlusionCallback) while it is still hidden,
-        // which is harmless only because ShowWindow follows immediately.
-        if (!win32.SetWindowPos(
-            self.hwnd,
-            null,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
-            win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
-        ).toBool()) log.warn("unable to apply initial window size err={}", .{win32.GetLastError()});
-    }
-
     /// The Direct3D 11 device has no options: each renderer creates its
     /// own device for this window.
     pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
@@ -1265,22 +1199,6 @@ pub const Surface = struct {
         return true;
     }
 
-    /// Bring the window to the front, restoring it first if it is
-    /// minimized, as GTK's `gtk.Window.present` does. SetForegroundWindow
-    /// alone only activates a window: a minimized one stays minimized.
-    pub fn present(self: *Surface) bool {
-        if (win32.IsIconic(self.hwnd).toBool()) {
-            // The BOOL is the previous visibility, not success.
-            _ = win32.ShowWindow(self.hwnd, win32.SW_RESTORE);
-        }
-
-        // SetForegroundWindow returning FALSE is the documented *normal*
-        // outcome under Windows' foreground lock -- the calling process is
-        // not foreground and has had no recent input -- so hard-coding true
-        // here would lie in the common case rather than the rare one.
-        return win32.SetForegroundWindow(self.hwnd).toBool();
-    }
-
     /// WM_PAINT. The render thread draws and presents on its own; all the
     /// main thread does is clear the update region and ask the core for a
     /// frame.
@@ -1370,8 +1288,7 @@ pub const Surface = struct {
                 // come, so return this window's share of the depth now.
                 // Otherwise every later wakeup would tick from whatever loop
                 // dispatched it.
-                self.app.modal_loop_depth -|= self.modal_loops;
-                self.modal_loops = 0;
+                self.modal_loops.release(&self.app.modal_loop_depth);
 
                 self.app.surfaceDestroyed(self);
                 return 0;
@@ -1409,19 +1326,7 @@ pub const Surface = struct {
                         log.warn("content scale callback failed err={}", .{err});
                 }
 
-                // lParam carries the suggested new window rect. Not honoring
-                // it leaves the window the wrong physical size on the new
-                // monitor, so it is applied verbatim.
-                const rect: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
-                _ = win32.SetWindowPos(
-                    hwnd,
-                    null,
-                    rect.left,
-                    rect.top,
-                    rect.right - rect.left,
-                    rect.bottom - rect.top,
-                    win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
-                );
+                Window.applySuggestedRect(hwnd, lparam);
                 return 0;
             },
 
@@ -1461,17 +1366,11 @@ pub const Surface = struct {
 
             // The system modal loops. See App.wndProc's WM_GHOSTTY_WAKEUP.
             win32.WM_ENTERSIZEMOVE, win32.WM_ENTERMENULOOP => {
-                self.modal_loops += 1;
-                self.app.modal_loop_depth += 1;
+                self.modal_loops.enter(&self.app.modal_loop_depth);
                 return 0;
             },
             win32.WM_EXITSIZEMOVE, win32.WM_EXITMENULOOP => {
-                // Only undo what this window added, so a stray EXIT can
-                // never take another window's loop out of the count.
-                if (self.modal_loops > 0) {
-                    self.modal_loops -= 1;
-                    self.app.modal_loop_depth -|= 1;
-                }
+                self.modal_loops.exit(&self.app.modal_loop_depth);
                 return 0;
             },
 
@@ -1630,14 +1529,7 @@ pub const Surface = struct {
                 return 0;
             },
 
-            win32.WM_SYSCOMMAND => {
-                // A bare Alt or F10 released without being consumed arrives
-                // as SC_KEYMENU with lParam 0 and would put the window into
-                // menu mode, swallowing the next keystroke. The window has no
-                // menu bar, so that mode is never wanted. Alt+Space arrives
-                // with lParam ' ' and still opens the window menu.
-                if (wparam & 0xFFF0 == win32.SC_KEYMENU and lparam == 0) return 0;
-            },
+            win32.WM_SYSCOMMAND => if (Window.isBareKeyMenu(wparam, lparam)) return 0,
 
             win32.WM_MOUSEMOVE => {
                 const core_surface = self.liveCore() orelse
@@ -2558,7 +2450,7 @@ pub const Surface = struct {
     /// capture on this window and sets its own cursor, which nothing would
     /// restore while captured.
     fn applyCursor(self: *Surface) void {
-        if (self.modal_loops != 0) return;
+        if (self.modal_loops.inLoop()) return;
         const own_drag = self.mouse.held.count() != 0 and self.hasCapture();
         if (!self.mouse.tracking and !own_drag) return;
         if (self.mouse.hidden or self.mouse.cursor != null) {
@@ -2775,24 +2667,6 @@ fn clampToRect(pt: win32.POINT, rect: win32.RECT) win32.POINT {
         .x = @max(rect.left, @min(pt.x, rect.right - 1)),
         .y = @max(rect.top, @min(pt.y, rect.bottom - 1)),
     };
-}
-
-/// The rect for a `width` x `height` window at `x`, `y`, kept inside the
-/// work area `work` as macOS keeps a window on screen
-/// (`NSWindow.constrainToScreen`): it is moved up or left until it fits, and
-/// made smaller only if it is larger than the work area.
-fn constrainToWorkArea(
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    work: win32.RECT,
-) win32.RECT {
-    const w = @min(width, work.right - work.left);
-    const h = @min(height, work.bottom - work.top);
-    const left = @max(work.left, @min(x, work.right - w));
-    const top = @max(work.top, @min(y, work.bottom - h));
-    return .{ .left = left, .top = top, .right = left + w, .bottom = top + h };
 }
 
 /// SPI_GETWHEELSCROLLLINES or SPI_GETWHEELSCROLLCHARS, read for every wheel
@@ -3090,79 +2964,6 @@ test "win32: a minimized or empty window is not resized" {
         SizeChange{ .resize = .{ .width = 0x9000, .height = 0x8000 } },
         SizeChange.init(0, 0x8000_9000),
     );
-}
-
-test "win32: an initial size is kept inside the monitor work area" {
-    const testing = std.testing;
-    const RECT = win32.RECT;
-
-    // 1920x1080 with a 40 px taskbar at the bottom.
-    const work: RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
-
-    // Fits where it is: unchanged.
-    try testing.expectEqual(
-        RECT{ .left = 100, .top = 50, .right = 900, .bottom = 650 },
-        constrainToWorkArea(100, 50, 800, 600, work),
-    );
-
-    // Fits the work area but not below and right of its origin: moved up
-    // and left, at the size asked for.
-    try testing.expectEqual(
-        RECT{ .left = 1120, .top = 40, .right = 1920, .bottom = 1040 },
-        constrainToWorkArea(1300, 80, 800, 1000, work),
-    );
-
-    // Larger than the work area, including the saturated size of an
-    // enormous `window-width`: the whole work area.
-    try testing.expectEqual(work, constrainToWorkArea(100, 50, 2500, 1200, work));
-    try testing.expectEqual(work, constrainToWorkArea(
-        100,
-        50,
-        std.math.maxInt(i32),
-        std.math.maxInt(i32),
-        work,
-    ));
-
-    // A monitor left of and above the primary, with the taskbar on its
-    // left edge: the work area does not start at zero.
-    try testing.expectEqual(
-        RECT{ .left = -1232, .top = 524, .right = -632, .bottom = 824 },
-        constrainToWorkArea(-1260, 700, 600, 300, .{
-            .left = -1232,
-            .top = -200,
-            .right = 0,
-            .bottom = 824,
-        }),
-    );
-}
-
-test "win32: presenting a minimized window restores it" {
-    // A top-level window created minimized and hidden stands in for a
-    // surface's: `present` only uses the handle.
-    const hwnd = win32.CreateWindowExW(
-        0,
-        L("STATIC"),
-        null,
-        win32.WS_OVERLAPPEDWINDOW | win32.WS_MINIMIZE,
-        0,
-        0,
-        200,
-        100,
-        null,
-        null,
-        null,
-        null,
-    ) orelse return error.TestUnexpectedResult;
-    defer _ = win32.DestroyWindow(hwnd);
-    try std.testing.expect(win32.IsIconic(hwnd).toBool());
-
-    // Static because the struct embeds a whole CoreSurface.
-    const s = struct {
-        var surface: Surface = undefined;
-    };
-    s.surface.hwnd = hwnd;
-    _ = s.surface.present();
-    try std.testing.expect(!win32.IsIconic(hwnd).toBool());
 }
 
 test "win32: key text drops controls and decodes surrogate pairs" {
@@ -3705,7 +3506,7 @@ test "win32: modal loops are counted per window and returned on destroy" {
         surface.app = &app;
         surface.hwnd = hwnd;
         surface.core_state = .none;
-        surface.modal_loops = 0;
+        surface.modal_loops = .{};
     }
 
     _ = s.a.handleMessage(hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
