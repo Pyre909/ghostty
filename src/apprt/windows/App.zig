@@ -66,12 +66,16 @@ pub const App = struct {
     /// lost exactly when the mailbox needs draining.
     msg_hwnd: win32.HWND,
 
-    /// The windows this runtime owns. See `surfaceDestroyed` for the
+    /// The terminals this runtime owns. See `surfaceDestroyed` for the
     /// ownership invariant. Each one whose `CoreSurface` is initialized is
     /// also registered with `CoreApp.addSurface`, which is what drives the
     /// quit timer; this list and the core's can differ only while a surface
     /// is being created or torn down.
     surfaces: std.ArrayListUnmanaged(*Surface),
+
+    /// The windows the terminals are in, with the same ownership rule
+    /// (`windowDestroyed`).
+    windows: std.ArrayListUnmanaged(*Window),
 
     /// Windows the core asked for (`.new_window`) that `run` has not
     /// created yet, oldest first, each with the core surface that asked,
@@ -273,6 +277,7 @@ pub const App = struct {
             .get_dpi_for_window = get_dpi_for_window,
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
+            .windows = .empty,
             .window_requests = .empty,
             .quit = false,
             .quit_timer = .off,
@@ -311,10 +316,10 @@ pub const App = struct {
         // unregistered; UnregisterClassW fails while a window of the class
         // still exists.
         //
-        // Each destroy removes and frees the surface (WM_DESTROY ->
-        // surfaceDestroyed). A window that could not be destroyed gets no
-        // WM_DESTROY, so it is released here the same way, or this loop
-        // would not end.
+        // Each destroy removes and frees the surface and its window
+        // (WM_DESTROY -> surfaceDestroyed, WM_NCDESTROY -> windowDestroyed).
+        // A window that could not be destroyed gets neither, so it is
+        // released here the same way, or these loops would not end.
         while (self.surfaces.getLastOrNull()) |surface| {
             if (!surface.destroy()) {
                 log.err("failed to destroy a surface window err={}", .{
@@ -324,6 +329,13 @@ pub const App = struct {
             }
         }
         self.surfaces.deinit(self.core_app.alloc);
+        while (self.windows.getLastOrNull()) |window| {
+            if (!win32.DestroyWindow(window.hwnd).toBool()) {
+                log.err("failed to destroy a window err={}", .{win32.GetLastError()});
+                self.windowDestroyed(window);
+            }
+        }
+        self.windows.deinit(self.core_app.alloc);
 
         // Windows asked for and never created: the process is quitting.
         self.window_requests.deinit(self.core_app.alloc);
@@ -460,33 +472,36 @@ pub const App = struct {
     /// No surface can be used while a prompt is open: ticks stop
     /// (`canReenterCore`), so every window's output pauses, and input does
     /// not reach the core. MessageBoxW disables only its owner, though, so
-    /// the outermost prompt disables every other surface window as well,
-    /// and `endPrompt` enables them again. A window that was already
-    /// disabled is left as it was.
+    /// the outermost prompt disables every other window as well, and
+    /// `endPrompt` enables them again; a disabled window takes no input for
+    /// its terminals either. A window that was already disabled is left as
+    /// it was.
     ///
-    /// Surfaces are not created while a prompt is open (only `run` creates
+    /// Windows are not created while a prompt is open (only `run` creates
     /// them) and their teardown is deferred, so `endPrompt` finds the
     /// windows disabled here.
     pub fn beginPrompt(self: *App, owner: ?win32.HWND) void {
         self.prompt_depth += 1;
         if (self.prompt_depth > 1) return;
-        for (self.surfaces.items) |surface| {
-            if (owner != null and surface.hwnd == owner.?) continue;
-            if (win32.EnableWindow(surface.hwnd, .FALSE).toBool()) continue;
-            surface.prompt_disabled = true;
+        for (self.windows.items) |window| {
+            if (owner != null and window.hwnd == owner.?) continue;
+            if (win32.EnableWindow(window.hwnd, .FALSE).toBool()) continue;
+            window.prompt_disabled = true;
         }
     }
 
-    /// The window a prompt belongs to: `hwnd`, or for a caller that has
-    /// none, the surface window the user was last in, else the first one.
-    /// With no owner, the box would leave every window disabled
-    /// (`beginPrompt`) and the activation would go to another application
-    /// when it closes; MessageBoxW enables its owner again before it
-    /// returns and hands the activation back to it.
+    /// The window a prompt belongs to: the top-level window of `hwnd`
+    /// (a terminal's is its frame), or for a caller that has none, the
+    /// window the user was last in, else the first one. With no owner, the
+    /// box would leave every window disabled (`beginPrompt`) and the
+    /// activation would go to another application when it closes;
+    /// MessageBoxW enables its owner again before it returns and hands the
+    /// activation back to it. It disables only that owner, so the owner
+    /// must be the top-level window, not a terminal inside it.
     pub fn promptOwner(self: *const App, hwnd: ?win32.HWND) ?win32.HWND {
-        if (hwnd) |h| return h;
-        if (self.core_app.focusedSurface()) |s| return s.rt_surface.hwnd;
-        if (self.surfaces.items.len > 0) return self.surfaces.items[0].hwnd;
+        if (hwnd) |h| return win32.GetAncestor(h, win32.GA_ROOT) orelse h;
+        if (self.core_app.focusedSurface()) |s| return s.rt_surface.window.hwnd;
+        if (self.windows.items.len > 0) return self.windows.items[0].hwnd;
         return null;
     }
 
@@ -494,10 +509,10 @@ pub const App = struct {
     pub fn endPrompt(self: *App) void {
         self.prompt_depth -= 1;
         if (self.prompt_depth > 0) return;
-        for (self.surfaces.items) |surface| {
-            if (!surface.prompt_disabled) continue;
-            surface.prompt_disabled = false;
-            _ = win32.EnableWindow(surface.hwnd, .TRUE);
+        for (self.windows.items) |window| {
+            if (!window.prompt_disabled) continue;
+            window.prompt_disabled = false;
+            _ = win32.EnableWindow(window.hwnd, .TRUE);
         }
     }
 
@@ -734,13 +749,13 @@ pub const App = struct {
     fn presentTerminal(target: apprt.Target) bool {
         return switch (target) {
             .app => false,
-            .surface => |v| Window.present(v.rt_surface.hwnd),
+            .surface => |v| Window.present(v.rt_surface.window.hwnd),
         };
     }
 
     /// Records the size `window-width`/`window-height` ask for. The core
     /// sends it from CoreSurface.init and again whenever the cell size
-    /// changes (`Surface.recomputeInitialSize`); `Surface.create` applies it
+    /// changes (`Surface.recomputeInitialSize`); `Window.show` applies it
     /// once, before the window is first shown. Later values are stored but
     /// never resize a live window, as on GTK (`setDefaultSize` in the
     /// window's surface init) and macOS (`initialSize` on a new window).
@@ -758,7 +773,8 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| maximize: {
-                Window.toggleMaximize(v.rt_surface.hwnd, &v.rt_surface.maximized);
+                const window = v.rt_surface.window;
+                Window.toggleMaximize(window.hwnd, &window.maximized);
                 break :maximize true;
             },
         };
@@ -993,9 +1009,10 @@ pub const App = struct {
 
     /// Create a terminal window: the initial one (`run`), or one the core
     /// asked for (`createRequestedWindows`) from `parent`, a live surface.
-    fn newWindow(self: *App, parent: ?*CoreSurface) !*Surface {
+    fn newWindow(self: *App, parent: ?*CoreSurface) !*Window {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
+        try self.windows.ensureUnusedCapacity(alloc, 1);
 
         // Taken from the asking surface itself (see Surface.Options).
         const cwd: ?[]const u8 = cwd: {
@@ -1008,7 +1025,7 @@ pub const App = struct {
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
         // itself, so there is no quit-timer handling here.
-        const surface = try Surface.create(self, .{
+        const window = try Window.create(self, .{
             .font_size = font_size: {
                 const p = parent orelse break :font_size null;
                 if (!self.config.@"window-inherit-font-size") break :font_size null;
@@ -1017,9 +1034,12 @@ pub const App = struct {
             .working_directory = cwd,
         });
         errdefer comptime unreachable;
-        self.surfaces.appendAssumeCapacity(surface);
+        self.windows.appendAssumeCapacity(window);
+        self.surfaces.appendAssumeCapacity(window.surface.?);
 
-        return surface;
+        // Shown once both are owned, so that its first messages find them.
+        window.show();
+        return window;
     }
 
     /// Called from the surface's WM_DESTROY handler, and by `terminate` for
@@ -1032,12 +1052,7 @@ pub const App = struct {
     /// chain safe -- DestroyWindow reenters here before the surface is
     /// registered, and a free here would be a double free.
     pub fn surfaceDestroyed(self: *App, surface: *Surface) void {
-        const idx = idx: {
-            for (self.surfaces.items, 0..) |s, i| {
-                if (s == surface) break :idx i;
-            }
-            return;
-        };
+        const idx = std.mem.indexOfScalar(*Surface, self.surfaces.items, surface) orelse return;
 
         // The HWND outlives its Surface by one message: WM_NCDESTROY is
         // still to come. Clear the back-pointer so wndProc's `v == 0` guard
@@ -1045,12 +1060,29 @@ pub const App = struct {
         _ = win32.SetWindowLongPtrW(surface.hwnd, win32.GWLP_USERDATA, 0);
 
         _ = self.surfaces.swapRemove(idx);
+        if (surface.window.surface == surface) surface.window.surface = null;
         surface.deinit();
         self.core_app.alloc.destroy(surface);
 
         // The quit timer is not handled here: CoreApp.deleteSurface, which
         // Surface.stopCore calls before the window is destroyed, starts it
         // when the core's last surface goes (`CoreApp.deleteSurface`).
+    }
+
+    /// Called from the frame's WM_NCDESTROY, after its terminal's
+    /// WM_DESTROY, and by `terminate` for a window that could not be
+    /// destroyed. The ownership invariant of `surfaceDestroyed` holds for
+    /// `self.windows` too: `Window.create` destroys a frame it has not
+    /// handed over yet, and frees it itself.
+    pub fn windowDestroyed(self: *App, window: *Window) void {
+        const idx = std.mem.indexOfScalar(*Window, self.windows.items, window) orelse return;
+
+        // As in surfaceDestroyed; after WM_NCDESTROY no message comes, but a
+        // window `terminate` gives up on still exists.
+        _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_USERDATA, 0);
+
+        _ = self.windows.swapRemove(idx);
+        self.core_app.alloc.destroy(window);
     }
 
     /// The message-only window's procedure.
@@ -1133,25 +1165,45 @@ const icon_resource_id = 1;
 fn registerClasses(hinstance: win32.HINSTANCE) !void {
     const arrow = win32.LoadCursorW(null, win32.IDC_ARROW);
 
-    // The exe's own icon for the caption and Alt+Tab. LoadIconW returns a
+    // The exe's own icon for the frame's caption and Alt+Tab. LoadIconW returns a
     // shared icon, so nothing destroys it. With hIconSm null the system
     // picks the small size from the same resource (WNDCLASSEXW docs); if
     // the load fails both stay null and the system default is used.
     const icon = win32.LoadIconW(hinstance, @ptrFromInt(icon_resource_id));
 
+    // No CS_HREDRAW or CS_VREDRAW for either class: nothing here draws
+    // through GDI, and WM_SIZE already queues the frame for the new size.
+    // They would invalidate the whole window on every resize step, shrinks
+    // included, and each resulting WM_PAINT wakes the renderer for another
+    // frame of the same size.
+    const window_class: win32.WNDCLASSEXW = .{
+        .cbSize = @sizeOf(win32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &Window.wndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = icon,
+        .hCursor = arrow,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = L(Window.class_name),
+        .hIconSm = null,
+    };
+    if (win32.RegisterClassExW(&window_class) == 0) {
+        log.err("failed to register the window class err={}", .{win32.GetLastError()});
+        return App.Error.Win32ClassRegistrationFailed;
+    }
+    errdefer _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
+
     const surface_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
-        // No CS_HREDRAW or CS_VREDRAW: nothing here draws through GDI, and
-        // WM_SIZE already queues the frame for the new size. They would
-        // invalidate the whole window on every resize step, shrinks
-        // included, and each resulting WM_PAINT wakes the renderer for
-        // another frame of the same size.
         .style = 0,
         .lpfnWndProc = &Surface.wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
         .hInstance = hinstance,
-        .hIcon = icon,
+        .hIcon = null,
         .hCursor = arrow,
         .hbrBackground = null,
         .lpszMenuName = null,
@@ -1187,6 +1239,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
 fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(app_class_name), hinstance);
     _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
+    _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
 }
 
 /// The allocator of the link `openUrl` hands to its opener thread, which
@@ -1413,7 +1466,7 @@ test "win32: only an armed quit timer expires" {
 
 test "win32: a prompt disables the other windows until the outermost one ends" {
     // MessageBoxW disables only its owner; the rest is beginPrompt's.
-    // Hidden top-level windows stand in for the surfaces' windows.
+    // Hidden top-level windows stand in for the frames.
     const testWindow = struct {
         fn create() !win32.HWND {
             return win32.CreateWindowExW(
@@ -1439,22 +1492,19 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
     const off = try testWindow();
     defer _ = win32.DestroyWindow(off);
 
-    // Static because the struct embeds a whole CoreSurface.
-    const s = struct {
-        var a: Surface = undefined;
-        var b: Surface = undefined;
-        var c: Surface = undefined;
-    };
-    s.a.hwnd = owner;
-    s.b.hwnd = other;
-    s.c.hwnd = off;
-    for ([_]*Surface{ &s.a, &s.b, &s.c }) |surface| surface.prompt_disabled = false;
+    var a: Window = undefined;
+    var b: Window = undefined;
+    var c: Window = undefined;
+    a.hwnd = owner;
+    b.hwnd = other;
+    c.hwnd = off;
+    for ([_]*Window{ &a, &b, &c }) |window| window.prompt_disabled = false;
 
     var app: App = undefined;
     app.prompt_depth = 0;
-    app.surfaces = .empty;
-    defer app.surfaces.deinit(std.testing.allocator);
-    try app.surfaces.appendSlice(std.testing.allocator, &.{ &s.a, &s.b, &s.c });
+    app.windows = .empty;
+    defer app.windows.deinit(std.testing.allocator);
+    try app.windows.appendSlice(std.testing.allocator, &.{ &a, &b, &c });
 
     // Disabled by something else, so not the prompt's to enable.
     _ = win32.EnableWindow(off, .FALSE);
@@ -1476,9 +1526,11 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
     try std.testing.expect(!win32.IsWindowEnabled(off).toBool());
 }
 
-test "win32: a prompt with no owner belongs to the last focused window" {
-    // An ownerless MessageBoxW would leave every window disabled and hand
-    // the activation to another application when it closes.
+test "win32: a prompt belongs to a top-level window" {
+    // MessageBoxW disables only its owner, so a prompt a terminal asks for
+    // belongs to the terminal's frame. An ownerless one would leave every
+    // window disabled and hand the activation to another application when
+    // it closes, so a caller with no window gets the last focused one.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.surfaces = .empty;
@@ -1487,31 +1539,175 @@ test "win32: a prompt with no owner belongs to the last focused window" {
 
     var app: App = undefined;
     app.core_app = &core_app;
-    app.surfaces = .empty;
-    defer app.surfaces.deinit(alloc);
+    app.windows = .empty;
+    defer app.windows.deinit(alloc);
 
-    // Static because the struct embeds a whole CoreSurface. The handles are
-    // only compared, never used as windows.
+    // Static because the struct embeds a whole CoreSurface. These handles
+    // are only compared, never used as windows.
     const s = struct {
         var a: Surface = undefined;
         var b: Surface = undefined;
+        var wa: Window = undefined;
+        var wb: Window = undefined;
     };
-    s.a.hwnd = @ptrFromInt(0x10);
-    s.b.hwnd = @ptrFromInt(0x20);
+    s.wa.hwnd = @ptrFromInt(0x10);
+    s.wb.hwnd = @ptrFromInt(0x20);
+    s.a.window = &s.wa;
+    s.b.window = &s.wb;
     s.a.core_surface.rt_surface = &s.a;
     s.b.core_surface.rt_surface = &s.b;
 
     try std.testing.expect(app.promptOwner(null) == null);
 
-    try app.surfaces.appendSlice(alloc, &.{ &s.a, &s.b });
-    try std.testing.expectEqual(s.a.hwnd, app.promptOwner(null).?);
+    try app.windows.appendSlice(alloc, &.{ &s.wa, &s.wb });
+    try std.testing.expectEqual(s.wa.hwnd, app.promptOwner(null).?);
 
     try core_app.surfaces.appendSlice(alloc, &.{ &s.a, &s.b });
     core_app.focused_surface = &s.b.core_surface;
-    try std.testing.expectEqual(s.b.hwnd, app.promptOwner(null).?);
+    try std.testing.expectEqual(s.wb.hwnd, app.promptOwner(null).?);
 
-    // The caller's own window always wins.
-    try std.testing.expectEqual(s.a.hwnd, app.promptOwner(s.a.hwnd).?);
+    // The caller's own window always wins, and for a terminal that is its
+    // frame. A hidden top-level window and a child of it stand in for them.
+    const frame = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        null,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(frame);
+    const pane = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        win32.WS_CHILD,
+        0,
+        0,
+        0,
+        0,
+        frame,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(frame, app.promptOwner(pane).?);
+    try std.testing.expectEqual(frame, app.promptOwner(frame).?);
+}
+
+test "win32: a window's terminal fills it, and both are freed once" {
+    // The real classes and window procedures, with no core surface, so that
+    // a teardown only frees. Both windows stay hidden and are never
+    // activated.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
+    app.modal_loop_depth = 0;
+    app.surfaces = .empty;
+    defer app.surfaces.deinit(alloc);
+    app.windows = .empty;
+    defer app.windows.deinit(alloc);
+    try app.surfaces.ensureUnusedCapacity(alloc, 1);
+    try app.windows.ensureUnusedCapacity(alloc, 1);
+
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+
+    const window = try alloc.create(Window);
+    window.* = .{
+        .app = &app,
+        .hwnd = undefined,
+        .surface = null,
+        .maximized = false,
+        .modal_loops = .{},
+        .prompt_disabled = false,
+    };
+    const frame = win32.CreateWindowExW(
+        0,
+        L(Window.class_name),
+        null,
+        win32.WS_OVERLAPPEDWINDOW | win32.WS_CLIPCHILDREN,
+        0,
+        0,
+        200,
+        100,
+        null,
+        null,
+        app.hinstance,
+        window,
+    ) orelse {
+        alloc.destroy(window);
+        return error.TestUnexpectedResult;
+    };
+    app.windows.appendAssumeCapacity(window);
+    // From here the frame's WM_NCDESTROY frees `window`, and once the
+    // terminal is in `app.surfaces`, its WM_DESTROY frees the terminal.
+    errdefer _ = win32.DestroyWindow(frame);
+
+    // Only what a terminal with no core surface reads while its window is
+    // created, resized and destroyed.
+    const surface = try alloc.create(Surface);
+    surface.app = &app;
+    surface.window = window;
+    surface.core_state = .none;
+    surface.title = null;
+    surface.ime = .{};
+    const pane = win32.CreateWindowExW(
+        0,
+        L(surface_class_name),
+        null,
+        win32.WS_CHILD,
+        0,
+        0,
+        200,
+        100,
+        frame,
+        null,
+        app.hinstance,
+        surface,
+    ) orelse {
+        alloc.destroy(surface);
+        return error.TestUnexpectedResult;
+    };
+    window.surface = surface;
+    app.surfaces.appendAssumeCapacity(surface);
+
+    // The frame's WM_SIZE, sent even to a hidden window, resizes the
+    // terminal to the frame's new client area.
+    try std.testing.expect(win32.SetWindowPos(
+        frame,
+        null,
+        0,
+        0,
+        400,
+        300,
+        win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOMOVE,
+    ).toBool());
+    var frame_client: win32.RECT = undefined;
+    var pane_client: win32.RECT = undefined;
+    try std.testing.expect(win32.GetClientRect(frame, &frame_client).toBool());
+    try std.testing.expect(win32.GetClientRect(pane, &pane_client).toBool());
+    try std.testing.expect(frame_client.right > 200);
+    try std.testing.expectEqual(frame_client, pane_client);
+
+    // DestroyWindow on the frame sends WM_DESTROY to the frame, then to the
+    // terminal's window, and the frame's WM_NCDESTROY only after its child
+    // windows are gone: the terminal frees itself and leaves the window,
+    // then the window frees itself. A leak or a second free of either
+    // fails the test through the testing allocator.
+    try std.testing.expect(win32.DestroyWindow(frame).toBool());
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(0, app.windows.items.len);
 }
 
 test "win32: a new window is recorded where it is asked for, and created later" {

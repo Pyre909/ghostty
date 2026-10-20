@@ -108,6 +108,10 @@ pub const CREATESTRUCTW = extern struct {
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 pub const WS_MINIMIZE: DWORD = 0x20000000;
+pub const WS_CHILD: DWORD = 0x40000000;
+pub const WS_VISIBLE: DWORD = 0x10000000;
+pub const WS_CLIPCHILDREN: DWORD = 0x02000000;
+pub const WS_CLIPSIBLINGS: DWORD = 0x04000000;
 pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_SHOWNORMAL: c_int = 1;
 pub const SW_MAXIMIZE: c_int = 3;
@@ -135,6 +139,7 @@ pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_MOUSEACTIVATE: UINT = 0x0021;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_NCCREATE: UINT = 0x0081;
+pub const WM_NCDESTROY: UINT = 0x0082;
 pub const WM_KEYFIRST: UINT = 0x0100;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_KEYUP: UINT = 0x0101;
@@ -199,6 +204,8 @@ pub const TME_LEAVE: DWORD = 0x00000002;
 /// The client-area hit-test code (WM_NCHITTEST), which is the low word
 /// of WM_MOUSEACTIVATE's and WM_SETCURSOR's lParam.
 pub const HTCLIENT: u16 = 1;
+/// WM_MOUSEACTIVATE: activate the window and pass the mouse message on.
+pub const MA_ACTIVATE: LRESULT = 1;
 /// WM_MOUSEACTIVATE: activate the window and discard the mouse message.
 pub const MA_ACTIVATEANDEAT: LRESULT = 2;
 
@@ -242,6 +249,7 @@ const QS_POINTER: DWORD = 0x1000;
 pub const QS_ALLINPUT: DWORD = 0x04FF | QS_TOUCH | QS_POINTER;
 pub const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
 
+pub const SWP_NOMOVE: UINT = 0x0002;
 pub const SWP_NOZORDER: UINT = 0x0004;
 pub const SWP_NOACTIVATE: UINT = 0x0010;
 
@@ -392,6 +400,13 @@ pub extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
 pub const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
 pub extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setfocus
+pub extern "user32" fn SetFocus(hwnd: ?HWND) callconv(.winapi) ?HWND;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getactivewindow
+pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getancestor
+pub extern "user32" fn GetAncestor(hwnd: HWND, flags: UINT) callconv(.winapi) ?HWND;
+pub const GA_ROOT: UINT = 2;
 pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;

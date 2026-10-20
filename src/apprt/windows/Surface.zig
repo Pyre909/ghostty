@@ -51,22 +51,24 @@ pub const Surface = struct {
 
     core_state: CoreState,
 
-    /// The window handle. Written from WM_NCCREATE, which is the first
-    /// message this window receives, so it is valid in every other handler.
+    /// The window this terminal is in. It outlives the surface: the
+    /// frame's child windows are destroyed before its WM_NCDESTROY frees it.
+    window: *Window,
+
+    /// The terminal's own window, a child filling the frame's client area.
+    /// Written from WM_NCCREATE, which is the first message this window
+    /// receives, so it is valid in every other handler.
     hwnd: win32.HWND,
 
     /// The current window title, owned by this struct. `getTitle` reads it
     /// back to answer CSI 21 t; a native runtime has to store it itself.
     title: ?[:0]u8,
 
-    /// Tracked so `.toggle_maximize` knows which way to toggle.
-    maximized: bool,
-
     /// The client size the core asked for through `.initial_size`, or null
     /// when `window-width`/`window-height` are unset. The core divides the
     /// cell area by the content scale but adds the padding in device pixels
     /// (`CoreSurface.recomputeInitialSize`), so the value is not purely in
-    /// 96-DPI units; see `Window.applyInitialSize`.
+    /// 96-DPI units; see `Window.applyInitialSize`. `Window.show` applies it.
     initial_size: ?apprt.action.InitialSize,
 
     /// A close has been requested and WM_GHOSTTY_DESTROY posted (or its
@@ -104,16 +106,8 @@ pub const Surface = struct {
     /// See `ShiftKeys`.
     shift: ShiftKeys,
 
-    /// This window's share of `App.modal_loop_depth`; see
-    /// `Window.ModalLoops`.
-    modal_loops: Window.ModalLoops,
-
     /// Keyboard focus, from WM_SETFOCUS / WM_KILLFOCUS. See `mouseMods`.
     focused: bool,
-
-    /// Disabled by `App.beginPrompt` for a prompt in another window, for
-    /// `App.endPrompt` to enable again.
-    prompt_disabled: bool,
 
     /// Mouse state, and what the core is still owed. See `Mouse`.
     mouse: Mouse,
@@ -568,24 +562,25 @@ pub const Surface = struct {
         working_directory: ?[]const u8 = null,
     };
 
-    /// Heap-allocate and initialize, including the core surface. The address
-    /// must be stable: the core stores raw `*apprt.Surface` pointers
-    /// (see `CoreSurface.init`), and the wndproc recovers this pointer from
-    /// GWLP_USERDATA.
-    pub fn create(app: *App, opts: Options) !*Surface {
+    /// Heap-allocate and initialize, including the core surface, as a child
+    /// window filling `window`'s client area. The address must be stable:
+    /// the core stores raw `*apprt.Surface` pointers (see
+    /// `CoreSurface.init`), and the wndproc recovers this pointer from
+    /// GWLP_USERDATA. The window is still hidden; `Window.show` shows it.
+    pub fn create(app: *App, window: *Window, opts: Options) !*Surface {
         const alloc = app.core_app.alloc;
         const self = try alloc.create(Surface);
         errdefer alloc.destroy(self);
 
         self.* = .{
             .app = app,
+            .window = window,
             .core_surface = undefined,
             .core_state = .none,
             // `hwnd` is written from WM_NCCREATE, the first message this
             // window receives, so it is set before anything can read it.
             .hwnd = undefined,
             .title = null,
-            .maximized = false,
             .initial_size = null,
             .closing = false,
             .destroy_deferred = false,
@@ -594,22 +589,24 @@ pub const Surface = struct {
             .high_surrogate = null,
             .alt_gr = .empty,
             .shift = .{},
-            .modal_loops = .{},
             .focused = false,
-            .prompt_disabled = false,
             .mouse = .init(),
         };
 
+        var client: win32.RECT = undefined;
+        if (!win32.GetClientRect(window.hwnd, &client).toBool()) {
+            return App.Error.Win32CallFailed;
+        }
         const hwnd = win32.CreateWindowExW(
             0,
             L(surface_class_name),
-            L("Ghostty"),
-            win32.WS_OVERLAPPEDWINDOW,
-            win32.CW_USEDEFAULT,
-            win32.CW_USEDEFAULT,
-            win32.CW_USEDEFAULT,
-            win32.CW_USEDEFAULT,
             null,
+            win32.WS_CHILD | win32.WS_VISIBLE | win32.WS_CLIPSIBLINGS,
+            0,
+            0,
+            client.right - client.left,
+            client.bottom - client.top,
+            window.hwnd,
             null,
             app.hinstance,
             self,
@@ -630,8 +627,9 @@ pub const Surface = struct {
         errdefer app.core_app.deleteSurface(self);
 
         // Preconditions CoreSurface.init relies on, both true here: the HWND
-        // exists at CW_USEDEFAULT size so getSize is non-zero
-        // (`CoreSurface.init` reads it), and getContentScale works on it.
+        // exists at the size of a frame created at CW_USEDEFAULT size, so
+        // getSize is non-zero (`CoreSurface.init` reads it), and
+        // getContentScale works on it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, .window);
         defer config.deinit();
         if (opts.working_directory) |wd| inheritWorkingDirectory(&config, wd);
@@ -647,8 +645,8 @@ pub const Surface = struct {
         // An inherited font size is applied after init, as the macOS
         // runtime does, so that `reset_font_size` still goes back to the
         // configured size (`original_font_size`). Before the window is
-        // sized below: the cell size it changes makes the core send
-        // `.initial_size` again (`CoreSurface.setCellSize`). A failure
+        // sized (`Window.show`): the cell size it changes makes the core
+        // send `.initial_size` again (`CoreSurface.setCellSize`). A failure
         // leaves the configured size.
         if (opts.font_size) |points| {
             var size = self.core_surface.font_size;
@@ -656,18 +654,6 @@ pub const Surface = struct {
             self.core_surface.setFontSize(size) catch |err|
                 log.warn("unable to apply the inherited font size err={}", .{err});
         }
-
-        // Size the still-hidden window to `window-width`/`window-height`
-        // before it is first shown, so it never appears at the default size.
-        if (self.initial_size) |size| {
-            Window.applyInitialSize(hwnd, (self.getContentScale() catch unreachable).x, size);
-        }
-
-        // The first WM_SETFOCUS and WM_PAINT (and the first WM_SIZE, unless
-        // applyInitialSize already sent one) reach the core from here, now
-        // that `core_state` is `.live`.
-        _ = win32.ShowWindow(hwnd, win32.SW_SHOWNORMAL);
-        _ = win32.UpdateWindow(hwnd);
 
         return self;
     }
@@ -724,12 +710,14 @@ pub const Surface = struct {
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
     }
 
-    /// Stop the core surface, then destroy the window. Returns whether the
-    /// window was destroyed; **when it was, `self` has been freed**
-    /// (WM_DESTROY -> App.surfaceDestroyed) and nothing may touch it.
+    /// Stop the core surface, then destroy the window it is in, its only
+    /// terminal. Returns whether the window was destroyed; **when it was,
+    /// `self` has been freed** (WM_DESTROY -> App.surfaceDestroyed), and so
+    /// has the window (WM_NCDESTROY -> App.windowDestroyed), and nothing may
+    /// touch either.
     pub fn destroy(self: *Surface) bool {
         self.stopCore();
-        return win32.DestroyWindow(self.hwnd).toBool();
+        return win32.DestroyWindow(self.window.hwnd).toBool();
     }
 
     /// The core surface, if message handlers may call into it.
@@ -1182,7 +1170,7 @@ pub const Surface = struct {
         };
         defer alloc.free(wide);
 
-        if (!win32.SetWindowTextW(self.hwnd, wide.ptr).toBool()) {
+        if (!win32.SetWindowTextW(self.window.hwnd, wide.ptr).toBool()) {
             log.warn("SetWindowTextW failed", .{});
             return false;
         }
@@ -1199,6 +1187,46 @@ pub const Surface = struct {
         return true;
     }
 
+    /// WM_CLOSE, of the frame or of this window: the title bar button,
+    /// Alt+F4 when no binding consumed it, and the window menu's Close.
+    pub fn requestClose(self: *Surface) void {
+        if (self.app.terminating) return;
+        switch (self.core_state) {
+            // CoreSurface.close -> Surface.close applies needsConfirmQuit
+            // and posts the teardown.
+            .live => self.core_surface.close(),
+            // Already going away.
+            .stopping => {},
+            // No core surface, so nothing to confirm or stop. This frees
+            // `self` and the window (WM_DESTROY, WM_NCDESTROY); nothing may
+            // follow it.
+            .none => _ = win32.DestroyWindow(self.window.hwnd),
+        }
+    }
+
+    /// The frame's WM_SIZE reports whether the window is minimized: a
+    /// child window is not resized when its frame is minimized, or restored
+    /// at the same size, so it never sees either. The core ignores repeats
+    /// (`Surface.occlusionCallback`).
+    pub fn occlusionChanged(self: *Surface, visible: bool) void {
+        const core_surface = self.liveCore() orelse return;
+        core_surface.occlusionCallback(visible) catch |err|
+            log.warn("occlusion callback failed err={}", .{err});
+    }
+
+    /// The frame's WM_DPICHANGED, with the new DPI: a child window gets
+    /// none of its own. The frame applies the suggested window rect after
+    /// this, which resizes this window synchronously, so the core sees the
+    /// scale before the size computed for it.
+    pub fn scaleChanged(self: *Surface, new_dpi: u16) void {
+        self.ime.form = null;
+        const core_surface = self.liveCore() orelse return;
+        const scale = @as(f32, @floatFromInt(new_dpi)) /
+            @as(f32, @floatFromInt(win32.USER_DEFAULT_SCREEN_DPI));
+        core_surface.contentScaleCallback(.{ .x = scale, .y = scale }) catch |err|
+            log.warn("content scale callback failed err={}", .{err});
+    }
+
     /// WM_PAINT. The render thread draws and presents on its own; all the
     /// main thread does is clear the update region and ask the core for a
     /// frame.
@@ -1210,7 +1238,7 @@ pub const Surface = struct {
         _ = win32.ValidateRect(self.hwnd, null);
 
         // A paint can arrive from inside CreateWindowExW, before the core
-        // surface exists; `create` shows the window only after it does.
+        // surface exists; `Window.show` shows the window only after it does.
         const core_surface = self.liveCore() orelse return;
 
         // refreshCallback, not CoreSurface.draw: WM_PAINT only needs the
@@ -1236,20 +1264,10 @@ pub const Surface = struct {
         // CreateWindowExW, long before CoreSurface.init. Callback errors are
         // logged and never propagated; there is no caller to take them.
         switch (msg) {
+            // Windows sends WM_CLOSE to the frame (`Window.handleMessage`);
+            // one sent to this window means the same.
             win32.WM_CLOSE => {
-                // The title bar button, Alt+F4 when no binding consumed it,
-                // and the window menu's Close.
-                if (self.app.terminating) return 0;
-                switch (self.core_state) {
-                    // CoreSurface.close -> Surface.close applies
-                    // needsConfirmQuit and posts the teardown.
-                    .live => self.core_surface.close(),
-                    // Already going away.
-                    .stopping => {},
-                    // No core surface, so nothing to confirm or stop. This
-                    // frees `self` (WM_DESTROY); nothing follows it.
-                    .none => _ = win32.DestroyWindow(hwnd),
-                }
+                self.requestClose();
                 return 0;
             },
 
@@ -1283,13 +1301,6 @@ pub const Surface = struct {
                     self.stopCore();
                 }
 
-                // Destroyed inside its own size/move or menu loop (e.g. the
-                // child exited mid-drag): the WM_EXIT* for that loop will not
-                // come, so return this window's share of the depth now.
-                // Otherwise every later wakeup would tick from whatever loop
-                // dispatched it.
-                self.modal_loops.release(&self.app.modal_loop_depth);
-
                 self.app.surfaceDestroyed(self);
                 return 0;
             },
@@ -1297,36 +1308,14 @@ pub const Surface = struct {
             win32.WM_SIZE => {
                 self.ime.form = null;
                 const core_surface = self.liveCore() orelse return 0;
-                const change: SizeChange = .init(wparam, lparam);
 
-                // Every WM_SIZE but a minimize means visible. Sent
-                // unconditionally; the core ignores repeats
-                // (`Surface.occlusionCallback`).
-                core_surface.occlusionCallback(change != .minimized) catch |err|
-                    log.warn("occlusion callback failed err={}", .{err});
-
-                switch (change) {
-                    .minimized, .empty => {},
+                // Visibility is the frame's to report (`occlusionChanged`):
+                // this window is never minimized itself.
+                switch (SizeChange.init(lparam)) {
+                    .empty => {},
                     .resize => |size| core_surface.sizeCallback(size) catch |err|
                         log.warn("size callback failed err={}", .{err}),
                 }
-                return 0;
-            },
-
-            win32.WM_DPICHANGED => {
-                self.ime.form = null;
-                // The new scale first: SetWindowPos below sends WM_SIZE
-                // synchronously, so the core sees the scale before the size
-                // computed for it. wParam carries the new DPI in both words;
-                // they are always equal for a window.
-                if (self.liveCore()) |core_surface| {
-                    const scale = @as(f32, @floatFromInt(win32.hiword(wparam))) /
-                        @as(f32, @floatFromInt(win32.USER_DEFAULT_SCREEN_DPI));
-                    core_surface.contentScaleCallback(.{ .x = scale, .y = scale }) catch |err|
-                        log.warn("content scale callback failed err={}", .{err});
-                }
-
-                Window.applySuggestedRect(hwnd, lparam);
                 return 0;
             },
 
@@ -1361,16 +1350,6 @@ pub const Surface = struct {
                     core_surface.focusCallback(msg == win32.WM_SETFOCUS) catch |err|
                         log.warn("focus callback failed err={}", .{err});
                 }
-                return 0;
-            },
-
-            // The system modal loops. See App.wndProc's WM_GHOSTTY_WAKEUP.
-            win32.WM_ENTERSIZEMOVE, win32.WM_ENTERMENULOOP => {
-                self.modal_loops.enter(&self.app.modal_loop_depth);
-                return 0;
-            },
-            win32.WM_EXITSIZEMOVE, win32.WM_EXITMENULOOP => {
-                self.modal_loops.exit(&self.app.modal_loop_depth);
                 return 0;
             },
 
@@ -1491,8 +1470,8 @@ pub const Surface = struct {
                     // so `self` is still valid -- but nothing here needs it.
                     .consumed, .closed => 0,
                     // Unhandled keys keep their system meaning: Alt and F10
-                    // reach WM_SYSCOMMAND (suppressed below), Alt+F4 becomes
-                    // SC_CLOSE if no binding took it.
+                    // reach the frame's WM_SYSCOMMAND (suppressed there),
+                    // Alt+F4 becomes SC_CLOSE if no binding took it.
                     .ignored => win32.DefWindowProcW(hwnd, msg, wparam, lparam),
                 };
             },
@@ -1511,8 +1490,9 @@ pub const Surface = struct {
                 // not exist for yet.
 
                 // Alt+Space's WM_SYSCHAR, deliberately left in the queue by
-                // the keydown handler: DefWindowProcW turns it into
-                // SC_KEYMENU with lParam ' ', which opens the window menu.
+                // the keydown handler: DefWindowProcW passes it to the
+                // frame, whose DefWindowProcW turns it into SC_KEYMENU with
+                // lParam ' ', which opens the window menu.
                 if (msg == win32.WM_SYSCHAR and wparam == ' ') {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
@@ -1528,8 +1508,6 @@ pub const Surface = struct {
                 // DefWindowProcW from beeping about a missing menu mnemonic.
                 return 0;
             },
-
-            win32.WM_SYSCOMMAND => if (Window.isBareKeyMenu(wparam, lparam)) return 0,
 
             win32.WM_MOUSEMOVE => {
                 const core_surface = self.liveCore() orelse
@@ -1669,13 +1647,32 @@ pub const Surface = struct {
             },
 
             win32.WM_MOUSEACTIVATE => {
-                // A click on an inactive window only activates it, as on
-                // macOS: it must not clear the selection, move the prompt
-                // cursor, or reach a program that reads the mouse. Client
-                // area only, so an inactive window can still be dragged by
-                // its caption. The button-up that may follow is dropped by
-                // mouseButton, because the press was never recorded.
-                if (win32.loword(lparam) == win32.HTCLIENT) return win32.MA_ACTIVATEANDEAT;
+                // Sent for every click on a child window, not only for one
+                // that activates its frame. Client area only; the caption is
+                // the frame's, so a click there never comes here.
+                if (win32.loword(lparam) == win32.HTCLIENT) {
+                    // A click on an inactive window only activates it, as on
+                    // macOS: it must not clear the selection, move the prompt
+                    // cursor, or reach a program that reads the mouse. The
+                    // button-up that may follow is dropped by mouseButton,
+                    // because the press was never recorded.
+                    if (win32.GetActiveWindow() != self.window.hwnd) {
+                        return win32.MA_ACTIVATEANDEAT;
+                    }
+
+                    // In an active window with the focus elsewhere in it,
+                    // the click only moves the focus here, and is consumed
+                    // as macOS consumes a click that moves the focus between
+                    // splits (`localEventLeftMouseDown` in
+                    // SurfaceView_AppKit.swift).
+                    if (win32.GetFocus() != hwnd) {
+                        _ = win32.SetFocus(hwnd);
+                        return win32.MA_ACTIVATEANDEAT;
+                    }
+
+                    // Otherwise the click is the terminal's.
+                    return win32.MA_ACTIVATE;
+                }
             },
 
             win32.WM_PAINT => {
@@ -2447,10 +2444,10 @@ pub const Surface = struct {
     /// for exactly these two cases.
     ///
     /// Not during a system size/move or menu loop: that loop holds the
-    /// capture on this window and sets its own cursor, which nothing would
+    /// capture on the frame and sets its own cursor, which nothing would
     /// restore while captured.
     fn applyCursor(self: *Surface) void {
-        if (self.modal_loops.inLoop()) return;
+        if (self.window.modal_loops.inLoop()) return;
         const own_drag = self.mouse.held.count() != 0 and self.hasCapture();
         if (!self.mouse.tracking and !own_drag) return;
         if (self.mouse.hidden or self.mouse.cursor != null) {
@@ -2635,24 +2632,19 @@ fn clientPos(lparam: win32.LPARAM) apprt.CursorPos {
     };
 }
 
-/// What a WM_SIZE tells the core.
+/// What a terminal window's WM_SIZE tells the core. The window is a child
+/// of its frame, which is the one minimized (`Window.handleMessage`).
 const SizeChange = union(enum) {
-    /// Occluded, and not resized. A minimized window reports a 0x0 client
-    /// area, and the grid is clamped to at least 1x1
-    /// (`renderer.size.GridSize.update`), so passing it on would reflow
-    /// every line to one column and back on restore.
-    minimized,
-
-    /// Visible, but not resized: a zero dimension can also occur without
-    /// minimizing (a window dragged to zero height), and would clamp the
-    /// grid the same way.
+    /// Not resized: the grid is clamped to at least 1x1
+    /// (`renderer.size.GridSize.update`), so a zero dimension (a window
+    /// dragged to zero height) would reflow every line to one column and
+    /// back.
     empty,
 
-    /// Visible, at this client size in physical pixels (PerMonitorV2).
+    /// At this client size in physical pixels (PerMonitorV2).
     resize: apprt.SurfaceSize,
 
-    fn init(wparam: win32.WPARAM, lparam: win32.LPARAM) SizeChange {
-        if (wparam == win32.SIZE_MINIMIZED) return .minimized;
+    fn init(lparam: win32.LPARAM) SizeChange {
         const width = win32.loword(lparam);
         const height = win32.hiword(lparam);
         if (width == 0 or height == 0) return .empty;
@@ -2947,22 +2939,20 @@ test "win32: an invented release lands on another cell than the press" {
     }
 }
 
-test "win32: a minimized or empty window is not resized" {
-    // wParam SIZE_RESTORED 0, SIZE_MINIMIZED 1, SIZE_MAXIMIZED 2; lParam
-    // MAKELPARAM(width, height).
-    try std.testing.expectEqual(SizeChange.minimized, SizeChange.init(1, 0));
-    try std.testing.expectEqual(SizeChange.minimized, SizeChange.init(1, 0x0438_0780));
-    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0, 0x0190_0000));
-    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0, 0x0000_0280));
+test "win32: an empty window is not resized" {
+    // lParam MAKELPARAM(width, height).
+    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0));
+    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0x0190_0000));
+    try std.testing.expectEqual(SizeChange.empty, SizeChange.init(0x0000_0280));
     try std.testing.expectEqual(
         SizeChange{ .resize = .{ .width = 1920, .height = 1080 } },
-        SizeChange.init(2, 0x0438_0780),
+        SizeChange.init(0x0438_0780),
     );
 
     // Unsigned: a client size is never negative, unlike a mouse position.
     try std.testing.expectEqual(
         SizeChange{ .resize = .{ .width = 0x9000, .height = 0x8000 } },
-        SizeChange.init(0, 0x8000_9000),
+        SizeChange.init(0x8000_9000),
     );
 }
 
@@ -3471,72 +3461,14 @@ test "win32: losing focus mid-drag wakes the app loop" {
     }
 }
 
-test "win32: modal loops are counted per window and returned on destroy" {
-    // The app ticks the core from its window procedure while any window is
-    // in a size/move or menu loop (WM_GHOSTTY_WAKEUP), so the count must
-    // not leak past a loop's end or a window's. One message-only window
-    // stands in for both surfaces' windows: these handlers never use it.
-    const hwnd = win32.CreateWindowExW(
-        0,
-        L("STATIC"),
-        null,
-        0,
-        0,
-        0,
-        0,
-        0,
-        win32.HWND_MESSAGE,
-        null,
-        null,
-        null,
-    ) orelse return error.TestUnexpectedResult;
-    defer _ = win32.DestroyWindow(hwnd);
-
-    var app: App = undefined;
-    app.modal_loop_depth = 0;
-    // Empty, so WM_DESTROY's surfaceDestroyed frees nothing.
-    app.surfaces = .empty;
-
-    // Static because the struct embeds a whole CoreSurface.
-    const s = struct {
-        var a: Surface = undefined;
-        var b: Surface = undefined;
-    };
-    for ([_]*Surface{ &s.a, &s.b }) |surface| {
-        surface.app = &app;
-        surface.hwnd = hwnd;
-        surface.core_state = .none;
-        surface.modal_loops = .{};
-    }
-
-    _ = s.a.handleMessage(hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
-    _ = s.a.handleMessage(hwnd, win32.WM_ENTERMENULOOP, 0, 0);
-    try std.testing.expectEqual(2, app.modal_loop_depth);
-
-    // An exit with no loop of its own takes nothing from another window.
-    _ = s.b.handleMessage(hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
-    try std.testing.expectEqual(2, app.modal_loop_depth);
-
-    _ = s.b.handleMessage(hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
-    try std.testing.expectEqual(3, app.modal_loop_depth);
-
-    // Destroyed inside both of its loops, so their exits never come.
-    _ = s.a.handleMessage(hwnd, win32.WM_DESTROY, 0, 0);
-    try std.testing.expectEqual(1, app.modal_loop_depth);
-
-    _ = s.b.handleMessage(hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
-    try std.testing.expectEqual(0, app.modal_loop_depth);
-    _ = s.b.handleMessage(hwnd, win32.WM_EXITMENULOOP, 0, 0);
-    try std.testing.expectEqual(0, app.modal_loop_depth);
-}
-
 test "win32: a teardown dispatched inside another waits for it" {
     // A teardown pumps messages while it waits for its surface's threads
     // (App.waitForThread), so another window's WM_GHOSTTY_DESTROY can be
     // dispatched inside it. That one is deferred while the first is still
-    // on the stack, and runs at once otherwise. A message-only
-    // window stands in for the surface's: with no core surface, a teardown
-    // that runs only destroys it.
+    // on the stack, and runs at once otherwise. Two message-only windows
+    // stand in for the frame and the terminal's window: with no core
+    // surface, a teardown that runs only destroys the frame, which would
+    // take a real terminal's window with it.
     var app: App = undefined;
     app.terminating = false;
     app.ticking = false;
@@ -3547,38 +3479,49 @@ test "win32: a teardown dispatched inside another waits for it" {
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
         var surface: Surface = undefined;
+        var window: Window = undefined;
     };
     const surface = &s.surface;
     surface.app = &app;
+    surface.window = &s.window;
     surface.core_state = .none;
 
+    const messageWindow = struct {
+        fn create() !win32.HWND {
+            return win32.CreateWindowExW(
+                0,
+                L("STATIC"),
+                null,
+                0,
+                0,
+                0,
+                0,
+                0,
+                win32.HWND_MESSAGE,
+                null,
+                null,
+                null,
+            ) orelse error.TestUnexpectedResult;
+        }
+    }.create;
+
     for ([_]u32{ 1, 0 }) |depth| {
-        const hwnd = win32.CreateWindowExW(
-            0,
-            L("STATIC"),
-            null,
-            0,
-            0,
-            0,
-            0,
-            0,
-            win32.HWND_MESSAGE,
-            null,
-            null,
-            null,
-        ) orelse return error.TestUnexpectedResult;
-        defer if (win32.IsWindow(hwnd).toBool()) {
-            _ = win32.DestroyWindow(hwnd);
+        const frame = try messageWindow();
+        defer if (win32.IsWindow(frame).toBool()) {
+            _ = win32.DestroyWindow(frame);
         };
-        surface.hwnd = hwnd;
+        const pane = try messageWindow();
+        defer _ = win32.DestroyWindow(pane);
+        surface.hwnd = pane;
+        s.window.hwnd = frame;
         surface.destroy_deferred = false;
         app.teardown_depth = depth;
 
-        _ = surface.handleMessage(hwnd, WM_GHOSTTY_DESTROY, 0, 0);
+        _ = surface.handleMessage(pane, WM_GHOSTTY_DESTROY, 0, 0);
 
         const deferred = depth > 0;
         try std.testing.expectEqual(deferred, surface.destroy_deferred);
-        try std.testing.expectEqual(deferred, win32.IsWindow(hwnd).toBool());
+        try std.testing.expectEqual(deferred, win32.IsWindow(frame).toBool());
     }
 }
 
@@ -3597,14 +3540,17 @@ test "win32: a finished teardown posts the ones it deferred again" {
     app.surfaces = .empty;
     defer app.surfaces.deinit(alloc);
 
-    // Static because the struct embeds a whole CoreSurface.
+    // Static because the struct embeds a whole CoreSurface. Each surface's
+    // window is its own message-only window: a teardown destroys it.
     const s = struct {
         var done: Surface = undefined;
         var waiting: Surface = undefined;
+        var windows: [2]Window = undefined;
     };
     const both = [_]*Surface{ &s.done, &s.waiting };
-    for (both) |surface| {
+    for (both, &s.windows) |surface, *window| {
         surface.app = &app;
+        surface.window = window;
         surface.core_state = .none;
         surface.closing = true;
         surface.hwnd = win32.CreateWindowExW(
@@ -3621,6 +3567,7 @@ test "win32: a finished teardown posts the ones it deferred again" {
             null,
             null,
         ) orelse return error.TestUnexpectedResult;
+        window.hwnd = surface.hwnd;
     }
     defer for (both) |surface| {
         if (win32.IsWindow(surface.hwnd).toBool()) _ = win32.DestroyWindow(surface.hwnd);
