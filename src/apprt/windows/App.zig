@@ -137,8 +137,8 @@ pub const App = struct {
     /// A teardown pumps messages while it waits for the surface's threads
     /// (`waitForThread`), so another window's WM_GHOSTTY_DESTROY can be
     /// dispatched inside it. `Surface.destroyPosted` defers that one while
-    /// this is non-zero, and `run` re-posts it: teardowns run one after
-    /// another, never one inside another's wait.
+    /// this is non-zero, and `repostDeferredDestroys` posts it again:
+    /// teardowns run one after another, never one inside another's wait.
     teardown_depth: u32,
 
     /// Set for the whole of `terminate`. Teardown is driven from there
@@ -680,14 +680,12 @@ pub const App = struct {
     fn requestQuit(self: *App) bool {
         if (self.quit) return true;
 
+        // No owner of its own: promptOwner gives the prompt the window the
+        // user was last in.
         if (self.core_app.needsConfirmQuit()) {
-            const owner: ?win32.HWND = if (self.core_app.focusedSurface()) |s|
-                s.rt_surface.hwnd
-            else
-                null;
             if (!confirm(
                 self,
-                owner,
+                null,
                 L("All terminal sessions will be terminated. Quit Ghostty?"),
                 .ok,
             )) return true;

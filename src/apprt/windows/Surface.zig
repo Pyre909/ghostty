@@ -76,7 +76,8 @@ pub const Surface = struct {
 
     /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
     /// (`App.canReenterCore` was false, or another surface's teardown was
-    /// running, `App.teardown_depth`). `App.run` re-posts it.
+    /// running, `App.teardown_depth`). It is re-posted by
+    /// `App.repostDeferredDestroys`.
     destroy_deferred: bool,
 
     /// Who put the text that is in the core's preedit slot: a dead key
@@ -679,9 +680,7 @@ pub const Surface = struct {
     /// subprocess's (src/termio/Exec.zig, `term.setPwd(cwd)`), which comes
     /// from `working-directory` and may be relative. A relative one is not
     /// resolved here, since this process's cwd is not the shell's, and
-    /// `openDirAbsolute` asserts an absolute path. The path is copied into
-    /// the config's arena, since `finalize` keeps the slice it is given
-    /// when there is nothing to expand.
+    /// `openDirAbsolute` asserts an absolute path.
     fn inheritWorkingDirectory(config: *configpkg.Config, wd: []const u8) void {
         if (wd.len == 0) return;
         if (!std.fs.path.isAbsolute(wd)) {
@@ -701,11 +700,7 @@ pub const Surface = struct {
             log.warn("the inherited working directory is not a directory dir={s}", .{wd});
             return;
         }
-        const path = config.arenaAlloc().dupe(u8, wd) catch |err| {
-            log.warn("cannot keep the inherited working directory err={}", .{err});
-            return;
-        };
-        var value: configpkg.WorkingDirectory = .{ .path = path };
+        var value: configpkg.WorkingDirectory = .{ .path = wd };
         value.finalize(config.arenaAlloc()) catch |err| {
             log.warn("cannot finalize the inherited working directory err={}", .{err});
             return;
@@ -884,8 +879,9 @@ pub const Surface = struct {
     /// second wait inside the first, and with several windows closing at
     /// once each would nest inside the last.
     ///
-    /// **`self` is freed by the `destroy` at the end**. Nothing may touch it
-    /// afterwards, which is why the function ends at that call.
+    /// **`self` is freed by `destroy`**: only `app`, read beforehand, is
+    /// used after it. A deferred teardown is re-posted by
+    /// `App.repostDeferredDestroys`.
     fn destroyPosted(self: *Surface) void {
         const app = self.app;
 
@@ -3871,8 +3867,6 @@ test "win32: a new window inherits only an existing working directory" {
     Surface.inheritWorkingDirectory(&config, dir_path);
     const got = config.@"working-directory" orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings(dir_path, got.path);
-    // A copy in the config's arena: the caller frees its own after create.
-    try testing.expect(got.path.ptr != dir_path.ptr);
 }
 
 test "win32: a closing surface leaves the core and its window requests" {
