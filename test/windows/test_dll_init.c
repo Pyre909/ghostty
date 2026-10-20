@@ -12,7 +12,7 @@
  * crashing, the CRT is properly initialized.
  *
  * Built for MinGW it also checks both halves of what mingw's _CRT_INIT does
- * for the DLL (DllMain forwards to it):
+ * for the DLL (mingw's DllMainCRTStartup, the DLL's entry, runs it):
  *
  * - The C++ global constructors. It initializes ghostty with
  *   ghostty_init_wtf16 and runs the terminal-stream benchmark over
@@ -33,8 +33,8 @@
  * System32 even with a copy of it beside this exe, which a bare LoadLibrary
  * would pick first.
  *
- * The MSVC DllMain does not run the constructors yet, so the MSVC build
- * stops after ghostty_info. The MinGW checks are chosen by the compiler that
+ * ghostty_init_wtf16 refuses an MSVC-built DLL until an MSVC build confirms
+ * its constructors run, so the MSVC build stops after ghostty_info. The MinGW checks are chosen by the compiler that
  * builds this test, so build the test and the DLL for the same ABI.
  *
  * Build:  zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc

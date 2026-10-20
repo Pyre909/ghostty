@@ -9,7 +9,8 @@ ghostty-internal.dll at runtime and calls ghostty_info to verify the C
 runtime is properly initialized.
 
 Built for MinGW it also checks both halves of what mingw's `_CRT_INIT`
-does for the DLL, which its DllMain forwards to:
+does for the DLL, which mingw's `DllMainCRTStartup`, the DLL's entry,
+runs:
 
 - The C++ global constructors: it calls ghostty_init_wtf16 and runs the
   terminal-stream benchmark over multi-byte UTF-8, which decodes through
@@ -47,8 +48,8 @@ zig cc test_dll_init.c -o test_dll_init.exe -target native-native-msvc
 ```
 
 For MinGW, build both for the GNU ABI. This is the build an embedding
-host needs: an MSVC-built DLL does not run its C++ initialization yet, so
-its ghostty_init_wtf16 always fails.
+host needs: ghostty_init_wtf16 refuses an MSVC-built DLL until an MSVC
+build confirms that its C++ initialization runs.
 
 ```
 zig build -Dapp-runtime=none -Demit-exe=false -Dtarget=native-windows-gnu
