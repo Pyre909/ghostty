@@ -20,6 +20,8 @@ const Window = @This();
 const std = @import("std");
 
 const apprt = @import("../../apprt.zig");
+const configpkg = @import("../../config.zig");
+const terminal = @import("../../terminal/main.zig");
 
 const win32 = @import("win32.zig");
 const L = win32.L;
@@ -246,8 +248,22 @@ fn handleMessage(
         // Sent to the top-level window, not to the terminal with the focus.
         win32.WM_SYSCOMMAND => if (isBareKeyMenu(wparam, lparam)) return 0,
 
-        // The terminals cover the whole client area.
+        // Erased by WM_PAINT below, all of it at once.
         win32.WM_ERASEBKGND => return 1,
+
+        // What the terminals leave of the client area: the dividers
+        // between them. WS_CLIPCHILDREN keeps the paint out of the
+        // terminals, which their own swap chains draw.
+        win32.WM_PAINT => {
+            var paint: win32.PAINTSTRUCT = undefined;
+            const hdc = win32.BeginPaint(hwnd, &paint) orelse return 0;
+            defer _ = win32.EndPaint(hwnd, &paint);
+            const color = dividerColor(&self.app.config);
+            const brush = win32.CreateSolidBrush(win32.rgb(color.r, color.g, color.b)) orelse return 0;
+            defer _ = win32.DeleteObject(brush);
+            _ = win32.FillRect(hdc, &paint.rcPaint, brush);
+            return 0;
+        },
 
         win32.WM_DESTROY => {
             // Destroyed inside its own size/move or menu loop (e.g. the
@@ -449,7 +465,8 @@ const Placer = struct {
         }
     }
 
-    /// The frame has nothing in the gaps yet: a window holds one terminal.
+    /// Nothing to place: the frame paints the gaps between terminals
+    /// itself (WM_PAINT).
     pub fn divider(self: *Placer, rect: win32.RECT) void {
         _ = self;
         _ = rect;
@@ -507,6 +524,24 @@ fn layoutNode(
             layoutNode(tree, s.right, b, divider, ctx);
         },
     }
+}
+
+/// The colour of the line between two terminals: `split-divider-color`, or
+/// the one macOS derives from the background (`splitDividerColor` in
+/// macos/Sources/Ghostty/Ghostty.Config.swift): darkened by 8% on a light
+/// background and by 40% on a dark one. macOS darkens the HSB brightness,
+/// which scales red, green and blue alike, and calls a background light
+/// above a perceived luminance of 0.5.
+pub fn dividerColor(config: *const configpkg.Config) terminal.color.RGB {
+    if (config.@"split-divider-color") |color| return color.toTerminalRGB();
+    const bg = config.background.toTerminalRGB();
+    const keep: f64 = if (bg.perceivedLuminance() > 0.5) 0.92 else 0.6;
+    const darken = struct {
+        fn darken(c: u8, k: f64) u8 {
+            return @intFromFloat(@round(@as(f64, @floatFromInt(c)) * k));
+        }
+    }.darken;
+    return .{ .r = darken(bg.r, keep), .g = darken(bg.g, keep), .b = darken(bg.b, keep) };
 }
 
 /// The width of the line between two terminals: a pixel at 96 DPI, scaled
@@ -843,6 +878,32 @@ fn testSplit(
     var single: TestTree = try .init(alloc, pane);
     defer single.deinit();
     return tree.split(alloc, at, direction, ratio, &single);
+}
+
+test "win32: dividers take their colour from the config or the background" {
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    // The default dark background, 0x282C34: 40% darker.
+    try std.testing.expectEqual(
+        terminal.color.RGB{ .r = 0x18, .g = 0x1A, .b = 0x1F },
+        dividerColor(&config),
+    );
+
+    // A light one: 8% darker.
+    config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+    try std.testing.expectEqual(
+        terminal.color.RGB{ .r = 0xEB, .g = 0xEB, .b = 0xEB },
+        dividerColor(&config),
+    );
+
+    // Set: used as it is.
+    config.@"split-divider-color" = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+    try std.testing.expectEqual(
+        terminal.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 },
+        dividerColor(&config),
+    );
 }
 
 test "win32: a divider is a pixel at 96 DPI, scaled to the nearest pixel" {

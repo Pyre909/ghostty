@@ -591,6 +591,33 @@ pub extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi
 
 pub extern "gdi32" fn GetDeviceCaps(hdc: HDC, index: c_int) callconv(.winapi) c_int;
 
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-paintstruct
+pub const PAINTSTRUCT = extern struct {
+    hdc: ?HDC,
+    fErase: BOOL,
+    rcPaint: RECT,
+    fRestore: BOOL,
+    fIncUpdate: BOOL,
+    rgbReserved: [32]u8,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-beginpaint
+pub extern "user32" fn BeginPaint(hwnd: HWND, paint: *PAINTSTRUCT) callconv(.winapi) ?HDC;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-endpaint
+pub extern "user32" fn EndPaint(hwnd: HWND, paint: *const PAINTSTRUCT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-fillrect
+pub extern "user32" fn FillRect(hdc: HDC, rect: *const RECT, brush: HBRUSH) callconv(.winapi) c_int;
+/// A colour as GDI takes it: 0x00BBGGRR.
+pub const COLORREF = w.COLORREF;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createsolidbrush
+pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUSH;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
+pub extern "gdi32" fn DeleteObject(object: HBRUSH) callconv(.winapi) BOOL;
+
+/// The RGB macro of wingdi.h.
+pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
+    return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);
+}
+
 pub fn loword(v: LPARAM) u16 {
     return @truncate(@as(usize, @bitCast(v)));
 }

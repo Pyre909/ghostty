@@ -1208,11 +1208,13 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     // the load fails both stay null and the system default is used.
     const icon = win32.LoadIconW(hinstance, @ptrFromInt(icon_resource_id));
 
-    // No CS_HREDRAW or CS_VREDRAW for either class: nothing here draws
-    // through GDI, and WM_SIZE already queues the frame for the new size.
-    // They would invalidate the whole window on every resize step, shrinks
-    // included, and each resulting WM_PAINT wakes the renderer for another
-    // frame of the same size.
+    // No CS_HREDRAW or CS_VREDRAW for either class. They would invalidate
+    // the whole window on every resize step, shrinks included. A terminal
+    // draws nothing through GDI, and WM_SIZE already queues its frame for
+    // the new size, so each resulting WM_PAINT would only wake its renderer
+    // for another frame of the same size. The frame paints just its
+    // dividers, and Windows already invalidates what a resize or a
+    // terminal's move uncovers of it.
     const window_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
         .style = 0,
