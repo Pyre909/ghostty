@@ -33,7 +33,7 @@ const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
 const FileType = @import("../file_type.zig").FileType;
 
-const macos = switch (builtin.os.tag) {
+const macos = switch (builtin.target.os.tag) {
     .macos => @import("macos"),
     else => void,
 };
@@ -41,7 +41,7 @@ const macos = switch (builtin.os.tag) {
 /// The display link used to pace drawing to the display's refresh
 /// rate. Only macOS has one. Everywhere else this is void and the
 /// display link code paths compile away.
-const DisplayLink = switch (builtin.os.tag) {
+const DisplayLink = switch (builtin.target.os.tag) {
     .macos => @import("DisplayLink.zig"),
     else => void,
 };
@@ -1652,7 +1652,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.search_selected_match) |m| {
                     self.terminal_state.updateHighlightsFlattened(
                         self.alloc,
-                        @intFromEnum(HighlightTag.search_match_selected),
+                        @backingInt(HighlightTag.search_match_selected),
                         &.{m.match},
                     ) catch |err| {
                         // Not a critical error, we just won't show highlights.
@@ -1663,7 +1663,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (self.search_matches) |m| {
                     self.terminal_state.updateHighlightsFlattened(
                         self.alloc,
-                        @intFromEnum(HighlightTag.search_match),
+                        @backingInt(HighlightTag.search_match),
                         m.matches,
                     ) catch |err| {
                         // Not a critical error, we just won't show highlights.
@@ -1730,7 +1730,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we're on macOS and have glass styles, we remove
                 // the background opacity because the glass effect handles
                 // it.
-                if (comptime builtin.os.tag == .macos) switch (self.config.background_blur) {
+                if (comptime builtin.target.os.tag == .macos) switch (self.config.background_blur) {
                     .@"macos-glass-regular",
                     .@"macos-glass-clear",
                     => self.uniforms.bg_color[3] = 0,
@@ -2381,12 +2381,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ).add(self.size.padding);
 
             // Setup our uniforms
-            self.uniforms.projection_matrix = math.ortho2d(
+            self.uniforms.projection_matrix = @bitCast(math.ortho2d(
                 -1 * @as(f32, @floatFromInt(self.size.padding.left)),
                 @floatFromInt(terminal_size.width + self.size.padding.right),
                 @floatFromInt(terminal_size.height + self.size.padding.bottom),
                 -1 * @as(f32, @floatFromInt(self.size.padding.top)),
-            );
+            ));
             self.uniforms.grid_padding = .{
                 @floatFromInt(blank.top),
                 @floatFromInt(blank.right),
@@ -2522,7 +2522,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Cursor style
             const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
             uniforms.previous_cursor_style = uniforms.current_cursor_style;
-            uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
+            uniforms.current_cursor_style = @as(i32, @backingInt(cursor_style));
         }
 
         /// Update per-frame custom shader uniforms.
@@ -3185,7 +3185,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (x_compare >= hl.range[0] and
                             x_compare <= hl.range[1])
                         {
-                            const tag: HighlightTag = @enumFromInt(hl.tag);
+                            const tag: HighlightTag = @fromBackingInt(hl.tag);
                             break :selected switch (tag) {
                                 .search_match => .search,
                                 .search_match_selected => .search_selected,
@@ -3487,7 +3487,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const render = try self.font_grid.renderGlyph(
                 self.alloc,
                 font.sprite_index,
-                @intFromEnum(sprite),
+                @backingInt(sprite),
                 .{
                     .cell_width = 1,
                     .grid_metrics = self.grid_metrics,
@@ -3518,7 +3518,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const render = try self.font_grid.renderGlyph(
                 self.alloc,
                 font.sprite_index,
-                @intFromEnum(font.Sprite.overline),
+                @backingInt(font.Sprite.overline),
                 .{
                     .cell_width = 1,
                     .grid_metrics = self.grid_metrics,
@@ -3549,7 +3549,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const render = try self.font_grid.renderGlyph(
                 self.alloc,
                 font.sprite_index,
-                @intFromEnum(font.Sprite.strikethrough),
+                @backingInt(font.Sprite.strikethrough),
                 .{
                     .cell_width = 1,
                     .grid_metrics = self.grid_metrics,
@@ -3676,7 +3676,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :render self.font_grid.renderGlyph(
                         self.alloc,
                         font.sprite_index,
-                        @intFromEnum(sprite),
+                        @backingInt(sprite),
                         .{
                             .cell_width = if (wide) 2 else 1,
                             .grid_metrics = self.grid_metrics,
