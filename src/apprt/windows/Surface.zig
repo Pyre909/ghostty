@@ -1665,8 +1665,11 @@ pub const Surface = struct {
                     // macOS: it must not clear the selection, move the prompt
                     // cursor, or reach a program that reads the mouse. The
                     // button-up that may follow is dropped by mouseButton,
-                    // because the press was never recorded.
+                    // because the press was never recorded. The terminal
+                    // clicked is the one the activation gives the focus
+                    // (the frame's WM_SETFOCUS).
                     if (win32.GetActiveWindow() != self.window.hwnd) {
+                        self.window.setFocused(self);
                         return win32.MA_ACTIVATEANDEAT;
                     }
 

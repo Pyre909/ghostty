@@ -2053,6 +2053,34 @@ test "win32: a window is titled after its focused terminal" {
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("right"), caption(window, &buf));
 }
 
+test "win32: a click on an inactive window picks the terminal it focuses" {
+    // The click only activates the window, and the activation focuses the
+    // terminal clicked rather than the one that had the focus before.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ left, right });
+    window.focused = left;
+
+    // A left button press on the client area; the hidden frame is not the
+    // active window.
+    const lparam: win32.LPARAM = (@as(win32.LPARAM, win32.WM_LBUTTONDOWN) << 16) | win32.HTCLIENT;
+    try std.testing.expectEqual(
+        win32.MA_ACTIVATEANDEAT,
+        Surface.wndProc(right.hwnd, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), lparam),
+    );
+    try std.testing.expect(window.focused == right);
+}
+
 test "win32: closing a window takes every terminal in it at once" {
     // One request posts one teardown to the frame, which destroys the
     // frame and frees it and its terminals; a second request while it is
