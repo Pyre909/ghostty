@@ -965,9 +965,9 @@ pub const App = struct {
     }
 
     /// Forget `core_surface` as the parent of the windows it asked for: it
-    /// is closing. Called by `Surface.stopCore` while the address is still
-    /// that surface's, so that a surface created later at the same address
-    /// cannot pass for the parent.
+    /// is closing. Called by `Surface.detachCore`, the first step of every
+    /// teardown, while the address is still that surface's, so that a
+    /// surface created later at the same address cannot pass for the parent.
     pub fn forgetWindowParent(self: *App, core_surface: *CoreSurface) void {
         for (self.window_requests.items) |*parent| {
             const p = parent.* orelse continue;

@@ -872,9 +872,9 @@ pub const Surface = struct {
     /// `App.waitForThread` -- never directly inside a core frame, because
     /// the message is only ever posted. When a core frame or prompt is
     /// nonetheless beneath that loop (`App.canReenterCore`), the teardown is
-    /// deferred to `run` instead: its pump would tick, and waiting there
-    /// could wait on threads blocked behind the undrained mailbox. So is a
-    /// teardown dispatched by another surface's teardown
+    /// deferred instead (`destroy_deferred`): its pump would tick, and
+    /// waiting there could wait on threads blocked behind the undrained
+    /// mailbox. So is a teardown dispatched by another surface's teardown
     /// (`App.teardown_depth`), from the pump in its wait: it would nest a
     /// second wait inside the first, and with several windows closing at
     /// once each would nest inside the last.
@@ -3729,8 +3729,8 @@ test "win32: modal loops are counted per window and returned on destroy" {
 test "win32: a teardown dispatched inside another waits for it" {
     // A teardown pumps messages while it waits for its surface's threads
     // (App.waitForThread), so another window's WM_GHOSTTY_DESTROY can be
-    // dispatched inside it. That one is deferred to `run` while the first
-    // is still on the stack, and runs at once otherwise. A message-only
+    // dispatched inside it. That one is deferred while the first is still
+    // on the stack, and runs at once otherwise. A message-only
     // window stands in for the surface's: with no core surface, a teardown
     // that runs only destroys it.
     var app: App = undefined;
@@ -3870,10 +3870,11 @@ test "win32: a new window inherits only an existing working directory" {
 }
 
 test "win32: a closing surface leaves the core and its window requests" {
-    // detachCore is the first step of every teardown (stopCore). After it
-    // the core no longer routes to the surface, and a window it asked for
-    // has no parent, so a surface created later at the same address cannot
-    // pass for it.
+    // What detachCore does, the first step of every teardown. That stopCore
+    // calls it is not covered here: stopCore needs a live core surface.
+    // After it the core no longer routes to the surface, and a window it
+    // asked for has no parent, so a surface created later at the same
+    // address cannot pass for it.
     const CoreApp = @import("../../App.zig");
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
