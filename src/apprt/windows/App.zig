@@ -91,7 +91,7 @@ pub const App = struct {
     /// the window or split after its tick (`createRequested`).
     ///
     /// A parent is always live: a surface clears its own entries when its
-    /// teardown starts (`forgetParent`), before its address can be
+    /// teardown starts (`forgetClosing`), before its address can be
     /// reused.
     requests: std.ArrayListUnmanaged(Request),
 
@@ -170,8 +170,8 @@ pub const App = struct {
         return false;
     }
 
-    /// A window or a split the core asked for and `run` has not created yet
-    /// (`requests`).
+    /// A window, a split or a focus move the core asked for and `run` has
+    /// not carried out yet (`requests`).
     pub const Request = union(enum) {
         /// A new window, from the surface that asked, if any.
         window: ?*CoreSurface,
@@ -182,7 +182,16 @@ pub const App = struct {
             direction: apprt.action.SplitDirection,
         },
 
-        /// A split whose parent began to close first: it has nowhere to go.
+        /// A `goto_split` asked for after a request still waiting here, so
+        /// that it moves within the windows and splits made before it
+        /// (`gotoSplit`).
+        goto: struct {
+            from: *CoreSurface,
+            to: apprt.action.GotoSplit,
+        },
+
+        /// A split or a focus move whose surface began to close first: it
+        /// has nowhere to go.
         dropped,
     };
 
@@ -445,8 +454,10 @@ pub const App = struct {
             // And IME work that could not run where it arose (Surface.syncIme).
             self.syncDeferredIme();
 
-            // And the windows and splits the core asked for (`requests`).
+            // And the windows and splits the core asked for (`requests`),
+            // and a focus move one asked for outside a key callback.
             self.createRequested();
+            self.applyPendingFocus();
         }
     }
 
@@ -713,6 +724,7 @@ pub const App = struct {
 
             .new_window => self.requestWindow(target),
             .new_split => self.requestSplit(target, value),
+            .goto_split => self.gotoSplit(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1035,12 +1047,13 @@ pub const App = struct {
         return true;
     }
 
-    /// Forget `core_surface` as the parent of the windows it asked for, and
-    /// drop the splits it asked for: it is closing. Called by
-    /// `Surface.detachCore`, the first step of every teardown, while the
-    /// address is still that surface's, so that a surface created later at
-    /// the same address cannot pass for the parent.
-    pub fn forgetParent(self: *App, core_surface: *CoreSurface) void {
+    /// Forget `core_surface`, which is closing, wherever something still
+    /// waits on it: windows it asked for lose it as their parent, splits and
+    /// focus moves it asked for are dropped, and so is a focus move to it.
+    /// Called by `Surface.detachCore`, the first step of every teardown,
+    /// while the address is still that surface's, so that a surface created
+    /// later at the same address cannot pass for it.
+    pub fn forgetClosing(self: *App, core_surface: *CoreSurface) void {
         for (self.requests.items) |*request| switch (request.*) {
             .window => |*parent| {
                 if (parent.* == core_surface) parent.* = null;
@@ -1048,13 +1061,73 @@ pub const App = struct {
             .split => |split| {
                 if (split.parent == core_surface) request.* = .dropped;
             },
+            .goto => |goto| {
+                if (goto.from == core_surface) request.* = .dropped;
+            },
             .dropped => {},
         };
+        for (self.windows.items) |window| {
+            const surface = window.pending_focus orelse continue;
+            if (&surface.core_surface == core_surface) window.pending_focus = null;
+        }
     }
 
-    /// Create the windows and splits in `requests`, oldest first.
-    /// Called by `run`, where `canReenterCore` holds and no teardown is
-    /// running.
+    /// `.goto_split`: whether there is a terminal to go to from the one the
+    /// action is performed on (`Window.goto`). `false` lets the key through
+    /// to the terminal, as the default bindings are performable. The focus
+    /// moves once the core's key callback has returned
+    /// (`Window.pending_focus`).
+    ///
+    /// After a window or split still waiting in `requests`, as when a binding
+    /// chains `goto_split` after `new_split`, the move waits behind it and is
+    /// made by `createRequested`, so that it goes within the split made
+    /// first. The action then reports it performed without knowing yet.
+    fn gotoSplit(self: *App, target: apprt.Target, to: apprt.action.GotoSplit) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        if (self.requests.items.len > 0) {
+            self.requests.append(self.core_app.alloc, .{ .goto = .{
+                .from = from,
+                .to = to,
+            } }) catch |err| {
+                log.warn("cannot record a split to go to err={}", .{err});
+                return false;
+            };
+            return true;
+        }
+
+        const window = from.rt_surface.window;
+        const surface = window.goto(from.rt_surface, to) orelse return false;
+
+        // One being torn down, as its window closes around it, takes no
+        // focus: the key reaches the terminal instead.
+        if (surface.liveCore() == null) return false;
+        window.pending_focus = surface;
+        return true;
+    }
+
+    /// Give each window the focus move a `goto_split` chose in it, if any
+    /// (`Window.pending_focus`). Called by a terminal's key handler once the
+    /// core's key callback has returned (`Surface.handleMessage`), and by
+    /// `run` for an action performed from anywhere else.
+    pub fn applyPendingFocus(self: *App) void {
+        // By index, reading the length each time round: giving the focus
+        // runs window procedures.
+        var i: usize = 0;
+        while (i < self.windows.items.len) : (i += 1) {
+            const window = self.windows.items[i];
+            const surface = window.pending_focus orelse continue;
+            window.pending_focus = null;
+            // Still live: a teardown would have cleared it (`forgetClosing`).
+            window.giveFocus(surface);
+        }
+    }
+
+    /// Create the windows and splits in `requests`, and make the focus moves
+    /// queued behind them, oldest first. Called by `run`, where
+    /// `canReenterCore` holds and no teardown is running.
     fn createRequested(self: *App) void {
         // A window opened now would only be torn down again by `terminate`.
         if (self.quit) return;
@@ -1086,9 +1159,24 @@ pub const App = struct {
                         );
                     },
                 },
+                .goto => |goto| gotoQueued(goto.from, goto.to),
                 .dropped => {},
             }
         }
+    }
+
+    /// A focus move `gotoSplit` queued behind a window or split, made now
+    /// that those exist. It starts from the window's focused terminal, as
+    /// GTK's does after a split (`newSplit` in
+    /// src/apprt/gtk/class/split_tree.zig makes the new terminal its last
+    /// focused one): after `new_split` that is the new terminal.
+    fn gotoQueued(from: *CoreSurface, to: apprt.action.GotoSplit) void {
+        const window = from.rt_surface.window;
+        const start = window.focused orelse from.rt_surface;
+        const surface = window.goto(start, to) orelse return;
+        if (surface.liveCore() == null) return;
+        // No core frame is on the stack here, unlike in gotoSplit.
+        window.giveFocus(surface);
     }
 
     /// What a new terminal takes from `parent`, the surface that asked for
@@ -1739,7 +1827,7 @@ test "win32: a prompt belongs to a top-level window" {
 /// For tests: an app with only what the frame and terminal window
 /// procedures read when nothing has a core surface. `core_app.alloc` must
 /// be set; the caller registers the classes (`registerClasses`).
-fn testApp(app: *App, core_app: *CoreApp) void {
+pub fn testApp(app: *App, core_app: *CoreApp) void {
     app.core_app = core_app;
     app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
     app.get_dpi_for_window = null;
@@ -1750,6 +1838,8 @@ fn testApp(app: *App, core_app: *CoreApp) void {
     app.teardown_depth = 0;
     app.surfaces = .empty;
     app.windows = .empty;
+    app.requests = .empty;
+    app.quit = false;
 }
 
 /// For tests: a hidden frame of the real class, owned by `app` as one
@@ -1763,6 +1853,7 @@ fn testFrame(app: *App) !*Window {
         .hwnd = undefined,
         .tree = .empty,
         .focused = null,
+        .pending_focus = null,
         .maximized = false,
         .modal_loops = .{},
         .prompt_disabled = false,
@@ -1800,6 +1891,8 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.app = app;
     surface.window = window;
     surface.core_state = .none;
+    // Only the way back from the core surface: actions name it.
+    surface.core_surface.rt_surface = surface;
     surface.title = null;
     surface.ime = .{};
     surface.closing = false;
@@ -1835,6 +1928,7 @@ fn testCleanup(app: *App) void {
     }
     app.surfaces.deinit(alloc);
     app.windows.deinit(alloc);
+    app.requests.deinit(alloc);
 }
 
 fn clientRect(hwnd: win32.HWND) !win32.RECT {
@@ -1902,12 +1996,22 @@ fn testCaption(window: *const Window, buf: []u16) []const u16 {
 /// For tests: `panes` side by side, in this order, as splitting each one
 /// off the last to the right puts them.
 fn testRow(alloc: std.mem.Allocator, panes: []const *Surface) !Window.Tree {
+    return testLine(alloc, panes, .right);
+}
+
+/// For tests: `panes` in a line, in this order, as splitting each one off
+/// the last in `where` puts them.
+fn testLine(
+    alloc: std.mem.Allocator,
+    panes: []const *Surface,
+    where: Window.Tree.Split.Direction,
+) !Window.Tree {
     var tree: Window.Tree = try .init(alloc, panes[0]);
     errdefer tree.deinit();
     for (panes[0 .. panes.len - 1], panes[1..]) |last, pane| {
         var single: Window.Tree = try .init(alloc, pane);
         defer single.deinit();
-        const next = try tree.split(alloc, tree.locate(last).?, .right, 0.5, &single);
+        const next = try tree.split(alloc, tree.locate(last).?, where, 0.5, &single);
         tree.deinit();
         tree = next;
     }
@@ -2021,6 +2125,214 @@ test "win32: a closing terminal hands its place, and the focus if it had it" {
     try std.testing.expect(d.destroy());
     try std.testing.expectEqual(0, app.surfaces.items.len);
     try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+test "win32: goto_split finds the terminal it names" {
+    // Three in a row and three in a column, so that going the wrong way
+    // finds another terminal: with two, a search by direction wraps around
+    // to the same one either way. The real classes and window procedures,
+    // with no core surfaces; the windows stay hidden.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // a | b | c
+    const row = try testFrame(&app);
+    const a = try testPane(&app, row);
+    const b = try testPane(&app, row);
+    const c = try testPane(&app, row);
+    row.tree = try testRow(alloc, &.{ a, b, c });
+    try std.testing.expect(row.goto(b, .left) == a);
+    try std.testing.expect(row.goto(b, .right) == c);
+
+    // In order, wrapping around.
+    try std.testing.expect(row.goto(a, .next) == b);
+    try std.testing.expect(row.goto(c, .next) == a);
+    try std.testing.expect(row.goto(a, .previous) == c);
+    try std.testing.expect(row.goto(b, .previous) == a);
+
+    // x over y over z
+    const column = try testFrame(&app);
+    const x = try testPane(&app, column);
+    const y = try testPane(&app, column);
+    const z = try testPane(&app, column);
+    column.tree = try testLine(alloc, &.{ x, y, z }, .down);
+    try std.testing.expect(column.goto(y, .up) == x);
+    try std.testing.expect(column.goto(y, .down) == z);
+
+    // A window with one terminal has nowhere to go.
+    const alone = try testFrame(&app);
+    const only = try testPane(&app, alone);
+    alone.tree = try .init(alloc, only);
+    try std.testing.expect(alone.goto(only, .next) == null);
+}
+
+test "win32: goto_split answers at once and moves the focus after the key" {
+    // The action says whether there is a split to go to, so that a key
+    // with nowhere to go reaches the terminal, but the focus moves only
+    // once the core's key callback has returned (`applyPendingFocus`). A
+    // target that starts closing first is forgotten, and one already
+    // closing is refused.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const alone = try testFrame(&app);
+    const only = try testPane(&app, alone);
+    alone.tree = try .init(alloc, only);
+    try std.testing.expect(!try app.performAction(.{ .surface = &only.core_surface }, .goto_split, .next));
+    try std.testing.expect(alone.pending_focus == null);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.focused = a;
+
+    // Already closing: refused.
+    b.core_state = .stopping;
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
+    try std.testing.expect(window.pending_focus == null);
+
+    // Live; no core call is made on it. Back to `.none` before the
+    // teardown at the end, which would stop a live core.
+    b.core_state = .live;
+    defer b.core_state = .none;
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
+    try std.testing.expect(window.focused == a);
+    app.forgetClosing(&b.core_surface);
+    app.applyPendingFocus();
+    try std.testing.expect(window.focused == a);
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
+    try std.testing.expect(window.focused == a);
+    app.applyPendingFocus();
+    try std.testing.expect(window.focused == b);
+}
+
+test "win32: goto_split moves the focus in every window it is performed in" {
+    // An `all:` binding performs the action on every surface, so each
+    // window keeps its own move until the key callback has returned
+    // (`Window.pending_focus`): one slot for the app would keep only the
+    // last window's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const first = try testFrame(&app);
+    const a = try testPane(&app, first);
+    const b = try testPane(&app, first);
+    first.tree = try testRow(alloc, &.{ a, b });
+    first.focused = a;
+
+    const second = try testFrame(&app);
+    const c = try testPane(&app, second);
+    const d = try testPane(&app, second);
+    second.tree = try testRow(alloc, &.{ c, d });
+    second.focused = c;
+
+    // Live; no core call is made on them. Back to `.none` before the
+    // teardown at the end, which would stop a live core.
+    b.core_state = .live;
+    defer b.core_state = .none;
+    d.core_state = .live;
+    defer d.core_state = .none;
+
+    for ([_]*Surface{ a, c }) |from| {
+        try std.testing.expect(try app.performAction(.{ .surface = &from.core_surface }, .goto_split, .right));
+    }
+    app.applyPendingFocus();
+    try std.testing.expect(first.focused == b);
+    try std.testing.expect(second.focused == d);
+}
+
+test "win32: a goto_split after a waiting split waits behind it" {
+    // A binding that chains goto_split after new_split: the split is only
+    // recorded (`requestSplit`), so the move is recorded behind it, to be
+    // made once the split exists (`gotoQueued`), not worked out from the
+    // window as it was before. A surface that starts closing first takes
+    // both with it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.focused = a;
+    b.core_state = .live;
+    defer b.core_state = .none;
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .new_split, .down));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
+    try std.testing.expect(window.pending_focus == null);
+    try std.testing.expect(window.focused == a);
+
+    const want = [_]App.Request{
+        .{ .split = .{ .parent = &a.core_surface, .direction = .down } },
+        .{ .goto = .{ .from = &a.core_surface, .to = .right } },
+    };
+    try std.testing.expectEqual(want.len, app.requests.items.len);
+    for (want, app.requests.items) |w, got| {
+        try std.testing.expect(std.meta.eql(w, got));
+    }
+
+    app.forgetClosing(&a.core_surface);
+    for (app.requests.items) |request| try std.testing.expect(request == .dropped);
+}
+
+test "win32: a queued goto_split starts from the window's focused terminal" {
+    // What `createRequested` does with a move queued behind a split: by
+    // then the split's new terminal has the focus, and the move starts
+    // there, as GTK's does, not from the terminal the binding was
+    // performed on.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // a | b | c, with the focus on b as a split beside a would leave it.
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b, c });
+    window.focused = b;
+    b.core_state = .live;
+    defer b.core_state = .none;
+    c.core_state = .live;
+    defer c.core_state = .none;
+
+    try app.requests.append(alloc, .{ .goto = .{ .from = &a.core_surface, .to = .right } });
+    app.createRequested();
+    try std.testing.expect(window.focused == c);
+    try std.testing.expectEqual(0, app.requests.items.len);
 }
 
 test "win32: a window is titled after its focused terminal" {
@@ -2195,7 +2507,7 @@ test "win32: new windows and splits are recorded where they are asked for" {
     // A `new_window` or `new_split` binding performs the action from inside
     // the core's key callback, so the action only records the request;
     // `run` creates it after its tick. A surface that starts closing in
-    // between clears itself from its requests (`forgetParent`, called
+    // between clears itself from its requests (`forgetClosing`, called
     // by Surface.stopCore): a window it asked for has no parent, and a split
     // beside it is dropped, so a surface created later at the same address
     // is not taken for the parent.
@@ -2204,10 +2516,8 @@ test "win32: new windows and splits are recorded where they are asked for" {
     core_app.alloc = alloc;
 
     var app: App = undefined;
-    app.core_app = &core_app;
-    app.requests = .empty;
+    testApp(&app, &core_app);
     defer app.requests.deinit(alloc);
-    app.surfaces = .empty;
 
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
@@ -2226,7 +2536,7 @@ test "win32: new windows and splits are recorded where they are asked for" {
     try std.testing.expect(!try app.performAction(.app, .new_split, .left));
     try std.testing.expectEqual(0, app.surfaces.items.len);
 
-    app.forgetParent(closed);
+    app.forgetClosing(closed);
 
     const want = [_]App.Request{
         .{ .window = open },

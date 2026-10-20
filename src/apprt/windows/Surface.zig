@@ -780,8 +780,8 @@ pub const Surface = struct {
     ///   1. `detachCore` first: `deleteSurface`, so the ticks in steps 2-4
     ///      drop any message still addressed to this surface instead of
     ///      calling into it (`CoreApp.hasSurface`), which also starts the quit
-    ///      timer when this was the last surface; and the window requests it
-    ///      made forget it (`App.forgetParent`).
+    ///      timer when this was the last surface; and what still waits on it
+    ///      forgets it (`App.forgetClosing`).
     ///   2. Stop the search thread, if any, and wait for it as in step 3,
     ///      while the render thread is still draining its mailbox.
     ///      `CoreSurface.deinit` would do this first too, but with an
@@ -879,12 +879,12 @@ pub const Surface = struct {
 
     /// The first step of `stopCore`, apart so that it can be tested: the
     /// core stops routing to this surface (`deleteSurface`, which also
-    /// starts the quit timer when it was the last one), and a window it
-    /// asked for and `run` has not created yet loses it as its parent while
-    /// the address is still this surface's (`App.forgetParent`).
+    /// starts the quit timer when it was the last one), and whatever still
+    /// waits on it forgets it while the address is still this surface's
+    /// (`App.forgetClosing`).
     fn detachCore(self: *Surface) void {
         self.app.core_app.deleteSurface(self);
-        self.app.forgetParent(&self.core_surface);
+        self.app.forgetClosing(&self.core_surface);
     }
 
     /// Ask for this window to be torn down from a message loop.
@@ -1471,7 +1471,12 @@ pub const Surface = struct {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 }
 
-                const effect = self.keyEvent(core_surface, msg, wparam, lparam, mods) catch |err| {
+                const result = self.keyEvent(core_surface, msg, wparam, lparam, mods);
+                // A focus move a binding chose (goto_split), now that the
+                // core's key callback has returned and before the next key
+                // is read (`Window.pending_focus`).
+                self.app.applyPendingFocus();
+                const effect = result catch |err| {
                     log.warn("key callback failed err={}", .{err});
                     return 0;
                 };
@@ -3655,12 +3660,12 @@ test "win32: a closing surface leaves the core and its window requests" {
     const CoreApp = @import("../../App.zig");
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
     core_app.surfaces = .empty;
     defer core_app.surfaces.deinit(alloc);
 
     var app: App = undefined;
-    app.core_app = &core_app;
-    app.requests = .empty;
+    @import("App.zig").testApp(&app, &core_app);
     defer app.requests.deinit(alloc);
 
     // Static because the struct embeds a whole CoreSurface.

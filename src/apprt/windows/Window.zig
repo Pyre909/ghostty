@@ -59,6 +59,20 @@ tree: Tree,
 /// empty.
 focused: ?*Surface,
 
+/// The terminal a `goto_split` binding chose to give the focus to, not yet
+/// given it. The action runs inside the core's key callback, where moving
+/// the focus would send WM_KILLFOCUS into the surface whose callback is on
+/// the stack, and losing the focus makes the core send that surface a key
+/// release through its key callback (`CoreSurface.focusCallback`). So the
+/// terminal's key handler gives it as soon as the callback has returned,
+/// before the next key is read, so that a second press or the text typed
+/// after it goes to the new terminal (`App.applyPendingFocus`). `App.run`
+/// applies it too, but only once it has drained the queue, too late for
+/// keys pressed in a burst. One per window, as an `all:` binding moves
+/// the focus in each. Live when set; cleared when it begins to close
+/// (`App.forgetClosing`).
+pending_focus: ?*Surface,
+
 /// A close of the whole window is being asked about, or was agreed to and
 /// its teardown posted (`requestClose`). Stops a second WM_CLOSE or
 /// close_window from asking or posting twice. Cleared when the user
@@ -94,6 +108,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .hwnd = undefined,
         .tree = .empty,
         .focused = null,
+        .pending_focus = null,
         .maximized = false,
         .modal_loops = .{},
         .prompt_disabled = false,
@@ -406,7 +421,7 @@ pub fn split(
 ) !*Surface {
     const alloc = self.app.core_app.alloc;
     // A parent leaves the tree only when it closes, and the core's request
-    // is dropped then (`App.forgetParent`).
+    // is dropped then (`App.forgetClosing`).
     const handle = self.tree.locate(parent) orelse return error.SplitParentGone;
     const where: Tree.Split.Direction = switch (direction) {
         .right => .right,
@@ -445,6 +460,31 @@ pub fn showPane(self: *Window, surface: *Surface) void {
     self.relayout();
     _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
     self.giveFocus(surface);
+}
+
+/// The terminal `to` names from `from`, for `goto_split`, as GTK goes
+/// (`gotoSplit` in src/apprt/gtk/class/application.zig): previous and next
+/// wrap around, and a direction is the nearest terminal that way
+/// (`SplitTree.goto`). Null when there is none but `from`.
+pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface {
+    const handle = self.tree.locate(from) orelse return null;
+    const found = self.tree.goto(self.app.core_app.alloc, handle, switch (to) {
+        .previous => .previous_wrapped,
+        .next => .next_wrapped,
+        .up => .{ .spatial = .up },
+        .down => .{ .spatial = .down },
+        .left => .{ .spatial = .left },
+        .right => .{ .spatial = .right },
+    }) catch |err| switch (err) {
+        // Only the search by direction allocates, and only a little.
+        error.OutOfMemory => {
+            log.warn("cannot find the split to go to err={}", .{err});
+            return null;
+        },
+    };
+    const target = found orelse return null;
+    if (target == handle) return null;
+    return self.tree.nodes[target.idx()].leaf;
 }
 
 /// Make `surface` the window's focused terminal and give it the keyboard

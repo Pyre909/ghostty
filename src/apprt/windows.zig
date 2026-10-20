@@ -34,18 +34,22 @@
 //!
 //! ## Windows
 //!
-//! Each window holds one surface. `.new_window` is recorded, and the window
-//! is created by `App.run` once the core frame that asked has returned
-//! (`App.window_requests`). The process quits when its last window closes,
-//! whatever `quit-after-last-window-closed` says: with no window left there
-//! is nothing to open another from (`App.setQuitTimer`).
+//! A window holds its terminals in a split tree, laid out over its client
+//! area (`Window`). `.new_window` and `.new_split` are recorded, and the
+//! window or split is created by `App.run` once the core frame that asked
+//! has returned (`App.requests`); `.goto_split` moves the focus once the
+//! core's key callback has returned (`Window.pending_focus`), or after
+//! such a window or split when it follows one. The process quits when
+//! its last window closes, whatever `quit-after-last-window-closed` says:
+//! with no window left there is nothing to open another from
+//! (`App.setQuitTimer`).
 //!
 //! ## What is still missing
 //!
-//! Not implemented: tabs and splits, a context menu,
-//! link previews and precision-touchpad scrolling. Without a menu, a right
-//! click with the default `right-click-action` only selects the word or
-//! link under the pointer.
+//! Not implemented: tabs, resizing, equalizing and zooming splits, a
+//! context menu, link previews and precision-touchpad scrolling. Without a
+//! menu, a right click with the default `right-click-action` only selects
+//! the word or link under the pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for `.mouse_over_link` and every other action it does not
 //! name; this runtime never claims an action it did not carry out.
