@@ -2480,26 +2480,48 @@ test "init frees the env when it fails" {
     var config = try configpkg.Config.default(testing.allocator);
     defer config.deinit();
 
-    // Fail the first allocation init makes from the env so that it
-    // returns an error after the env is in its hands.
-    var failing: testing.FailingAllocator = .init(testing.allocator, .{});
-    var env: EnvMap = .init(failing.allocator());
-    {
-        errdefer env.deinit();
-        try env.put("HOME", "/home/ghostty");
-        try env.put("SHELL", "/bin/sh");
-    }
-    failing.fail_index = failing.alloc_index;
+    const Run = struct {
+        fn initWithEnv(alloc: Allocator, cfg: *const configpkg.Config) !void {
+            var env: EnvMap = .init(alloc);
+            {
+                errdefer env.deinit();
+                try env.put("HOME", "/home/ghostty");
+                try env.put("SHELL", "/bin/sh");
+            }
 
-    // The env is not freed here: testing.allocator reports it as a leak
-    // unless init freed it.
-    try testing.expectError(error.OutOfMemory, init(testing.allocator, .{
-        .env = env,
-        .resources_dir = null,
-        .term = "xterm-ghostty",
-        .rt_pre_exec_info = .init(&config),
-        .rt_post_fork_info = .init(&config),
-    }));
+            // The env is not freed here once init has it: the failing
+            // allocator reports it as a leak unless init freed it.
+            var exec = try init(alloc, .{
+                .env = env,
+                .resources_dir = null,
+                .term = "xterm-ghostty",
+                .rt_pre_exec_info = .init(cfg),
+                .rt_post_fork_info = .init(cfg),
+            });
+            exec.deinit();
+        }
+    };
+
+    // Fail each allocation in turn, while building the env and inside init,
+    // as std.testing.checkAllAllocationFailures does. That function cannot
+    // be used directly: init deliberately falls back to a basic shell when
+    // building the command fails, so some runs succeed despite the failure.
+    // Every run must still free all it allocated.
+    const count = count: {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        try Run.initWithEnv(failing.allocator(), &config);
+        break :count failing.alloc_index;
+    };
+    for (0..count) |fail_index| {
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        Run.initWithEnv(failing.allocator(), &config) catch |err| switch (err) {
+            error.OutOfMemory => {},
+            else => return err,
+        };
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "read thread windows: quit byte reaches the reader" {

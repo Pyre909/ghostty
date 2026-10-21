@@ -69,6 +69,7 @@ bennettp123
 benodiwal
 bernsno
 beryesa
+binaryfire
 bitigchi
 bkircher
 bleikurr
@@ -114,6 +115,7 @@ diego-moment
 diegoarmstrong
 dkinzler
 dmehala
+dmkenney
 dmunozv04
 dobbylee
 dolzenko
@@ -363,6 +365,7 @@ tasselx
 tbrundige
 tdgroot
 tdslot
+thapakrish
 thirstycrow
 -thomas-trijindev No human in the loop
 thomasfedb

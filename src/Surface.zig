@@ -572,10 +572,11 @@ pub fn init(
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
     var renderer_impl = renderer: {
-        // Renderer.init takes ownership of the config only on success; the
-        // errdefer below owns everything once it has.
+        // Renderer.init takes ownership of the config only on success, after
+        // which the errdefer below frees it, so this errdefer must end here.
         var renderer_config = try Renderer.DerivedConfig.init(alloc, config);
         errdefer renderer_config.deinit();
+
         break :renderer try Renderer.init(alloc, .{
             .device = render_device,
             .config = renderer_config,
@@ -703,8 +704,7 @@ pub fn init(
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
         errdefer io_mailbox.deinit(alloc);
 
-        // Termio.init takes ownership only on success, like the
-        // backend and mailbox above.
+        // Termio.init takes ownership of the config only on success.
         var io_config = try termio.Termio.DerivedConfig.init(alloc, config);
         errdefer io_config.deinit();
 
