@@ -214,6 +214,14 @@ pub const App = struct {
         /// (`reloadConfig`).
         reload,
 
+        /// Make the window of this surface cover its monitor, or put it
+        /// back (`requestFullscreen`).
+        fullscreen: *CoreSurface,
+
+        /// Maximize the window of this surface, or restore it
+        /// (`requestMaximize`).
+        maximize: *CoreSurface,
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -789,7 +797,8 @@ pub const App = struct {
             .close_window => self.closeWindow(target),
             .close_tab => self.closeTab(target, value),
             .present_terminal => presentTerminal(target),
-            .toggle_maximize => toggleMaximize(target),
+            .toggle_maximize => self.requestMaximize(target),
+            .toggle_fullscreen => self.requestFullscreen(target),
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
@@ -911,17 +920,6 @@ pub const App = struct {
             .surface => |v| stored: {
                 v.rt_surface.initial_size = value;
                 break :stored true;
-            },
-        };
-    }
-
-    fn toggleMaximize(target: apprt.Target) bool {
-        return switch (target) {
-            .app => false,
-            .surface => |v| maximize: {
-                const window = v.rt_surface.window;
-                Window.toggleMaximize(window.hwnd, &window.maximized);
-                break :maximize true;
             },
         };
     }
@@ -1247,7 +1245,7 @@ pub const App = struct {
             .resize => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
-            .equalize => |from| {
+            .equalize, .fullscreen, .maximize => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .reload, .dropped => {},
@@ -1348,6 +1346,38 @@ pub const App = struct {
         return true;
     }
 
+    /// `.toggle_maximize`: recorded for `run`, as `toggle_fullscreen` is:
+    /// maximizing lays the terminals out again, and a chain of the two
+    /// keeps its order. Not made on a window that covers its monitor then.
+    fn requestMaximize(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .maximize = from }) catch |err| {
+            log.warn("cannot record toggling maximized err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.toggle_fullscreen`: recorded for `run`, as `resizeSplit` is, since
+    /// covering the monitor lays the terminals out again
+    /// (`Window.toggleFullscreen`). Windows has one kind of fullscreen; the
+    /// macOS-only kinds the value can name (`macos-non-native-fullscreen`)
+    /// are taken as it.
+    fn requestFullscreen(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .fullscreen = from }) catch |err| {
+            log.warn("cannot record toggling fullscreen err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     /// Give each window the focus move a `goto_split` chose in it, if any
     /// (`Window.pending_focus`). Called by a terminal's key handler once the
     /// core's key callback has returned (`Surface.handleMessage`), and by
@@ -1407,6 +1437,13 @@ pub const App = struct {
                 },
                 .equalize => |from| from.rt_surface.window.equalize(),
                 .reload => self.reloadQueued(),
+                .fullscreen => |from| from.rt_surface.window.toggleFullscreen(),
+                // A window covering its monitor is left as it is: maximized,
+                // it would have the work area instead.
+                .maximize => |from| {
+                    const window = from.rt_surface.window;
+                    if (window.fullscreen == null) window.toggleMaximize();
+                },
                 .dropped => {},
             }
         }
@@ -2137,8 +2174,8 @@ fn testFrame(app: *App) !*Window {
         .tree = .empty,
         .focused = null,
         .pending_focus = null,
-        .maximized = false,
         .dark_frame = false,
+        .fullscreen = null,
         .modal_loops = .{},
         .prompt_disabled = false,
         .closing = false,
@@ -2167,7 +2204,9 @@ fn testFrame(app: *App) !*Window {
 
 /// For tests: a hidden terminal window of the real class in `window`,
 /// owned by `app`, with no core surface: a teardown only destroys and
-/// frees it. The caller puts it in the window's tree.
+/// frees it. The caller puts it in the window's tree. A test that
+/// activates its frame hands it the focus and takes it back at teardown,
+/// so it has what WM_SETFOCUS and WM_KILLFOCUS read.
 fn testPane(app: *App, window: *Window) !*Surface {
     const alloc = app.core_app.alloc;
     try app.surfaces.ensureUnusedCapacity(alloc, 1);
@@ -2182,6 +2221,8 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.closing = false;
     surface.destroy_deferred = false;
     surface.focused = false;
+    surface.mouse = .init();
+    surface.preedit = .none;
     _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
@@ -2218,6 +2259,12 @@ fn testCleanup(app: *App) void {
 fn clientRect(hwnd: win32.HWND) !win32.RECT {
     var rect: win32.RECT = undefined;
     if (!win32.GetClientRect(hwnd, &rect).toBool()) return error.TestUnexpectedResult;
+    return rect;
+}
+
+fn windowRect(hwnd: win32.HWND) !win32.RECT {
+    var rect: win32.RECT = undefined;
+    if (!win32.GetWindowRect(hwnd, &rect).toBool()) return error.TestUnexpectedResult;
     return rect;
 }
 
@@ -3326,4 +3373,167 @@ test "win32: a new configuration re-themes every title bar" {
         try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
         try std.testing.expectEqual(theme == .dark, window.dark_frame);
     }
+}
+
+test "win32: toggle_fullscreen waits for run, covers the monitor and comes back" {
+    // Covering the monitor lays the terminals out again, whose WM_SIZE
+    // would re-enter the core inside its key callback, so the toggle is
+    // recorded and made by createRequested. A surface that starts closing
+    // takes its own with it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const placed = try windowRect(window.hwnd);
+
+    const monitor = win32.MonitorFromWindow(window.hwnd, win32.MONITOR_DEFAULTTONEAREST) orelse
+        return error.TestUnexpectedResult;
+    var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
+    info.cbSize = @sizeOf(win32.MONITORINFO);
+    try std.testing.expect(win32.GetMonitorInfoW(monitor, &info).toBool());
+
+    // Recorded, not made.
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    try std.testing.expectEqual(placed, try windowRect(window.hwnd));
+    try std.testing.expectEqual(1, app.requests.items.len);
+
+    // Made: the frame covers the monitor with no caption, and the terminal
+    // fills it.
+    app.createRequested();
+    try std.testing.expectEqual(info.rcMonitor, try windowRect(window.hwnd));
+    const caption: isize = win32.WS_CAPTION;
+    try std.testing.expectEqual(0, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & caption);
+    try std.testing.expectEqual(try clientRect(window.hwnd), try clientRect(pane.hwnd));
+
+    // Not maximized while it covers the monitor.
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_maximize, {}));
+    app.createRequested();
+    try std.testing.expectEqual(info.rcMonitor, try windowRect(window.hwnd));
+    try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
+
+    // Nor by Win+Up's maximize, which would give it the work area.
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, win32.SC_MAXIMIZE, 0);
+    try std.testing.expectEqual(info.rcMonitor, try windowRect(window.hwnd));
+    try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
+
+    // A change of scale keeps it covering the monitor, not the scaled rect
+    // Windows suggests.
+    var suggested = info.rcMonitor;
+    suggested.right += 600;
+    suggested.bottom += 300;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_DPICHANGED, 144 << 16 | 144, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expectEqual(info.rcMonitor, try windowRect(window.hwnd));
+
+    // And back, with its frame, where it was: at its rect, not its
+    // placement's, which a window snapped to a side of the screen keeps
+    // from before the snap.
+    window.fullscreen.?.placement.rcNormalPosition.left += 40;
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.createRequested();
+    try std.testing.expectEqual(placed, try windowRect(window.hwnd));
+    try std.testing.expectEqual(caption, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & caption);
+    try std.testing.expectEqual(null, window.fullscreen);
+
+    // Unless no monitor shows that rect any more, as when its monitor is
+    // unplugged: then by its placement, which comes back on a monitor.
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.createRequested();
+    window.fullscreen.?.rect = .{ .left = -40000, .top = -40000, .right = -39000, .bottom = -39500 };
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.createRequested();
+    try std.testing.expectEqual(placed, try windowRect(window.hwnd));
+
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.forgetClosing(&pane.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+}
+
+test "win32: a maximized window comes back from fullscreen maximized" {
+    // From maximized, a window that covers its monitor keeps WS_MAXIMIZE:
+    // Win+Down's restore leaves fullscreen rather than restoring it with no
+    // frame, Win+Up's maximize does nothing, and a chained
+    // toggle_fullscreen then toggle_maximize keep their order.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_MAXIMIZE);
+
+    // Maximized as the caption button does it, not by toggle_maximize,
+    // which goes by the window: it restores it, then maximizes it again.
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_maximize, {}));
+    app.createRequested();
+    try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_maximize, {}));
+    app.createRequested();
+    try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+    const maximized = try windowRect(window.hwnd);
+    const caption: isize = win32.WS_CAPTION;
+
+    for ([_]win32.WPARAM{ win32.SC_MAXIMIZE, win32.SC_RESTORE }) |command| {
+        try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+        app.createRequested();
+        try std.testing.expect(window.fullscreen != null);
+        const covering = try windowRect(window.hwnd);
+
+        _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, win32.SC_MAXIMIZE, 0);
+        try std.testing.expectEqual(covering, try windowRect(window.hwnd));
+        _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, command, 0);
+        if (command == win32.SC_MAXIMIZE) {
+            // Still covering; leave by the toggle.
+            try std.testing.expectEqual(covering, try windowRect(window.hwnd));
+            try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+            app.createRequested();
+        }
+        try std.testing.expectEqual(null, window.fullscreen);
+        try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+        try std.testing.expectEqual(maximized, try windowRect(window.hwnd));
+        try std.testing.expectEqual(caption, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & caption);
+    }
+
+    // Minimized while it covers the monitor, then restored, as from the
+    // taskbar: it comes back covering it, still fullscreen, though it was
+    // maximized.
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.createRequested();
+    const covering = try windowRect(window.hwnd);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMINNOACTIVE);
+    try std.testing.expect(win32.IsIconic(window.hwnd).toBool());
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, win32.SC_RESTORE, 0);
+    try std.testing.expect(!win32.IsIconic(window.hwnd).toBool());
+    try std.testing.expect(window.fullscreen != null);
+    try std.testing.expectEqual(covering, try windowRect(window.hwnd));
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.createRequested();
+    try std.testing.expectEqual(maximized, try windowRect(window.hwnd));
+
+    // Covering the monitor, then a chain of toggle_fullscreen and
+    // toggle_maximize: out of fullscreen first, then restored from
+    // maximized, in that order.
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    app.createRequested();
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_maximize, {}));
+    app.createRequested();
+    try std.testing.expectEqual(null, window.fullscreen);
+    try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
 }

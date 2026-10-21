@@ -43,6 +43,18 @@ pub const class_name = "GhosttyWindowClass";
 /// nothing; see the ownership note above.
 pub const Tree = SplitTree(Surface);
 
+/// What `toggleFullscreen` puts back.
+pub const Restore = struct {
+    /// For a maximized window, which comes back maximized with its restore
+    /// rect, and for one whose rect no monitor shows any more.
+    placement: win32.WINDOWPLACEMENT,
+
+    /// For any other, which comes back where it was. A window snapped to a
+    /// side of the screen is not at its placement's rect, which is where
+    /// it was before the snap.
+    rect: win32.RECT,
+};
+
 app: *App,
 
 /// The frame. Written from WM_NCCREATE, the first message it receives, so
@@ -85,12 +97,13 @@ closing: bool,
 /// (`Surface.destroy_deferred`).
 destroy_deferred: bool,
 
-/// Tracked so `.toggle_maximize` knows which way to toggle.
-maximized: bool,
-
 /// Whether the title bar was last made dark (`applyTheme`). A new frame
 /// has a light one.
 dark_frame: bool,
+
+/// Where and how the window was before it covered its monitor, to put it
+/// back (`toggleFullscreen`); null while it does not.
+fullscreen: ?Restore,
 
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
@@ -114,8 +127,8 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .tree = .empty,
         .focused = null,
         .pending_focus = null,
-        .maximized = false,
         .dark_frame = false,
+        .fullscreen = null,
         .modal_loops = .{},
         .prompt_disabled = false,
         .closing = false,
@@ -167,16 +180,22 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     return self;
 }
 
-/// Size the still-hidden frame to `window-width`/`window-height` and show
-/// it. The first WM_SETFOCUS and WM_PAINT (and the first WM_SIZE, unless
-/// the size already sent one) reach the terminal from here; its core is
-/// live by now.
+/// Size the still-hidden frame to `window-width`/`window-height`, cover
+/// its monitor if `fullscreen` asks, and show it. The first WM_SETFOCUS
+/// and WM_PAINT (and the first WM_SIZE, unless the size already sent one)
+/// reach the terminal from here; its core is live by now.
 pub fn show(self: *Window) void {
     if (self.focused) |surface| {
         if (surface.initial_size) |size| {
             applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
         }
     }
+
+    // `fullscreen` starts every window covering its monitor, as on GTK;
+    // the macOS-only kinds of it are taken as the one kind there is. After
+    // the size above, which leaving fullscreen goes back to.
+    if (self.app.config.fullscreen != .false) self.toggleFullscreen();
+
     _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNORMAL);
     _ = win32.UpdateWindow(self.hwnd);
 }
@@ -256,7 +275,16 @@ fn handleMessage(
             // both words; they are always equal for a window.
             var it = self.tree.iterator();
             while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
-            applySuggestedRect(hwnd, lparam);
+            if (self.fullscreen == null) {
+                applySuggestedRect(hwnd, lparam);
+            } else {
+                // The suggested rect is the window's, scaled, which no longer
+                // covers a monitor: it covers the monitor that rect is on.
+                const suggested: *const win32.RECT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                if (monitorRect(win32.MonitorFromRect(suggested, win32.MONITOR_DEFAULTTONEAREST))) |rect| {
+                    self.moveTo(rect, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+                }
+            }
 
             // The rect lays the terminals out through WM_SIZE only if it
             // changes the client size, but the divider width depends on the
@@ -288,7 +316,26 @@ fn handleMessage(
         },
 
         // Sent to the top-level window, not to the terminal with the focus.
-        win32.WM_SYSCOMMAND => if (isBareKeyMenu(wparam, lparam)) return 0,
+        win32.WM_SYSCOMMAND => {
+            if (isBareKeyMenu(wparam, lparam)) return 0;
+
+            // A window that covers its monitor keeps WS_MAXIMIZE if it had
+            // it, so Win+Down's restore would put it back at its restore
+            // rect with no frame, and Win+Up's maximize would give it the
+            // work area. A restore leaves fullscreen instead, as Windows
+            // Terminal's does (microsoft/terminal#10607), and a maximize does
+            // nothing, as toggle_maximize does then. A minimized window is
+            // restored by DefWindowProcW, and comes back covering its
+            // monitor, as it was.
+            if (self.fullscreen != null) switch (wparam & win32.SC_MASK) {
+                win32.SC_RESTORE => if (!win32.IsIconic(hwnd).toBool()) {
+                    self.toggleFullscreen();
+                    return 0;
+                },
+                win32.SC_MAXIMIZE => return 0,
+                else => {},
+            };
+        },
 
         // Erased by WM_PAINT below, all of it at once.
         win32.WM_ERASEBKGND => return 1,
@@ -1066,17 +1113,102 @@ pub fn present(hwnd: win32.HWND) bool {
     return win32.SetForegroundWindow(hwnd).toBool();
 }
 
-/// `.toggle_maximize`: maximize the window, or restore it, and record which
-/// in `maximized`.
-pub fn toggleMaximize(hwnd: win32.HWND, maximized: *bool) void {
-    maximized.* = !maximized.*;
+/// `.toggle_fullscreen`: cover the monitor the window is mostly on, with
+/// no frame, or put the window back where and as it was, maximized or not.
+/// The overlapped-window styles come off and the window takes the
+/// monitor's rect, and the placement saved first brings it back, as
+/// Raymond Chen describes it ("How do I switch a window between normal
+/// and fullscreen?", The Old New Thing). The terminals are laid out again
+/// from the frame's WM_SIZE, so this never runs inside a core frame
+/// (`App.requests`).
+pub fn toggleFullscreen(self: *Window) void {
+    const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_STYLE);
+    const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
+    const reframe = win32.SWP_NOOWNERZORDER | win32.SWP_FRAMECHANGED;
+
+    if (self.fullscreen) |restore| {
+        self.fullscreen = null;
+        _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, style | overlapped);
+        // By the placement for a window that was maximized, and for one
+        // whose rect no monitor shows any more, as when one is unplugged or
+        // a remote session comes back with fewer: SetWindowPlacement moves
+        // a placement off every monitor onto one, SetWindowPos would not.
+        const maximized = restore.placement.showCmd == win32.SW_SHOWMAXIMIZED;
+        const gone = win32.MonitorFromRect(&restore.rect, win32.MONITOR_DEFAULTTONULL) == null;
+        if (!maximized and !gone) {
+            self.moveTo(restore.rect, win32.SWP_NOZORDER | reframe);
+            return;
+        }
+        _ = win32.SetWindowPlacement(self.hwnd, &restore.placement);
+        _ = win32.SetWindowPos(
+            self.hwnd,
+            null,
+            0,
+            0,
+            0,
+            0,
+            win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | reframe,
+        );
+        return;
+    }
+
+    var restore: Restore = .{
+        .placement = std.mem.zeroes(win32.WINDOWPLACEMENT),
+        .rect = undefined,
+    };
+    restore.placement.length = @sizeOf(win32.WINDOWPLACEMENT);
+    if (!win32.GetWindowPlacement(self.hwnd, &restore.placement).toBool()) {
+        log.warn("cannot go fullscreen: GetWindowPlacement failed err={}", .{win32.GetLastError()});
+        return;
+    }
+    if (!win32.GetWindowRect(self.hwnd, &restore.rect).toBool()) {
+        log.warn("cannot go fullscreen: GetWindowRect failed err={}", .{win32.GetLastError()});
+        return;
+    }
+    const monitor = monitorRect(win32.MonitorFromWindow(self.hwnd, win32.MONITOR_DEFAULTTONEAREST)) orelse
+        return;
+
+    self.fullscreen = restore;
+    _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, style & ~overlapped);
+    self.moveTo(monitor, reframe);
+}
+
+/// Move and size the frame to `rect`, in screen coordinates.
+fn moveTo(self: *Window, rect: win32.RECT, flags: win32.UINT) void {
+    _ = win32.SetWindowPos(
+        self.hwnd,
+        null,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        flags,
+    );
+}
+
+/// The rect of `monitor`, or null, logged, if it cannot be read.
+fn monitorRect(monitor: ?win32.HMONITOR) ?win32.RECT {
+    var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
+    info.cbSize = @sizeOf(win32.MONITORINFO);
+    if (!win32.GetMonitorInfoW(monitor orelse return null, &info).toBool()) {
+        log.warn("cannot cover the monitor: GetMonitorInfoW failed err={}", .{win32.GetLastError()});
+        return null;
+    }
+    return info.rcMonitor;
+}
+
+/// `.toggle_maximize`: maximize the window, or restore it, by whether it
+/// is maximized now, as GTK decides (`surfaceToggleMaximize`): the user
+/// also maximizes and restores it with the caption buttons, a double click
+/// and Win+Up and Win+Down.
+pub fn toggleMaximize(self: *Window) void {
     // ShowWindow's BOOL is the window's *previous* visibility, not
     // whether the call succeeded, so it deliberately is not
     // propagated: a window that was hidden returns zero from a
     // call that worked perfectly.
     _ = win32.ShowWindow(
-        hwnd,
-        if (maximized.*) win32.SW_MAXIMIZE else win32.SW_RESTORE,
+        self.hwnd,
+        if (win32.IsZoomed(self.hwnd).toBool()) win32.SW_RESTORE else win32.SW_MAXIMIZE,
     );
 }
 
@@ -1103,7 +1235,7 @@ pub fn applySuggestedRect(hwnd: win32.HWND, lparam: win32.LPARAM) void {
 /// menu bar, so that mode is never wanted. Alt+Space arrives with lParam
 /// ' ' and still opens the window menu.
 pub fn isBareKeyMenu(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
-    return wparam & 0xFFF0 == win32.SC_KEYMENU and lparam == 0;
+    return wparam & win32.SC_MASK == win32.SC_KEYMENU and lparam == 0;
 }
 
 /// A window's share of `App.modal_loop_depth`: the system modal loops

@@ -36,9 +36,9 @@
 //!
 //! A window holds its terminals in a split tree, laid out over its client
 //! area (`Window`). `.new_window`, `.new_split`, `.resize_split`,
-//! `.equalize_splits` and a full `.reload_config` are recorded, and
-//! carried out by `App.run` once the core frame that asked has returned
-//! (`App.requests`); `.goto_split`
+//! `.equalize_splits`, `.toggle_fullscreen`, `.toggle_maximize` and a full
+//! `.reload_config` are recorded, and carried out by `App.run` once the
+//! core frame that asked has returned (`App.requests`); `.goto_split`
 //! moves the focus once the core's key callback has returned
 //! (`Window.pending_focus`), or after such a request when it follows one.
 //! The process quits when its last window closes, whatever

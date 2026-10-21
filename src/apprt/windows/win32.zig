@@ -107,6 +107,7 @@ pub const CREATESTRUCTW = extern struct {
 };
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
+pub const WS_CAPTION: DWORD = 0x00C00000;
 pub const WS_MINIMIZE: DWORD = 0x20000000;
 pub const WS_CHILD: DWORD = 0x40000000;
 pub const WS_VISIBLE: DWORD = 0x10000000;
@@ -116,8 +117,11 @@ pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_HIDE: c_int = 0;
 pub const SW_SHOWNORMAL: c_int = 1;
 pub const SW_SHOWNOACTIVATE: c_int = 4;
+pub const SW_SHOWMINNOACTIVE: c_int = 7;
 pub const SW_SHOWNA: c_int = 8;
 pub const SW_MAXIMIZE: c_int = 3;
+/// SW_MAXIMIZE's other name, the one WINDOWPLACEMENT.showCmd reports.
+pub const SW_SHOWMAXIMIZED: c_int = 3;
 pub const SW_RESTORE: c_int = 9;
 
 /// Parent value that makes CreateWindowExW produce a message-only window:
@@ -129,6 +133,7 @@ pub const HWND_MESSAGE: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -3))))
 pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: HANDLE =
     @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
+pub const GWL_STYLE: c_int = -16;
 pub const GWLP_USERDATA: c_int = -21;
 
 pub const WM_DESTROY: UINT = 0x0002;
@@ -215,7 +220,12 @@ pub const MA_ACTIVATE: LRESULT = 1;
 pub const MA_ACTIVATEANDEAT: LRESULT = 2;
 
 /// WM_SYSCOMMAND wParam (low four bits are reserved and must be masked).
+/// WM_SYSCOMMAND: the system uses wParam's low four bits internally; mask
+/// them before comparing.
+pub const SC_MASK: WPARAM = 0xFFF0;
+pub const SC_MAXIMIZE: WPARAM = 0xF030;
 pub const SC_KEYMENU: WPARAM = 0xF100;
+pub const SC_RESTORE: WPARAM = 0xF120;
 
 // Virtual-key codes.
 pub const VK_SPACE: WPARAM = 0x20;
@@ -254,9 +264,12 @@ const QS_POINTER: DWORD = 0x1000;
 pub const QS_ALLINPUT: DWORD = 0x04FF | QS_TOUCH | QS_POINTER;
 pub const MWMO_INPUTAVAILABLE: DWORD = 0x0004;
 
+pub const SWP_NOSIZE: UINT = 0x0001;
 pub const SWP_NOMOVE: UINT = 0x0002;
 pub const SWP_NOZORDER: UINT = 0x0004;
 pub const SWP_NOACTIVATE: UINT = 0x0010;
+pub const SWP_FRAMECHANGED: UINT = 0x0020;
+pub const SWP_NOOWNERZORDER: UINT = 0x0200;
 
 /// A resource name that may be an integer id (MAKEINTRESOURCEW): the
 /// same pointer as LPCWSTR, but without its alignment, since the ids are
@@ -410,6 +423,19 @@ const window_long = struct {
 pub extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
 pub const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
 pub extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement
+pub const WINDOWPLACEMENT = extern struct {
+    length: UINT,
+    flags: UINT,
+    showCmd: UINT,
+    ptMinPosition: POINT,
+    ptMaxPosition: POINT,
+    rcNormalPosition: RECT,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowplacement
+pub extern "user32" fn GetWindowPlacement(hwnd: HWND, placement: *WINDOWPLACEMENT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowplacement
+pub extern "user32" fn SetWindowPlacement(hwnd: HWND, placement: *const WINDOWPLACEMENT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setfocus
 pub extern "user32" fn SetFocus(hwnd: ?HWND) callconv(.winapi) ?HWND;
@@ -564,6 +590,7 @@ pub extern "imm32" fn ImmNotifyIME(himc: HIMC, action: DWORD, index: DWORD, valu
 pub extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isiconic
 pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
+pub extern "user32" fn IsZoomed(hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow
 pub extern "user32" fn IsWindow(hwnd: HWND) callconv(.winapi) BOOL;
 /// Returns whether the window was disabled *before* the call.
@@ -572,7 +599,8 @@ pub extern "user32" fn EnableWindow(hwnd: HWND, enable: BOOL) callconv(.winapi) 
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowenabled
 pub extern "user32" fn IsWindowEnabled(hwnd: HWND) callconv(.winapi) BOOL;
 
-const HMONITOR = *opaque {};
+pub const HMONITOR = *opaque {};
+pub const MONITOR_DEFAULTTONULL: DWORD = 0x00000000;
 pub const MONITOR_DEFAULTTONEAREST: DWORD = 0x00000002;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-monitorinfo
 pub const MONITORINFO = extern struct {
@@ -583,6 +611,8 @@ pub const MONITORINFO = extern struct {
 };
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromwindow
 pub extern "user32" fn MonitorFromWindow(hwnd: HWND, flags: DWORD) callconv(.winapi) ?HMONITOR;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromrect
+pub extern "user32" fn MonitorFromRect(rect: *const RECT, flags: DWORD) callconv(.winapi) ?HMONITOR;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmonitorinfow
 pub extern "user32" fn GetMonitorInfoW(monitor: HMONITOR, info: *MONITORINFO) callconv(.winapi) BOOL;
 pub extern "user32" fn ValidateRect(hwnd: ?HWND, rect: ?*const RECT) callconv(.winapi) BOOL;

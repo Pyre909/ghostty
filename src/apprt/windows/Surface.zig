@@ -390,7 +390,7 @@ pub const Surface = struct {
         /// instead (the `.grid` arm of `renderer.size.Coordinate.convert`).
         const outside: apprt.CursorPos = .{ .x = -1, .y = -1 };
 
-        fn init() Mouse {
+        pub fn init() Mouse {
             return .{
                 .pos = outside,
                 .held = .empty,
