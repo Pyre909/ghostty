@@ -170,8 +170,8 @@ pub const App = struct {
         return false;
     }
 
-    /// A window, a split or a focus move the core asked for and `run` has
-    /// not carried out yet (`requests`).
+    /// A window, a split, a change to splits or a focus move the core asked
+    /// for and `run` has not carried out yet (`requests`).
     pub const Request = union(enum) {
         /// A new window, from the surface that asked, if any.
         window: ?*CoreSurface,
@@ -190,8 +190,19 @@ pub const App = struct {
             to: apprt.action.GotoSplit,
         },
 
-        /// A split or a focus move whose surface began to close first: it
-        /// has nowhere to go.
+        /// Move a divider, as `resize_split` names it, in the window of
+        /// `from` (`resizeSplit`).
+        resize: struct {
+            from: *CoreSurface,
+            value: apprt.action.ResizeSplit,
+        },
+
+        /// Give the splits of the window of this surface equal shares
+        /// (`equalizeSplits`).
+        equalize: *CoreSurface,
+
+        /// One of the above whose surface began to close first: it has
+        /// nowhere to go.
         dropped,
     };
 
@@ -725,6 +736,8 @@ pub const App = struct {
             .new_window => self.requestWindow(target),
             .new_split => self.requestSplit(target, value),
             .goto_split => self.gotoSplit(target, value),
+            .resize_split => self.resizeSplit(target, value),
+            .equalize_splits => self.equalizeSplits(target),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1048,8 +1061,9 @@ pub const App = struct {
     }
 
     /// Forget `core_surface`, which is closing, wherever something still
-    /// waits on it: windows it asked for lose it as their parent, splits and
-    /// focus moves it asked for are dropped, and so is a focus move to it.
+    /// waits on it: windows it asked for lose it as their parent, splits,
+    /// changes to splits and focus moves it asked for are dropped, and so is
+    /// a focus move to it.
     /// Called by `Surface.detachCore`, the first step of every teardown,
     /// while the address is still that surface's, so that a surface created
     /// later at the same address cannot pass for it.
@@ -1063,6 +1077,12 @@ pub const App = struct {
             },
             .goto => |goto| {
                 if (goto.from == core_surface) request.* = .dropped;
+            },
+            .resize => |resize| {
+                if (resize.from == core_surface) request.* = .dropped;
+            },
+            .equalize => |from| {
+                if (from == core_surface) request.* = .dropped;
             },
             .dropped => {},
         };
@@ -1108,6 +1128,60 @@ pub const App = struct {
         return true;
     }
 
+    /// `.resize_split`: recorded for `run` (`requests`), which lays the
+    /// terminals out again once the core's key callback has returned: a
+    /// terminal moved inside it would re-enter the core with WM_SIZE
+    /// (`CoreSurface.sizeCallback`). GTK and macOS lay out later too. As on
+    /// GTK, `false` for no amount or a window with a single terminal, so
+    /// that the key reaches the terminal, unless a split for that window is
+    /// still to come from `requests`.
+    fn resizeSplit(self: *App, target: apprt.Target, value: apprt.action.ResizeSplit) bool {
+        const from = switch (target) {
+            .app => {
+                log.warn("resize_split to app is unexpected", .{});
+                return false;
+            },
+            .surface => |v| v,
+        };
+        if (value.amount == 0) return false;
+        const window = from.rt_surface.window;
+        if (!window.tree.isSplit() and !self.splitQueuedIn(window)) return false;
+        self.requests.append(self.core_app.alloc, .{ .resize = .{
+            .from = from,
+            .value = value,
+        } }) catch |err| {
+            log.warn("cannot record a split resize err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Whether `requests` holds a split that will land in `window`.
+    fn splitQueuedIn(self: *const App, window: *const Window) bool {
+        for (self.requests.items) |request| switch (request) {
+            .split => |split| if (split.parent.rt_surface.window == window) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// `.equalize_splits`: recorded for `run`, as `resizeSplit` is. Always
+    /// `true` for a surface, as on GTK, whose action is always enabled.
+    fn equalizeSplits(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => {
+                log.warn("equalize_splits to app is unexpected", .{});
+                return false;
+            },
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .equalize = from }) catch |err| {
+            log.warn("cannot record equalizing the splits err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     /// Give each window the focus move a `goto_split` chose in it, if any
     /// (`Window.pending_focus`). Called by a terminal's key handler once the
     /// core's key callback has returned (`Surface.handleMessage`), and by
@@ -1125,8 +1199,8 @@ pub const App = struct {
         }
     }
 
-    /// Create the windows and splits in `requests`, and make the focus moves
-    /// queued behind them, oldest first. Called by `run`, where
+    /// Create the windows and splits in `requests`, and make the changes to
+    /// splits and the focus moves queued with them, oldest first. Called by `run`, where
     /// `canReenterCore` holds and no teardown is running.
     fn createRequested(self: *App) void {
         // A window opened now would only be torn down again by `terminate`.
@@ -1160,6 +1234,13 @@ pub const App = struct {
                     },
                 },
                 .goto => |goto| gotoQueued(goto.from, goto.to),
+                // From the focused terminal, as gotoQueued starts, which is
+                // GTK's active surface.
+                .resize => |resize| {
+                    const window = resize.from.rt_surface.window;
+                    window.resizeSplit(window.focused orelse resize.from.rt_surface, resize.value);
+                },
+                .equalize => |from| from.rt_surface.window.equalize(),
                 .dropped => {},
             }
         }
@@ -1993,6 +2074,15 @@ fn testCaption(window: *const Window, buf: []u16) []const u16 {
     return buf[0..@intCast(n)];
 }
 
+/// For tests: `got` within a pixel of `want`, the most that rounding a
+/// split's f16 ratio moves a divider.
+fn expectNear(want: i32, got: i32) !void {
+    if (@abs(want - got) > 1) {
+        std.debug.print("expected {d} give or take 1, found {d}\n", .{ want, got });
+        return error.TestUnexpectedResult;
+    }
+}
+
 /// For tests: `panes` side by side, in this order, as splitting each one
 /// off the last to the right puts them.
 fn testRow(alloc: std.mem.Allocator, panes: []const *Surface) !Window.Tree {
@@ -2333,6 +2423,226 @@ test "win32: a queued goto_split starts from the window's focused terminal" {
     app.createRequested();
     try std.testing.expect(window.focused == c);
     try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: resize_split moves the nearest divider across it" {
+    // In (a | b) over c, left and right move the line between a and b, and
+    // up and down the one above c (`SplitTree.resize` takes the nearest
+    // split that runs across the move). An amount is in device-independent
+    // pixels of the whole window: 96 DPI here, so pixels, give or take one
+    // for rounding.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tree = tree: {
+        var row = try testRow(alloc, &.{ a, b });
+        defer row.deinit();
+        var below: Window.Tree = try .init(alloc, c);
+        defer below.deinit();
+        break :tree try row.split(alloc, .root, .down, 0.5, &below);
+    };
+    window.relayout();
+    const before_a = try paneRect(window, a);
+    const before_c = try paneRect(window, c);
+
+    window.resizeSplit(a, .{ .amount = 20, .direction = .right });
+    const wider = try paneRect(window, a);
+    try expectNear(before_a.right + 20, wider.right);
+    try std.testing.expectEqual(before_a.bottom, wider.bottom);
+
+    window.resizeSplit(b, .{ .amount = 10, .direction = .up });
+    const shorter = try paneRect(window, a);
+    try expectNear(before_a.bottom - 10, shorter.bottom);
+    try expectNear(before_c.top - 10, (try paneRect(window, c)).top);
+    try std.testing.expectEqual(wider.right, shorter.right);
+}
+
+test "win32: resize_split never leaves a terminal less than a cell" {
+    // SplitTree.resize clamps a ratio to 0 or 1, which would leave b no
+    // room at all, so that move is refused (`Window.adopt`); a terminal
+    // with no core needs a pixel, one with a core a cell of its font. The
+    // largest amount also tests that the move is kept within the [-1, 1]
+    // that SplitTree.resize asserts.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.relayout();
+    const before = try paneRect(window, b);
+
+    window.resizeSplit(a, .{ .amount = std.math.maxInt(u16), .direction = .right });
+    try std.testing.expectEqual(before, try paneRect(window, b));
+
+    // A move that leaves room is still made.
+    window.resizeSplit(a, .{ .amount = 10, .direction = .right });
+    try std.testing.expect((try paneRect(window, b)).left > before.left);
+}
+
+test "win32: equalize_splits gives each terminal an equal share" {
+    // a | (b | c), as new splits leave it, gives a half. Equalizing weighs
+    // each side of a split by its terminals (`SplitTree.equalize`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b, c });
+    window.relayout();
+    const width = struct {
+        fn width(w: *const Window, pane: *const Surface) !i32 {
+            const r = try paneRect(w, pane);
+            return r.right - r.left;
+        }
+    }.width;
+    try std.testing.expect(try width(window, a) > try width(window, b) + 1);
+
+    window.equalize();
+    try expectNear(try width(window, a), try width(window, b));
+    try expectNear(try width(window, b), try width(window, c));
+    try expectRow(window, &.{ a, b, c });
+}
+
+test "win32: resize_split and equalize_splits wait for run" {
+    // Laying the terminals out moves windows, whose WM_SIZE would re-enter
+    // the core inside its key callback, so both are recorded and made by
+    // createRequested. resize_split is not performed with no amount, or for
+    // a single terminal unless a split may still come, so that the key
+    // reaches the terminal. A surface that starts closing takes its own
+    // with it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const alone = try testFrame(&app);
+    const only = try testPane(&app, alone);
+    alone.tree = try .init(alloc, only);
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.focused = a;
+    window.relayout();
+
+    const right: apprt.action.ResizeSplit = .{ .amount = 20, .direction = .right };
+    try std.testing.expect(!try app.performAction(.{ .surface = &only.core_surface }, .resize_split, right));
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .resize_split, .{ .amount = 0, .direction = .right }));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Requests that cannot give `only` a split leave its key alone.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .new_window, {}));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .new_split, .down));
+    try std.testing.expect(!try app.performAction(.{ .surface = &only.core_surface }, .resize_split, right));
+    try std.testing.expectEqual(2, app.requests.items.len);
+    app.requests.clearRetainingCapacity();
+
+    const before = try paneRect(window, a);
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .resize_split, right));
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .equalize_splits, {}));
+    try std.testing.expectEqual(before, try paneRect(window, a));
+    const want = [_]App.Request{
+        .{ .resize = .{ .from = &a.core_surface, .value = right } },
+        .{ .equalize = &only.core_surface },
+    };
+    try std.testing.expectEqual(want.len, app.requests.items.len);
+    for (want, app.requests.items) |w, got| {
+        try std.testing.expect(std.meta.eql(w, got));
+    }
+    app.createRequested();
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try expectNear(before.right + 20, (try paneRect(window, a)).right);
+
+    // A single terminal's resize waits behind a split still to come.
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .new_split, .right));
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .resize_split, right));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .equalize_splits, {}));
+    try std.testing.expectEqual(3, app.requests.items.len);
+    app.forgetClosing(&only.core_surface);
+    app.forgetClosing(&a.core_surface);
+    for (app.requests.items) |request| try std.testing.expect(request == .dropped);
+}
+
+test "win32: queued split changes reach the window from its focused terminal" {
+    // What createRequested does with a .resize and an .equalize: a resize
+    // starts from the window's focused terminal, as gotoQueued does (GTK's
+    // active surface), not from the one that asked; an equalize reaches the
+    // asking surface's window. In a | (b over c) only a path from b or c
+    // crosses a line that runs across, so a resize down from a would move
+    // nothing.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tree = tree: {
+        var row = try testRow(alloc, &.{ a, b });
+        defer row.deinit();
+        var below: Window.Tree = try .init(alloc, c);
+        defer below.deinit();
+        break :tree try row.split(alloc, row.locate(b).?, .down, 0.5, &below);
+    };
+    window.focused = b;
+    window.relayout();
+    const before = try paneRect(window, b);
+    try app.requests.append(alloc, .{ .resize = .{
+        .from = &a.core_surface,
+        .value = .{ .amount = 10, .direction = .down },
+    } });
+    app.createRequested();
+    try expectNear(before.bottom + 10, (try paneRect(window, b)).bottom);
+
+    // a | b | c as new splits leave it: a has half until equalized.
+    const row = try testFrame(&app);
+    const x = try testPane(&app, row);
+    const y = try testPane(&app, row);
+    const z = try testPane(&app, row);
+    row.tree = try testRow(alloc, &.{ x, y, z });
+    row.relayout();
+    try app.requests.append(alloc, .{ .equalize = &x.core_surface });
+    app.createRequested();
+    try expectRow(row, &.{ x, y, z });
+    const wx = (try paneRect(row, x)).right - (try paneRect(row, x)).left;
+    const wz = (try paneRect(row, z)).right - (try paneRect(row, z)).left;
+    try expectNear(wx, wz);
 }
 
 test "win32: a window is titled after its focused terminal" {
