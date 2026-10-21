@@ -77,22 +77,23 @@ pub const App = struct {
     /// (`windowDestroyed`).
     windows: std.ArrayListUnmanaged(*Window),
 
-    /// Windows and splits the core asked for (`.new_window`,
-    /// `.new_split`) that `run` has not created yet, oldest first, each
-    /// with the core surface that asked, if any (`Request`).
+    /// Work the core asked for that `run` has not carried out yet, oldest
+    /// first (`Request`): windows and splits, the changes to splits and
+    /// the focus moves after them, and a full configuration reload.
     ///
-    /// The core asks from inside its own frames: a `new_window` or
-    /// `new_split` binding performs the action from
-    /// `CoreSurface.keyCallback` (`performBindingAction`). Creating the
-    /// terminal there would register a surface with the core in the middle
-    /// of that frame and send the new terminal's focus, and the old one's
-    /// WM_KILLFOCUS, into a surface whose key callback is still on the
-    /// stack. So the action only records the request, and `run` creates
-    /// the window or split after its tick (`createRequested`).
+    /// The core asks from inside its own frames: a binding performs the
+    /// action from `CoreSurface.keyCallback` (`performBindingAction`).
+    /// Creating a terminal there would register a surface with the core in
+    /// the middle of that frame and send the new terminal's focus, and the
+    /// old one's WM_KILLFOCUS, into a surface whose key callback is still
+    /// on the stack; laying terminals out sends them WM_SIZE, which enters
+    /// the core; and a reload frees the configuration the binding's actions
+    /// live in. So the action only records the request, and `run` carries
+    /// it out after its tick (`createRequested`).
     ///
-    /// A parent is always live: a surface clears its own entries when its
-    /// teardown starts (`forgetClosing`), before its address can be
-    /// reused.
+    /// A surface named in a request is always live: a surface clears its
+    /// own entries when its teardown starts (`forgetClosing`), before its
+    /// address can be reused.
     requests: std.ArrayListUnmanaged(Request),
 
     /// Set when the loop should stop. Written only on the main thread.
@@ -170,8 +171,8 @@ pub const App = struct {
         return false;
     }
 
-    /// A window, a split, a change to splits or a focus move the core asked
-    /// for and `run` has not carried out yet (`requests`).
+    /// Work the core asked for that `run` has not carried out yet
+    /// (`requests`).
     pub const Request = union(enum) {
         /// A new window, from the surface that asked, if any.
         window: ?*CoreSurface,
@@ -200,6 +201,10 @@ pub const App = struct {
         /// Give the splits of the window of this surface equal shares
         /// (`equalizeSplits`).
         equalize: *CoreSurface,
+
+        /// Read the configuration from disk again and give it to the core
+        /// (`reloadConfig`).
+        reload,
 
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
@@ -465,8 +470,9 @@ pub const App = struct {
             // And IME work that could not run where it arose (Surface.syncIme).
             self.syncDeferredIme();
 
-            // And the windows and splits the core asked for (`requests`),
-            // and a focus move one asked for outside a key callback.
+            // And the work the core asked for from inside its frames
+            // (`requests`), and a focus move one asked for outside a key
+            // callback.
             self.createRequested();
             self.applyPendingFocus();
         }
@@ -728,6 +734,8 @@ pub const App = struct {
             .mouse_shape => mouseShape(target, value),
             .open_url => openUrl(target, value),
             .initial_size => initialSize(target, value),
+            .reload_config => try self.reloadConfig(target, value),
+            .config_change => try self.configChange(target, value),
 
             .ring_bell => ring_bell: {
                 _ = win32.MessageBeep(win32.MB_ICONASTERISK);
@@ -933,6 +941,88 @@ pub const App = struct {
         return true;
     }
 
+    /// `.reload_config`. A full reload reads the configuration from disk
+    /// again; a soft one hands over the loaded configuration again, which
+    /// the core asks for when a conditional state such as the color scheme
+    /// changes. Either goes to the target, and for the app the core answers
+    /// with `.config_change` (`configChange`).
+    ///
+    /// The app's full reload comes from the `reload_config` binding,
+    /// Ctrl+Shift+, by default, inside the core's key callback. Giving the
+    /// core a new configuration there frees the one the terminal's bindings
+    /// live in, and a chained binding still reads the actions after this
+    /// one from it (`CoreSurface.maybeHandleBinding`). So the reload is
+    /// recorded in `requests` and `run` makes it once the callback has
+    /// returned (`reloadQueued`), in order with the windows and splits a
+    /// chain asks for. GTK and macOS reload at once. A soft reload and a
+    /// terminal's own follow a change of color scheme, which a runtime
+    /// reports outside any binding, and are made at once.
+    fn reloadConfig(
+        self: *App,
+        target: apprt.Target,
+        opts: apprt.action.ReloadConfig,
+    ) !bool {
+        if (!opts.soft and target == .app) {
+            try self.requests.append(self.core_app.alloc, .reload);
+            return true;
+        }
+        try self.reloadNow(target, opts.soft);
+        return true;
+    }
+
+    /// Give `target` the configuration: the loaded one again when `soft`,
+    /// otherwise one read from disk. A configuration that fails to load is
+    /// an error, and the loaded one stays.
+    fn reloadNow(self: *App, target: apprt.Target, soft: bool) !void {
+        var loaded: ?Config = if (soft) null else try Config.load(self.core_app.alloc);
+        defer if (loaded) |*c| c.deinit();
+        const config: *const Config = if (loaded) |*c| c else &self.config;
+
+        switch (target) {
+            .app => try self.core_app.updateConfig(self, config),
+            .surface => |core| try core.updateConfig(config),
+        }
+    }
+
+    /// The full reload `reloadConfig` recorded.
+    fn reloadQueued(self: *App) void {
+        self.reloadNow(.app, false) catch |err| {
+            log.warn("failed to reload the configuration err={}", .{err});
+        };
+    }
+
+    /// `.config_change`. For the app, the configuration becomes this
+    /// runtime's, with the conditional state the core applied to it, as GTK
+    /// and macOS keep theirs: new terminals derive theirs from it, the
+    /// dividers take their color from it, and every other reader of
+    /// `config` reads it when it needs it. The value only lives for the
+    /// call, so it is copied, and every window repaints its dividers. In a
+    /// soft reload the value comes from `config` itself, and is `config`
+    /// when the core could not apply the conditional state, so it is copied
+    /// before `config` is freed. `CoreApp.updateConfig` does not touch the
+    /// configuration it was given once the action returns.
+    ///
+    /// Nothing in this runtime depends on a terminal's own configuration:
+    /// `false` for a surface.
+    fn configChange(
+        self: *App,
+        target: apprt.Target,
+        value: apprt.action.ConfigChange,
+    ) !bool {
+        switch (target) {
+            .app => {},
+            .surface => return false,
+        }
+
+        const config = try value.config.clone(self.core_app.alloc);
+        self.config.deinit();
+        self.config = config;
+        for (self.windows.items) |window| {
+            _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
+        }
+        return true;
+    }
+
     /// Arm or cancel the quit-after-last-window timer. Returns whether the
     /// requested state was actually reached; `.quit_timer` reports it to the
     /// core verbatim.
@@ -1098,7 +1188,7 @@ pub const App = struct {
             .equalize => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
-            .dropped => {},
+            .reload, .dropped => {},
         };
         for (self.windows.items) |window| {
             const surface = window.pending_focus orelse continue;
@@ -1213,8 +1303,7 @@ pub const App = struct {
         }
     }
 
-    /// Create the windows and splits in `requests`, and make the changes to
-    /// splits and the focus moves queued with them, oldest first. Called by `run`, where
+    /// Carry out `requests`, oldest first. Called by `run`, where
     /// `canReenterCore` holds and no teardown is running.
     fn createRequested(self: *App) void {
         // A window opened now would only be torn down again by `terminate`.
@@ -1255,6 +1344,7 @@ pub const App = struct {
                     window.resizeSplit(window.focused orelse resize.from.rt_surface, resize.value);
                 },
                 .equalize => |from| from.rt_surface.window.equalize(),
+                .reload => self.reloadQueued(),
                 .dropped => {},
             }
         }
@@ -2921,4 +3011,77 @@ test "win32: new windows and splits are recorded where they are asked for" {
     for (want, app.requests.items) |w, got| {
         try std.testing.expect(std.meta.eql(w, got));
     }
+}
+
+test "win32: config_change makes a copy of the app's configuration" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+
+    // The value only lives for the action. The title is in its arena, so
+    // a configuration that kept pointing into it would read freed memory.
+    {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.title = try changed.arenaAlloc().dupeSentinel(u8, "reloaded", 0);
+        changed.@"split-divider-color" = .{ .r = 0x12, .g = 0x34, .b = 0x56 };
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    }
+    try std.testing.expectEqualStrings("reloaded", app.config.title.?);
+
+    // The dividers are painted from it.
+    try std.testing.expectEqual(
+        terminal.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 },
+        Window.dividerColor(&app.config),
+    );
+}
+
+test "win32: a soft reload_config hands the app's configuration back through the core" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
+    const before = app.config.title.?.ptr;
+
+    // The core applies the app's conditional state and answers with
+    // config_change, which replaces the configuration the reload started
+    // from with a copy of the result: the same settings in new memory. The
+    // testing allocator fails a free of the old one that is missing or
+    // comes twice.
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = true }));
+    try std.testing.expectEqualStrings("kept", app.config.title.?);
+    try std.testing.expect(app.config.title.?.ptr != before);
+}
+
+test "win32: a full reload_config waits for run" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    defer app.requests.deinit(alloc);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
+    const before = app.config.title.?.ptr;
+
+    // From a binding, inside the core's key callback: recorded, and the
+    // configuration the binding may still be reading stays. `run` makes it
+    // (`reloadQueued`), which reads the configuration from disk, so it is
+    // not made here: the VM scenario does that.
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{}));
+    try std.testing.expect(app.config.title != null);
+    try std.testing.expectEqual(before, app.config.title.?.ptr);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .reload);
 }
