@@ -1847,9 +1847,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     self.releaseGpuResources();
                     self.shaders.deinit(self.alloc);
-                    self.images.deinit(self.alloc);
-                    self.images = .empty;
-                    self.images.kitty_rebuild = true;
+                    self.images.discardForRebuild(self.alloc);
                     if (self.bg_image) |*img| {
                         img.deinit(self.alloc);
                         self.bg_image = null;

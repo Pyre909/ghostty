@@ -47,10 +47,16 @@ pub const State = struct {
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
-    /// Set when the GPU copies of the kitty images were dropped without
-    /// the terminal knowing, as after a lost graphics device: the next
-    /// update rebuilds them from the terminal's storage even though no
-    /// generation changed. Like the rest of this state it is only ever
+    /// Set by `discardForRebuild` after a lost graphics device. Resetting
+    /// to `.empty` zeroes the generations above, and a storage that ever
+    /// held an image never has generation zero, so the next
+    /// `kittyRequiresUpdate` already returns true whenever there may be
+    /// an image to rebuild. This flag is for what that misses:
+    /// `animationWake` reads it to schedule that update on an idle
+    /// surface, and `kittyRequiresUpdate` returns true for it so that
+    /// `kittyUpdate` runs and clears it even when the terminal never
+    /// had an image. Otherwise `animationWake` would keep waking the
+    /// surface for good. Like the rest of this state it is only ever
     /// written on the render thread, which is what lets
     /// `kittyRequiresUpdate` read it there without the draw mutex.
     kitty_rebuild: bool,
@@ -74,6 +80,15 @@ pub const State = struct {
         }
         self.kitty_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
+    }
+
+    /// Drop every image after a lost graphics device took their GPU
+    /// copies with it, and have the next kitty update prepare them
+    /// again from the terminal. See `kitty_rebuild`.
+    pub fn discardForRebuild(self: *State, alloc: Allocator) void {
+        self.deinit(alloc);
+        self.* = .empty;
+        self.kitty_rebuild = true;
     }
 
     /// Upload any images to the GPU that need to be uploaded,
@@ -271,7 +286,8 @@ pub const State = struct {
         // placement, such as deleting an image with no placements.
         if (t.screens.active.kitty_images.generation != self.kitty_storage_generation) return true;
 
-        // If our GPU copies are gone, we must rebuild them.
+        // After a lost device, update even with no images so that
+        // kittyUpdate clears the flag and animationWake stops waking us.
         if (self.kitty_rebuild) return true;
 
         return false;
@@ -1434,4 +1450,84 @@ test "kitty renderer uploads the current animation frame" {
         &.{ 0, 0, 255, 255 },
         entry.image.pending.dataSlice(),
     );
+}
+
+test "kitty renderer clears a rebuild after a lost device without images" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    var render_state: terminal.RenderState = .empty;
+    defer render_state.deinit(alloc);
+
+    // The terminal never had an image, so no generation will ask for
+    // an update.
+    try render_state.update(alloc, &t);
+    try testing.expect(!state.kittyRequiresUpdate(&t, &render_state));
+
+    // The flag alone must make the update run, or it is never cleared
+    // and the renderer keeps waking for it.
+    state.discardForRebuild(alloc);
+    try testing.expect(state.kitty_rebuild);
+    try testing.expect(state.kittyRequiresUpdate(&t, &render_state));
+    state.kittyUpdate(alloc, &t, &render_state);
+    try testing.expect(!state.kitty_rebuild);
+    try testing.expect(!state.kittyRequiresUpdate(&t, &render_state));
+}
+
+test "kitty renderer prepares the images again after a lost device" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    t.width_px = 30;
+    t.height_px = 30;
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    var render_state: terminal.RenderState = .empty;
+    defer render_state.deinit(alloc);
+
+    const storage = &t.screens.active.kitty_images;
+    const pixels = try alloc.alloc(u8, 3);
+    @memset(pixels, 0);
+    try storage.addImage(io, alloc, t.screens.active, .{
+        .id = 1,
+        .width = 1,
+        .height = 1,
+        .format = .rgb,
+        .data = .{ .complete = pixels },
+    });
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.cursor.page_pin.*,
+    );
+    try storage.addPlacement(io, alloc, t.screens.active, 1, 1, .{
+        .location = .{ .pin = pin },
+        .columns = 1,
+        .rows = 1,
+    });
+    try render_state.update(alloc, &t);
+    state.kittyUpdate(alloc, &t, &render_state);
+    try testing.expect(!state.kittyRequiresUpdate(&t, &render_state));
+
+    // Losing the device drops the image and its placement, while the
+    // terminal still has both.
+    state.discardForRebuild(alloc);
+    try testing.expectEqual(@as(usize, 0), state.images.count());
+    try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
+
+    // The next update prepares the image again for upload.
+    try testing.expect(state.kittyRequiresUpdate(&t, &render_state));
+    state.kittyUpdate(alloc, &t, &render_state);
+    try testing.expect(!state.kitty_rebuild);
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+    try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isPending());
+    try testing.expect(!state.kittyRequiresUpdate(&t, &render_state));
 }
