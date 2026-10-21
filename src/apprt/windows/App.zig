@@ -18,6 +18,8 @@ const Window = @import("Window.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
+const retry = @import("dialog.zig").retry;
+const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 
 const log = std.log.scoped(.win32);
 
@@ -433,6 +435,7 @@ pub const App = struct {
                 return err;
             };
         }
+        self.showConfigErrors();
 
         var msg: win32.MSG = undefined;
         while (!self.quit) {
@@ -544,8 +547,9 @@ pub const App = struct {
         return !self.ticking and self.prompt_depth == 0;
     }
 
-    /// Enter a modal prompt (`dialog.confirm`, `dialog.notice`) owned by
-    /// `owner`, or by no window.
+    /// Enter a modal prompt (`dialog.messageBox`, behind `dialog.confirm`,
+    /// `dialog.retry` and `dialog.notice`) owned by `owner`, or by no
+    /// window.
     ///
     /// No surface can be used while a prompt is open: ticks stop
     /// (`canReenterCore`), so every window's output pauses, and input does
@@ -584,6 +588,12 @@ pub const App = struct {
     }
 
     /// Leave the prompt entered by the matching `beginPrompt`.
+    ///
+    /// The outermost one wakes `run`. The prompt's message loop dispatched
+    /// the wakeups posted while it was open, with no tick (`canReenterCore`),
+    /// and a prompt `run` opened outside a tick (`showConfigErrors`) has no
+    /// tick after it to drain what they announced, nor to make what its
+    /// answer recorded in `requests`. Inside a tick this costs one more tick.
     pub fn endPrompt(self: *App) void {
         self.prompt_depth -= 1;
         if (self.prompt_depth > 0) return;
@@ -592,6 +602,7 @@ pub const App = struct {
             window.prompt_disabled = false;
             _ = win32.EnableWindow(window.hwnd, .TRUE);
         }
+        self.wakeup();
     }
 
     /// Whether a posted teardown may run now (`Surface.destroyPosted`,
@@ -1059,10 +1070,35 @@ pub const App = struct {
         }
     }
 
-    /// The full reload `reloadConfig` recorded.
+    /// The full reload `reloadConfig` recorded, and the errors in what it
+    /// read (`showConfigErrors`).
     fn reloadQueued(self: *App) void {
         self.reloadNow(.app, false) catch |err| {
             log.warn("failed to reload the configuration err={}", .{err});
+            return;
+        };
+        self.showConfigErrors();
+    }
+
+    /// GTK's configuration errors dialog: the configuration's diagnostics,
+    /// if it has any, and a reload if the user asks for one (Retry), which
+    /// `run` makes (`requests`) and which shows what errors remain. Called
+    /// where a prompt may open: by `run` after the initial window, and
+    /// after a full reload, so that a reload for a change of color scheme,
+    /// which reads no file, does not show the same errors again. No owner
+    /// of its own: `promptOwner` gives the prompt the window the user was
+    /// last in.
+    fn showConfigErrors(self: *App) void {
+        if (self.config._diagnostics.empty()) return;
+        const alloc = self.core_app.alloc;
+        const text = configErrorsText(alloc, &self.config) catch |err| {
+            log.warn("cannot show the configuration errors err={}", .{err});
+            return;
+        };
+        defer alloc.free(text);
+        if (!retry(self, null, text)) return;
+        self.requests.append(alloc, .reload) catch |err| {
+            log.warn("cannot record reloading the configuration err={}", .{err});
         };
     }
 
@@ -1791,6 +1827,36 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
 }
 
+/// The text of `showConfigErrors`: GTK's dialog's, then each diagnostic on
+/// a line of its own, at most `config_errors_shown` of them, then what the
+/// buttons do. A diagnostic can quote the file, so invalid UTF-8 becomes
+/// U+FFFD (`wideFromUtf8`), and so does a NUL, which MessageBoxW would
+/// take for the end of the text: a UTF-16 file, read as UTF-8, has one
+/// beside each ASCII character.
+fn configErrorsText(alloc: Allocator, config: *const Config) ![:0]u16 {
+    var text: std.Io.Writer.Allocating = .init(alloc);
+    defer text.deinit();
+    const w = &text.writer;
+    try w.writeAll("One or more configuration errors were found. Please review the " ++
+        "errors below, and either reload your configuration or ignore these errors.\n\n");
+    const items = config._diagnostics.items();
+    for (items[0..@min(items.len, config_errors_shown)]) |*diag| {
+        try diag.format(w);
+        try w.writeByte('\n');
+    }
+    if (items.len > config_errors_shown) {
+        try w.print("...and {d} more\n", .{items.len - config_errors_shown});
+    }
+    try w.writeAll("\nRetry reloads the configuration; Cancel ignores these errors.");
+    const wide = try wideFromUtf8(alloc, text.written());
+    std.mem.replaceScalar(u16, wide, 0, std.unicode.replacement_character);
+    return wide;
+}
+
+/// How many diagnostics `configErrorsText` lists: a message box does not
+/// scroll.
+const config_errors_shown = 20;
+
 /// Windows' light or dark mode for apps: the AppsUseLightTheme value that
 /// "Choose your default app mode" in Settings writes. Light when it cannot
 /// be read, Windows' own default.
@@ -2149,7 +2215,7 @@ test "win32: only an armed quit timer expires" {
     }
 }
 
-test "win32: a prompt disables the other windows until the outermost one ends" {
+test "win32: a prompt disables the other windows until the outermost one ends and wakes run" {
     // MessageBoxW disables only its owner; the rest is beginPrompt's.
     // Hidden top-level windows stand in for the frames.
     const testWindow = struct {
@@ -2194,6 +2260,29 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
     // Disabled by something else, so not the prompt's to enable.
     _ = win32.EnableWindow(off, .FALSE);
 
+    // A message-only window stands in for the app's, to see the wakeup.
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(app.msg_hwnd);
+    const woken = struct {
+        fn f(hwnd: win32.HWND) bool {
+            var msg: win32.MSG = undefined;
+            return win32.PeekMessageW(&msg, hwnd, WM_GHOSTTY_WAKEUP, WM_GHOSTTY_WAKEUP, win32.PM_REMOVE).toBool();
+        }
+    }.f;
+
     app.beginPrompt(owner);
     try std.testing.expect(win32.IsWindowEnabled(owner).toBool());
     try std.testing.expect(!win32.IsWindowEnabled(other).toBool());
@@ -2204,11 +2293,15 @@ test "win32: a prompt disables the other windows until the outermost one ends" {
     try std.testing.expect(win32.IsWindowEnabled(owner).toBool());
     app.endPrompt();
     try std.testing.expect(!win32.IsWindowEnabled(other).toBool());
+    try std.testing.expect(!woken(app.msg_hwnd));
 
+    // The outermost one's end wakes `run`, whose tick the prompt's own
+    // message loop could not make.
     app.endPrompt();
     try std.testing.expectEqual(0, app.prompt_depth);
     try std.testing.expect(win32.IsWindowEnabled(other).toBool());
     try std.testing.expect(!win32.IsWindowEnabled(off).toBool());
+    try std.testing.expect(woken(app.msg_hwnd));
 }
 
 test "win32: a prompt belongs to a top-level window" {
@@ -3806,4 +3899,38 @@ test "win32: a text file of no registered kind opens as a text file" {
     try std.testing.expect(hasProgram(ext(".exe")));
     try std.testing.expect(!hasProgram(ext(".ghostty-test-no-such-kind")));
     try std.testing.expect(!hasProgram(ext("")));
+}
+
+test "win32: the configuration errors list at most twenty diagnostics" {
+    const alloc = std.testing.allocator;
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    for (0..21) |i| try config.addDiagnosticFmt("bad line {d}", .{i});
+    try config.addDiagnosticFmt("bad \xff byte", .{});
+
+    const wide = try configErrorsText(alloc, &config);
+    defer alloc.free(wide);
+    const text = try std.unicode.utf16LeToUtf8Alloc(alloc, wide);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "One or more configuration errors were found."));
+    try std.testing.expect(std.mem.indexOf(u8, text, "bad line 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bad line 19\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bad line 20") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "...and 2 more\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "Cancel ignores these errors."));
+
+    // A byte that is not UTF-8, or a NUL, as a diagnostic quoting the file
+    // can hold, does not stop the list where MessageBoxW reads it: up to
+    // the first NUL.
+    var one: Config = try .default(alloc);
+    defer one.deinit();
+    try one.addDiagnosticFmt("bad \xff byte", .{});
+    try one.addDiagnosticFmt("bad \x00 byte", .{});
+    try one.addDiagnosticFmt("next", .{});
+    const wide_one = try configErrorsText(alloc, &one);
+    defer alloc.free(wide_one);
+    const text_one = try std.unicode.utf16LeToUtf8Alloc(alloc, std.mem.span(wide_one.ptr));
+    defer alloc.free(text_one);
+    try std.testing.expect(std.mem.indexOf(u8, text_one, "bad \u{FFFD} byte\nbad \u{FFFD} byte\nnext\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text_one, "Cancel ignores these errors."));
 }

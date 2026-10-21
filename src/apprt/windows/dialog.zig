@@ -24,35 +24,37 @@ pub const ConfirmDefault = enum {
 };
 
 /// A modal yes/no prompt. This is the only confirmation UI this runtime has.
-///
-/// MessageBoxW runs a nested message loop. `prompt_depth` tells every
-/// handler dispatched inside it that a core frame is probably beneath: no
-/// ticks and no surface teardown until it returns (`App.canReenterCore`).
-/// Output from every surface pauses while a prompt is open, so the prompt
-/// is modal to every window, not only to `hwnd` (`App.beginPrompt`).
 pub fn confirm(
     app: *App,
     hwnd: ?win32.HWND,
     text: win32.LPCWSTR,
     default: ConfirmDefault,
 ) bool {
-    const owner = app.promptOwner(hwnd);
-    app.beginPrompt(owner);
-    defer app.endPrompt();
-    return win32.MessageBoxW(
-        owner,
-        text,
-        L("Ghostty"),
-        win32.MB_OKCANCEL | win32.MB_ICONWARNING | default.style(),
-    ) == win32.IDOK;
+    return messageBox(app, hwnd, text, win32.MB_OKCANCEL | default.style()) == win32.IDOK;
 }
 
-/// The OK-only form of `confirm`, with the same nesting rules.
+/// The Retry/Cancel form of `confirm`: true for Retry, the default button.
+pub fn retry(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) bool {
+    return messageBox(app, hwnd, text, win32.MB_RETRYCANCEL) == win32.IDRETRY;
+}
+
+/// The OK-only form of `confirm`.
 pub fn notice(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) void {
+    _ = messageBox(app, hwnd, text, win32.MB_OK);
+}
+
+/// The prompt behind `confirm`, `retry` and `notice`, with `buttons`.
+///
+/// MessageBoxW runs a nested message loop. `prompt_depth` tells every
+/// handler dispatched inside it that a core frame is probably beneath: no
+/// ticks and no surface teardown until it returns (`App.canReenterCore`).
+/// Output from every surface pauses while a prompt is open, so the prompt
+/// is modal to every window, not only to `hwnd` (`App.beginPrompt`).
+fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();
-    _ = win32.MessageBoxW(owner, text, L("Ghostty"), win32.MB_OK | win32.MB_ICONWARNING);
+    return win32.MessageBoxW(owner, text, L("Ghostty"), buttons | win32.MB_ICONWARNING);
 }
 
 /// A failure that ends the process before any window exists. The

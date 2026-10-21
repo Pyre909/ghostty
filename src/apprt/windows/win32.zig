@@ -297,12 +297,14 @@ pub const CP_UTF8: UINT = 65001;
 
 pub const MB_OK: UINT = 0x00000000;
 pub const MB_OKCANCEL: UINT = 0x00000001;
+pub const MB_RETRYCANCEL: UINT = 0x00000005;
 pub const MB_ICONWARNING: UINT = 0x00000030;
 pub const MB_ICONERROR: UINT = 0x00000010;
 pub const MB_DEFBUTTON1: UINT = 0x00000000;
 pub const MB_DEFBUTTON2: UINT = 0x00000100;
 pub const MB_DEFMASK: UINT = 0x00000F00;
 pub const IDOK: c_int = 1;
+pub const IDRETRY: c_int = 4;
 
 pub const MB_ICONASTERISK: UINT = 0x00000040;
 
