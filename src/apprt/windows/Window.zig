@@ -249,17 +249,20 @@ fn handleMessage(
         },
 
         win32.WM_SIZE => {
-            const minimized = wparam == win32.SIZE_MINIMIZED;
             // A child window is not resized when its frame is minimized
             // or restored at the same size, so it never sees either:
-            // report the visibility from here. The core ignores repeats.
-            var it = self.tree.iterator();
-            while (it.next()) |entry| entry.view.occlusionChanged(!minimized);
-
+            // report the visibility from here, and from `relayout`, which
+            // also knows which terminals a zoom hides. The core ignores
+            // repeats.
+            //
             // A minimized frame reports a 0x0 client area. The terminals
             // keep their sizes, since the core clamps the grid to at least
             // 1x1 and would reflow every line to one column and back.
-            if (minimized) return 0;
+            if (wparam == win32.SIZE_MINIMIZED) {
+                var it = self.tree.iterator();
+                while (it.next()) |entry| entry.view.occlusionChanged(false);
+                return 0;
+            }
 
             // Each terminal gets its WM_SIZE synchronously, which resizes
             // its core.
@@ -495,9 +498,7 @@ pub fn split(
         .up => .up,
     };
 
-    var place: win32.RECT = undefined;
-    if (!win32.GetWindowRect(parent.hwnd, &place).toBool()) return App.Error.Win32CallFailed;
-    if (!self.toClient(&place)) return App.Error.Win32CallFailed;
+    const place = self.tiledPlace(parent) orelse return App.Error.Win32CallFailed;
     const cell = parent.core_surface.size.cell;
     const min = std.math.lossyCast(i32, if (where == .left or where == .right) cell.width else cell.height);
     const rect = newPaneArea(
@@ -519,11 +520,44 @@ pub fn split(
     return surface;
 }
 
+/// Where `pane` is in the client area with no zoom, as `layout` tiles it.
+/// A split divides that place, since it ends any zoom (`SplitTree.split`),
+/// whereas a zoomed terminal's window covers the whole client area.
+pub fn tiledPlace(self: *Window, pane: *Surface) ?win32.RECT {
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return null;
+    var tiled = self.tree;
+    tiled.zoomed = null;
+    var found: PlaceOf = .{ .target = pane };
+    layout(&tiled, client, dividerWidth(dpiOf(self.app, self.hwnd)), &found);
+    return found.place;
+}
+
+/// What `tiledPlace` asks `layout` for: one terminal's place.
+const PlaceOf = struct {
+    target: *Surface,
+    place: ?win32.RECT = null,
+
+    pub fn pane(self: *PlaceOf, surface: *Surface, rect: win32.RECT) void {
+        if (surface == self.target) self.place = rect;
+    }
+
+    pub fn divider(self: *PlaceOf, rect: win32.RECT) void {
+        _ = self;
+        _ = rect;
+    }
+
+    pub fn hidden(self: *PlaceOf, surface: *Surface) void {
+        _ = self;
+        _ = surface;
+    }
+};
+
 /// Show a terminal `split` opened, now that the app owns it, with room
 /// made for it, and give it the focus.
 pub fn showPane(self: *Window, surface: *Surface) void {
+    // The layout shows it (`Placer.pane`).
     self.relayout();
-    _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
     self.giveFocus(surface);
 }
 
@@ -673,6 +707,35 @@ fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
     return true;
 }
 
+/// `toggle_split_zoom`: make `from` fill the window alone, or end the
+/// zoom, as GTK's `split-tree.zoom` does. Never inside a core frame: the
+/// layout sends WM_SIZE (`App.requests`).
+pub fn toggleZoom(self: *Window, from: *Surface) void {
+    if (self.tree.zoomed != null) {
+        self.tree.zoom(null);
+    } else {
+        self.tree.zoom(self.tree.locate(from) orelse return);
+    }
+    self.relayout();
+}
+
+/// Give the focus to `surface`, which a `goto_split` chose. A zoom ends
+/// first, as on GTK, or with `split-preserve-zoom = navigation` moves to
+/// `surface` (`goto` in src/apprt/gtk/class/split_tree.zig), so that the
+/// focus never goes to a hidden terminal. Never inside a core frame: the
+/// layout sends WM_SIZE.
+pub fn focusFromGoto(self: *Window, surface: *Surface) void {
+    if (self.tree.zoomed != null) {
+        if (self.app.config.@"split-preserve-zoom".navigation) {
+            if (self.tree.locate(surface)) |handle| self.tree.zoom(handle);
+        } else {
+            self.tree.zoom(null);
+        }
+        self.relayout();
+    }
+    self.giveFocus(surface);
+}
+
 /// Make `surface` the window's focused terminal and give it the keyboard
 /// focus. Only the active window sets the keyboard focus at once; another
 /// one would be activated by it, so it hands the focus over when it is
@@ -794,18 +857,32 @@ const Placer = struct {
 
     // Not SWP_NOCOPYBITS: it would repaint a terminal on every step of a
     // shrink, which the class styles avoid (`App.registerClasses`), and a
-    // flip-model swap chain moves with its window.
-    const flags = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE;
+    // flip-model swap chain moves with its window. A terminal placed is
+    // shown, as one a zoom hid comes back when the zoom ends.
+    const flags = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_SHOWWINDOW;
+    const hide_flags = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOMOVE |
+        win32.SWP_NOSIZE | win32.SWP_HIDEWINDOW;
 
     pub fn pane(self: *Placer, surface: *Surface, rect: win32.RECT) void {
+        surface.occlusionChanged(true);
+        self.place(surface.hwnd, rect, flags);
+    }
+
+    /// A terminal a zoom hides (`layout`): its core stops drawing.
+    pub fn hidden(self: *Placer, surface: *Surface) void {
+        surface.occlusionChanged(false);
+        self.place(surface.hwnd, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, hide_flags);
+    }
+
+    fn place(self: *Placer, hwnd: win32.HWND, rect: win32.RECT, how: win32.UINT) void {
         if (self.dropped) return;
         const w = rect.right - rect.left;
         const h = rect.bottom - rect.top;
         if (self.batch) |batch| {
-            self.batch = win32.DeferWindowPos(batch, surface.hwnd, null, rect.left, rect.top, w, h, flags);
+            self.batch = win32.DeferWindowPos(batch, hwnd, null, rect.left, rect.top, w, h, how);
             self.dropped = self.batch == null;
         } else {
-            _ = win32.SetWindowPos(surface.hwnd, null, rect.left, rect.top, w, h, flags);
+            _ = win32.SetWindowPos(hwnd, null, rect.left, rect.top, w, h, how);
         }
     }
 
@@ -826,10 +903,21 @@ const Placer = struct {
 /// layout without dividers, but normalized to f16, which is up to two
 /// pixels off at 3840 pixels across.
 ///
+/// A zoomed terminal (`toggleZoom`) fills `area` alone, and every other
+/// one is `ctx.hidden(view)`, with no dividers.
+///
 /// Generic over the tree so that tests can lay out a tree of their own.
 pub fn layout(tree: anytype, area: win32.RECT, divider: i32, ctx: anytype) void {
     if (tree.isEmpty()) return;
-    layoutNode(tree, .root, area, divider, ctx);
+    const zoomed = tree.zoomed orelse {
+        layoutNode(tree, .root, area, divider, ctx);
+        return;
+    };
+    var it = tree.iterator();
+    while (it.next()) |entry| {
+        if (entry.handle != zoomed) ctx.hidden(entry.view);
+    }
+    layoutNode(tree, zoomed, area, divider, ctx);
 }
 
 fn layoutNode(
@@ -1337,6 +1425,8 @@ const TestLayout = struct {
     pane_count: usize = 0,
     dividers: [8]win32.RECT = undefined,
     divider_count: usize = 0,
+    hiddens: [8]*TestPane = undefined,
+    hidden_count: usize = 0,
 
     const Pane = struct { view: *TestPane, rect: win32.RECT };
 
@@ -1348,6 +1438,11 @@ const TestLayout = struct {
     pub fn divider(self: *TestLayout, rect: win32.RECT) void {
         self.dividers[self.divider_count] = rect;
         self.divider_count += 1;
+    }
+
+    pub fn hidden(self: *TestLayout, view: *TestPane) void {
+        self.hiddens[self.hidden_count] = view;
+        self.hidden_count += 1;
     }
 
     fn rectOf(self: *const TestLayout, view: *const TestPane) win32.RECT {
@@ -1488,6 +1583,29 @@ test "win32: a divider is a pixel at 96 DPI, scaled to the nearest pixel" {
     }) |c| {
         try std.testing.expectEqual(@as(i32, @intCast(c[1])), dividerWidth(c[0]));
     }
+}
+
+test "win32: a zoomed terminal fills the window alone" {
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a' };
+    var b: TestPane = .{ .name = 'b' };
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    var only_b: TestTree = try .init(alloc, &b);
+    defer only_b.deinit();
+    var tree = try only_a.split(alloc, .root, .right, 0.5, &only_b);
+    defer tree.deinit();
+    tree.zoom(tree.locate(&b).?);
+
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 100, .bottom = 50 };
+    var got: TestLayout = .{};
+    layout(&tree, area, 2, &got);
+    try std.testing.expectEqual(1, got.pane_count);
+    try std.testing.expectEqual(&b, got.panes[0].view);
+    try std.testing.expectEqual(area, got.panes[0].rect);
+    try std.testing.expectEqual(0, got.divider_count);
+    try std.testing.expectEqual(1, got.hidden_count);
+    try std.testing.expectEqual(&a, got.hiddens[0]);
 }
 
 test "win32: split terminals and their dividers tile the window" {

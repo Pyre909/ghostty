@@ -269,6 +269,8 @@ pub const SWP_NOMOVE: UINT = 0x0002;
 pub const SWP_NOZORDER: UINT = 0x0004;
 pub const SWP_NOACTIVATE: UINT = 0x0010;
 pub const SWP_FRAMECHANGED: UINT = 0x0020;
+pub const SWP_SHOWWINDOW: UINT = 0x0040;
+pub const SWP_HIDEWINDOW: UINT = 0x0080;
 pub const SWP_NOOWNERZORDER: UINT = 0x0200;
 
 /// A resource name that may be an integer id (MAKEINTRESOURCEW): the

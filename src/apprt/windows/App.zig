@@ -222,6 +222,10 @@ pub const App = struct {
         /// (`requestMaximize`).
         maximize: *CoreSurface,
 
+        /// Zoom the focused terminal of the window of this surface, or end
+        /// the zoom (`toggleSplitZoom`).
+        zoom: *CoreSurface,
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -817,6 +821,7 @@ pub const App = struct {
             .goto_split => self.gotoSplit(target, value),
             .resize_split => self.resizeSplit(target, value),
             .equalize_splits => self.equalizeSplits(target),
+            .toggle_split_zoom => self.toggleSplitZoom(target),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1245,7 +1250,7 @@ pub const App = struct {
             .resize => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
-            .equalize, .fullscreen, .maximize => |from| {
+            .equalize, .fullscreen, .maximize, .zoom => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .reload, .dropped => {},
@@ -1378,6 +1383,27 @@ pub const App = struct {
         return true;
     }
 
+    /// `.toggle_split_zoom`: recorded for `run`, as `resizeSplit` is, since
+    /// a zoom lays the terminals out again (`Window.toggleZoom`). As on
+    /// GTK it is not performed for a single terminal, unless a split for
+    /// its window is still to come, so that the key reaches the terminal.
+    fn toggleSplitZoom(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => {
+                log.warn("toggle_split_zoom to app is unexpected", .{});
+                return false;
+            },
+            .surface => |v| v,
+        };
+        const window = from.rt_surface.window;
+        if (!window.tree.isSplit() and !self.splitQueuedIn(window)) return false;
+        self.requests.append(self.core_app.alloc, .{ .zoom = from }) catch |err| {
+            log.warn("cannot record zooming the split err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     /// Give each window the focus move a `goto_split` chose in it, if any
     /// (`Window.pending_focus`). Called by a terminal's key handler once the
     /// core's key callback has returned (`Surface.handleMessage`), and by
@@ -1391,7 +1417,7 @@ pub const App = struct {
             const surface = window.pending_focus orelse continue;
             window.pending_focus = null;
             // Still live: a teardown would have cleared it (`forgetClosing`).
-            window.giveFocus(surface);
+            window.focusFromGoto(surface);
         }
     }
 
@@ -1444,6 +1470,11 @@ pub const App = struct {
                     const window = from.rt_surface.window;
                     if (window.fullscreen == null) window.toggleMaximize();
                 },
+                // From the focused terminal, as `resize` starts.
+                .zoom => |from| {
+                    const window = from.rt_surface.window;
+                    window.toggleZoom(window.focused orelse from.rt_surface);
+                },
                 .dropped => {},
             }
         }
@@ -1460,7 +1491,7 @@ pub const App = struct {
         const surface = window.goto(start, to) orelse return;
         if (surface.liveCore() == null) return;
         // No core frame is on the stack here, unlike in gotoSplit.
-        window.giveFocus(surface);
+        window.focusFromGoto(surface);
     }
 
     /// What a new terminal takes from `parent`, the surface that asked for
@@ -2260,6 +2291,13 @@ fn clientRect(hwnd: win32.HWND) !win32.RECT {
     var rect: win32.RECT = undefined;
     if (!win32.GetClientRect(hwnd, &rect).toBool()) return error.TestUnexpectedResult;
     return rect;
+}
+
+/// For tests: whether a window is shown itself, whatever its parent is
+/// (IsWindowVisible is false for every child of a hidden frame).
+fn shown(hwnd: win32.HWND) bool {
+    const visible: isize = win32.WS_VISIBLE;
+    return win32.GetWindowLongPtrW(hwnd, win32.GWL_STYLE) & visible != 0;
 }
 
 fn windowRect(hwnd: win32.HWND) !win32.RECT {
@@ -3536,4 +3574,89 @@ test "win32: a maximized window comes back from fullscreen maximized" {
     app.createRequested();
     try std.testing.expectEqual(null, window.fullscreen);
     try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
+}
+
+test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
+    // A zoom lays the terminals out again, whose WM_SIZE would re-enter the
+    // core inside its key callback, so it is recorded and made by
+    // createRequested; a single terminal's key reaches the terminal. A
+    // goto_split ends the zoom, or moves it with split-preserve-zoom =
+    // navigation, so that the focus never goes to a hidden terminal.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const alone = try testFrame(&app);
+    const only = try testPane(&app, alone);
+    alone.tree = try .init(alloc, only);
+    try std.testing.expect(!try app.performAction(.{ .surface = &only.core_surface }, .toggle_split_zoom, {}));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Unless a split for its window is still to come, as in a chain.
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .new_split, .right));
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .toggle_split_zoom, {}));
+    try std.testing.expectEqual(2, app.requests.items.len);
+    app.requests.clearRetainingCapacity();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.focused = a;
+    window.relayout();
+    const split_a = try paneRect(window, a);
+
+    // Recorded, then made from the focused terminal: it fills the frame
+    // and the other is hidden.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .toggle_split_zoom, {}));
+    try std.testing.expectEqual(split_a, try paneRect(window, a));
+    app.createRequested();
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, a));
+    try std.testing.expect(!shown(b.hwnd));
+
+    // A split from it divides its place in the tiling, not the window it
+    // covers: the split ends the zoom.
+    try std.testing.expectEqual(split_a, window.tiledPlace(a).?);
+
+    // And back.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_split_zoom, {}));
+    app.createRequested();
+    try std.testing.expectEqual(split_a, try paneRect(window, a));
+    try std.testing.expect(shown(b.hwnd));
+
+    // A goto_split from the zoomed terminal ends the zoom. The target is
+    // live only for the action, which refuses one that is not; no core
+    // call is made on it.
+    for ([_]bool{ false, true }) |navigation| {
+        app.config.@"split-preserve-zoom".navigation = navigation;
+        window.focused = a;
+        try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_split_zoom, {}));
+        app.createRequested();
+        b.core_state = .live;
+        const goes = try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right);
+        b.core_state = .none;
+        try std.testing.expect(goes);
+        app.applyPendingFocus();
+        try std.testing.expect(window.focused == b);
+        try std.testing.expect(shown(b.hwnd));
+        if (navigation) {
+            // The zoom moved to it.
+            try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, b));
+            try std.testing.expect(!shown(a.hwnd));
+            window.toggleZoom(b);
+        } else {
+            try std.testing.expectEqual(split_a, try paneRect(window, a));
+        }
+    }
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_split_zoom, {}));
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
 }

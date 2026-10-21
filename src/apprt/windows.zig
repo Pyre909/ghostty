@@ -36,11 +36,13 @@
 //!
 //! A window holds its terminals in a split tree, laid out over its client
 //! area (`Window`). `.new_window`, `.new_split`, `.resize_split`,
-//! `.equalize_splits`, `.toggle_fullscreen`, `.toggle_maximize` and a full
-//! `.reload_config` are recorded, and carried out by `App.run` once the
-//! core frame that asked has returned (`App.requests`); `.goto_split`
-//! moves the focus once the core's key callback has returned
-//! (`Window.pending_focus`), or after such a request when it follows one.
+//! `.equalize_splits`, `.toggle_split_zoom`, `.toggle_fullscreen`,
+//! `.toggle_maximize` and a full `.reload_config` are recorded, and
+//! carried out by `App.run` once the core frame that asked has returned
+//! (`App.requests`); `.goto_split` moves the focus once the core's key
+//! callback has returned (`Window.pending_focus`), or after such a request
+//! when it follows one, and ends a zoom or moves it
+//! (`Window.focusFromGoto`).
 //! The process quits when its last window closes, whatever
 //! `quit-after-last-window-closed` says: with no window left there is
 //! nothing to open another from (`App.setQuitTimer`).
@@ -48,7 +50,7 @@
 //! ## What is still missing
 //!
 //! Not implemented: tabs (a window is its own one tab, so `close_tab:this`
-//! closes it), zooming splits and dragging their dividers, a context menu,
+//! closes it), dragging the dividers between splits, a context menu,
 //! link previews and precision-touchpad scrolling. Without a menu, a
 //! right click with the default `right-click-action` only selects the word
 //! or link under the pointer.
