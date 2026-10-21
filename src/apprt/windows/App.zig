@@ -720,6 +720,7 @@ pub const App = struct {
 
             .set_title => self.setTitle(target, value),
             .close_window => self.closeWindow(target),
+            .close_tab => self.closeTab(target, value),
             .present_terminal => presentTerminal(target),
             .toggle_maximize => toggleMaximize(target),
             .render => render(target),
@@ -806,6 +807,19 @@ pub const App = struct {
                 v.rt_surface.window.requestClose();
                 break :close true;
             },
+        };
+    }
+
+    /// `.close_tab`: without tabs a window is its own one tab, so `.this`
+    /// closes the window as `close_window` does. That is what the default
+    /// Ctrl+Shift+W does on this platform (`Config.Keybinds.init`, where it
+    /// replaced `close_surface`), as it closes a tab of one window on GTK.
+    /// `.other` and `.right` name other tabs, which there are not: `false`,
+    /// unsupported, as for every tab action until tabs exist.
+    fn closeTab(self: *App, target: apprt.Target, mode: apprt.action.CloseTabMode) bool {
+        return switch (mode) {
+            .this => self.closeWindow(target),
+            .other, .right => false,
         };
     }
 
@@ -2701,6 +2715,54 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
         Surface.wndProc(right.hwnd, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), lparam),
     );
     try std.testing.expect(window.focused == right);
+}
+
+test "win32: close_tab closes the window, its one tab" {
+    // Without tabs a window is its own one tab, so close_tab:this, the
+    // default Ctrl+Shift+W, closes it as close_window does: one teardown
+    // is posted to the frame, and it frees the window and its terminals.
+    // The other modes name tabs there are not: unsupported, so the action
+    // reports not performed (a `performable:` binding then passes its key
+    // to the terminal), and nothing is posted.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ a, b });
+    window.focused = a;
+
+    var msg: win32.MSG = undefined;
+    for ([_]apprt.action.CloseTabMode{ .other, .right }) |mode| {
+        try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .close_tab, mode));
+    }
+    try std.testing.expect(!win32.PeekMessageW(
+        &msg,
+        window.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_NOREMOVE,
+    ).toBool());
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .close_tab, .this));
+    try std.testing.expect(window.closing);
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        window.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
 }
 
 test "win32: closing a window takes every terminal in it at once" {

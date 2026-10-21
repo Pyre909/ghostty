@@ -46,10 +46,11 @@
 //!
 //! ## What is still missing
 //!
-//! Not implemented: tabs, zooming splits and dragging their dividers, a
-//! context menu, link previews and precision-touchpad scrolling. Without a
-//! menu, a right click with the default `right-click-action` only selects
-//! the word or link under the pointer.
+//! Not implemented: tabs (a window is its own one tab, so `close_tab:this`
+//! closes it), zooming splits and dragging their dividers, a context menu,
+//! link previews and precision-touchpad scrolling. Without a menu, a
+//! right click with the default `right-click-action` only selects the word
+//! or link under the pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for `.mouse_over_link` and every other action it does not
 //! name; this runtime never claims an action it did not carry out.
