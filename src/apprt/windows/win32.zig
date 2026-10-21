@@ -494,16 +494,54 @@ pub extern "user32" fn EndDeferWindowPos(batch: HDWP) callconv(.winapi) BOOL;
 pub extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HCURSOR;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadiconw
 pub extern "user32" fn LoadIconW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HICON;
-/// Returns an HINSTANCE in name only: a value of 32 or below is an
-/// SE_ERR_* code (0 means out of memory), so it is read as an integer.
-pub extern "shell32" fn ShellExecuteW(
-    hwnd: ?HWND,
-    operation: ?LPCWSTR,
-    file: LPCWSTR,
-    parameters: ?LPCWSTR,
-    directory: ?LPCWSTR,
-    show: c_int,
-) callconv(.winapi) usize;
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlwapi/nf-shlwapi-assocquerystringw
+pub extern "shlwapi" fn AssocQueryStringW(
+    flags: DWORD,
+    str: DWORD,
+    assoc: LPCWSTR,
+    extra: ?LPCWSTR,
+    out: ?[*]u16,
+    out_len: *DWORD,
+) callconv(.winapi) HRESULT;
+/// ASSOCF_INIT_IGNOREUNKNOWN: fail for a kind no program is registered
+/// for, rather than answer with the shell's Unknown type (OpenWith).
+pub const ASSOCF_INIT_IGNOREUNKNOWN: DWORD = 0x00000400;
+/// ASSOCF_NOTRUNCATE: fail with E_POINTER for a string the buffer cannot
+/// hold, rather than cut it short.
+pub const ASSOCF_NOTRUNCATE: DWORD = 0x00000020;
+pub const ASSOCSTR_COMMAND: DWORD = 1;
+pub const ASSOCSTR_PROGID: DWORD = 20;
+/// Takes a path of at most MAX_PATH characters, and returns the address
+/// of its extension's '.' or of its terminating NUL.
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlwapi/nf-shlwapi-pathfindextensionw
+pub extern "shlwapi" fn PathFindExtensionW(path: LPCWSTR) callconv(.winapi) LPCWSTR;
+pub const MAX_PATH = w.MAX_PATH;
+/// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow
+pub const SHELLEXECUTEINFOW = extern struct {
+    cbSize: DWORD,
+    fMask: DWORD,
+    hwnd: ?HWND = null,
+    lpVerb: ?LPCWSTR = null,
+    lpFile: ?LPCWSTR = null,
+    lpParameters: ?LPCWSTR = null,
+    lpDirectory: ?LPCWSTR = null,
+    nShow: c_int,
+    hInstApp: ?HINSTANCE = null,
+    lpIDList: ?*anyopaque = null,
+    lpClass: ?LPCWSTR = null,
+    hkeyClass: ?HKEY = null,
+    dwHotKey: DWORD = 0,
+    hIconOrMonitor: ?HANDLE = null,
+    hProcess: ?HANDLE = null,
+};
+pub const SEE_MASK_CLASSNAME: DWORD = 0x00000001;
+/// SEE_MASK_NOASYNC: finish the launch, a DDE conversation included,
+/// before returning; required of a thread with no message loop or one
+/// that ends soon after the call.
+pub const SEE_MASK_NOASYNC: DWORD = 0x00000100;
+pub const SEE_MASK_FLAG_NO_UI: DWORD = 0x00000400;
+/// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw
+pub extern "shell32" fn ShellExecuteExW(info: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
 pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
 pub const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
 pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;

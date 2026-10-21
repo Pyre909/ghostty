@@ -58,10 +58,12 @@
 //! for `.mouse_over_link` and every other action it does not
 //! name; this runtime never claims an action it did not carry out.
 //!
-//! Links open through the shell (`ShellExecuteW`). An OSC 8 target and a
-//! link found in the terminal's text are program output, so only a
-//! well-formed http, https or mailto link is opened from one; anything else
-//! is refused with a notice (`App.linkRefused`).
+//! Links open through the shell's `open` verb (`App.openLink`); a text
+//! file of a kind no program is registered for opens with the program for
+//! text files, as macOS falls back to its default text editor. An OSC 8
+//! target and a link found in the terminal's text are program output, so
+//! only a well-formed http, https or mailto link is opened from one;
+//! anything else is refused with a notice (`App.linkRefused`).
 //!
 //! An IME composition is drawn inline as the core's preedit. The IME's own
 //! composition window is therefore turned off (WM_IME_SETCONTEXT), and

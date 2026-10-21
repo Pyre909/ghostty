@@ -807,6 +807,7 @@ pub const App = struct {
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
             .open_url => openUrl(target, value),
+            .open_config => self.openConfig(value),
             .initial_size => initialSize(target, value),
             .reload_config => try self.reloadConfig(target, value),
             .config_change => try self.configChange(target, value),
@@ -977,9 +978,8 @@ pub const App = struct {
     /// holding its renderer lock (`Surface.mouseButtonCallback`), and the next
     /// mouse move dispatched on this thread would take that lock again in
     /// cursorPosCallback. The notice is therefore posted and shown once
-    /// this frame has returned, and ShellExecuteW, which blocks until the
-    /// handler has started and may dispatch messages while it waits, runs
-    /// on its own thread, as the core's opener does (src/os/open.zig).
+    /// this frame has returned, and the link is opened on a thread of its
+    /// own (`openLink`).
     fn openUrl(target: apprt.Target, value: apprt.action.OpenUrl) bool {
         const hwnd = switch (target) {
             .app => return false,
@@ -992,17 +992,28 @@ pub const App = struct {
             return true;
         }
 
-        const wide = std.unicode.utf8ToUtf16LeAllocZ(open_url_alloc, value.url) catch |err| {
-            log.warn("open url: cannot convert the target err={}", .{err});
+        return openLink(value.kind, value.url);
+    }
+
+    /// `.open_config` (Ctrl+, by default): open the configuration file,
+    /// created empty if there is none (`configpkg.edit.openPath`), with
+    /// the program Windows has for it, or else the one it has for text
+    /// files, as macOS opens it with the default text editor when no
+    /// program claims `.ghostty` (`openUrlThread`). Only `os_open`:
+    /// `new_window`, which runs $EDITOR in a new window, is GTK's alone, as
+    /// the action's documentation says.
+    fn openConfig(self: *App, value: apprt.action.OpenConfig) bool {
+        switch (value) {
+            .os_open => {},
+            .new_window => return false,
+        }
+        const alloc = self.core_app.alloc;
+        const path = configpkg.edit.openPath(alloc) catch |err| {
+            log.warn("cannot find the configuration file to open err={}", .{err});
             return false;
         };
-        const thread = std.Thread.spawn(.{}, openUrlThread, .{wide}) catch |err| {
-            open_url_alloc.free(wide);
-            log.warn("open url: cannot start the opener thread err={}", .{err});
-            return false;
-        };
-        thread.detach();
-        return true;
+        defer alloc.free(path);
+        return openLink(.text, path);
     }
 
     /// `.reload_config`. A full reload reads the configuration from disk
@@ -1814,24 +1825,126 @@ fn coreScheme(config: *const Config, system: apprt.ColorScheme) apprt.ColorSchem
     return if (Window.frameDark(config, system)) .dark else .light;
 }
 
-/// The allocator of the link `openUrl` hands to its opener thread, which
-/// frees it. ShellExecuteW blocks until the handler has started, which can
-/// be a cold browser start or the shell's app picker, and the detached
-/// thread can outlive App.terminate and global.deinit, which deinitializes
-/// the debug allocator. So the link is allocated with an allocator of the
-/// process rather than `core_app.alloc`, as no allocator of the app is
-/// known to outlive the thread.
+/// The allocator of the link `openLink` hands to its opener thread, which
+/// frees it. The detached thread can outlive App.terminate and
+/// global.deinit, which deinitializes the debug allocator, so the link is
+/// allocated with an allocator of the process rather than
+/// `core_app.alloc`, as no allocator of the app is known to outlive the
+/// thread.
 const open_url_alloc = std.heap.smp_allocator;
 
+/// Open `url` with the shell's `open` verb on a thread of its own
+/// (`openUrlThread`): ShellExecuteExW blocks until the handler has
+/// started, which can be a cold browser start or the shell's app picker,
+/// and may dispatch messages while it waits, so it never runs on the UI
+/// thread, as the core's opener does not either (src/os/open.zig).
+fn openLink(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(open_url_alloc, url) catch |err| {
+        log.warn("cannot convert the {t} link to open err={}", .{ kind, err });
+        return false;
+    };
+    const thread = std.Thread.spawn(.{}, openUrlThread, .{ wide, kind == .text }) catch |err| {
+        open_url_alloc.free(wide);
+        log.warn("cannot start the opener thread for a {t} link err={}", .{ kind, err });
+        return false;
+    };
+    thread.detach();
+    return true;
+}
+
 /// Opens `wide` with the shell, then frees it. COM is initialized for the
-/// thread first, as ShellExecuteW documents: a shell extension it delegates
-/// to may need a single-threaded apartment.
-fn openUrlThread(wide: [:0]u16) void {
+/// thread first, as ShellExecuteExW documents: a shell extension it
+/// delegates to may need a single-threaded apartment. The thread has no
+/// message loop and ends when the call returns, so the call finishes the
+/// launch, a DDE conversation included, before it returns
+/// (SEE_MASK_NOASYNC), as SHELLEXECUTEINFOW's remarks require of such a
+/// thread; it exists only to wait.
+///
+/// A `text` file, a path the core resolved itself, whose kind no program
+/// is registered for opens with the program for text files. The shell's
+/// `open` would hand it to its Unknown type, OpenWith, and report success
+/// with nothing shown, so this is decided beforehand (`hasProgram`).
+fn openUrlThread(wide: [:0]u16, text: bool) void {
     defer open_url_alloc.free(wide);
     const hr = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED | win32.COINIT_DISABLE_OLE1DDE);
     defer if (hr >= 0) win32.CoUninitialize();
-    const rc = win32.ShellExecuteW(null, L("open"), wide.ptr, null, null, win32.SW_SHOWNORMAL);
-    if (rc <= 32) log.warn("ShellExecuteW failed code={}", .{rc});
+
+    var info: win32.SHELLEXECUTEINFOW = .{
+        .cbSize = @sizeOf(win32.SHELLEXECUTEINFOW),
+        .fMask = win32.SEE_MASK_NOASYNC,
+        .lpVerb = L("open"),
+        .lpFile = wide.ptr,
+        .nShow = win32.SW_SHOWNORMAL,
+    };
+    var progid: ProgId = undefined;
+    if (text and !hasProgram(textPathExtension(wide))) {
+        if (textProgId(&progid)) |class| {
+            info.fMask |= win32.SEE_MASK_CLASSNAME | win32.SEE_MASK_FLAG_NO_UI;
+            info.lpClass = class;
+        }
+    }
+    if (!win32.ShellExecuteExW(&info).toBool()) {
+        log.warn("ShellExecuteExW failed err={}", .{win32.GetLastError()});
+    }
+}
+
+/// The extension of the file a `.text` link names, with its dot, or the
+/// empty string for one with none, such as the legacy `config`. Its
+/// separators are made backslashes first, in place: a path the core put
+/// together can mix them (the configuration's is joined with '/'), and
+/// ShellExecuteExW finds no file by such a path, while PathFindExtensionW
+/// takes only a backslash for a separator, and would take a dot in a
+/// directory's name for the extension. It takes a path of at most
+/// MAX_PATH characters, so a longer one has none here.
+fn textPathExtension(path: [:0]u16) [*:0]const u16 {
+    std.mem.replaceScalar(u16, path, '/', '\\');
+    if (path.len >= win32.MAX_PATH) return path[path.len..].ptr;
+    return win32.PathFindExtensionW(path.ptr);
+}
+
+/// A ProgID, for `textProgId`. One is at most 39 characters
+/// (https://learn.microsoft.com/en-us/windows/win32/com/-progid--key); the
+/// rest is room for one registered against that rule, and a longer one
+/// fails rather than is cut short (ASSOCF_NOTRUNCATE).
+const ProgId = [256:0]u16;
+
+/// The ProgID that opens text files for this user, in `buf`, or null,
+/// logged. ASSOCSTR_PROGID follows the user's default, the choice made in
+/// Settings; `.txt`'s own class key does not, and on Windows 11 names the
+/// legacy Notepad (txtfilelegacy), which ShellExecuteExW cannot open with
+/// where only the Store Notepad is installed.
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlwapi/ne-shlwapi-assocstr
+fn textProgId(buf: *ProgId) ?[*:0]const u16 {
+    var size: win32.DWORD = buf.len + 1;
+    const hr = win32.AssocQueryStringW(
+        win32.ASSOCF_INIT_IGNOREUNKNOWN | win32.ASSOCF_NOTRUNCATE,
+        win32.ASSOCSTR_PROGID,
+        L(".txt"),
+        null,
+        buf,
+        &size,
+    );
+    if (hr < 0) {
+        log.warn("no program for text files hr=0x{x}", .{@as(u32, @bitCast(hr))});
+        return null;
+    }
+    return buf;
+}
+
+/// Whether a program is registered to open files with `extension`, the
+/// shell's Unknown type left out; none is for no extension.
+fn hasProgram(extension: [*:0]const u16) bool {
+    if (extension[0] == 0) return false;
+    var size: win32.DWORD = 0;
+    const hr = win32.AssocQueryStringW(
+        win32.ASSOCF_INIT_IGNOREUNKNOWN,
+        win32.ASSOCSTR_COMMAND,
+        extension,
+        L("open"),
+        null,
+        &size,
+    );
+    return hr >= 0;
 }
 
 /// Whether `openUrl` refuses a link: OSC 8 targets and links found in the
@@ -3659,4 +3772,38 @@ test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_split_zoom, {}));
     app.forgetClosing(&a.core_surface);
     try std.testing.expect(app.requests.items[0] == .dropped);
+}
+
+test "win32: open_config's new_window is not handled" {
+    // `new_window`, $EDITOR in a new window, is GTK's alone, as it was
+    // before open_config was handled; `os_open` starts a program, so only
+    // the VM scenario runs it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try std.testing.expect(!try app.performAction(.app, .open_config, .new_window));
+}
+
+test "win32: a text file of no registered kind opens as a text file" {
+    const ext = std.unicode.utf8ToUtf16LeStringLiteral;
+    // The configuration's path is joined with '/': its separators are made
+    // backslashes before its extension is looked for.
+    var path = ext("C:\\Users\\me/.config/ghostty/config.ghostty").*;
+    try std.testing.expectEqualSlices(u16, ext(".ghostty"), std.mem.span(textPathExtension(&path)));
+    try std.testing.expectEqualSlices(u16, ext("C:\\Users\\me\\.config\\ghostty\\config.ghostty"), &path);
+    // The legacy file has none; a dot in a directory's name is not one.
+    var legacy = ext("C:\\Users\\me.x/ghostty/config").*;
+    try std.testing.expectEqualSlices(u16, ext(""), std.mem.span(textPathExtension(&legacy)));
+    // Nor does a path PathFindExtensionW does not take.
+    var long: [win32.MAX_PATH + 4:0]u16 = @splat('a');
+    @memcpy(long[long.len - 4 ..], ext(".txt"));
+    try std.testing.expectEqualSlices(u16, ext(""), std.mem.span(textPathExtension(&long)));
+
+    // A program for a kind every Windows registers; none for a kind nobody
+    // registered, nor for no kind; the shell's Unknown type does not count.
+    try std.testing.expect(hasProgram(ext(".exe")));
+    try std.testing.expect(!hasProgram(ext(".ghostty-test-no-such-kind")));
+    try std.testing.expect(!hasProgram(ext("")));
 }
