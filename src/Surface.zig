@@ -569,6 +569,18 @@ pub fn init(
         break :device device;
     };
 
+    // Create the renderer thread before the renderer, so that a failed
+    // init deinitializes the renderer first, in the order deinit uses:
+    // the renderer's display link points at the thread's handles.
+    var render_thread = try rendererpkg.Thread.init(
+        alloc,
+        config,
+        rt_surface,
+        &self.renderer,
+        &self.renderer_state,
+    );
+    errdefer render_thread.deinit();
+
     // Create our terminal grid with the initial size
     const app_mailbox: App.Mailbox = .{ .rt_app = rt_app, .mailbox = &app.mailbox };
     var renderer_impl = renderer: {
@@ -593,16 +605,6 @@ pub fn init(
     const mutex = try alloc.create(std.Io.Mutex);
     mutex.* = .init;
     errdefer alloc.destroy(mutex);
-
-    // Create the renderer thread
-    var render_thread = try rendererpkg.Thread.init(
-        alloc,
-        config,
-        rt_surface,
-        &self.renderer,
-        &self.renderer_state,
-    );
-    errdefer render_thread.deinit();
 
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
