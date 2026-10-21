@@ -228,6 +228,13 @@ pub const App = struct {
         /// the zoom (`toggleSplitZoom`).
         zoom: *CoreSurface,
 
+        /// Activate the window before or after the one of `from`
+        /// (`gotoWindow`).
+        goto_window: struct {
+            from: *CoreSurface,
+            to: apprt.action.GotoWindow,
+        },
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -834,6 +841,7 @@ pub const App = struct {
             .resize_split => self.resizeSplit(target, value),
             .equalize_splits => self.equalizeSplits(target),
             .toggle_split_zoom => self.toggleSplitZoom(target),
+            .goto_window => self.gotoWindow(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1300,6 +1308,9 @@ pub const App = struct {
             .equalize, .fullscreen, .maximize, .zoom => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
+            .goto_window => |goto| {
+                if (goto.from == core_surface) request.* = .dropped;
+            },
             .reload, .dropped => {},
         };
         for (self.windows.items) |window| {
@@ -1430,6 +1441,46 @@ pub const App = struct {
         return true;
     }
 
+    /// `.goto_window`: activate the window beside the one asking, wrapping
+    /// around, as GTK goes through its windows from the active one
+    /// (`Application.gotoWindow`, `windowBeside`); `false` with one window,
+    /// so that the key reaches the terminal. Recorded for `run`, as
+    /// `goto_split`'s move is held back: the activation moves the focus,
+    /// which would send the asking terminal's core its loss inside its key
+    /// callback.
+    fn gotoWindow(self: *App, target: apprt.Target, to: apprt.action.GotoWindow) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        if (self.windows.items.len < 2) return false;
+        self.requests.append(self.core_app.alloc, .{ .goto_window = .{
+            .from = from,
+            .to = to,
+        } }) catch |err| {
+            log.warn("cannot record the window to go to err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// The window `goto_window` goes to from `from`, wrapping around, or
+    /// null when it is the only one: for `.next` the one opened before it,
+    /// and for `.previous` the one opened after it, in GTK's order, since
+    /// GTK walks `gtk.Window.listToplevels`, which lists the newest window
+    /// first. `windows` is in opening order (`windowDestroyed`).
+    fn windowBeside(self: *const App, from: *Window, to: apprt.action.GotoWindow) ?*Window {
+        const windows = self.windows.items;
+        if (windows.len < 2) return null;
+        const i = std.mem.indexOfScalar(*Window, windows, from) orelse return null;
+        return windows[
+            switch (to) {
+                .next => (i + windows.len - 1) % windows.len,
+                .previous => (i + 1) % windows.len,
+            }
+        ];
+    }
+
     /// `.toggle_split_zoom`: recorded for `run`, as `resizeSplit` is, since
     /// a zoom lays the terminals out again (`Window.toggleZoom`). As on
     /// GTK it is not performed for a single terminal, unless a split for
@@ -1516,6 +1567,10 @@ pub const App = struct {
                 .maximize => |from| {
                     const window = from.rt_surface.window;
                     if (window.fullscreen == null) window.toggleMaximize();
+                },
+                .goto_window => |goto| {
+                    const window = self.windowBeside(goto.from.rt_surface.window, goto.to) orelse continue;
+                    _ = Window.present(window.hwnd);
                 },
                 // From the focused terminal, as `resize` starts.
                 .zoom => |from| {
@@ -1651,7 +1706,8 @@ pub const App = struct {
         // window `terminate` gives up on still exists.
         _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_USERDATA, 0);
 
-        _ = self.windows.swapRemove(idx);
+        // In order: `windowBeside` goes by opening order.
+        _ = self.windows.orderedRemove(idx);
         // Empty already unless `terminate` gave up on the frame, which then
         // had no WM_DESTROY.
         window.tree.deinit();
@@ -3964,4 +4020,68 @@ test "win32: maximize starts a window maximized, and under fullscreen too" {
     covering.toggleFullscreen();
     try std.testing.expect(win32.IsZoomed(covering.hwnd).toBool());
     try std.testing.expectEqual(try windowRect(window.hwnd), try windowRect(covering.hwnd));
+}
+
+test "win32: goto_window waits for run and goes round the windows" {
+    // Activating a window moves the focus, which would reach the asking
+    // terminal's core inside its key callback, so the move is recorded and
+    // made by createRequested; with one window the key reaches the
+    // terminal. Activation needs the foreground, which a test process does
+    // not hold, but `Window.present` restores a minimized window first, so
+    // the window gone to is the one no longer minimized.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    var windows: [3]*Window = undefined;
+    var panes: [3]*Surface = undefined;
+    for (&windows, &panes, 0..) |*w, *p, i| {
+        w.* = try testFrame(&app);
+        p.* = try testPane(&app, w.*);
+        w.*.tree = try .init(alloc, p.*);
+        if (i == 0) {
+            // Alone, there is nowhere to go.
+            try std.testing.expect(!try app.performAction(.{ .surface = &p.*.core_surface }, .goto_window, .next));
+            try std.testing.expectEqual(0, app.requests.items.len);
+        }
+    }
+
+    // In GTK's order, newest first: next is the window opened before,
+    // previous the one opened after, round the ends.
+    try std.testing.expectEqual(windows[2], app.windowBeside(windows[0], .next).?);
+    try std.testing.expectEqual(windows[1], app.windowBeside(windows[0], .previous).?);
+    try std.testing.expectEqual(windows[1], app.windowBeside(windows[2], .next).?);
+    try std.testing.expectEqual(windows[0], app.windowBeside(windows[2], .previous).?);
+
+    const Case = struct { to: apprt.action.GotoWindow, want: usize, other: usize };
+    for ([_]Case{
+        .{ .to = .next, .want = 2, .other = 1 },
+        .{ .to = .previous, .want = 1, .other = 2 },
+    }) |c| {
+        for (windows[1..]) |w| _ = win32.ShowWindow(w.hwnd, win32.SW_SHOWMINNOACTIVE);
+        try std.testing.expect(try app.performAction(.{ .surface = &panes[0].core_surface }, .goto_window, c.to));
+        try std.testing.expectEqual(1, app.requests.items.len);
+        try std.testing.expect(win32.IsIconic(windows[c.want].hwnd).toBool());
+        app.createRequested();
+        try std.testing.expectEqual(0, app.requests.items.len);
+        try std.testing.expect(!win32.IsIconic(windows[c.want].hwnd).toBool());
+        try std.testing.expect(win32.IsIconic(windows[c.other].hwnd).toBool());
+    }
+
+    // A closing terminal drops its own.
+    try std.testing.expect(try app.performAction(.{ .surface = &panes[0].core_surface }, .goto_window, .next));
+    app.forgetClosing(&panes[0].core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.requests.clearRetainingCapacity();
+
+    // A window closing between others leaves the rest in opening order.
+    const last = try testFrame(&app);
+    try std.testing.expect(win32.DestroyWindow(windows[1].hwnd).toBool());
+    try std.testing.expectEqual(last, app.windowBeside(windows[0], .next).?);
+    try std.testing.expectEqual(windows[2], app.windowBeside(windows[0], .previous).?);
 }
