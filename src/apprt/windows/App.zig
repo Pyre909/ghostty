@@ -3934,3 +3934,34 @@ test "win32: the configuration errors list at most twenty diagnostics" {
     try std.testing.expect(std.mem.indexOf(u8, text_one, "bad \u{FFFD} byte\nbad \u{FFFD} byte\nnext\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, text_one, "Cancel ignores these errors."));
 }
+
+test "win32: maximize starts a window maximized, and under fullscreen too" {
+    // GTK applies maximize before fullscreen: a window that starts covering
+    // its monitor comes back maximized. No terminal is focused, so no
+    // initial size applies.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    app.config.maximize = true;
+
+    const window = try testFrame(&app);
+    window.show();
+    try std.testing.expect(shown(window.hwnd));
+    try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+
+    app.config.fullscreen = .true;
+    const covering = try testFrame(&app);
+    covering.show();
+    try std.testing.expect(shown(covering.hwnd));
+    try std.testing.expect(covering.fullscreen != null);
+    covering.toggleFullscreen();
+    try std.testing.expect(win32.IsZoomed(covering.hwnd).toBool());
+    try std.testing.expectEqual(try windowRect(window.hwnd), try windowRect(covering.hwnd));
+}

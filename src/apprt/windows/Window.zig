@@ -180,10 +180,11 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     return self;
 }
 
-/// Size the still-hidden frame to `window-width`/`window-height`, cover
-/// its monitor if `fullscreen` asks, and show it. The first WM_SETFOCUS
-/// and WM_PAINT (and the first WM_SIZE, unless the size already sent one)
-/// reach the terminal from here; its core is live by now.
+/// Size the still-hidden frame to `window-width`/`window-height`, maximize
+/// it if `maximize` asks, cover its monitor if `fullscreen` asks, and show
+/// it. The first WM_SETFOCUS and WM_PAINT (and the first WM_SIZE, unless
+/// the size already sent one) reach the terminal from here; its core is
+/// live by now.
 pub fn show(self: *Window) void {
     if (self.focused) |surface| {
         if (surface.initial_size) |size| {
@@ -191,12 +192,25 @@ pub fn show(self: *Window) void {
         }
     }
 
+    // `maximize` starts every window maximized, as on GTK, which applies it
+    // before `fullscreen`, so that a window that starts covering its
+    // monitor comes back maximized. The first ShowWindow then both shows
+    // and maximizes it. It also wins over the show state a launcher asks
+    // for (STARTF_USESHOWWINDOW, as a shortcut set to run minimized does):
+    // Windows takes that in place of SW_SHOWNORMAL, but not of
+    // SW_SHOWMAXIMIZED, by heuristics Raymond Chen describes as
+    // implementation details ("When does STARTF_USESHOWWINDOW override the
+    // parameter passed to ShowWindow()?", The Old New Thing), and does not
+    // give it to a later window shown with SW_SHOWNORMAL instead.
+    const maximize = self.app.config.maximize;
+    if (maximize) _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWMAXIMIZED);
+
     // `fullscreen` starts every window covering its monitor, as on GTK;
     // the macOS-only kinds of it are taken as the one kind there is. After
     // the size above, which leaving fullscreen goes back to.
     if (self.app.config.fullscreen != .false) self.toggleFullscreen();
 
-    _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNORMAL);
+    if (!maximize) _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNORMAL);
     _ = win32.UpdateWindow(self.hwnd);
 }
 
