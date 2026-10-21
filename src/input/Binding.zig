@@ -777,7 +777,7 @@ pub const Action = union(enum) {
     ///
     /// Terminal windows always start as normal (not float-on-top) windows.
     ///
-    /// Only implemented on macOS.
+    /// Only implemented on macOS and Windows.
     toggle_window_float_on_top,
 
     /// Toggle secure input mode.

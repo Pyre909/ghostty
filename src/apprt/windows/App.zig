@@ -842,6 +842,7 @@ pub const App = struct {
             .equalize_splits => self.equalizeSplits(target),
             .toggle_split_zoom => self.toggleSplitZoom(target),
             .goto_window => self.gotoWindow(target, value),
+            .float_window => floatWindow(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1462,6 +1463,20 @@ pub const App = struct {
             return false;
         };
         return true;
+    }
+
+    /// `.float_window`, from `toggle_window_float_on_top`: made at once,
+    /// since it changes no terminal's size (`Window.setFloating`).
+    fn floatWindow(target: apprt.Target, value: apprt.action.FloatWindow) bool {
+        const window = switch (target) {
+            .app => return false,
+            .surface => |v| v.rt_surface.window,
+        };
+        return window.setFloating(switch (value) {
+            .on => true,
+            .off => false,
+            .toggle => !window.isFloating(),
+        });
     }
 
     /// The window `goto_window` goes to from `from`, wrapping around, or
@@ -4084,4 +4099,70 @@ test "win32: goto_window waits for run and goes round the windows" {
     try std.testing.expect(win32.DestroyWindow(windows[1].hwnd).toBool());
     try std.testing.expectEqual(last, app.windowBeside(windows[0], .next).?);
     try std.testing.expectEqual(windows[2], app.windowBeside(windows[0], .previous).?);
+}
+
+test "win32: float_window keeps a window on top, or puts it back" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+
+    // It is made at once, inside the core's key callback, so neither the
+    // window, shown as one that floats is, nor its terminal may hear of a
+    // size or a focus change: only its place in the z-order changes.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const Seen = struct {
+        var count: usize = 0;
+        fn proc(code: c_int, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+            if (code >= 0) {
+                const sent: *const win32.CWPSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                switch (sent.message) {
+                    win32.WM_SIZE, win32.WM_ACTIVATE, win32.WM_SETFOCUS, win32.WM_KILLFOCUS => count += 1,
+                    else => {},
+                }
+            }
+            return win32.CallNextHookEx(null, code, wparam, lparam);
+        }
+    };
+    const hook = win32.SetWindowsHookExW(
+        win32.WH_CALLWNDPROC,
+        Seen.proc,
+        null,
+        std.os.windows.GetCurrentThreadId(),
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.UnhookWindowsHookEx(hook);
+
+    try std.testing.expect(!window.isFloating());
+    for ([_]struct { apprt.action.FloatWindow, bool }{
+        .{ .toggle, true },
+        .{ .toggle, false },
+        .{ .on, true },
+        .{ .on, true },
+        .{ .off, false },
+        .{ .off, false },
+    }) |c| {
+        try std.testing.expect(try app.performAction(target, .float_window, c[0]));
+        try std.testing.expectEqual(c[1], window.isFloating());
+    }
+    try std.testing.expectEqual(0, Seen.count);
+    // The hook does see a change of size.
+    _ = win32.SetWindowPos(window.hwnd, null, 0, 0, 300, 150, win32.SWP_NOMOVE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    try std.testing.expect(Seen.count > 0);
+
+    // Covering the monitor and coming back keeps it floating.
+    try std.testing.expect(try app.performAction(target, .float_window, .on));
+    window.focused = pane;
+    window.toggleFullscreen();
+    try std.testing.expect(window.isFloating());
+    window.toggleFullscreen();
+    try std.testing.expect(window.isFloating());
 }

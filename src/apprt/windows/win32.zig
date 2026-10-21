@@ -134,10 +134,17 @@ pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: HANDLE =
     @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
 pub const GWL_STYLE: c_int = -16;
+pub const GWL_EXSTYLE: c_int = -20;
+pub const WS_EX_TOPMOST: DWORD = 0x00000008;
+/// SetWindowPos's place for a window above every window that is not on
+/// top, and back among them.
+pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+pub const HWND_NOTOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
 pub const GWLP_USERDATA: c_int = -21;
 
 pub const WM_DESTROY: UINT = 0x0002;
 pub const WM_SIZE: UINT = 0x0005;
+pub const WM_ACTIVATE: UINT = 0x0006;
 pub const WM_SETFOCUS: UINT = 0x0007;
 pub const WM_KILLFOCUS: UINT = 0x0008;
 pub const WM_CLOSE: UINT = 0x0010;
@@ -474,6 +481,26 @@ pub extern "user32" fn SetWindowPos(
     cy: c_int,
     flags: UINT,
 ) callconv(.winapi) BOOL;
+/// For tests: a hook on the messages sent to a thread's windows.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowshookexw
+pub const HHOOK = *opaque {};
+pub const HOOKPROC = *const fn (code: c_int, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT;
+pub const WH_CALLWNDPROC: c_int = 4;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-cwpstruct
+pub const CWPSTRUCT = extern struct {
+    lParam: LPARAM,
+    wParam: WPARAM,
+    message: UINT,
+    hwnd: HWND,
+};
+pub extern "user32" fn SetWindowsHookExW(
+    id: c_int,
+    proc: HOOKPROC,
+    module: ?HINSTANCE,
+    thread: DWORD,
+) callconv(.winapi) ?HHOOK;
+pub extern "user32" fn UnhookWindowsHookEx(hook: HHOOK) callconv(.winapi) BOOL;
+pub extern "user32" fn CallNextHookEx(hook: ?HHOOK, code: c_int, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT;
 /// A pending batch of window positions (BeginDeferWindowPos).
 pub const HDWP = *opaque {};
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-begindeferwindowpos

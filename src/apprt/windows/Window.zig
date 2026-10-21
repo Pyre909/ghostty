@@ -1299,6 +1299,33 @@ fn monitorRect(monitor: ?win32.HMONITOR) ?win32.RECT {
     return info.rcMonitor;
 }
 
+/// Whether the window floats above every window that does not
+/// (`setFloating`).
+pub fn isFloating(self: *const Window) bool {
+    const topmost: isize = win32.WS_EX_TOPMOST;
+    return win32.GetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE) & topmost != 0;
+}
+
+/// `float_window`: keep the window above every window that does not
+/// float, focused or not, as macOS floats it, or put it back among them.
+/// Only its place in the z-order changes, so no terminal is laid out
+/// again. False, logged, if it did not change.
+pub fn setFloating(self: *Window, on: bool) bool {
+    if (!win32.SetWindowPos(
+        self.hwnd,
+        if (on) win32.HWND_TOPMOST else win32.HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE,
+    ).toBool()) {
+        log.warn("cannot change whether the window floats err={}", .{win32.GetLastError()});
+        return false;
+    }
+    return true;
+}
+
 /// `.toggle_maximize`: maximize the window, or restore it, by whether it
 /// is maximized now, as GTK decides (`surfaceToggleMaximize`): the user
 /// also maximizes and restores it with the caption buttons, a double click
