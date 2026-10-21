@@ -17,7 +17,7 @@ const win32 = @This();
 
 const w = std.os.windows;
 
-const BOOL = w.BOOL;
+pub const BOOL = w.BOOL;
 pub const BYTE = w.BYTE;
 pub const DWORD = w.DWORD;
 const HRESULT = internal_os.windows.HRESULT;
@@ -138,6 +138,8 @@ pub const WM_KILLFOCUS: UINT = 0x0008;
 pub const WM_CLOSE: UINT = 0x0010;
 pub const WM_QUIT: UINT = 0x0012;
 pub const WM_ERASEBKGND: UINT = 0x0014;
+/// Sent to top-level windows, never to message-only ones.
+pub const WM_SETTINGCHANGE: UINT = 0x001A;
 pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_MOUSEACTIVATE: UINT = 0x0021;
 pub const WM_PAINT: UINT = 0x000F;
@@ -377,6 +379,12 @@ pub extern "user32" fn PostMessageW(
     wparam: WPARAM,
     lparam: LPARAM,
 ) callconv(.winapi) BOOL;
+pub extern "user32" fn SendMessageW(
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
 /// user32 exports the LONG_PTR forms only on 64-bit Windows. On 32-bit,
 /// winuser.h defines them as the LONG forms, which have the same
@@ -472,6 +480,32 @@ pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
 pub const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
 pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
 pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+
+// DWM
+/// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
+pub extern "dwmapi" fn DwmSetWindowAttribute(
+    hwnd: HWND,
+    attribute: DWORD,
+    value: *const anyopaque,
+    size: DWORD,
+) callconv(.winapi) HRESULT;
+/// dwmapi.h, from Windows 10 20H1 (build 19041).
+pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
+
+// Registry
+pub const HKEY = w.HKEY;
+pub const HKEY_CURRENT_USER = w.HKEY_CURRENT_USER;
+pub const RRF_RT_REG_DWORD: DWORD = 0x0000_0010;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-reggetvaluew
+pub extern "advapi32" fn RegGetValueW(
+    key: HKEY,
+    subkey: ?LPCWSTR,
+    value: ?LPCWSTR,
+    flags: DWORD,
+    value_type: ?*DWORD,
+    data: ?*anyopaque,
+    size: ?*DWORD,
+) callconv(.winapi) LONG;
 
 // IMM32. Both forms are in client coordinates of the context's window.
 pub const HIMC = *opaque {};

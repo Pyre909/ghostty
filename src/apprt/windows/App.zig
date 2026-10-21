@@ -59,6 +59,14 @@ pub const App = struct {
     /// Windows 10 1607. Null means every window reports the system DPI.
     get_dpi_for_window: ?win32.GetDpiForWindowFn,
 
+    /// Windows' light or dark mode for apps, read when the app starts and
+    /// again when a frame hears that it changed (`systemSchemeChanged`).
+    system_scheme: apprt.ColorScheme,
+
+    /// The color scheme the core was last told (`syncColorScheme`), null
+    /// until it is first told.
+    reported_scheme: ?apprt.ColorScheme,
+
     /// A message-only window. It is the target for `wakeup` and for the quit
     /// timer. Using a window rather than `PostThreadMessageW` is deliberate:
     /// thread messages are silently dropped by the nested modal loops that
@@ -316,6 +324,8 @@ pub const App = struct {
             .config = config,
             .hinstance = hinstance,
             .get_dpi_for_window = get_dpi_for_window,
+            .system_scheme = systemColorScheme(),
+            .reported_scheme = null,
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
             .windows = .empty,
@@ -393,6 +403,10 @@ pub const App = struct {
 
     /// The Win32 message loop.
     pub fn run(self: *App) !void {
+        // The core learns the color scheme before the initial window, so
+        // that its terminal starts with it.
+        self.syncColorScheme();
+
         // Create the initial window directly, not through the core's
         // `.new_window` as GTK's `activate` does. If it cannot open, the
         // process has no window at all, and this path says why
@@ -475,6 +489,11 @@ pub const App = struct {
             // callback.
             self.createRequested();
             self.applyPendingFocus();
+
+            // And a change of color scheme: of the system's mode, which a
+            // prompt may have held back, or of the configuration, which a
+            // reload in `requests` may just have made.
+            self.syncColorScheme();
         }
     }
 
@@ -614,6 +633,48 @@ pub const App = struct {
             const core_surface = surface.liveCore() orelse continue;
             surface.syncIme(core_surface);
         }
+    }
+
+    /// Tell the core the color scheme (`coreScheme`) if it changed: the
+    /// app's conditional state, which new terminals start from, and each
+    /// live terminal's, which pick the light or dark half of `theme` and
+    /// answer a program's color scheme query. For each the core reloads the
+    /// configuration softly (`reloadConfig`). Called by `run`, where
+    /// `canReenterCore` holds: before the initial window, then after every
+    /// tick and the requests after it, which picks up a change of the
+    /// system's mode (`systemSchemeChanged`) or of `window-theme` and the
+    /// background (`configChange`, as a recorded reload makes it). The
+    /// list does not change during the loop: a reload creates and destroys
+    /// no surface.
+    fn syncColorScheme(self: *App) void {
+        const scheme = coreScheme(&self.config, self.system_scheme);
+        if (self.reported_scheme == scheme) return;
+        self.reported_scheme = scheme;
+
+        self.core_app.colorSchemeEvent(self, scheme) catch |err| {
+            log.warn("cannot give the core the color scheme err={}", .{err});
+        };
+        for (self.surfaces.items) |surface| {
+            const core_surface = surface.liveCore() orelse continue;
+            core_surface.colorSchemeCallback(scheme) catch |err| {
+                log.warn("cannot give a terminal the color scheme err={}", .{err});
+            };
+        }
+    }
+
+    /// A frame heard that Windows' settings changed (WM_SETTINGCHANGE,
+    /// "ImmersiveColorSet"); every frame hears it, and `Window.create`
+    /// asks too. If the light or dark mode for apps is not the one read
+    /// last, every title bar follows at once, and the core hears of it from
+    /// `run` (`syncColorScheme`), since a prompt may be open now. The
+    /// message is sent, not posted, so GetMessageW in `run` handles it and
+    /// keeps waiting: `run` is woken to come round.
+    pub fn systemSchemeChanged(self: *App) void {
+        const scheme = systemColorScheme();
+        if (scheme == self.system_scheme) return;
+        self.system_scheme = scheme;
+        for (self.windows.items) |window| window.applyTheme();
+        self.wakeup();
     }
 
     /// Wait until the thread `handle` has exited, while keeping the main
@@ -1019,6 +1080,7 @@ pub const App = struct {
         self.config = config;
         for (self.windows.items) |window| {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
+            window.applyTheme();
         }
         return true;
     }
@@ -1650,6 +1712,40 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
 }
 
+/// Windows' light or dark mode for apps: the AppsUseLightTheme value that
+/// "Choose your default app mode" in Settings writes. Light when it cannot
+/// be read, Windows' own default.
+fn systemColorScheme() apprt.ColorScheme {
+    var value: win32.DWORD = 1;
+    var size: win32.DWORD = @sizeOf(win32.DWORD);
+    const rc = win32.RegGetValueW(
+        win32.HKEY_CURRENT_USER,
+        L("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+        L("AppsUseLightTheme"),
+        win32.RRF_RT_REG_DWORD,
+        null,
+        &value,
+        &size,
+    );
+    if (rc != internal_os.windows.ERROR_SUCCESS) {
+        // Not there on every edition, and read for every new window.
+        log.debug("cannot read AppsUseLightTheme err={d}, assuming light", .{rc});
+        return .light;
+    }
+    return if (value == 0) .dark else .light;
+}
+
+/// The color scheme the core is told, which picks the light or dark half of
+/// `theme` and answers a program's color scheme query: the one the title
+/// bars show (`Window.frameDark`). Under `auto` without a light and a dark
+/// theme the core thus hears that a dark background is dark, whatever the
+/// system's mode, as macOS tells its core the appearance `auto` gives its
+/// windows; with them, and under `system`, it hears the system's mode.
+/// macOS gives `ghostty` the system's appearance; here it is `auto`.
+fn coreScheme(config: *const Config, system: apprt.ColorScheme) apprt.ColorScheme {
+    return if (Window.frameDark(config, system)) .dark else .light;
+}
+
 /// The allocator of the link `openUrl` hands to its opener thread, which
 /// frees it. ShellExecuteW blocks until the handler has started, which can
 /// be a cold browser start or the shell's app picker, and the detached
@@ -2016,6 +2112,8 @@ pub fn testApp(app: *App, core_app: *CoreApp) void {
     app.core_app = core_app;
     app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
     app.get_dpi_for_window = null;
+    app.system_scheme = .light;
+    app.reported_scheme = null;
     app.modal_loop_depth = 0;
     app.terminating = false;
     app.ticking = false;
@@ -2040,6 +2138,7 @@ fn testFrame(app: *App) !*Window {
         .focused = null,
         .pending_focus = null,
         .maximized = false,
+        .dark_frame = false,
         .modal_loops = .{},
         .prompt_disabled = false,
         .closing = false,
@@ -3084,4 +3183,147 @@ test "win32: a full reload_config waits for run" {
     try std.testing.expectEqual(before, app.config.title.?.ptr);
     try std.testing.expectEqual(1, app.requests.items.len);
     try std.testing.expect(app.requests.items[0] == .reload);
+}
+
+test "win32: the core is told the color scheme the title bars show" {
+    const alloc = std.testing.allocator;
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+
+    for ([_]apprt.ColorScheme{ .light, .dark }) |system| {
+        config.@"window-theme" = .system;
+        try std.testing.expectEqual(system, coreScheme(&config, system));
+        config.@"window-theme" = .light;
+        try std.testing.expectEqual(.light, coreScheme(&config, system));
+        config.@"window-theme" = .dark;
+        try std.testing.expectEqual(.dark, coreScheme(&config, system));
+    }
+
+    // auto and ghostty: the background's, against the system's mode, and
+    // with a light and a dark theme the system's, against the background.
+    for ([_]configpkg.Config.WindowTheme{ .auto, .ghostty }) |theme| {
+        config.@"window-theme" = theme;
+        config._conditional_set = .{};
+        config.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
+        try std.testing.expectEqual(.dark, coreScheme(&config, .light));
+        config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+        try std.testing.expectEqual(.light, coreScheme(&config, .dark));
+        config._conditional_set.insert(.theme);
+        try std.testing.expectEqual(.dark, coreScheme(&config, .dark));
+    }
+}
+
+test "win32: the core is told the color scheme when it changes" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
+
+    // The system's dark mode reaches the core, which reloads the app's
+    // configuration softly for it: config_change replaces this runtime's
+    // with a copy.
+    app.config.@"window-theme" = .system;
+    app.system_scheme = .dark;
+    const before = app.config.title.?.ptr;
+    app.syncColorScheme();
+    try std.testing.expectEqual(.dark, core_app.config_conditional_state.theme);
+    try std.testing.expect(app.config.title.?.ptr != before);
+
+    // Told once. The core ignores a repeat by itself, so it is made to have
+    // lost the scheme: told again, it would take it back and reload.
+    core_app.config_conditional_state.theme = .light;
+    const told = app.config.title.?.ptr;
+    app.syncColorScheme();
+    try std.testing.expectEqual(.light, core_app.config_conditional_state.theme);
+    try std.testing.expectEqual(told, app.config.title.?.ptr);
+    core_app.config_conditional_state.theme = .dark;
+
+    // window-theme = light overrides the system's mode.
+    app.config.@"window-theme" = .light;
+    app.syncColorScheme();
+    try std.testing.expectEqual(.light, core_app.config_conditional_state.theme);
+}
+
+test "win32: a change of the system's app mode reaches every title bar" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    app.config.@"window-theme" = .system;
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const window = try testFrame(&app);
+
+    // A message-only window stands in for the app's, to see the wakeup.
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(app.msg_hwnd);
+
+    // The mode read last is the other one, as if Windows had just switched,
+    // and the frame shows it. The system's mode itself is never changed.
+    const now = systemColorScheme();
+    app.system_scheme = if (now == .dark) .light else .dark;
+    window.applyTheme();
+    try std.testing.expectEqual(now != .dark, window.dark_frame);
+
+    // Windows announces the change to every top-level window, with the
+    // name in a buffer of its own.
+    var name = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet").*;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SETTINGCHANGE, 0, @bitCast(@intFromPtr(&name)));
+    try std.testing.expectEqual(now, app.system_scheme);
+    try std.testing.expectEqual(now == .dark, window.dark_frame);
+
+    // The message was sent, so `run` is woken to tell the core.
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        app.msg_hwnd,
+        WM_GHOSTTY_WAKEUP,
+        WM_GHOSTTY_WAKEUP,
+        win32.PM_REMOVE,
+    ).toBool());
+}
+
+test "win32: a new configuration re-themes every title bar" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    testApp(&app, &core_app);
+    app.config = try .default(alloc);
+    defer app.config.deinit();
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const window = try testFrame(&app);
+
+    // Each way, so that it fails whatever the frame showed before.
+    for ([_]configpkg.Config.WindowTheme{ .dark, .light, .dark }) |theme| {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.@"window-theme" = theme;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        try std.testing.expectEqual(theme == .dark, window.dark_frame);
+    }
 }

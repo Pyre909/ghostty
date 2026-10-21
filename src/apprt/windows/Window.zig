@@ -88,6 +88,10 @@ destroy_deferred: bool,
 /// Tracked so `.toggle_maximize` knows which way to toggle.
 maximized: bool,
 
+/// Whether the title bar was last made dark (`applyTheme`). A new frame
+/// has a light one.
+dark_frame: bool,
+
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
 
@@ -111,6 +115,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .focused = null,
         .pending_focus = null,
         .maximized = false,
+        .dark_frame = false,
         .modal_loops = .{},
         .prompt_disabled = false,
         .closing = false,
@@ -137,6 +142,13 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     // Safe alongside the errdefer above: WM_NCDESTROY frees only a window
     // that is in App.windows, which this one is not yet.
     errdefer _ = win32.DestroyWindow(hwnd);
+
+    // Windows announces a change of its app mode only to the top-level
+    // windows there are, so one made before this frame existed is read now.
+    // Then the title bar, before the frame is first shown, so that it
+    // never shows the wrong one.
+    app.systemSchemeChanged();
+    self.applyTheme();
 
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(hwnd, &client).toBool()) return App.Error.Win32CallFailed;
@@ -252,6 +264,11 @@ fn handleMessage(
             self.relayout();
             return 0;
         },
+
+        // Sent to every top-level window, so to every frame: the app reads
+        // the system's light or dark mode again once and ignores repeats.
+        // DefWindowProcW below as well.
+        win32.WM_SETTINGCHANGE => if (isColorSetChange(lparam)) self.app.systemSchemeChanged(),
 
         // Keyboard focus belongs to a terminal: the frame gets it on
         // activation (DefWindowProcW's WM_ACTIVATE), and passes it on.
@@ -874,6 +891,57 @@ pub fn dividerWidth(dpi: u32) i32 {
     return @intCast(@max(1, (dpi +| base / 2) / base));
 }
 
+/// Whether a frame's title bar is dark, by `window-theme`. `auto` follows
+/// the background, light above a perceived luminance of 0.5 as on GTK and
+/// macOS, except with a light and a dark `theme`, when it follows the
+/// system: `Config.finalize` turns such an `auto` into `system`. `ghostty`,
+/// the GTK header bar in the terminal's colors, is taken as `auto`, as GTK
+/// takes it when it picks its color scheme, and finalize leaves it alone,
+/// so the pair is checked here. Followed by the background, a pair would
+/// pick the scheme from the half it picked: stuck on one half, or, if the
+/// light half is dark, flipping between them for good.
+pub fn frameDark(config: *const configpkg.Config, system: apprt.ColorScheme) bool {
+    return switch (config.@"window-theme") {
+        .light => false,
+        .dark => true,
+        .system => system == .dark,
+        .auto, .ghostty => if (config._conditional_set.contains(.theme))
+            system == .dark
+        else
+            config.background.toTerminalRGB().perceivedLuminance() <= 0.5,
+    };
+}
+
+/// Give the frame the title bar `frameDark` asks for, through DWM's
+/// immersive dark mode. A visible frame repaints its title bar by itself.
+/// A failed call leaves `dark_frame` as it was, so the next one tries
+/// again.
+pub fn applyTheme(self: *Window) void {
+    const dark = frameDark(&self.app.config, self.app.system_scheme);
+    if (dark == self.dark_frame) return;
+
+    const value: win32.BOOL = if (dark) .TRUE else .FALSE;
+    const hr = win32.DwmSetWindowAttribute(
+        self.hwnd,
+        win32.DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &value,
+        @sizeOf(win32.BOOL),
+    );
+    if (hr < 0) {
+        log.warn("cannot set the title bar's mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
+        return;
+    }
+    self.dark_frame = dark;
+}
+
+/// Whether a WM_SETTINGCHANGE is about the light or dark mode of apps,
+/// which Windows announces as "ImmersiveColorSet".
+fn isColorSetChange(lparam: win32.LPARAM) bool {
+    if (lparam == 0) return false;
+    const name: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    return std.mem.orderZ(u16, name, L("ImmersiveColorSet")) == .eq;
+}
+
 /// The DPI of `hwnd`, falling back to the reference 96 when it cannot be
 /// determined. Never returns 0: scaling by zero would silently produce a
 /// zero-size grid rather than an error anybody could see.
@@ -1227,6 +1295,57 @@ test "win32: dividers take their colour from the config or the background" {
         terminal.color.RGB{ .r = 0x12, .g = 0x34, .b = 0x56 },
         dividerColor(&config),
     );
+}
+
+test "win32: the title bar follows window-theme" {
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    // Forced, whatever the system's mode.
+    for ([_]apprt.ColorScheme{ .light, .dark }) |system| {
+        config.@"window-theme" = .light;
+        try std.testing.expect(!frameDark(&config, system));
+        config.@"window-theme" = .dark;
+        try std.testing.expect(frameDark(&config, system));
+        config.@"window-theme" = .system;
+        try std.testing.expectEqual(system == .dark, frameDark(&config, system));
+    }
+
+    // auto and ghostty: the background, whatever the system's mode. The
+    // default one, 0x282C34, is dark.
+    for ([_]configpkg.Config.WindowTheme{ .auto, .ghostty }) |theme| {
+        config.@"window-theme" = theme;
+        config.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
+        try std.testing.expect(frameDark(&config, .light));
+        config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+        try std.testing.expect(!frameDark(&config, .dark));
+    }
+
+    // With a light and a dark theme, which Config.finalize marks in the
+    // conditional set: the system's mode, whatever the background. finalize
+    // makes such an auto system ("theme specifying light/dark changes
+    // window-theme from auto"); ghostty stays as it is.
+    config._conditional_set.insert(.theme);
+    for ([_]configpkg.Config.WindowTheme{ .auto, .ghostty }) |theme| {
+        config.@"window-theme" = theme;
+        config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
+        try std.testing.expect(frameDark(&config, .dark));
+        config.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
+        try std.testing.expect(!frameDark(&config, .light));
+    }
+}
+
+test "win32: only the app mode setting is a color set change" {
+    // Copies, as Windows passes the name in a buffer of its own: the
+    // literal would be the one the function compares with.
+    var name = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSet").*;
+    try std.testing.expect(isColorSetChange(@bitCast(@intFromPtr(&name))));
+    var other = std.unicode.utf8ToUtf16LeStringLiteral("Policy").*;
+    try std.testing.expect(!isColorSetChange(@bitCast(@intFromPtr(&other))));
+    var longer = std.unicode.utf8ToUtf16LeStringLiteral("ImmersiveColorSetX").*;
+    try std.testing.expect(!isColorSetChange(@bitCast(@intFromPtr(&longer))));
+    try std.testing.expect(!isColorSetChange(0));
 }
 
 test "win32: a divider is a pixel at 96 DPI, scaled to the nearest pixel" {
