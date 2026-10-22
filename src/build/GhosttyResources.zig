@@ -231,6 +231,13 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         &steps,
     );
 
+    // The icon Windows shows on a toast (src/apprt/windows/toast.zig),
+    // where Linux has the same one.
+    if (cfg.target.result.os.tag == .windows) try steps.append(b.allocator, &b.addInstallFile(
+        b.path("images/gnome/256.png"),
+        "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png",
+    ).step);
+
     return .{ .steps = steps.items };
 }
 
