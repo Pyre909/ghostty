@@ -1149,36 +1149,38 @@ pub fn dpiOf(app: *const App, hwnd: win32.HWND) u32 {
 /// window's content scale. The whole value is scaled, as macOS and GTK also
 /// treat it, so the core's device-pixel padding comes out larger by the
 /// scale factor: the grid is never smaller than requested, at most a little
-/// larger, unless the window would not fit its monitor's work area. The
-/// frame is measured from the window itself rather than with
+/// larger, unless the window would not fit its monitor's work area
+/// (`resizeClient`).
+pub fn applyInitialSize(hwnd: win32.HWND, scale: f32, size: apprt.action.InitialSize) void {
+    // SetWindowPos sends WM_SIZE synchronously; the core is live, so it
+    // sees the new size before the first paint. That WM_SIZE also reports
+    // the window visible (occlusionCallback) while it is still hidden,
+    // which is harmless only because ShowWindow follows immediately.
+    _ = resizeClient(hwnd, scaledSize(size.width, scale), scaledSize(size.height, scale));
+}
+
+/// `points` at `scale`, in device pixels, rounded up.
+pub fn scaledSize(points: u32, scale: f32) i32 {
+    return std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(points)) * scale));
+}
+
+/// Resize the window so its client area is `client_w` by `client_h`
+/// device pixels, its top-left corner kept, unless it would not fit its
+/// monitor's work area; false, logged, if it could not be. The frame is
+/// measured from the window itself rather than with
 /// AdjustWindowRectExForDpi, which does not exist before Windows 10 1607
 /// (see the dynamic imports in App.init): the window already exists at its
 /// final DPI, so its window rect minus its client rect is exactly the frame.
 /// The sizes saturate, since `window-width` is only clamped from below.
-pub fn applyInitialSize(hwnd: win32.HWND, scale: f32, size: apprt.action.InitialSize) void {
-    const client_w = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.width)) * scale));
-    const client_h = std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(size.height)) * scale));
+fn resizeClient(hwnd: win32.HWND, client_w: i32, client_h: i32) bool {
     var window: win32.RECT = undefined;
     var client: win32.RECT = undefined;
-    var monitor: win32.MONITORINFO = .{
-        .cbSize = @sizeOf(win32.MONITORINFO),
-        .rcMonitor = undefined,
-        .rcWork = undefined,
-        .dwFlags = 0,
-    };
-    const read = read: {
-        if (!win32.GetWindowRect(hwnd, &window).toBool()) break :read false;
-        if (!win32.GetClientRect(hwnd, &client).toBool()) break :read false;
-        const m = win32.MonitorFromWindow(
-            hwnd,
-            win32.MONITOR_DEFAULTTONEAREST,
-        ) orelse break :read false;
-        break :read win32.GetMonitorInfoW(m, &monitor).toBool();
-    };
-    if (!read) {
-        log.warn("unable to read the window frame or work area, initial size not applied", .{});
-        return;
+    if (!win32.GetWindowRect(hwnd, &window).toBool() or !win32.GetClientRect(hwnd, &client).toBool()) {
+        log.warn("unable to read the window frame, window not resized err={}", .{win32.GetLastError()});
+        return false;
     }
+    const monitor = monitorInfo(win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST)) orelse
+        return false;
     const frame_w = (window.right - window.left) - (client.right - client.left);
     const frame_h = (window.bottom - window.top) - (client.bottom - client.top);
 
@@ -1195,10 +1197,6 @@ pub fn applyInitialSize(hwnd: win32.HWND, scale: f32, size: apprt.action.Initial
         monitor.rcWork,
     );
 
-    // SetWindowPos sends WM_SIZE synchronously; the core is live, so it
-    // sees the new size before the first paint. That WM_SIZE also reports
-    // the window visible (occlusionCallback) while it is still hidden,
-    // which is harmless only because ShowWindow follows immediately.
     if (!win32.SetWindowPos(
         hwnd,
         null,
@@ -1207,7 +1205,53 @@ pub fn applyInitialSize(hwnd: win32.HWND, scale: f32, size: apprt.action.Initial
         rect.right - rect.left,
         rect.bottom - rect.top,
         win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
-    ).toBool()) log.warn("unable to apply initial window size err={}", .{win32.GetLastError()});
+    ).toBool()) {
+        log.warn("unable to resize the window err={}", .{win32.GetLastError()});
+        return false;
+    }
+    return true;
+}
+
+/// Whether the window is at a size of its own, as Microsoft's IsRestored
+/// example for IsWindowArranged decides it: not minimized, maximized or
+/// snapped (arranged; not known before Windows 10 1903), nor covering its
+/// monitor.
+pub fn isRestored(self: *const Window) bool {
+    if (self.fullscreen != null) return false;
+    if (win32.IsIconic(self.hwnd).toBool() or win32.IsZoomed(self.hwnd).toBool()) return false;
+    if (self.app.is_window_arranged) |arranged| {
+        if (arranged(self.hwnd).toBool()) return false;
+    }
+    return true;
+}
+
+/// Whether `resize_window` may resize the window for `surface`: as on GTK
+/// and macOS, only when it is the window's one terminal, since other
+/// terminals would change too, and the window is at a size of its own
+/// (`isRestored`), as `vt-window-resize-allowed` documents it.
+pub fn terminalResizable(self: *const Window, surface: *const Surface) bool {
+    if (self.tree.isSplit() or self.tree.locate(surface) == null) return false;
+    return self.isRestored();
+}
+
+/// `resize_window`, which a program asks for (CSI 8 t): resize the window
+/// so that `surface`, its one terminal, which fills the client area, is
+/// `size` in points, a zero dimension kept as it is, its top-left corner
+/// kept and clamped to the work area (`resizeClient`), as macOS does it.
+/// Nothing changes when it may not be (`terminalResizable`).
+pub fn resizeToTerminal(self: *Window, surface: *Surface, size: apprt.action.ResizeWindow) void {
+    if (!self.terminalResizable(surface)) return;
+    const scale = surface.getContentScale() catch unreachable;
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(self.hwnd, &client).toBool()) {
+        log.warn("unable to read the client area, window not resized err={}", .{win32.GetLastError()});
+        return;
+    }
+    _ = resizeClient(
+        self.hwnd,
+        if (size.width > 0) scaledSize(size.width, scale.x) else client.right,
+        if (size.height > 0) scaledSize(size.height, scale.y) else client.bottom,
+    );
 }
 
 /// The rect for a `width` x `height` window at `x`, `y`, kept inside the

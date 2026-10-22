@@ -61,6 +61,11 @@ pub const App = struct {
     /// Windows 10 1607. Null means every window reports the system DPI.
     get_dpi_for_window: ?win32.GetDpiForWindowFn,
 
+    /// IsWindowArranged, resolved at runtime because it exists only from
+    /// Windows 10 1903 and has no import library. Null means no window is
+    /// known to be snapped (`Window.restored`).
+    is_window_arranged: ?win32.IsWindowArrangedFn,
+
     /// Windows' light or dark mode for apps, read when the app starts and
     /// again when a frame hears that it changed (`systemSchemeChanged`).
     system_scheme: apprt.ColorScheme,
@@ -236,6 +241,13 @@ pub const App = struct {
         /// for (`configChange`).
         redecorate,
 
+        /// Resize the window of this surface for the size a program asked
+        /// of it (`requestResizeWindow`).
+        resize_window: struct {
+            from: *CoreSurface,
+            size: apprt.action.ResizeWindow,
+        },
+
         /// Activate the window before or after the one of `from`
         /// (`gotoWindow`).
         goto_window: struct {
@@ -305,6 +317,14 @@ pub const App = struct {
             };
             break :dpi @ptrCast(@alignCast(p));
         };
+        const is_window_arranged: ?win32.IsWindowArrangedFn = arranged: {
+            const m = user32 orelse break :arranged null;
+            const p = win32.GetProcAddress(m, "IsWindowArranged") orelse {
+                log.info("IsWindowArranged missing (pre-1903 Windows), snapped windows are not told apart", .{});
+                break :arranged null;
+            };
+            break :arranged @ptrCast(@alignCast(p));
+        };
 
         // As the GTK runtime does: a configuration that fails to load is
         // recorded as a diagnostic and the defaults are used, which only
@@ -353,6 +373,7 @@ pub const App = struct {
             .config = config,
             .hinstance = hinstance,
             .get_dpi_for_window = get_dpi_for_window,
+            .is_window_arranged = is_window_arranged,
             .system_scheme = systemColorScheme(),
             .reported_scheme = null,
             .msg_hwnd = msg_hwnd,
@@ -830,6 +851,7 @@ pub const App = struct {
             .toggle_maximize => self.requestMaximize(target),
             .toggle_fullscreen => self.requestFullscreen(target),
             .toggle_window_decorations => self.requestDecorations(target),
+            .resize_window => self.requestResizeWindow(target, value),
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
@@ -1331,6 +1353,9 @@ pub const App = struct {
             .goto_window => |goto| {
                 if (goto.from == core_surface) request.* = .dropped;
             },
+            .resize_window => |resize| {
+                if (resize.from == core_surface) request.* = .dropped;
+            },
             .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| {
@@ -1476,6 +1501,35 @@ pub const App = struct {
         return true;
     }
 
+    /// `.resize_window`, which a program asks for (CSI 8 t) when
+    /// `vt-window-resize-allowed` lets it: recorded for `run`, as
+    /// `toggle_fullscreen` is, since the terminals are laid out again, and
+    /// made then if it still may be (`Window.resizeToTerminal`). `false`
+    /// when it may not be now: as on GTK and macOS, only the one terminal
+    /// of a window at a size of its own is resized.
+    fn requestResizeWindow(
+        self: *App,
+        target: apprt.Target,
+        value: apprt.action.ResizeWindow,
+    ) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        if (!from.rt_surface.window.terminalResizable(from.rt_surface)) {
+            log.debug("resize_window not made: not the one terminal of a window at a size of its own", .{});
+            return false;
+        }
+        self.requests.append(self.core_app.alloc, .{ .resize_window = .{
+            .from = from,
+            .size = value,
+        } }) catch |err| {
+            log.warn("cannot record resizing the window err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     /// `.goto_window`: activate the window beside the one asking, wrapping
     /// around, as GTK goes through its windows from the active one
     /// (`Application.gotoWindow`, `windowBeside`); `false` with one window,
@@ -1612,6 +1666,10 @@ pub const App = struct {
                 .reload => self.reloadQueued(),
                 .fullscreen => |from| from.rt_surface.window.toggleFullscreen(),
                 .decorations => |from| from.rt_surface.window.toggleDecorations(),
+                .resize_window => |resize| resize.from.rt_surface.window.resizeToTerminal(
+                    resize.from.rt_surface,
+                    resize.size,
+                ),
                 .redecorate => for (self.windows.items) |window| window.applyDecorations(),
                 // A window covering its monitor is left as it is: maximized,
                 // it would have the work area instead.
@@ -2495,6 +2553,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.core_app = core_app;
     app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
     app.get_dpi_for_window = null;
+    app.is_window_arranged = null;
     app.system_scheme = .light;
     app.reported_scheme = null;
     app.modal_loop_depth = 0;
@@ -4135,6 +4194,94 @@ test "win32: goto_window waits for run and goes round the windows" {
     try std.testing.expect(win32.DestroyWindow(windows[1].hwnd).toBool());
     try std.testing.expectEqual(last, app.windowBeside(windows[0], .next).?);
     try std.testing.expectEqual(windows[2], app.windowBeside(windows[0], .previous).?);
+}
+
+test "win32: resize_window waits for run and resizes the window of a lone terminal" {
+    // A program asks for it (CSI 8 t), and the core asks from inside a
+    // tick; the terminals are laid out again, so it is recorded and made
+    // by createRequested. As on GTK and macOS only the one terminal of a
+    // window at a size of its own is resized, and a zero dimension is
+    // kept.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+    const scale = try pane.getContentScale();
+
+    // Recorded, not made; then the width, and the height kept.
+    const before = try clientRect(window.hwnd);
+    try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 300, .height = 0 }));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expectEqual(before, try clientRect(window.hwnd));
+    app.createRequested();
+    const wide = try clientRect(window.hwnd);
+    try std.testing.expectEqual(Window.scaledSize(300, scale.x), wide.right);
+    try std.testing.expectEqual(before.bottom, wide.bottom);
+    try std.testing.expectEqual(wide, try clientRect(pane.hwnd));
+
+    // The height, and the width kept.
+    try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 0, .height = 200 }));
+    app.createRequested();
+    const tall = try clientRect(window.hwnd);
+    try std.testing.expectEqual(wide.right, tall.right);
+    try std.testing.expectEqual(Window.scaledSize(200, scale.y), tall.bottom);
+
+    // Not for a maximized window, nor one covering its monitor.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMAXIMIZED);
+    try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
+    _ = win32.ShowWindow(window.hwnd, win32.SW_RESTORE);
+    window.toggleFullscreen();
+    try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
+    window.toggleFullscreen();
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Nor for a snapped one, which Windows tells apart from Windows 10
+    // 1903 (IsWindowArranged); one that is not is resized.
+    const arranged = struct {
+        fn yes(_: win32.HWND) callconv(.winapi) win32.BOOL {
+            return .TRUE;
+        }
+        fn no(_: win32.HWND) callconv(.winapi) win32.BOOL {
+            return .FALSE;
+        }
+    };
+    app.is_window_arranged = arranged.yes;
+    try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    app.is_window_arranged = arranged.no;
+    try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
+    app.requests.clearRetainingCapacity();
+    app.is_window_arranged = null;
+
+    // A closing terminal drops its own, and a window that is no longer
+    // at a size of its own when run comes is left as it is.
+    try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 400, .height = 0 }));
+    app.forgetClosing(&pane.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.requests.clearRetainingCapacity();
+    try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 400, .height = 0 }));
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMAXIMIZED);
+    const maximized = try windowRect(window.hwnd);
+    app.createRequested();
+    try std.testing.expectEqual(maximized, try windowRect(window.hwnd));
+    _ = win32.ShowWindow(window.hwnd, win32.SW_RESTORE);
+
+    // Not in a split.
+    const other = try testPane(&app, window);
+    window.tree.deinit();
+    window.tree = try testRow(alloc, &.{ pane, other });
+    try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
 }
 
 test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {

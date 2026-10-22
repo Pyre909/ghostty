@@ -350,6 +350,10 @@ pub const SetProcessDpiAwarenessContextFn = *const fn (
 pub const GetDpiForWindowFn = *const fn (hwnd: HWND) callconv(.winapi) UINT;
 pub const GetThreadDpiAwarenessContextFn = *const fn () callconv(.winapi) ?HANDLE;
 pub const AreDpiAwarenessContextsEqualFn = *const fn (a: HANDLE, b: HANDLE) callconv(.winapi) BOOL;
+/// From Windows 10 1903, and with no import library at all: whether a
+/// window is arranged, as a snapped one is.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowarranged
+pub const IsWindowArrangedFn = *const fn (hwnd: HWND) callconv(.winapi) BOOL;
 
 pub const GetLastError = internal_os.windows.GetLastError;
 pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
