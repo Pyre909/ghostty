@@ -41,7 +41,7 @@
 //! out by `App.run` once the core frame that asked has returned, and so is
 //! the frame change a new configuration's `window-decoration` makes
 //! (`App.requests`, which `App.Request` lists); `.goto_split` moves the
-//! focus once the core's key callback has returned (`Window.pending_focus`),
+//! focus once the core's key callback has returned (`Tab.pending_focus`),
 //! or after such a request when it follows one, and ends a zoom or moves it
 //! (`Window.focusFromGoto`).
 //! The process quits when its last window closes, whatever
@@ -148,6 +148,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
     _ = @import("windows/Surface.zig");
+    _ = @import("windows/Tab.zig");
     _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/desktop_notifications.zig");

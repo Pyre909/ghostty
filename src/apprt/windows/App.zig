@@ -1446,8 +1446,8 @@ pub const App = struct {
             .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| {
-            const surface = window.pending_focus orelse continue;
-            if (&surface.core_surface == core_surface) window.pending_focus = null;
+            const surface = window.tab().pending_focus orelse continue;
+            if (&surface.core_surface == core_surface) window.tab().pending_focus = null;
         }
     }
 
@@ -1455,7 +1455,7 @@ pub const App = struct {
     /// action is performed on (`Window.goto`). `false` lets the key through
     /// to the terminal, as the default bindings are performable. The focus
     /// moves once the core's key callback has returned
-    /// (`Window.pending_focus`).
+    /// (`Tab.pending_focus`).
     ///
     /// After a window or split still waiting in `requests`, as when a binding
     /// chains `goto_split` after `new_split`, the move waits behind it and is
@@ -1483,7 +1483,7 @@ pub const App = struct {
         // One being torn down, as its window closes around it, takes no
         // focus: the key reaches the terminal instead.
         if (surface.liveCore() == null) return false;
-        window.pending_focus = surface;
+        window.tab().pending_focus = surface;
         return true;
     }
 
@@ -1504,7 +1504,7 @@ pub const App = struct {
         };
         if (value.amount == 0) return false;
         const window = from.rt_surface.window;
-        if (!window.tree.isSplit() and !self.splitQueuedIn(window)) return false;
+        if (!window.tab().tree.isSplit() and !self.splitQueuedIn(window)) return false;
         self.requests.append(self.core_app.alloc, .{ .resize = .{
             .from = from,
             .value = value,
@@ -1823,7 +1823,7 @@ pub const App = struct {
             .surface => |v| v,
         };
         const window = from.rt_surface.window;
-        if (!window.tree.isSplit() and !self.splitQueuedIn(window)) return false;
+        if (!window.tab().tree.isSplit() and !self.splitQueuedIn(window)) return false;
         self.requests.append(self.core_app.alloc, .{ .zoom = from }) catch |err| {
             log.warn("cannot record zooming the split err={}", .{err});
             return false;
@@ -1832,7 +1832,7 @@ pub const App = struct {
     }
 
     /// Give each window the focus move a `goto_split` chose in it, if any
-    /// (`Window.pending_focus`). Called by a terminal's key handler once the
+    /// (`Tab.pending_focus`). Called by a terminal's key handler once the
     /// core's key callback has returned (`Surface.handleMessage`), and by
     /// `run` for an action performed from anywhere else.
     pub fn applyPendingFocus(self: *App) void {
@@ -1841,8 +1841,8 @@ pub const App = struct {
         var i: usize = 0;
         while (i < self.windows.items.len) : (i += 1) {
             const window = self.windows.items[i];
-            const surface = window.pending_focus orelse continue;
-            window.pending_focus = null;
+            const surface = window.tab().pending_focus orelse continue;
+            window.tab().pending_focus = null;
             // Still live: a teardown would have cleared it (`forgetClosing`).
             window.focusFromGoto(surface);
         }
@@ -1886,7 +1886,7 @@ pub const App = struct {
                 // GTK's active surface.
                 .resize => |resize| {
                     const window = resize.from.rt_surface.window;
-                    window.resizeSplit(window.focused orelse resize.from.rt_surface, resize.value);
+                    window.resizeSplit(window.tab().focused orelse resize.from.rt_surface, resize.value);
                 },
                 .equalize => |from| from.rt_surface.window.equalize(),
                 .reload => self.reloadQueued(),
@@ -1911,7 +1911,7 @@ pub const App = struct {
                 // From the focused terminal, as `resize` starts.
                 .zoom => |from| {
                     const window = from.rt_surface.window;
-                    window.toggleZoom(window.focused orelse from.rt_surface);
+                    window.toggleZoom(window.tab().focused orelse from.rt_surface);
                 },
                 .dropped => {},
             }
@@ -1925,7 +1925,7 @@ pub const App = struct {
     /// focused one): after `new_split` that is the new terminal.
     fn gotoQueued(from: *CoreSurface, to: apprt.action.GotoSplit) void {
         const window = from.rt_surface.window;
-        const start = window.focused orelse from.rt_surface;
+        const start = window.tab().focused orelse from.rt_surface;
         const surface = window.goto(start, to) orelse return;
         if (surface.liveCore() == null) return;
         // No core frame is on the stack here, unlike in gotoSplit.
@@ -1971,7 +1971,7 @@ pub const App = struct {
         const window = try Window.create(self, opts);
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
-        self.surfaces.appendAssumeCapacity(window.focused.?);
+        self.surfaces.appendAssumeCapacity(window.tab().focused.?);
 
         // Shown once both are owned, so that its first messages find them.
         window.show();
@@ -2023,7 +2023,7 @@ pub const App = struct {
         // Already moved off a terminal that closed on its own
         // (`Window.removePane`), and gone once the frame is destroyed
         // (its WM_DESTROY); this only keeps it from ever dangling.
-        if (surface.window.focused == surface) surface.window.focused = null;
+        if (surface.window.tab().focused == surface) surface.window.tab().focused = null;
         surface.deinit();
         self.core_app.alloc.destroy(surface);
 
@@ -2046,9 +2046,9 @@ pub const App = struct {
 
         // In order: `windowBeside` goes by opening order.
         _ = self.windows.orderedRemove(idx);
-        // Empty already unless `terminate` gave up on the frame, which then
-        // had no WM_DESTROY.
-        window.tree.deinit();
+        // Its tabs' trees are empty already unless `terminate` gave up on
+        // the frame, which then had no WM_DESTROY.
+        window.deinitTabs(self.core_app.alloc);
         self.core_app.alloc.destroy(window);
     }
 
@@ -2831,12 +2831,12 @@ fn testFrame(app: *App) !*Window {
     const alloc = app.core_app.alloc;
     try app.windows.ensureUnusedCapacity(alloc, 1);
     const window = try alloc.create(Window);
+    errdefer alloc.destroy(window);
     window.* = .{
         .app = app,
         .hwnd = undefined,
-        .tree = .empty,
-        .focused = null,
-        .pending_focus = null,
+        .tabs = .empty,
+        .selected = 0,
         .dark_frame = false,
         .fullscreen = null,
         .decoration = null,
@@ -2846,10 +2846,9 @@ fn testFrame(app: *App) !*Window {
         .closing = false,
         .destroy_deferred = false,
     };
-    _ = window.createFrame(0, 0, 200, 100) catch {
-        alloc.destroy(window);
-        return error.TestUnexpectedResult;
-    };
+    _ = try window.appendTab(alloc);
+    errdefer window.deinitTabs(alloc);
+    _ = try window.createFrame(0, 0, 200, 100);
     app.windows.appendAssumeCapacity(window);
     return window;
 }
@@ -2963,8 +2962,8 @@ test "win32: a window's terminal fills it, and both are freed once" {
 
     const window = try testFrame(&app);
     const surface = try testPane(&app, window);
-    window.tree = try .init(alloc, surface);
-    window.focused = surface;
+    window.tab().tree = try .init(alloc, surface);
+    window.tab().focused = surface;
 
     // The frame's WM_SIZE, sent even to a hidden window, lays the terminal
     // out over the frame's new client area.
@@ -3072,8 +3071,8 @@ test "win32: a window lays its terminals out side by side" {
     const window = try testFrame(&app);
     const left = try testPane(&app, window);
     const right = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ left, right });
-    window.focused = left;
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
 
     window.relayout();
     try expectRow(window, &.{ left, right });
@@ -3106,7 +3105,7 @@ test "win32: a closing terminal hands its place, and the focus if it had it" {
     var panes: [4]*Surface = undefined;
     for (&panes) |*pane| pane.* = try testPane(&app, window);
     const a, const b, const c, const d = panes;
-    window.tree = try testRow(alloc, &panes);
+    window.tab().tree = try testRow(alloc, &panes);
     window.relayout();
     try expectRow(window, &panes);
 
@@ -3125,21 +3124,21 @@ test "win32: a closing terminal hands its place, and the focus if it had it" {
         }
     }.focus;
     focus(d);
-    try std.testing.expect(window.focused == d);
+    try std.testing.expect(window.tab().focused == d);
 
     try std.testing.expect(a.destroy());
-    try std.testing.expect(window.focused == d);
+    try std.testing.expect(window.tab().focused == d);
     try expectRow(window, &.{ b, c, d });
 
     focus(c);
     try std.testing.expect(c.destroy());
-    try std.testing.expect(window.focused == b);
+    try std.testing.expect(window.tab().focused == b);
     try std.testing.expectEqualSlices(u16, utf16("b"), testCaption(window, &buf));
     try expectRow(window, &.{ b, d });
 
     // The first terminal has none before it: the one after it.
     try std.testing.expect(b.destroy());
-    try std.testing.expect(window.focused == d);
+    try std.testing.expect(window.tab().focused == d);
     try std.testing.expectEqualSlices(u16, utf16("d"), testCaption(window, &buf));
     try expectRow(window, &.{d});
 
@@ -3167,7 +3166,7 @@ test "win32: goto_split finds the terminal it names" {
     const a = try testPane(&app, row);
     const b = try testPane(&app, row);
     const c = try testPane(&app, row);
-    row.tree = try testRow(alloc, &.{ a, b, c });
+    row.tab().tree = try testRow(alloc, &.{ a, b, c });
     try std.testing.expect(row.goto(b, .left) == a);
     try std.testing.expect(row.goto(b, .right) == c);
 
@@ -3182,14 +3181,14 @@ test "win32: goto_split finds the terminal it names" {
     const x = try testPane(&app, column);
     const y = try testPane(&app, column);
     const z = try testPane(&app, column);
-    column.tree = try testLine(alloc, &.{ x, y, z }, .down);
+    column.tab().tree = try testLine(alloc, &.{ x, y, z }, .down);
     try std.testing.expect(column.goto(y, .up) == x);
     try std.testing.expect(column.goto(y, .down) == z);
 
     // A window with one terminal has nowhere to go.
     const alone = try testFrame(&app);
     const only = try testPane(&app, alone);
-    alone.tree = try .init(alloc, only);
+    alone.tab().tree = try .init(alloc, only);
     try std.testing.expect(alone.goto(only, .next) == null);
 }
 
@@ -3210,20 +3209,20 @@ test "win32: goto_split answers at once and moves the focus after the key" {
 
     const alone = try testFrame(&app);
     const only = try testPane(&app, alone);
-    alone.tree = try .init(alloc, only);
+    alone.tab().tree = try .init(alloc, only);
     try std.testing.expect(!try app.performAction(.{ .surface = &only.core_surface }, .goto_split, .next));
-    try std.testing.expect(alone.pending_focus == null);
+    try std.testing.expect(alone.tab().pending_focus == null);
 
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
-    window.focused = a;
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
 
     // Already closing: refused.
     b.core_state = .stopping;
     try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
-    try std.testing.expect(window.pending_focus == null);
+    try std.testing.expect(window.tab().pending_focus == null);
 
     // Live; no core call is made on it. Back to `.none` before the
     // teardown at the end, which would stop a live core.
@@ -3231,21 +3230,21 @@ test "win32: goto_split answers at once and moves the focus after the key" {
     defer b.core_state = .none;
 
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
-    try std.testing.expect(window.focused == a);
+    try std.testing.expect(window.tab().focused == a);
     app.forgetClosing(&b.core_surface);
     app.applyPendingFocus();
-    try std.testing.expect(window.focused == a);
+    try std.testing.expect(window.tab().focused == a);
 
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
-    try std.testing.expect(window.focused == a);
+    try std.testing.expect(window.tab().focused == a);
     app.applyPendingFocus();
-    try std.testing.expect(window.focused == b);
+    try std.testing.expect(window.tab().focused == b);
 }
 
 test "win32: goto_split moves the focus in every window it is performed in" {
     // An `all:` binding performs the action on every surface, so each
     // window keeps its own move until the key callback has returned
-    // (`Window.pending_focus`): one slot for the app would keep only the
+    // (`Tab.pending_focus`): one slot for the app would keep only the
     // last window's.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
@@ -3259,14 +3258,14 @@ test "win32: goto_split moves the focus in every window it is performed in" {
     const first = try testFrame(&app);
     const a = try testPane(&app, first);
     const b = try testPane(&app, first);
-    first.tree = try testRow(alloc, &.{ a, b });
-    first.focused = a;
+    first.tab().tree = try testRow(alloc, &.{ a, b });
+    first.tab().focused = a;
 
     const second = try testFrame(&app);
     const c = try testPane(&app, second);
     const d = try testPane(&app, second);
-    second.tree = try testRow(alloc, &.{ c, d });
-    second.focused = c;
+    second.tab().tree = try testRow(alloc, &.{ c, d });
+    second.tab().focused = c;
 
     // Live; no core call is made on them. Back to `.none` before the
     // teardown at the end, which would stop a live core.
@@ -3279,8 +3278,8 @@ test "win32: goto_split moves the focus in every window it is performed in" {
         try std.testing.expect(try app.performAction(.{ .surface = &from.core_surface }, .goto_split, .right));
     }
     app.applyPendingFocus();
-    try std.testing.expect(first.focused == b);
-    try std.testing.expect(second.focused == d);
+    try std.testing.expect(first.tab().focused == b);
+    try std.testing.expect(second.tab().focused == d);
 }
 
 test "win32: a goto_split after a waiting split waits behind it" {
@@ -3301,15 +3300,15 @@ test "win32: a goto_split after a waiting split waits behind it" {
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
-    window.focused = a;
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
     b.core_state = .live;
     defer b.core_state = .none;
 
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .new_split, .down));
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .goto_split, .right));
-    try std.testing.expect(window.pending_focus == null);
-    try std.testing.expect(window.focused == a);
+    try std.testing.expect(window.tab().pending_focus == null);
+    try std.testing.expect(window.tab().focused == a);
 
     const want = [_]App.Request{
         .{ .split = .{ .parent = &a.core_surface, .direction = .down } },
@@ -3343,8 +3342,8 @@ test "win32: a queued goto_split starts from the window's focused terminal" {
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     const c = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b, c });
-    window.focused = b;
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
+    window.tab().focused = b;
     b.core_state = .live;
     defer b.core_state = .none;
     c.core_state = .live;
@@ -3352,7 +3351,7 @@ test "win32: a queued goto_split starts from the window's focused terminal" {
 
     try app.requests.append(alloc, .{ .goto = .{ .from = &a.core_surface, .to = .right } });
     app.createRequested();
-    try std.testing.expect(window.focused == c);
+    try std.testing.expect(window.tab().focused == c);
     try std.testing.expectEqual(0, app.requests.items.len);
 }
 
@@ -3375,7 +3374,7 @@ test "win32: resize_split moves the nearest divider across it" {
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     const c = try testPane(&app, window);
-    window.tree = tree: {
+    window.tab().tree = tree: {
         var row = try testRow(alloc, &.{ a, b });
         defer row.deinit();
         var below: Window.Tree = try .init(alloc, c);
@@ -3416,7 +3415,7 @@ test "win32: resize_split never leaves a terminal less than a cell" {
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
+    window.tab().tree = try testRow(alloc, &.{ a, b });
     window.relayout();
     const before = try paneRect(window, b);
 
@@ -3444,7 +3443,7 @@ test "win32: equalize_splits gives each terminal an equal share" {
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     const c = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b, c });
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
     window.relayout();
     const width = struct {
         fn width(w: *const Window, pane: *const Surface) !i32 {
@@ -3478,12 +3477,12 @@ test "win32: resize_split and equalize_splits wait for run" {
 
     const alone = try testFrame(&app);
     const only = try testPane(&app, alone);
-    alone.tree = try .init(alloc, only);
+    alone.tab().tree = try .init(alloc, only);
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
-    window.focused = a;
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
     window.relayout();
 
     const right: apprt.action.ResizeSplit = .{ .amount = 20, .direction = .right };
@@ -3544,14 +3543,14 @@ test "win32: queued split changes reach the window from its focused terminal" {
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     const c = try testPane(&app, window);
-    window.tree = tree: {
+    window.tab().tree = tree: {
         var row = try testRow(alloc, &.{ a, b });
         defer row.deinit();
         var below: Window.Tree = try .init(alloc, c);
         defer below.deinit();
         break :tree try row.split(alloc, row.locate(b).?, .down, 0.5, &below);
     };
-    window.focused = b;
+    window.tab().focused = b;
     window.relayout();
     const before = try paneRect(window, b);
     try app.requests.append(alloc, .{ .resize = .{
@@ -3566,7 +3565,7 @@ test "win32: queued split changes reach the window from its focused terminal" {
     const x = try testPane(&app, row);
     const y = try testPane(&app, row);
     const z = try testPane(&app, row);
-    row.tree = try testRow(alloc, &.{ x, y, z });
+    row.tab().tree = try testRow(alloc, &.{ x, y, z });
     row.relayout();
     try app.requests.append(alloc, .{ .equalize = &x.core_surface });
     app.createRequested();
@@ -3590,7 +3589,7 @@ test "win32: a window is titled after its focused terminal" {
     const window = try testFrame(&app);
     const left = try testPane(&app, window);
     const right = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ left, right });
+    window.tab().tree = try testRow(alloc, &.{ left, right });
 
     const caption = testCaption;
     var buf: [64]u16 = undefined;
@@ -3621,8 +3620,8 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
     const window = try testFrame(&app);
     const left = try testPane(&app, window);
     const right = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ left, right });
-    window.focused = left;
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
 
     // A left button press on the client area; the hidden frame is not the
     // active window.
@@ -3631,7 +3630,7 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
         win32.MA_ACTIVATEANDEAT,
         Surface.wndProc(right.hwnd, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), lparam),
     );
-    try std.testing.expect(window.focused == right);
+    try std.testing.expect(window.tab().focused == right);
 }
 
 test "win32: close_tab closes the window, its one tab" {
@@ -3653,8 +3652,8 @@ test "win32: close_tab closes the window, its one tab" {
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
-    window.focused = a;
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
 
     var msg: win32.MSG = undefined;
     for ([_]apprt.action.CloseTabMode{ .other, .right }) |mode| {
@@ -3704,8 +3703,8 @@ test "win32: closing a window takes every terminal in it at once" {
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
-    window.focused = a;
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
 
     // Shown without being activated, so that a change is seen.
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
@@ -3768,8 +3767,8 @@ test "win32: a terminal with no core closes through a posted teardown" {
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
 
     // Both still there: had the close destroyed the terminal, it would
     // have taken the window and freed both.
@@ -4058,8 +4057,8 @@ test "win32: toggle_fullscreen waits for run, covers the monitor and comes back"
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     const placed = try windowRect(window.hwnd);
     const info = try monitorOf(window.hwnd);
@@ -4135,8 +4134,8 @@ test "win32: a maximized window comes back from fullscreen maximized" {
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     _ = win32.ShowWindow(window.hwnd, win32.SW_MAXIMIZE);
 
     // Maximized as the caption button does it, not by toggle_maximize,
@@ -4215,7 +4214,7 @@ test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
 
     const alone = try testFrame(&app);
     const only = try testPane(&app, alone);
-    alone.tree = try .init(alloc, only);
+    alone.tab().tree = try .init(alloc, only);
     try std.testing.expect(!try app.performAction(.{ .surface = &only.core_surface }, .toggle_split_zoom, {}));
     try std.testing.expectEqual(0, app.requests.items.len);
 
@@ -4228,8 +4227,8 @@ test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ a, b });
-    window.focused = a;
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
     window.relayout();
     const split_a = try paneRect(window, a);
 
@@ -4256,7 +4255,7 @@ test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
     // call is made on it.
     for ([_]bool{ false, true }) |navigation| {
         app.config.@"split-preserve-zoom".navigation = navigation;
-        window.focused = a;
+        window.tab().focused = a;
         try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_split_zoom, {}));
         app.createRequested();
         b.core_state = .live;
@@ -4264,7 +4263,7 @@ test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
         b.core_state = .none;
         try std.testing.expect(goes);
         app.applyPendingFocus();
-        try std.testing.expect(window.focused == b);
+        try std.testing.expect(window.tab().focused == b);
         try std.testing.expect(shown(b.hwnd));
         if (navigation) {
             // The zoom moved to it.
@@ -4400,7 +4399,7 @@ test "win32: goto_window waits for run and goes round the windows" {
     for (&windows, &panes, 0..) |*w, *p, i| {
         w.* = try testFrame(&app);
         p.* = try testPane(&app, w.*);
-        w.*.tree = try .init(alloc, p.*);
+        w.*.tab().tree = try .init(alloc, p.*);
         if (i == 0) {
             // Alone, there is nowhere to go.
             try std.testing.expect(!try app.performAction(.{ .surface = &p.*.core_surface }, .goto_window, .next));
@@ -4460,8 +4459,8 @@ test "win32: resize_window waits for run and resizes the window of a lone termin
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     const target: apprt.Target = .{ .surface = &pane.core_surface };
     const scale = try pane.getContentScale();
@@ -4526,8 +4525,8 @@ test "win32: resize_window waits for run and resizes the window of a lone termin
 
     // Not in a split.
     const other = try testPane(&app, window);
-    window.tree.deinit();
-    window.tree = try testRow(alloc, &.{ pane, other });
+    window.tab().tree.deinit();
+    window.tab().tree = try testRow(alloc, &.{ pane, other });
     try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
 }
 
@@ -4547,8 +4546,8 @@ test "win32: reset_window_size waits for run and gives the window a new one's si
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     const target: apprt.Target = .{ .surface = &pane.core_surface };
     const scale = try pane.getContentScale();
@@ -4619,8 +4618,8 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     const target: apprt.Target = .{ .surface = &pane.core_surface };
 
     // Put back whatever text the clipboard held, as the clipboard's own
@@ -4666,8 +4665,8 @@ test "win32: toggle_window_decorations waits for run and takes the caption off o
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
-    window.focused = pane;
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     const target: apprt.Target = .{ .surface = &pane.core_surface };
     const placed = try windowRect(window.hwnd);
@@ -4898,8 +4897,8 @@ test "win32: progress_report shows the focused terminal's progress on the taskba
     const window = try testFrame(&app);
     const left = try testPane(&app, window);
     const right = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ left, right });
-    window.focused = left;
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
     const report = struct {
         fn f(a: *App, pane: *Surface, value: terminal.osc.Command.ProgressReport) !void {
             try std.testing.expect(try a.performAction(.{ .surface = &pane.core_surface }, .progress_report, value));
@@ -4957,8 +4956,8 @@ test "win32: progress_report shows the focused terminal's progress on the taskba
     // the keyboard focus: that is in the first window.
     const other = try testFrame(&app);
     const pane = try testPane(&app, other);
-    other.tree = try .init(alloc, pane);
-    other.focused = pane;
+    other.tab().tree = try .init(alloc, pane);
+    other.tab().focused = pane;
     _ = win32.SendMessageW(other.hwnd, app.taskbar_created, 0, 0);
     try report(&app, pane, .{ .state = .set, .progress = 70 });
     try std.testing.expect(!pane.focused);
@@ -5002,7 +5001,7 @@ test "win32: desktop_notification shows a toast for its terminal, which a click 
     const window = try testFrame(&app);
     const left = try testPane(&app, window);
     const right = try testPane(&app, window);
-    window.tree = try testRow(alloc, &.{ left, right });
+    window.tab().tree = try testRow(alloc, &.{ left, right });
     _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
     try std.testing.expect(left.setTitle("vim"));
     const notify = struct {
@@ -5062,7 +5061,7 @@ test "win32: desktop_notification shows a toast for its terminal, which a click 
         win32.PM_REMOVE,
     ).toBool());
     _ = App.wndProc(app.msg_hwnd, msg.message, msg.wParam, msg.lParam);
-    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(left, window.tab().focused.?);
     const click = struct {
         fn f(a: *App, group: u64) void {
             const m = toast.groupMessage(group);
@@ -5070,37 +5069,37 @@ test "win32: desktop_notification shows a toast for its terminal, which a click 
         }
     }.f;
     click(&app, 12345);
-    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(left, window.tab().focused.?);
 
     // Not for a terminal that is closing, nor one in a window closing,
     // nor while the app quits.
     right.closing = true;
     click(&app, right.notifications.id);
-    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(left, window.tab().focused.?);
     right.closing = false;
     window.closing = true;
     click(&app, right.notifications.id);
-    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(left, window.tab().focused.?);
     window.closing = false;
     app.terminating = true;
     click(&app, right.notifications.id);
-    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(left, window.tab().focused.?);
     app.terminating = false;
 
     // Under a prompt, where the focus may not move, `run` makes it later.
     app.prompt_depth = 1;
     click(&app, right.notifications.id);
-    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(left, window.tab().focused.?);
     app.prompt_depth = 0;
     app.applyPendingClick();
-    try std.testing.expectEqual(right, window.focused.?);
+    try std.testing.expectEqual(right, window.tab().focused.?);
 
     // A zoom that hides the terminal ends first.
-    window.tree.zoom(window.tree.locate(right).?);
+    window.tab().tree.zoom(window.tab().tree.locate(right).?);
     window.relayout();
     click(&app, left.notifications.id);
-    try std.testing.expectEqual(left, window.focused.?);
-    try std.testing.expectEqual(null, window.tree.zoomed);
+    try std.testing.expectEqual(left, window.tab().focused.?);
+    try std.testing.expectEqual(null, window.tab().tree.zoomed);
 
     // Closing removes a terminal's.
     try notify(&app, left, "again");
@@ -5127,7 +5126,7 @@ test "win32: float_window keeps a window on top, or puts it back" {
 
     const window = try testFrame(&app);
     const pane = try testPane(&app, window);
-    window.tree = try .init(alloc, pane);
+    window.tab().tree = try .init(alloc, pane);
     const target: apprt.Target = .{ .surface = &pane.core_surface };
 
     // It is made at once, inside the core's key callback, so neither the
@@ -5174,7 +5173,7 @@ test "win32: float_window keeps a window on top, or puts it back" {
 
     // Covering the monitor and coming back keeps it floating.
     try std.testing.expect(try app.performAction(target, .float_window, .on));
-    window.focused = pane;
+    window.tab().focused = pane;
     window.toggleFullscreen();
     try std.testing.expect(window.isFloating());
     window.toggleFullscreen();

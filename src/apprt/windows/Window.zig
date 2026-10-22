@@ -1,8 +1,9 @@
 //! A terminal window: the top-level frame, and what belongs to the window
 //! rather than to a terminal -- its size, caption, maximize state, the size
 //! Windows suggests on a DPI change, its system modal loops. Its terminals
-//! are `Surface`s, child windows the frame lays out from its split tree
-//! (`tree`, `layout`); `split` opens another beside one.
+//! are `Surface`s, child windows the frame lays out from the split tree of
+//! the tab it shows (`Tab.tree`, `layout`); `split` opens another beside
+//! one.
 //!
 //! Ownership, as for surfaces (`App.surfaceDestroyed`): membership in
 //! `App.windows` is ownership of the allocation. The frame's WM_NCDESTROY,
@@ -10,14 +11,15 @@
 //! window that is in the list; one that is not yet (`create` failing) is
 //! freed by `create` itself.
 //!
-//! The tree holds its terminals by pointer and owns none of them. It never
-//! holds a freed one: a terminal that closes on its own leaves it before it
-//! is destroyed (`removePane`), and the frame's WM_DESTROY, which comes
-//! before its child windows are destroyed, empties it.
+//! Each tab's tree holds its terminals by pointer and owns none of them. It
+//! never holds a freed one: a terminal that closes on its own leaves it
+//! before it is destroyed (`removePane`), and the frame's WM_DESTROY, which
+//! comes before its child windows are destroyed, empties every tab's.
 
 const Window = @This();
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const apprt = @import("../../apprt.zig");
@@ -28,6 +30,7 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
+pub const Tab = @import("Tab.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -39,7 +42,7 @@ const log = std.log.scoped(.win32);
 /// The frame's window class, registered in `App.init`.
 pub const class_name = "GhosttyWindowClass";
 
-/// The terminals of a window. `Surface.ref` and `Surface.unref` do
+/// A tab's terminals. `Surface.ref` and `Surface.unref` do
 /// nothing; see the ownership note above.
 pub const Tree = SplitTree(Surface);
 
@@ -61,30 +64,13 @@ app: *App,
 /// it is valid in every other handler.
 hwnd: win32.HWND,
 
-/// This window's terminals: never empty from `create` until the frame's
-/// WM_DESTROY empties it.
-tree: Tree,
+/// The window's tabs, in the order they show; never empty from `create`
+/// until the window is freed (`deinitTabs`). Each is allocated, so that a
+/// pointer to one stays put.
+tabs: std.ArrayListUnmanaged(*Tab),
 
-/// The terminal with the keyboard focus, or the one to give it to when the
-/// window is next activated, and the one the window is titled after: set
-/// by each terminal's WM_SETFOCUS, and moved off a terminal that closes on
-/// its own by `removePane` (`setFocused`). Null only while the tree is
-/// empty.
-focused: ?*Surface,
-
-/// The terminal a `goto_split` binding chose to give the focus to, not yet
-/// given it. The action runs inside the core's key callback, where moving
-/// the focus would send WM_KILLFOCUS into the surface whose callback is on
-/// the stack, and losing the focus makes the core send that surface a key
-/// release through its key callback (`CoreSurface.focusCallback`). So the
-/// terminal's key handler gives it as soon as the callback has returned,
-/// before the next key is read, so that a second press or the text typed
-/// after it goes to the new terminal (`App.applyPendingFocus`). `App.run`
-/// applies it too, but only once it has drained the queue, too late for
-/// keys pressed in a burst. One per window, as an `all:` binding moves
-/// the focus in each. Live when set; cleared when it begins to close
-/// (`App.forgetClosing`).
-pending_focus: ?*Surface,
+/// The index in `tabs` of the tab the window shows.
+selected: usize,
 
 /// A close of the whole window is being asked about, or was agreed to and
 /// its teardown posted (`requestClose`). Stops a second WM_CLOSE or
@@ -121,6 +107,31 @@ taskbar_button: bool,
 /// `App.endPrompt` to enable again.
 prompt_disabled: bool,
 
+/// The tab the window shows, whose terminals are laid out in its client
+/// area.
+pub fn tab(self: *const Window) *Tab {
+    return self.tabs.items[self.selected];
+}
+
+/// A new, empty tab at the end of `tabs`.
+pub fn appendTab(self: *Window, alloc: Allocator) Allocator.Error!*Tab {
+    try self.tabs.ensureUnusedCapacity(alloc, 1);
+    const t = try alloc.create(Tab);
+    t.* = .{};
+    self.tabs.appendAssumeCapacity(t);
+    return t;
+}
+
+/// Free the tabs, with what their trees still hold: nothing once the
+/// frame's WM_DESTROY has run.
+pub fn deinitTabs(self: *Window, alloc: Allocator) void {
+    for (self.tabs.items) |t| {
+        t.tree.deinit();
+        alloc.destroy(t);
+    }
+    self.tabs.deinit(alloc);
+}
+
 /// Create a window holding a new terminal, still hidden: `show` shows it
 /// once the app owns both (`App.newWindow`). The frame is created at
 /// CW_USEDEFAULT size so that the terminal, which fills it, starts with a
@@ -133,9 +144,8 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     self.* = .{
         .app = app,
         .hwnd = undefined,
-        .tree = .empty,
-        .focused = null,
-        .pending_focus = null,
+        .tabs = .empty,
+        .selected = 0,
         .dark_frame = false,
         .fullscreen = null,
         .decoration = null,
@@ -145,6 +155,8 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .closing = false,
         .destroy_deferred = false,
     };
+    const first = try self.appendTab(alloc);
+    errdefer self.deinitTabs(alloc);
 
     const hwnd = try self.createFrame(
         win32.CW_USEDEFAULT,
@@ -167,7 +179,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     if (!win32.GetClientRect(hwnd, &client).toBool()) return App.Error.Win32CallFailed;
     const surface = try Surface.create(app, self, client, opts);
     // Nothing owns the terminal until it is in the tree.
-    self.tree = Tree.init(alloc, surface) catch |err| {
+    first.tree = Tree.init(alloc, surface) catch |err| {
         surface.discard();
         return err;
     };
@@ -219,7 +231,7 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
 /// the size already sent one) reach the terminal from here; its core is
 /// live by now.
 pub fn show(self: *Window) void {
-    if (self.focused) |surface| {
+    if (self.tab().focused) |surface| {
         if (surface.initial_size) |size| {
             applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
         }
@@ -315,7 +327,7 @@ fn handleMessage(
             // keep their sizes, since the core clamps the grid to at least
             // 1x1 and would reflow every line to one column and back.
             if (wparam == win32.SIZE_MINIMIZED) {
-                var it = self.tree.iterator();
+                var it = self.tab().tree.iterator();
                 while (it.next()) |entry| entry.view.occlusionChanged(false);
                 return 0;
             }
@@ -332,7 +344,7 @@ fn handleMessage(
             // scale before the sizes computed for them. A child window gets
             // no WM_DPICHANGED of its own. wParam carries the new DPI in
             // both words; they are always equal for a window.
-            var it = self.tree.iterator();
+            var it = self.tab().tree.iterator();
             while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
             if (self.fullscreen == null) {
                 applySuggestedRect(hwnd, lparam);
@@ -360,7 +372,7 @@ fn handleMessage(
         // Keyboard focus belongs to a terminal: the frame gets it on
         // activation (DefWindowProcW's WM_ACTIVATE), and passes it on.
         win32.WM_SETFOCUS => {
-            if (self.focused) |surface| _ = win32.SetFocus(surface.hwnd);
+            if (self.tab().focused) |surface| _ = win32.SetFocus(surface.hwnd);
             return 0;
         },
 
@@ -430,9 +442,11 @@ fn handleMessage(
             // The child windows are destroyed next, and each frees its
             // terminal (App.surfaceDestroyed): the tree lets go of them
             // first. Nothing lays the window out after this.
-            self.tree.deinit();
-            self.tree = .empty;
-            self.focused = null;
+            for (self.tabs.items) |t| {
+                t.tree.deinit();
+                t.tree = .empty;
+                t.focused = null;
+            }
             return 0;
         },
 
@@ -461,10 +475,10 @@ pub fn requestClose(self: *Window) void {
     if (self.app.terminating or self.closing) return;
     self.closing = true;
 
-    // The tree does not change while the prompt is open: only `run` adds
+    // No tree changes while the prompt is open: only `run` adds
     // terminals, and a teardown is deferred (`App.canReenterCore`).
     const ask = ask: {
-        var it = self.tree.iterator();
+        var it = self.tab().tree.iterator();
         while (it.next()) |entry| {
             const core_surface = entry.view.liveCore() orelse continue;
             if (core_surface.needsConfirmQuit()) break :ask true;
@@ -552,7 +566,7 @@ pub fn split(
     const alloc = self.app.core_app.alloc;
     // A parent leaves the tree only when it closes, and the core's request
     // is dropped then (`App.forgetClosing`).
-    const handle = self.tree.locate(parent) orelse return error.SplitParentGone;
+    const handle = self.tab().tree.locate(parent) orelse return error.SplitParentGone;
     const where: Tree.Split.Direction = switch (direction) {
         .right => .right,
         .down => .down,
@@ -575,10 +589,10 @@ pub fn split(
     errdefer surface.discard();
     var single: Tree = try .init(alloc, surface);
     defer single.deinit();
-    const tree = try self.tree.split(alloc, handle, where, new_split_ratio, &single);
+    const tree = try self.tab().tree.split(alloc, handle, where, new_split_ratio, &single);
     errdefer comptime unreachable;
-    self.tree.deinit();
-    self.tree = tree;
+    self.tab().tree.deinit();
+    self.tab().tree = tree;
     return surface;
 }
 
@@ -588,7 +602,7 @@ pub fn split(
 pub fn tiledPlace(self: *Window, pane: *Surface) ?win32.RECT {
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return null;
-    var tiled = self.tree;
+    var tiled = self.tab().tree;
     tiled.zoomed = null;
     var found: PlaceOf = .{ .target = pane };
     layout(&tiled, client, dividerWidth(dpiOf(self.app, self.hwnd)), &found);
@@ -628,8 +642,8 @@ pub fn showPane(self: *Window, surface: *Surface) void {
 /// wrap around, and a direction is the nearest terminal that way
 /// (`SplitTree.goto`). Null when there is none but `from`.
 pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface {
-    const handle = self.tree.locate(from) orelse return null;
-    const found = self.tree.goto(self.app.core_app.alloc, handle, switch (to) {
+    const handle = self.tab().tree.locate(from) orelse return null;
+    const found = self.tab().tree.goto(self.app.core_app.alloc, handle, switch (to) {
         .previous => .previous_wrapped,
         .next => .next_wrapped,
         .up => .{ .spatial = .up },
@@ -645,7 +659,7 @@ pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface
     };
     const target = found orelse return null;
     if (target == handle) return null;
-    return self.tree.nodes[target.idx()].leaf;
+    return self.tab().tree.nodes[target.idx()].leaf;
 }
 
 /// For `resize_split`: move the divider of the split nearest `from` that
@@ -654,7 +668,7 @@ pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface
 /// src/apprt/gtk/class/split_tree.zig, then `SplitTree.resize`). Nothing
 /// moves if a terminal would shrink below a cell (`adopt`).
 pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSplit) void {
-    const handle = self.tree.locate(from) orelse return;
+    const handle = self.tab().tree.locate(from) orelse return;
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
     const across = value.direction == .left or value.direction == .right;
@@ -663,7 +677,7 @@ pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSpli
     const ratio = resizeShare(value.amount, dpiOf(self.app, self.hwnd), extent, value.direction);
 
     const layout_of: Tree.Split.Layout = if (across) .horizontal else .vertical;
-    var tree = self.tree.resize(self.app.core_app.alloc, handle, layout_of, ratio) catch |err| {
+    var tree = self.tab().tree.resize(self.app.core_app.alloc, handle, layout_of, ratio) catch |err| {
         log.warn("cannot resize the split err={}", .{err});
         return;
     };
@@ -697,7 +711,7 @@ fn resizeShare(
 pub fn equalize(self: *Window) void {
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
-    var tree = self.tree.equalize(self.app.core_app.alloc) catch |err| {
+    var tree = self.tab().tree.equalize(self.app.core_app.alloc) catch |err| {
         log.warn("cannot equalize the splits err={}", .{err});
         return;
     };
@@ -705,19 +719,19 @@ pub fn equalize(self: *Window) void {
 }
 
 /// Lay the terminals out by `tree`, a resized or equalized copy of
-/// `self.tree`, and keep it; or, if that would leave a terminal it shrinks
+/// `self.tab().tree`, and keep it; or, if that would leave a terminal it shrinks
 /// less than a cell across or down in `client`, free it and change
 /// nothing. A split refuses the same (`newPaneArea`): a terminal with no
 /// room shows nothing, and `SplitTree.resize` would clamp a ratio as far
 /// as 0 or 1.
 fn adopt(self: *Window, tree: *Tree, client: win32.RECT) void {
     const divider = dividerWidth(dpiOf(self.app, self.hwnd));
-    if (!keepsCells(&self.tree, tree, client, divider)) {
+    if (!keepsCells(&self.tab().tree, tree, client, divider)) {
         tree.deinit();
         return;
     }
-    self.tree.deinit();
-    self.tree = tree.*;
+    self.tab().tree.deinit();
+    self.tab().tree = tree.*;
     self.relayout();
 }
 
@@ -773,10 +787,10 @@ fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
 /// zoom, as GTK's `split-tree.zoom` does. Never inside a core frame: the
 /// layout sends WM_SIZE (`App.requests`).
 pub fn toggleZoom(self: *Window, from: *Surface) void {
-    if (self.tree.zoomed != null) {
-        self.tree.zoom(null);
+    if (self.tab().tree.zoomed != null) {
+        self.tab().tree.zoom(null);
     } else {
-        self.tree.zoom(self.tree.locate(from) orelse return);
+        self.tab().tree.zoom(self.tab().tree.locate(from) orelse return);
     }
     self.relayout();
 }
@@ -787,11 +801,11 @@ pub fn toggleZoom(self: *Window, from: *Surface) void {
 /// focus never goes to a hidden terminal. Never inside a core frame: the
 /// layout sends WM_SIZE.
 pub fn focusFromGoto(self: *Window, surface: *Surface) void {
-    if (self.tree.zoomed != null) {
+    if (self.tab().tree.zoomed != null) {
         if (self.app.config.@"split-preserve-zoom".navigation) {
-            if (self.tree.locate(surface)) |handle| self.tree.zoom(handle);
+            if (self.tab().tree.locate(surface)) |handle| self.tab().tree.zoom(handle);
         } else {
-            self.tree.zoom(null);
+            self.tab().tree.zoom(null);
         }
         self.relayout();
     }
@@ -810,7 +824,7 @@ pub fn giveFocus(self: *Window, surface: *Surface) void {
 /// Make `surface` the window's focused terminal, and name the window after
 /// it, as GTK and macOS title a window after its focused split.
 pub fn setFocused(self: *Window, surface: *Surface) void {
-    self.focused = surface;
+    self.tab().focused = surface;
     _ = self.showTitle(surface.title);
     self.showProgress();
 }
@@ -821,7 +835,7 @@ pub fn setFocused(self: *Window, surface: *Surface) void {
 pub fn showProgress(self: *Window) void {
     if (!self.taskbar_button) return;
     const list = self.app.taskbar_list orelse return;
-    const surface = self.focused orelse return;
+    const surface = self.tab().focused orelse return;
     list.show(self.hwnd, surface.progress);
 }
 
@@ -871,22 +885,22 @@ pub fn toClient(self: *const Window, rect: *win32.RECT) bool {
 /// Fails only to allocate the new tree, and then changes nothing.
 pub fn removePane(self: *Window, handle: Tree.Node.Handle) !void {
     const alloc = self.app.core_app.alloc;
-    const surface = self.tree.nodes[handle.idx()].leaf;
+    const surface = self.tab().tree.nodes[handle.idx()].leaf;
 
     // From the tree as it is, which still has `handle`. `.previous` and
     // `.next` allocate nothing.
-    const focus: ?*Surface = if (self.focused != surface) self.focused else focus: {
-        const to = (self.tree.goto(alloc, handle, .previous) catch null) orelse
-            (self.tree.goto(alloc, handle, .next) catch null) orelse
+    const focus: ?*Surface = if (self.tab().focused != surface) self.tab().focused else focus: {
+        const to = (self.tab().tree.goto(alloc, handle, .previous) catch null) orelse
+            (self.tab().tree.goto(alloc, handle, .next) catch null) orelse
             break :focus null;
-        break :focus self.tree.nodes[to.idx()].leaf;
+        break :focus self.tab().tree.nodes[to.idx()].leaf;
     };
 
-    const tree = try self.tree.remove(alloc, handle);
+    const tree = try self.tab().tree.remove(alloc, handle);
     errdefer comptime unreachable;
-    self.tree.deinit();
-    self.tree = tree;
-    self.focused = focus;
+    self.tab().tree.deinit();
+    self.tab().tree = tree;
+    self.tab().focused = focus;
 
     // The focus moves first, so that it is never left on a hidden window.
     if (focus) |f| self.giveFocus(f);
@@ -897,15 +911,15 @@ pub fn removePane(self: *Window, handle: Tree.Node.Handle) !void {
 /// Lay the terminals out over the client area (`layout`). Not while the
 /// window is minimized and its client area is empty (see WM_SIZE).
 pub fn relayout(self: *Window) void {
-    if (self.tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
+    if (self.tab().tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
     const divider = dividerWidth(dpiOf(self.app, self.hwnd));
 
     // One batch, so that the terminals move together.
-    const count = std.math.lossyCast(c_int, self.tree.nodes.len);
+    const count = std.math.lossyCast(c_int, self.tab().tree.nodes.len);
     var placer: Placer = .{ .batch = win32.BeginDeferWindowPos(count) };
-    layout(&self.tree, client, divider, &placer);
+    layout(&self.tab().tree, client, divider, &placer);
     if (placer.batch) |batch| {
         if (win32.EndDeferWindowPos(batch).toBool()) return;
     } else if (!placer.dropped) {
@@ -916,7 +930,7 @@ pub fn relayout(self: *Window) void {
     // The batch failed, and none of its positions were applied: each
     // terminal is placed on its own instead.
     var direct: Placer = .{ .batch = null };
-    layout(&self.tree, client, divider, &direct);
+    layout(&self.tab().tree, client, divider, &direct);
 }
 
 /// Moves each terminal where `layout` puts it: in a batch while there is
@@ -1260,7 +1274,7 @@ pub fn isRestored(self: *const Window) bool {
 /// terminals would change too, and the window is at a size of its own
 /// (`isRestored`), as `vt-window-resize-allowed` documents it.
 pub fn terminalResizable(self: *const Window, surface: *const Surface) bool {
-    if (self.tree.isSplit() or self.tree.locate(surface) == null) return false;
+    if (self.tab().tree.isSplit() or self.tab().tree.locate(surface) == null) return false;
     return self.isRestored();
 }
 
@@ -1279,7 +1293,7 @@ pub const DefaultSize = union(enum) {
 pub fn defaultSize(self: *const Window) ?DefaultSize {
     if (self.fullscreen != null) return null;
     if (self.app.config.maximize) return .maximized;
-    const surface = self.focused orelse return null;
+    const surface = self.tab().focused orelse return null;
     return .{ .initial = surface.initial_size orelse return null };
 }
 
@@ -1294,7 +1308,7 @@ pub fn resetSize(self: *Window) void {
         .initial => |size| {
             if (!self.isRestored()) _ = win32.ShowWindow(self.hwnd, win32.SW_RESTORE);
             // defaultSize found one.
-            const surface = self.focused.?;
+            const surface = self.tab().focused.?;
             applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
         },
     }
@@ -2227,8 +2241,8 @@ test "win32: modal loops are counted per window and returned on destroy" {
     for ([_]*Window{ &a, &b }) |window| {
         window.app = &app;
         window.hwnd = hwnd;
-        window.tree = .empty;
-        window.focused = null;
+        window.tabs = .empty;
+        window.selected = 0;
         window.modal_loops = .{};
     }
 

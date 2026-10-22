@@ -755,7 +755,7 @@ pub const Surface = struct {
     /// the close can be asked for again.
     pub fn destroy(self: *Surface) bool {
         const window = self.window;
-        if (window.tree.locate(self)) |handle| {
+        if (window.tab().tree.locate(self)) |handle| {
             if (handle == .root) return window.destroy();
             window.removePane(handle) catch |err| {
                 log.err("unable to take a closing terminal out of its window err={}", .{err});
@@ -1219,7 +1219,7 @@ pub const Surface = struct {
                 log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
             }
         }
-        if (self.window.focused == self) self.window.showProgress();
+        if (self.window.tab().focused == self) self.window.showProgress();
     }
 
     /// The progress timer's WM_TIMER. One already queued can arrive after
@@ -1271,7 +1271,7 @@ pub const Surface = struct {
         if (self.title) |old| alloc.free(old);
         self.title = copy;
 
-        if (self.window.focused != self) return true;
+        if (self.window.tab().focused != self) return true;
         return self.window.showTitle(self.title);
     }
 
@@ -1570,7 +1570,7 @@ pub const Surface = struct {
                 const result = self.keyEvent(core_surface, msg, wparam, lparam, mods);
                 // A focus move a binding chose (goto_split), now that the
                 // core's key callback has returned and before the next key
-                // is read (`Window.pending_focus`).
+                // is read (`Tab.pending_focus`).
                 self.app.applyPendingFocus();
                 const effect = result catch |err| {
                     log.warn("key callback failed err={}", .{err});
@@ -3594,14 +3594,18 @@ test "win32: a teardown dispatched inside another waits for it" {
     const s = struct {
         var surface: Surface = undefined;
         var window: Window = undefined;
+        var tab: Window.Tab = .{};
+        var tabs = [_]*Window.Tab{&tab};
     };
     const surface = &s.surface;
     surface.app = &app;
     surface.window = &s.window;
     surface.core_state = .none;
+    s.window.tabs = .fromOwnedSlice(&s.tabs);
+    s.window.selected = 0;
     // The window's only terminal, so a teardown that runs takes the window.
-    s.window.tree = try .init(std.testing.allocator, surface);
-    defer s.window.tree.deinit();
+    s.tab.tree = try .init(std.testing.allocator, surface);
+    defer s.tab.tree.deinit();
     s.window.app = &app;
     app.windows = .empty;
 
@@ -3695,10 +3699,16 @@ test "win32: a finished teardown posts the ones it deferred again" {
     // the window.
     app.windows = .empty;
     for (&s.windows) |*window| window.app = &app;
-    s.windows[0].tree = try .init(alloc, &s.done);
-    defer s.windows[0].tree.deinit();
-    s.windows[1].tree = try .init(alloc, &s.waiting);
-    defer s.windows[1].tree.deinit();
+    var tabs: [2]Window.Tab = .{ .{}, .{} };
+    var tab_lists: [2][1]*Window.Tab = .{ .{&tabs[0]}, .{&tabs[1]} };
+    for (&s.windows, &tab_lists) |*window, *list| {
+        window.tabs = .fromOwnedSlice(list);
+        window.selected = 0;
+    }
+    tabs[0].tree = try .init(alloc, &s.done);
+    defer tabs[0].tree.deinit();
+    tabs[1].tree = try .init(alloc, &s.waiting);
+    defer tabs[1].tree.deinit();
     s.done.destroy_deferred = false;
     s.waiting.destroy_deferred = true;
     try app.surfaces.append(alloc, &s.waiting);
