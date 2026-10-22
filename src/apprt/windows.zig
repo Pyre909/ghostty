@@ -34,15 +34,16 @@
 //!
 //! ## Windows
 //!
-//! A window holds its terminals in a split tree, laid out over its client
-//! area (`Window`). An action that lays out terminals, moves the focus to
-//! another window or frees core state, such as `.new_split`,
-//! `.toggle_fullscreen` or a full `.reload_config`, is recorded and carried
-//! out by `App.run` once the core frame that asked has returned, and so is
-//! the frame change a new configuration's `window-decoration` makes
-//! (`App.requests`, which `App.Request` lists); `.goto_split` moves the
-//! focus once the core's key callback has returned (`Tab.pending_focus`),
-//! or after such a request when it follows one, and ends a zoom or moves it
+//! A window holds tabs, each with its terminals in a split tree, and shows
+//! one, laid out over its client area (`Window`, `Tab`). An action that
+//! lays out terminals, moves the focus to another window or tab, or frees
+//! core state, such as `.new_split`, `.goto_tab`, `.toggle_fullscreen` or
+//! a full `.reload_config`, is recorded and carried out by `App.run` once
+//! the core frame that asked has returned, and so is the frame change a
+//! new configuration's `window-decoration` makes (`App.requests`, which
+//! `App.Request` lists); `.goto_split` moves the focus once the core's key
+//! callback has returned (`Tab.pending_focus`), or after such a request
+//! when it follows one, and ends a zoom or moves it
 //! (`Window.focusFromGoto`).
 //! The process quits when its last window closes, whatever
 //! `quit-after-last-window-closed` says: with no window left there is
@@ -50,8 +51,8 @@
 //!
 //! ## What is still missing
 //!
-//! Not implemented: tabs (a window is its own one tab, so `close_tab:this`
-//! closes it), dragging the dividers between splits, a context menu,
+//! Not implemented: a tab bar (tabs come and go by their key bindings),
+//! the tab overview, dragging the dividers between splits, a context menu,
 //! link previews and precision-touchpad scrolling. Without a menu, a
 //! right click with the default `right-click-action` only selects the word
 //! or link under the pointer.

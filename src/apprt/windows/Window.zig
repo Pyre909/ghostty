@@ -125,11 +125,202 @@ pub fn appendTab(self: *Window, alloc: Allocator) Allocator.Error!*Tab {
 /// Free the tabs, with what their trees still hold: nothing once the
 /// frame's WM_DESTROY has run.
 pub fn deinitTabs(self: *Window, alloc: Allocator) void {
-    for (self.tabs.items) |t| {
-        t.tree.deinit();
-        alloc.destroy(t);
-    }
+    for (self.tabs.items) |t| freeTab(alloc, t);
     self.tabs.deinit(alloc);
+}
+
+fn freeTab(alloc: Allocator, t: *Tab) void {
+    t.tree.deinit();
+    if (t.title_override) |title| alloc.free(title);
+    alloc.destroy(t);
+}
+
+/// Where a terminal is: its tab's index in `tabs`, and its node in that
+/// tab's tree.
+pub const Place = struct {
+    index: usize,
+    handle: Tree.Node.Handle,
+};
+
+/// Where `surface` is, in whichever tab holds it, shown or not.
+pub fn find(self: *const Window, surface: *const Surface) ?Place {
+    for (self.tabs.items, 0..) |t, index| {
+        if (t.tree.locate(surface)) |handle| return .{ .index = index, .handle = handle };
+    }
+    return null;
+}
+
+/// The tab holding `surface`, which need not be the one shown.
+pub fn tabOf(self: *const Window, surface: *const Surface) ?*Tab {
+    const place = self.find(surface) orelse return null;
+    return self.tabs.items[place.index];
+}
+
+/// The index of `t` in `tabs`.
+pub fn tabIndex(self: *const Window, t: *Tab) ?usize {
+    return std.mem.indexOfScalar(*Tab, self.tabs.items, t);
+}
+
+/// What the window is titled after while `t` is shown: its title from
+/// `set_tab_title`, or else its focused terminal's.
+pub fn tabTitle(t: *const Tab) ?[:0]const u8 {
+    if (t.title_override) |title| return title;
+    const surface = t.focused orelse return null;
+    return surface.title;
+}
+
+/// Put `surface`, a new terminal not yet shown, in a tab of its own after
+/// the shown one or at the end, as `window-new-tab-position` asks; its
+/// index. The tab is not shown yet (`selectTab`).
+pub fn insertTab(self: *Window, surface: *Surface) !usize {
+    const alloc = self.app.core_app.alloc;
+    try self.tabs.ensureUnusedCapacity(alloc, 1);
+    const t = try alloc.create(Tab);
+    errdefer alloc.destroy(t);
+    t.* = .{ .tree = try .init(alloc, surface), .focused = surface };
+    errdefer comptime unreachable;
+    const at = switch (self.app.config.@"window-new-tab-position") {
+        .current => self.selected + 1,
+        .end => self.tabs.items.len,
+    };
+    self.tabs.insertAssumeCapacity(at, t);
+    return at;
+}
+
+/// A new terminal, made with `opts` at the size of the client area, in a
+/// tab of its own (`insertTab`); the tab's index. Hidden until the tab is
+/// shown (`selectTab`), once the app owns the terminal (`App.newTab`).
+pub fn newTab(self: *Window, opts: Surface.Options) !usize {
+    const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
+    const surface = try Surface.create(self.app, self, area, opts);
+    // Nothing owns the terminal until it is in a tab.
+    errdefer surface.discard();
+    return try self.insertTab(surface);
+}
+
+/// Where a tab's terminals go: the client area. A minimized frame has
+/// none, so then the place the shown tab's terminals keep, which the
+/// frame's WM_SIZE leaves them while it is minimized: a terminal made at
+/// 0x0 would start its shell on a grid of one cell.
+pub fn layoutArea(self: *const Window) ?win32.RECT {
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return null;
+    if (!win32.IsIconic(self.hwnd).toBool()) return client;
+    var area: ?win32.RECT = null;
+    var it = self.tab().tree.iterator();
+    while (it.next()) |entry| {
+        var rect: win32.RECT = undefined;
+        if (!win32.GetWindowRect(entry.view.hwnd, &rect).toBool() or !self.toClient(&rect)) continue;
+        area = if (area) |a| .{
+            .left = @min(a.left, rect.left),
+            .top = @min(a.top, rect.top),
+            .right = @max(a.right, rect.right),
+            .bottom = @max(a.bottom, rect.bottom),
+        } else rect;
+    }
+    return area orelse client;
+}
+
+/// Show the tab at `index` in place of the one shown, as GTK selects a
+/// tab: its terminals are laid out and shown, and its focused one gets the
+/// focus and titles the window; then the other's are hidden, and their
+/// renderers see themselves occluded. Never inside a core frame
+/// (`App.requests`): the layout sends WM_SIZE, and the focus moves.
+pub fn selectTab(self: *Window, index: usize) void {
+    assert(index < self.tabs.items.len);
+    if (index == self.selected) return;
+    const old = self.tab();
+    self.selected = index;
+    self.showTab();
+    // A focus move a goto_split left waiting there would outlive its tab.
+    old.pending_focus = null;
+    hideTab(old);
+}
+
+/// Lay the shown tab out and give its focused terminal the focus.
+fn showTab(self: *Window) void {
+    self.relayout();
+    if (self.tab().focused) |surface| self.giveFocus(surface);
+}
+
+fn hideTab(t: *Tab) void {
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        _ = win32.ShowWindow(entry.view.hwnd, win32.SW_HIDE);
+        entry.view.occlusionChanged(false);
+    }
+}
+
+/// Take `t`, whose last terminal is closing, out of the window. A shown
+/// tab gives its place to the one after it, or else the one before, as a
+/// browser's do.
+pub fn removeTab(self: *Window, t: *Tab) void {
+    const index = self.tabIndex(t) orelse return;
+    assert(self.tabs.items.len > 1);
+    _ = self.tabs.orderedRemove(index);
+    const shown = index == self.selected;
+    if (index < self.selected or (shown and index == self.tabs.items.len)) self.selected -= 1;
+    // The next tab first, then the closing terminal hidden, so that it is
+    // not shown, nor clicked, while its core stops (`Surface.destroy`).
+    if (shown) {
+        self.showTab();
+        hideTab(t);
+    }
+    freeTab(self.app.core_app.alloc, t);
+}
+
+/// Move the tab holding `surface` by `amount`, wrapping round, as GTK
+/// moves it (`Window.moveTab` in src/apprt/gtk/class/window.zig); false
+/// with one tab, or when it would not move. Only the order changes: no
+/// terminal is laid out again.
+pub fn moveTab(self: *Window, surface: *const Surface, amount: isize) bool {
+    const total = self.tabs.items.len;
+    if (total <= 1) return false;
+    const from = (self.find(surface) orelse return false).index;
+    const t = self.tabs.items[from];
+    const to: usize = @intCast(@mod(@as(isize, @intCast(from)) + amount, @as(isize, @intCast(total))));
+    if (to == from) return false;
+    const shown = self.tab();
+    _ = self.tabs.orderedRemove(from);
+    self.tabs.insertAssumeCapacity(to, t);
+    self.selected = self.tabIndex(shown).?;
+    return true;
+}
+
+/// The index `goto_tab` goes to from the shown tab, as GTK selects it
+/// (`Window.selectTab`): previous and next wrap round, an index counts
+/// from 1 and stops at the last tab; null for 0, or for the shown tab, so
+/// that the key reaches the terminal.
+pub fn gotoTabIndex(self: *const Window, to: apprt.action.GotoTab) ?usize {
+    const total = self.tabs.items.len;
+    const current = self.selected;
+    const index: usize = switch (to) {
+        .previous => if (current > 0) current - 1 else total - 1,
+        .next => if (current + 1 < total) current + 1 else 0,
+        .last => total - 1,
+        _ => n: {
+            const n = @backingInt(to);
+            if (n <= 0) return null;
+            break :n @min(@as(usize, @intCast(n)) - 1, total - 1);
+        },
+    };
+    return if (index == current) null else index;
+}
+
+/// `set_tab_title` for the tab holding `surface`: `title` shows in place
+/// of its focused terminal's, or an empty one ends that. False if it could
+/// not be stored.
+pub fn setTabTitle(self: *Window, surface: *const Surface, title: [:0]const u8) bool {
+    const alloc = self.app.core_app.alloc;
+    const t = self.tabOf(surface) orelse return false;
+    const copy: ?[:0]u8 = if (title.len == 0) null else alloc.dupeSentinel(u8, title, 0) catch |err| {
+        log.warn("failed to store the tab title err={}", .{err});
+        return false;
+    };
+    if (t.title_override) |old| alloc.free(old);
+    t.title_override = copy;
+    if (t == self.tab()) return self.showTitle(tabTitle(t));
+    return true;
 }
 
 /// Create a window holding a new terminal, still hidden: `show` shows it
@@ -344,8 +535,10 @@ fn handleMessage(
             // scale before the sizes computed for them. A child window gets
             // no WM_DPICHANGED of its own. wParam carries the new DPI in
             // both words; they are always equal for a window.
-            var it = self.tab().tree.iterator();
-            while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
+            for (self.tabs.items) |t| {
+                var it = t.tree.iterator();
+                while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
+            }
             if (self.fullscreen == null) {
                 applySuggestedRect(hwnd, lparam);
             } else {
@@ -477,14 +670,9 @@ pub fn requestClose(self: *Window) void {
 
     // No tree changes while the prompt is open: only `run` adds
     // terminals, and a teardown is deferred (`App.canReenterCore`).
-    const ask = ask: {
-        var it = self.tab().tree.iterator();
-        while (it.next()) |entry| {
-            const core_surface = entry.view.liveCore() orelse continue;
-            if (core_surface.needsConfirmQuit()) break :ask true;
-        }
-        break :ask false;
-    };
+    const ask = for (self.tabs.items) |t| {
+        if (needsConfirm(t)) break true;
+    } else false;
     if (ask and !confirm(
         self.app,
         self.hwnd,
@@ -496,6 +684,67 @@ pub fn requestClose(self: *Window) void {
     }
 
     self.postDestroy();
+}
+
+/// `close_tab`: the tabs `mode` names from the one at index `at`, as GTK
+/// closes them: that one itself, every other tab, or the tabs after it.
+/// Asks first, as `requestClose` does, if a process is still running in
+/// one; then each of their terminals is torn down from a message loop, and
+/// a tab goes with its last (`Surface.destroy`). False when `mode` names
+/// no tab. Closing the window's only tab is closing the window
+/// (`App.closeTab`).
+///
+/// `close_tab` runs inside a core frame, so this only posts.
+pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMode) bool {
+    if (at >= self.tabs.items.len) return false;
+    const closes = struct {
+        fn f(index: usize, from: usize, m: apprt.action.CloseTabMode) bool {
+            return switch (m) {
+                .this => index == from,
+                .other => index != from,
+                .right => index > from,
+            };
+        }
+    }.f;
+
+    var any = false;
+    var ask = false;
+    for (self.tabs.items, 0..) |x, i| {
+        if (!closes(i, at, mode)) continue;
+        any = true;
+        if (needsConfirm(x)) ask = true;
+    }
+    if (!any) return false;
+    if (self.app.terminating or self.closing) return true;
+    if (ask and !confirm(
+        self.app,
+        self.hwnd,
+        L("A process is still running in a tab. Close it anyway?"),
+        .ok,
+    )) return true;
+
+    // The tabs do not change while the prompt was open: only `run` adds a
+    // terminal, and a teardown is deferred (`App.canReenterCore`).
+    for (self.tabs.items, 0..) |x, i| {
+        if (!closes(i, at, mode)) continue;
+        var it = x.tree.iterator();
+        while (it.next()) |entry| {
+            if (entry.view.closing) continue;
+            entry.view.closing = true;
+            entry.view.postDestroy();
+        }
+    }
+    return true;
+}
+
+/// Whether a terminal of `t` asks before it closes.
+fn needsConfirm(t: *const Tab) bool {
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        const core_surface = entry.view.liveCore() orelse continue;
+        if (core_surface.needsConfirmQuit()) return true;
+    }
+    return false;
 }
 
 /// Ask for the window to be torn down from a message loop.
@@ -564,9 +813,11 @@ pub fn split(
     opts: Surface.Options,
 ) !*Surface {
     const alloc = self.app.core_app.alloc;
-    // A parent leaves the tree only when it closes, and the core's request
-    // is dropped then (`App.forgetClosing`).
-    const handle = self.tab().tree.locate(parent) orelse return error.SplitParentGone;
+    // A parent leaves its tab only when it closes, and the core's request
+    // is dropped then (`App.forgetClosing`). Its tab need not be shown.
+    const at = self.find(parent) orelse return error.SplitParentGone;
+    const t = self.tabs.items[at.index];
+    const handle = at.handle;
     const where: Tree.Split.Direction = switch (direction) {
         .right => .right,
         .down => .down,
@@ -589,10 +840,10 @@ pub fn split(
     errdefer surface.discard();
     var single: Tree = try .init(alloc, surface);
     defer single.deinit();
-    const tree = try self.tab().tree.split(alloc, handle, where, new_split_ratio, &single);
+    const tree = try t.tree.split(alloc, handle, where, new_split_ratio, &single);
     errdefer comptime unreachable;
-    self.tab().tree.deinit();
-    self.tab().tree = tree;
+    t.tree.deinit();
+    t.tree = tree;
     return surface;
 }
 
@@ -600,9 +851,8 @@ pub fn split(
 /// A split divides that place, since it ends any zoom (`SplitTree.split`),
 /// whereas a zoomed terminal's window covers the whole client area.
 pub fn tiledPlace(self: *Window, pane: *Surface) ?win32.RECT {
-    var client: win32.RECT = undefined;
-    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return null;
-    var tiled = self.tab().tree;
+    const client = self.layoutArea() orelse return null;
+    var tiled = (self.tabOf(pane) orelse return null).tree;
     tiled.zoomed = null;
     var found: PlaceOf = .{ .target = pane };
     layout(&tiled, client, dividerWidth(dpiOf(self.app, self.hwnd)), &found);
@@ -642,8 +892,10 @@ pub fn showPane(self: *Window, surface: *Surface) void {
 /// wrap around, and a direction is the nearest terminal that way
 /// (`SplitTree.goto`). Null when there is none but `from`.
 pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface {
-    const handle = self.tab().tree.locate(from) orelse return null;
-    const found = self.tab().tree.goto(self.app.core_app.alloc, handle, switch (to) {
+    const place = self.find(from) orelse return null;
+    const t = self.tabs.items[place.index];
+    const handle = place.handle;
+    const found = t.tree.goto(self.app.core_app.alloc, handle, switch (to) {
         .previous => .previous_wrapped,
         .next => .next_wrapped,
         .up => .{ .spatial = .up },
@@ -659,7 +911,7 @@ pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface
     };
     const target = found orelse return null;
     if (target == handle) return null;
-    return self.tab().tree.nodes[target.idx()].leaf;
+    return t.tree.nodes[target.idx()].leaf;
 }
 
 /// For `resize_split`: move the divider of the split nearest `from` that
@@ -668,7 +920,9 @@ pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface
 /// src/apprt/gtk/class/split_tree.zig, then `SplitTree.resize`). Nothing
 /// moves if a terminal would shrink below a cell (`adopt`).
 pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSplit) void {
-    const handle = self.tab().tree.locate(from) orelse return;
+    const place = self.find(from) orelse return;
+    const t = self.tabs.items[place.index];
+    const handle = place.handle;
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
     const across = value.direction == .left or value.direction == .right;
@@ -677,11 +931,11 @@ pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSpli
     const ratio = resizeShare(value.amount, dpiOf(self.app, self.hwnd), extent, value.direction);
 
     const layout_of: Tree.Split.Layout = if (across) .horizontal else .vertical;
-    var tree = self.tab().tree.resize(self.app.core_app.alloc, handle, layout_of, ratio) catch |err| {
+    var tree = t.tree.resize(self.app.core_app.alloc, handle, layout_of, ratio) catch |err| {
         log.warn("cannot resize the split err={}", .{err});
         return;
     };
-    self.adopt(&tree, client);
+    self.adopt(t, &tree, client);
 }
 
 /// `resize_split`'s move as `SplitTree.resize` takes it: `amount`
@@ -708,31 +962,32 @@ fn resizeShare(
 /// For `equalize_splits`: give each split a share by the number of
 /// terminals on each side of it, as GTK and macOS do (`SplitTree.equalize`).
 /// Nothing moves if a terminal would shrink below a cell (`adopt`).
-pub fn equalize(self: *Window) void {
+pub fn equalize(self: *Window, from: *Surface) void {
+    const t = self.tabOf(from) orelse return;
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
-    var tree = self.tab().tree.equalize(self.app.core_app.alloc) catch |err| {
+    var tree = t.tree.equalize(self.app.core_app.alloc) catch |err| {
         log.warn("cannot equalize the splits err={}", .{err});
         return;
     };
-    self.adopt(&tree, client);
+    self.adopt(t, &tree, client);
 }
 
-/// Lay the terminals out by `tree`, a resized or equalized copy of
-/// `self.tab().tree`, and keep it; or, if that would leave a terminal it shrinks
-/// less than a cell across or down in `client`, free it and change
+/// Keep `tree`, a resized or equalized copy of `t.tree`, laying its
+/// terminals out if `t` is shown; or, if that would leave a terminal it
+/// shrinks less than a cell across or down in `client`, free it and change
 /// nothing. A split refuses the same (`newPaneArea`): a terminal with no
 /// room shows nothing, and `SplitTree.resize` would clamp a ratio as far
 /// as 0 or 1.
-fn adopt(self: *Window, tree: *Tree, client: win32.RECT) void {
+fn adopt(self: *Window, t: *Tab, tree: *Tree, client: win32.RECT) void {
     const divider = dividerWidth(dpiOf(self.app, self.hwnd));
-    if (!keepsCells(&self.tab().tree, tree, client, divider)) {
+    if (!keepsCells(&t.tree, tree, client, divider)) {
         tree.deinit();
         return;
     }
-    self.tab().tree.deinit();
-    self.tab().tree = tree.*;
-    self.relayout();
+    t.tree.deinit();
+    t.tree = tree.*;
+    if (t == self.tab()) self.relayout();
 }
 
 /// Whether laying the terminals out by `new` instead of `old` in `area`
@@ -787,12 +1042,14 @@ fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
 /// zoom, as GTK's `split-tree.zoom` does. Never inside a core frame: the
 /// layout sends WM_SIZE (`App.requests`).
 pub fn toggleZoom(self: *Window, from: *Surface) void {
-    if (self.tab().tree.zoomed != null) {
-        self.tab().tree.zoom(null);
+    const place = self.find(from) orelse return;
+    const t = self.tabs.items[place.index];
+    if (t.tree.zoomed != null) {
+        t.tree.zoom(null);
     } else {
-        self.tab().tree.zoom(self.tab().tree.locate(from) orelse return);
+        t.tree.zoom(place.handle);
     }
-    self.relayout();
+    if (t == self.tab()) self.relayout();
 }
 
 /// Give the focus to `surface`, which a `goto_split` chose. A zoom ends
@@ -801,15 +1058,38 @@ pub fn toggleZoom(self: *Window, from: *Surface) void {
 /// focus never goes to a hidden terminal. Never inside a core frame: the
 /// layout sends WM_SIZE.
 pub fn focusFromGoto(self: *Window, surface: *Surface) void {
-    if (self.tab().tree.zoomed != null) {
-        if (self.app.config.@"split-preserve-zoom".navigation) {
-            if (self.tab().tree.locate(surface)) |handle| self.tab().tree.zoom(handle);
-        } else {
-            self.tab().tree.zoom(null);
-        }
-        self.relayout();
-    }
+    // In its own tab, shown first, as GTK presents a terminal: the focus
+    // and the zoom below are the shown tab's.
+    const place = self.find(surface) orelse return;
+    self.selectTab(place.index);
+    if (self.followZoom(self.tab(), surface)) self.relayout();
     self.giveFocus(surface);
+}
+
+/// A `goto_split` focus move in `t`, a hidden tab, which an `all:`
+/// binding reaches (`CoreApp.performAllAction`): `surface` is the terminal
+/// it shows with the focus when it is next selected (`showTab`), its zoom
+/// moved as `focusFromGoto` moves it, as GTK's goto_split sets a hidden
+/// tab's last focused terminal and zoom (`goto` in
+/// src/apprt/gtk/class/split_tree.zig). Sends no window message, so it may
+/// run inside a core frame.
+pub fn focusHidden(self: *const Window, t: *Tab, surface: *Surface) void {
+    assert(t != self.tab());
+    _ = self.followZoom(t, surface);
+    t.focused = surface;
+}
+
+/// Move `t`'s zoom, if any, for a focus move to `surface`: onto it with
+/// `split-preserve-zoom = navigation`, or else ended. Returns whether there
+/// was one.
+fn followZoom(self: *const Window, t: *Tab, surface: *Surface) bool {
+    if (t.tree.zoomed == null) return false;
+    if (self.app.config.@"split-preserve-zoom".navigation) {
+        if (t.tree.locate(surface)) |handle| t.tree.zoom(handle);
+    } else {
+        t.tree.zoom(null);
+    }
+    return true;
 }
 
 /// Make `surface` the window's focused terminal and give it the keyboard
@@ -821,11 +1101,14 @@ pub fn giveFocus(self: *Window, surface: *Surface) void {
     if (win32.GetActiveWindow() == self.hwnd) _ = win32.SetFocus(surface.hwnd);
 }
 
-/// Make `surface` the window's focused terminal, and name the window after
-/// it, as GTK and macOS title a window after its focused split.
+/// Make `surface` its tab's focused terminal and, in the tab shown, name
+/// the window after it, as GTK and macOS title a window after its focused
+/// split. A terminal in no tab yet, still being made, is not recorded.
 pub fn setFocused(self: *Window, surface: *Surface) void {
-    self.tab().focused = surface;
-    _ = self.showTitle(surface.title);
+    const t = self.tabOf(surface) orelse return;
+    t.focused = surface;
+    if (t != self.tab()) return;
+    _ = self.showTitle(tabTitle(t));
     self.showProgress();
 }
 
@@ -883,25 +1166,28 @@ pub fn toClient(self: *const Window, rect: *win32.RECT) bool {
 /// hidden, so that nothing shows it while its core stops.
 ///
 /// Fails only to allocate the new tree, and then changes nothing.
-pub fn removePane(self: *Window, handle: Tree.Node.Handle) !void {
+pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
     const alloc = self.app.core_app.alloc;
-    const surface = self.tab().tree.nodes[handle.idx()].leaf;
+    const surface = t.tree.nodes[handle.idx()].leaf;
 
     // From the tree as it is, which still has `handle`. `.previous` and
     // `.next` allocate nothing.
-    const focus: ?*Surface = if (self.tab().focused != surface) self.tab().focused else focus: {
-        const to = (self.tab().tree.goto(alloc, handle, .previous) catch null) orelse
-            (self.tab().tree.goto(alloc, handle, .next) catch null) orelse
+    const focus: ?*Surface = if (t.focused != surface) t.focused else focus: {
+        const to = (t.tree.goto(alloc, handle, .previous) catch null) orelse
+            (t.tree.goto(alloc, handle, .next) catch null) orelse
             break :focus null;
-        break :focus self.tab().tree.nodes[to.idx()].leaf;
+        break :focus t.tree.nodes[to.idx()].leaf;
     };
 
-    const tree = try self.tab().tree.remove(alloc, handle);
+    const tree = try t.tree.remove(alloc, handle);
     errdefer comptime unreachable;
-    self.tab().tree.deinit();
-    self.tab().tree = tree;
-    self.tab().focused = focus;
+    t.tree.deinit();
+    t.tree = tree;
+    t.focused = focus;
 
+    // A hidden tab's terminals are hidden already, and the focus and the
+    // layout are the shown tab's.
+    if (t != self.tab()) return;
     // The focus moves first, so that it is never left on a hidden window.
     if (focus) |f| self.giveFocus(f);
     _ = win32.ShowWindow(surface.hwnd, win32.SW_HIDE);
@@ -1274,6 +1560,7 @@ pub fn isRestored(self: *const Window) bool {
 /// terminals would change too, and the window is at a size of its own
 /// (`isRestored`), as `vt-window-resize-allowed` documents it.
 pub fn terminalResizable(self: *const Window, surface: *const Surface) bool {
+    if (self.tabs.items.len != 1) return false;
     if (self.tab().tree.isSplit() or self.tab().tree.locate(surface) == null) return false;
     return self.isRestored();
 }

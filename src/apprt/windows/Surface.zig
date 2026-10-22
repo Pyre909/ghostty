@@ -597,7 +597,10 @@ pub const Surface = struct {
     /// starts at. The address must be stable: the core stores raw
     /// `*apprt.Surface` pointers (see `CoreSurface.init`), and the wndproc
     /// recovers this pointer from GWLP_USERDATA. The terminal's window is
-    /// created hidden; `Window.create` and `Window.showPane` show it.
+    /// created hidden; `Window.create`, `Window.showPane` and, for a new
+    /// tab, `Window.selectTab` show it. `rect` should not be empty: a minimized
+    /// frame's client area is, so a split or a tab made then takes the
+    /// place its tab's terminals keep (`Window.layoutArea`).
     pub fn create(app: *App, window: *Window, rect: win32.RECT, opts: Options) !*Surface {
         const alloc = app.core_app.alloc;
         const self = try alloc.create(Surface);
@@ -755,13 +758,21 @@ pub const Surface = struct {
     /// the close can be asked for again.
     pub fn destroy(self: *Surface) bool {
         const window = self.window;
-        if (window.tab().tree.locate(self)) |handle| {
-            if (handle == .root) return window.destroy();
-            window.removePane(handle) catch |err| {
-                log.err("unable to take a closing terminal out of its window err={}", .{err});
-                self.closing = false;
-                return false;
-            };
+        if (window.find(self)) |at| {
+            const t = window.tabs.items[at.index];
+            if (at.handle != .root) {
+                window.removePane(t, at.handle) catch |err| {
+                    log.err("unable to take a closing terminal out of its window err={}", .{err});
+                    self.closing = false;
+                    return false;
+                };
+            } else if (window.tabs.items.len == 1) {
+                // The window's last terminal takes it with it.
+                return window.destroy();
+            } else {
+                // A tab's last terminal takes the tab with it.
+                window.removeTab(t);
+            }
         }
         self.stopCore();
         return win32.DestroyWindow(self.hwnd).toBool();
@@ -1272,7 +1283,7 @@ pub const Surface = struct {
         self.title = copy;
 
         if (self.window.tab().focused != self) return true;
-        return self.window.showTitle(self.title);
+        return self.window.showTitle(Window.tabTitle(self.window.tab()));
     }
 
     /// WM_CLOSE sent to this window: it closes alone. Windows sends the
