@@ -252,9 +252,9 @@ test "win32: clipboard writes read back, with invalid UTF-8 replaced" {
     const Case = struct { text: []const u8, want: []const u8 };
     const cases = [_]Case{
         .{ .text = "", .want = "" },
-        .{ .text = "caf\u{e9} \u{1F600}", .want = "caf\u{e9} \u{1F600}" },
+        .{ .text = "café \u{1F600}", .want = "café \u{1F600}" },
         // Latin-1 from a legacy program, as OSC 52 can deliver it.
-        .{ .text = "caf\xe9", .want = "caf\u{FFFD}" },
+        .{ .text = "abc\xe9", .want = "abc\u{FFFD}" },
     };
     for (cases) |c| {
         try writeClipboardText(hwnd, c.text);
@@ -292,7 +292,7 @@ test "win32: utf-8 becomes wide text with invalid sequences replaced" {
         .{ .text = "", .want = &.{} },
         .{ .text = "\u{65E5}\u{1F600}", .want = &.{ 0x65E5, 0xD83D, 0xDE00 } },
         // Latin-1, as from a config saved in a legacy code page.
-        .{ .text = "caf\xe9", .want = &.{ 'c', 'a', 'f', 0xFFFD } },
+        .{ .text = "abc\xe9", .want = &.{ 'a', 'b', 'c', 0xFFFD } },
     };
     for (cases) |c| {
         const got = try wideFromUtf8(alloc, c.text);
