@@ -682,7 +682,7 @@ pub const Action = union(enum) {
     /// size that a new window would be created with. This has no effect
     /// if the window is fullscreen.
     ///
-    /// Only implemented on macOS.
+    /// Only implemented on macOS and Windows.
     reset_window_size,
 
     /// Control the visibility of the terminal inspector.

@@ -241,6 +241,10 @@ pub const App = struct {
         /// for (`configChange`).
         redecorate,
 
+        /// Give the window of this surface the size a new one is made with
+        /// (`requestResetWindowSize`).
+        reset_window_size: *CoreSurface,
+
         /// Resize the window of this surface for the size a program asked
         /// of it (`requestResizeWindow`).
         resize_window: struct {
@@ -852,6 +856,7 @@ pub const App = struct {
             .toggle_fullscreen => self.requestFullscreen(target),
             .toggle_window_decorations => self.requestDecorations(target),
             .resize_window => self.requestResizeWindow(target, value),
+            .reset_window_size => self.requestResetWindowSize(target),
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
@@ -1347,7 +1352,7 @@ pub const App = struct {
             .resize => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
-            .equalize, .fullscreen, .maximize, .zoom, .decorations => |from| {
+            .equalize, .fullscreen, .maximize, .zoom, .decorations, .reset_window_size => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .goto_window => |goto| {
@@ -1496,6 +1501,24 @@ pub const App = struct {
         };
         self.requests.append(self.core_app.alloc, .{ .decorations = from }) catch |err| {
             log.warn("cannot record toggling the window decorations err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.reset_window_size`: recorded for `run`, as `toggle_fullscreen` is,
+    /// since the terminals are laid out again, and made then
+    /// (`Window.resetSize`). `false` when the window has no size to go
+    /// back to, or covers its monitor (`Window.defaultSize`), as macOS
+    /// does nothing then.
+    fn requestResetWindowSize(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        if (from.rt_surface.window.defaultSize() == null) return false;
+        self.requests.append(self.core_app.alloc, .{ .reset_window_size = from }) catch |err| {
+            log.warn("cannot record resetting the window size err={}", .{err});
             return false;
         };
         return true;
@@ -1666,6 +1689,7 @@ pub const App = struct {
                 .reload => self.reloadQueued(),
                 .fullscreen => |from| from.rt_surface.window.toggleFullscreen(),
                 .decorations => |from| from.rt_surface.window.toggleDecorations(),
+                .reset_window_size => |from| from.rt_surface.window.resetSize(),
                 .resize_window => |resize| resize.from.rt_surface.window.resizeToTerminal(
                     resize.from.rt_surface,
                     resize.size,
@@ -2626,6 +2650,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     // Only the way back from the core surface: actions name it.
     surface.core_surface.rt_surface = surface;
     surface.title = null;
+    surface.initial_size = null;
     surface.ime = .{};
     surface.closing = false;
     surface.destroy_deferred = false;
@@ -4282,6 +4307,82 @@ test "win32: resize_window waits for run and resizes the window of a lone termin
     window.tree.deinit();
     window.tree = try testRow(alloc, &.{ pane, other });
     try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
+}
+
+test "win32: reset_window_size waits for run and gives the window a new one's size" {
+    // As on macOS: maximized with `maximize`, or else the size
+    // `window-width` and `window-height` ask for; nothing with neither, or
+    // for a window covering its monitor. The terminals are laid out again,
+    // so it is recorded and made by createRequested.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+    const scale = try pane.getContentScale();
+
+    // No size to go back to.
+    try std.testing.expect(!try app.performAction(target, .reset_window_size, {}));
+
+    // The size `window-width` and `window-height` ask for: recorded, not
+    // made; then the client area takes it.
+    pane.initial_size = .{ .width = 320, .height = 180 };
+    const before = try clientRect(window.hwnd);
+    try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
+    try std.testing.expectEqual(before, try clientRect(window.hwnd));
+    app.createRequested();
+    const sized = try clientRect(window.hwnd);
+    try std.testing.expectEqual(Window.scaledSize(320, scale.x), sized.right);
+    try std.testing.expectEqual(Window.scaledSize(180, scale.x), sized.bottom);
+
+    // A maximized window is restored and given it, though it was
+    // resized after, which is what it would be restored to.
+    const resized = win32.SWP_NOMOVE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE;
+    _ = win32.SetWindowPos(window.hwnd, null, 0, 0, 500, 400, resized);
+    try std.testing.expect(!std.meta.eql(sized, try clientRect(window.hwnd)));
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMAXIMIZED);
+    try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
+    app.createRequested();
+    try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
+    try std.testing.expectEqual(sized, try clientRect(window.hwnd));
+
+    // And so is a snapped one (IsWindowArranged).
+    _ = win32.SetWindowPos(window.hwnd, null, 0, 0, 500, 400, resized);
+    app.is_window_arranged = struct {
+        fn f(_: win32.HWND) callconv(.winapi) win32.BOOL {
+            return .TRUE;
+        }
+    }.f;
+    try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
+    app.createRequested();
+    try std.testing.expectEqual(sized, try clientRect(window.hwnd));
+    app.is_window_arranged = null;
+
+    // Not for a window covering its monitor.
+    window.toggleFullscreen();
+    try std.testing.expect(!try app.performAction(target, .reset_window_size, {}));
+    window.toggleFullscreen();
+
+    // With `maximize`, maximized.
+    app.config.maximize = true;
+    try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
+    app.createRequested();
+    try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+
+    // A closing terminal drops its own.
+    try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
+    app.forgetClosing(&pane.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
 }
 
 test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {

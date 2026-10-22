@@ -1234,6 +1234,42 @@ pub fn terminalResizable(self: *const Window, surface: *const Surface) bool {
     return self.isRestored();
 }
 
+/// What `reset_window_size` gives the window, as macOS decides a new
+/// window's size: maximized with `maximize`, or else the size
+/// `window-width` and `window-height` ask for (`Surface.initial_size`);
+/// null with neither, when a new window takes Windows' default, which
+/// macOS does not go back to either.
+pub const DefaultSize = union(enum) {
+    maximized,
+    initial: apprt.action.InitialSize,
+};
+
+/// The size `reset_window_size` would give the window now, or null when
+/// it has none or covers its monitor, which `reset_window_size` leaves.
+pub fn defaultSize(self: *const Window) ?DefaultSize {
+    if (self.fullscreen != null) return null;
+    if (self.app.config.maximize) return .maximized;
+    const surface = self.focused orelse return null;
+    return .{ .initial = surface.initial_size orelse return null };
+}
+
+/// `reset_window_size`: give the window the size a new one is made with
+/// (`defaultSize`), maximizing it, or restoring a maximized or snapped one
+/// first and sizing its client area as `show` sizes a new one; nothing
+/// when there is none. The terminals are laid out again, so this never
+/// runs inside a core frame (`App.requests`).
+pub fn resetSize(self: *Window) void {
+    switch (self.defaultSize() orelse return) {
+        .maximized => _ = win32.ShowWindow(self.hwnd, win32.SW_MAXIMIZE),
+        .initial => |size| {
+            if (!self.isRestored()) _ = win32.ShowWindow(self.hwnd, win32.SW_RESTORE);
+            // defaultSize found one.
+            const surface = self.focused.?;
+            applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
+        },
+    }
+}
+
 /// `resize_window`, which a program asks for (CSI 8 t): resize the window
 /// so that `surface`, its one terminal, which fills the client area, is
 /// `size` in points, a zero dimension kept as it is, its top-left corner
