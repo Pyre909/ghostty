@@ -2169,6 +2169,9 @@ keybind: Keybinds = .{},
 ///
 /// macOS: To hide the titlebar without removing the native window borders
 ///        or rounded corners, use `macos-titlebar-style = hidden` instead.
+///
+/// Windows: `none` removes the titlebar and keeps the resizable border;
+///          `client` and `server` are the same as `auto`.
 @"window-decoration": WindowDecoration = .auto,
 
 /// The font that will be used for the application's window and tab titles.

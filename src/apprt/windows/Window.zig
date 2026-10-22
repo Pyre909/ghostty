@@ -105,6 +105,11 @@ dark_frame: bool,
 /// back (`toggleFullscreen`); null while it does not.
 fullscreen: ?Restore,
 
+/// This window's own `window-decoration`, from
+/// `toggle_window_decorations`, or null while it follows the
+/// configuration's, as GTK keeps one per window (`toggleDecorations`).
+decoration: ?configpkg.WindowDecoration,
+
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
 
@@ -129,29 +134,19 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .pending_focus = null,
         .dark_frame = false,
         .fullscreen = null,
+        .decoration = null,
         .modal_loops = .{},
         .prompt_disabled = false,
         .closing = false,
         .destroy_deferred = false,
     };
 
-    const hwnd = win32.CreateWindowExW(
-        0,
-        L(class_name),
-        L("Ghostty"),
-        win32.WS_OVERLAPPEDWINDOW | win32.WS_CLIPCHILDREN,
+    const hwnd = try self.createFrame(
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
-        null,
-        null,
-        app.hinstance,
-        self,
-    ) orelse {
-        log.err("CreateWindowExW failed for a window frame", .{});
-        return App.Error.Win32WindowCreationFailed;
-    };
+    );
     // Safe alongside the errdefer above: WM_NCDESTROY frees only a window
     // that is in App.windows, which this one is not yet.
     errdefer _ = win32.DestroyWindow(hwnd);
@@ -178,6 +173,34 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     // The frame is still hidden, so this shows nothing yet.
     _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
     return self;
+}
+
+/// Create the hidden frame of `self` at `x`, `y`, `width` by `height`
+/// (CW_USEDEFAULT for where and how large Windows makes a new window),
+/// with the decorations it should have (`applyDecorations`), before
+/// anything measures its client area. CreateWindowExW gives every window
+/// that is neither a child nor a popup a caption, so the frame is made with
+/// one, and loses it after.
+pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_int) !win32.HWND {
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L(class_name),
+        L("Ghostty"),
+        win32.WS_OVERLAPPEDWINDOW | win32.WS_CLIPCHILDREN,
+        x,
+        y,
+        width,
+        height,
+        null,
+        null,
+        self.app.hinstance,
+        self,
+    ) orelse {
+        log.err("CreateWindowExW failed for a window frame", .{});
+        return App.Error.Win32WindowCreationFailed;
+    };
+    self.applyDecorations();
+    return hwnd;
 }
 
 /// Size the still-hidden frame to `window-width`/`window-height`, maximize
@@ -330,6 +353,12 @@ fn handleMessage(
         win32.WM_EXITSIZEMOVE, win32.WM_EXITMENULOOP => {
             self.modal_loops.exit(&self.app.modal_loop_depth);
             return 0;
+        },
+
+        // A frame without a caption maximizes over its whole monitor. See
+        // keepToWorkArea. DefWindowProcW below as well.
+        win32.WM_WINDOWPOSCHANGING => if (!self.isDecorated() and self.fullscreen == null) {
+            keepToWorkArea(hwnd, @ptrFromInt(@as(usize, @bitCast(lparam))));
         },
 
         // Sent to the top-level window, not to the terminal with the focus.
@@ -1230,7 +1259,9 @@ pub fn toggleFullscreen(self: *Window) void {
 
     if (self.fullscreen) |restore| {
         self.fullscreen = null;
-        _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, style | overlapped);
+        // With the frame `window-decoration` asks for now, which a toggle
+        // while it covered the monitor may have changed.
+        _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, (style & ~overlapped) | frameStyle(self.isDecorated()));
         // By the placement for a window that was maximized, and for one
         // whose rect no monitor shows any more, as when one is unplugged or
         // a remote session comes back with fewer: SetWindowPlacement moves
@@ -1251,6 +1282,10 @@ pub fn toggleFullscreen(self: *Window) void {
             0,
             win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | reframe,
         );
+        // Windows holds a window that was maximized as maximized all along,
+        // and does not always place it again for its new frame: one without
+        // a caption stays at the monitor's rect.
+        self.refitMaximized(win32.SWP_NOZORDER | reframe);
         return;
     }
 
@@ -1290,13 +1325,142 @@ fn moveTo(self: *Window, rect: win32.RECT, flags: win32.UINT) void {
 
 /// The rect of `monitor`, or null, logged, if it cannot be read.
 fn monitorRect(monitor: ?win32.HMONITOR) ?win32.RECT {
+    const info = monitorInfo(monitor) orelse return null;
+    return info.rcMonitor;
+}
+
+/// The rects of `monitor`, or null, logged, if they cannot be read.
+fn monitorInfo(monitor: ?win32.HMONITOR) ?win32.MONITORINFO {
     var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
     info.cbSize = @sizeOf(win32.MONITORINFO);
     if (!win32.GetMonitorInfoW(monitor orelse return null, &info).toBool()) {
-        log.warn("cannot cover the monitor: GetMonitorInfoW failed err={}", .{win32.GetLastError()});
+        log.warn("cannot read the monitor: GetMonitorInfoW failed err={}", .{win32.GetLastError()});
         return null;
     }
-    return info.rcMonitor;
+    return info;
+}
+
+/// Whether the window shows its title bar: its own `window-decoration`
+/// (`decoration`), or else the configuration's, is not `none`.
+pub fn isDecorated(self: *const Window) bool {
+    return switch (self.decoration orelse self.app.config.@"window-decoration") {
+        // One here: Windows draws every frame.
+        .auto, .client, .server => true,
+        .none => false,
+    };
+}
+
+/// The overlapped-window styles of a frame `decorated` or not. Without
+/// decorations only the caption comes off: the sizing border (WS_THICKFRAME)
+/// stays, so that the window can still be resized from its edges and keeps
+/// the rounded corners and shadow Windows 11 gives such a frame, and so do
+/// the window menu and the minimize and maximize boxes.
+fn frameStyle(decorated: bool) isize {
+    const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
+    const caption: isize = win32.WS_CAPTION;
+    return if (decorated) overlapped else overlapped & ~caption;
+}
+
+/// `.toggle_window_decorations`, as GTK's (`toggleWindowDecorations`):
+/// the window's own setting is dropped if it has one, back to
+/// `window-decoration`, or else it takes the other one, `none` if that has
+/// decorations and `auto` if not. The frame changes (`applyDecorations`),
+/// so this never runs inside a core frame (`App.requests`).
+pub fn toggleDecorations(self: *Window) void {
+    self.decoration = if (self.decoration != null) null else switch (self.app.config.@"window-decoration") {
+        .none => .auto,
+        .auto, .client, .server => .none,
+    };
+    self.applyDecorations();
+}
+
+/// Give the frame the styles `isDecorated` asks for, keeping its rect, or a
+/// maximized one the work area (`refitMaximized`). A window that covers its
+/// monitor has none of them, and takes them when it leaves
+/// (`toggleFullscreen`). The client area grows or shrinks by the caption,
+/// and the terminals are laid out again from the frame's WM_SIZE, so this
+/// never runs inside a core frame (`App.requests`).
+pub fn applyDecorations(self: *Window) void {
+    if (self.fullscreen != null) return;
+    const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_STYLE);
+    const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
+    const want = (style & ~overlapped) | frameStyle(self.isDecorated());
+    if (want == style) return;
+    _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, want);
+
+    const reframe = win32.SWP_NOZORDER | win32.SWP_NOOWNERZORDER | win32.SWP_NOACTIVATE | win32.SWP_FRAMECHANGED;
+    _ = win32.SetWindowPos(self.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | reframe);
+    self.refitMaximized(reframe);
+}
+
+/// Place a maximized window, not minimized, on its work area again
+/// (`maximizedRect`), after its styles changed: Windows does not work out
+/// again where a window it already holds maximized goes.
+fn refitMaximized(self: *Window, flags: win32.UINT) void {
+    if (!win32.IsZoomed(self.hwnd).toBool() or win32.IsIconic(self.hwnd).toBool()) return;
+    if (self.maximizedRect()) |rect| self.moveTo(rect, flags);
+}
+
+/// The rect a maximized frame takes with its present styles: its
+/// monitor's work area grown by the sizing border, which Windows puts off
+/// the edges. The border is measured from the window, which must not be
+/// minimized, as `applyInitialSize` measures its frame.
+fn maximizedRect(self: *Window) ?win32.RECT {
+    var window: win32.RECT = undefined;
+    if (!win32.GetWindowRect(self.hwnd, &window).toBool()) return null;
+    var corner: win32.POINT = .{ .x = window.left, .y = window.top };
+    if (!win32.ScreenToClient(self.hwnd, &corner).toBool()) return null;
+    const border = -corner.x;
+    const info = monitorInfo(win32.MonitorFromWindow(self.hwnd, win32.MONITOR_DEFAULTTONEAREST)) orelse
+        return null;
+    return .{
+        .left = info.rcWork.left - border,
+        .top = info.rcWork.top - border,
+        .right = info.rcWork.right + border,
+        .bottom = info.rcWork.bottom + border,
+    };
+}
+
+/// WM_WINDOWPOSCHANGING for a frame without decorations. Windows
+/// maximizes a frame with no caption over its whole monitor, the taskbar's
+/// place included, with its sizing border off the monitor's edges, so a
+/// maximized one is moved onto the work area instead (`onWorkArea`), as a
+/// framed one is. WM_GETMINMAXINFO cannot ask for that: Windows reads its
+/// ptMaxSize as a size on the primary monitor, and adds to it the
+/// difference to the monitor the window maximizes on, a larger one's
+/// included, when it is no smaller than the primary.
+/// Ref: https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-minmaxinfo
+fn keepToWorkArea(hwnd: win32.HWND, pos: *win32.WINDOWPOS) void {
+    if (pos.flags & (win32.SWP_NOMOVE | win32.SWP_NOSIZE) != 0) return;
+    if (!win32.IsZoomed(hwnd).toBool()) return;
+    const rect: win32.RECT = .{
+        .left = pos.x,
+        .top = pos.y,
+        .right = pos.x +| pos.cx,
+        .bottom = pos.y +| pos.cy,
+    };
+    const info = monitorInfo(win32.MonitorFromRect(&rect, win32.MONITOR_DEFAULTTONEAREST)) orelse
+        return;
+    const moved = onWorkArea(rect, info.rcMonitor, info.rcWork) orelse return;
+    pos.x = moved.left;
+    pos.y = moved.top;
+    pos.cx = moved.right - moved.left;
+    pos.cy = moved.bottom - moved.top;
+}
+
+/// `rect`, a maximized frame's that covers `monitor` with its border off
+/// the edges, as far off the edges of `work`, the monitor's work area; null
+/// for a rect that does not cover the monitor, which includes one already
+/// moved, unless the work area is the whole monitor, when nothing moves.
+fn onWorkArea(rect: win32.RECT, monitor: win32.RECT, work: win32.RECT) ?win32.RECT {
+    if (rect.left > monitor.left or rect.top > monitor.top or
+        rect.right < monitor.right or rect.bottom < monitor.bottom) return null;
+    return .{
+        .left = work.left - (monitor.left - rect.left),
+        .top = work.top - (monitor.top - rect.top),
+        .right = work.right + (rect.right - monitor.right),
+        .bottom = work.bottom + (rect.bottom - monitor.bottom),
+    };
 }
 
 /// Whether the window floats above every window that does not
@@ -1443,6 +1607,58 @@ test "win32: an initial size is kept inside the monitor work area" {
             .bottom = 824,
         }),
     );
+}
+
+test "win32: a maximized frame without decorations is moved onto the work area" {
+    const testing = std.testing;
+    const RECT = win32.RECT;
+
+    // Windows' rect for a frame without a caption, 8 px of sizing border,
+    // maximized on a 1920x1080 primary with a 40 px taskbar at the bottom:
+    // the client area is the work area, the border as far off its edges.
+    const primary: RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+    const maximized: RECT = .{ .left = -8, .top = -8, .right = 1928, .bottom = 1088 };
+    try testing.expectEqual(
+        RECT{ .left = -8, .top = -8, .right = 1928, .bottom = 1048 },
+        onWorkArea(maximized, primary, .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 }).?,
+    );
+
+    // On a larger 2560x1440 monitor right of it, with the taskbar on its
+    // left edge: the work area there, whatever the primary's size.
+    const larger: RECT = .{ .left = 1920, .top = 0, .right = 4480, .bottom = 1440 };
+    const work: RECT = .{ .left = 1968, .top = 0, .right = 4480, .bottom = 1440 };
+    const moved = onWorkArea(
+        .{ .left = 1912, .top = -8, .right = 4488, .bottom = 1448 },
+        larger,
+        work,
+    ).?;
+    try testing.expectEqual(
+        RECT{ .left = 1960, .top = -8, .right = 4488, .bottom = 1448 },
+        moved,
+    );
+
+    // On the primary, with the taskbar on the right edge, or along the top.
+    try testing.expectEqual(
+        RECT{ .left = -8, .top = -8, .right = 1880, .bottom = 1088 },
+        onWorkArea(maximized, primary, .{ .left = 0, .top = 0, .right = 1872, .bottom = 1080 }).?,
+    );
+    try testing.expectEqual(
+        RECT{ .left = -8, .top = 40, .right = 1928, .bottom = 1088 },
+        onWorkArea(maximized, primary, .{ .left = 0, .top = 48, .right = 1920, .bottom = 1080 }).?,
+    );
+
+    // A rect already moved is not moved again, nor one that does not
+    // cover its monitor at all.
+    try testing.expectEqual(null, onWorkArea(moved, larger, work));
+    try testing.expectEqual(null, onWorkArea(
+        .{ .left = 2000, .top = 100, .right = 2800, .bottom = 700 },
+        larger,
+        work,
+    ));
+
+    // With no taskbar on the monitor, nothing moves.
+    const covering: RECT = .{ .left = 1912, .top = -8, .right = 4488, .bottom = 1448 };
+    try testing.expectEqual(covering, onWorkArea(covering, larger, larger).?);
 }
 
 /// For the layout tests: a view with a name and no reference count.

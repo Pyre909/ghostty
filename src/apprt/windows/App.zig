@@ -228,6 +228,14 @@ pub const App = struct {
         /// the zoom (`toggleSplitZoom`).
         zoom: *CoreSurface,
 
+        /// Hide or show the title bar of the window of this surface
+        /// (`requestDecorations`).
+        decorations: *CoreSurface,
+
+        /// Give every window the decorations the configuration now asks
+        /// for (`configChange`).
+        redecorate,
+
         /// Activate the window before or after the one of `from`
         /// (`gotoWindow`).
         goto_window: struct {
@@ -821,6 +829,7 @@ pub const App = struct {
             .present_terminal => presentTerminal(target),
             .toggle_maximize => self.requestMaximize(target),
             .toggle_fullscreen => self.requestFullscreen(target),
+            .toggle_window_decorations => self.requestDecorations(target),
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
@@ -1141,6 +1150,16 @@ pub const App = struct {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
         }
+        // `window-decoration` may have changed, here or in a theme a soft
+        // reload switched to; the frames change for it from `run`, since a
+        // soft reload comes inside a core frame. `run` is woken for it: the
+        // reload that `run`'s own syncColorScheme makes comes after its
+        // createRequested.
+        self.requests.append(self.core_app.alloc, .redecorate) catch |err| {
+            log.warn("cannot record redecorating the windows err={}", .{err});
+            return true;
+        };
+        self.wakeup();
         return true;
     }
 
@@ -1306,13 +1325,13 @@ pub const App = struct {
             .resize => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
-            .equalize, .fullscreen, .maximize, .zoom => |from| {
+            .equalize, .fullscreen, .maximize, .zoom, .decorations => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .goto_window => |goto| {
                 if (goto.from == core_surface) request.* = .dropped;
             },
-            .reload, .dropped => {},
+            .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| {
             const surface = window.pending_focus orelse continue;
@@ -1437,6 +1456,21 @@ pub const App = struct {
         };
         self.requests.append(self.core_app.alloc, .{ .fullscreen = from }) catch |err| {
             log.warn("cannot record toggling fullscreen err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.toggle_window_decorations`: recorded for `run`, as
+    /// `toggle_fullscreen` is, since a frame without its caption lays the
+    /// terminals out again (`Window.toggleDecorations`).
+    fn requestDecorations(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .decorations = from }) catch |err| {
+            log.warn("cannot record toggling the window decorations err={}", .{err});
             return false;
         };
         return true;
@@ -1577,6 +1611,8 @@ pub const App = struct {
                 .equalize => |from| from.rt_surface.window.equalize(),
                 .reload => self.reloadQueued(),
                 .fullscreen => |from| from.rt_surface.window.toggleFullscreen(),
+                .decorations => |from| from.rt_surface.window.toggleDecorations(),
+                .redecorate => for (self.windows.items) |window| window.applyDecorations(),
                 // A window covering its monitor is left as it is: maximized,
                 // it would have the work area instead.
                 .maximize => |from| {
@@ -2451,9 +2487,11 @@ test "win32: a prompt belongs to a top-level window" {
 }
 
 /// For tests: an app with only what the frame and terminal window
-/// procedures read when nothing has a core surface. `core_app.alloc` must
-/// be set; the caller registers the classes (`registerClasses`).
-pub fn testApp(app: *App, core_app: *CoreApp) void {
+/// procedures read when nothing has a core surface, the default
+/// configuration, and a message-only window standing in for the app's, to
+/// see a wakeup. `core_app.alloc` must be set; the caller registers the
+/// classes (`registerClasses`) and frees it all (`testCleanup`).
+pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.core_app = core_app;
     app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
     app.get_dpi_for_window = null;
@@ -2468,10 +2506,26 @@ pub fn testApp(app: *App, core_app: *CoreApp) void {
     app.windows = .empty;
     app.requests = .empty;
     app.quit = false;
+    app.config = try .default(core_app.alloc);
+    errdefer app.config.deinit();
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
 }
 
-/// For tests: a hidden frame of the real class, owned by `app` as one
-/// `newWindow` made, with no terminal yet.
+/// For tests: a hidden frame made as `newWindow` makes one
+/// (`Window.createFrame`), owned by `app`, with no terminal yet.
 fn testFrame(app: *App) !*Window {
     const alloc = app.core_app.alloc;
     try app.windows.ensureUnusedCapacity(alloc, 1);
@@ -2484,25 +2538,13 @@ fn testFrame(app: *App) !*Window {
         .pending_focus = null,
         .dark_frame = false,
         .fullscreen = null,
+        .decoration = null,
         .modal_loops = .{},
         .prompt_disabled = false,
         .closing = false,
         .destroy_deferred = false,
     };
-    _ = win32.CreateWindowExW(
-        0,
-        L(Window.class_name),
-        null,
-        win32.WS_OVERLAPPEDWINDOW | win32.WS_CLIPCHILDREN,
-        0,
-        0,
-        200,
-        100,
-        null,
-        null,
-        app.hinstance,
-        window,
-    ) orelse {
+    _ = window.createFrame(0, 0, 200, 100) catch {
         alloc.destroy(window);
         return error.TestUnexpectedResult;
     };
@@ -2553,8 +2595,8 @@ fn testPane(app: *App, window: *Window) !*Surface {
 }
 
 /// For tests: destroy whatever `testFrame` and `testPane` left, which
-/// frees it all, then release the lists.
-fn testCleanup(app: *App) void {
+/// frees it all, then release what `testApp` made.
+pub fn testCleanup(app: *App) void {
     const alloc = app.core_app.alloc;
     while (app.windows.getLastOrNull()) |window| {
         if (!win32.DestroyWindow(window.hwnd).toBool()) break;
@@ -2562,6 +2604,8 @@ fn testCleanup(app: *App) void {
     app.surfaces.deinit(alloc);
     app.windows.deinit(alloc);
     app.requests.deinit(alloc);
+    app.config.deinit();
+    _ = win32.DestroyWindow(app.msg_hwnd);
 }
 
 fn clientRect(hwnd: win32.HWND) !win32.RECT {
@@ -2577,10 +2621,26 @@ fn shown(hwnd: win32.HWND) bool {
     return win32.GetWindowLongPtrW(hwnd, win32.GWL_STYLE) & visible != 0;
 }
 
+/// For tests: whether a frame has its caption.
+fn captioned(hwnd: win32.HWND) bool {
+    const caption: isize = win32.WS_CAPTION;
+    return win32.GetWindowLongPtrW(hwnd, win32.GWL_STYLE) & caption == caption;
+}
+
 fn windowRect(hwnd: win32.HWND) !win32.RECT {
     var rect: win32.RECT = undefined;
     if (!win32.GetWindowRect(hwnd, &rect).toBool()) return error.TestUnexpectedResult;
     return rect;
+}
+
+/// For tests: the rects of the monitor `hwnd` is mostly on.
+fn monitorOf(hwnd: win32.HWND) !win32.MONITORINFO {
+    const monitor = win32.MonitorFromWindow(hwnd, win32.MONITOR_DEFAULTTONEAREST) orelse
+        return error.TestUnexpectedResult;
+    var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
+    info.cbSize = @sizeOf(win32.MONITORINFO);
+    if (!win32.GetMonitorInfoW(monitor, &info).toBool()) return error.TestUnexpectedResult;
+    return info;
 }
 
 test "win32: a window's terminal fills it, and both are freed once" {
@@ -2590,7 +2650,7 @@ test "win32: a window's terminal fills it, and both are freed once" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2698,7 +2758,7 @@ test "win32: a window lays its terminals out side by side" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2731,7 +2791,7 @@ test "win32: a closing terminal hands its place, and the focus if it had it" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2791,7 +2851,7 @@ test "win32: goto_split finds the terminal it names" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2837,7 +2897,7 @@ test "win32: goto_split answers at once and moves the focus after the key" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2885,7 +2945,7 @@ test "win32: goto_split moves the focus in every window it is performed in" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2927,7 +2987,7 @@ test "win32: a goto_split after a waiting split waits behind it" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -2967,7 +3027,7 @@ test "win32: a queued goto_split starts from the window's focused terminal" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3000,7 +3060,7 @@ test "win32: resize_split moves the nearest divider across it" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3042,7 +3102,7 @@ test "win32: resize_split never leaves a terminal less than a cell" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3069,7 +3129,7 @@ test "win32: equalize_splits gives each terminal an equal share" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3105,7 +3165,7 @@ test "win32: resize_split and equalize_splits wait for run" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3169,7 +3229,7 @@ test "win32: queued split changes reach the window from its focused terminal" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3216,7 +3276,7 @@ test "win32: a window is titled after its focused terminal" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3247,7 +3307,7 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3279,7 +3339,7 @@ test "win32: close_tab closes the window, its one tab" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3330,7 +3390,7 @@ test "win32: closing a window takes every terminal in it at once" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3395,7 +3455,7 @@ test "win32: a terminal with no core closes through a posted teardown" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3439,8 +3499,8 @@ test "win32: new windows and splits are recorded where they are asked for" {
     core_app.alloc = alloc;
 
     var app: App = undefined;
-    testApp(&app, &core_app);
-    defer app.requests.deinit(alloc);
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
 
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
@@ -3479,9 +3539,8 @@ test "win32: config_change makes a copy of the app's configuration" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
 
     // The value only lives for the action. The title is in its arena, so
     // a configuration that kept pointing into it would read freed memory.
@@ -3507,9 +3566,8 @@ test "win32: a soft reload_config hands the app's configuration back through the
     try core_app.init(alloc);
     defer core_app.deinit();
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
     app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
     const before = app.config.title.?.ptr;
 
@@ -3529,10 +3587,8 @@ test "win32: a full reload_config waits for run" {
     try core_app.init(alloc);
     defer core_app.deinit();
     var app: App = undefined;
-    testApp(&app, &core_app);
-    defer app.requests.deinit(alloc);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
     app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
     const before = app.config.title.?.ptr;
 
@@ -3581,20 +3637,31 @@ test "win32: the core is told the color scheme when it changes" {
     try core_app.init(alloc);
     defer core_app.deinit();
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
     app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
 
     // The system's dark mode reaches the core, which reloads the app's
     // configuration softly for it: config_change replaces this runtime's
-    // with a copy.
+    // with a copy. The frames change for its `window-decoration` from
+    // `run`, which is woken for it: `run` tells the core after making
+    // what was recorded.
     app.config.@"window-theme" = .system;
     app.system_scheme = .dark;
     const before = app.config.title.?.ptr;
     app.syncColorScheme();
     try std.testing.expectEqual(.dark, core_app.config_conditional_state.theme);
     try std.testing.expect(app.config.title.?.ptr != before);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .redecorate);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        app.msg_hwnd,
+        WM_GHOSTTY_WAKEUP,
+        WM_GHOSTTY_WAKEUP,
+        win32.PM_REMOVE,
+    ).toBool());
 
     // Told once. The core ignores a repeat by itself, so it is made to have
     // lost the scheme: told again, it would take it back and reload.
@@ -3616,31 +3683,12 @@ test "win32: a change of the system's app mode reaches every title bar" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
     app.config.@"window-theme" = .system;
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
     const window = try testFrame(&app);
-
-    // A message-only window stands in for the app's, to see the wakeup.
-    app.msg_hwnd = win32.CreateWindowExW(
-        0,
-        L("STATIC"),
-        null,
-        0,
-        0,
-        0,
-        0,
-        0,
-        win32.HWND_MESSAGE,
-        null,
-        null,
-        null,
-    ) orelse return error.TestUnexpectedResult;
-    defer _ = win32.DestroyWindow(app.msg_hwnd);
 
     // The mode read last is the other one, as if Windows had just switched,
     // and the frame shows it. The system's mode itself is never changed.
@@ -3672,9 +3720,7 @@ test "win32: a new configuration re-themes every title bar" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3699,7 +3745,7 @@ test "win32: toggle_fullscreen waits for run, covers the monitor and comes back"
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3710,12 +3756,7 @@ test "win32: toggle_fullscreen waits for run, covers the monitor and comes back"
     window.focused = pane;
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     const placed = try windowRect(window.hwnd);
-
-    const monitor = win32.MonitorFromWindow(window.hwnd, win32.MONITOR_DEFAULTTONEAREST) orelse
-        return error.TestUnexpectedResult;
-    var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
-    info.cbSize = @sizeOf(win32.MONITORINFO);
-    try std.testing.expect(win32.GetMonitorInfoW(monitor, &info).toBool());
+    const info = try monitorOf(window.hwnd);
 
     // Recorded, not made.
     try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
@@ -3726,8 +3767,7 @@ test "win32: toggle_fullscreen waits for run, covers the monitor and comes back"
     // fills it.
     app.createRequested();
     try std.testing.expectEqual(info.rcMonitor, try windowRect(window.hwnd));
-    const caption: isize = win32.WS_CAPTION;
-    try std.testing.expectEqual(0, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & caption);
+    try std.testing.expect(!captioned(window.hwnd));
     try std.testing.expectEqual(try clientRect(window.hwnd), try clientRect(pane.hwnd));
 
     // Not maximized while it covers the monitor.
@@ -3756,7 +3796,7 @@ test "win32: toggle_fullscreen waits for run, covers the monitor and comes back"
     try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
     app.createRequested();
     try std.testing.expectEqual(placed, try windowRect(window.hwnd));
-    try std.testing.expectEqual(caption, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & caption);
+    try std.testing.expect(captioned(window.hwnd));
     try std.testing.expectEqual(null, window.fullscreen);
 
     // Unless no monitor shows that rect any more, as when its monitor is
@@ -3782,7 +3822,7 @@ test "win32: a maximized window comes back from fullscreen maximized" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3802,7 +3842,6 @@ test "win32: a maximized window comes back from fullscreen maximized" {
     app.createRequested();
     try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
     const maximized = try windowRect(window.hwnd);
-    const caption: isize = win32.WS_CAPTION;
 
     for ([_]win32.WPARAM{ win32.SC_MAXIMIZE, win32.SC_RESTORE }) |command| {
         try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_fullscreen, .native));
@@ -3822,7 +3861,7 @@ test "win32: a maximized window comes back from fullscreen maximized" {
         try std.testing.expectEqual(null, window.fullscreen);
         try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
         try std.testing.expectEqual(maximized, try windowRect(window.hwnd));
-        try std.testing.expectEqual(caption, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & caption);
+        try std.testing.expect(captioned(window.hwnd));
     }
 
     // Minimized while it covers the monitor, then restored, as from the
@@ -3863,9 +3902,7 @@ test "win32: toggle_split_zoom waits for run and zooms the focused terminal" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -3946,7 +3983,8 @@ test "win32: open_config's new_window is not handled" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
     try std.testing.expect(!try app.performAction(.app, .open_config, .new_window));
 }
 
@@ -4014,9 +4052,7 @@ test "win32: maximize starts a window maximized, and under fullscreen too" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
-    app.config = try .default(alloc);
-    defer app.config.deinit();
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -4048,7 +4084,7 @@ test "win32: goto_window waits for run and goes round the windows" {
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -4101,12 +4137,180 @@ test "win32: goto_window waits for run and goes round the windows" {
     try std.testing.expectEqual(windows[2], app.windowBeside(windows[0], .previous).?);
 }
 
+test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {
+    // The client area changes with the caption and the terminals are laid
+    // out again, so the toggle is recorded and made by createRequested. As
+    // on GTK a window keeps a setting of its own: the first toggle takes
+    // the other one, the next goes back to `window-decoration`.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+    const placed = try windowRect(window.hwnd);
+
+    // Recorded, not made; then the caption comes off, the window keeps its
+    // rect, and the terminal fills the larger client area.
+    try std.testing.expect(try app.performAction(target, .toggle_window_decorations, {}));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(captioned(window.hwnd));
+    const framed = try clientRect(window.hwnd);
+    app.createRequested();
+    try std.testing.expect(!captioned(window.hwnd));
+    try std.testing.expectEqual(placed, try windowRect(window.hwnd));
+    try std.testing.expect((try clientRect(window.hwnd)).bottom > framed.bottom);
+    try std.testing.expectEqual(try clientRect(window.hwnd), try clientRect(pane.hwnd));
+
+    // Leaving fullscreen keeps it so; and a toggle while it covers the
+    // monitor changes nothing there, but shows when it leaves.
+    window.toggleFullscreen();
+    window.toggleFullscreen();
+    try std.testing.expect(!captioned(window.hwnd));
+    window.toggleFullscreen();
+    window.toggleDecorations();
+    try std.testing.expect(!captioned(window.hwnd));
+    window.toggleFullscreen();
+    try std.testing.expect(captioned(window.hwnd));
+    try std.testing.expectEqual(null, window.decoration);
+
+    // With `none` from a new configuration, which `run` applies, the
+    // caption comes off; then a toggle puts it back.
+    var none: Config = try .default(alloc);
+    defer none.deinit();
+    none.@"window-decoration" = .none;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &none }));
+    try std.testing.expect(captioned(window.hwnd));
+    app.createRequested();
+    try std.testing.expect(!captioned(window.hwnd));
+    try std.testing.expect(try app.performAction(target, .toggle_window_decorations, {}));
+    app.createRequested();
+    try std.testing.expect(captioned(window.hwnd));
+
+    // A closing terminal drops its own.
+    try std.testing.expect(try app.performAction(target, .toggle_window_decorations, {}));
+    app.forgetClosing(&pane.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+}
+
+test "win32: a window without decorations is made without its caption" {
+    // CreateWindowExW gives a frame its caption whatever style it asks for,
+    // and the terminal is created at the frame's client area, so the caption
+    // comes off before anything measures it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.config.@"window-decoration" = .none;
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    try std.testing.expect(!captioned(window.hwnd));
+    const thick: isize = win32.WS_THICKFRAME;
+    try std.testing.expectEqual(thick, win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE) & thick);
+
+    // The client area is the window less its sizing border, the same all
+    // round, with no caption's height on top.
+    const outer = try windowRect(window.hwnd);
+    const client = try clientRect(window.hwnd);
+    const border = @divExact((outer.right - outer.left) - client.right, 2);
+    try std.testing.expectEqual((outer.bottom - outer.top) - 2 * border, client.bottom);
+}
+
+test "win32: a window without decorations maximizes to the work area" {
+    // Windows maximizes a frame with no caption over its whole monitor,
+    // the taskbar's place included. A framed window of the same class,
+    // maximized by Windows, is the reference.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const reference = try testFrame(&app);
+    _ = win32.ShowWindow(reference.hwnd, win32.SW_SHOWMAXIMIZED);
+    const framed = try windowRect(reference.hwnd);
+    const window = try testFrame(&app);
+    window.toggleDecorations();
+    try std.testing.expect(!captioned(window.hwnd));
+
+    const info = try monitorOf(window.hwnd);
+    const work = info.rcWork;
+    const clientOnScreen = struct {
+        fn f(hwnd: win32.HWND) !win32.RECT {
+            const client = try clientRect(hwnd);
+            var origin: win32.POINT = .{ .x = 0, .y = 0 };
+            if (!win32.ScreenToClient(hwnd, &origin).toBool()) return error.TestUnexpectedResult;
+            return .{
+                .left = -origin.x,
+                .top = -origin.y,
+                .right = client.right - origin.x,
+                .bottom = client.bottom - origin.y,
+            };
+        }
+    }.f;
+
+    // Maximized, its client area is the work area; and so restored from
+    // minimized, as from the taskbar, and back from fullscreen.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMAXIMIZED);
+    try std.testing.expectEqual(work, try clientOnScreen(window.hwnd));
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMINNOACTIVE);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, win32.SC_RESTORE, 0);
+    try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+    try std.testing.expectEqual(work, try clientOnScreen(window.hwnd));
+    window.toggleFullscreen();
+    window.toggleFullscreen();
+    try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+    try std.testing.expectEqual(work, try clientOnScreen(window.hwnd));
+
+    // Given its caption while maximized, it takes the reference's rect;
+    // without it again, the work area again.
+    window.toggleDecorations();
+    try std.testing.expect(captioned(window.hwnd));
+    try std.testing.expectEqual(framed, try windowRect(window.hwnd));
+    window.toggleDecorations();
+    try std.testing.expectEqual(work, try clientOnScreen(window.hwnd));
+
+    // Toggled while it covers the monitor, each way: the same, once it
+    // leaves.
+    window.toggleFullscreen();
+    window.toggleDecorations();
+    window.toggleFullscreen();
+    try std.testing.expect(captioned(window.hwnd));
+    try std.testing.expectEqual(framed, try windowRect(window.hwnd));
+    window.toggleFullscreen();
+    window.toggleDecorations();
+    window.toggleFullscreen();
+    try std.testing.expect(!captioned(window.hwnd));
+    try std.testing.expectEqual(work, try clientOnScreen(window.hwnd));
+
+    // With no taskbar, or one that hides itself, the work area is the
+    // whole monitor, which such a frame's client area covers maximized
+    // whether it is kept to the work area or not.
+    if (std.meta.eql(work, info.rcMonitor)) return error.SkipZigTest;
+}
+
 test "win32: float_window keeps a window on top, or puts it back" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
-    testApp(&app, &core_app);
+    try testApp(&app, &core_app);
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);

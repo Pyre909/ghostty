@@ -59,6 +59,16 @@ const WNDPROC = *const fn (
 ) callconv(.winapi) LRESULT;
 
 pub const POINT = extern struct { x: LONG, y: LONG };
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowpos
+pub const WINDOWPOS = extern struct {
+    hwnd: ?HWND,
+    hwndInsertAfter: ?HWND,
+    x: c_int,
+    y: c_int,
+    cx: c_int,
+    cy: c_int,
+    flags: UINT,
+};
 pub const TRACKMOUSEEVENT = extern struct {
     cbSize: DWORD,
     dwFlags: DWORD,
@@ -108,6 +118,7 @@ pub const CREATESTRUCTW = extern struct {
 
 pub const WS_OVERLAPPEDWINDOW: DWORD = 0x00CF0000;
 pub const WS_CAPTION: DWORD = 0x00C00000;
+pub const WS_THICKFRAME: DWORD = 0x00040000;
 pub const WS_MINIMIZE: DWORD = 0x20000000;
 pub const WS_CHILD: DWORD = 0x40000000;
 pub const WS_VISIBLE: DWORD = 0x10000000;
@@ -154,6 +165,9 @@ pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_SETTINGCHANGE: UINT = 0x001A;
 pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_MOUSEACTIVATE: UINT = 0x0021;
+/// lParam is the WINDOWPOS about to be applied, which the handler may
+/// change in place.
+pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_NCCREATE: UINT = 0x0081;
 pub const WM_NCDESTROY: UINT = 0x0082;

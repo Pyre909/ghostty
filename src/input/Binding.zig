@@ -769,7 +769,7 @@ pub const Action = union(enum) {
 
     /// Toggle window decorations (titlebar, buttons, etc.) for the current window.
     ///
-    /// Only implemented on Linux.
+    /// Only implemented on Linux and Windows.
     toggle_window_decorations,
 
     /// Toggle whether the terminal window should always float on top of other

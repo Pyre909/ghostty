@@ -3665,8 +3665,8 @@ test "win32: a closing surface leaves the core and its window requests" {
     defer core_app.surfaces.deinit(alloc);
 
     var app: App = undefined;
-    @import("App.zig").testApp(&app, &core_app);
-    defer app.requests.deinit(alloc);
+    try @import("App.zig").testApp(&app, &core_app);
+    defer @import("App.zig").testCleanup(&app);
 
     // Static because the struct embeds a whole CoreSurface.
     const s = struct {
