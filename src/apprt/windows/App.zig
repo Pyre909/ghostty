@@ -64,7 +64,7 @@ pub const App = struct {
 
     /// IsWindowArranged, resolved at runtime because it exists only from
     /// Windows 10 1903 and has no import library. Null means no window is
-    /// known to be snapped (`Window.restored`).
+    /// known to be snapped (`Window.isRestored`).
     is_window_arranged: ?win32.IsWindowArrangedFn,
 
     /// Windows' light or dark mode for apps, read when the app starts and
