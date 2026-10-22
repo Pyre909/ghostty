@@ -31,6 +31,7 @@ const L = win32.L;
 const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 pub const Tab = @import("Tab.zig");
+const TabBar = @import("TabBar.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -71,6 +72,10 @@ tabs: std.ArrayListUnmanaged(*Tab),
 
 /// The index in `tabs` of the tab the window shows.
 selected: usize,
+
+/// The tab bar over the terminals, shown as `window-show-tab-bar` asks
+/// (`barShown`).
+bar: TabBar.Bar,
 
 /// A close of the whole window is being asked about, or was agreed to and
 /// its teardown posted (`requestClose`). Stops a second WM_CLOSE or
@@ -184,6 +189,7 @@ pub fn insertTab(self: *Window, surface: *Surface) !usize {
         .end => self.tabs.items.len,
     };
     self.tabs.insertAssumeCapacity(at, t);
+    self.bar.tabsChanged(self);
     return at;
 }
 
@@ -191,21 +197,37 @@ pub fn insertTab(self: *Window, surface: *Surface) !usize {
 /// tab of its own (`insertTab`); the tab's index. Hidden until the tab is
 /// shown (`selectTab`), once the app owns the terminal (`App.newTab`).
 pub fn newTab(self: *Window, opts: Surface.Options) !usize {
-    const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
+    const area = self.newTabArea() orelse return App.Error.Win32CallFailed;
     const surface = try Surface.create(self.app, self, area, opts);
     // Nothing owns the terminal until it is in a tab.
     errdefer surface.discard();
     return try self.insertTab(surface);
 }
 
-/// Where a tab's terminals go: the client area. A minimized frame has
-/// none, so then the place the shown tab's terminals keep, which the
-/// frame's WM_SIZE leaves them while it is minimized: a terminal made at
-/// 0x0 would start its shell on a grid of one cell.
+/// Where a new tab's terminal goes: under the bar as it will be with
+/// that tab, so that its shell starts at the size it keeps.
+pub fn newTabArea(self: *const Window) ?win32.RECT {
+    return self.layoutAreaFor(self.tabs.items.len + 1);
+}
+
+/// Where a tab's terminals go: the client area under the bar
+/// (`layoutAreaFor`).
 pub fn layoutArea(self: *const Window) ?win32.RECT {
+    return self.layoutAreaFor(self.tabs.items.len);
+}
+
+/// Where a tab's terminals go with `count` tabs: the client area under
+/// the bar. A minimized frame has none, so then the place the shown tab's
+/// terminals keep, which the frame's WM_SIZE leaves them while it is
+/// minimized: a terminal made at 0x0 would start its shell on a grid of
+/// one cell.
+fn layoutAreaFor(self: *const Window, count: usize) ?win32.RECT {
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return null;
-    if (!win32.IsIconic(self.hwnd).toBool()) return client;
+    if (!win32.IsIconic(self.hwnd).toBool()) {
+        client.top = @min(client.bottom, client.top + self.barHeightFor(count));
+        return client;
+    }
     var area: ?win32.RECT = null;
     var it = self.tab().tree.iterator();
     while (it.next()) |entry| {
@@ -235,6 +257,8 @@ pub fn selectTab(self: *Window, index: usize) void {
     // A focus move a goto_split left waiting there would outlive its tab.
     old.pending_focus = null;
     hideTab(old);
+    // The layout scrolled the bar to show it (`placeBar`).
+    self.bar.invalidate();
 }
 
 /// Lay the shown tab out and give its focused terminal the focus.
@@ -260,11 +284,15 @@ pub fn removeTab(self: *Window, t: *Tab) void {
     _ = self.tabs.orderedRemove(index);
     const shown = index == self.selected;
     if (index < self.selected or (shown and index == self.tabs.items.len)) self.selected -= 1;
+    self.bar.tabsChanged(self);
     // The next tab first, then the closing terminal hidden, so that it is
     // not shown, nor clicked, while its core stops (`Surface.destroy`).
     if (shown) {
         self.showTab();
         hideTab(t);
+    } else {
+        // Laid out again: with one tab left the bar may go.
+        self.relayout();
     }
     freeTab(self.app.core_app.alloc, t);
 }
@@ -272,7 +300,8 @@ pub fn removeTab(self: *Window, t: *Tab) void {
 /// Move the tab holding `surface` by `amount`, wrapping round, as GTK
 /// moves it (`Window.moveTab` in src/apprt/gtk/class/window.zig); false
 /// with one tab, or when it would not move. Only the order changes: no
-/// terminal is laid out again.
+/// terminal is laid out again, but the bar scrolls to keep the shown tab
+/// in sight.
 pub fn moveTab(self: *Window, surface: *const Surface, amount: isize) bool {
     const total = self.tabs.items.len;
     if (total <= 1) return false;
@@ -284,6 +313,8 @@ pub fn moveTab(self: *Window, surface: *const Surface, amount: isize) bool {
     _ = self.tabs.orderedRemove(from);
     self.tabs.insertAssumeCapacity(to, t);
     self.selected = self.tabIndex(shown).?;
+    self.bar.scrollToShow(self, self.selected);
+    self.bar.tabsChanged(self);
     return true;
 }
 
@@ -319,6 +350,7 @@ pub fn setTabTitle(self: *Window, surface: *const Surface, title: [:0]const u8) 
     };
     if (t.title_override) |old| alloc.free(old);
     t.title_override = copy;
+    self.bar.invalidate();
     if (t == self.tab()) return self.showTitle(tabTitle(t));
     return true;
 }
@@ -337,6 +369,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .hwnd = undefined,
         .tabs = .empty,
         .selected = 0,
+        .bar = .{},
         .dark_frame = false,
         .fullscreen = null,
         .decoration = null,
@@ -358,6 +391,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     // Safe alongside the errdefer above: WM_NCDESTROY frees only a window
     // that is in App.windows, which this one is not yet.
     errdefer _ = win32.DestroyWindow(hwnd);
+    self.bar.create(self);
 
     // Windows announces a change of its app mode only to the top-level
     // windows there are, so one made before this frame existed is read now.
@@ -366,9 +400,9 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     app.systemSchemeChanged();
     self.applyTheme();
 
-    var client: win32.RECT = undefined;
-    if (!win32.GetClientRect(hwnd, &client).toBool()) return App.Error.Win32CallFailed;
-    const surface = try Surface.create(app, self, client, opts);
+    // Under the bar, if `window-show-tab-bar = always` shows it already.
+    const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
+    const surface = try Surface.create(app, self, area, opts);
     // Nothing owns the terminal until it is in the tree.
     first.tree = Tree.init(alloc, surface) catch |err| {
         surface.discard();
@@ -424,7 +458,7 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
 pub fn show(self: *Window) void {
     if (self.tab().focused) |surface| {
         if (surface.initial_size) |size| {
-            applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
+            self.applyInitialSize((surface.getContentScale() catch unreachable).x, size);
         }
     }
 
@@ -560,7 +594,14 @@ fn handleMessage(
         // Sent to every top-level window, so to every frame: the app reads
         // the system's light or dark mode again once and ignores repeats.
         // DefWindowProcW below as well.
-        win32.WM_SETTINGCHANGE => if (isColorSetChange(lparam)) self.app.systemSchemeChanged(),
+        win32.WM_SETTINGCHANGE => {
+            if (isColorSetChange(lparam)) self.app.systemSchemeChanged();
+            // The bar's font is the system's message font (`TabBar.messageFont`).
+            if (wparam == win32.SPI_SETNONCLIENTMETRICS) {
+                self.bar.freeFont();
+                self.bar.invalidate();
+            }
+        },
 
         // Keyboard focus belongs to a terminal: the frame gets it on
         // activation (DefWindowProcW's WM_ACTIVATE), and passes it on.
@@ -692,7 +733,7 @@ pub fn requestClose(self: *Window) void {
 /// one; then each of their terminals is torn down from a message loop, and
 /// a tab goes with its last (`Surface.destroy`). False when `mode` names
 /// no tab. Closing the window's only tab is closing the window
-/// (`App.closeTab`).
+/// (`closeTabs`).
 ///
 /// `close_tab` runs inside a core frame, so this only posts.
 pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMode) bool {
@@ -735,6 +776,115 @@ pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMod
         }
     }
     return true;
+}
+
+/// Whether the tab bar shows: as `window-show-tab-bar` asks, `auto` with
+/// two tabs or more, and never while the window covers its monitor, as
+/// Windows Terminal hides its tabs then.
+pub fn barShown(self: *const Window) bool {
+    return self.barShownFor(self.tabs.items.len);
+}
+
+/// Whether the bar shows with `count` tabs (`barShown`).
+fn barShownFor(self: *const Window, count: usize) bool {
+    if (self.bar.hwnd == null or self.fullscreen != null) return false;
+    return switch (self.app.config.@"window-show-tab-bar") {
+        .always => true,
+        .auto => count >= 2,
+        .never => false,
+    };
+}
+
+/// The bar's height while it shows, else 0.
+fn barHeight(self: *const Window) i32 {
+    return self.barHeightFor(self.tabs.items.len);
+}
+
+/// The bar's height with `count` tabs (`barShownFor`).
+fn barHeightFor(self: *const Window, count: usize) i32 {
+    if (!self.barShownFor(count)) return 0;
+    return TabBar.Metrics.init(dpiOf(self.app, self.hwnd)).height;
+}
+
+/// Show the bar along the top of the client area, or hide it, scrolled
+/// to show the shown tab at its new width.
+fn placeBar(self: *Window) void {
+    const hwnd = self.bar.hwnd orelse return;
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
+    const height = self.barHeight();
+    const flags: win32.UINT = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE |
+        if (height > 0) win32.SWP_SHOWWINDOW else win32.SWP_HIDEWINDOW;
+    _ = win32.SetWindowPos(hwnd, null, 0, 0, client.right, height, flags);
+    self.bar.scrollToShow(self, self.selected);
+    self.bar.invalidate();
+}
+
+/// A click on tab `index` in the bar shows it, as GTK's tab bar selects
+/// a clicked tab. At once when the core may be re-entered, as it may when
+/// `run`'s loop dispatched the click; else, under a prompt or a tick, from
+/// `run` as `goto_tab` is, since showing it lays terminals out and moves
+/// the focus (`App.requests`). Nothing for a window being torn down.
+///
+/// Shown at once, a click runs ahead of tab requests already queued from
+/// the same burst of input, such as a `goto_tab:next` key dispatched just
+/// before it, which `run` then applies from the clicked tab; GTK takes the
+/// two in the order they came. That is the price of selecting at once,
+/// which keeps the index the click named from going stale behind them.
+pub fn clickTab(self: *Window, index: usize) void {
+    if (self.closing or self.app.terminating) return;
+    if (index >= self.tabs.items.len or index == self.selected) return;
+    if (self.app.canReenterCore()) return self.selectTab(index);
+    const from = self.tab().focused orelse return;
+    if (from.closing) return;
+    // Every surface a request names is live (`App.requests`): a stopping
+    // one's are dropped already (`App.forgetClosing`).
+    const core = from.liveCore() orelse return;
+    self.app.requests.append(self.app.core_app.alloc, .{ .goto_tab = .{
+        .from = core,
+        .to = @fromBackingInt(@intCast(index + 1)),
+    } }) catch |err| {
+        log.warn("cannot record a tab to show err={}", .{err});
+        return;
+    };
+    self.app.wakeup();
+}
+
+/// The bar's "+", or a double click on its empty part: a new tab from
+/// the shown tab's focused terminal. Performed as the `new_tab` binding
+/// is, as GTK's "+" does (`btnNewTab` in src/apprt/gtk/class/window.zig),
+/// when the core may be re-entered; else recorded for `run` as that
+/// binding records it (`App.requestTab`).
+pub fn clickNewTab(self: *Window) void {
+    if (self.closing or self.app.terminating) return;
+    const from = self.tab().focused orelse return;
+    const core = from.liveCore() orelse return;
+    if (self.app.canReenterCore()) {
+        _ = core.performBindingAction(.new_tab) catch |err|
+            return log.warn("cannot open a new tab err={}", .{err});
+        self.app.wakeup();
+        return;
+    }
+    self.app.requests.append(self.app.core_app.alloc, .{ .tab = core }) catch |err| {
+        log.warn("cannot record a new tab request err={}", .{err});
+        return;
+    };
+    self.app.wakeup();
+}
+
+/// `close_tab` from the tab at index `at` (`requestCloseTabs`), where
+/// closing the window's only tab closes the window (`requestClose`); for
+/// a binding (`App.closeTab`) and for the bar's close glyph and middle
+/// click alike. False when `mode` names no tab.
+pub fn closeTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMode) bool {
+    if (at >= self.tabs.items.len) return false;
+    if (mode == .this and self.tabs.items.len == 1) {
+        // It only posts: this runs inside a core frame for a binding
+        // (see `App.closeWindow`).
+        self.requestClose();
+        return true;
+    }
+    return self.requestCloseTabs(at, mode);
 }
 
 /// Whether a terminal of `t` asks before it closes.
@@ -923,8 +1073,7 @@ pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSpli
     const place = self.find(from) orelse return;
     const t = self.tabs.items[place.index];
     const handle = place.handle;
-    var client: win32.RECT = undefined;
-    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
+    const client = self.layoutArea() orelse return;
     const across = value.direction == .left or value.direction == .right;
     const extent = if (across) client.right - client.left else client.bottom - client.top;
     if (extent <= 0) return;
@@ -964,8 +1113,7 @@ fn resizeShare(
 /// Nothing moves if a terminal would shrink below a cell (`adopt`).
 pub fn equalize(self: *Window, from: *Surface) void {
     const t = self.tabOf(from) orelse return;
-    var client: win32.RECT = undefined;
-    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
+    const client = self.layoutArea() orelse return;
     var tree = t.tree.equalize(self.app.core_app.alloc) catch |err| {
         log.warn("cannot equalize the splits err={}", .{err});
         return;
@@ -1107,6 +1255,8 @@ pub fn giveFocus(self: *Window, surface: *Surface) void {
 pub fn setFocused(self: *Window, surface: *Surface) void {
     const t = self.tabOf(surface) orelse return;
     t.focused = surface;
+    // Its label is its focused terminal's title, shown or not.
+    self.bar.invalidate();
     if (t != self.tab()) return;
     _ = self.showTitle(tabTitle(t));
     self.showProgress();
@@ -1198,8 +1348,8 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
 /// window is minimized and its client area is empty (see WM_SIZE).
 pub fn relayout(self: *Window) void {
     if (self.tab().tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
-    var client: win32.RECT = undefined;
-    if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
+    self.placeBar();
+    const client = self.layoutArea() orelse return;
     const divider = dividerWidth(dpiOf(self.app, self.hwnd));
 
     // One batch, so that the terminals move together.
@@ -1440,6 +1590,7 @@ pub fn applyTheme(self: *Window) void {
         return;
     }
     self.dark_frame = dark;
+    self.bar.invalidate();
 }
 
 /// Whether a WM_SETTINGCHANGE is about the light or dark mode of apps,
@@ -1481,12 +1632,13 @@ pub fn dpiOf(app: *const App, hwnd: win32.HWND) u32 {
 /// scale factor: the grid is never smaller than requested, at most a little
 /// larger, unless the window would not fit its monitor's work area
 /// (`resizeClient`).
-pub fn applyInitialSize(hwnd: win32.HWND, scale: f32, size: apprt.action.InitialSize) void {
+pub fn applyInitialSize(self: *Window, scale: f32, size: apprt.action.InitialSize) void {
     // SetWindowPos sends WM_SIZE synchronously; the core is live, so it
     // sees the new size before the first paint. That WM_SIZE also reports
     // the window visible (occlusionCallback) while it is still hidden,
-    // which is harmless only because ShowWindow follows immediately.
-    _ = resizeClient(hwnd, scaledSize(size.width, scale), scaledSize(size.height, scale));
+    // which is harmless only because ShowWindow follows immediately. The
+    // bar, if it shows, comes on top of the terminal's size.
+    _ = resizeClient(self.hwnd, scaledSize(size.width, scale), scaledSize(size.height, scale) +| self.barHeight());
 }
 
 /// `points` at `scale`, in device pixels, rounded up.
@@ -1596,7 +1748,7 @@ pub fn resetSize(self: *Window) void {
             if (!self.isRestored()) _ = win32.ShowWindow(self.hwnd, win32.SW_RESTORE);
             // defaultSize found one.
             const surface = self.tab().focused.?;
-            applyInitialSize(self.hwnd, (surface.getContentScale() catch unreachable).x, size);
+            self.applyInitialSize((surface.getContentScale() catch unreachable).x, size);
         },
     }
 }
@@ -1609,15 +1761,15 @@ pub fn resetSize(self: *Window) void {
 pub fn resizeToTerminal(self: *Window, surface: *Surface, size: apprt.action.ResizeWindow) void {
     if (!self.terminalResizable(surface)) return;
     const scale = surface.getContentScale() catch unreachable;
-    var client: win32.RECT = undefined;
-    if (!win32.GetClientRect(self.hwnd, &client).toBool()) {
+    const area = self.layoutArea() orelse {
         log.warn("unable to read the client area, window not resized err={}", .{win32.GetLastError()});
         return;
-    }
+    };
+    // The bar, if it shows, comes on top of the terminal's size.
     _ = resizeClient(
         self.hwnd,
-        if (size.width > 0) scaledSize(size.width, scale.x) else client.right,
-        if (size.height > 0) scaledSize(size.height, scale.y) else client.bottom,
+        if (size.width > 0) scaledSize(size.width, scale.x) else area.right - area.left,
+        (if (size.height > 0) scaledSize(size.height, scale.y) else area.bottom - area.top) +| self.barHeight(),
     );
 }
 
@@ -1660,9 +1812,9 @@ pub fn present(hwnd: win32.HWND) bool {
 /// The overlapped-window styles come off and the window takes the
 /// monitor's rect, and the placement saved first brings it back, as
 /// Raymond Chen describes it ("How do I switch a window between normal
-/// and fullscreen?", The Old New Thing). The terminals are laid out again
-/// from the frame's WM_SIZE, so this never runs inside a core frame
-/// (`App.requests`).
+/// and fullscreen?", The Old New Thing). The terminals are laid out again,
+/// from the frame's WM_SIZE and then here for the bar, so this never runs
+/// inside a core frame (`App.requests`).
 pub fn toggleFullscreen(self: *Window) void {
     const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_STYLE);
     const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
@@ -1670,6 +1822,11 @@ pub fn toggleFullscreen(self: *Window) void {
 
     if (self.fullscreen) |restore| {
         self.fullscreen = null;
+        // The bar comes back with the window's frame. Laid out here, not
+        // only from WM_SIZE, which does not come when the client area keeps
+        // its size (a monitor whose work area is all of it); terminals
+        // already in place are not moved again.
+        defer self.relayout();
         // With the frame `window-decoration` asks for now, which a toggle
         // while it covered the monitor may have changed.
         _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, (style & ~overlapped) | frameStyle(self.isDecorated()));
@@ -1719,6 +1876,8 @@ pub fn toggleFullscreen(self: *Window) void {
     self.fullscreen = restore;
     _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_STYLE, style & ~overlapped);
     self.moveTo(monitor, reframe);
+    // The bar goes, even if the client area kept its size (see above).
+    self.relayout();
 }
 
 /// Move and size the frame to `rect`, in screen coordinates.

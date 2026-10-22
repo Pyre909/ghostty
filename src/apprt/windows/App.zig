@@ -17,6 +17,7 @@ const Surface = @import("Surface.zig").Surface;
 const Tab = @import("Tab.zig");
 const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
+const TabBar = @import("TabBar.zig");
 const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
@@ -279,7 +280,8 @@ pub const App = struct {
         decorations: *CoreSurface,
 
         /// Give every window the decorations the configuration now asks
-        /// for (`configChange`).
+        /// for (`configChange`), and lay it out again, since
+        /// `window-show-tab-bar` may have changed.
         redecorate,
 
         /// Give the window of this surface the size a new one is made with
@@ -1067,10 +1069,10 @@ pub const App = struct {
             .app => return false,
             .surface => |v| v.rt_surface,
         };
+        _ = self;
         const window = surface.window;
-        if (mode == .this and window.tabs.items.len == 1) return self.closeWindow(target);
         const at = window.find(surface) orelse return false;
-        return window.requestCloseTabs(at.index, mode);
+        return window.closeTabs(at.index, mode);
     }
 
     /// `.new_tab`: for a terminal, a tab in its window, recorded for `run`
@@ -2040,7 +2042,11 @@ pub const App = struct {
                     resize.from.rt_surface,
                     resize.size,
                 ),
-                .redecorate => for (self.windows.items) |window| window.applyDecorations(),
+                // And `window-show-tab-bar` may have changed.
+                .redecorate => for (self.windows.items) |window| {
+                    window.applyDecorations();
+                    window.relayout();
+                },
                 // A window covering its monitor is left as it is: maximized,
                 // it would have the work area instead.
                 .maximize => |from| {
@@ -2214,6 +2220,12 @@ pub const App = struct {
         // As in surfaceDestroyed; after WM_NCDESTROY no message comes, but a
         // window `terminate` gives up on still exists.
         _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_USERDATA, 0);
+        // The bar is a child of the frame, which it outlives with the same
+        // back-pointer; and its WM_DESTROY, which frees its font, never
+        // comes. Not DestroyWindow: it would fail as the frame's did, and on
+        // the normal path the bar is gone already (`hwnd` null).
+        if (window.bar.hwnd) |bar| _ = win32.SetWindowLongPtrW(bar, win32.GWLP_USERDATA, 0);
+        window.bar.freeFont();
 
         // In order: `windowBeside` goes by opening order.
         _ = self.windows.orderedRemove(idx);
@@ -2324,13 +2336,13 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     // the load fails both stay null and the system default is used.
     const icon = win32.LoadIconW(hinstance, @ptrFromInt(icon_resource_id));
 
-    // No CS_HREDRAW or CS_VREDRAW for either class. They would invalidate
-    // the whole window on every resize step, shrinks included. A terminal
-    // draws nothing through GDI, and WM_SIZE already queues its frame for
-    // the new size, so each resulting WM_PAINT would only wake its renderer
-    // for another frame of the same size. The frame paints just its
-    // dividers, and Windows already invalidates what a resize or a
-    // terminal's move uncovers of it.
+    // No CS_HREDRAW or CS_VREDRAW for the frame and terminal classes.
+    // They would invalidate the whole window on every resize step, shrinks
+    // included. A terminal draws nothing through GDI, and WM_SIZE already
+    // queues its frame for the new size, so each resulting WM_PAINT would
+    // only wake its renderer for another frame of the same size. The frame
+    // paints just its dividers, and Windows already invalidates what a
+    // resize or a terminal's move uncovers of it.
     const window_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
         .style = 0,
@@ -2371,6 +2383,31 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     }
     errdefer _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
 
+    // CS_DBLCLKS: a double click on its empty part opens a tab; with it
+    // every button's second quick press is a *BUTTONDBLCLK, which the bar
+    // takes as a press anywhere else (`TabBar.wndProc`). The bar
+    // draws itself through GDI, and is invalidated explicitly whenever it
+    // is placed or its tabs change (`Window.placeBar`, `TabBar.Bar`).
+    const bar_class: win32.WNDCLASSEXW = .{
+        .cbSize = @sizeOf(win32.WNDCLASSEXW),
+        .style = win32.CS_DBLCLKS,
+        .lpfnWndProc = &TabBar.wndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = arrow,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = L(TabBar.class_name),
+        .hIconSm = null,
+    };
+    if (win32.RegisterClassExW(&bar_class) == 0) {
+        log.err("failed to register the tab bar class err={}", .{win32.GetLastError()});
+        return App.Error.Win32ClassRegistrationFailed;
+    }
+    errdefer _ = win32.UnregisterClassW(L(TabBar.class_name), hinstance);
+
     const app_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
         .style = 0,
@@ -2395,6 +2432,7 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(app_class_name), hinstance);
     _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
     _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
+    _ = win32.UnregisterClassW(L(TabBar.class_name), hinstance);
 }
 
 /// The text of `showConfigErrors`: GTK's dialog's, then each diagnostic on
@@ -3008,6 +3046,7 @@ fn testFrame(app: *App) !*Window {
         .hwnd = undefined,
         .tabs = .empty,
         .selected = 0,
+        .bar = .{},
         .dark_frame = false,
         .fullscreen = null,
         .decoration = null,
@@ -3020,6 +3059,7 @@ fn testFrame(app: *App) !*Window {
     _ = try window.appendTab(alloc);
     errdefer window.deinitTabs(alloc);
     _ = try window.createFrame(0, 0, 200, 100);
+    window.bar.create(window);
     app.windows.appendAssumeCapacity(window);
     return window;
 }
@@ -4014,7 +4054,6 @@ test "win32: a terminal in a hidden tab acts in its own tab" {
     window.relayout();
     try std.testing.expect(a.setTitle("a"));
     const ta = window.tab();
-    const a_rect = try paneRect(window, a);
 
     const b = try testTab(&app, window);
     const b2 = try testPane(&app, window);
@@ -4043,6 +4082,9 @@ test "win32: a terminal in a hidden tab acts in its own tab" {
     app.forgetClosing(&a2.core_surface);
     try std.testing.expect(ta.pending_focus == null);
     window.selectTab(window.tabIndex(ta).?);
+    // Its place under the tab bar, which three tabs show.
+    const a_rect = try paneRect(window, a);
+    try std.testing.expect(a_rect.top > 0);
 
     // A terminal of the hidden tab given the focus is that tab's, and
     // retitles nothing.
@@ -4178,6 +4220,781 @@ test "win32: close_tab closes this tab, the others or those after it" {
     try std.testing.expectEqual(1, window.tabs.items.len);
     try std.testing.expectEqual(e, window.tab().focused.?);
     try std.testing.expect(!window.closing);
+}
+
+test "win32: the tab bar shows over the terminals, and its clicks show and close tabs" {
+    // As window-show-tab-bar = auto: hidden with one tab and along the top
+    // with two, the terminals under it; never as it says, from a reloaded
+    // configuration too; and not while the window covers its monitor. A
+    // click on a tab shows it at once, `run`'s loop having dispatched it;
+    // its close glyph, and a middle click, close it when pressed and
+    // released on the same tab; the wheel scrolls tabs that do not fit,
+    // by fractions of a notch too, and the highlight follows.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    try std.testing.expect(!shown(bar));
+    try std.testing.expectEqual(0, (try paneRect(window, a)).top);
+
+    const b = try testTab(&app, window);
+    window.selectTab(1);
+    const height = TabBar.Metrics.init(Window.dpiOf(&app, window.hwnd)).height;
+    try std.testing.expect(shown(bar));
+    try std.testing.expectEqual(height, (try paneRect(window, b)).top);
+
+    app.config.@"window-show-tab-bar" = .never;
+    window.relayout();
+    try std.testing.expect(!shown(bar));
+    try std.testing.expectEqual(0, (try paneRect(window, b)).top);
+    app.config.@"window-show-tab-bar" = .auto;
+    window.relayout();
+    window.toggleFullscreen();
+    try std.testing.expect(!shown(bar));
+    window.toggleFullscreen();
+    try std.testing.expect(shown(bar));
+
+    // A reloaded configuration lays every window out again (`redecorate`):
+    // the frame keeps its styles, so no WM_SIZE does it.
+    {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.@"window-show-tab-bar" = .never;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        app.createRequested();
+        try std.testing.expect(!shown(bar));
+        try std.testing.expectEqual(0, (try paneRect(window, b)).top);
+        changed.@"window-show-tab-bar" = .auto;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        app.createRequested();
+        try std.testing.expect(shown(bar));
+        try std.testing.expectEqual(height, (try paneRect(window, b)).top);
+    }
+
+    const c = try testTab(&app, window);
+    const layout = testBarLayout(window);
+    try std.testing.expectEqual(0, layout.scroll);
+
+    // A click on the first tab shows it at once, and records nothing.
+    const first = layout.tabRect(0);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, testPoint(first.left + 4, 4));
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(first.left + 4, 4));
+    try std.testing.expectEqual(0, window.selected);
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // The second tab's close glyph, pressed and released on it: closed.
+    const close = layout.closeRect(1);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, testMid(close));
+    try std.testing.expect(!b.closing);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testMid(close));
+    try std.testing.expect(b.closing);
+    try std.testing.expect(!a.closing);
+
+    // Pressed on a tab, which shows it, and released on its close glyph:
+    // not closed.
+    const third = layout.tabRect(2);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, testPoint(third.left + 4, 4));
+    try std.testing.expectEqual(2, window.selected);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testMid(layout.closeRect(2)));
+    try std.testing.expect(!c.closing);
+
+    // A middle click closes a tab only if it went down on that tab: not a
+    // release alone, nor one from another tab; its close glyph counts.
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, testPoint(first.left + 4, 4));
+    try std.testing.expect(!a.closing);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, testPoint(third.left + 4, 4));
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, testPoint(first.left + 4, 4));
+    try std.testing.expect(!a.closing);
+    try std.testing.expect(!c.closing);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, testPoint(first.left + 4, 4));
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, testMid(layout.closeRect(0)));
+    try std.testing.expect(a.closing);
+
+    // Their teardowns leave the third, alone, and the bar goes.
+    testTeardowns();
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expect(window.tab().focused == c);
+    try std.testing.expect(!shown(bar));
+
+    // So does a hidden tab's last terminal, leaving one tab.
+    const d = try testTab(&app, window);
+    window.relayout();
+    try std.testing.expect(shown(bar));
+    try std.testing.expect(d.destroy());
+    try std.testing.expect(!shown(bar));
+    try std.testing.expectEqual(0, (try paneRect(window, c)).top);
+
+    // Tabs too many for the bar scroll with the wheel: a notch a tab, a
+    // high-resolution wheel's fraction of one in proportion; and the
+    // highlight goes to the tab now under the pointer.
+    for (0..19) |_| _ = try testTab(&app, window);
+    window.relayout();
+    const over = testBarLayout(window);
+    try std.testing.expectEqual(0, over.scroll);
+    try std.testing.expect(over.max_scroll > 2 * over.tab);
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEMOVE, 0, testPoint(10, 4));
+    try std.testing.expect(std.meta.eql(window.bar.hover, TabBar.Hit{ .tab = 0 }));
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEWHEEL, testWheel(-30), 0);
+    const part = @divTrunc(30 * over.tab, win32.WHEEL_DELTA);
+    try std.testing.expectEqual(part, window.bar.scroll);
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    try std.testing.expectEqual(part + over.tab, window.bar.scroll);
+    try std.testing.expect(std.meta.eql(window.bar.hover, TabBar.Hit{ .tab = 1 }));
+}
+
+test "win32: the tab bar's buttons take every click, and only their own" {
+    // A quick second click, which Windows sends as a double click, is a
+    // click on a close glyph or the "+"; on the bar's empty part it opens
+    // a tab. A press counts only with its release on the same thing: not
+    // once the capture is taken away, nor once the tabs change under it.
+    // The "+" goes through the core's new_tab binding.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    // Each goes after the shown tab, so they end a, b, c, d, e, f.
+    const f = try testTab(&app, window);
+    const e = try testTab(&app, window);
+    const d = try testTab(&app, window);
+    const c = try testTab(&app, window);
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    try std.testing.expect(window.tabs.items[1].focused == b);
+
+    // The shown terminal opens the new tabs. Live, so that the binding
+    // runs; no other core call is made on it. Back to `.none` before
+    // anything lays it out (its WM_SIZE would reach a core), and before
+    // the teardown at the end, which would stop a live core.
+    a.core_state = .live;
+    defer a.core_state = .none;
+    a.core_surface.rt_app = &app;
+
+    // The "+", clicked twice quickly: two new tabs.
+    const plus = testMid(testBarLayout(window).plusRect());
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, plus);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, plus);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, 0, plus);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, plus);
+    try std.testing.expectEqual(2, app.requests.items.len);
+    for (app.requests.items) |request| try std.testing.expect(request == .tab);
+    app.requests.clearRetainingCapacity();
+
+    // The empty part: its double click opens one.
+    const empty = testPoint(testBarLayout(window).plusRect().right + 20, 4);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, empty);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, empty);
+    try std.testing.expectEqual(0, app.requests.items.len);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, 0, empty);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, empty);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .tab);
+    app.requests.clearRetainingCapacity();
+    a.core_state = .none;
+
+    // Pressed on b's close glyph, then the capture taken away: the button
+    // came up elsewhere, so a release there later closes nothing.
+    const close_b = testMid(testBarLayout(window).closeRect(1));
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, close_b);
+    _ = win32.SendMessageW(bar, win32.WM_CAPTURECHANGED, 0, 0);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, close_b);
+    try std.testing.expect(!b.closing);
+
+    // b's close glyph, clicked; once b is gone c takes its place, and a
+    // quick second click there closes c.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, close_b);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, close_b);
+    try std.testing.expect(b.closing);
+    testTeardowns();
+    try std.testing.expect(window.tabs.items[1].focused == c);
+    const close_c = testMid(testBarLayout(window).closeRect(1));
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, 0, close_c);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, close_c);
+    try std.testing.expect(c.closing);
+    testTeardowns();
+
+    // a, d, e, f: pressed on e's close glyph; d goes meanwhile, and f's
+    // glyph has e's index now: the release on it closes nothing.
+    try std.testing.expect(window.tabs.items[2].focused == e);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, testMid(testBarLayout(window).closeRect(2)));
+    try std.testing.expect(d.destroy());
+    try std.testing.expect(window.tabs.items[2].focused == f);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testMid(testBarLayout(window).closeRect(2)));
+    try std.testing.expect(!e.closing);
+    try std.testing.expect(!f.closing);
+
+    // a, e, f: the pointer on f; once e goes the "+" is there, and the
+    // highlight goes with it.
+    const on_f = testBarLayout(window).tabRect(2);
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEMOVE, 0, testPoint(on_f.left + 4, 4));
+    try std.testing.expect(std.meta.eql(window.bar.hover, TabBar.Hit{ .tab = 2 }));
+    try std.testing.expect(e.destroy());
+    try std.testing.expect(std.meta.eql(window.bar.hover, testBarLayout(window).hit(on_f.left + 4, 4)));
+    try std.testing.expect(window.bar.hover == .plus);
+}
+
+test "win32: a double click on the tab bar is two clicks, but on its empty part" {
+    // With CS_DBLCLKS a quick second click of either button comes as a
+    // double click: a middle one closes the tab now under the pointer, as
+    // a left one on a close glyph does. A double click opens a tab only
+    // with both of its presses on the bar's empty part, not when the first
+    // closed the last tab and left empty space under the second.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    // Each goes after the shown tab, so they end a, b, c, d, e.
+    const e = try testTab(&app, window);
+    _ = try testTab(&app, window);
+    const c = try testTab(&app, window);
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    try std.testing.expect(window.tabs.items[1].focused == b);
+
+    // b's label, middle-clicked twice quickly: b closes, c takes its
+    // place, and the second click closes c. The tabs widen as one goes, so
+    // the point is on the second tab with four tabs as with five.
+    const five = testBarLayout(window);
+    const four: TabBar.Layout = .init(five.m, 4, five.width, 0);
+    const second = four.tabRect(1).left + 4;
+    try std.testing.expect(std.meta.eql(five.hit(second, 4), TabBar.Hit{ .tab = 1 }));
+    const on_b = testPoint(second, 4);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, on_b);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_b);
+    try std.testing.expect(b.closing);
+    testTeardowns();
+    try std.testing.expect(window.tabs.items[1].focused == c);
+    try std.testing.expect(std.meta.eql(testBarLayout(window).hit(second, 4), TabBar.Hit{ .tab = 1 }));
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDBLCLK, 0, on_b);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_b);
+    try std.testing.expect(c.closing);
+    try std.testing.expect(!a.closing);
+    testTeardowns();
+
+    // a, d, e, as wide as tabs go, so the "+" follows e: once e's close
+    // glyph closes it, the "+" moves left and the glyph's place is empty.
+    try std.testing.expect(window.tabs.items[2].focused == e);
+    const layout = testBarLayout(window);
+    try std.testing.expectEqual(layout.m.tab_max, layout.tab);
+    const glyph = layout.closeRect(2);
+    const x = @divTrunc(glyph.left + glyph.right, 2);
+    const y = @divTrunc(glyph.top + glyph.bottom, 2);
+    const at = testPoint(x, y);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, at);
+    try std.testing.expect(e.closing);
+    testTeardowns();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(testBarLayout(window).hit(x, y) == .none);
+
+    // The shown terminal would open the tab: live, so that the binding
+    // runs (see the test above).
+    a.core_state = .live;
+    defer a.core_state = .none;
+    a.core_surface.rt_app = &app;
+
+    // The second press of that double click, on the empty place: nothing.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, 0, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, at);
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Both presses there: a new tab.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, 0, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, at);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .tab);
+    app.requests.clearRetainingCapacity();
+}
+
+test "win32: the tab bar holds the mouse capture while a button is down on it" {
+    // Taken by a press on a tab, its close glyph or the "+", so that the
+    // bar sees the button come up wherever it does, and let go once no
+    // button is down on it, the left and middle ones held together too. A
+    // capture another window takes cancels the press.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const c = try testTab(&app, window);
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    defer _ = win32.ReleaseCapture();
+    try std.testing.expect(win32.GetCapture() == null);
+
+    const layout = testBarLayout(window);
+    const close_b = testMid(layout.closeRect(1));
+    const plus = testMid(layout.plusRect());
+    const empty = testPoint(layout.plusRect().right + 20, 4);
+    const on_a = testPoint(layout.tabRect(0).left + 4, 4);
+    const on_b = testPoint(layout.tabRect(1).left + 4, 4);
+    const on_c = testPoint(layout.tabRect(2).left + 4, 4);
+
+    // b's close glyph and the "+": held, then let go off them.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, close_b);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, empty);
+    try std.testing.expect(win32.GetCapture() == null);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, plus);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, empty);
+    try std.testing.expect(win32.GetCapture() == null);
+    try std.testing.expect(!b.closing);
+
+    // Nothing to press on: no capture.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, empty);
+    try std.testing.expect(win32.GetCapture() == null);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, empty);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, plus);
+    try std.testing.expect(win32.GetCapture() == null);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, plus);
+
+    // Left on the shown tab, then the middle button down on b and up on c:
+    // the left one is still down, so the capture stays until it comes up.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, on_a);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, on_b);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_c);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, on_a);
+    try std.testing.expect(win32.GetCapture() == null);
+
+    // The other way round.
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, on_b);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, on_a);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, on_a);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_c);
+    try std.testing.expect(win32.GetCapture() == null);
+    try std.testing.expect(!b.closing);
+    try std.testing.expect(!c.closing);
+
+    // b's close glyph held, and the frame takes the capture: Windows tells
+    // the bar (WM_CAPTURECHANGED), the press is cancelled, and its release
+    // on the glyph closes nothing, nor lets go of the frame's capture.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, close_b);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SetCapture(window.hwnd);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, close_b);
+    try std.testing.expect(!b.closing);
+    try std.testing.expect(win32.GetCapture() == window.hwnd);
+    _ = win32.ReleaseCapture();
+
+    // The middle button likewise.
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, on_b);
+    try std.testing.expect(win32.GetCapture() == bar);
+    _ = win32.SetCapture(window.hwnd);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_b);
+    try std.testing.expect(!b.closing);
+    _ = win32.ReleaseCapture();
+}
+
+test "win32: a click on a tab waits for run under a prompt, from a live terminal" {
+    // Under a prompt, which may have a core frame beneath it, the tab is
+    // shown from `run`, as goto_tab is; the request names the shown tab's
+    // focused terminal, which must be live (`App.requests`). A window
+    // being torn down takes no click.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = try testTab(&app, window);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    const second = testBarLayout(window).tabRect(1);
+    const click = struct {
+        fn f(hwnd: win32.HWND, at: win32.LPARAM) void {
+            _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, at);
+            _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, at);
+        }
+    }.f;
+
+    app.prompt_depth = 1;
+    defer app.prompt_depth = 0;
+    a.core_state = .live;
+    defer a.core_state = .none;
+    click(bar, testPoint(second.left + 4, 4));
+    try std.testing.expectEqual(0, window.selected);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    switch (app.requests.items[0]) {
+        .goto_tab => |goto| try std.testing.expect(goto.from == &a.core_surface),
+        else => return error.TestUnexpectedResult,
+    }
+    app.requests.clearRetainingCapacity();
+
+    // Stopping, its requests already dropped: none is recorded.
+    a.core_state = .stopping;
+    click(bar, testPoint(second.left + 4, 4));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    a.core_state = .none;
+
+    app.prompt_depth = 0;
+    window.closing = true;
+    click(bar, testPoint(second.left + 4, 4));
+    window.closing = false;
+    try std.testing.expectEqual(0, window.selected);
+    try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: the tab bar goes in fullscreen though the client area keeps its size" {
+    // A frame without the overlapped styles, at its monitor's rect, keeps
+    // its client area when it covers the monitor: no WM_SIZE comes, as on a
+    // monitor whose work area is all of it. The bar goes all the same, and
+    // comes back with a tab opened meanwhile.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const b = try testTab(&app, window);
+    window.selectTab(1);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const bar = window.bar.hwnd.?;
+
+    const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
+    const style = win32.GetWindowLongPtrW(window.hwnd, win32.GWL_STYLE);
+    _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWL_STYLE, style & ~overlapped);
+    const m = (try monitorOf(window.hwnd)).rcMonitor;
+    _ = win32.SetWindowPos(
+        window.hwnd,
+        null,
+        m.left,
+        m.top,
+        m.right - m.left,
+        m.bottom - m.top,
+        win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_FRAMECHANGED,
+    );
+    try std.testing.expect(shown(bar));
+    const before = try clientRect(window.hwnd);
+
+    window.toggleFullscreen();
+    try std.testing.expectEqual(before, try clientRect(window.hwnd));
+    try std.testing.expect(!shown(bar));
+    try std.testing.expectEqual(0, (try paneRect(window, b)).top);
+
+    const c = try testTab(&app, window);
+    window.selectTab(window.find(c).?.index);
+    window.toggleFullscreen();
+    try std.testing.expect(shown(bar));
+}
+
+test "win32: the tab bar keeps the shown tab in sight" {
+    // Narrower, or with the shown tab moved round to the end, the bar
+    // scrolls to show it, as selecting it does.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    for (0..19) |_| _ = try testTab(&app, window);
+    window.relayout();
+    const inSight = struct {
+        fn f(w: *Window) bool {
+            const l = testBarLayout(w);
+            const r = l.tabRect(w.selected);
+            return r.left >= 0 and r.right <= l.width - l.m.plus;
+        }
+    }.f;
+
+    window.selectTab(9);
+    try std.testing.expectEqual(0, window.bar.scroll);
+    try std.testing.expect(inSight(window));
+    testResize(window, 400, 300);
+    try std.testing.expect(window.bar.scroll > 0);
+    try std.testing.expect(inSight(window));
+
+    window.selectTab(0);
+    try std.testing.expectEqual(0, window.bar.scroll);
+    try std.testing.expect(window.moveTab(a, -1));
+    try std.testing.expectEqual(19, window.selected);
+    try std.testing.expect(inSight(window));
+}
+
+test "win32: the tab bar counts in every size it takes from the client area" {
+    // A new tab's terminal starts under the bar that tab brings. With
+    // window-show-tab-bar = always one terminal has the bar above it: a
+    // size asked for it comes on top, and splits, resized or equalized,
+    // measure from under it. Its close glyph closes the window, its one
+    // tab.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    const height = TabBar.Metrics.init(Window.dpiOf(&app, window.hwnd)).height;
+    try std.testing.expectEqual(0, window.layoutArea().?.top);
+    try std.testing.expectEqual(height, window.newTabArea().?.top);
+
+    app.config.@"window-show-tab-bar" = .always;
+    window.relayout();
+    try std.testing.expect(shown(bar));
+    try std.testing.expectEqual(height, (try paneRect(window, a)).top);
+
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    const scale = try a.getContentScale();
+    try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 0, .height = 200 }));
+    app.createRequested();
+    var client = try clientRect(window.hwnd);
+    try std.testing.expectEqual(Window.scaledSize(200, scale.y) + height, client.bottom);
+    try std.testing.expectEqual(height, (try paneRect(window, a)).top);
+
+    a.initial_size = .{ .width = 320, .height = 180 };
+    try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
+    app.createRequested();
+    client = try clientRect(window.hwnd);
+    try std.testing.expectEqual(Window.scaledSize(180, scale.x) + height, client.bottom);
+
+    // a over b.
+    const b = try testPane(&app, window);
+    window.tab().tree.deinit();
+    window.tab().tree = try testLine(alloc, &.{ a, b }, .down);
+    testResize(window, 400, 400);
+    const before = try paneRect(window, a);
+    try std.testing.expectEqual(height, before.top);
+    window.resizeSplit(a, .{ .amount = 100, .direction = .down });
+    try expectNear(before.bottom + 100, (try paneRect(window, a)).bottom);
+    window.equalize(a);
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    try expectNear(ra.bottom - ra.top, rb.bottom - rb.top);
+    try std.testing.expectEqual((try clientRect(window.hwnd)).bottom, rb.bottom);
+
+    // a over b over c, under a bar that leaves a divider and a pixel: a
+    // has that pixel, b and c none. Equalized, a would have none there, so
+    // nothing moves; over the whole client area each would keep a row, and
+    // with room they share it.
+    const c = try testPane(&app, window);
+    window.tab().tree.deinit();
+    window.tab().tree = try testLine(alloc, &.{ a, b, c }, .down);
+    const divider = Window.dividerWidth(Window.dpiOf(&app, window.hwnd));
+    const frame = try windowRect(window.hwnd);
+    const nonclient = (frame.bottom - frame.top) - (try clientRect(window.hwnd)).bottom;
+    testResize(window, 400, nonclient + height + divider + 1);
+    window.relayout();
+    try std.testing.expectEqual(height + divider + 1, (try clientRect(window.hwnd)).bottom);
+    const crowded = try paneRect(window, a);
+    try std.testing.expectEqual(height, crowded.top);
+    try std.testing.expectEqual(height + 1, crowded.bottom);
+    window.equalize(a);
+    try std.testing.expectEqual(crowded, try paneRect(window, a));
+    testResize(window, 400, 400);
+    window.equalize(a);
+    const ea = try paneRect(window, a);
+    const eb = try paneRect(window, b);
+    const ec = try paneRect(window, c);
+    try expectNear(ea.bottom - ea.top, eb.bottom - eb.top);
+    try expectNear(eb.bottom - eb.top, ec.bottom - ec.top);
+
+    const close = testMid(testBarLayout(window).closeRect(0));
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, close);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, close);
+    try std.testing.expect(window.closing);
+}
+
+test "win32: only a title a tab's label shows repaints the tab bar" {
+    // A tab's label shows its focused terminal's title, or its own: a
+    // title from another of its terminals, or under a title of its own,
+    // changes no label, as on GTK.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    const c = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    try std.testing.expect(shown(bar));
+    const pending = struct {
+        fn f(hwnd: win32.HWND) bool {
+            return win32.GetUpdateRect(hwnd, null, .FALSE).toBool();
+        }
+    }.f;
+
+    _ = win32.UpdateWindow(bar);
+    try std.testing.expect(!pending(bar));
+    try std.testing.expect(b.setTitle("unfocused"));
+    try std.testing.expect(!pending(bar));
+    try std.testing.expect(a.setTitle("focused"));
+    try std.testing.expect(pending(bar));
+
+    try std.testing.expect(window.setTabTitle(a, "own"));
+    _ = win32.UpdateWindow(bar);
+    try std.testing.expect(a.setTitle("under its own"));
+    try std.testing.expect(!pending(bar));
+
+    // A hidden tab's focused terminal: its label shows it.
+    try std.testing.expect(c.setTitle("hidden"));
+    try std.testing.expect(pending(bar));
+}
+
+test "win32: a window terminate gave up on leaves its tab bar no back-pointer" {
+    // As App.terminate does when DestroyWindow fails on a frame: the
+    // Window is freed, its frame and bar stay. A message to the bar then
+    // touches nothing freed.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const frame = window.hwnd;
+    const bar = window.bar.hwnd.?;
+    app.windowDestroyed(window);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEMOVE, 0, testPoint(4, 4));
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, testPoint(4, 4));
+    try std.testing.expect(win32.DestroyWindow(frame).toBool());
+}
+
+/// For tests: resize `window`'s frame, which lays it out (WM_SIZE).
+fn testResize(window: *Window, width: c_int, height: c_int) void {
+    _ = win32.SetWindowPos(
+        window.hwnd,
+        null,
+        0,
+        0,
+        width,
+        height,
+        win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOMOVE,
+    );
+}
+
+/// For tests: a mouse message's lParam for the client point `x`, `y`.
+fn testPoint(x: i32, y: i32) win32.LPARAM {
+    const xy: u32 = @as(u32, @as(u16, @bitCast(@as(i16, @intCast(x))))) |
+        (@as(u32, @as(u16, @bitCast(@as(i16, @intCast(y))))) << 16);
+    return @bitCast(@as(usize, xy));
+}
+
+/// For tests: a mouse message's lParam for the middle of `r`.
+fn testMid(r: win32.RECT) win32.LPARAM {
+    return testPoint(@divTrunc(r.left + r.right, 2), @divTrunc(r.top + r.bottom, 2));
+}
+
+/// For tests: WM_MOUSEWHEEL's wParam for a turn of `delta`.
+fn testWheel(delta: i16) win32.WPARAM {
+    return @as(win32.WPARAM, @as(u16, @bitCast(delta))) << 16;
+}
+
+/// For tests: the layout of `window`'s bar now, as its window procedure
+/// works it out.
+fn testBarLayout(window: *Window) TabBar.Layout {
+    const bar = window.bar.hwnd.?;
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(bar, &client).toBool()) client.right = 0;
+    return .init(.init(Window.dpiOf(window.app, bar)), window.tabs.items.len, client.right, window.bar.scroll);
+}
+
+/// For tests: run the teardowns posted so far.
+fn testTeardowns() void {
+    var msg: win32.MSG = undefined;
+    while (win32.PeekMessageW(&msg, null, WM_GHOSTTY_DESTROY, WM_GHOSTTY_DESTROY, win32.PM_REMOVE).toBool()) {
+        _ = win32.DispatchMessageW(&msg);
+    }
 }
 
 test "win32: close_tab closes the window, its one tab" {

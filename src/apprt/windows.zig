@@ -51,8 +51,8 @@
 //!
 //! ## What is still missing
 //!
-//! Not implemented: a tab bar (tabs come and go by their key bindings),
-//! the tab overview, dragging the dividers between splits, a context menu,
+//! Not implemented: the tab overview, dragging tabs, dragging the dividers
+//! between splits, a context menu,
 //! link previews and precision-touchpad scrolling. Without a menu, a
 //! right click with the default `right-click-action` only selects the word
 //! or link under the pointer.
@@ -150,6 +150,7 @@ test {
     _ = @import("windows/App.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
+    _ = @import("windows/TabBar.zig");
     _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/desktop_notifications.zig");

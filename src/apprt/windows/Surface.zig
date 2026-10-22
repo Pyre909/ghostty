@@ -1282,6 +1282,12 @@ pub const Surface = struct {
         if (self.title) |old| alloc.free(old);
         self.title = copy;
 
+        // A tab's label shows its focused terminal's title, unless the tab
+        // has one of its own; any other title changes no label, as on GTK,
+        // whose tab binds only its active surface's title.
+        if (self.window.tabOf(self)) |t| {
+            if (t.focused == self and t.title_override == null) self.window.bar.invalidate();
+        }
         if (self.window.tab().focused != self) return true;
         return self.window.showTitle(Window.tabTitle(self.window.tab()));
     }

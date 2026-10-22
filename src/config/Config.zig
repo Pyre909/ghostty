@@ -2349,7 +2349,9 @@ keybind: Keybinds = .{},
 ///    Never show the tab bar. Tabs are only accessible via the tab
 ///    overview or by keybind actions.
 ///
-/// Currently only supported on Linux (GTK).
+/// Currently only supported on Linux (GTK) and Windows. On Windows the tab
+/// bar is not shown while the window is fullscreen, and there is no tab
+/// overview, so with `never` tabs are reached only by keybind actions.
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
 /// Background color for the window titlebar. This only takes effect if

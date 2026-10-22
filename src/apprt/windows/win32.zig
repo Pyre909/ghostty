@@ -27,7 +27,7 @@ pub const WCHAR = w.WCHAR;
 pub const LPCWSTR = w.LPCWSTR;
 pub const HANDLE = w.HANDLE;
 pub const HWND = w.HWND;
-const HDC = w.HDC;
+pub const HDC = w.HDC;
 pub const HINSTANCE = w.HINSTANCE;
 pub const HMODULE = w.HMODULE;
 const HICON = w.HICON;
@@ -100,6 +100,10 @@ pub const WNDCLASSEXW = extern struct {
     lpszClassName: LPCWSTR,
     hIconSm: ?HICON,
 };
+/// WNDCLASSEXW.style: the class's windows get a double-click message in
+/// place of the second press of a quick second click, for every button:
+/// WM_LBUTTONDBLCLK, WM_MBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_XBUTTONDBLCLK.
+pub const CS_DBLCLKS: UINT = 0x0008;
 
 pub const CREATESTRUCTW = extern struct {
     lpCreateParams: ?*anyopaque,
@@ -187,16 +191,23 @@ pub const WM_TIMER: UINT = 0x0113;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
 pub const WM_LBUTTONUP: UINT = 0x0202;
+/// Only for a window whose class has CS_DBLCLKS: the second press of a
+/// double click, in place of its WM_LBUTTONDOWN.
+pub const WM_LBUTTONDBLCLK: UINT = 0x0203;
 pub const WM_RBUTTONDOWN: UINT = 0x0204;
 pub const WM_RBUTTONUP: UINT = 0x0205;
 pub const WM_MBUTTONDOWN: UINT = 0x0207;
 pub const WM_MBUTTONUP: UINT = 0x0208;
+/// As WM_LBUTTONDBLCLK, for the middle button.
+pub const WM_MBUTTONDBLCLK: UINT = 0x0209;
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_XBUTTONDOWN: UINT = 0x020B;
 pub const WM_XBUTTONUP: UINT = 0x020C;
 pub const WM_MOUSEHWHEEL: UINT = 0x020E;
 pub const WM_ENTERMENULOOP: UINT = 0x0211;
 pub const WM_EXITMENULOOP: UINT = 0x0212;
+/// Sent to the window losing the mouse capture, whatever took it.
+pub const WM_CAPTURECHANGED: UINT = 0x0215;
 pub const WM_ENTERSIZEMOVE: UINT = 0x0231;
 pub const WM_EXITSIZEMOVE: UINT = 0x0232;
 pub const WM_MOUSELEAVE: UINT = 0x02A3;
@@ -231,6 +242,11 @@ pub const WHEEL_DELTA: i32 = 120;
 pub const SPI_GETWHEELSCROLLLINES: UINT = 0x0068;
 pub const SPI_GETWHEELSCROLLCHARS: UINT = 0x006C;
 pub const WHEEL_PAGESCROLL: UINT = std.math.maxInt(UINT);
+/// SystemParametersInfoW: read the fonts and sizes of the non-client
+/// area (NONCLIENTMETRICSW), at the system DPI; WM_SETTINGCHANGE's wParam
+/// once they change.
+pub const SPI_GETNONCLIENTMETRICS: UINT = 0x0029;
+pub const SPI_SETNONCLIENTMETRICS: UINT = 0x002A;
 pub const TME_LEAVE: DWORD = 0x00000002;
 /// The client-area hit-test code (WM_NCHITTEST), which is the low word
 /// of WM_MOUSEACTIVATE's and WM_SETCURSOR's lParam.
@@ -857,8 +873,117 @@ pub extern "user32" fn FillRect(hdc: HDC, rect: *const RECT, brush: HBRUSH) call
 pub const COLORREF = w.COLORREF;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createsolidbrush
 pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUSH;
+/// A brush, font, bitmap or other GDI object.
+pub const HGDIOBJ = *anyopaque;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
-pub extern "gdi32" fn DeleteObject(object: HBRUSH) callconv(.winapi) BOOL;
+pub extern "gdi32" fn DeleteObject(object: HGDIOBJ) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-selectobject
+pub extern "gdi32" fn SelectObject(hdc: HDC, object: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createcompatibledc
+pub extern "gdi32" fn CreateCompatibleDC(hdc: ?HDC) callconv(.winapi) ?HDC;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createcompatiblebitmap
+pub extern "gdi32" fn CreateCompatibleBitmap(hdc: HDC, width: c_int, height: c_int) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deletedc
+pub extern "gdi32" fn DeleteDC(hdc: HDC) callconv(.winapi) BOOL;
+pub const SRCCOPY: DWORD = 0x00CC0020;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-bitblt
+pub extern "gdi32" fn BitBlt(
+    dest: HDC,
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+    src: HDC,
+    src_x: c_int,
+    src_y: c_int,
+    rop: DWORD,
+) callconv(.winapi) BOOL;
+pub const TRANSPARENT: c_int = 1;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbkmode
+pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: c_int) callconv(.winapi) c_int;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-settextcolor
+pub extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
+pub const DT_CENTER: UINT = 0x0001;
+pub const DT_VCENTER: UINT = 0x0004;
+pub const DT_SINGLELINE: UINT = 0x0020;
+pub const DT_NOPREFIX: UINT = 0x0800;
+pub const DT_END_ELLIPSIS: UINT = 0x8000;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-drawtextw
+pub extern "user32" fn DrawTextW(hdc: HDC, text: [*]const u16, len: c_int, rect: *RECT, format: UINT) callconv(.winapi) c_int;
+pub const FW_NORMAL: c_int = 400;
+pub const DEFAULT_CHARSET: DWORD = 1;
+pub const OUT_DEFAULT_PRECIS: DWORD = 0;
+pub const CLIP_DEFAULT_PRECIS: DWORD = 0;
+pub const CLEARTYPE_QUALITY: DWORD = 5;
+pub const DEFAULT_PITCH: DWORD = 0;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createfontw
+pub extern "gdi32" fn CreateFontW(
+    height: c_int,
+    width: c_int,
+    escapement: c_int,
+    orientation: c_int,
+    weight: c_int,
+    italic: DWORD,
+    underline: DWORD,
+    strike_out: DWORD,
+    charset: DWORD,
+    out_precision: DWORD,
+    clip_precision: DWORD,
+    quality: DWORD,
+    pitch_and_family: DWORD,
+    face: LPCWSTR,
+) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-logfontw
+pub const LOGFONTW = extern struct {
+    lfHeight: LONG,
+    lfWidth: LONG,
+    lfEscapement: LONG,
+    lfOrientation: LONG,
+    lfWeight: LONG,
+    lfItalic: u8,
+    lfUnderline: u8,
+    lfStrikeOut: u8,
+    lfCharSet: u8,
+    lfOutPrecision: u8,
+    lfClipPrecision: u8,
+    lfQuality: u8,
+    lfPitchAndFamily: u8,
+    lfFaceName: [32]u16,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-nonclientmetricsw
+/// With iPaddedBorderWidth, which Windows Vista added.
+pub const NONCLIENTMETRICSW = extern struct {
+    cbSize: UINT,
+    iBorderWidth: c_int,
+    iScrollWidth: c_int,
+    iScrollHeight: c_int,
+    iCaptionWidth: c_int,
+    iCaptionHeight: c_int,
+    lfCaptionFont: LOGFONTW,
+    iSmCaptionWidth: c_int,
+    iSmCaptionHeight: c_int,
+    lfSmCaptionFont: LOGFONTW,
+    iMenuWidth: c_int,
+    iMenuHeight: c_int,
+    lfMenuFont: LOGFONTW,
+    lfStatusFont: LOGFONTW,
+    lfMessageFont: LOGFONTW,
+    iPaddedBorderWidth: c_int,
+};
+comptime {
+    // The sizes of the SDK's structs, which SystemParametersInfoW checks
+    // against cbSize.
+    std.debug.assert(@sizeOf(LOGFONTW) == 92);
+    std.debug.assert(@sizeOf(NONCLIENTMETRICSW) == 504);
+}
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createfontindirectw
+pub extern "gdi32" fn CreateFontIndirectW(font: *const LOGFONTW) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getobjectw
+pub extern "gdi32" fn GetObjectW(object: HGDIOBJ, size: c_int, out: ?*anyopaque) callconv(.winapi) c_int;
+/// GetDeviceCaps index for vertical DPI.
+pub const LOGPIXELSY: c_int = 90;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getupdaterect
+pub extern "user32" fn GetUpdateRect(hwnd: HWND, rect: ?*RECT, erase: BOOL) callconv(.winapi) BOOL;
 
 /// The RGB macro of wingdi.h.
 pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
