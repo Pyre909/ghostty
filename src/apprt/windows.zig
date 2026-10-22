@@ -150,8 +150,10 @@ test {
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
+    _ = @import("windows/desktop_notifications.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/key.zig");
     _ = @import("windows/taskbar.zig");
+    _ = @import("windows/toast.zig");
     _ = @import("windows/win32.zig");
 }

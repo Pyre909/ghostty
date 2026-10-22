@@ -18,6 +18,7 @@ const App = @import("App.zig").App;
 const postTeardown = @import("App.zig").postTeardown;
 const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
+const DesktopNotifications = @import("desktop_notifications.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -131,6 +132,9 @@ pub const Surface = struct {
     /// When `progress` lapses with no newer report, in GetTickCount64's
     /// milliseconds (`progressTimer`).
     progress_expires: u64,
+
+    /// The terminal's toasts (`notify`).
+    notifications: DesktopNotifications,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -620,6 +624,7 @@ pub const Surface = struct {
             .mouse = .init(),
             .progress = .{},
             .progress_expires = 0,
+            .notifications = .{},
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -668,6 +673,7 @@ pub const Surface = struct {
         // Nothing below can fail, so the core surface needs no errdefer.
         errdefer comptime unreachable;
         self.core_state = .live;
+        self.notifications.id = self.core_surface.id;
 
         // An inherited font size is applied after init, as the macOS
         // runtime does, so that `reset_font_size` still goes back to the
@@ -735,6 +741,7 @@ pub const Surface = struct {
         if (self.title) |v| self.app.core_app.alloc.free(v);
         self.title = null;
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
+        self.notifications.deinit(self.app.core_app.alloc);
     }
 
     /// Stop the core surface and destroy its window. The last terminal in a
@@ -1223,6 +1230,29 @@ pub const Surface = struct {
         self.reportProgress(.{ .state = .remove });
     }
 
+    /// `.desktop_notification`: a toast for this terminal, with its title in
+    /// a smaller line, as macOS shows it, which a click brings forward
+    /// (`App.notificationClicked`), and which goes as macOS and GTK remove
+    /// it (`DesktopNotifications`). False if it could not be shown.
+    pub fn notify(self: *Surface, title: []const u8, body: []const u8) bool {
+        const notifier = self.app.notifierFor() orelse return false;
+        return self.notifications.send(
+            self.app.core_app.alloc,
+            notifier,
+            self.hwnd,
+            .{ .title = title, .body = body, .attribution = self.title },
+            self.app.nextToastTag(),
+            self.focused,
+            win32.GetTickCount64(),
+        );
+    }
+
+    /// Remove the terminal's toasts, shown or kept in the notification
+    /// center: when it gains the focus or closes, as macOS and GTK do.
+    pub fn clearNotifications(self: *Surface) void {
+        self.notifications.clear(self.app.notifier, self.hwnd);
+    }
+
     /// Remember the title for `getTitle`, and show it as the window's
     /// caption if this is its focused terminal: a window is titled after
     /// its focused terminal (`Window.setFocused`), so another terminal's
@@ -1379,14 +1409,24 @@ pub const Surface = struct {
                 return 0;
             },
 
-            win32.WM_TIMER => if (wparam == progress_timer_id) {
-                self.progressTimer();
-                return 0;
+            win32.WM_TIMER => switch (wparam) {
+                progress_timer_id => {
+                    self.progressTimer();
+                    return 0;
+                },
+                DesktopNotifications.timer_id => {
+                    self.notifications.expire(self.app.notifier, self.hwnd, win32.GetTickCount64());
+                    return 0;
+                },
+                else => {},
             },
 
             win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
                 self.focused = msg == win32.WM_SETFOCUS;
-                if (self.focused) self.window.setFocused(self);
+                if (self.focused) {
+                    self.window.setFocused(self);
+                    self.clearNotifications();
+                }
 
                 if (!self.focused) {
                     // A drag does not survive losing focus (Alt+Tab, a

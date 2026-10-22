@@ -720,7 +720,10 @@ pub fn add(
 /// Zig auto-links the import library named by an `extern "user32"`-style
 /// declaration on Windows targets, so these are redundant; they are spelled
 /// out so the system libraries the runtime and its renderer import are
-/// listed in one place (kernel32 aside, which every Windows binary links).
+/// listed in one place (kernel32 aside, which every Windows binary links,
+/// and the Windows Runtime's API sets, which mingw has and the Windows SDK
+/// does not: their declarations alone link them, on either ABI,
+/// src/apprt/windows/win32.zig).
 ///
 /// Note that this deliberately does NOT take the `glad_egl.c` +
 /// `linkSystemLibrary("egl")` path above: there is no libEGL on Windows,

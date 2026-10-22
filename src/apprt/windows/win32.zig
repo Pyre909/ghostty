@@ -645,6 +645,67 @@ pub extern "advapi32" fn RegGetValueW(
     size: ?*DWORD,
 ) callconv(.winapi) LONG;
 
+pub const REG_SZ: DWORD = 1;
+pub const REG_OPTION_NON_VOLATILE: DWORD = 0;
+pub const KEY_SET_VALUE: DWORD = 0x0002;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
+pub extern "advapi32" fn RegCreateKeyExW(
+    key: HKEY,
+    subkey: LPCWSTR,
+    reserved: DWORD,
+    class: ?LPCWSTR,
+    options: DWORD,
+    sam: DWORD,
+    security: ?*anyopaque,
+    result: *HKEY,
+    disposition: ?*DWORD,
+) callconv(.winapi) LONG;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regsetvalueexw
+pub extern "advapi32" fn RegSetValueExW(
+    key: HKEY,
+    name: ?LPCWSTR,
+    reserved: DWORD,
+    value_type: DWORD,
+    data: [*]const u8,
+    size: DWORD,
+) callconv(.winapi) LONG;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletevaluew
+pub extern "advapi32" fn RegDeleteValueW(key: HKEY, name: ?LPCWSTR) callconv(.winapi) LONG;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regclosekey
+pub extern "advapi32" fn RegCloseKey(key: HKEY) callconv(.winapi) LONG;
+
+// COM, shared by the runtime's own interfaces (taskbar.zig, toast.zig).
+pub const S_OK: HRESULT = internal_os.windows.S_OK;
+pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
+pub const IID_IUnknown: w.GUID = w.GUID.parse("{00000000-0000-0000-c000-000000000046}");
+/// An object that may be called on any thread, with no marshaling.
+pub const IID_IAgileObject: w.GUID = w.GUID.parse("{94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90}");
+
+// Windows Runtime. Both import libraries are API sets, which Windows
+// resolves to combase.dll: mingw has them, the Windows SDK does not, so
+// they are linked only through these declarations
+// (src/build/SharedDeps.zig).
+pub const HSTRING = ?*opaque {};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winstring/nf-winstring-windowscreatestring
+pub extern "api-ms-win-core-winrt-string-l1-1-0" fn WindowsCreateString(
+    source: ?[*]const u16,
+    length: u32,
+    string: *HSTRING,
+) callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winstring/nf-winstring-windowsdeletestring
+pub extern "api-ms-win-core-winrt-string-l1-1-0" fn WindowsDeleteString(string: HSTRING) callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/roapi/nf-roapi-rogetactivationfactory
+pub extern "api-ms-win-core-winrt-l1-1-0" fn RoGetActivationFactory(
+    class: HSTRING,
+    iid: *const w.GUID,
+    factory: *?*anyopaque,
+) callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/roapi/nf-roapi-roactivateinstance
+pub extern "api-ms-win-core-winrt-l1-1-0" fn RoActivateInstance(
+    class: HSTRING,
+    instance: *?*anyopaque,
+) callconv(.winapi) HRESULT;
+
 // IMM32. Both forms are in client coordinates of the context's window.
 pub const HIMC = *opaque {};
 pub const COMPOSITIONFORM = extern struct { dwStyle: DWORD, ptCurrentPos: POINT, rcArea: RECT };
@@ -751,6 +812,8 @@ pub extern "user32" fn ToUnicodeEx(
     flags: UINT,
     layout: ?HKL,
 ) callconv(.winapi) c_int;
+/// The shortest a timer runs; SetTimer takes any shorter time as this.
+pub const USER_TIMER_MINIMUM: UINT = 0x0000000A;
 pub extern "user32" fn SetTimer(
     hwnd: ?HWND,
     id: UINT_PTR,

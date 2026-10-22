@@ -16,6 +16,7 @@ const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
+const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
@@ -42,6 +43,11 @@ pub const WM_GHOSTTY_DESTROY: win32.UINT = win32.WM_APP + 2;
 /// Posted to a surface window by `App.openUrl` for a refused OSC 8 link.
 /// Its handler shows the notice; `App.openUrl` says why it is posted.
 pub const WM_GHOSTTY_LINK_REFUSED: win32.UINT = win32.WM_APP + 3;
+
+/// Posted to the message-only window by a toast's click handler
+/// (`toast.Activated`) from a thread of Windows', with the id of the
+/// terminal the toast is for (`notificationClicked`).
+pub const WM_GHOSTTY_NOTIFICATION: win32.UINT = win32.WM_APP + 4;
 
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
@@ -77,6 +83,24 @@ pub const App = struct {
     /// The taskbar buttons' progress bars, made when the first button
     /// exists (`taskbarList`); null before, or while it cannot be made.
     taskbar_list: ?*taskbar.ITaskbarList3,
+
+    /// The system's notifications, made for the first desktop notification
+    /// (`notifierFor`); null before, or when they could not be made.
+    toasts: ?*toast.Toasts,
+
+    /// What desktop notifications are shown through: `toasts`, or a
+    /// test's stand-in.
+    notifier: ?toast.Notifier,
+
+    /// Making `toasts` failed, logged once; it is not tried again.
+    toasts_failed: bool,
+
+    /// The tag of the last toast shown (`toast.Toast.tag`).
+    toast_tag: u64,
+
+    /// A toast's click that came where the focus could not move, for `run`
+    /// to make (`notificationMessage`); the latest wins.
+    pending_click: ?u64,
 
     /// `init` entered a single-threaded apartment on this thread, for
     /// `terminate` to leave.
@@ -404,6 +428,11 @@ pub const App = struct {
             .is_window_arranged = is_window_arranged,
             .taskbar_created = taskbar_created,
             .taskbar_list = null,
+            .toasts = null,
+            .notifier = null,
+            .toasts_failed = false,
+            .toast_tag = 0,
+            .pending_click = null,
             .com_initialized = com_hr >= 0,
             .system_scheme = systemColorScheme(),
             .reported_scheme = null,
@@ -482,6 +511,13 @@ pub const App = struct {
         self.config.deinit();
 
         if (self.taskbar_list) |list| list.release();
+        // Each terminal's toasts went with it (`surfaceDestroyed`). Not
+        // every toast of the app ID: another Ghostty process shows its own
+        // under it.
+        if (self.toasts) |t| {
+            t.deinit();
+            self.core_app.alloc.destroy(t);
+        }
         if (self.com_initialized) win32.CoUninitialize();
     }
 
@@ -584,6 +620,9 @@ pub const App = struct {
             // callback.
             self.createRequested();
             self.applyPendingFocus();
+
+            // And a toast's click a prompt or a teardown held back.
+            self.applyPendingClick();
 
             // And a change of color scheme: of the system's mode, which a
             // prompt may have held back, or of the configuration, which a
@@ -921,6 +960,7 @@ pub const App = struct {
             .goto_window => self.gotoWindow(target, value),
             .float_window => floatWindow(target, value),
             .progress_report => progressReport(target, value),
+            .desktop_notification => self.desktopNotification(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1570,6 +1610,94 @@ pub const App = struct {
         return true;
     }
 
+    /// The system's notifications, made the first time one is shown, with
+    /// Ghostty's app ID registered for them (`toast.register`); null,
+    /// logged once, if they cannot be.
+    pub fn notifierFor(self: *App) ?toast.Notifier {
+        if (self.notifier) |notifier| return notifier;
+        if (self.toasts_failed) return null;
+        const t = self.makeToasts() catch |err| {
+            log.warn("desktop notifications are unavailable err={}", .{err});
+            self.toasts_failed = true;
+            return null;
+        };
+        self.toasts = t;
+        self.notifier = t.notifierOf();
+        return self.notifier;
+    }
+
+    fn makeToasts(self: *App) !*toast.Toasts {
+        var buf: [1024]u8 = undefined;
+        const icon = if (global.resourcesDir().app()) |resources| toast.iconPath(&buf, resources) else null;
+        try toast.register(toast.app_id, toast.app_name, icon);
+
+        const alloc = self.core_app.alloc;
+        const t = try alloc.create(toast.Toasts);
+        errdefer alloc.destroy(t);
+        t.* = try toast.Toasts.init(alloc, toast.app_id, self.msg_hwnd, WM_GHOSTTY_NOTIFICATION);
+        return t;
+    }
+
+    /// The tag of a new toast, unique to the process (`toast.Toast.tag`).
+    pub fn nextToastTag(self: *App) u64 {
+        self.toast_tag += 1;
+        return self.toast_tag;
+    }
+
+    /// `.desktop_notification`: a toast (`Surface.notify`). The app's own,
+    /// which the core does not send, goes back to no terminal.
+    fn desktopNotification(self: *App, target: apprt.Target, value: apprt.action.DesktopNotification) bool {
+        return switch (target) {
+            .app => app: {
+                const notifier = self.notifierFor() orelse break :app false;
+                break :app notifier.show(.{
+                    .title = value.title,
+                    .body = value.body,
+                    .group = 0,
+                    .tag = self.nextToastTag(),
+                });
+            },
+            .surface => |v| v.rt_surface.notify(value.title, value.body),
+        };
+    }
+
+    /// WM_GHOSTTY_NOTIFICATION, a toast's click, made at once where the
+    /// focus may move, or else kept for `run` (`pending_click`): a prompt's
+    /// or a teardown's message loop dispatches it too, with a core frame or
+    /// a teardown beneath. Dropped while quitting.
+    fn notificationMessage(self: *App, group: u64) void {
+        if (self.terminating) return;
+        if (!self.canReenterCore() or self.teardown_depth > 0) {
+            self.pending_click = group;
+            return;
+        }
+        self.notificationClicked(group);
+    }
+
+    /// The click `notificationMessage` kept, if any. Called by `run`.
+    fn applyPendingClick(self: *App) void {
+        const group = self.pending_click orelse return;
+        self.pending_click = null;
+        self.notificationClicked(group);
+    }
+
+    /// A toast was clicked (`toast.Activated`): its terminal, if it is still
+    /// there and neither it nor its window is closing, is brought forward
+    /// with the focus, as GTK's present-surface and macOS bring it, ending
+    /// a zoom that hides it (`Window.focusFromGoto`). The terminals may be
+    /// laid out again, so never inside a core frame (`notificationMessage`).
+    fn notificationClicked(self: *App, group: u64) void {
+        log.debug("toast clicked group={d}", .{group});
+        if (group == 0) return;
+        for (self.surfaces.items) |surface| {
+            if (surface.notifications.id != group) continue;
+            if (surface.closing or surface.window.closing) return;
+            surface.window.focusFromGoto(surface);
+            _ = Window.present(surface.window.hwnd);
+            return;
+        }
+    }
+
     /// `.progress_report`: on the taskbar button of the terminal's window
     /// (`Surface.reportProgress`). Made at once: nothing is laid out and no
     /// focus moves.
@@ -1890,6 +2018,8 @@ pub const App = struct {
         _ = win32.SetWindowLongPtrW(surface.hwnd, win32.GWLP_USERDATA, 0);
 
         _ = self.surfaces.swapRemove(idx);
+        // As on macOS and GTK, a terminal's toasts go with it.
+        surface.clearNotifications();
         // Already moved off a terminal that closed on its own
         // (`Window.removePane`), and gone once the frame is destroyed
         // (its WM_DESTROY); this only keeps it from ever dangling.
@@ -1949,6 +2079,11 @@ pub const App = struct {
             // guards against the one exception, a prompt beneath the loop.
             WM_GHOSTTY_WAKEUP => {
                 if (self.modal_loop_depth > 0) self.tickFromHandler();
+                return 0;
+            },
+
+            WM_GHOSTTY_NOTIFICATION => {
+                self.notificationMessage(toast.messageGroup(wparam, lparam));
                 return 0;
             },
 
@@ -2655,6 +2790,11 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.is_window_arranged = null;
     app.taskbar_created = 0;
     app.taskbar_list = null;
+    app.toasts = null;
+    app.notifier = null;
+    app.toasts_failed = false;
+    app.toast_tag = 0;
+    app.pending_click = null;
     app.com_initialized = false;
     app.system_scheme = .light;
     app.reported_scheme = null;
@@ -2737,6 +2877,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.mouse = .init();
     surface.progress = .{};
     surface.progress_expires = 0;
+    surface.notifications = .{ .id = @intFromPtr(surface) };
     surface.preedit = .none;
     _ = win32.CreateWindowExW(
         0,
@@ -4840,6 +4981,138 @@ test "win32: progress_report shows the focused terminal's progress on the taskba
     app.config.@"progress-style" = false;
     try report(&app, left, .{ .state = .set, .progress = 50 });
     try std.testing.expectEqual(.none, fake.state);
+}
+
+test "win32: desktop_notification shows a toast for its terminal, which a click goes back to" {
+    // As on macOS and GTK: a toast is in its terminal's group, which goes
+    // when the terminal gains the focus or closes, and one shown while it
+    // has the focus goes after three seconds (DesktopNotifications); a
+    // click brings its terminal forward with the focus.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var fake: toast.TestNotifier = .{};
+    app.notifier = fake.notifier();
+
+    const window = try testFrame(&app);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ left, right });
+    _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(left.setTitle("vim"));
+    const notify = struct {
+        fn f(a: *App, pane: *Surface, title: [:0]const u8) !void {
+            try std.testing.expect(try a.performAction(
+                .{ .surface = &pane.core_surface },
+                .desktop_notification,
+                .{ .title = title, .body = "done" },
+            ));
+        }
+    }.f;
+
+    // For a terminal without the focus: in its group, with no title of
+    // its own to show under it, kept.
+    try notify(&app, right, "build");
+    try std.testing.expectEqual(1, fake.shown_len);
+    try std.testing.expectEqual(right.notifications.id, fake.shown[0].group);
+    try std.testing.expectEqual(null, fake.shown[0].attribution);
+    try std.testing.expectEqual(0, right.notifications.expiring.items.len);
+
+    // For the focused one: its title under it, and removed once three
+    // seconds have passed, not at a WM_TIMER that comes before.
+    try notify(&app, left, "test");
+    try std.testing.expectEqual(left.notifications.id, fake.shown[1].group);
+    try std.testing.expectEqualStrings("vim", fake.shown[1].attribution orelse "");
+    try std.testing.expect(fake.shown[1].tag != fake.shown[0].tag);
+    const timer = @import("desktop_notifications.zig").timer_id;
+    _ = Surface.wndProc(left.hwnd, win32.WM_TIMER, timer, 0);
+    try std.testing.expectEqual(0, fake.removed_len);
+    try std.testing.expectEqual(1, left.notifications.expiring.items.len);
+    left.notifications.expiring.items[0].at = 0;
+    _ = Surface.wndProc(left.hwnd, win32.WM_TIMER, timer, 0);
+    try std.testing.expectEqual(1, fake.removed_len);
+    try std.testing.expectEqual([2]u64{ left.notifications.id, fake.shown[1].tag }, fake.removed[0]);
+
+    // Gaining the focus removes a terminal's, once.
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqual(1, fake.removed_groups_len);
+    try std.testing.expectEqual(right.notifications.id, fake.removed_groups[0]);
+
+    // A click on the first one's, as Windows reports it: the handler posts
+    // it to the app's window, whose procedure gives that terminal the focus
+    // and brings its frame to the front, shown as a real one is. One for a
+    // terminal that is gone changes nothing.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    const handler = try toast.Activated.create(app.msg_hwnd, WM_GHOSTTY_NOTIFICATION, left.notifications.id);
+    _ = handler.vtable.Invoke(handler, null, null);
+    _ = handler.vtable.Release(handler);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        app.msg_hwnd,
+        WM_GHOSTTY_NOTIFICATION,
+        WM_GHOSTTY_NOTIFICATION,
+        win32.PM_REMOVE,
+    ).toBool());
+    _ = App.wndProc(app.msg_hwnd, msg.message, msg.wParam, msg.lParam);
+    try std.testing.expectEqual(left, window.focused.?);
+    const click = struct {
+        fn f(a: *App, group: u64) void {
+            const m = toast.groupMessage(group);
+            _ = App.wndProc(a.msg_hwnd, WM_GHOSTTY_NOTIFICATION, m[0], m[1]);
+        }
+    }.f;
+    click(&app, 12345);
+    try std.testing.expectEqual(left, window.focused.?);
+
+    // Not for a terminal that is closing, nor one in a window closing,
+    // nor while the app quits.
+    right.closing = true;
+    click(&app, right.notifications.id);
+    try std.testing.expectEqual(left, window.focused.?);
+    right.closing = false;
+    window.closing = true;
+    click(&app, right.notifications.id);
+    try std.testing.expectEqual(left, window.focused.?);
+    window.closing = false;
+    app.terminating = true;
+    click(&app, right.notifications.id);
+    try std.testing.expectEqual(left, window.focused.?);
+    app.terminating = false;
+
+    // Under a prompt, where the focus may not move, `run` makes it later.
+    app.prompt_depth = 1;
+    click(&app, right.notifications.id);
+    try std.testing.expectEqual(left, window.focused.?);
+    app.prompt_depth = 0;
+    app.applyPendingClick();
+    try std.testing.expectEqual(right, window.focused.?);
+
+    // A zoom that hides the terminal ends first.
+    window.tree.zoom(window.tree.locate(right).?);
+    window.relayout();
+    click(&app, left.notifications.id);
+    try std.testing.expectEqual(left, window.focused.?);
+    try std.testing.expectEqual(null, window.tree.zoomed);
+
+    // Closing removes a terminal's.
+    try notify(&app, left, "again");
+    const removed = fake.removed_groups_len;
+    const left_id = left.notifications.id;
+    try std.testing.expect(left.destroy());
+    try std.testing.expectEqual(removed + 1, fake.removed_groups_len);
+    try std.testing.expectEqual(left_id, fake.removed_groups[removed]);
+
+    // The app's own: no terminal's group.
+    try std.testing.expect(try app.performAction(.app, .desktop_notification, .{ .title = "", .body = "app" }));
+    try std.testing.expectEqual(0, fake.shown[fake.shown_len - 1].group);
 }
 
 test "win32: float_window keeps a window on top, or puts it back" {
