@@ -2235,6 +2235,8 @@ test "win32: modal loops are counted per window and returned on destroy" {
 
     var app: App = undefined;
     app.modal_loop_depth = 0;
+    // Read by the frame's procedure before any other message.
+    app.taskbar_created = 0;
 
     var a: Window = undefined;
     var b: Window = undefined;
