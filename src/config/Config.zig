@@ -3915,6 +3915,9 @@ else
 /// If `true` (default), applications running in the terminal can show
 /// graphical progress bars using the ConEmu OSC 9;4 escape sequence.
 /// If `false`, progress bar sequences are silently ignored.
+///
+/// On Windows, the progress bar is shown on the window's taskbar button,
+/// for the terminal that has the focus in that window.
 @"progress-style": bool = true,
 
 /// Modifies the color used for bold text in the terminal.

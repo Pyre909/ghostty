@@ -113,6 +113,10 @@ decoration: ?configpkg.WindowDecoration,
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
 
+/// Explorer said the frame's taskbar button exists (`App.taskbar_created`),
+/// which ITaskbarList3 asks to wait for (`showProgress`).
+taskbar_button: bool,
+
 /// Disabled by `App.beginPrompt` for a prompt in another window, for
 /// `App.endPrompt` to enable again.
 prompt_disabled: bool,
@@ -136,6 +140,7 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .fullscreen = null,
         .decoration = null,
         .modal_loops = .{},
+        .taskbar_button = false,
         .prompt_disabled = false,
         .closing = false,
         .destroy_deferred = false,
@@ -200,6 +205,11 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
         return App.Error.Win32WindowCreationFailed;
     };
     self.applyDecorations();
+    // Explorer runs at medium integrity, so an elevated Ghostty would not
+    // hear of its button otherwise.
+    if (self.app.taskbar_created != 0) {
+        _ = win32.ChangeWindowMessageFilterEx(hwnd, self.app.taskbar_created, win32.MSGFLT_ALLOW, null);
+    }
     return hwnd;
 }
 
@@ -271,6 +281,15 @@ fn handleMessage(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) win32.LRESULT {
+    // Registered at startup, so not a constant the switch could take: the
+    // button exists now, or again after Explorer restarted.
+    if (msg == self.app.taskbar_created and msg != 0) {
+        self.taskbar_button = true;
+        _ = self.app.taskbarList();
+        self.showProgress();
+        return 0;
+    }
+
     switch (msg) {
         // The title bar button, Alt+F4 when no binding consumed it, and the
         // window menu's Close.
@@ -793,6 +812,17 @@ pub fn giveFocus(self: *Window, surface: *Surface) void {
 pub fn setFocused(self: *Window, surface: *Surface) void {
     self.focused = surface;
     _ = self.showTitle(surface.title);
+    self.showProgress();
+}
+
+/// Show the focused terminal's progress on the window's taskbar button, as
+/// Windows Terminal shows its focused pane's; nothing before the button
+/// exists (`taskbar_button`).
+pub fn showProgress(self: *Window) void {
+    if (!self.taskbar_button) return;
+    const list = self.app.taskbar_list orelse return;
+    const surface = self.focused orelse return;
+    list.show(self.hwnd, surface.progress);
 }
 
 /// Show `title`, the focused terminal's, as the window's caption, or

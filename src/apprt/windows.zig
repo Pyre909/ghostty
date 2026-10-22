@@ -152,5 +152,6 @@ test {
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/key.zig");
+    _ = @import("windows/taskbar.zig");
     _ = @import("windows/win32.zig");
 }

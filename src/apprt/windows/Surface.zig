@@ -17,6 +17,7 @@ const WM_GHOSTTY_LINK_REFUSED = @import("App.zig").WM_GHOSTTY_LINK_REFUSED;
 const App = @import("App.zig").App;
 const postTeardown = @import("App.zig").postTeardown;
 const Window = @import("Window.zig");
+const taskbar = @import("taskbar.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -37,6 +38,13 @@ const confirm = @import("dialog.zig").confirm;
 const notice = @import("dialog.zig").notice;
 
 const log = std.log.scoped(.win32);
+
+/// The WM_TIMER that removes a progress report no newer one followed
+/// (`reportProgress`).
+pub const progress_timer_id: win32.UINT_PTR = 1;
+
+/// How long a progress report shows with no newer one: GTK's 15 seconds.
+const progress_timeout_ms: u32 = 15 * std.time.ms_per_s;
 
 pub const Surface = struct {
     app: *App,
@@ -114,6 +122,15 @@ pub const Surface = struct {
 
     /// Mouse state, and what the core is still owed. See `Mouse`.
     mouse: Mouse,
+
+    /// The progress the terminal's program last reported (OSC 9;4), shown
+    /// on its window's taskbar button while it has the window's focus
+    /// (`reportProgress`, `Window.showProgress`).
+    progress: taskbar.Progress,
+
+    /// When `progress` lapses with no newer report, in GetTickCount64's
+    /// milliseconds (`progressTimer`).
+    progress_expires: u64,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -601,6 +618,8 @@ pub const Surface = struct {
             .shift = .{},
             .focused = false,
             .mouse = .init(),
+            .progress = .{},
+            .progress_expires = 0,
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -1172,6 +1191,38 @@ pub const Surface = struct {
     // Win32 message handling
     // ---------------------------------------------------------------------
 
+    /// `.progress_report`: take the program's report, and show it on the
+    /// window's taskbar button if this terminal has the window's focus. As
+    /// on GTK, a report with no newer one lapses after 15 seconds, for a
+    /// program that stalls or exits without removing it, and with
+    /// `progress-style = false` a report removes what was shown instead.
+    pub fn reportProgress(self: *Surface, report: terminal.osc.Command.ProgressReport) void {
+        if (self.app.config.@"progress-style") {
+            self.progress.update(report);
+        } else {
+            self.progress.update(.{ .state = .remove });
+        }
+
+        if (self.progress.state == .none) {
+            _ = win32.KillTimer(self.hwnd, progress_timer_id);
+        } else {
+            self.progress_expires = win32.GetTickCount64() + progress_timeout_ms;
+            // Replaces the timer a previous report set.
+            if (win32.SetTimer(self.hwnd, progress_timer_id, progress_timeout_ms, null) == 0) {
+                log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
+            }
+        }
+        if (self.window.focused == self) self.window.showProgress();
+    }
+
+    /// The progress timer's WM_TIMER. One already queued can arrive after
+    /// a newer report set the timer again, so only progress that has
+    /// lapsed is removed.
+    fn progressTimer(self: *Surface) void {
+        if (win32.GetTickCount64() < self.progress_expires) return;
+        self.reportProgress(.{ .state = .remove });
+    }
+
     /// Remember the title for `getTitle`, and show it as the window's
     /// caption if this is its focused terminal: a window is titled after
     /// its focused terminal (`Window.setFocused`), so another terminal's
@@ -1325,6 +1376,11 @@ pub const Surface = struct {
                     .resize => |size| core_surface.sizeCallback(size) catch |err|
                         log.warn("size callback failed err={}", .{err}),
                 }
+                return 0;
+            },
+
+            win32.WM_TIMER => if (wparam == progress_timer_id) {
+                self.progressTimer();
                 return 0;
             },
 

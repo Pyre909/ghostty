@@ -20,7 +20,7 @@ const w = std.os.windows;
 pub const BOOL = w.BOOL;
 pub const BYTE = w.BYTE;
 pub const DWORD = w.DWORD;
-const HRESULT = internal_os.windows.HRESULT;
+pub const HRESULT = internal_os.windows.HRESULT;
 pub const UINT = w.UINT;
 pub const LONG = w.LONG;
 pub const WCHAR = w.WCHAR;
@@ -358,6 +358,9 @@ pub const IsWindowArrangedFn = *const fn (hwnd: HWND) callconv(.winapi) BOOL;
 pub const GetLastError = internal_os.windows.GetLastError;
 pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
 pub const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
+/// Milliseconds since the system started.
+/// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64
+pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 pub extern "kernel32" fn GlobalAlloc(flags: UINT, bytes: usize) callconv(.winapi) ?HGLOBAL;
 pub extern "kernel32" fn GlobalFree(mem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
 pub extern "kernel32" fn GlobalLock(mem: HGLOBAL) callconv(.winapi) ?*anyopaque;
@@ -428,6 +431,19 @@ pub extern "user32" fn SendMessageW(
     lparam: LPARAM,
 ) callconv(.winapi) LRESULT;
 pub extern "user32" fn PostQuitMessage(code: c_int) callconv(.winapi) void;
+/// A message number for `name`, the same in every process; 0 on failure.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerwindowmessagew
+pub extern "user32" fn RegisterWindowMessageW(name: LPCWSTR) callconv(.winapi) UINT;
+pub const MSGFLT_ALLOW: DWORD = 1;
+/// Lets a message through to `hwnd` from a process of lower integrity, as
+/// one running elevated needs for Explorer's TaskbarButtonCreated.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-changewindowmessagefilterex
+pub extern "user32" fn ChangeWindowMessageFilterEx(
+    hwnd: HWND,
+    message: UINT,
+    action: DWORD,
+    change_filter: ?*anyopaque,
+) callconv(.winapi) BOOL;
 /// user32 exports the LONG_PTR forms only on 64-bit Windows. On 32-bit,
 /// winuser.h defines them as the LONG forms, which have the same
 /// signature there because LONG_PTR is LONG.
@@ -593,6 +609,15 @@ pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
 pub const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
 pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
 pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
+pub const CLSCTX_INPROC_SERVER: DWORD = 0x1;
+/// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cocreateinstance
+pub extern "ole32" fn CoCreateInstance(
+    clsid: *const w.GUID,
+    outer: ?*anyopaque,
+    context: DWORD,
+    iid: *const w.GUID,
+    out: *?*anyopaque,
+) callconv(.winapi) HRESULT;
 
 // DWM
 /// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute

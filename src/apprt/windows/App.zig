@@ -15,6 +15,7 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
+const taskbar = @import("taskbar.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
@@ -66,6 +67,20 @@ pub const App = struct {
     /// Windows 10 1903 and has no import library. Null means no window is
     /// known to be snapped (`Window.isRestored`).
     is_window_arranged: ?win32.IsWindowArrangedFn,
+
+    /// Explorer's TaskbarButtonCreated, registered at startup: sent to a
+    /// frame once its taskbar button exists, and again after Explorer
+    /// restarts (`Window.taskbar_button`). 0 if it could not be registered,
+    /// which leaves the taskbar alone.
+    taskbar_created: win32.UINT,
+
+    /// The taskbar buttons' progress bars, made when the first button
+    /// exists (`taskbarList`); null before, or while it cannot be made.
+    taskbar_list: ?*taskbar.ITaskbarList3,
+
+    /// `init` entered a single-threaded apartment on this thread, for
+    /// `terminate` to leave.
+    com_initialized: bool,
 
     /// Windows' light or dark mode for apps, read when the app starts and
     /// again when a frame hears that it changed (`systemSchemeChanged`).
@@ -353,6 +368,14 @@ pub const App = struct {
         };
         errdefer unregisterClasses(hinstance);
 
+        // The taskbar's object is of an apartment-threaded class, and this
+        // thread has the message loop such an apartment needs.
+        const com_hr = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED | win32.COINIT_DISABLE_OLE1DDE);
+        if (com_hr < 0) log.warn("CoInitializeEx failed hr=0x{x}", .{@as(u32, @bitCast(com_hr))});
+        errdefer if (com_hr >= 0) win32.CoUninitialize();
+        const taskbar_created = win32.RegisterWindowMessageW(L("TaskbarButtonCreated"));
+        if (taskbar_created == 0) log.warn("RegisterWindowMessageW failed err={}", .{win32.GetLastError()});
+
         const msg_hwnd = win32.CreateWindowExW(
             0,
             L(app_class_name),
@@ -379,6 +402,9 @@ pub const App = struct {
             .hinstance = hinstance,
             .get_dpi_for_window = get_dpi_for_window,
             .is_window_arranged = is_window_arranged,
+            .taskbar_created = taskbar_created,
+            .taskbar_list = null,
+            .com_initialized = com_hr >= 0,
             .system_scheme = systemColorScheme(),
             .reported_scheme = null,
             .msg_hwnd = msg_hwnd,
@@ -454,6 +480,19 @@ pub const App = struct {
         _ = win32.DestroyWindow(self.msg_hwnd);
         unregisterClasses(self.hinstance);
         self.config.deinit();
+
+        if (self.taskbar_list) |list| list.release();
+        if (self.com_initialized) win32.CoUninitialize();
+    }
+
+    /// The taskbar buttons' progress bars, made the first time a button
+    /// exists (`Window.taskbar_button`); null, logged, if they cannot be,
+    /// and tried again for the next button.
+    pub fn taskbarList(self: *App) ?*taskbar.ITaskbarList3 {
+        if (self.taskbar_list) |list| return list;
+        // Logged by `create`.
+        self.taskbar_list = taskbar.create() catch return null;
+        return self.taskbar_list;
     }
 
     /// The Win32 message loop.
@@ -881,6 +920,7 @@ pub const App = struct {
             .toggle_split_zoom => self.toggleSplitZoom(target),
             .goto_window => self.gotoWindow(target, value),
             .float_window => floatWindow(target, value),
+            .progress_report => progressReport(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1527,6 +1567,17 @@ pub const App = struct {
             log.warn("cannot copy the title to the clipboard err={}", .{err});
             return false;
         };
+        return true;
+    }
+
+    /// `.progress_report`: on the taskbar button of the terminal's window
+    /// (`Surface.reportProgress`). Made at once: nothing is laid out and no
+    /// focus moves.
+    fn progressReport(target: apprt.Target, value: terminal.osc.Command.ProgressReport) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |v| v.rt_surface.reportProgress(value),
+        }
         return true;
     }
 
@@ -2602,6 +2653,9 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.hinstance = @ptrCast(std.os.windows.peb().ImageBaseAddress);
     app.get_dpi_for_window = null;
     app.is_window_arranged = null;
+    app.taskbar_created = 0;
+    app.taskbar_list = null;
+    app.com_initialized = false;
     app.system_scheme = .light;
     app.reported_scheme = null;
     app.modal_loop_depth = 0;
@@ -2647,6 +2701,7 @@ fn testFrame(app: *App) !*Window {
         .fullscreen = null,
         .decoration = null,
         .modal_loops = .{},
+        .taskbar_button = false,
         .prompt_disabled = false,
         .closing = false,
         .destroy_deferred = false,
@@ -2680,6 +2735,8 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.destroy_deferred = false;
     surface.focused = false;
     surface.mouse = .init();
+    surface.progress = .{};
+    surface.progress_expires = 0;
     surface.preedit = .none;
     _ = win32.CreateWindowExW(
         0,
@@ -4618,6 +4675,171 @@ test "win32: a window without decorations maximizes to the work area" {
     // whole monitor, which such a frame's client area covers maximized
     // whether it is kept to the work area or not.
     if (std.meta.eql(work, info.rcMonitor)) return error.SkipZigTest;
+}
+
+/// For tests: a stand-in for the taskbar's object, which keeps what a
+/// button would show.
+const TestTaskbar = struct {
+    list: taskbar.ITaskbarList3 = .{ .vtable = &vtable },
+    hwnd: ?win32.HWND = null,
+    state: taskbar.State = .none,
+    /// Out of 100, while the state shows one.
+    value: ?u64 = null,
+    calls: usize = 0,
+    /// Every state set, in order.
+    states: [32]taskbar.State = undefined,
+    states_len: usize = 0,
+
+    const vtable = vtable: {
+        var v: taskbar.ITaskbarList3.VTable = undefined;
+        const info = @typeInfo(taskbar.ITaskbarList3.VTable).@"struct";
+        for (info.field_names, info.field_types) |name, T| {
+            if (T == *const anyopaque) @field(v, name) = @ptrCast(&unused);
+        }
+        v.Release = release;
+        v.HrInit = hrInit;
+        v.SetProgressValue = setProgressValue;
+        v.SetProgressState = setProgressState;
+        break :vtable v;
+    };
+
+    fn unused() callconv(.winapi) void {
+        unreachable;
+    }
+
+    fn release(_: *taskbar.ITaskbarList3) callconv(.winapi) std.os.windows.ULONG {
+        return 1;
+    }
+
+    fn hrInit(_: *taskbar.ITaskbarList3) callconv(.winapi) win32.HRESULT {
+        return 0;
+    }
+
+    fn setProgressState(list: *taskbar.ITaskbarList3, hwnd: win32.HWND, state: taskbar.State) callconv(.winapi) win32.HRESULT {
+        const self: *TestTaskbar = @fieldParentPtr("list", list);
+        self.calls += 1;
+        self.hwnd = hwnd;
+        self.state = state;
+        if (!state.filled()) self.value = null;
+        self.states[self.states_len] = state;
+        self.states_len += 1;
+        return 0;
+    }
+
+    fn setProgressValue(list: *taskbar.ITaskbarList3, hwnd: win32.HWND, done: u64, total: u64) callconv(.winapi) win32.HRESULT {
+        const self: *TestTaskbar = @fieldParentPtr("list", list);
+        self.calls += 1;
+        self.hwnd = hwnd;
+        self.value = done * 100 / total;
+        return 0;
+    }
+};
+
+test "win32: progress_report shows the focused terminal's progress on the taskbar button" {
+    // Only once Explorer says the button exists, as ITaskbarList3 asks, and
+    // only the focused terminal's, as Windows Terminal shows its focused
+    // pane's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // A number of this test's own: Explorer's real one could reach a
+    // frame another test shows.
+    var fake: TestTaskbar = .{};
+    app.taskbar_list = &fake.list;
+    app.taskbar_created = win32.WM_APP + 0x100;
+
+    const window = try testFrame(&app);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tree = try testRow(alloc, &.{ left, right });
+    window.focused = left;
+    const report = struct {
+        fn f(a: *App, pane: *Surface, value: terminal.osc.Command.ProgressReport) !void {
+            try std.testing.expect(try a.performAction(.{ .surface = &pane.core_surface }, .progress_report, value));
+        }
+    }.f;
+
+    // Kept before the button exists, and shown once it does.
+    try report(&app, left, .{ .state = .set, .progress = 40 });
+    try std.testing.expectEqual(0, fake.calls);
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try std.testing.expectEqual(@as(?win32.HWND, window.hwnd), fake.hwnd);
+    try std.testing.expectEqual(.normal, fake.state);
+    try std.testing.expectEqual(40, fake.value.?);
+
+    // Another terminal's is shown once it has the focus: an error it
+    // reported with no value, shown full; then the first one's again.
+    const calls = fake.calls;
+    try report(&app, right, .{ .state = .@"error" });
+    try std.testing.expectEqual(calls, fake.calls);
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqual(.@"error", fake.state);
+    try std.testing.expectEqual(100, fake.value.?);
+    _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqual(.normal, fake.state);
+    try std.testing.expectEqual(40, fake.value.?);
+
+    // Not for the app.
+    try std.testing.expect(!try app.performAction(.app, .progress_report, .{ .state = .set, .progress = 1 }));
+
+    // A report lapses once it is 15 seconds old, not at a WM_TIMER that
+    // was queued before it.
+    const timer = @import("Surface.zig").progress_timer_id;
+    _ = Surface.wndProc(left.hwnd, win32.WM_TIMER, timer, 0);
+    try std.testing.expectEqual(.normal, fake.state);
+    left.progress_expires = 0;
+    _ = Surface.wndProc(left.hwnd, win32.WM_TIMER, timer, 0);
+    try std.testing.expectEqual(.none, fake.state);
+    try std.testing.expectEqual(taskbar.Progress{}, left.progress);
+
+    // From an error or a pause to the indeterminate state, none comes
+    // first, as Windows Terminal sets it, or the button keeps the old bar;
+    // also when the focus moves from a paused terminal to such a one.
+    try report(&app, left, .{ .state = .@"error", .progress = 50 });
+    fake.states_len = 0;
+    try report(&app, left, .{ .state = .indeterminate });
+    try std.testing.expectEqualSlices(taskbar.State, &.{ .none, .indeterminate }, fake.states[0..fake.states_len]);
+    try report(&app, right, .{ .state = .pause, .progress = 30 });
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqual(.paused, fake.state);
+    fake.states_len = 0;
+    _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqualSlices(taskbar.State, &.{ .none, .indeterminate }, fake.states[0..fake.states_len]);
+
+    // Each window shows its own focused terminal's, which need not have
+    // the keyboard focus: that is in the first window.
+    const other = try testFrame(&app);
+    const pane = try testPane(&app, other);
+    other.tree = try .init(alloc, pane);
+    other.focused = pane;
+    _ = win32.SendMessageW(other.hwnd, app.taskbar_created, 0, 0);
+    try report(&app, pane, .{ .state = .set, .progress = 70 });
+    try std.testing.expect(!pane.focused);
+    try std.testing.expectEqual(@as(?win32.HWND, other.hwnd), fake.hwnd);
+    try std.testing.expectEqual(.normal, fake.state);
+    try std.testing.expectEqual(70, fake.value.?);
+
+    // Explorer restarted, and says the first window's button exists again:
+    // it shows its progress again.
+    fake.hwnd = null;
+    fake.state = .none;
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try std.testing.expectEqual(@as(?win32.HWND, window.hwnd), fake.hwnd);
+    try std.testing.expectEqual(.indeterminate, fake.state);
+
+    // With progress-style = false a report removes what was shown.
+    try report(&app, left, .{ .state = .pause, .progress = 30 });
+    try std.testing.expectEqual(.paused, fake.state);
+    try std.testing.expectEqual(30, fake.value.?);
+    app.config.@"progress-style" = false;
+    try report(&app, left, .{ .state = .set, .progress = 50 });
+    try std.testing.expectEqual(.none, fake.state);
 }
 
 test "win32: float_window keeps a window on top, or puts it back" {
