@@ -20,6 +20,7 @@ const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
 const retry = @import("dialog.zig").retry;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
+const writeClipboardText = @import("clipboard.zig").writeClipboardText;
 
 const log = std.log.scoped(.win32);
 
@@ -857,6 +858,7 @@ pub const App = struct {
             .toggle_window_decorations => self.requestDecorations(target),
             .resize_window => self.requestResizeWindow(target, value),
             .reset_window_size => self.requestResetWindowSize(target),
+            .copy_title_to_clipboard => copyTitleToClipboard(target),
             .render => render(target),
             .mouse_visibility => mouseVisibility(target, value),
             .mouse_shape => mouseShape(target, value),
@@ -1501,6 +1503,28 @@ pub const App = struct {
         };
         self.requests.append(self.core_app.alloc, .{ .decorations = from }) catch |err| {
             log.warn("cannot record toggling the window decorations err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.copy_title_to_clipboard`: the terminal's title, written as a copy
+    /// is (`Surface.setClipboard`), as GTK copies it; `false` with none, or
+    /// an empty one, on which the binding's documentation says it has no
+    /// effect. Made at once, as a copy is: nothing is laid out and no focus
+    /// moves.
+    fn copyTitleToClipboard(target: apprt.Target) bool {
+        const surface = switch (target) {
+            .app => return false,
+            .surface => |v| v.rt_surface,
+        };
+        const title = surface.getTitle() orelse return false;
+        if (title.len == 0) return false;
+        surface.setClipboard(.standard, &.{.{
+            .mime = "text/plain",
+            .data = title,
+        }}, false) catch |err| {
+            log.warn("cannot copy the title to the clipboard err={}", .{err});
             return false;
         };
         return true;
@@ -4383,6 +4407,49 @@ test "win32: reset_window_size waits for run and gives the window a new one's si
     try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
     app.forgetClosing(&pane.core_surface);
     try std.testing.expect(app.requests.items[0] == .dropped);
+}
+
+test "win32: copy_title_to_clipboard copies the terminal's title, if it has one" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tree = try .init(alloc, pane);
+    window.focused = pane;
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+
+    // Put back whatever text the clipboard held, as the clipboard's own
+    // test does.
+    const readClipboardText = @import("clipboard.zig").readClipboardText;
+    const saved = try readClipboardText(alloc, pane.hwnd);
+    defer if (saved) |text| {
+        writeClipboardText(pane.hwnd, text) catch {};
+        alloc.free(text);
+    };
+    try writeClipboardText(pane.hwnd, "before");
+
+    // None yet, then an empty one: no effect.
+    try std.testing.expect(!try app.performAction(target, .copy_title_to_clipboard, {}));
+    _ = pane.setTitle("");
+    try std.testing.expect(!try app.performAction(target, .copy_title_to_clipboard, {}));
+    {
+        const text = (try readClipboardText(alloc, pane.hwnd)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("before", text);
+    }
+
+    _ = pane.setTitle("vim café");
+    try std.testing.expect(try app.performAction(target, .copy_title_to_clipboard, {}));
+    const text = (try readClipboardText(alloc, pane.hwnd)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("vim café", text);
 }
 
 test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {
