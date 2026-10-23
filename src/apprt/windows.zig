@@ -38,16 +38,16 @@
 //! one, laid out over its client area (`Window`, `Tab`).
 //! `.move_tab_to_new_window` moves a tab whole into a new window: its
 //! terminals keep their windows and cores and only change frames
-//! (`Window.moveTabTo`). An action that
-//! lays out terminals, moves the focus to another window or tab, or frees
-//! core state, such as `.new_split`, `.goto_tab`, `.toggle_fullscreen`,
-//! `.move_tab_to_new_window` or a full `.reload_config`, is recorded and carried out by `App.run` once
-//! the core frame that asked has returned, and so is the frame change a
-//! new configuration's `window-decoration` makes (`App.requests`, which
-//! `App.Request` lists); `.goto_split` moves the focus once the core's key
-//! callback has returned (`Tab.pending_focus`), or after such a request
-//! when it follows one, and ends a zoom or moves it
-//! (`Window.focusFromGoto`).
+//! (`Window.moveTabTo`). An action that lays out terminals, moves the
+//! focus to another window or tab, or frees core state, such as
+//! `.new_split`, `.goto_tab`, `.toggle_fullscreen`,
+//! `.move_tab_to_new_window` or a full `.reload_config`, is recorded and
+//! carried out by `App.run` once the core frame that asked has returned,
+//! and so is the frame change a new configuration's `window-decoration`
+//! makes (`App.requests`, which `App.Request` lists); `.goto_split` moves
+//! the focus once the core's key callback has returned
+//! (`Tab.pending_focus`), or after such a request when it follows one,
+//! and ends a zoom or moves it (`Window.focusFromGoto`).
 //! The process quits when its last window closes, whatever
 //! `quit-after-last-window-closed` says: with no window left there is
 //! nothing to open another from (`App.setQuitTimer`).

@@ -8,8 +8,8 @@
 //! Ownership, as for surfaces (`App.surfaceDestroyed`): membership in
 //! `App.windows` is ownership of the allocation. The frame's WM_NCDESTROY,
 //! which Windows sends after its child windows are destroyed, frees a
-//! window that is in the list; one that is not yet (`create` failing) is
-//! freed by `create` itself.
+//! window that is in the list; one that is not yet (`create` or
+//! `App.moveTabToNewWindow` failing) is freed by `discard`.
 //!
 //! Each tab's tree holds its terminals by pointer and owns none of them. It
 //! never holds a freed one: a terminal that closes on its own leaves it
@@ -19,6 +19,7 @@
 const Window = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
@@ -316,37 +317,83 @@ fn unlinkTab(self: *Window, index: usize) bool {
 ///
 /// The one step that can fail, moving the terminals' windows to the new
 /// frame, comes first and is undone if it fails, so that the tab is then
-/// still here, as it was. Never inside a core frame (`App.requests`): it
-/// lays terminals out and moves the focus.
-pub fn moveTabTo(self: *Window, index: usize, to: *Window) !void {
+/// still here, as it was; if it cannot be undone, the move is finished
+/// instead (`reparentTab`). Never inside a core frame (`App.requests`):
+/// it lays terminals out and moves the focus.
+pub fn moveTabTo(self: *Window, index: usize, to: *Window) !Moved {
     assert(self.tabs.items.len > 1);
     const t = self.tabs.items[index];
-    try reparentTab(t, to.hwnd, self.hwnd);
+    const moved = try reparentTab(t, to.hwnd, self.hwnd);
     errdefer comptime unreachable;
     to.adoptTab(self.takeTab(index), dpiOf(self.app, self.hwnd));
+    return moved;
 }
 
+/// How `moveTabTo` moved a tab.
+pub const Moved = enum {
+    /// Every terminal went to the new frame.
+    whole,
+    /// A terminal could not go, and then one already gone could not come
+    /// back, so the move was finished instead (`reparentTab`); the caller
+    /// says so.
+    after_failure,
+};
+
 /// Make each terminal of `t` a child window of the frame `to` in place of
-/// `back`, the one it is in. If one cannot be moved, those moved already
-/// go back to `back`, and the error is returned.
-fn reparentTab(t: *Tab, to: win32.HWND, back: win32.HWND) !void {
+/// `back`, the one they are in, so that they all end in the frame of the
+/// window holding the tab. A terminal in another frame would be destroyed
+/// with that frame while its tab still holds it, or else outlive its own
+/// window's frame, whose destruction is what frees it
+/// (`App.surfaceDestroyed`): then nothing frees it, and the app, which
+/// quits once it has no terminal, never quits.
+///
+/// If one cannot be moved, those moved go back to `back` and the error is
+/// returned: the tab stays, and `to` holds no terminal (`discard`). If
+/// one of those cannot go back either, the tab cannot stay whole where it
+/// was, so the move is finished instead: every terminal not in `to` yet
+/// is moved there again, and `.after_failure` is returned. A terminal
+/// that neither frame takes is left where it is, logged: no single frame
+/// can then hold the tab. None of this is known to happen: SetParent is
+/// not known to fail between live windows of one thread, and a tab never
+/// holds a terminal whose window is gone (`removePane`); tests make it
+/// fail (`test_set_parent`).
+fn reparentTab(t: *Tab, to: win32.HWND, back: win32.HWND) !Moved {
+    if (moveInto(t, to, null)) return .whole;
+    if (moveInto(t, back, to)) return App.Error.Win32CallFailed;
+    // A warning: the caller reports it (`App.createRequested`).
+    log.warn("a terminal could not go back after a failed move to a new window: the move is finished instead", .{});
+    if (!moveInto(t, to, null)) log.err("a terminal is left out of its tab's new window", .{});
+    return .after_failure;
+}
+
+/// Make each terminal of `t` that is not in the frame `into` yet a child
+/// window of it, only those in the frame `from` if not null; whether all
+/// of those are in `into` now. A failure is a warning: the caller reports
+/// it (`App.createRequested`).
+fn moveInto(t: *Tab, into: win32.HWND, from: ?win32.HWND) bool {
+    var all = true;
     var it = t.tree.iterator();
-    var moved: usize = 0;
-    while (it.next()) |entry| : (moved += 1) {
-        if (win32.SetParent(entry.view.hwnd, to) != null) continue;
-        // A warning: the caller reports the failure (`App.createRequested`).
-        log.warn("SetParent failed for a terminal moving to a new window err={}", .{win32.GetLastError()});
-        var undo = t.tree.iterator();
-        for (0..moved) |_| {
-            const surface = (undo.next() orelse break).view;
-            // Nothing else is left to try: logged, and the new frame is
-            // then kept rather than destroyed with it (`discard`).
-            if (win32.SetParent(surface.hwnd, back) == null) {
-                log.err("SetParent failed for a terminal going back err={}", .{win32.GetLastError()});
-            }
-        }
-        return App.Error.Win32CallFailed;
+    while (it.next()) |entry| {
+        const hwnd = entry.view.hwnd;
+        const parent = win32.GetAncestor(hwnd, win32.GA_PARENT);
+        if (parent == into) continue;
+        if (from) |f| if (parent != f) continue;
+        if (setParent(hwnd, into)) continue;
+        log.warn("SetParent failed for a terminal changing frames err={}", .{win32.GetLastError()});
+        all = false;
     }
+    return all;
+}
+
+/// SetParent, for `moveInto`, outside tests. A test replaces it to make a
+/// call fail, which the live windows of one thread are not known to do.
+pub var test_set_parent: if (builtin.is_test) *const SetParentFn else void =
+    if (builtin.is_test) &win32.SetParent else {};
+const SetParentFn = fn (win32.HWND, ?win32.HWND) callconv(.winapi) ?win32.HWND;
+
+fn setParent(child: win32.HWND, parent: win32.HWND) bool {
+    const set: *const SetParentFn = if (builtin.is_test) test_set_parent else &win32.SetParent;
+    return set(child, parent) != null;
 }
 
 /// Take the tab at `index`, whose terminals another frame holds now
@@ -519,15 +566,12 @@ pub fn createBare(app: *App) !*Window {
 
 /// Undo `createBare`: destroy the frame, which frees nothing, as the
 /// window is not in `App.windows` (WM_NCDESTROY), then free the window.
-/// A terminal still in the frame, which a failed `moveTabTo` could not
-/// move back, would be destroyed with it while its tab still holds it: the
-/// frame is then kept, hidden, with the window, rather than lose it.
+/// No terminal may be in the frame, which would destroy it while a tab
+/// still holds it; a failed `moveTabTo` leaves none there (`reparentTab`).
 pub fn discard(self: *Window) void {
-    for (self.app.surfaces.items) |surface| {
-        if (win32.GetAncestor(surface.hwnd, win32.GA_PARENT) != self.hwnd) continue;
-        log.err("a terminal is left in a new window that failed: the window is kept hidden", .{});
-        return;
-    }
+    if (std.debug.runtime_safety) for (self.app.surfaces.items) |surface| {
+        assert(win32.GetAncestor(surface.hwnd, win32.GA_PARENT) != self.hwnd);
+    };
     const alloc = self.app.core_app.alloc;
     _ = win32.DestroyWindow(self.hwnd);
     self.deinitTabs(alloc);

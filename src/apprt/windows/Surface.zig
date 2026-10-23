@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
@@ -1323,11 +1324,17 @@ pub const Surface = struct {
             log.warn("occlusion callback failed err={}", .{err});
     }
 
+    /// Told the DPI `scaleChanged` gives each terminal, in tests only,
+    /// where a terminal has no core to see it.
+    pub var test_scale_changed: if (builtin.is_test) ?*const fn (*Surface, u16) void else void =
+        if (builtin.is_test) null else {};
+
     /// The frame's WM_DPICHANGED, with the new DPI: a child window gets
     /// none of its own. The frame applies the suggested window rect after
     /// this, which resizes this window synchronously, so the core sees the
     /// scale before the size computed for it.
     pub fn scaleChanged(self: *Surface, new_dpi: u16) void {
+        if (builtin.is_test) if (test_scale_changed) |seen| seen(self, new_dpi);
         self.ime.form = null;
         const core_surface = self.liveCore() orelse return;
         const scale = @as(f32, @floatFromInt(new_dpi)) /
