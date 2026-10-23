@@ -55,6 +55,18 @@
 //! `quit-after-last-window-closed` says: with no window left there is
 //! nothing to open another from (`App.setQuitTimer`).
 //!
+//! ## Search
+//!
+//! `.start_search` opens a terminal's search bar over its top-right
+//! corner, as GTK's search overlay floats over its surface, and moves the
+//! focus into its field once the core frame that asked has returned
+//! (`App.search_focus`); `.end_search`, Escape in the field or its close
+//! button hides it and gives the terminal the focus back. The bar is a
+//! child window of the frame placed above the terminal, not of the
+//! terminal, whose flip-model swap chain would hide it, so every layout
+//! places it (`SearchBar.place`). Typing in the field does not search yet,
+//! and a key in it reaches the field, never a binding.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
@@ -154,6 +166,7 @@ comptime {
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
+    _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
     _ = @import("windows/TabBar.zig");

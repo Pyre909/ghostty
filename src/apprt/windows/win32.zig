@@ -51,7 +51,7 @@ const SHORT = w.SHORT;
 /// Keyboard layout handle. Only ever passed back to user32.
 const HKL = *opaque {};
 
-const WNDPROC = *const fn (
+pub const WNDPROC = *const fn (
     hwnd: HWND,
     msg: UINT,
     wparam: WPARAM,
@@ -1020,6 +1020,75 @@ pub extern "gdi32" fn GetObjectW(object: HGDIOBJ, size: c_int, out: ?*anyopaque)
 pub const LOGPIXELSY: c_int = 90;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getupdaterect
 pub extern "user32" fn GetUpdateRect(hwnd: HWND, rect: ?*RECT, erase: BOOL) callconv(.winapi) BOOL;
+
+// The search bar (SearchBar.zig): a window of our own holding an EDIT
+// control, subclassed as SetWindowLongPtrW(GWLP_WNDPROC) documents, which
+// needs nothing of comctl32 but the control the manifest's Common Controls
+// v6 gives.
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-callwindowprocw
+pub extern "user32" fn CallWindowProcW(proc: WNDPROC, hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT;
+pub const GWLP_WNDPROC: c_int = -4;
+/// SetWindowPos's place in the Z order: above every sibling.
+pub const HWND_TOP: ?HWND = null;
+pub const GW_HWNDNEXT: UINT = 2;
+pub const GW_CHILD: UINT = 5;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow
+pub extern "user32" fn GetWindow(hwnd: HWND, cmd: UINT) callconv(.winapi) ?HWND;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowtextlengthw
+pub extern "user32" fn GetWindowTextLengthW(hwnd: HWND) callconv(.winapi) c_int;
+pub const ES_AUTOHSCROLL: DWORD = 0x0080;
+pub const WM_SETFONT: UINT = 0x0030;
+pub const WM_COMMAND: UINT = 0x0111;
+pub const WM_CTLCOLOREDIT: UINT = 0x0133;
+/// WM_COMMAND's high word of wParam: the EDIT's text changed.
+pub const EN_CHANGE: UINT = 0x0300;
+pub const EM_GETSEL: UINT = 0x00B0;
+pub const EM_SETSEL: UINT = 0x00B1;
+pub const EM_REPLACESEL: UINT = 0x00C2;
+/// ECM_FIRST + 1: the gray hint an empty EDIT shows (Common Controls v6).
+pub const EM_SETCUEBANNER: UINT = 0x1501;
+pub const VK_BACK: WPARAM = 0x08;
+pub const VK_TAB: WPARAM = 0x09;
+pub const VK_RETURN: WPARAM = 0x0D;
+pub const VK_ESCAPE: WPARAM = 0x1B;
+pub const DT_RIGHT: UINT = 0x0002;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbkcolor
+pub extern "gdi32" fn SetBkColor(hdc: HDC, color: COLORREF) callconv(.winapi) COLORREF;
+pub const PS_SOLID: c_int = 0;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createpen
+pub extern "gdi32" fn CreatePen(style: c_int, width: c_int, color: COLORREF) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-polyline
+pub extern "gdi32" fn Polyline(hdc: HDC, points: [*]const POINT, count: c_int) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-textmetricw
+pub const TEXTMETRICW = extern struct {
+    tmHeight: LONG,
+    tmAscent: LONG,
+    tmDescent: LONG,
+    tmInternalLeading: LONG,
+    tmExternalLeading: LONG,
+    tmAveCharWidth: LONG,
+    tmMaxCharWidth: LONG,
+    tmWeight: LONG,
+    tmOverhang: LONG,
+    tmDigitizedAspectX: LONG,
+    tmDigitizedAspectY: LONG,
+    tmFirstChar: u16,
+    tmLastChar: u16,
+    tmDefaultChar: u16,
+    tmBreakChar: u16,
+    tmItalic: u8,
+    tmUnderlined: u8,
+    tmStruckOut: u8,
+    tmPitchAndFamily: u8,
+    tmCharSet: u8,
+};
+comptime {
+    // The SDK's sizeof(TEXTMETRICW).
+    std.debug.assert(@sizeOf(TEXTMETRICW) == 60);
+}
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-gettextmetricsw
+pub extern "gdi32" fn GetTextMetricsW(hdc: HDC, tm: *TEXTMETRICW) callconv(.winapi) BOOL;
 
 /// The RGB macro of wingdi.h.
 pub fn rgb(r: u8, g: u8, b: u8) COLORREF {

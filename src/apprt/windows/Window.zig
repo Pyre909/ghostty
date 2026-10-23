@@ -33,6 +33,7 @@ const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 pub const Tab = @import("Tab.zig");
 const TabBar = @import("TabBar.zig");
+const SearchBar = @import("SearchBar.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -279,6 +280,8 @@ fn hideTab(t: *Tab) void {
     var it = t.tree.iterator();
     while (it.next()) |entry| {
         _ = win32.ShowWindow(entry.view.hwnd, win32.SW_HIDE);
+        // Its search bar with it; it stays open for when the tab shows.
+        entry.view.search_bar.hideWindow();
         entry.view.occlusionChanged(false);
     }
 }
@@ -961,13 +964,19 @@ fn handleMessage(
             if (wparam == win32.SPI_SETNONCLIENTMETRICS) {
                 self.bar.freeFont();
                 self.bar.invalidate();
+                // And the search bars', made again as they are placed.
+                for (self.tabs.items) |t| {
+                    var it = t.tree.iterator();
+                    while (it.next()) |entry| entry.view.search_bar.fontChanged();
+                }
+                self.placeSearchBars();
             }
         },
 
         // Keyboard focus belongs to a terminal: the frame gets it on
         // activation (DefWindowProcW's WM_ACTIVATE), and passes it on.
         win32.WM_SETFOCUS => {
-            if (self.tab().focused) |surface| _ = win32.SetFocus(surface.hwnd);
+            if (self.tab().focused) |surface| self.setKeyboardFocus(focusTarget(surface), false);
             return 0;
         },
 
@@ -1602,12 +1611,13 @@ fn followZoom(self: *const Window, t: *Tab, surface: *Surface) bool {
 }
 
 /// Make `surface` the window's focused terminal and give it the keyboard
-/// focus. Only the active window sets the keyboard focus at once; another
-/// one would be activated by it, so it hands the focus over when it is
-/// activated (WM_SETFOCUS).
+/// focus, or its search field if that had it last (`focusTarget`). Only
+/// the active window sets the keyboard focus at once; another one would be
+/// activated by it, so it hands the focus over when it is activated
+/// (WM_SETFOCUS).
 pub fn giveFocus(self: *Window, surface: *Surface) void {
     self.setFocused(surface);
-    if (win32.GetActiveWindow() == self.hwnd) _ = win32.SetFocus(surface.hwnd);
+    self.setKeyboardFocus(focusTarget(surface), true);
 }
 
 /// Make `surface` its tab's focused terminal and, in the tab shown, name
@@ -1705,12 +1715,61 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
     self.relayout();
 }
 
-/// Lay the terminals out over the client area (`layout`). Not while the
-/// window is minimized and its client area is empty (see WM_SIZE).
+/// Lay the terminals out over the client area (`layout`), then place their
+/// search bars over them. Not while the window is minimized and its
+/// client area is empty (see WM_SIZE).
 pub fn relayout(self: *Window) void {
     if (self.tab().tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
     self.placeBar();
     const client = self.layoutArea() orelse return;
+    self.placeTerminals(client);
+    self.placeSearchBars();
+}
+
+/// Place each search bar of the shown tab's terminals where its terminal
+/// is now, above it, or hide it (`SearchBar.place`): a terminal a zoom
+/// hides has its bar hidden, and one that came back from a zoom, or was
+/// made since, is under the bars again.
+pub fn placeSearchBars(self: *Window) void {
+    var it = self.tab().tree.iterator();
+    while (it.next()) |entry| SearchBar.place(entry.view);
+}
+
+/// The window that gets the keyboard focus for `surface`: its search
+/// field while the field had it last and shows, else the terminal
+/// (`SearchBar.Bar.focusTarget`).
+pub fn focusTarget(surface: *const Surface) win32.HWND {
+    return surface.search_bar.focusTarget() orelse surface.hwnd;
+}
+
+/// For tests: told the window SetFocus would be given by `giveFocus` and
+/// the frame's WM_SETFOCUS, in place of SetFocus, which activates the
+/// window, so that a test sees where the focus goes without taking the
+/// foreground.
+pub var test_set_focus: if (builtin.is_test) ?*const fn (win32.HWND) void else void =
+    if (builtin.is_test) null else {};
+
+/// SetFocus(`hwnd`), a window of this frame; with `active_only`, only
+/// while the frame is the active window, as another would be activated by
+/// it.
+pub fn setKeyboardFocus(self: *const Window, hwnd: win32.HWND, active_only: bool) void {
+    if (builtin.is_test) if (test_set_focus) |seen| return seen(hwnd);
+    if (active_only and win32.GetActiveWindow() != self.hwnd) return;
+    _ = win32.SetFocus(hwnd);
+}
+
+/// The focus move `start_search` or `end_search` asked for
+/// (`App.search_focus`): `surface`, or its search field
+/// (`focusTarget`), gets the focus if it shows: a hidden tab's terminals
+/// are hidden (`selectTab`), and so is one a zoom hides (`layout`).
+pub fn giveSearchFocus(self: *Window, surface: *Surface) void {
+    const visible: isize = win32.WS_VISIBLE;
+    if (win32.GetWindowLongPtrW(surface.hwnd, win32.GWL_STYLE) & visible == 0) return;
+    self.giveFocus(surface);
+}
+
+/// Move each terminal of the shown tab where `layout` puts it in `client`.
+fn placeTerminals(self: *Window, client: win32.RECT) void {
     const divider = dividerWidth(dpiOf(self.app, self.hwnd));
 
     // One batch, so that the terminals move together.
@@ -1952,6 +2011,10 @@ pub fn applyTheme(self: *Window) void {
     }
     self.dark_frame = dark;
     self.bar.invalidate();
+    for (self.tabs.items) |t| {
+        var it = t.tree.iterator();
+        while (it.next()) |entry| entry.view.search_bar.invalidate();
+    }
 }
 
 /// Whether a WM_SETTINGCHANGE is about the light or dark mode of apps,

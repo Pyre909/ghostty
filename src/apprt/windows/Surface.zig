@@ -20,6 +20,7 @@ const postTeardown = @import("App.zig").postTeardown;
 const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
 const DesktopNotifications = @import("desktop_notifications.zig");
+const SearchBar = @import("SearchBar.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -136,6 +137,10 @@ pub const Surface = struct {
 
     /// The terminal's toasts (`notify`).
     notifications: DesktopNotifications,
+
+    /// The terminal's search bar (`SearchBar`), a window of the frame's
+    /// over this one's top-right corner once `start_search` opened it.
+    search_bar: SearchBar.Bar,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -629,6 +634,7 @@ pub const Surface = struct {
             .progress = .{},
             .progress_expires = 0,
             .notifications = .{},
+            .search_bar = .{},
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -746,6 +752,7 @@ pub const Surface = struct {
         self.title = null;
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
         self.notifications.deinit(self.app.core_app.alloc);
+        self.search_bar.deinit();
     }
 
     /// Stop the core surface and destroy its window. The last terminal in a
@@ -775,6 +782,9 @@ pub const Surface = struct {
                 window.removeTab(t);
             }
         }
+        // Its search bar, a window of the frame's, goes with it, before
+        // its core stops: nothing shows it, nor is clicked, meanwhile.
+        self.search_bar.destroy();
         self.stopCore();
         return win32.DestroyWindow(self.hwnd).toBool();
     }
@@ -1448,6 +1458,9 @@ pub const Surface = struct {
             win32.WM_SETFOCUS, win32.WM_KILLFOCUS => {
                 self.focused = msg == win32.WM_SETFOCUS;
                 if (self.focused) {
+                    // The terminal, not its search field, has the focus
+                    // now, and gets it back (`SearchBar.Bar.focusTarget`).
+                    self.search_bar.field_focus = false;
                     self.window.setFocused(self);
                     self.clearNotifications();
                 }
@@ -1794,6 +1807,8 @@ pub const Surface = struct {
                     // clicked is the one the activation gives the focus
                     // (the frame's WM_SETFOCUS).
                     if (win32.GetActiveWindow() != self.window.hwnd) {
+                        // The terminal itself, not its search field.
+                        self.search_bar.field_focus = false;
                         self.window.setFocused(self);
                         return win32.MA_ACTIVATEANDEAT;
                     }
