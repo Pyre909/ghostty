@@ -311,13 +311,18 @@ pub const App = struct {
         goto_tab: struct {
             from: *CoreSurface,
             to: apprt.action.GotoTab,
+            /// The index in `requests` of the move of `from`'s tab to a
+            /// new window this waits behind, if it does (`dropBehind`).
+            behind: ?usize = null,
         },
 
-        /// `.move_tab` behind a tab still to open in `from`'s window
-        /// (`moveTab`).
+        /// `.move_tab` behind a tab still to open in `from`'s window, or
+        /// behind a move of its tab to a new window (`moveTab`).
         move_tab: struct {
             from: *CoreSurface,
             amount: isize,
+            /// As for `goto_tab`.
+            behind: ?usize = null,
         },
 
         /// `.move_tab_to_new_window`: the tab of `from`, moved into a
@@ -330,14 +335,20 @@ pub const App = struct {
         },
 
         /// `.close_window` behind a move of `from`'s tab to a new window,
-        /// which it then closes (`closeWindow`).
-        close_window: *CoreSurface,
+        /// which it then closes (`closeWindow`); dropped if the tab does
+        /// not move (`dropBehind`).
+        close_window: struct {
+            from: *CoreSurface,
+            /// The index in `requests` of that move.
+            behind: usize,
+        },
 
         /// `.close_tab` behind a move of `from`'s tab to a new window,
-        /// among the tabs there (`closeTab`).
+        /// among the tabs there (`closeTab`); dropped as `close_window` is.
         close_tab: struct {
             from: *CoreSurface,
             mode: apprt.action.CloseTabMode,
+            behind: usize,
         },
 
         /// One of the above whose surface began to close first: it has
@@ -721,9 +732,11 @@ pub const App = struct {
     /// its terminals either. A window that was already disabled is left as
     /// it was.
     ///
-    /// Windows are not created while a prompt is open (only `run` creates
-    /// them) and their teardown is deferred, so `endPrompt` finds the
-    /// windows disabled here.
+    /// Windows are not created while a prompt is open, as both places that
+    /// create them wait for `canReenterCore`: `run` (`createRequested`),
+    /// and a tab dropped out of a bar, from whichever loop dispatched the
+    /// release (`Window.dropTabOut`); and their teardown is deferred, so
+    /// `endPrompt` finds the windows disabled here.
     pub fn beginPrompt(self: *App, owner: ?win32.HWND) void {
         self.prompt_depth += 1;
         if (self.prompt_depth > 1) return;
@@ -1075,10 +1088,14 @@ pub const App = struct {
             //
             // Behind a move of the terminal's tab to a new window, as when
             // a binding chains it after move_tab_to_new_window, recorded
-            // for `run`, so that it closes the new window (`moveQueuedFor`).
+            // for `run`, so that it closes the new window (`moveQueuedFor`),
+            // or nothing if the tab does not move (`dropBehind`).
             .surface => |v| close: {
-                if (self.moveQueuedFor(v.rt_surface)) {
-                    self.requests.append(self.core_app.alloc, .{ .close_window = v }) catch |err| {
+                if (self.moveQueuedFor(v.rt_surface)) |behind| {
+                    self.requests.append(self.core_app.alloc, .{ .close_window = .{
+                        .from = v,
+                        .behind = behind,
+                    } }) catch |err| {
                         log.warn("cannot record a window to close err={}", .{err});
                         break :close false;
                     };
@@ -1096,18 +1113,20 @@ pub const App = struct {
     /// on this platform (`Config.Keybinds.init`, where it replaced
     /// `close_surface`). `false` when the mode names no tab. Behind a move
     /// of the terminal's tab to a new window, recorded for `run`, so that
-    /// it closes tabs there (`moveQueuedFor`); the action then reports it
-    /// performed without knowing yet, as `gotoSplit` does.
+    /// it closes tabs there (`moveQueuedFor`), or none if the tab does not
+    /// move (`dropBehind`); the action then reports it performed without
+    /// knowing yet, as `gotoSplit` does.
     fn closeTab(self: *App, target: apprt.Target, mode: apprt.action.CloseTabMode) bool {
         const from = switch (target) {
             .app => return false,
             .surface => |v| v,
         };
         const surface = from.rt_surface;
-        if (self.moveQueuedFor(surface)) {
+        if (self.moveQueuedFor(surface)) |behind| {
             self.requests.append(self.core_app.alloc, .{ .close_tab = .{
                 .from = from,
                 .mode = mode,
+                .behind = behind,
             } }) catch |err| {
                 log.warn("cannot record a tab to close err={}", .{err});
                 return false;
@@ -1171,10 +1190,15 @@ pub const App = struct {
             .surface => |v| v,
         };
         const window = from.rt_surface.window;
+        const behind = self.moveQueuedFor(from.rt_surface);
         if (window.gotoTabIndex(to) == null and
             !self.tabQueuedIn(window) and
-            !self.moveQueuedFor(from.rt_surface)) return false;
-        self.requests.append(self.core_app.alloc, .{ .goto_tab = .{ .from = from, .to = to } }) catch |err| {
+            behind == null) return false;
+        self.requests.append(self.core_app.alloc, .{ .goto_tab = .{
+            .from = from,
+            .to = to,
+            .behind = behind,
+        } }) catch |err| {
             log.warn("cannot record a tab to go to err={}", .{err});
             return false;
         };
@@ -1193,12 +1217,14 @@ pub const App = struct {
             .surface => |v| v,
         };
         const window = from.rt_surface.window;
-        if (!self.tabQueuedIn(window) and !self.moveQueuedFor(from.rt_surface)) {
+        const behind = self.moveQueuedFor(from.rt_surface);
+        if (!self.tabQueuedIn(window) and behind == null) {
             return window.moveTab(from.rt_surface, value.amount);
         }
         self.requests.append(self.core_app.alloc, .{ .move_tab = .{
             .from = from,
             .amount = value.amount,
+            .behind = behind,
         } }) catch |err| {
             log.warn("cannot record a tab to move err={}", .{err});
             return false;
@@ -1241,17 +1267,42 @@ pub const App = struct {
     /// src/apprt/gtk/class/window.zig), so that what a terminal of the tab
     /// does next to its window or tabs, such as a binding chained after
     /// it, acts on the new window: here that waits behind the move, as
-    /// behind a tab still to open (`tabQueuedIn`).
-    fn moveQueuedFor(self: *const App, surface: *const Surface) bool {
-        const t = surface.window.tabOf(surface) orelse return false;
-        for (self.requests.items) |request| switch (request) {
+    /// behind a tab still to open (`tabQueuedIn`). The index in `requests`
+    /// of the last such move, which the action waits behind, or null.
+    fn moveQueuedFor(self: *const App, surface: *const Surface) ?usize {
+        const t = surface.window.tabOf(surface) orelse return null;
+        var last: ?usize = null;
+        for (self.requests.items, 0..) |request, i| switch (request) {
             .move_tab_to_new_window => |move| {
                 const moving = move.from.rt_surface;
-                if (moving.window.tabOf(moving) == t) return true;
+                if (moving.window.tabOf(moving) == t) last = i;
             },
             else => {},
         };
-        return false;
+        return last;
+    }
+
+    /// The move of a tab to a new window at `index` in `requests` did not
+    /// happen: it failed, or was not made because the tab's window had no
+    /// other tab left or was closing, or its terminal began to close
+    /// (`forgetClosing`). What waits behind it (`moveQueuedFor`) is dropped,
+    /// logged: it was meant for the new window, and would act on the old
+    /// one, where close_window, say, would close the window the move was
+    /// to leave with its other tabs. GTK makes the move at once, so that
+    /// what follows it never finds it undone.
+    fn dropBehind(self: *App, index: usize) void {
+        for (self.requests.items[index + 1 ..]) |*request| {
+            const behind: ?usize = switch (request.*) {
+                .close_window => |close| close.behind,
+                .close_tab => |close| close.behind,
+                .goto_tab => |goto| goto.behind,
+                .move_tab => |move| move.behind,
+                else => null,
+            };
+            if (behind != index) continue;
+            log.info("a {s} waiting for a tab's move to a new window is dropped: the tab did not move", .{@tagName(request.*)});
+            request.* = .dropped;
+        }
     }
 
     /// `.set_tab_title`: made at once, as `set_title` is.
@@ -1633,12 +1684,13 @@ pub const App = struct {
     /// Forget `core_surface`, which is closing, wherever something still
     /// waits on it: windows it asked for lose it as their parent, splits,
     /// changes to splits and focus moves it asked for are dropped, and so is
-    /// a focus move to it.
+    /// a focus move to it; with a move of its tab to a new window, so is
+    /// what waits behind that move (`dropBehind`).
     /// Called by `Surface.detachCore`, the first step of every teardown,
     /// while the address is still that surface's, so that a surface created
     /// later at the same address cannot pass for it.
     pub fn forgetClosing(self: *App, core_surface: *CoreSurface) void {
-        for (self.requests.items) |*request| switch (request.*) {
+        for (self.requests.items, 0..) |*request, i| switch (request.*) {
             .window => |*parent| {
                 if (parent.* == core_surface) parent.* = null;
             },
@@ -1666,11 +1718,13 @@ pub const App = struct {
             .move_tab => |move| {
                 if (move.from == core_surface) request.* = .dropped;
             },
-            .move_tab_to_new_window => |move| {
-                if (move.from == core_surface) request.* = .dropped;
+            // With what waits behind it, from other terminals of the tab.
+            .move_tab_to_new_window => |move| if (move.from == core_surface) {
+                request.* = .dropped;
+                self.dropBehind(i);
             },
-            .close_window => |from| {
-                if (from == core_surface) request.* = .dropped;
+            .close_window => |close| {
+                if (close.from == core_surface) request.* = .dropped;
             },
             .close_tab => |close| {
                 if (close.from == core_surface) request.* = .dropped;
@@ -2165,11 +2219,11 @@ pub const App = struct {
                     if (window.gotoTabIndex(goto.to)) |index| window.selectTab(index);
                 },
                 .move_tab => |move| _ = move.from.rt_surface.window.moveTab(move.from.rt_surface, move.amount),
-                .move_tab_to_new_window => |move| self.reportMove(
+                .move_tab_to_new_window => |move| if (!self.reportMove(
                     move.from.rt_surface.hwnd,
                     self.moveTabToNewWindow(move.from, move.drop),
-                ),
-                .close_window => |from| from.rt_surface.window.requestClose(),
+                )) self.dropBehind(i),
+                .close_window => |close| close.from.rt_surface.window.requestClose(),
                 .close_tab => |close| {
                     const window = close.from.rt_surface.window;
                     const at = window.find(close.from.rt_surface) orelse continue;
@@ -2262,30 +2316,34 @@ pub const App = struct {
     /// On an error nothing has changed: whatever can fail is done before
     /// the old window lets go of the tab (`Window.moveTabTo`), and the new
     /// window is then discarded. Should that step fail and not be undone,
-    /// the move is finished instead, and this returns true, for the caller
-    /// to say so: either way each terminal is in the frame of the one
-    /// window holding it, which the app owns, so that closing it frees
-    /// them.
+    /// the move is finished instead, with any terminal that still cannot
+    /// go kept in the old window (`Window.Moved`), for the caller to say
+    /// so: either way each terminal is in the frame of the one window
+    /// holding it, which the app owns, so that closing it frees them. Null
+    /// when nothing was moved and nothing failed.
     ///
     /// A tab dragged out of the bar comes with where it was dropped, for
     /// the new frame's place (`Window.placeForDrop`).
-    fn moveTabToNewWindow(self: *App, from: *CoreSurface, drop: ?Window.Drop) !bool {
+    fn moveTabToNewWindow(self: *App, from: *CoreSurface, drop: ?Window.Drop) !?Window.Moved {
         const surface = from.rt_surface;
         const old = surface.window;
-        const at = old.find(surface) orelse return false;
+        const at = old.find(surface) orelse return null;
         if (surface.closing) {
             log.info("the tab is not moved to a new window: its terminal is closing", .{});
-            return false;
+            return null;
         }
         return self.moveTabAt(old, at.index, drop);
     }
 
-    /// `moveTabToNewWindow` for the tab at `index` in `old`.
-    fn moveTabAt(self: *App, old: *Window, index: usize, drop: ?Window.Drop) !bool {
+    /// `moveTabToNewWindow` for the tab at `index` in `old`. Called where
+    /// `canReenterCore` holds: by `run` (`createRequested`), where no
+    /// teardown is running, and for a drop (`moveTabOut`), which may come
+    /// inside one.
+    fn moveTabAt(self: *App, old: *Window, index: usize, drop: ?Window.Drop) !?Window.Moved {
         const alloc = self.core_app.alloc;
         if (old.closing or old.tabs.items.len <= 1) {
             log.info("the tab is not moved to a new window: its window is closing, or it is the only tab", .{});
-            return false;
+            return null;
         }
 
         try self.windows.ensureUnusedCapacity(alloc, 1);
@@ -2300,39 +2358,59 @@ pub const App = struct {
 
         // Shown once it is owned, as a new window is.
         window.show();
-        return moved == .after_failure;
+        return moved;
     }
 
     /// A tab dragged out of `old`'s bar, the one at `index`, dropped
-    /// outside the window when the core may be re-entered
-    /// (`Window.dropTabOut`): moved to a new window at once, as `run` moves
-    /// one for `move_tab_to_new_window`, and its failure told the same way.
-    /// Nothing while its focused terminal is closing, as for the action.
+    /// outside the window (`Window.dropTabOut`), whenever the core may be
+    /// re-entered: from `run`'s loop, from a system modal loop, or from
+    /// the pump inside a terminal's teardown (`waitForThread`), which a
+    /// release can reach as well. Moved to a new window at once, as `run`
+    /// moves one for `move_tab_to_new_window`, and its failure told the
+    /// same way. A terminal being torn down has left its tab already
+    /// (`Surface.destroy`), and a window being torn down refuses the drop
+    /// (`Window.closing`). Nothing while the tab's focused terminal is
+    /// closing, as for the action.
     pub fn moveTabOut(self: *App, old: *Window, index: usize, drop: Window.Drop) void {
         const focused = old.tabs.items[index].focused orelse return;
         if (focused.closing) {
             log.info("the tab is not moved to a new window: its terminal is closing", .{});
             return;
         }
-        self.reportMove(focused.hwnd, self.moveTabAt(old, index, drop));
+        _ = self.reportMove(focused.hwnd, self.moveTabAt(old, index, drop));
     }
 
     /// Tell the user, in a notice owned by the window of `owner`, the moved
     /// tab's terminal, if moving a tab to a new window failed (`result`),
-    /// or failed partway and was finished instead (`Window.Moved`).
-    fn reportMove(self: *App, owner: win32.HWND, result: anyerror!bool) void {
-        const finished = result catch |err| {
+    /// or failed partway and was finished instead (`Window.Moved`); whether
+    /// the tab moved.
+    fn reportMove(self: *App, owner: win32.HWND, result: anyerror!?Window.Moved) bool {
+        const maybe = result catch |err| {
             log.err("failed to move a tab to a new window err={}", .{err});
             notice(self, owner, L("Ghostty could not move the tab to a new window."));
-            return;
+            return false;
         };
-        if (!finished) return;
-        log.err("a tab was moved to a new window after its move failed and could not be undone", .{});
-        notice(
-            self,
-            owner,
-            L("Moving the tab to a new window failed partway and could not be undone, so the tab was moved anyway."),
-        );
+        const moved = maybe orelse return false;
+        switch (moved) {
+            .whole => {},
+            .after_failure => {
+                log.err("a tab was moved to a new window after its move failed and could not be undone", .{});
+                notice(
+                    self,
+                    owner,
+                    L("Moving the tab to a new window failed partway and could not be undone, so the tab was moved anyway."),
+                );
+            },
+            .split => {
+                log.err("a tab was moved to a new window after its move failed, but a terminal stayed behind", .{});
+                notice(
+                    self,
+                    owner,
+                    L("Moving the tab to a new window failed partway: the tab was moved, but a terminal that could not move stays in the window it was in, in a tab of its own."),
+                );
+            },
+        }
+        return true;
     }
 
     /// Open a split beside `parent`, a live surface, in `direction`: a new
@@ -4594,7 +4672,7 @@ test "win32: a tab that cannot move to a new window stays as it was" {
             }
             continue;
         };
-        try std.testing.expect(!finished);
+        try std.testing.expect(finished.? == .whole);
         break;
     }
     // Some allocation failed before the one run that succeeded.
@@ -4716,7 +4794,7 @@ test "win32: a tab that can neither move nor go back is moved after all" {
     defer Window.test_set_parent = &win32.SetParent;
 
     // True: the caller says the move was finished after a failure.
-    try std.testing.expect(try app.moveTabToNewWindow(&b.core_surface, null));
+    try std.testing.expect((try app.moveTabToNewWindow(&b.core_surface, null)).? == .after_failure);
     try std.testing.expectEqual(1, Fail.forward_failures);
     try std.testing.expectEqual(1, Fail.back_failures);
     try std.testing.expectEqual(2, app.windows.items.len);
@@ -4742,6 +4820,138 @@ test "win32: a tab that can neither move nor go back is moved after all" {
     try std.testing.expect(app.windows.items[0] == window);
     try std.testing.expectEqual(1, app.surfaces.items.len);
     try std.testing.expect(app.surfaces.items[0] == a);
+}
+
+test "win32: a terminal that can change frames neither way stays in its old window" {
+    // SetParent always fails for b2 and b3 moving to the new frame, and
+    // for b, which moved, going back: the move is finished, b alone in the
+    // new window, and b2 and b3, still in the old frame, stay with the old
+    // window, each in a tab of its own where the tab was, one shown as the
+    // tab was. Each terminal then belongs to the window whose frame holds
+    // it, so that closing either window first frees its own terminals,
+    // once, and the other's after (a double free or a leak fails the test
+    // through the testing allocator, or the app's lists).
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |old_first| {
+        var core_app: CoreApp = undefined;
+        core_app.alloc = alloc;
+        var app: App = undefined;
+        try testApp(&app, &core_app);
+        try registerClasses(app.hinstance);
+        defer unregisterClasses(app.hinstance);
+        defer testCleanup(&app);
+
+        const window = try testFrame(&app);
+        testResize(window, 800, 300);
+        const a = try testPane(&app, window);
+        window.tab().tree = try .init(alloc, a);
+        window.tab().focused = a;
+        _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+        window.relayout();
+        const ta = window.tab();
+        const b = try testTab(&app, window);
+        const b2 = try testPane(&app, window);
+        const b3 = try testPane(&app, window);
+        const tb = window.tabOf(b).?;
+        tb.tree.deinit();
+        tb.tree = try testRow(alloc, &.{ b2, b, b3 });
+        // Focused on one that stays: the tab's focus goes to b, as when
+        // it closes (`Window.removePane`).
+        tb.focused = b2;
+        window.selectTab(1);
+        try std.testing.expect(shown(b2.hwnd) and shown(b3.hwnd));
+
+        const Fail = struct {
+            var home: win32.HWND = undefined;
+            var stuck: [2]win32.HWND = undefined;
+            var back: win32.HWND = undefined;
+            var forward_failures: usize = 0;
+            var back_failures: usize = 0;
+            fn setParent(child: win32.HWND, parent: ?win32.HWND) callconv(.winapi) ?win32.HWND {
+                if (parent == home and child == back) {
+                    back_failures += 1;
+                    return null;
+                }
+                if (parent != home and (child == stuck[0] or child == stuck[1])) {
+                    forward_failures += 1;
+                    return null;
+                }
+                return win32.SetParent(child, parent);
+            }
+        };
+        Fail.home = window.hwnd;
+        Fail.stuck = .{ b2.hwnd, b3.hwnd };
+        Fail.back = b.hwnd;
+        Fail.forward_failures = 0;
+        Fail.back_failures = 0;
+        Window.test_set_parent = &Fail.setParent;
+        defer Window.test_set_parent = &win32.SetParent;
+
+        try std.testing.expect((try app.moveTabToNewWindow(&b.core_surface, null)).? == .split);
+        // b2 and b3 twice each: at first, and when the move is finished.
+        try std.testing.expectEqual(4, Fail.forward_failures);
+        try std.testing.expectEqual(1, Fail.back_failures);
+
+        // The new window: b alone, focused, in its frame.
+        try std.testing.expectEqual(2, app.windows.items.len);
+        const moved = app.windows.items[1];
+        try std.testing.expect(moved != window);
+        try std.testing.expectEqual(1, moved.tabs.items.len);
+        try std.testing.expect(moved.tab() == tb);
+        try std.testing.expect(tb.tree.locate(b) != null);
+        try std.testing.expect(tb.tree.locate(b2) == null);
+        try std.testing.expect(tb.tree.locate(b3) == null);
+        try std.testing.expect(tb.focused == b);
+        try std.testing.expect(b.window == moved);
+        try std.testing.expect(win32.GetAncestor(b.hwnd, win32.GA_PARENT) == moved.hwnd);
+        try std.testing.expect(shown(moved.hwnd));
+
+        // The old one: a, then b2 and b3 each in a tab, the first shown
+        // in the tab's place, the other hidden.
+        try std.testing.expectEqual(3, window.tabs.items.len);
+        try std.testing.expect(window.tabs.items[0] == ta);
+        try std.testing.expectEqual(1, window.selected);
+        const t2 = window.tabOf(b2).?;
+        const t3 = window.tabOf(b3).?;
+        try std.testing.expect(t2 != t3 and t2 != ta and t3 != ta);
+        for ([_]struct { *Surface, *Window.Tab }{ .{ b2, t2 }, .{ b3, t3 } }) |kept| {
+            try std.testing.expect(kept[0].window == window);
+            try std.testing.expect(win32.GetAncestor(kept[0].hwnd, win32.GA_PARENT) == window.hwnd);
+            try std.testing.expect(kept[1].focused == kept[0]);
+            try std.testing.expect(kept[1].tree.locate(kept[0]).? == .root);
+            try std.testing.expectEqual(kept[1] == window.tab(), shown(kept[0].hwnd));
+        }
+        try std.testing.expect(window.tab() == t2 or window.tab() == t3);
+        try std.testing.expect(win32.GetAncestor(a.hwnd, win32.GA_PARENT) == window.hwnd);
+
+        // Closing each window in turn frees its own terminals, once.
+        const order: [2]*Window = if (old_first) .{ window, moved } else .{ moved, window };
+        const second = order[1];
+        order[0].requestClose();
+        var msg: win32.MSG = undefined;
+        while (win32.PeekMessageW(&msg, null, WM_GHOSTTY_DESTROY, WM_GHOSTTY_DESTROY, win32.PM_REMOVE).toBool()) {
+            _ = win32.DispatchMessageW(&msg);
+        }
+        try std.testing.expectEqual(1, app.windows.items.len);
+        try std.testing.expect(app.windows.items[0] == second);
+        if (old_first) {
+            try std.testing.expectEqual(1, app.surfaces.items.len);
+            try std.testing.expect(app.surfaces.items[0] == b);
+            try std.testing.expect(moved.tab().tree.locate(b) != null);
+        } else {
+            try std.testing.expectEqual(3, app.surfaces.items.len);
+            for ([_]*Surface{ a, b2, b3 }) |pane| {
+                try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, pane) != null);
+                try std.testing.expect(window.find(pane) != null);
+            }
+        }
+        second.requestClose();
+        while (win32.PeekMessageW(&msg, null, WM_GHOSTTY_DESTROY, WM_GHOSTTY_DESTROY, win32.PM_REMOVE).toBool()) {
+            _ = win32.DispatchMessageW(&msg);
+        }
+        try std.testing.expectEqual(0, app.windows.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+    }
 }
 
 test "win32: tab and window actions behind a queued move act on the new window" {
@@ -4843,6 +5053,92 @@ test "win32: tab and window actions behind a queued move act on the new window" 
     try std.testing.expectEqual(1, app.windows.items.len);
     try std.testing.expectEqual(2, window.tabs.items.len);
     try std.testing.expect(!a.closing and !c.closing and !window.closing);
+}
+
+test "win32: tab and window actions behind a move that does not happen are dropped" {
+    // close_window, close_tab, move_tab and goto_tab from a terminal of a
+    // tab whose move to a new window is queued wait for it, meant for the
+    // new window (`moveQueuedFor`). When the move does not happen they are
+    // dropped, not made in the old window, where close_window would close
+    // it with the tabs the move was to leave there: when its terminal
+    // begins to close first, and when its window has no other tab left by
+    // then.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    app.config.@"window-new-tab-position" = .end;
+    // a; x and y side by side; c. x's tab shown.
+    const x = try testTab(&app, window);
+    const y = try testPane(&app, window);
+    const t = window.tabOf(x).?;
+    t.tree.deinit();
+    t.tree = try testRow(alloc, &.{ x, y });
+    const c = try testTab(&app, window);
+    window.selectTab(1);
+    const ta = window.tabOf(a).?;
+    const tc = window.tabOf(c).?;
+
+    const Check = struct {
+        // The move from x, then each action from y, in its tab. Made in
+        // the old window, each would change it: a and c would close, the
+        // tab move, another tab show, and the window close.
+        fn queue(app_: *App, x_: *Surface, y_: *Surface) !void {
+            const from: apprt.Target = .{ .surface = &y_.core_surface };
+            try std.testing.expect(try app_.performAction(.{ .surface = &x_.core_surface }, .move_tab_to_new_window, {}));
+            try std.testing.expect(try app_.performAction(from, .close_tab, .other));
+            try std.testing.expect(try app_.performAction(from, .move_tab, .{ .amount = 1 }));
+            try std.testing.expect(try app_.performAction(from, .goto_tab, .next));
+            try std.testing.expect(try app_.performAction(from, .close_window, {}));
+            try std.testing.expectEqual(5, app_.requests.items.len);
+        }
+
+        // The window as it was: these tabs in this order, `shown` shown,
+        // nothing closing.
+        fn same(window_: *Window, tabs: []const *Window.Tab, shown_: *Window.Tab) !void {
+            try std.testing.expect(!window_.closing);
+            try std.testing.expectEqual(tabs.len, window_.tabs.items.len);
+            for (tabs, window_.tabs.items) |want, have| try std.testing.expect(want == have);
+            try std.testing.expect(window_.tab() == shown_);
+            for (window_.tabs.items) |tab_| {
+                var it = tab_.tree.iterator();
+                while (it.next()) |entry| try std.testing.expect(!entry.view.closing);
+            }
+        }
+    };
+
+    // A move that fails takes the same way as one not made (`reportMove`
+    // returns false), but logs an error, which fails a test run.
+
+    // x begins to close before the move: the move is dropped, and so is
+    // what y queued behind it.
+    try Check.queue(&app, x, y);
+    app.forgetClosing(&x.core_surface);
+    for (app.requests.items) |request| try std.testing.expect(request == .dropped);
+    app.createRequested();
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try Check.same(window, &.{ ta, t, tc }, t);
+
+    // a and c close before the move: with no other tab, the tab stays.
+    try Check.queue(&app, x, y);
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(c.destroy());
+    app.createRequested();
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(x.window == window);
+    try Check.same(window, &.{t}, t);
 }
 
 test "win32: a moved tab takes its new frame's scale, place and title unshown" {
@@ -5685,6 +5981,14 @@ test "win32: a tab drag ends with a lost capture or a change of the tabs" {
     try std.testing.expectEqual(over.max_scroll, window.bar.scroll);
     try std.testing.expect(window.tabs.items[19].focused == b);
     try std.testing.expectEqual(19, window.selected);
+    // The highlight is what the tabs scrolled under the pointer, as for
+    // the wheel, not what was there at the last move: the last tab.
+    const hover = testBarLayout(window).hit(end, 10);
+    try std.testing.expect(std.meta.eql(window.bar.hover, hover));
+    try std.testing.expect(switch (hover) {
+        .tab, .close => |index| index == 19,
+        else => false,
+    });
 
     // And back to the left end: first again.
     testDragTo(bar, 0, 10);
@@ -5841,6 +6145,184 @@ test "win32: a tab dropped outside its window moves to a new one" {
         try std.testing.expectEqual(3, app.windows.items.len);
         try testTabOrder(window, &.{a});
         try std.testing.expect(a.window == window);
+    }
+}
+
+test "win32: a tab dropped just past its window's visible edge moves out" {
+    // GetWindowRect includes the invisible resize borders, a few pixels
+    // past the frame on the left, the right and the bottom: a tab released
+    // there is outside the window as it shows, and moves to a new one
+    // (`TabBar.visibleBounds`); one released just inside stays. Per-monitor
+    // aware, as the app is from its manifest, so that DWM's bounds are in
+    // the pointer's pixels.
+    const Context = struct {
+        extern "user32" fn SetThreadDpiAwarenessContext(context: ?win32.HANDLE) callconv(.winapi) ?win32.HANDLE;
+    };
+    const before = Context.SetThreadDpiAwarenessContext(win32.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) orelse
+        return error.TestUnexpectedResult;
+    defer _ = Context.SetThreadDpiAwarenessContext(before);
+
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    defer _ = win32.ReleaseCapture();
+    const tab = testBarLayout(window).tab;
+
+    // The border this is about, which Windows 11 gives the frame.
+    var rect: win32.RECT = undefined;
+    try std.testing.expect(win32.GetWindowRect(window.hwnd, &rect).toBool());
+    const visible = TabBar.visibleBounds(window.hwnd).?;
+    try std.testing.expect(visible.bottom + 2 < rect.bottom);
+
+    // b, pressed 40 px in, dragged down to a row of the screen and
+    // released there.
+    const Drop = struct {
+        fn at(bar_: win32.HWND, x: i32, screen_y: i32) !win32.POINT {
+            var p: win32.POINT = .{ .x = x, .y = 0 };
+            if (!win32.ClientToScreen(bar_, &p).toBool()) return error.TestUnexpectedResult;
+            p.y = screen_y;
+            if (!win32.ScreenToClient(bar_, &p).toBool()) return error.TestUnexpectedResult;
+            return p;
+        }
+        fn release(bar_: win32.HWND, p: win32.POINT) void {
+            _ = win32.SendMessageW(bar_, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(p.x, 10));
+            testDragTo(bar_, p.x, 100);
+            testDragTo(bar_, p.x, p.y);
+            _ = win32.SendMessageW(bar_, win32.WM_LBUTTONUP, 0, testPoint(p.x, p.y));
+        }
+    };
+
+    // Just inside the visible frame: it stays.
+    Drop.release(bar, try Drop.at(bar, tab + 40, visible.bottom - 2));
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try testTabOrder(window, &.{ a, b });
+
+    // Just past it, still inside the window rect: it moves out.
+    Drop.release(bar, try Drop.at(bar, tab + 40, visible.bottom + 1));
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expect(b.window == app.windows.items[1]);
+    try testTabOrder(window, &.{a});
+}
+
+test "win32: a tab dropped on a monitor of another DPI is placed again there" {
+    // The new frame, made at one DPI, gets WM_DPICHANGED as its place for
+    // the drop takes it to a monitor with another, and the rect Windows
+    // suggests, scaled about the frame's centre here, moves it off the
+    // drop: it is placed again from its new size, so that the label is
+    // under the pointer and the frame inside the work area, near the work
+    // area's corner too. A fake GetDpiForWindow, and a hook sending the
+    // WM_DPICHANGED Windows would send, stand in for a second monitor.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try Window.createBare(&app);
+    defer window.discard();
+
+    const Monitor = struct {
+        var frame: win32.HWND = undefined;
+        var dpi: win32.UINT = 96;
+        /// The next move of the frame takes it to the other monitor.
+        var armed = false;
+        var changes: usize = 0;
+
+        fn dpiOf(hwnd: win32.HWND) callconv(.winapi) win32.UINT {
+            return if (hwnd == frame) dpi else 96;
+        }
+
+        fn proc(code: c_int, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+            if (code >= 0) {
+                const sent: *const win32.CWPRETSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                if (armed and sent.hwnd == frame and sent.message == win32.WM_WINDOWPOSCHANGED) {
+                    armed = false;
+                    changes += 1;
+                    dpi = 144;
+                    var r: win32.RECT = undefined;
+                    if (win32.GetWindowRect(frame, &r).toBool()) {
+                        const w = @divTrunc(r.right - r.left, 4);
+                        const h = @divTrunc(r.bottom - r.top, 4);
+                        var suggested: win32.RECT = .{
+                            .left = r.left - w,
+                            .top = r.top - h,
+                            .right = r.right + w,
+                            .bottom = r.bottom + h,
+                        };
+                        _ = win32.SendMessageW(frame, win32.WM_DPICHANGED, 144 << 16 | 144, @bitCast(@intFromPtr(&suggested)));
+                    }
+                }
+            }
+            return win32.CallNextHookEx(null, code, wparam, lparam);
+        }
+    };
+    Monitor.frame = window.hwnd;
+    app.get_dpi_for_window = &Monitor.dpiOf;
+    const hook = win32.SetWindowsHookExW(
+        win32.WH_CALLWNDPROCRET,
+        Monitor.proc,
+        null,
+        std.os.windows.GetCurrentThreadId(),
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.UnhookWindowsHookEx(hook);
+
+    const info = try monitorOf(window.hwnd);
+    const work = info.rcWork;
+    const grab: win32.POINT = .{ .x = 40, .y = 10 };
+    for ([_]win32.POINT{
+        // The middle of the work area, where the frame fits as it is.
+        .{ .x = @divTrunc(work.left + work.right, 2), .y = @divTrunc(work.top + work.bottom, 2) },
+        // Its bottom-right corner, where it is pushed back inside.
+        .{ .x = work.right - 5, .y = work.bottom - 5 },
+    }, 0..) |at, i| {
+        // At 400x240 at the work area's corner, at 96 DPI.
+        Monitor.dpi = 96;
+        try std.testing.expect(win32.SetWindowPos(
+            window.hwnd,
+            null,
+            work.left,
+            work.top,
+            400,
+            240,
+            win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
+        ).toBool());
+        Monitor.armed = true;
+        window.placeForDrop(.{ .at = at, .grab = grab });
+        try std.testing.expectEqual(i + 1, Monitor.changes);
+
+        // At the size the new DPI gave it, inside the work area.
+        var placed: win32.RECT = undefined;
+        try std.testing.expect(win32.GetWindowRect(window.hwnd, &placed).toBool());
+        try std.testing.expectEqual(600, placed.right - placed.left);
+        try std.testing.expectEqual(360, placed.bottom - placed.top);
+        try std.testing.expect(placed.left >= work.left and placed.top >= work.top);
+        try std.testing.expect(placed.right <= work.right and placed.bottom <= work.bottom);
+        // The label under the pointer where the work area allows.
+        var origin: win32.POINT = .{ .x = 0, .y = 0 };
+        try std.testing.expect(win32.ClientToScreen(window.hwnd, &origin).toBool());
+        try std.testing.expectEqual(placed, Window.dropRect(placed, origin, .{ .at = at, .grab = grab }, work));
+        if (i == 0) {
+            try std.testing.expectEqual(at.x, origin.x + grab.x);
+            try std.testing.expectEqual(at.y, origin.y + grab.y);
+        }
     }
 }
 

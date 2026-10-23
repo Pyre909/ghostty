@@ -179,11 +179,7 @@ pub fn tabTitle(t: *const Tab) ?[:0]const u8 {
 /// the shown one or at the end, as `window-new-tab-position` asks; its
 /// index. The tab is not shown yet (`selectTab`).
 pub fn insertTab(self: *Window, surface: *Surface) !usize {
-    const alloc = self.app.core_app.alloc;
-    try self.tabs.ensureUnusedCapacity(alloc, 1);
-    const t = try alloc.create(Tab);
-    errdefer alloc.destroy(t);
-    t.* = .{ .tree = try .init(alloc, surface), .focused = surface };
+    const t = try self.tabFor(surface);
     errdefer comptime unreachable;
     const at = switch (self.app.config.@"window-new-tab-position") {
         .current => self.selected + 1,
@@ -192,6 +188,17 @@ pub fn insertTab(self: *Window, surface: *Surface) !usize {
     self.tabs.insertAssumeCapacity(at, t);
     self.bar.tabsChanged(self);
     return at;
+}
+
+/// A new tab holding only `surface`, focused, with room made for it in
+/// `tabs`, for the caller to put there.
+fn tabFor(self: *Window, surface: *Surface) Allocator.Error!*Tab {
+    const alloc = self.app.core_app.alloc;
+    try self.tabs.ensureUnusedCapacity(alloc, 1);
+    const t = try alloc.create(Tab);
+    errdefer alloc.destroy(t);
+    t.* = .{ .tree = try .init(alloc, surface), .focused = surface };
+    return t;
 }
 
 /// A new terminal, made with `opts` at the size of the client area, in a
@@ -318,15 +325,23 @@ fn unlinkTab(self: *Window, index: usize) bool {
 /// The one step that can fail, moving the terminals' windows to the new
 /// frame, comes first and is undone if it fails, so that the tab is then
 /// still here, as it was; if it cannot be undone, the move is finished
-/// instead (`reparentTab`). Never inside a core frame (`App.requests`):
-/// it lays terminals out and moves the focus.
+/// instead (`reparentTab`), and a terminal that still cannot go stays here
+/// in a tab of its own (`keepLeftOut`). Never inside a core frame
+/// (`App.requests`): it lays terminals out and moves the focus.
 pub fn moveTabTo(self: *Window, index: usize, to: *Window) !Moved {
     assert(self.tabs.items.len > 1);
     const t = self.tabs.items[index];
     const moved = try reparentTab(t, to.hwnd, self.hwnd);
     errdefer comptime unreachable;
+    const kept = if (moved == .after_failure) self.keepLeftOut(t, index, to.hwnd) else 0;
     to.adoptTab(self.takeTab(index), dpiOf(self.app, self.hwnd));
-    return moved;
+    // The first of them is shown in the tab's place if the tab was shown
+    // (`takeTab`); the others were shown with it, and are hidden now.
+    for (self.tabs.items[index..][0..kept]) |own| {
+        if (own != self.tab()) hideTab(own);
+    }
+    const result: Moved = if (kept > 0) .split else moved;
+    return result;
 }
 
 /// How `moveTabTo` moved a tab.
@@ -337,6 +352,10 @@ pub const Moved = enum {
     /// back, so the move was finished instead (`reparentTab`); the caller
     /// says so.
     after_failure,
+    /// As `after_failure`, but a terminal could not go even then, and
+    /// stayed in the old window, in a tab of its own (`keepLeftOut`); the
+    /// caller says so.
+    split,
 };
 
 /// Make each terminal of `t` a child window of the frame `to` in place of
@@ -352,18 +371,99 @@ pub const Moved = enum {
 /// one of those cannot go back either, the tab cannot stay whole where it
 /// was, so the move is finished instead: every terminal not in `to` yet
 /// is moved there again, and `.after_failure` is returned. A terminal
-/// that neither frame takes is left where it is, logged: no single frame
-/// can then hold the tab. None of this is known to happen: SetParent is
-/// not known to fail between live windows of one thread, and a tab never
-/// holds a terminal whose window is gone (`removePane`); tests make it
-/// fail (`test_set_parent`).
+/// that `to` does not take even then is still in `back`, and no single
+/// frame can hold the tab: the caller takes it out of the tab, to stay
+/// with `back`'s window (`keepLeftOut`). None of this is known to happen:
+/// SetParent is not known to fail between live windows of one thread, and
+/// a tab never holds a terminal whose window is gone (`removePane`); tests
+/// make it fail (`test_set_parent`).
 fn reparentTab(t: *Tab, to: win32.HWND, back: win32.HWND) !Moved {
     if (moveInto(t, to, null)) return .whole;
     if (moveInto(t, back, to)) return App.Error.Win32CallFailed;
     // A warning: the caller reports it (`App.createRequested`).
     log.warn("a terminal could not go back after a failed move to a new window: the move is finished instead", .{});
-    if (!moveInto(t, to, null)) log.err("a terminal is left out of its tab's new window", .{});
+    if (!moveInto(t, to, null)) {
+        log.warn("a terminal could not change frames even then: it stays in its old window", .{});
+    }
+    // Not known to happen, as a terminal that could not go back is still
+    // in `to`; but should none be, the tab stays whole where it was, and
+    // `to` holds no terminal (`discard`).
+    if (!anyIn(t, to)) return App.Error.Win32CallFailed;
     return .after_failure;
+}
+
+/// The terminal of `t` not in the frame `frame`, after the first `skip`
+/// of those, in the tree's order; null if there is none.
+fn leftOut(t: *const Tab, frame: win32.HWND, skip: usize) ?*Surface {
+    var seen: usize = 0;
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        if (win32.GetAncestor(entry.view.hwnd, win32.GA_PARENT) == frame) continue;
+        if (seen == skip) return entry.view;
+        seen += 1;
+    }
+    return null;
+}
+
+/// Whether a terminal of `t` is in the frame `frame`.
+fn anyIn(t: *const Tab, frame: win32.HWND) bool {
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        if (win32.GetAncestor(entry.view.hwnd, win32.GA_PARENT) == frame) return true;
+    }
+    return false;
+}
+
+/// After `reparentTab` finished a move that failed, take each terminal of
+/// `t`, the tab at `index`, that is still not in the frame `to` out of the
+/// tab, and keep it in this window, whose frame holds it, in a tab of its
+/// own after `t`; the number of those tabs. The rest of `t` then goes to
+/// `to`'s window, and its terminals go with it (`adoptTab`), so that each
+/// terminal belongs to the one window whose frame holds it, and closing
+/// that window frees it (`destroy`): a tab in `to`'s window holding one
+/// in this frame would see it freed with this frame, or a terminal of
+/// this window outlive it in `to`'s.
+///
+/// Out of memory, a terminal that cannot have a tab of its own is closed:
+/// out of every tab, in this frame and of this window, its teardown finds
+/// no tab to leave (`Surface.destroy`). One that cannot even leave `t`
+/// stays there, logged: then no frame holds the tab.
+fn keepLeftOut(self: *Window, t: *Tab, index: usize, to: win32.HWND) usize {
+    const alloc = self.app.core_app.alloc;
+    var kept: usize = 0;
+    var skip: usize = 0;
+    while (leftOut(t, to, skip)) |surface| {
+        const handle = t.tree.locate(surface).?;
+        // Made before it leaves `t`, which then cannot fail.
+        const own: ?*Tab = self.tabFor(surface) catch null;
+        // From the tree as it is, as `removePane` picks it.
+        const focus: ?*Surface = if (t.focused != surface) t.focused else focus: {
+            const next = (t.tree.goto(alloc, handle, .previous) catch null) orelse
+                (t.tree.goto(alloc, handle, .next) catch null) orelse
+                break :focus null;
+            break :focus t.tree.nodes[next.idx()].leaf;
+        };
+        const tree = t.tree.remove(alloc, handle) catch {
+            if (own) |o| freeTab(alloc, o);
+            log.err("out of memory: a terminal in its old frame stays in its tab's new window", .{});
+            skip += 1;
+            continue;
+        };
+        t.tree.deinit();
+        t.tree = tree;
+        t.focused = focus;
+        if (own) |o| {
+            self.tabs.insertAssumeCapacity(index + 1 + kept, o);
+            kept += 1;
+            log.warn("a terminal that could not change frames stays in its old window, in a tab of its own", .{});
+        } else {
+            log.err("out of memory: a terminal that could not change frames is closed", .{});
+            _ = win32.ShowWindow(surface.hwnd, win32.SW_HIDE);
+            surface.close(false);
+        }
+    }
+    if (kept > 0) self.bar.tabsChanged(self);
+    return kept;
 }
 
 /// Make each terminal of `t` that is not in the frame `into` yet a child
@@ -474,10 +574,12 @@ pub const Drop = struct {
 /// window, moves to a new window as `move_tab_to_new_window` moves it, as
 /// GTK's tab bar lets a tab be dragged out; the new frame placed so that
 /// the label is where it was dropped (`placeForDrop`). Nothing for the
-/// window's only tab, nor for a window being torn down. At once when the
-/// core may be re-entered, as it may when `run`'s loop dispatched the
-/// release; else recorded for `run`, naming the tab's focused terminal,
-/// which must be live, as `clickTab` records a click (`App.requests`).
+/// window's only tab, nor for a window being torn down. At once whenever
+/// the core may be re-entered, whichever loop dispatched the release:
+/// `run`'s, a system modal loop, or the pump inside a terminal's teardown
+/// (`App.moveTabOut`); else, under a prompt or a core frame, recorded for
+/// `run`, naming the tab's focused terminal, which must be live, as
+/// `clickTab` records a click (`App.requests`).
 pub fn dropTabOut(self: *Window, index: usize, drop: Drop) void {
     if (self.closing or self.app.terminating) return;
     if (index >= self.tabs.items.len or self.tabs.items.len <= 1) return;
@@ -501,7 +603,22 @@ pub fn dropTabOut(self: *Window, index: usize, drop: Drop) void {
 /// where the label was grabbed goes under the pointer, where the tab's
 /// label is when the bar shows (`dropRect`), on the monitor the pointer
 /// is on. Logged, and left where it is, if it cannot be.
+///
+/// The frame was made on whichever monitor Windows chose, at its DPI, and
+/// is placed from its size and caption there. On a monitor with another
+/// DPI it gets WM_DPICHANGED as it arrives, whose suggested rect, applied
+/// over the placed one, is scaled and moved: the label would no longer be
+/// under the pointer, nor the frame inside the work area. So once its DPI
+/// has changed it is placed again, from its size and caption at the new
+/// DPI.
 pub fn placeForDrop(self: *Window, drop: Drop) void {
+    const dpi = dpiOf(self.app, self.hwnd);
+    self.placeAt(drop);
+    if (dpiOf(self.app, self.hwnd) != dpi) self.placeAt(drop);
+}
+
+/// One placing of `placeForDrop`, from the frame as it is now.
+fn placeAt(self: *Window, drop: Drop) void {
     var frame: win32.RECT = undefined;
     var origin: win32.POINT = .{ .x = 0, .y = 0 };
     if (!win32.GetWindowRect(self.hwnd, &frame).toBool() or

@@ -172,6 +172,8 @@ pub const WM_MOUSEACTIVATE: UINT = 0x0021;
 /// lParam is the WINDOWPOS about to be applied, which the handler may
 /// change in place.
 pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
+/// lParam is the WINDOWPOS that was applied.
+pub const WM_WINDOWPOSCHANGED: UINT = 0x0047;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_NCCREATE: UINT = 0x0081;
 pub const WM_NCDESTROY: UINT = 0x0082;
@@ -549,6 +551,15 @@ pub extern "user32" fn SetWindowPos(
 pub const HHOOK = *opaque {};
 pub const HOOKPROC = *const fn (code: c_int, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT;
 pub const WH_CALLWNDPROC: c_int = 4;
+pub const WH_CALLWNDPROCRET: c_int = 12;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-cwpretstruct
+pub const CWPRETSTRUCT = extern struct {
+    lResult: LRESULT,
+    lParam: LPARAM,
+    wParam: WPARAM,
+    message: UINT,
+    hwnd: HWND,
+};
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-cwpstruct
 pub const CWPSTRUCT = extern struct {
     lParam: LPARAM,
@@ -658,6 +669,16 @@ pub extern "dwmapi" fn DwmSetWindowAttribute(
 ) callconv(.winapi) HRESULT;
 /// dwmapi.h, from Windows 10 20H1 (build 19041).
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
+/// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmgetwindowattribute
+pub extern "dwmapi" fn DwmGetWindowAttribute(
+    hwnd: HWND,
+    attribute: DWORD,
+    value: *anyopaque,
+    size: DWORD,
+) callconv(.winapi) HRESULT;
+/// The frame's visible bounds, a RECT in screen coordinates, without the
+/// invisible resize borders GetWindowRect includes (dwmapi.h).
+pub const DWMWA_EXTENDED_FRAME_BOUNDS: DWORD = 9;
 
 // Registry
 pub const HKEY = w.HKEY;

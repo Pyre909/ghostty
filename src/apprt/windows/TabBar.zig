@@ -174,6 +174,8 @@ pub const Bar = struct {
         self.scroll = scroll;
         self.wheel_rem = 0;
         self.follow(window, hwnd);
+        // The tabs moved under a pointer that did not, as for the wheel.
+        self.rehover(window);
     }
 
     /// The left button came up at `at`, ending a drag that began: in
@@ -181,9 +183,8 @@ pub const Bar = struct {
     /// new one (`Window.dropTabOut`), the label where it was grabbed.
     fn drop(window: *Window, hwnd: win32.HWND, d: Drag, at: win32.POINT) void {
         var screen = at;
-        var frame: RECT = undefined;
-        if (!win32.ClientToScreen(hwnd, &screen).toBool() or
-            !win32.GetWindowRect(window.hwnd, &frame).toBool()) return;
+        if (!win32.ClientToScreen(hwnd, &screen).toBool()) return;
+        const frame = visibleBounds(window.hwnd) orelse return;
         if (contains(frame, screen.x, screen.y)) return;
         window.dropTabOut(d.index, .{ .at = screen, .grab = d.grab });
     }
@@ -277,6 +278,31 @@ pub const Drag = struct {
     /// Whether the pointer went past the threshold: the tab follows it.
     active: bool = false,
 };
+
+/// The frame `hwnd` as it shows on the screen, for whether a drop is
+/// outside it: DWM's extended frame bounds, which leave out the invisible
+/// resize borders that GetWindowRect includes on Windows 10 and 11, a few
+/// pixels wide on the left, the right and the bottom ("the Window Rect now
+/// includes the area occupied by the drop shadow", GetWindowRect's
+/// remarks); else, as without DWM, GetWindowRect's rect. Null if the
+/// window rect cannot be read.
+///
+/// "Unlike the Window Rect, the DWM Extended Frame Bounds are not
+/// adjusted for DPI" (DWMWINDOWATTRIBUTE): for a caller Windows scales,
+/// as an exe without the app's manifest (the tests'), they are in other
+/// units than the pointer's, and need not lie inside the window rect.
+/// Then the window rect is used.
+pub fn visibleBounds(hwnd: win32.HWND) ?RECT {
+    var window: RECT = undefined;
+    if (!win32.GetWindowRect(hwnd, &window).toBool()) return null;
+    var frame: RECT = undefined;
+    if (win32.DwmGetWindowAttribute(hwnd, win32.DWMWA_EXTENDED_FRAME_BOUNDS, &frame, @sizeOf(RECT)) < 0) {
+        return window;
+    }
+    const inside = frame.left >= window.left and frame.top >= window.top and
+        frame.right <= window.right and frame.bottom <= window.bottom;
+    return if (inside) frame else window;
+}
 
 /// The bar's timer while a tab is dragged (`Bar.autoScroll`), and how often
 /// it fires: about once a frame at 60 Hz.
