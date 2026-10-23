@@ -1052,6 +1052,9 @@ pub const EN_CHANGE: UINT = 0x0300;
 pub const EM_GETSEL: UINT = 0x00B0;
 pub const EM_SETSEL: UINT = 0x00B1;
 pub const EM_REPLACESEL: UINT = 0x00C2;
+/// An EDIT copies its selection, and pastes the clipboard's text.
+pub const WM_COPY: UINT = 0x0301;
+pub const WM_PASTE: UINT = 0x0302;
 /// ECM_FIRST + 1: the gray hint an empty EDIT shows (Common Controls v6).
 pub const EM_SETCUEBANNER: UINT = 0x1501;
 pub const VK_BACK: WPARAM = 0x08;

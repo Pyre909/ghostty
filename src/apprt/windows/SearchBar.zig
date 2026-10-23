@@ -22,7 +22,9 @@
 //! There is no dialog manager here, so the subclass does what O1 found an
 //! EDIT does not: its WM_CHAR for Enter, Tab and Escape beeps, so those
 //! are swallowed, and Ctrl+Backspace inserts U+007F, so the word before the
-//! caret is deleted by hand (`wordStart`).
+//! caret is deleted by hand (`wordStart`). The terminal's bindings for the
+//! app, the window, its tabs and splits still act from the field, and its
+//! copy, paste and select all act on the field (`overlay_keys`).
 //!
 //! The count and the buttons are painted with GDI and hit-tested by a pure
 //! `Layout` of the bar's size, its DPI and the field's text height, as the
@@ -36,6 +38,7 @@ const input = @import("../../input.zig");
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
+const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
@@ -292,9 +295,9 @@ var edit_proc: ?win32.WNDPROC = null;
 pub var test_forwarded: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
 /// For tests: called with each binding action the bar would perform on its
-/// terminal's core (`perform`), in place of performing it; a test's
-/// terminal has no core.
-pub var test_perform: if (builtin.is_test) ?*const fn (*Surface, input.Binding.Action) void else void =
+/// terminal's core (`perform`), in place of performing it, and answering
+/// whether it was; a test's terminal has no core.
+pub var test_perform: if (builtin.is_test) ?*const fn (*Surface, input.Binding.Action) bool else void =
     if (builtin.is_test) null else {};
 
 /// `start_search` on `surface`: open its bar, with `needle` in the field
@@ -395,7 +398,7 @@ fn searchNow(surface: *Surface) void {
     // An unpaired surrogate becomes U+FFFD.
     const text = utf8FromWide(alloc, wide[0..n]) catch |err| return log.warn("cannot read the search field err={}", .{err});
     defer alloc.free(text);
-    perform(surface, .{ .search = text });
+    _ = perform(surface, .{ .search = text });
 }
 
 /// Enter, Shift+Enter or the up and down buttons: the next or previous
@@ -406,7 +409,7 @@ fn searchNow(surface: *Surface) void {
 fn navigate(surface: *Surface, to: input.Binding.Action.NavigateSearch) void {
     if (!surface.app.canReenterCore()) return;
     searchNow(surface);
-    perform(surface, .{ .navigate_search = to });
+    _ = perform(surface, .{ .navigate_search = to });
 }
 
 /// The bar's close button, or Escape in its field: `end_search` on the
@@ -417,20 +420,24 @@ fn navigate(surface: *Surface, to: input.Binding.Action.NavigateSearch) void {
 /// search it runs could not be stopped.
 fn close(surface: *Surface) void {
     if (!surface.app.canReenterCore()) return;
-    perform(surface, .end_search);
+    _ = perform(surface, .end_search);
     if (surface.search_bar.open) finish(surface);
     surface.app.applyPendingFocus();
 }
 
 /// Perform `action` on the terminal's core, as GTK's overlay does
 /// (`performBindingAction`), from a message `run`'s loop dispatched to the
-/// bar. Each caller first checks that the core may be re-entered, as a
-/// key is dropped under a prompt (`Surface.handleMessage`).
-fn perform(surface: *Surface, action: input.Binding.Action) void {
+/// bar: whether it was performed. Each caller first checks that the core
+/// may be re-entered, as a key is dropped under a prompt
+/// (`Surface.handleMessage`); so do the bindings the field's keys perform
+/// (`overlay_keys`).
+pub fn perform(surface: *Surface, action: input.Binding.Action) bool {
     if (builtin.is_test) if (test_perform) |seen| return seen(surface, action);
-    const core = surface.liveCore() orelse return;
-    _ = core.performBindingAction(action) catch |err|
-        log.warn("cannot perform a search action err={}", .{err});
+    const core = surface.liveCore() orelse return false;
+    return core.performBindingAction(action) catch |err| {
+        log.warn("cannot perform a binding action from a search bar action={t} err={}", .{ action, err });
+        return false;
+    };
 }
 
 /// Place `surface`'s bar over the top-right corner of its terminal, above
@@ -643,7 +650,8 @@ fn hitAt(surface: *Surface, hwnd: win32.HWND, lparam: win32.LPARAM) Hit {
 }
 
 /// The field's subclass: the keys an EDIT gets wrong without a dialog
-/// manager, and the focus. The bar is the field's parent.
+/// manager, the bindings that still act from the field
+/// (`overlay_keys.keyDown`), and the focus. The bar is the field's parent.
 fn editProc(
     hwnd: win32.HWND,
     msg: win32.UINT,
@@ -683,6 +691,8 @@ fn editProc(
             return 0;
         },
     }
+    // Then the terminal's bindings that still act from the field (D3).
+    if (overlay_keys.keyDown(surface, hwnd, proc, msg, wparam, lparam)) return 0;
     if (builtin.is_test) if (msg == win32.WM_CHAR) {
         test_forwarded += 1;
     };

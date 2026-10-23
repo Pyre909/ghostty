@@ -19,6 +19,7 @@ const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
+const overlay_keys = @import("overlay_keys.zig");
 const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
@@ -360,6 +361,14 @@ pub const App = struct {
             from: *CoreSurface,
             mode: apprt.action.CloseTabMode,
             behind: usize,
+        },
+
+        /// A binding a key in `from`'s search field found while the core
+        /// could not be re-entered, by the trigger it was found under, to
+        /// be looked up again and performed (`overlay_keys.replay`).
+        overlay_key: struct {
+            from: *CoreSurface,
+            trigger: input.Binding.Trigger,
         },
 
         /// One of the above whose surface began to close first: it has
@@ -1790,6 +1799,9 @@ pub const App = struct {
             .resize_window => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
+            .overlay_key => |key| {
+                if (key.from == core_surface) request.* = .dropped;
+            },
             .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
@@ -2301,6 +2313,7 @@ pub const App = struct {
                     const t = from.window.tabOf(from) orelse continue;
                     from.window.toggleZoom(t.focused orelse from);
                 },
+                .overlay_key => |key| overlay_keys.replay(key.from, key.trigger),
                 .dropped => {},
             }
         }
@@ -8286,13 +8299,16 @@ const FocusSeen = struct {
 const SearchSeen = struct {
     var buf: [512]u8 = undefined;
     var len: usize = 0;
-    fn seen(_: *Surface, action: input.Binding.Action) void {
+    /// Whether the actions seen were performed.
+    var performed: bool = true;
+    fn seen(_: *Surface, action: input.Binding.Action) bool {
         const s = switch (action) {
             .search => |text| std.mem.print(buf[len..], "search:{s};", .{text}),
             .navigate_search => |nav| std.mem.print(buf[len..], "navigate_search:{s};", .{@tagName(nav)}),
             else => std.mem.print(buf[len..], "{s};", .{@tagName(action)}),
-        } catch return;
+        } catch return performed;
         len += s.len;
+        return performed;
     }
     /// What was performed since the last call.
     fn take() []const u8 {
@@ -8732,6 +8748,258 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
     try std.testing.expectEqualStrings("0/0", SearchBar.countLabel(buf[0..48], bar.total, bar.selected));
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .search_selected, .{ .selected = null }));
     try std.testing.expect(bar.selected == null);
+}
+
+/// For tests: a key pressed in the search field `edit` with modifiers
+/// held, as `run` dispatches it: `char`, the character TranslateMessage
+/// queued for it (a WM_SYSCHAR with Alt), is posted before the key is
+/// sent, and the characters the field's subclass left in the queue are
+/// dispatched after it. `scan` is the key's scan code in lParam, with 0xE0
+/// in the high byte for an extended key; with none, the layout's mapping
+/// of `vk` stands for it (`scanCode`), which for the arrows is the keypad's.
+fn fieldKey(edit: win32.HWND, vk: u8, mods: struct { ctrl: bool = false, shift: bool = false, alt: bool = false, scan: u16 = 0 }, char: ?u16) !void {
+    var keys: [256]u8 = undefined;
+    if (!win32.GetKeyboardState(&keys).toBool()) return error.TestUnexpectedResult;
+    const saved = keys;
+    defer _ = win32.SetKeyboardState(&saved);
+    if (mods.ctrl) for ([_]usize{ 0x11, 0xA2 }) |vk_mod| {
+        keys[vk_mod] = 0x80;
+    };
+    if (mods.shift) for ([_]usize{ 0x10, 0xA0 }) |vk_mod| {
+        keys[vk_mod] = 0x80;
+    };
+    if (mods.alt) for ([_]usize{ 0x12, 0xA4 }) |vk_mod| {
+        keys[vk_mod] = 0x80;
+    };
+    if (!win32.SetKeyboardState(&keys).toBool()) return error.TestUnexpectedResult;
+    if (char) |c| _ = win32.PostMessageW(edit, if (mods.alt) win32.WM_SYSCHAR else win32.WM_CHAR, c, 0);
+    const extended: win32.LPARAM = if (mods.scan & 0xE000 != 0) 1 << 24 else 0;
+    const lparam: win32.LPARAM = (@as(win32.LPARAM, mods.scan & 0xFF) << 16) | extended;
+    _ = win32.SendMessageW(edit, if (mods.alt) win32.WM_SYSKEYDOWN else win32.WM_KEYDOWN, vk, lparam);
+    var m: win32.MSG = undefined;
+    for ([_][2]win32.UINT{ .{ win32.WM_CHAR, win32.WM_DEADCHAR }, .{ win32.WM_SYSCHAR, win32.WM_SYSDEADCHAR } }) |r| {
+        while (win32.PeekMessageW(&m, edit, r[0], r[1], win32.PM_REMOVE).toBool()) _ = win32.DispatchMessageW(&m);
+    }
+}
+
+/// For tests: the key messages a terminal's window receives, counted by a
+/// subclass of it (`install`, `remove`).
+const TerminalKeys = struct {
+    var count: usize = 0;
+    var old: ?win32.WNDPROC = null;
+
+    fn install(hwnd: win32.HWND) void {
+        count = 0;
+        const prev = win32.SetWindowLongPtrW(hwnd, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&proc)));
+        old = @ptrFromInt(@as(usize, @bitCast(prev)));
+    }
+
+    fn remove(hwnd: win32.HWND) void {
+        _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(old.?)));
+    }
+
+    fn proc(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+        switch (msg) {
+            win32.WM_KEYDOWN, win32.WM_SYSKEYDOWN, win32.WM_CHAR, win32.WM_SYSCHAR => count += 1,
+            else => {},
+        }
+        return win32.CallWindowProcW(old.?, hwnd, msg, wparam, lparam);
+    }
+};
+
+/// For tests: `SearchSeen`, and the core's answer to `start_search`, which
+/// is the apprt's `start_search` (CoreSurface.performBindingAction).
+const SearchAnswer = struct {
+    fn seen(surface: *Surface, action: input.Binding.Action) bool {
+        const performed = SearchSeen.seen(surface, action);
+        if (action == .start_search) {
+            _ = surface.app.performAction(.{ .surface = &surface.core_surface }, .start_search, .{ .needle = "" }) catch {};
+        }
+        return performed;
+    }
+};
+
+test "win32: keys in a search field perform the terminal's bindings for its window, and act on the field" {
+    // The overlay plan's D3, as GTK keeps a window's accelerators working
+    // while an entry has the focus: in the field, a binding is performed
+    // only if every action in it is the app's, the window's, a tab's or a
+    // split's, a search action, the palette or a title prompt; copy, paste
+    // and select all act on the field; anything else, and every key that
+    // types, is the field's, and no key reaches the terminal. Under a
+    // prompt a binding is recorded for `run` rather than performed.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    SearchBar.test_perform = &SearchAnswer.seen;
+    defer SearchBar.test_perform = null;
+    SearchSeen.performed = true;
+    defer SearchSeen.performed = true;
+    _ = SearchSeen.take();
+
+    // Bindings of every kind beside the defaults.
+    const arena = app.config._arena.?.allocator();
+    for ([_][]const u8{
+        "x=new_tab",
+        "ctrl+shift+k=text:hello",
+        "ctrl+shift+g>n=new_tab",
+        "unconsumed:ctrl+shift+u=new_tab",
+        "unconsumed:arrow_up=new_tab",
+        "performable:ctrl+shift+y=new_tab",
+        "all:ctrl+shift+h=select_all",
+        "all:ctrl+shift+l=new_tab",
+        "ctrl+shift+b=new_tab",
+        "chain=text:x",
+        "ctrl+shift+m=new_split:right",
+        "chain=select_all",
+    }) |binding| try app.config.keybind.parseCLI(arena, binding);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    TerminalKeys.install(a.hwnd);
+    defer TerminalKeys.remove(a.hwnd);
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "needle" }));
+    app.applyPendingFocus();
+    const edit = a.search_bar.edit.?;
+    var buf: [64]u8 = undefined;
+
+    // The default new-tab and next-tab keys, and Alt+F4: performed, and
+    // the control character Ctrl+Shift+T queued is not the field's.
+    const forwarded = SearchBar.test_forwarded;
+    try fieldKey(edit, 'T', .{ .ctrl = true, .shift = true }, 0x14);
+    try fieldKey(edit, win32.VK_TAB, .{ .ctrl = true }, null);
+    try fieldKey(edit, 0x73, .{ .alt = true }, null);
+    try std.testing.expectEqualStrings("new_tab;next_tab;close_window;", SearchSeen.take());
+    try std.testing.expectEqual(forwarded, SearchBar.test_forwarded);
+    try std.testing.expectEqualStrings("needle", try fieldText(a, &buf));
+
+    // start_search again: the core answers, and the field's text is
+    // selected again and given the focus once the key is handled.
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 2, 2);
+    FocusSeen.last = null;
+    try fieldKey(edit, 'F', .{ .ctrl = true, .shift = true }, 0x06);
+    try std.testing.expectEqualStrings("start_search;", SearchSeen.take());
+    try std.testing.expectEqual([2]u32{ 0, 6 }, fieldSelection(a));
+    try std.testing.expect(app.search_focus == null);
+    try std.testing.expect(FocusSeen.last == edit);
+
+    // Copy, paste and select all act on the field. Pressed first with no
+    // character queued, which the EDIT would act on by itself (U+0003,
+    // U+0016, U+0001); then a paste with its U+0016, which must not paste
+    // a second time. The clipboard's text is put back after.
+    const readClipboardText = @import("clipboard.zig").readClipboardText;
+    const saved = try readClipboardText(alloc, a.hwnd);
+    defer if (saved) |text| {
+        writeClipboardText(a.hwnd, text) catch {};
+        alloc.free(text);
+    };
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 4);
+    try fieldKey(edit, 'C', .{ .ctrl = true, .shift = true }, null);
+    {
+        const text = (try readClipboardText(alloc, a.hwnd)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("eed", text);
+    }
+    try writeClipboardText(a.hwnd, "pasted");
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 6, 6);
+    try fieldKey(edit, 'V', .{ .ctrl = true, .shift = true }, null);
+    try std.testing.expectEqualStrings("needlepasted", try fieldText(a, &buf));
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 0, 0);
+    try fieldKey(edit, 'V', .{ .ctrl = true, .shift = true }, 0x16);
+    try std.testing.expectEqualStrings("pastedneedlepasted", try fieldText(a, &buf));
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 2, 2);
+    try fieldKey(edit, 'A', .{ .ctrl = true, .shift = true }, null);
+    try std.testing.expectEqual([2]u32{ 0, 18 }, fieldSelection(a));
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+
+    // A chain with an action for the core and one for the field: both.
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 2, 2);
+    try fieldKey(edit, 'M', .{ .ctrl = true, .shift = true }, null);
+    try std.testing.expectEqualStrings("new_split;", SearchSeen.take());
+    try std.testing.expectEqual([2]u32{ 0, 18 }, fieldSelection(a));
+
+    // Not allowed, alone or in a chain: the default write_screen_file, a
+    // text binding, a binding's chained text, a leader, select all on every
+    // terminal: nothing is performed, the field's selection stays.
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 2, 2);
+    try fieldKey(edit, 'J', .{ .ctrl = true, .shift = true }, null);
+    try fieldKey(edit, 'K', .{ .ctrl = true, .shift = true }, null);
+    try fieldKey(edit, 'B', .{ .ctrl = true, .shift = true }, null);
+    try fieldKey(edit, 'G', .{ .ctrl = true, .shift = true }, null);
+    try fieldKey(edit, 'H', .{ .ctrl = true, .shift = true }, null);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expectEqual([2]u32{ 2, 2 }, fieldSelection(a));
+    // A key bound on every terminal, for the core: performed.
+    try fieldKey(edit, 'L', .{ .ctrl = true, .shift = true }, null);
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+
+    // A key that types is the field's, bound or not.
+    _ = win32.SetWindowTextW(edit, L(""));
+    try fieldKey(edit, 'X', .{}, 'x');
+    try fieldKey(edit, 'X', .{ .shift = true }, 'X');
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expectEqualStrings("xX", try fieldText(a, &buf));
+
+    // unconsumed: performed, and the key goes on to the field. A
+    // performable binding none of whose actions could act: as if unbound.
+    // Their control characters reach the EDIT, which ignores them.
+    const before = SearchBar.test_forwarded;
+    try fieldKey(edit, 'U', .{ .ctrl = true, .shift = true }, 0x15);
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    try std.testing.expectEqual(before + 1, SearchBar.test_forwarded);
+    try fieldKey(edit, 'Y', .{ .ctrl = true, .shift = true }, 0x19);
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    try std.testing.expectEqual(before + 1, SearchBar.test_forwarded);
+    SearchSeen.performed = false;
+    try fieldKey(edit, 'Y', .{ .ctrl = true, .shift = true }, 0x19);
+    SearchSeen.performed = true;
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    try std.testing.expectEqual(before + 2, SearchBar.test_forwarded);
+    // The key itself goes on too: a single-line EDIT takes Up as Left.
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 2, 2);
+    try fieldKey(edit, 0x26, .{ .scan = 0xE048 }, null);
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    try std.testing.expectEqual([2]u32{ 1, 1 }, fieldSelection(a));
+
+    // Under a prompt: recorded, then performed by `run`; an action on the
+    // field alone acts at once. Dropped if its terminal begins to close.
+    SearchBar.test_perform = &SearchSeen.seen;
+    app.prompt_depth = 1;
+    try fieldKey(edit, 'T', .{ .ctrl = true, .shift = true }, 0x14);
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 1);
+    try fieldKey(edit, 'A', .{ .ctrl = true, .shift = true }, null);
+    app.prompt_depth = 0;
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expectEqual([2]u32{ 0, 2 }, fieldSelection(a));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    switch (app.requests.items[0]) {
+        .overlay_key => |key| try std.testing.expect(key.from == &a.core_surface),
+        else => return error.TestUnexpectedResult,
+    }
+    app.createRequested();
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    try std.testing.expectEqual(0, app.requests.items.len);
+    app.prompt_depth = 1;
+    try fieldKey(edit, 'T', .{ .ctrl = true, .shift = true }, 0x14);
+    app.prompt_depth = 0;
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+
+    // None of it reached the terminal.
+    try std.testing.expectEqual(0, TerminalKeys.count);
 }
 
 test "win32: a search bar follows its terminal through zooms, tabs, splits and moves" {

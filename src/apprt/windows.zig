@@ -69,8 +69,12 @@
 //! has settled, as GTK's search entry waits (`SearchBar.Debounce`); Enter,
 //! Shift+Enter and the bar's buttons ask for the next and previous match,
 //! and `.search_total` and `.search_selected` make its count. The core's
-//! renderer draws the matches. A key in the field reaches the field, never
-//! a binding.
+//! renderer draws the matches. In the field, its own keys come first; then
+//! the terminal's bindings for the app, the window, its tabs and splits,
+//! search, the command palette and the title prompts still act, and copy,
+//! paste and select all act on the field (`overlay_keys`). Every other key
+//! is the field's: nothing typed there reaches the terminal. Leader
+//! sequences and key tables are not started from the field.
 //!
 //! ## What is still missing
 //!
@@ -180,6 +184,7 @@ test {
     _ = @import("windows/desktop_notifications.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/key.zig");
+    _ = @import("windows/overlay_keys.zig");
     _ = @import("windows/taskbar.zig");
     _ = @import("windows/toast.zig");
     _ = @import("windows/win32.zig");
