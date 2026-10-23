@@ -165,6 +165,12 @@ pub const App = struct {
     /// (`forgetClosing`) or is freed (`surfaceDestroyed`).
     search_focus: ?*Surface,
 
+    /// The terminal whose search bar `end_search` closed while the bar
+    /// held the keyboard focus, left shown until `applyPendingFocus` has
+    /// moved the focus out of it (`SearchBar.finish`). One for the app, as
+    /// only one window has the focus. Live when set, as `search_focus`.
+    search_hide: ?*Surface,
+
     /// Set when the loop should stop. Written only on the main thread.
     quit: bool,
 
@@ -371,6 +377,13 @@ pub const App = struct {
             trigger: input.Binding.Trigger,
         },
 
+        /// Enter, Escape or a button of `from`'s search bar while the core
+        /// could not be re-entered (`SearchBar.replay`).
+        search_key: struct {
+            from: *CoreSurface,
+            key: SearchBar.FieldKey,
+        },
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -513,6 +526,7 @@ pub const App = struct {
             .windows = .empty,
             .requests = .empty,
             .search_focus = null,
+            .search_hide = null,
             .quit = false,
             .quit_timer = .off,
             .ticking = false,
@@ -1802,6 +1816,9 @@ pub const App = struct {
             .overlay_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
+            .search_key => |key| {
+                if (key.from == core_surface) request.* = .dropped;
+            },
             .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
@@ -1810,6 +1827,10 @@ pub const App = struct {
         };
         if (self.search_focus) |surface| {
             if (&surface.core_surface == core_surface) self.search_focus = null;
+        }
+        // Its bar is destroyed with it (`Surface.destroy`).
+        if (self.search_hide) |surface| {
+            if (&surface.core_surface == core_surface) self.search_hide = null;
         }
     }
 
@@ -2221,6 +2242,14 @@ pub const App = struct {
             self.search_focus = null;
             surface.window.giveSearchFocus(surface);
         }
+        // Then the bar `end_search` left shown while it held the focus:
+        // hidden now that the focus has left it, or given to its terminal
+        // here if it has not (`SearchBar.place`); placed again instead if
+        // a `start_search` opened it meanwhile.
+        if (self.search_hide) |surface| {
+            self.search_hide = null;
+            SearchBar.place(surface);
+        }
     }
 
     /// Carry out `requests`, oldest first. Called by `run`, where
@@ -2314,6 +2343,7 @@ pub const App = struct {
                     from.window.toggleZoom(t.focused orelse from);
                 },
                 .overlay_key => |key| overlay_keys.replay(key.from, key.trigger),
+                .search_key => |key| SearchBar.replay(key.from, key.key),
                 .dropped => {},
             }
         }
@@ -2552,6 +2582,7 @@ pub const App = struct {
         }
         // A terminal with no core never passed through `forgetClosing`.
         if (self.search_focus == surface) self.search_focus = null;
+        if (self.search_hide == surface) self.search_hide = null;
         surface.deinit();
         self.core_app.alloc.destroy(surface);
 
@@ -3392,6 +3423,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.windows = .empty;
     app.requests = .empty;
     app.search_focus = null;
+    app.search_hide = null;
     app.quit = false;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
@@ -8286,11 +8318,19 @@ test "win32: float_window keeps a window on top, or puts it back" {
     try std.testing.expect(window.isFloating());
 }
 
-/// For tests: where `Window.test_set_focus` was last told the focus goes.
+/// For tests: where `Window.test_set_focus` was last told the focus goes,
+/// which `current`, as `Window.test_get_focus`, answers for GetFocus; and
+/// whether the window `watch` showed when the focus last moved.
 const FocusSeen = struct {
     var last: ?win32.HWND = null;
+    var watch: ?win32.HWND = null;
+    var watch_shown: bool = false;
     fn seen(hwnd: win32.HWND) void {
         last = hwnd;
+        if (watch) |w| watch_shown = shown(w);
+    }
+    fn current() ?win32.HWND {
+        return last;
     }
 };
 
@@ -8381,7 +8421,8 @@ test "win32: start_search opens a search bar over its terminal, its field to get
     // callback has returned (`App.search_focus`); a second one selects it
     // all again. end_search hides it, keeping its text, and gives the
     // terminal the focus if the field had it. The bar is a child of the
-    // frame, above the terminal (the overlay plan's O1).
+    // frame, above the terminal, as a child of the terminal would never
+    // be composed over its swap chain.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -8559,7 +8600,9 @@ test "win32: a search field gets the focus back, and takes its own keys" {
     try std.testing.expect(!shown(bar.hwnd.?));
     try std.testing.expect(FocusSeen.last == b.hwnd);
 
-    // Under a prompt, nothing.
+    // Under a prompt, Escape and the close button are recorded for `run`,
+    // as the field's bindings are: the first closes the bar, the second
+    // finds it closed. Dropped if the terminal begins to close.
     try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
     app.prompt_depth = 1;
     _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0);
@@ -8569,6 +8612,28 @@ test "win32: a search field gets the focus back, and takes its own keys" {
     app.prompt_depth = 0;
     try std.testing.expectEqualStrings("", SearchSeen.take());
     try std.testing.expect(bar.open);
+    try std.testing.expectEqual(2, app.requests.items.len);
+    for (app.requests.items) |request| switch (request) {
+        .search_key => |key| {
+            try std.testing.expect(key.from == &b.core_surface);
+            try std.testing.expectEqual(SearchBar.FieldKey.close, key.key);
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    app.createRequested();
+    try std.testing.expectEqualStrings("end_search;", SearchSeen.take());
+    try std.testing.expect(!bar.open);
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
+    app.prompt_depth = 1;
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0);
+    app.prompt_depth = 0;
+    app.forgetClosing(&b.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expect(bar.open);
+    try std.testing.expectEqual(0, app.requests.items.len);
 
     // The close button, pressed and released on it; not pressed on
     // another button.
@@ -8599,6 +8664,19 @@ fn searchTimerDue(hwnd: win32.HWND) bool {
     return win32.PeekMessageW(&msg, hwnd, win32.WM_TIMER, win32.WM_TIMER, win32.PM_REMOVE).toBool();
 }
 
+/// For tests: whether the search bar `hwnd`'s timer fires within two
+/// seconds, its WM_TIMER taken from the queue undispatched. Only for a
+/// timer that should fire: when the wait must still be on, the test asks
+/// the bar at a given time instead (`SearchBar.test_now`).
+fn searchTimerFires(hwnd: win32.HWND) bool {
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 10) {
+        if (searchTimerDue(hwnd)) return true;
+        win32.Sleep(10);
+    }
+    return false;
+}
+
 /// For tests: the search bar `hwnd`'s timer, as `run` would dispatch it.
 fn searchTimer(hwnd: win32.HWND) void {
     _ = win32.SendMessageW(hwnd, win32.WM_TIMER, SearchBar.search_timer, 0);
@@ -8610,8 +8688,10 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
     // given by start_search, and again when the bar opens again; Enter,
     // Shift+Enter and the up and down buttons ask for the next and previous
     // match, after a search still to be made. Under a prompt the search
-    // waits and navigation is dropped; end_search drops a search not yet
-    // made. search_total and search_selected make the count.
+    // waits and navigation is recorded for `run`; end_search drops a
+    // search not yet made. search_total and search_selected make the
+    // count. The wait is measured on a clock the test sets
+    // (`SearchBar.test_now`), the timer it waits on being real.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -8624,6 +8704,8 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
     defer Window.test_set_focus = null;
     SearchBar.test_perform = &SearchSeen.seen;
     defer SearchBar.test_perform = null;
+    SearchBar.test_now = 1000;
+    defer SearchBar.test_now = null;
 
     const window = try testFrame(&app);
     testResize(window, 900, 500);
@@ -8639,31 +8721,38 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
     const edit = bar.edit.?;
     _ = SearchSeen.take();
 
-    // Typed text: searched for after the wait, from the timer, once.
+    // Typed text: searched for after the wait, from the timer, once. A
+    // timer that comes a millisecond early waits out the rest.
     _ = win32.SetWindowTextW(edit, L("alpha"));
     try std.testing.expectEqualStrings("", SearchSeen.take());
-    win32.Sleep(40);
-    try std.testing.expect(!searchTimerDue(hwnd));
-    win32.Sleep(250);
-    try std.testing.expect(searchTimerDue(hwnd));
+    SearchBar.test_now = 1149;
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expect(searchTimerFires(hwnd));
+    SearchBar.test_now = 1150;
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("search:alpha;", SearchSeen.take());
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("", SearchSeen.take());
-    // And the timer stopped.
+    // And the timer stopped: it never fires again.
     win32.Sleep(200);
     try std.testing.expect(!searchTimerDue(hwnd));
 
-    // Changes inside the wait: one search, for the last text.
+    // Changes inside the wait: each starts it again, and there is one
+    // search, for the last text.
     _ = win32.SetWindowTextW(edit, L("alp"));
+    SearchBar.test_now = 1250;
     _ = win32.SetWindowTextW(edit, L("alpha beta"));
+    SearchBar.test_now = 1300;
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    SearchBar.test_now = 1400;
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("search:alpha beta;", SearchSeen.take());
 
     // Emptied: at once, which stops the search.
     _ = win32.SetWindowTextW(edit, L(""));
-    win32.Sleep(100);
-    try std.testing.expect(searchTimerDue(hwnd));
+    try std.testing.expect(searchTimerFires(hwnd));
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("search:;", SearchSeen.take());
 
@@ -8696,34 +8785,61 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
     _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, testMid(l.down));
     try std.testing.expectEqualStrings("navigate_search:next;navigate_search:previous;", SearchSeen.take());
 
-    // Under a prompt: the search waits for the next tick of its timer,
-    // and Enter is dropped.
+    // Under a prompt: the search waits for the next tick of its timer;
+    // Enter and the buttons are recorded for `run`, which makes the search
+    // still to be made first, as Enter does.
     _ = win32.SetWindowTextW(edit, L("delta"));
+    SearchBar.test_now = 2000;
     app.prompt_depth = 1;
     searchTimer(hwnd);
     _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testMid(l.down));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, testMid(l.down));
     app.prompt_depth = 0;
     try std.testing.expectEqualStrings("", SearchSeen.take());
-    win32.Sleep(250);
-    try std.testing.expect(searchTimerDue(hwnd));
+    try std.testing.expect(searchTimerFires(hwnd));
+    try std.testing.expectEqual(2, app.requests.items.len);
+    app.createRequested();
+    try std.testing.expectEqualStrings("search:delta;navigate_search:next;navigate_search:previous;", SearchSeen.take());
     searchTimer(hwnd);
-    try std.testing.expectEqualStrings("search:delta;", SearchSeen.take());
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    // Recorded for a bar closed before `run` came to it: nothing.
+    app.prompt_depth = 1;
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    app.prompt_depth = 0;
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    app.createRequested();
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    searchTimer(hwnd);
+    _ = SearchSeen.take();
+    // The search under a prompt, after the wait, from the timer.
+    _ = win32.SetWindowTextW(edit, L("epsilon"));
+    app.prompt_depth = 1;
+    SearchBar.test_now = 3000;
+    searchTimer(hwnd);
+    app.prompt_depth = 0;
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expect(searchTimerFires(hwnd));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:epsilon;", SearchSeen.take());
 
     // An unpaired surrogate is U+FFFD.
     const lone = [_:0]u16{ 'a', 0xD800, 'b' };
     _ = win32.SetWindowTextW(edit, &lone);
+    SearchBar.test_now = 3150;
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("search:a\u{FFFD}b;", SearchSeen.take());
 
-    // end_search drops a search not yet made; opened again, the text it
-    // kept is searched for at once. Opened when open, nothing.
+    // end_search drops a search not yet made, due or not; opened again,
+    // the text it kept is searched for at once. Opened when open, nothing.
     _ = win32.SetWindowTextW(edit, L("omega"));
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    SearchBar.test_now = 4000;
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("", SearchSeen.take());
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
-    win32.Sleep(100);
-    try std.testing.expect(searchTimerDue(hwnd));
+    try std.testing.expect(searchTimerFires(hwnd));
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("search:omega;", SearchSeen.take());
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
@@ -8732,8 +8848,7 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
 
     // A needle, as search_selection gives: searched for at once.
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "needle" }));
-    win32.Sleep(100);
-    try std.testing.expect(searchTimerDue(hwnd));
+    try std.testing.expect(searchTimerFires(hwnd));
     searchTimer(hwnd);
     try std.testing.expectEqualStrings("search:needle;", SearchSeen.take());
 
@@ -8820,13 +8935,13 @@ const SearchAnswer = struct {
 };
 
 test "win32: keys in a search field perform the terminal's bindings for its window, and act on the field" {
-    // The overlay plan's D3, as GTK keeps a window's accelerators working
-    // while an entry has the focus: in the field, a binding is performed
-    // only if every action in it is the app's, the window's, a tab's or a
-    // split's, a search action, the palette or a title prompt; copy, paste
-    // and select all act on the field; anything else, and every key that
-    // types, is the field's, and no key reaches the terminal. Under a
-    // prompt a binding is recorded for `run` rather than performed.
+    // As GTK keeps a window's accelerators working while an entry has the
+    // focus: in the field, a binding is performed only if every action in
+    // it is on the allow-list (`overlay_keys.route`); copy, paste and
+    // select all act on the field; anything else, and every key that
+    // types, is the field's, and no key reaches the terminal. An Alt+key
+    // no binding takes does not beep. Under a prompt a binding is
+    // recorded for `run` rather than performed.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -8854,6 +8969,7 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
         "performable:ctrl+shift+y=new_tab",
         "all:ctrl+shift+h=select_all",
         "all:ctrl+shift+l=new_tab",
+        "unconsumed:all:ctrl+shift+o=new_tab",
         "ctrl+shift+b=new_tab",
         "chain=text:x",
         "ctrl+shift+m=new_split:right",
@@ -8943,6 +9059,21 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
     // A key bound on every terminal, for the core: performed.
     try fieldKey(edit, 'L', .{ .ctrl = true, .shift = true }, null);
     try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    // With unconsumed: too, its key is consumed all the same, as the core
+    // consumes an all: binding's: its control character never reaches the
+    // EDIT.
+    const before_all = SearchBar.test_forwarded;
+    try fieldKey(edit, 'O', .{ .ctrl = true, .shift = true }, 0x0F);
+    try std.testing.expectEqualStrings("new_tab;", SearchSeen.take());
+    try std.testing.expectEqual(before_all, SearchBar.test_forwarded);
+
+    // An Alt+letter no binding takes: its WM_SYSCHAR, which the default
+    // procedure would beep at as a menu mnemonic, never reaches the EDIT.
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 2, 2);
+    try fieldKey(edit, 'X', .{ .alt = true }, 'x');
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expectEqual(before_all, SearchBar.test_forwarded);
+    try std.testing.expectEqualStrings("pastedneedlepasted", try fieldText(a, &buf));
 
     // A key that types is the field's, bound or not.
     _ = win32.SetWindowTextW(edit, L(""));
@@ -9102,7 +9233,149 @@ test "win32: a search bar follows its terminal through zooms, tabs, splits and m
     try std.testing.expect(!win32.IsWindow(hwnd).toBool());
     try std.testing.expect(app.search_focus == null);
 
-    // A window closing with a bar open frees both.
+    // A window closing with a bar open frees both, whichever of the two
+    // Windows destroys first. The terminal raised above its bar is
+    // destroyed, and freed, first, as Windows destroys a frame's children
+    // from the top: its bar then lets go of it (`Bar.deinit`), and gets
+    // its own WM_DESTROY with no terminal to write to.
     try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
-    try std.testing.expect(b.search_bar.hwnd != null);
+    const b_bar = b.search_bar.hwnd.?;
+    // In the new window, with the tab it moved in.
+    const frame = b.window.hwnd;
+    try std.testing.expect(frame == moved.hwnd);
+    _ = win32.SetWindowPos(b.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+    try std.testing.expect(above(frame, b.hwnd, b_bar));
+    SearchBar.test_detached = 0;
+    try std.testing.expect(win32.DestroyWindow(frame).toBool());
+    try std.testing.expect(!win32.IsWindow(b_bar).toBool());
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(SearchBar.test_detached > 0);
+}
+
+/// For tests: `SearchSeen`, and the core's answer to `end_search`, the
+/// apprt's `end_search` (CoreSurface.performBindingAction), noting what it
+/// left as it returned: whether the bar showed, and where the focus was.
+const EndAnswer = struct {
+    var bar_shown: bool = false;
+    var focus: ?win32.HWND = null;
+    fn seen(surface: *Surface, action: input.Binding.Action) bool {
+        const performed = SearchSeen.seen(surface, action);
+        if (action == .end_search) {
+            _ = surface.app.performAction(.{ .surface = &surface.core_surface }, .end_search, {}) catch {};
+            bar_shown = shown(surface.search_bar.hwnd.?);
+            focus = FocusSeen.last;
+        }
+        return performed;
+    }
+};
+
+test "win32: a search bar hides once the focus has left it, and opens only where it shows" {
+    // end_search while the field has the keyboard focus, from Escape or a
+    // binding in the field, leaves the bar shown until the core's
+    // end_search has returned; then the terminal takes the focus, and only
+    // then does the bar hide, so that hiding the window with the focus
+    // never moves the focus into the core still on the stack. A bar that
+    // hides for want of room hands its terminal the focus first too.
+    // start_search in a terminal too small for the bar is not performed.
+    // A bar made again takes the font.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    SearchBar.test_perform = &EndAnswer.seen;
+    defer SearchBar.test_perform = null;
+    FocusSeen.last = null;
+    defer FocusSeen.watch = null;
+    _ = SearchSeen.take();
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    const bar = &a.search_bar;
+    const hwnd = bar.hwnd.?;
+    const edit = bar.edit.?;
+    try std.testing.expect(FocusSeen.last == edit);
+    FocusSeen.watch = hwnd;
+
+    // The core's end_search, as a binding performs it: closed, still
+    // shown, the focus where it was. Once it has returned, the focus goes
+    // to the terminal while the bar shows, and then the bar hides.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    try std.testing.expect(!bar.open);
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(FocusSeen.last == edit);
+    try std.testing.expect(app.search_hide == a);
+    FocusSeen.watch_shown = false;
+    app.applyPendingFocus();
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try std.testing.expect(FocusSeen.watch_shown);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(app.search_hide == null);
+
+    // Escape in the field: the same, around the core's own end_search.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    try std.testing.expect(FocusSeen.last == edit);
+    EndAnswer.bar_shown = false;
+    FocusSeen.watch_shown = false;
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0);
+    try std.testing.expectEqualStrings("end_search;", SearchSeen.take());
+    try std.testing.expect(EndAnswer.bar_shown);
+    try std.testing.expect(EndAnswer.focus == edit);
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try std.testing.expect(FocusSeen.watch_shown);
+    try std.testing.expect(!shown(hwnd));
+
+    // A bar whose field has the focus, its terminal shrunk below the
+    // bar's least size: the terminal takes the focus, then the bar hides,
+    // still open.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    try std.testing.expect(FocusSeen.last == edit);
+    FocusSeen.watch_shown = false;
+    testResize(window, 240, 500);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try std.testing.expect(FocusSeen.watch_shown);
+    try std.testing.expect(bar.open);
+
+    // start_search there: not performed, so that the key goes on, and the
+    // bar not opened; with room again, it opens.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    app.applyPendingFocus();
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "x" }));
+    try std.testing.expect(!bar.open);
+    try std.testing.expect(app.search_focus == null);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("", try fieldText(a, &buf));
+    testResize(window, 900, 500);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    try expectBarOver(window, a);
+    app.applyPendingFocus();
+
+    // Its window destroyed while its terminal lives, as when it cannot
+    // follow the terminal to a new frame: the next start_search makes
+    // another, whose field has the bar's font.
+    try std.testing.expect(win32.DestroyWindow(hwnd).toBool());
+    try std.testing.expect(bar.hwnd == null);
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    const font = win32.SendMessageW(bar.edit.?, win32.WM_GETFONT, 0, 0);
+    try std.testing.expect(font != 0);
+    try std.testing.expectEqual(@intFromPtr(bar.font.?), @as(usize, @bitCast(font)));
 }

@@ -1,6 +1,5 @@
 //! Keys typed into an overlay's field, as the search bar's: which of the
-//! terminal's bindings still act while the field has the keyboard focus
-//! (the overlay plan's D3, ~/ghostty-win/notes/win32-overlay-plan.md).
+//! terminal's bindings still act while the field has the keyboard focus.
 //!
 //! GTK's overlays keep the window's accelerators working while their entry
 //! has the focus; the entry takes everything else. Here the field's own
@@ -11,7 +10,8 @@
 //! terminal's root binding set (the set `CoreSurface.keyEventIsBinding`
 //! reads), and the binding is performed only if every action in it is on
 //! the allow-list (`route`): actions of the app, the window, its tabs and
-//! splits, the search actions, the command palette and the title prompts.
+//! splits, the search actions, the command palette, the terminal's title,
+//! and the rest of GTK's window accelerators, reset and clear.
 //! Three act on the field instead of the terminal behind it: copy, paste
 //! and select all. A key whose binding is not allowed, or that has none,
 //! is the field's: typed into it or ignored by it. Nothing typed in the
@@ -20,7 +20,8 @@
 //! Leader sequences and key tables are not started from a field: a key
 //! that leads a sequence, or that only a key table binds, is the field's,
 //! and a sequence or table already active in the terminal is not consulted.
-//! This is a documented limit, as the plan has it.
+//! This is a known limit: a field would need the sequence and table state
+//! the core keeps for the terminal's own key path.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -106,25 +107,32 @@ pub fn route(key: Binding.Action.Key) Route {
         .navigate_search,
         .search_selection,
         .end_search,
-        // The palette and the remaining title prompt.
+        // The palette, and the terminal's title, which titles its tab and
+        // window as `set_tab_title` does, and writes nothing to the pty.
         .toggle_command_palette,
         .prompt_surface_title,
+        .set_surface_title,
+        // GTK's window accelerators, so they act from its overlays' entries
+        // too (`syncActionAccelerators` in
+        // src/apprt/gtk/class/application.zig): they reset or clear the
+        // terminal behind the field, and take no input from it.
+        .reset,
+        .clear_screen,
         => .core,
 
         .copy_to_clipboard => .copy,
         .paste_from_clipboard => .paste,
         .select_all => .select_all,
 
-        // Everything that acts on the terminal behind the field, writes to
-        // its pty, or starts a key table; and `ignore`, which would make a
-        // key the field takes dead.
+        // Everything else that acts on the terminal behind the field,
+        // writes to its pty, or starts a key table; and `ignore`, which
+        // would make a key the field takes dead.
         .ignore,
         .unbind,
         .csi,
         .esc,
         .text,
         .cursor_key,
-        .reset,
         .paste_from_selection,
         .copy_url_to_clipboard,
         .copy_title_to_clipboard,
@@ -133,7 +141,6 @@ pub fn route(key: Binding.Action.Key) Route {
         .reset_font_size,
         .set_font_size,
         .search,
-        .clear_screen,
         .scroll_to_top,
         .scroll_to_bottom,
         .scroll_to_selection,
@@ -147,8 +154,10 @@ pub fn route(key: Binding.Action.Key) Route {
         .write_scrollback_file,
         .write_screen_file,
         .write_selection_file,
-        .set_surface_title,
         .toggle_readonly,
+        // GTK's accelerators have it, but this runtime has no inspector to
+        // open (`App.performAction` does not handle the apprt's
+        // `inspector`), so the key stays the field's.
         .inspector,
         .show_on_screen_keyboard,
         .toggle_secure_input,
@@ -304,7 +313,8 @@ fn allowed(leaf: *const Binding.Set.GenericLeaf) bool {
 /// `maybeHandleBinding` does, from a field `edit` (null if it has gone).
 /// A binding with an action for the core is recorded instead while the
 /// core may not be re-entered, as under a prompt, as `Window.clickTab`
-/// records a tab (`.now`; a replay runs where it may).
+/// records a tab (`.now`; a replay runs where it may), and as the search
+/// bar records its own Enter, Escape and buttons (`SearchBar.record`).
 fn perform(
     surface: *Surface,
     edit: ?win32.HWND,
@@ -355,7 +365,9 @@ fn perform(
         performed = true;
     }
     if (leaf.flags.performable and !performed) return .done_and_field;
-    if (!leaf.flags.consumed) return .done_and_field;
+    // The core consumes an `all:` or `global:` binding's key whatever its
+    // `unconsumed:` says (`maybeHandleBinding`).
+    if (!leaf.flags.consumed and !(leaf.flags.all or leaf.flags.global)) return .done_and_field;
     return .done;
 }
 
@@ -372,7 +384,7 @@ fn performAll(surface: *Surface, actions: []const Binding.Action) void {
 
 /// The surface a request names: the live core surface. A test's terminal
 /// has none, and stands for its own.
-fn coreOf(surface: *Surface) ?*CoreSurface {
+pub fn coreOf(surface: *Surface) ?*CoreSurface {
     if (surface.liveCore()) |core| return core;
     if (builtin.is_test) return &surface.core_surface;
     return null;
@@ -536,13 +548,18 @@ test "win32: a field's own keys" {
 
 test "win32: the allow-list's choices" {
     // A few of each kind; the switch itself is exhaustive.
-    for ([_]Binding.Action.Key{ .new_tab, .next_tab, .goto_tab, .new_split, .goto_split, .close_surface, .close_window, .toggle_fullscreen, .quit, .new_window, .start_search, .navigate_search, .search_selection, .end_search, .toggle_command_palette, .prompt_surface_title, .prompt_tab_title, .prompt_window_title }) |k| {
+    for ([_]Binding.Action.Key{ .new_tab, .next_tab, .goto_tab, .new_split, .goto_split, .close_surface, .close_window, .toggle_fullscreen, .quit, .new_window, .start_search, .navigate_search, .search_selection, .end_search, .toggle_command_palette, .prompt_surface_title, .set_surface_title, .prompt_tab_title, .prompt_window_title }) |k| {
         try std.testing.expectEqual(Route.core, route(k));
     }
+    // GTK's window accelerators act from its overlays, and so from the
+    // field, but the inspector, which this runtime does not have.
+    try std.testing.expectEqual(Route.core, route(.reset));
+    try std.testing.expectEqual(Route.core, route(.clear_screen));
+    try std.testing.expectEqual(Route.field, route(.inspector));
     try std.testing.expectEqual(Route.copy, route(.copy_to_clipboard));
     try std.testing.expectEqual(Route.paste, route(.paste_from_clipboard));
     try std.testing.expectEqual(Route.select_all, route(.select_all));
-    for ([_]Binding.Action.Key{ .ignore, .text, .csi, .esc, .search, .clear_screen, .scroll_page_up, .adjust_selection, .write_screen_file, .increase_font_size, .activate_key_table, .end_key_sequence, .paste_from_selection, .set_surface_title }) |k| {
+    for ([_]Binding.Action.Key{ .ignore, .text, .csi, .esc, .search, .scroll_page_up, .adjust_selection, .write_screen_file, .increase_font_size, .activate_key_table, .end_key_sequence, .paste_from_selection }) |k| {
         try std.testing.expectEqual(Route.field, route(k));
     }
 }

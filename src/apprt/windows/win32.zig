@@ -503,6 +503,8 @@ pub extern "user32" fn GetWindowPlacement(hwnd: HWND, placement: *WINDOWPLACEMEN
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowplacement
 pub extern "user32" fn SetWindowPlacement(hwnd: HWND, placement: *const WINDOWPLACEMENT) callconv(.winapi) BOOL;
 pub extern "user32" fn GetFocus() callconv(.winapi) ?HWND;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-ischild
+pub extern "user32" fn IsChild(parent: HWND, hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setfocus
 pub extern "user32" fn SetFocus(hwnd: ?HWND) callconv(.winapi) ?HWND;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getactivewindow
@@ -1045,6 +1047,7 @@ pub extern "user32" fn GetWindow(hwnd: HWND, cmd: UINT) callconv(.winapi) ?HWND;
 pub extern "user32" fn GetWindowTextLengthW(hwnd: HWND) callconv(.winapi) c_int;
 pub const ES_AUTOHSCROLL: DWORD = 0x0080;
 pub const WM_SETFONT: UINT = 0x0030;
+pub const WM_GETFONT: UINT = 0x0031;
 pub const WM_COMMAND: UINT = 0x0111;
 pub const WM_CTLCOLOREDIT: UINT = 0x0133;
 /// WM_COMMAND's high word of wParam: the EDIT's text changed.

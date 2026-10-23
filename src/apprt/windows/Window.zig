@@ -1749,6 +1749,17 @@ pub fn focusTarget(surface: *const Surface) win32.HWND {
 pub var test_set_focus: if (builtin.is_test) ?*const fn (win32.HWND) void else void =
     if (builtin.is_test) null else {};
 
+/// For tests: answers in place of GetFocus (`keyboardFocus`), as
+/// `test_set_focus` stands for SetFocus.
+pub var test_get_focus: if (builtin.is_test) ?*const fn () ?win32.HWND else void =
+    if (builtin.is_test) null else {};
+
+/// The window with the keyboard focus on this thread, GetFocus's answer.
+pub fn keyboardFocus() ?win32.HWND {
+    if (builtin.is_test) if (test_get_focus) |get| return get();
+    return win32.GetFocus();
+}
+
 /// SetFocus(`hwnd`), a window of this frame; with `active_only`, only
 /// while the frame is the active window, as another would be activated by
 /// it.
