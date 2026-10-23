@@ -504,7 +504,10 @@ pub extern "user32" fn SetFocus(hwnd: ?HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getancestor
 pub extern "user32" fn GetAncestor(hwnd: HWND, flags: UINT) callconv(.winapi) ?HWND;
+pub const GA_PARENT: UINT = 1;
 pub const GA_ROOT: UINT = 2;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setparent
+pub extern "user32" fn SetParent(child: HWND, parent: ?HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;

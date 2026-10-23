@@ -35,10 +35,13 @@
 //! ## Windows
 //!
 //! A window holds tabs, each with its terminals in a split tree, and shows
-//! one, laid out over its client area (`Window`, `Tab`). An action that
+//! one, laid out over its client area (`Window`, `Tab`).
+//! `.move_tab_to_new_window` moves a tab whole into a new window: its
+//! terminals keep their windows and cores and only change frames
+//! (`Window.moveTabTo`). An action that
 //! lays out terminals, moves the focus to another window or tab, or frees
-//! core state, such as `.new_split`, `.goto_tab`, `.toggle_fullscreen` or
-//! a full `.reload_config`, is recorded and carried out by `App.run` once
+//! core state, such as `.new_split`, `.goto_tab`, `.toggle_fullscreen`,
+//! `.move_tab_to_new_window` or a full `.reload_config`, is recorded and carried out by `App.run` once
 //! the core frame that asked has returned, and so is the frame change a
 //! new configuration's `window-decoration` makes (`App.requests`, which
 //! `App.Request` lists); `.goto_split` moves the focus once the core's key

@@ -320,6 +320,10 @@ pub const App = struct {
             amount: isize,
         },
 
+        /// `.move_tab_to_new_window`: the tab of this surface, moved into
+        /// a window of its own (`moveTabToNewWindow`).
+        move_tab_to_new_window: *CoreSurface,
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -978,6 +982,7 @@ pub const App = struct {
             .new_tab => self.requestTab(target),
             .goto_tab => self.gotoTab(target, value),
             .move_tab => self.moveTab(target, value),
+            .move_tab_to_new_window => self.requestMoveTabToNewWindow(target),
             .set_tab_title => setTabTitle(target, value),
             .new_split => self.requestSplit(target, value),
             .goto_split => self.gotoSplit(target, value),
@@ -1150,6 +1155,27 @@ pub const App = struct {
             .amount = value.amount,
         } }) catch |err| {
             log.warn("cannot record a tab to move err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.move_tab_to_new_window`: whether the terminal's window has another
+    /// tab to keep, or one still to open there (`tabQueuedIn`, as when a
+    /// binding chains it after `new_tab`); else, and for the app, `false`,
+    /// as on GTK, so that the key reaches the terminal. The move is made by
+    /// `run` (`moveTabToNewWindow`): a binding performs this inside the
+    /// core's key callback, and the move creates a window, lays terminals
+    /// out and moves the focus.
+    fn requestMoveTabToNewWindow(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        const window = from.rt_surface.window;
+        if (window.tabs.items.len <= 1 and !self.tabQueuedIn(window)) return false;
+        self.requests.append(self.core_app.alloc, .{ .move_tab_to_new_window = from }) catch |err| {
+            log.warn("cannot record a tab to move to a new window err={}", .{err});
             return false;
         };
         return true;
@@ -1575,6 +1601,9 @@ pub const App = struct {
             },
             .move_tab => |move| {
                 if (move.from == core_surface) request.* = .dropped;
+            },
+            .move_tab_to_new_window => |from| {
+                if (from == core_surface) request.* = .dropped;
             },
             .resize_window => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
@@ -2066,6 +2095,10 @@ pub const App = struct {
                     if (window.gotoTabIndex(goto.to)) |index| window.selectTab(index);
                 },
                 .move_tab => |move| _ = move.from.rt_surface.window.moveTab(move.from.rt_surface, move.amount),
+                .move_tab_to_new_window => |from| self.moveTabToNewWindow(from) catch |err| {
+                    log.err("failed to move a tab to a new window err={}", .{err});
+                    notice(self, from.rt_surface.hwnd, L("Ghostty could not move the tab to a new window."));
+                },
                 // From the focused terminal, as `resize` starts.
                 .zoom => |core_from| {
                     const from = core_from.rt_surface;
@@ -2141,6 +2174,37 @@ pub const App = struct {
         // Shown once both are owned, so that its first messages find them.
         window.show();
         return window;
+    }
+
+    /// Move the tab of `from`, a live surface, into a new window, made and
+    /// shown as `newWindow` makes and shows one, which titles itself after
+    /// the tab and gives its focused terminal the focus (`Window.show`);
+    /// as on GTK. Nothing, logged, if by now `from` or its window is
+    /// closing or the window has no other tab: tabs may have closed since
+    /// the action was recorded.
+    ///
+    /// On an error nothing has changed: whatever can fail is done before
+    /// the old window lets go of the tab (`Window.moveTabTo`), and the new
+    /// window is then discarded.
+    fn moveTabToNewWindow(self: *App, from: *CoreSurface) !void {
+        const alloc = self.core_app.alloc;
+        const surface = from.rt_surface;
+        const old = surface.window;
+        const at = old.find(surface) orelse return;
+        if (surface.closing or old.closing or old.tabs.items.len <= 1) {
+            log.info("the tab is not moved to a new window: it or its window is closing, or it is the only tab", .{});
+            return;
+        }
+
+        try self.windows.ensureUnusedCapacity(alloc, 1);
+        const window = try Window.createBare(self);
+        errdefer window.discard();
+        try old.moveTabTo(at.index, window);
+        errdefer comptime unreachable;
+        self.windows.appendAssumeCapacity(window);
+
+        // Shown once it is owned, as a new window is.
+        window.show();
     }
 
     /// Open a split beside `parent`, a live surface, in `direction`: a new
@@ -4156,6 +4220,365 @@ test "win32: a terminal in a hidden tab acts in its own tab" {
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMINNOACTIVE);
     try std.testing.expect(win32.IsIconic(window.hwnd).toBool());
     try std.testing.expectEqual(a_rect, window.tiledPlace(a).?);
+}
+
+test "win32: move_tab_to_new_window waits for run, and only with another tab" {
+    // As on GTK: not performed for the app, nor for a window's only tab,
+    // so that a key reaches the terminal; else recorded, since a binding
+    // performs it inside the core's key callback, and made by
+    // createRequested, which looks the tab up again: dropped when its
+    // terminal begins to close, and nothing while the terminal or its
+    // window is closing, or once the window has no other tab.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    try std.testing.expect(!try app.performAction(.app, .move_tab_to_new_window, {}));
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Behind a tab still to open there, as one binding chains them, it is
+    // recorded, to be made among the tabs there will be.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .new_tab, {}));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    try std.testing.expectEqual(2, app.requests.items.len);
+    try std.testing.expect(app.requests.items[1] == .move_tab_to_new_window);
+    app.requests.clearRetainingCapacity();
+
+    const b = try testTab(&app, window);
+    window.selectTab(window.tabIndex(window.tabOf(b).?).?);
+
+    // Recorded, not made: the terminal is still in its window.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .move_tab_to_new_window, {}));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .move_tab_to_new_window);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(b.window == window);
+
+    // Dropped once the terminal begins to close.
+    app.forgetClosing(&b.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(2, window.tabs.items.len);
+
+    // Nothing while the window is closing, nor while the terminal is.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .move_tab_to_new_window, {}));
+    window.closing = true;
+    app.createRequested();
+    window.closing = false;
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .move_tab_to_new_window, {}));
+    b.closing = true;
+    app.createRequested();
+    b.closing = false;
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(2, window.tabs.items.len);
+
+    // Nor once the window has no other tab: here b's closed first.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    try std.testing.expect(b.destroy());
+    app.createRequested();
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expect(a.window == window);
+    try std.testing.expect(win32.GetAncestor(a.hwnd, win32.GA_PARENT) == window.hwnd);
+}
+
+test "win32: move_tab_to_new_window moves a tab whole into a new window" {
+    // The tab, with its split, zoom, focused terminal and title of its
+    // own, becomes the only tab of a new window, which is shown and
+    // captioned after it; its terminals are that frame's children and
+    // point back at it. The old window shows the tab after it, or else
+    // the one before, as when a tab closes, and its bar goes with one tab
+    // left. A toast's click then reaches a moved terminal in its new
+    // window.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    try std.testing.expect(a.setTitle("a"));
+
+    // a; x and y side by side, zoomed on x, titled "logs"; c.
+    const c = try testTab(&app, window);
+    const x = try testTab(&app, window);
+    const y = try testPane(&app, window);
+    const t = window.tabOf(x).?;
+    t.tree.deinit();
+    t.tree = try testRow(alloc, &.{ x, y });
+    t.tree.zoom(t.tree.locate(x).?);
+    try std.testing.expect(c.setTitle("c"));
+    try std.testing.expect(x.setTitle("x"));
+    try std.testing.expect(try app.performAction(.{ .surface = &x.core_surface }, .set_tab_title, .{ .title = "logs" }));
+    window.selectTab(1);
+    try std.testing.expect(window.tab() == t);
+    try std.testing.expect(!shown(y.hwnd));
+
+    // A focus move left pending on the tab; a middle button down on the
+    // bar's third tab, c's, which the move cancels as the indexes shift.
+    t.pending_focus = y;
+    const bar = window.bar.hwnd.?;
+    const on_c = testMid(testBarLayout(window).tabRect(2));
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONDOWN, 0, on_c);
+    try std.testing.expectEqual(2, window.bar.middle.?);
+    // y, which the zoom hides, is never resized, so the IME form it keeps
+    // tells whether it was given a new scale (`Surface.scaleChanged`).
+    y.ime.form = .{ .pt = .{ .x = 1, .y = 1 }, .rc = .{ .left = 0, .top = 0, .right = 1, .bottom = 1 } };
+
+    try std.testing.expect(try app.performAction(.{ .surface = &x.core_surface }, .move_tab_to_new_window, {}));
+    try std.testing.expectEqual(1, app.windows.items.len);
+    app.createRequested();
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(2, app.windows.items.len);
+    const moved = app.windows.items[1];
+
+    var buf: [64]u16 = undefined;
+    try std.testing.expectEqual(1, moved.tabs.items.len);
+    try std.testing.expect(moved.tab() == t);
+    try std.testing.expect(t.focused == x);
+    try std.testing.expect(t.pending_focus == null);
+    try std.testing.expectEqualStrings("logs", t.title_override.?);
+    try std.testing.expectEqual(t.tree.locate(x), t.tree.zoomed);
+    for ([_]*Surface{ x, y }) |pane| {
+        try std.testing.expect(pane.window == moved);
+        try std.testing.expect(win32.GetAncestor(pane.hwnd, win32.GA_PARENT) == moved.hwnd);
+    }
+    try std.testing.expect(shown(moved.hwnd));
+    try std.testing.expect(shown(x.hwnd));
+    try std.testing.expect(!shown(y.hwnd));
+    try std.testing.expect(!shown(moved.bar.hwnd.?));
+    try std.testing.expectEqual(try clientRect(moved.hwnd), try paneRect(moved, x));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("logs"), testCaption(moved, &buf));
+    // Both frames have the same DPI: no new scale.
+    try std.testing.expect(y.ime.form != null);
+
+    // The old window shows c, the tab after, captioned after it; the
+    // bar's press is cancelled, so its release closes nothing.
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(window.tabOf(x) == null);
+    try std.testing.expect(window.tab() == window.tabOf(c).?);
+    try std.testing.expect(shown(c.hwnd));
+    try std.testing.expect(!shown(a.hwnd));
+    try std.testing.expect(shown(bar));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("c"), testCaption(window, &buf));
+    try std.testing.expect(window.bar.middle == null);
+    _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_c);
+    try std.testing.expect(!a.closing and !c.closing);
+
+    // A toast's click on y finds it in the new window: the zoom there
+    // ends, and y has the focus.
+    app.notificationClicked(y.notifications.id);
+    try std.testing.expect(t.tree.zoomed == null);
+    try std.testing.expect(t.focused == y);
+    try std.testing.expect(shown(y.hwnd));
+
+    // A hidden tab's, as an `all:` binding reaches it: a's. The window
+    // keeps c shown, and with one tab left its bar goes.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(3, app.windows.items.len);
+    const moved_a = app.windows.items[2];
+    try std.testing.expect(a.window == moved_a);
+    try std.testing.expect(shown(a.hwnd));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("a"), testCaption(moved_a, &buf));
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expect(window.tab().focused == c);
+    try std.testing.expect(!shown(bar));
+    try std.testing.expectEqual(0, (try paneRect(window, c)).top);
+
+    // Every window has one tab now.
+    for ([_]*Surface{ a, c, x }) |pane| {
+        try std.testing.expect(!try app.performAction(.{ .surface = &pane.core_surface }, .move_tab_to_new_window, {}));
+    }
+    try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: a tab that cannot move to a new window stays as it was" {
+    // Whatever can fail is done before the old window lets go of the tab
+    // (`Window.moveTabTo`): an allocation failing at any point leaves the
+    // tab, its terminals and the window as they were, and no new window
+    // behind, which the testing allocator would report as a leak.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const b = try testTab(&app, window);
+    const b2 = try testPane(&app, window);
+    const tb = window.tabOf(b).?;
+    tb.tree.deinit();
+    tb.tree = try testRow(alloc, &.{ b, b2 });
+    window.selectTab(1);
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = fail_index });
+        core_app.alloc = failing.allocator();
+        const result = app.moveTabToNewWindow(&b.core_surface);
+        core_app.alloc = alloc;
+        result catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqual(1, app.windows.items.len);
+            try std.testing.expectEqual(2, window.tabs.items.len);
+            try std.testing.expect(window.tab() == tb);
+            try std.testing.expect(tb.focused == b);
+            for ([_]*Surface{ b, b2 }) |pane| {
+                try std.testing.expect(pane.window == window);
+                try std.testing.expect(win32.GetAncestor(pane.hwnd, win32.GA_PARENT) == window.hwnd);
+                try std.testing.expect(shown(pane.hwnd));
+            }
+            continue;
+        };
+        break;
+    }
+    // Some allocation failed before the one run that succeeded.
+    try std.testing.expect(fail_index > 0);
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expect(b.window == app.windows.items[1]);
+    try std.testing.expect(b2.window == app.windows.items[1]);
+}
+
+test "win32: a tab whose terminal cannot change frames stays where it was" {
+    // SetParent fails for a window handle that is no longer valid: the
+    // terminal moved before it goes back to the old frame, the new window
+    // is discarded (a leak of it fails the test through the testing
+    // allocator), and the tab is shown where it was.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const b = try testTab(&app, window);
+    // Out of the app's list, so that its window's WM_DESTROY frees
+    // nothing; its handle is then dead.
+    const z = try testPane(&app, window);
+    _ = app.surfaces.pop();
+    defer alloc.destroy(z);
+    try std.testing.expect(win32.DestroyWindow(z.hwnd).toBool());
+    const tb = window.tabOf(b).?;
+    tb.tree.deinit();
+    // z on the left: a split keeps the node it adds before the one split
+    // (`SplitTree.split`), so b is moved first, and must go back.
+    tb.tree = try testRow(alloc, &.{ z, b });
+    var order = tb.tree.iterator();
+    try std.testing.expect(order.next().?.view == b);
+    window.selectTab(1);
+
+    try std.testing.expectError(App.Error.Win32CallFailed, app.moveTabToNewWindow(&b.core_surface));
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(window.tab() == tb);
+    try std.testing.expect(tb.focused == b);
+    try std.testing.expect(b.window == window);
+    try std.testing.expect(win32.GetAncestor(b.hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(shown(b.hwnd));
+
+    // z leaves the tree before it is freed.
+    tb.tree.deinit();
+    tb.tree = try .init(alloc, b);
+}
+
+test "win32: a moved tab takes its new frame's scale, place and title unshown" {
+    // `Window.moveTabTo` onto a frame nobody has shown yet, as
+    // `createBare` makes one: its terminals are laid out in it, given its
+    // scale where it differs from the old frame's, as the frame's
+    // WM_DPICHANGED gives it, and the frame is captioned after the tab
+    // without being activated.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // A hidden tab of p and q, zoomed on p, so that q is never resized.
+    const p = try testTab(&app, window);
+    const q = try testPane(&app, window);
+    const t = window.tabOf(p).?;
+    t.tree.deinit();
+    t.tree = try testRow(alloc, &.{ p, q });
+    t.tree.zoom(t.tree.locate(p).?);
+    try std.testing.expect(p.setTitle("p"));
+    q.ime.form = .{ .pt = .{ .x = 1, .y = 1 }, .rc = .{ .left = 0, .top = 0, .right = 1, .bottom = 1 } };
+
+    // The old frame at 96 DPI, every other at 144.
+    const Dpi = struct {
+        var old: ?win32.HWND = null;
+        fn of(hwnd: win32.HWND) callconv(.winapi) win32.UINT {
+            return if (win32.GetAncestor(hwnd, win32.GA_ROOT) == old) 96 else 144;
+        }
+    };
+    Dpi.old = window.hwnd;
+    app.get_dpi_for_window = &Dpi.of;
+
+    const to = try testFrame(&app);
+    try window.moveTabTo(1, to);
+    try std.testing.expect(q.ime.form == null);
+    try std.testing.expect(to.tab() == t);
+    try std.testing.expect(p.window == to and q.window == to);
+    try std.testing.expectEqual(try clientRect(to.hwnd), try paneRect(to, p));
+    try std.testing.expect(!shown(to.hwnd));
+    var buf: [64]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("p"), testCaption(to, &buf));
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expectEqual(1, window.tabs.items.len);
 }
 
 test "win32: close_tab closes this tab, the others or those after it" {

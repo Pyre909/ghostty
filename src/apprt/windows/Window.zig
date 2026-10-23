@@ -280,14 +280,9 @@ fn hideTab(t: *Tab) void {
 /// browser's do.
 pub fn removeTab(self: *Window, t: *Tab) void {
     const index = self.tabIndex(t) orelse return;
-    assert(self.tabs.items.len > 1);
-    _ = self.tabs.orderedRemove(index);
-    const shown = index == self.selected;
-    if (index < self.selected or (shown and index == self.tabs.items.len)) self.selected -= 1;
-    self.bar.tabsChanged(self);
     // The next tab first, then the closing terminal hidden, so that it is
     // not shown, nor clicked, while its core stops (`Surface.destroy`).
-    if (shown) {
+    if (self.unlinkTab(index)) {
         self.showTab();
         hideTab(t);
     } else {
@@ -295,6 +290,98 @@ pub fn removeTab(self: *Window, t: *Tab) void {
         self.relayout();
     }
     freeTab(self.app.core_app.alloc, t);
+}
+
+/// Take the tab at `index` out of `tabs`, for `removeTab` and `takeTab`,
+/// and return whether it was the one shown, whose place then goes to the
+/// tab after it, or else the one before; the caller shows that one. The
+/// bar's press is cancelled, as its indexes now name other tabs.
+fn unlinkTab(self: *Window, index: usize) bool {
+    assert(self.tabs.items.len > 1);
+    _ = self.tabs.orderedRemove(index);
+    const shown = index == self.selected;
+    if (index < self.selected or (shown and index == self.tabs.items.len)) self.selected -= 1;
+    self.bar.tabsChanged(self);
+    return shown;
+}
+
+/// `move_tab_to_new_window`: move the tab at `index`, whole, into `to`, a
+/// window `createBare` made and nobody has shown yet, as its only tab, as
+/// GTK moves a tab's page to a new window's tab view
+/// (`moveTabToNewWindow` in src/apprt/gtk/class/window.zig). The tab keeps
+/// its split tree with its zoom, its focused terminal and its title from
+/// `set_tab_title`; its terminals keep their windows and cores, which only
+/// change frames. This window carries on as when a tab closes
+/// (`removeTab`).
+///
+/// The one step that can fail, moving the terminals' windows to the new
+/// frame, comes first and is undone if it fails, so that the tab is then
+/// still here, as it was. Never inside a core frame (`App.requests`): it
+/// lays terminals out and moves the focus.
+pub fn moveTabTo(self: *Window, index: usize, to: *Window) !void {
+    assert(self.tabs.items.len > 1);
+    const t = self.tabs.items[index];
+    try reparentTab(t, to.hwnd, self.hwnd);
+    errdefer comptime unreachable;
+    to.adoptTab(self.takeTab(index), dpiOf(self.app, self.hwnd));
+}
+
+/// Make each terminal of `t` a child window of the frame `to` in place of
+/// `back`, the one it is in. If one cannot be moved, those moved already
+/// go back to `back`, and the error is returned.
+fn reparentTab(t: *Tab, to: win32.HWND, back: win32.HWND) !void {
+    var it = t.tree.iterator();
+    var moved: usize = 0;
+    while (it.next()) |entry| : (moved += 1) {
+        if (win32.SetParent(entry.view.hwnd, to) != null) continue;
+        // A warning: the caller reports the failure (`App.createRequested`).
+        log.warn("SetParent failed for a terminal moving to a new window err={}", .{win32.GetLastError()});
+        var undo = t.tree.iterator();
+        for (0..moved) |_| {
+            const surface = (undo.next() orelse break).view;
+            // Nothing else is left to try: logged, and the new frame is
+            // then kept rather than destroyed with it (`discard`).
+            if (win32.SetParent(surface.hwnd, back) == null) {
+                log.err("SetParent failed for a terminal going back err={}", .{win32.GetLastError()});
+            }
+        }
+        return App.Error.Win32CallFailed;
+    }
+}
+
+/// Take the tab at `index`, whose terminals another frame holds now
+/// (`moveTabTo`), out of the window, which shows the next tab in its place
+/// if it was shown, as `removeTab` does, and lays itself out again: with
+/// one tab left the bar may go. A focus move pending on the tab is
+/// dropped, as `selectTab` drops one: it is a key's, made in this window.
+fn takeTab(self: *Window, index: usize) *Tab {
+    const t = self.tabs.items[index];
+    if (self.unlinkTab(index)) self.showTab() else self.relayout();
+    t.pending_focus = null;
+    return t;
+}
+
+/// Make `t`, which another window gave up with its terminals already in
+/// this frame (`moveTabTo`), this window's only tab, in place of the empty
+/// one `createBare` made: its terminals point back here, take this frame's
+/// scale if it is not `from_dpi`, the old frame's, as the frame's
+/// WM_DPICHANGED gives it, before the layout sizes them; and the window is
+/// titled after the tab, even if it is never activated, as `create` titles
+/// a new window.
+fn adoptTab(self: *Window, t: *Tab, from_dpi: u32) void {
+    assert(self.tabs.items.len == 1 and self.tab().tree.isEmpty());
+    freeTab(self.app.core_app.alloc, self.tabs.items[0]);
+    self.tabs.items[0] = t;
+    self.selected = 0;
+    const dpi = dpiOf(self.app, self.hwnd);
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        entry.view.window = self;
+        if (dpi != from_dpi) entry.view.scaleChanged(std.math.lossyCast(u16, dpi));
+    }
+    self.bar.tabsChanged(self);
+    self.relayout();
+    if (t.focused) |surface| self.setFocused(surface);
 }
 
 /// Move the tab holding `surface` by `amount`, wrapping round, as GTK
@@ -361,6 +448,33 @@ pub fn setTabTitle(self: *Window, surface: *const Surface, title: [:0]const u8) 
 /// non-zero size (`CoreSurface.init` reads it).
 pub fn create(app: *App, opts: Surface.Options) !*Window {
     const alloc = app.core_app.alloc;
+    const self = try createBare(app);
+    errdefer self.discard();
+
+    // Under the bar, if `window-show-tab-bar = always` shows it already.
+    const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
+    const surface = try Surface.create(app, self, area, opts);
+    // Nothing owns the terminal until it is in the tree.
+    self.tab().tree = Tree.init(alloc, surface) catch |err| {
+        surface.discard();
+        return err;
+    };
+    // A title the core set while it started is shown, even if the window
+    // is never activated (launched minimized, or behind another).
+    self.setFocused(surface);
+
+    // The frame is still hidden, so this shows nothing yet.
+    _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
+    return self;
+}
+
+/// A new window, still hidden and not yet the app's, with one empty tab:
+/// `create` puts a new terminal in it, `moveTabTo` a tab from another
+/// window in its place. Its frame is made at CW_USEDEFAULT, with its bar
+/// and its title bar's theme. Undone by `discard` until it is in
+/// `App.windows`.
+pub fn createBare(app: *App) !*Window {
+    const alloc = app.core_app.alloc;
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
 
@@ -379,18 +493,19 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
         .closing = false,
         .destroy_deferred = false,
     };
-    const first = try self.appendTab(alloc);
+    // Before the frame: its first messages read the shown tab. The
+    // errdefer comes first, as the list's room outlives a failure to make
+    // the tab.
     errdefer self.deinitTabs(alloc);
+    _ = try self.appendTab(alloc);
 
-    const hwnd = try self.createFrame(
+    _ = try self.createFrame(
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
         win32.CW_USEDEFAULT,
     );
-    // Safe alongside the errdefer above: WM_NCDESTROY frees only a window
-    // that is in App.windows, which this one is not yet.
-    errdefer _ = win32.DestroyWindow(hwnd);
+    errdefer comptime unreachable;
     self.bar.create(self);
 
     // Windows announces a change of its app mode only to the top-level
@@ -399,22 +514,24 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     // never shows the wrong one.
     app.systemSchemeChanged();
     self.applyTheme();
-
-    // Under the bar, if `window-show-tab-bar = always` shows it already.
-    const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
-    const surface = try Surface.create(app, self, area, opts);
-    // Nothing owns the terminal until it is in the tree.
-    first.tree = Tree.init(alloc, surface) catch |err| {
-        surface.discard();
-        return err;
-    };
-    // A title the core set while it started is shown, even if the window
-    // is never activated (launched minimized, or behind another).
-    self.setFocused(surface);
-
-    // The frame is still hidden, so this shows nothing yet.
-    _ = win32.ShowWindow(surface.hwnd, win32.SW_SHOWNA);
     return self;
+}
+
+/// Undo `createBare`: destroy the frame, which frees nothing, as the
+/// window is not in `App.windows` (WM_NCDESTROY), then free the window.
+/// A terminal still in the frame, which a failed `moveTabTo` could not
+/// move back, would be destroyed with it while its tab still holds it: the
+/// frame is then kept, hidden, with the window, rather than lose it.
+pub fn discard(self: *Window) void {
+    for (self.app.surfaces.items) |surface| {
+        if (win32.GetAncestor(surface.hwnd, win32.GA_PARENT) != self.hwnd) continue;
+        log.err("a terminal is left in a new window that failed: the window is kept hidden", .{});
+        return;
+    }
+    const alloc = self.app.core_app.alloc;
+    _ = win32.DestroyWindow(self.hwnd);
+    self.deinitTabs(alloc);
+    alloc.destroy(self);
 }
 
 /// Create the hidden frame of `self` at `x`, `y`, `width` by `height`
