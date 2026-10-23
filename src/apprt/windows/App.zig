@@ -320,9 +320,14 @@ pub const App = struct {
             amount: isize,
         },
 
-        /// `.move_tab_to_new_window`: the tab of this surface, moved into
-        /// a window of its own (`moveTabToNewWindow`).
-        move_tab_to_new_window: *CoreSurface,
+        /// `.move_tab_to_new_window`: the tab of `from`, moved into a
+        /// window of its own (`moveTabToNewWindow`); or a tab dragged out
+        /// of the bar, the one `from` is the focused terminal of, with
+        /// where it was dropped (`Window.dropTabOut`).
+        move_tab_to_new_window: struct {
+            from: *CoreSurface,
+            drop: ?Window.Drop = null,
+        },
 
         /// `.close_window` behind a move of `from`'s tab to a new window,
         /// which it then closes (`closeWindow`).
@@ -1215,7 +1220,7 @@ pub const App = struct {
         };
         const window = from.rt_surface.window;
         if (window.tabs.items.len <= 1 and !self.tabQueuedIn(window)) return false;
-        self.requests.append(self.core_app.alloc, .{ .move_tab_to_new_window = from }) catch |err| {
+        self.requests.append(self.core_app.alloc, .{ .move_tab_to_new_window = .{ .from = from } }) catch |err| {
             log.warn("cannot record a tab to move to a new window err={}", .{err});
             return false;
         };
@@ -1240,8 +1245,8 @@ pub const App = struct {
     fn moveQueuedFor(self: *const App, surface: *const Surface) bool {
         const t = surface.window.tabOf(surface) orelse return false;
         for (self.requests.items) |request| switch (request) {
-            .move_tab_to_new_window => |from| {
-                const moving = from.rt_surface;
+            .move_tab_to_new_window => |move| {
+                const moving = move.from.rt_surface;
                 if (moving.window.tabOf(moving) == t) return true;
             },
             else => {},
@@ -1661,7 +1666,10 @@ pub const App = struct {
             .move_tab => |move| {
                 if (move.from == core_surface) request.* = .dropped;
             },
-            .move_tab_to_new_window, .close_window => |from| {
+            .move_tab_to_new_window => |move| {
+                if (move.from == core_surface) request.* = .dropped;
+            },
+            .close_window => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .close_tab => |close| {
@@ -2157,18 +2165,10 @@ pub const App = struct {
                     if (window.gotoTabIndex(goto.to)) |index| window.selectTab(index);
                 },
                 .move_tab => |move| _ = move.from.rt_surface.window.moveTab(move.from.rt_surface, move.amount),
-                .move_tab_to_new_window => |from| if (self.moveTabToNewWindow(from)) |finished| {
-                    if (!finished) continue;
-                    log.err("a tab was moved to a new window after its move failed and could not be undone", .{});
-                    notice(
-                        self,
-                        from.rt_surface.hwnd,
-                        L("Moving the tab to a new window failed partway and could not be undone, so the tab was moved anyway."),
-                    );
-                } else |err| {
-                    log.err("failed to move a tab to a new window err={}", .{err});
-                    notice(self, from.rt_surface.hwnd, L("Ghostty could not move the tab to a new window."));
-                },
+                .move_tab_to_new_window => |move| self.reportMove(
+                    move.from.rt_surface.hwnd,
+                    self.moveTabToNewWindow(move.from, move.drop),
+                ),
                 .close_window => |from| from.rt_surface.window.requestClose(),
                 .close_tab => |close| {
                     const window = close.from.rt_surface.window;
@@ -2266,26 +2266,73 @@ pub const App = struct {
     /// to say so: either way each terminal is in the frame of the one
     /// window holding it, which the app owns, so that closing it frees
     /// them.
-    fn moveTabToNewWindow(self: *App, from: *CoreSurface) !bool {
-        const alloc = self.core_app.alloc;
+    ///
+    /// A tab dragged out of the bar comes with where it was dropped, for
+    /// the new frame's place (`Window.placeForDrop`).
+    fn moveTabToNewWindow(self: *App, from: *CoreSurface, drop: ?Window.Drop) !bool {
         const surface = from.rt_surface;
         const old = surface.window;
         const at = old.find(surface) orelse return false;
-        if (surface.closing or old.closing or old.tabs.items.len <= 1) {
-            log.info("the tab is not moved to a new window: it or its window is closing, or it is the only tab", .{});
+        if (surface.closing) {
+            log.info("the tab is not moved to a new window: its terminal is closing", .{});
+            return false;
+        }
+        return self.moveTabAt(old, at.index, drop);
+    }
+
+    /// `moveTabToNewWindow` for the tab at `index` in `old`.
+    fn moveTabAt(self: *App, old: *Window, index: usize, drop: ?Window.Drop) !bool {
+        const alloc = self.core_app.alloc;
+        if (old.closing or old.tabs.items.len <= 1) {
+            log.info("the tab is not moved to a new window: its window is closing, or it is the only tab", .{});
             return false;
         }
 
         try self.windows.ensureUnusedCapacity(alloc, 1);
         const window = try Window.createBare(self);
         errdefer window.discard();
-        const moved = try old.moveTabTo(at.index, window);
+        // Before the tab comes, so that its terminals take the scale of the
+        // monitor the frame is on (`Window.adoptTab`).
+        if (drop) |d| window.placeForDrop(d);
+        const moved = try old.moveTabTo(index, window);
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
 
         // Shown once it is owned, as a new window is.
         window.show();
         return moved == .after_failure;
+    }
+
+    /// A tab dragged out of `old`'s bar, the one at `index`, dropped
+    /// outside the window when the core may be re-entered
+    /// (`Window.dropTabOut`): moved to a new window at once, as `run` moves
+    /// one for `move_tab_to_new_window`, and its failure told the same way.
+    /// Nothing while its focused terminal is closing, as for the action.
+    pub fn moveTabOut(self: *App, old: *Window, index: usize, drop: Window.Drop) void {
+        const focused = old.tabs.items[index].focused orelse return;
+        if (focused.closing) {
+            log.info("the tab is not moved to a new window: its terminal is closing", .{});
+            return;
+        }
+        self.reportMove(focused.hwnd, self.moveTabAt(old, index, drop));
+    }
+
+    /// Tell the user, in a notice owned by the window of `owner`, the moved
+    /// tab's terminal, if moving a tab to a new window failed (`result`),
+    /// or failed partway and was finished instead (`Window.Moved`).
+    fn reportMove(self: *App, owner: win32.HWND, result: anyerror!bool) void {
+        const finished = result catch |err| {
+            log.err("failed to move a tab to a new window err={}", .{err});
+            notice(self, owner, L("Ghostty could not move the tab to a new window."));
+            return;
+        };
+        if (!finished) return;
+        log.err("a tab was moved to a new window after its move failed and could not be undone", .{});
+        notice(
+            self,
+            owner,
+            L("Moving the tab to a new window failed partway and could not be undone, so the tab was moved anyway."),
+        );
     }
 
     /// Open a split beside `parent`, a live surface, in `direction`: a new
@@ -4532,7 +4579,7 @@ test "win32: a tab that cannot move to a new window stays as it was" {
     while (true) : (fail_index += 1) {
         var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = fail_index });
         core_app.alloc = failing.allocator();
-        const result = app.moveTabToNewWindow(&b.core_surface);
+        const result = app.moveTabToNewWindow(&b.core_surface, null);
         core_app.alloc = alloc;
         const finished = result catch |err| {
             try std.testing.expectEqual(error.OutOfMemory, err);
@@ -4594,7 +4641,7 @@ test "win32: a tab whose terminal cannot change frames stays where it was" {
     try std.testing.expect(order.next().?.view == b);
     window.selectTab(1);
 
-    try std.testing.expectError(App.Error.Win32CallFailed, app.moveTabToNewWindow(&b.core_surface));
+    try std.testing.expectError(App.Error.Win32CallFailed, app.moveTabToNewWindow(&b.core_surface, null));
     try std.testing.expectEqual(1, app.windows.items.len);
     try std.testing.expectEqual(2, window.tabs.items.len);
     try std.testing.expect(window.tab() == tb);
@@ -4669,7 +4716,7 @@ test "win32: a tab that can neither move nor go back is moved after all" {
     defer Window.test_set_parent = &win32.SetParent;
 
     // True: the caller says the move was finished after a failure.
-    try std.testing.expect(try app.moveTabToNewWindow(&b.core_surface));
+    try std.testing.expect(try app.moveTabToNewWindow(&b.core_surface, null));
     try std.testing.expectEqual(1, Fail.forward_failures);
     try std.testing.expectEqual(1, Fail.back_failures);
     try std.testing.expectEqual(2, app.windows.items.len);
@@ -5416,6 +5463,385 @@ test "win32: a click on a tab waits for run under a prompt, from a live terminal
     window.closing = false;
     try std.testing.expectEqual(0, window.selected);
     try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+/// For tests: the bar's WM_MOUSEMOVE to `x`, `y` with the left button down.
+fn testDragTo(bar: win32.HWND, x: i32, y: i32) void {
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, testPoint(x, y));
+}
+
+/// For tests: that `window`'s tabs are, in order, those showing `panes`.
+fn testTabOrder(window: *const Window, panes: []const *Surface) !void {
+    try std.testing.expectEqual(panes.len, window.tabs.items.len);
+    for (panes, window.tabs.items) |pane, t| try std.testing.expect(t.focused == pane);
+}
+
+test "win32: a tab dragged in the bar moves among the others" {
+    // A press on a tab's label shows it, and stays a click until the
+    // pointer goes past the system's drag threshold with the button down;
+    // then the tab follows the pointer, the others making room once it
+    // has passed half of one, and stays where the button comes up, still
+    // shown. Only the order changes: nothing is recorded, no window made.
+    // A close glyph is never dragged.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    // Each goes after the shown tab, so they end a, b, c.
+    const c = try testTab(&app, window);
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    defer _ = win32.ReleaseCapture();
+    try testTabOrder(window, &.{ a, b, c });
+    const layout = testBarLayout(window);
+    try std.testing.expectEqual(layout.m.tab_max, layout.tab);
+    const tab = layout.tab;
+    // How far a tab goes before a neighbour makes room: half of one,
+    // rounded up (`TabBar.Layout.dropIndex`).
+    const swap = tab - @divTrunc(tab, 2);
+
+    // b, pressed 40 px in, then moved as far as the threshold each way: a
+    // click, which shows b and moves nothing.
+    const x = tab + 40;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(x, 10));
+    try std.testing.expectEqual(1, window.selected);
+    const threshold = window.bar.drag.?.threshold;
+    try std.testing.expect(threshold.x > 0 and threshold.y > 0);
+    testDragTo(bar, x + threshold.x, 10 + threshold.y);
+    testDragTo(bar, x - threshold.x, 10);
+    try std.testing.expect(!window.bar.drag.?.active);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(x - threshold.x, 10));
+    try std.testing.expect(window.bar.drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+    try testTabOrder(window, &.{ a, b, c });
+    try std.testing.expectEqual(1, window.selected);
+
+    // A move without the button down, as after a release unseen, ends the
+    // press: the moves after it drag nothing.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(x, 10));
+    _ = win32.SendMessageW(bar, win32.WM_MOUSEMOVE, 0, testPoint(x + 5, 10));
+    try std.testing.expect(window.bar.drag == null);
+    testDragTo(bar, x + 2 * tab, 10);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(x + 2 * tab, 10));
+    try testTabOrder(window, &.{ a, b, c });
+
+    // b's close glyph, held and moved two tabs on: no drag.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testMid(layout.closeRect(1)));
+    testDragTo(bar, 2 * tab + 40, 10);
+    try std.testing.expect(window.bar.drag == null);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(2 * tab + 40, 10));
+    try testTabOrder(window, &.{ a, b, c });
+    try std.testing.expect(!b.closing);
+
+    // a, dragged right: past the threshold it is a drag, which moves
+    // nothing yet; once it has passed half of b, b makes room, and then c.
+    // Released there: b, c, a, with a shown.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(40, 10));
+    try std.testing.expect(window.tab().focused == a);
+    testDragTo(bar, 40 + threshold.x + 1, 10);
+    try std.testing.expect(window.bar.drag.?.active);
+    try testTabOrder(window, &.{ a, b, c });
+    testDragTo(bar, 40 + swap - 1, 10);
+    try testTabOrder(window, &.{ a, b, c });
+    testDragTo(bar, 40 + swap, 10);
+    try testTabOrder(window, &.{ b, a, c });
+    try std.testing.expect(window.tab().focused == a);
+    testDragTo(bar, 40 + tab + swap - 1, 14);
+    try testTabOrder(window, &.{ b, a, c });
+    testDragTo(bar, 40 + tab + swap, 14);
+    try testTabOrder(window, &.{ b, c, a });
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(40 + tab + swap, 14));
+    try testTabOrder(window, &.{ b, c, a });
+    try std.testing.expectEqual(2, window.selected);
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expect(shown(a.hwnd) and !shown(b.hwnd) and !shown(c.hwnd));
+    try std.testing.expect(window.bar.drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(1, app.windows.items.len);
+
+    // c, dragged left, and released past the last move, where its place
+    // is first: the release counts.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    try std.testing.expect(window.tab().focused == c);
+    testDragTo(bar, tab + 40 - threshold.x - 1, 10);
+    try std.testing.expect(window.bar.drag.?.active);
+    try testTabOrder(window, &.{ b, c, a });
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(30, 10));
+    try testTabOrder(window, &.{ c, b, a });
+    try std.testing.expectEqual(0, window.selected);
+    try std.testing.expect(shown(c.hwnd) and !shown(a.hwnd));
+    try std.testing.expectEqual(1, app.windows.items.len);
+}
+
+test "win32: a tab drag ends with a lost capture or a change of the tabs" {
+    // A capture taken away puts the dragged tab back where it began, and
+    // the release then does nothing; a tab closing meanwhile ends the drag
+    // where it is, so that the pointer moves nothing after, nor drops the
+    // tab out. Held near an end of tabs too many for the bar, the drag's
+    // timer scrolls them, the dragged tab finding its place among them.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    // a, b, c, d.
+    const d = try testTab(&app, window);
+    const c = try testTab(&app, window);
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    defer _ = win32.ReleaseCapture();
+    const tab = testBarLayout(window).tab;
+    const swap = tab - @divTrunc(tab, 2);
+
+    // a, dragged past b and c; the frame takes the capture: back first.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(40, 10));
+    testDragTo(bar, 40 + tab + swap, 10);
+    try testTabOrder(window, &.{ b, c, a, d });
+    _ = win32.SetCapture(window.hwnd);
+    try testTabOrder(window, &.{ a, b, c, d });
+    try std.testing.expect(window.bar.drag == null);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(40 + tab + swap, 10));
+    try testTabOrder(window, &.{ a, b, c, d });
+    _ = win32.ReleaseCapture();
+
+    // Under a prompt, whose caller may count on the order of the tabs
+    // (`Window.requestCloseTabs`), the pointer moves nothing, and the
+    // capture the prompt takes ends the drag where it is.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(40, 10));
+    testDragTo(bar, 40 + tab + swap, 10);
+    try testTabOrder(window, &.{ b, c, a, d });
+    app.prompt_depth = 1;
+    testDragTo(bar, 40, 10);
+    try testTabOrder(window, &.{ b, c, a, d });
+    _ = win32.SetCapture(window.hwnd);
+    app.prompt_depth = 0;
+    try testTabOrder(window, &.{ b, c, a, d });
+    try std.testing.expect(window.bar.drag == null);
+    _ = win32.ReleaseCapture();
+    window.reorderTab(2, 0);
+    try testTabOrder(window, &.{ a, b, c, d });
+
+    // b, dragged first; d closes: the drag ends there, b first. The
+    // pointer then moves nothing, and its release below the window drops
+    // nothing out of it.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    testDragTo(bar, 40, 10);
+    try testTabOrder(window, &.{ b, a, c, d });
+    try std.testing.expect(d.destroy());
+    try testTabOrder(window, &.{ b, a, c });
+    try std.testing.expect(window.bar.drag == null);
+    testDragTo(bar, 2 * tab + 40, 10);
+    try testTabOrder(window, &.{ b, a, c });
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(2 * tab + 40, 600));
+    try testTabOrder(window, &.{ b, a, c });
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(window.tab().focused == b);
+
+    // Twenty tabs, b first and shown. A timer tick with no drag scrolls
+    // nothing.
+    for (0..17) |_| _ = try testTab(&app, window);
+    window.relayout();
+    const over = testBarLayout(window);
+    try std.testing.expectEqual(0, over.scroll);
+    try std.testing.expect(over.max_scroll > 0);
+    _ = win32.SendMessageW(bar, win32.WM_TIMER, TabBar.drag_timer, 0);
+    try std.testing.expectEqual(0, window.bar.scroll);
+
+    // b, dragged to the right end and held there: each tick scrolls by
+    // the step, until the end, where b is last.
+    const end = over.width - over.m.plus - 1;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 10));
+    testDragTo(bar, end, 10);
+    try std.testing.expect(window.bar.drag.?.active);
+    const step = over.autoScrollStep(end, 10);
+    try std.testing.expect(step > 0);
+    _ = win32.SendMessageW(bar, win32.WM_TIMER, TabBar.drag_timer, 0);
+    try std.testing.expectEqual(step, window.bar.scroll);
+    for (0..1000) |_| _ = win32.SendMessageW(bar, win32.WM_TIMER, TabBar.drag_timer, 0);
+    try std.testing.expectEqual(over.max_scroll, window.bar.scroll);
+    try std.testing.expect(window.tabs.items[19].focused == b);
+    try std.testing.expectEqual(19, window.selected);
+
+    // And back to the left end: first again.
+    testDragTo(bar, 0, 10);
+    for (0..1000) |_| _ = win32.SendMessageW(bar, win32.WM_TIMER, TabBar.drag_timer, 0);
+    try std.testing.expectEqual(0, window.bar.scroll);
+    try std.testing.expect(window.tabs.items[0].focused == b);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(0, 10));
+    try std.testing.expect(window.tabs.items[0].focused == b);
+    try std.testing.expectEqual(0, window.selected);
+}
+
+test "win32: a tab dropped outside its window moves to a new one" {
+    // Released outside the frame, a dragged tab moves to a new window as
+    // move_tab_to_new_window moves one, the new frame placed so that the
+    // point where its label was grabbed is under the pointer, as far as
+    // the work area allows. Under a prompt the move is recorded, naming
+    // the tab's focused terminal, and made by `run`; a press there stays
+    // a click, which drops nothing. A window's only tab stays.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    // a, b, c.
+    const c = try testTab(&app, window);
+    const b = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    defer _ = win32.ReleaseCapture();
+    const tab = testBarLayout(window).tab;
+    const below = 600;
+
+    // b, pressed 40 px in and 10 down, dragged straight down out of the
+    // window and released there.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    testDragTo(bar, tab + 40, 200);
+    try std.testing.expect(window.bar.drag.?.active);
+    testDragTo(bar, tab + 40, below);
+    var at: win32.POINT = .{ .x = tab + 40, .y = below };
+    try std.testing.expect(win32.ClientToScreen(bar, &at).toBool());
+    var old_rect: win32.RECT = undefined;
+    try std.testing.expect(win32.GetWindowRect(window.hwnd, &old_rect).toBool());
+    try std.testing.expect(at.y >= old_rect.bottom);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(tab + 40, below));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(2, app.windows.items.len);
+    const moved = app.windows.items[1];
+    try std.testing.expect(b.window == moved);
+    try std.testing.expect(win32.GetAncestor(b.hwnd, win32.GA_PARENT) == moved.hwnd);
+    try std.testing.expectEqual(1, moved.tabs.items.len);
+    try std.testing.expect(shown(moved.hwnd) and shown(b.hwnd));
+    try testTabOrder(window, &.{ a, c });
+    try std.testing.expect(window.tab().focused == c);
+    try std.testing.expect(win32.GetCapture() == null);
+
+    // Placed for the drop: placing it again would not move it.
+    var placed: win32.RECT = undefined;
+    try std.testing.expect(win32.GetWindowRect(moved.hwnd, &placed).toBool());
+    var origin: win32.POINT = .{ .x = 0, .y = 0 };
+    try std.testing.expect(win32.ClientToScreen(moved.hwnd, &origin).toBool());
+    var info: win32.MONITORINFO = undefined;
+    info.cbSize = @sizeOf(win32.MONITORINFO);
+    const monitor = win32.MonitorFromPoint(at, win32.MONITOR_DEFAULTTONEAREST) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(win32.GetMonitorInfoW(monitor, &info).toBool());
+    const drop: Window.Drop = .{ .at = at, .grab = .{ .x = 40, .y = 10 } };
+    try std.testing.expectEqual(placed, Window.dropRect(placed, origin, drop, info.rcWork));
+
+    // c, whose terminal is closing, dropped out: it stays, as for the
+    // action.
+    c.closing = true;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    testDragTo(bar, tab + 40, below);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(tab + 40, below));
+    c.closing = false;
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try testTabOrder(window, &.{ a, c });
+
+    // Under a prompt: c, dragged out as the prompt opens, is recorded,
+    // and moved by run; but not while its terminal has no live core, as
+    // when it is stopping (`App.requests`), and nothing is moved then.
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    try std.testing.expect(window.tab().focused == c);
+    testDragTo(bar, tab + 40, below);
+    app.prompt_depth = 1;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(tab + 40, below));
+    app.prompt_depth = 0;
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try testTabOrder(window, &.{ a, c });
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    testDragTo(bar, tab + 40, below);
+    try std.testing.expect(window.bar.drag.?.active);
+    app.prompt_depth = 1;
+    c.core_state = .live;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(tab + 40, below));
+    app.prompt_depth = 0;
+    c.core_state = .none;
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    switch (app.requests.items[0]) {
+        .move_tab_to_new_window => |move| {
+            try std.testing.expect(move.from == &c.core_surface);
+            try std.testing.expectEqual(at, move.drop.?.at);
+            try std.testing.expectEqual(drop.grab, move.drop.?.grab);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    app.createRequested();
+    try std.testing.expectEqual(3, app.windows.items.len);
+    try std.testing.expect(c.window == app.windows.items[2]);
+    try testTabOrder(window, &.{a});
+
+    // Under a prompt a press stays a click: d, held and released below the
+    // window, stays, and nothing is recorded.
+    const d = try testTab(&app, window);
+    window.relayout();
+    app.prompt_depth = 1;
+    d.core_state = .live;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(tab + 40, 10));
+    testDragTo(bar, tab + 40, below);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(tab + 40, below));
+    app.prompt_depth = 0;
+    d.core_state = .none;
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(3, app.windows.items.len);
+    try testTabOrder(window, &.{ a, d });
+
+    // A window's only tab, with its bar shown, dragged out: it stays, at
+    // once and under a prompt alike.
+    app.config.@"window-show-tab-bar" = .always;
+    try std.testing.expect(d.destroy());
+    window.relayout();
+    try std.testing.expect(shown(bar));
+    a.core_state = .live;
+    defer a.core_state = .none;
+    for ([_]u32{ 0, 1 }) |prompt| {
+        _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(40, 10));
+        testDragTo(bar, 40, below);
+        try std.testing.expect(window.bar.drag.?.active);
+        app.prompt_depth = prompt;
+        _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, testPoint(40, below));
+        app.prompt_depth = 0;
+        try std.testing.expectEqual(0, app.requests.items.len);
+        try std.testing.expectEqual(3, app.windows.items.len);
+        try testTabOrder(window, &.{a});
+        try std.testing.expect(a.window == window);
+    }
 }
 
 test "win32: the tab bar goes in fullscreen though the client area keeps its size" {

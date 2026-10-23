@@ -370,6 +370,9 @@ pub const AreDpiAwarenessContextsEqualFn = *const fn (a: HANDLE, b: HANDLE) call
 /// window is arranged, as a snapped one is.
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowarranged
 pub const IsWindowArrangedFn = *const fn (hwnd: HWND) callconv(.winapi) BOOL;
+/// From Windows 10 1607, as GetDpiForWindow.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetricsfordpi
+pub const GetSystemMetricsForDpiFn = *const fn (index: c_int, dpi: UINT) callconv(.winapi) c_int;
 
 pub const GetLastError = internal_os.windows.GetLastError;
 pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
@@ -514,6 +517,13 @@ pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
 pub extern "user32" fn TrackMouseEvent(tme: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
 pub extern "user32" fn WindowFromPoint(pt: POINT) callconv(.winapi) ?HWND;
 pub extern "user32" fn ScreenToClient(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn ClientToScreen(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetrics
+pub extern "user32" fn GetSystemMetrics(index: c_int) callconv(.winapi) c_int;
+/// The pixels on either side of a press the pointer may move before a
+/// drag begins, at the system DPI (GetSystemMetrics) or a given one.
+pub const SM_CXDRAG: c_int = 68;
+pub const SM_CYDRAG: c_int = 69;
 pub extern "user32" fn SystemParametersInfoW(
     action: UINT,
     param: UINT,
@@ -805,6 +815,8 @@ pub const MONITORINFO = extern struct {
 pub extern "user32" fn MonitorFromWindow(hwnd: HWND, flags: DWORD) callconv(.winapi) ?HMONITOR;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfromrect
 pub extern "user32" fn MonitorFromRect(rect: *const RECT, flags: DWORD) callconv(.winapi) ?HMONITOR;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-monitorfrompoint
+pub extern "user32" fn MonitorFromPoint(pt: POINT, flags: DWORD) callconv(.winapi) ?HMONITOR;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getmonitorinfow
 pub extern "user32" fn GetMonitorInfoW(monitor: HMONITOR, info: *MONITORINFO) callconv(.winapi) BOOL;
 pub extern "user32" fn ValidateRect(hwnd: ?HWND, rect: ?*const RECT) callconv(.winapi) BOOL;

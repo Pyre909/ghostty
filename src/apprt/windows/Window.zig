@@ -440,16 +440,99 @@ pub fn moveTab(self: *Window, surface: *const Surface, amount: isize) bool {
     const total = self.tabs.items.len;
     if (total <= 1) return false;
     const from = (self.find(surface) orelse return false).index;
-    const t = self.tabs.items[from];
     const to: usize = @intCast(@mod(@as(isize, @intCast(from)) + amount, @as(isize, @intCast(total))));
     if (to == from) return false;
-    const shown = self.tab();
-    _ = self.tabs.orderedRemove(from);
-    self.tabs.insertAssumeCapacity(to, t);
-    self.selected = self.tabIndex(shown).?;
+    self.reorderTab(from, to);
     self.bar.scrollToShow(self, self.selected);
     self.bar.tabsChanged(self);
     return true;
+}
+
+/// Put the tab at index `from` at index `to`, the tabs between making
+/// room, the shown one still shown: only the order changes, and no
+/// terminal is laid out again. For `moveTab`, and for a drag in the bar,
+/// which keeps its press (`TabBar.Bar.drag`) where `moveTab` cancels it.
+pub fn reorderTab(self: *Window, from: usize, to: usize) void {
+    assert(from < self.tabs.items.len and to < self.tabs.items.len);
+    if (from == to) return;
+    const shown = self.tab();
+    const t = self.tabs.orderedRemove(from);
+    self.tabs.insertAssumeCapacity(to, t);
+    self.selected = self.tabIndex(shown).?;
+}
+
+/// Where a tab dragged out of the bar was dropped (`dropTabOut`), for
+/// placing the window it moves to (`placeForDrop`).
+pub const Drop = struct {
+    /// The pointer, in screen coordinates.
+    at: win32.POINT,
+    /// Where the tab's label was grabbed, from its top-left corner.
+    grab: win32.POINT,
+};
+
+/// The tab at `index`, dragged out of the bar and dropped outside the
+/// window, moves to a new window as `move_tab_to_new_window` moves it, as
+/// GTK's tab bar lets a tab be dragged out; the new frame placed so that
+/// the label is where it was dropped (`placeForDrop`). Nothing for the
+/// window's only tab, nor for a window being torn down. At once when the
+/// core may be re-entered, as it may when `run`'s loop dispatched the
+/// release; else recorded for `run`, naming the tab's focused terminal,
+/// which must be live, as `clickTab` records a click (`App.requests`).
+pub fn dropTabOut(self: *Window, index: usize, drop: Drop) void {
+    if (self.closing or self.app.terminating) return;
+    if (index >= self.tabs.items.len or self.tabs.items.len <= 1) return;
+    const t = self.tabs.items[index];
+    if (self.app.canReenterCore()) return self.app.moveTabOut(self, index, drop);
+    const from = t.focused orelse return;
+    if (from.closing) return;
+    const core = from.liveCore() orelse return;
+    self.app.requests.append(self.app.core_app.alloc, .{ .move_tab_to_new_window = .{
+        .from = core,
+        .drop = drop,
+    } }) catch |err| {
+        log.warn("cannot record a tab to move to a new window err={}", .{err});
+        return;
+    };
+    self.app.wakeup();
+}
+
+/// Move the frame, which `createBare` made and nobody has shown yet, for
+/// a tab dropped at `drop` (`dropTabOut`): the point of its client area
+/// where the label was grabbed goes under the pointer, where the tab's
+/// label is when the bar shows (`dropRect`), on the monitor the pointer
+/// is on. Logged, and left where it is, if it cannot be.
+pub fn placeForDrop(self: *Window, drop: Drop) void {
+    var frame: win32.RECT = undefined;
+    var origin: win32.POINT = .{ .x = 0, .y = 0 };
+    if (!win32.GetWindowRect(self.hwnd, &frame).toBool() or
+        !win32.ClientToScreen(self.hwnd, &origin).toBool())
+    {
+        log.warn("unable to read the new window's frame, not placed at the drop err={}", .{win32.GetLastError()});
+        return;
+    }
+    const monitor = monitorInfo(win32.MonitorFromPoint(drop.at, win32.MONITOR_DEFAULTTONEAREST)) orelse return;
+    const rect = dropRect(frame, origin, drop, monitor.rcWork);
+    if (!win32.SetWindowPos(
+        self.hwnd,
+        null,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
+    ).toBool()) {
+        log.warn("unable to place the new window at the drop err={}", .{win32.GetLastError()});
+    }
+}
+
+/// The rect for a frame now at `frame`, its client area's top-left corner
+/// at `client` on the screen, moved so that the client point `drop.grab`
+/// is at `drop.at`, then kept inside the work area `work` as
+/// `constrainToWorkArea` keeps it.
+pub fn dropRect(frame: win32.RECT, client: win32.POINT, drop: Drop, work: win32.RECT) win32.RECT {
+    const left = drop.at.x - drop.grab.x - (client.x - frame.left);
+    const top = drop.at.y - drop.grab.y - (client.y - frame.top);
+    return constrainToWorkArea(left, top, frame.right - frame.left, frame.bottom - frame.top, work);
 }
 
 /// The index `goto_tab` goes to from the shown tab, as GTK selects it
@@ -2337,6 +2420,32 @@ test "win32: an initial size is kept inside the monitor work area" {
             .right = 0,
             .bottom = 824,
         }),
+    );
+}
+
+test "win32: a tab dropped outside its window is placed with its label at the pointer" {
+    const testing = std.testing;
+    const RECT = win32.RECT;
+    const work: RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
+    // An 800x600 frame whose client area starts 8 px in and 31 px down.
+    const frame: RECT = .{ .left = 100, .top = 50, .right = 900, .bottom = 650 };
+    const client: win32.POINT = .{ .x = 108, .y = 81 };
+
+    // Grabbed 30 px into the label and 12 down, dropped at 500, 400: the
+    // client point 30, 12 goes there, the size kept.
+    const placed = dropRect(frame, client, .{ .at = .{ .x = 500, .y = 400 }, .grab = .{ .x = 30, .y = 12 } }, work);
+    try testing.expectEqual(RECT{ .left = 462, .top = 357, .right = 1262, .bottom = 957 }, placed);
+    try testing.expectEqual(500, placed.left + (client.x - frame.left) + 30);
+    try testing.expectEqual(400, placed.top + (client.y - frame.top) + 12);
+
+    // Near the work area's ends: kept inside it, as a new window is.
+    try testing.expectEqual(
+        RECT{ .left = 1120, .top = 440, .right = 1920, .bottom = 1040 },
+        dropRect(frame, client, .{ .at = .{ .x = 1900, .y = 1030 }, .grab = .{ .x = 30, .y = 12 } }, work),
+    );
+    try testing.expectEqual(
+        RECT{ .left = 0, .top = 0, .right = 800, .bottom = 600 },
+        dropRect(frame, client, .{ .at = .{ .x = 0, .y = 0 }, .grab = .{ .x = 30, .y = 12 } }, work),
     );
 }
 

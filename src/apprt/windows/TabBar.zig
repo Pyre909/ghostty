@@ -7,6 +7,13 @@
 //! on any input: tabs share the width between a minimum and a maximum
 //! size, and once even the minimum does not fit they scroll, the "+"
 //! button then kept at the right end.
+//!
+//! A tab is dragged with the left button, as on GTK's AdwTabBar, in
+//! Windows Terminal and in Edge: once the pointer has moved past the
+//! system's drag threshold (`pastDragThreshold`), the tab follows it and
+//! the others make room (`Layout.dropIndex`), the tabs scrolling while it
+//! is held near either end (`Layout.autoScrollStep`); dropped outside the
+//! window, it moves to a new one (`Window.dropTabOut`). See `Drag`.
 
 const std = @import("std");
 
@@ -41,6 +48,10 @@ pub const Bar = struct {
     /// The tab the middle button went down on, which a middle click
     /// closes only if it comes up on the same; cancelled as `pressed` is.
     middle: ?usize = null,
+    /// A left press on a tab's label, which becomes a drag once the
+    /// pointer moves far enough with the button down; null without one.
+    /// Ended by the release, and cancelled as `pressed` is.
+    drag: ?Drag = null,
     /// Whether the last left press was on the bar's empty part. A double
     /// click opens a tab only if both of its presses were there: its first
     /// press may have closed the last tab, leaving empty space under the
@@ -86,11 +97,117 @@ pub const Bar = struct {
 
     /// The tabs came, went or moved: a press names a tab by its index,
     /// which may now name another, so it is cancelled; and the highlight
-    /// follows what is now under the pointer.
+    /// follows what is now under the pointer. A drag ends where it is: the
+    /// tabs changed under it, so where it began no longer says where its
+    /// tab was. A drag's own moves do not come here (`Window.reorderTab`).
     pub fn tabsChanged(self: *Bar, window: *Window) void {
         self.pressed = .none;
         self.middle = null;
+        self.endDrag();
         self.rehover(window);
+        self.invalidate();
+    }
+
+    /// A left press at `at` on the label of tab `index`, once the click
+    /// has shown it (`Window.clickTab`): it may become a drag. Where the
+    /// label was grabbed is read after that, as showing the tab may have
+    /// scrolled it, and kept within it.
+    fn pressTab(self: *Bar, window: *Window, hwnd: win32.HWND, index: usize, at: win32.POINT) void {
+        self.endDrag();
+        if (window.closing or window.app.terminating) return;
+        if (index >= window.tabs.items.len) return;
+        const l = layoutOf(window, hwnd);
+        self.drag = .{
+            .index = index,
+            .from = index,
+            .press = at,
+            .grab = .{ .x = std.math.clamp(at.x - l.tabRect(index).left, 0, @max(0, l.tab - 1)), .y = at.y },
+            .threshold = dragThreshold(Window.dpiOf(window.app, hwnd)),
+            .pointer = at,
+        };
+    }
+
+    /// The pointer moved to `at` with the left button down. Past the drag
+    /// threshold, the press becomes a drag: the tab follows the pointer
+    /// from then on. Not while the core may not be re-entered, as under a
+    /// prompt, whose caller may count on the order of the tabs
+    /// (`Window.requestCloseTabs`): the press stays a click.
+    fn dragTo(self: *Bar, window: *Window, hwnd: win32.HWND, at: win32.POINT) void {
+        const d = if (self.drag) |*d| d else return;
+        d.pointer = at;
+        if (!d.active) {
+            if (!pastDragThreshold(d.press, at, d.threshold)) return;
+            if (!window.app.canReenterCore()) return;
+            d.active = true;
+            // For as long as the pointer is held near an end of the bar,
+            // which sends no WM_MOUSEMOVE (`autoScroll`).
+            if (win32.SetTimer(hwnd, drag_timer, drag_timer_ms, null) == 0) {
+                log.warn("cannot start the tab drag's timer, the tabs will not scroll err={}", .{win32.GetLastError()});
+            }
+        }
+        self.follow(window, hwnd);
+    }
+
+    /// Put the dragged tab where the pointer now puts it among the others
+    /// (`Layout.dropIndex`), and draw it there. Only the order changes
+    /// (`Window.reorderTab`); while the core may not be re-entered it waits
+    /// for the next move, as it does in `dragTo`.
+    fn follow(self: *Bar, window: *Window, hwnd: win32.HWND) void {
+        const d = &self.drag.?;
+        if (window.app.canReenterCore() and d.index < window.tabs.items.len) {
+            const to = layoutOf(window, hwnd).dropIndex(d.grab.x, d.pointer.x);
+            window.reorderTab(d.index, to);
+            d.index = to;
+        }
+        self.invalidate();
+    }
+
+    /// The drag's timer: with the pointer held near either end of tabs
+    /// that do not all fit, they scroll (`Layout.autoScrollStep`), and the
+    /// dragged tab finds its place among those that come into view.
+    fn autoScroll(self: *Bar, window: *Window, hwnd: win32.HWND) void {
+        const d = self.drag orelse return self.endDrag();
+        if (!d.active) return self.endDrag();
+        const l = layoutOf(window, hwnd);
+        const scroll = std.math.clamp(l.scroll + l.autoScrollStep(d.pointer.x, d.pointer.y), 0, l.max_scroll);
+        if (scroll == l.scroll) return;
+        self.scroll = scroll;
+        self.wheel_rem = 0;
+        self.follow(window, hwnd);
+    }
+
+    /// The left button came up at `at`, ending a drag that began: in
+    /// place, or, released outside the window, with its tab moved to a
+    /// new one (`Window.dropTabOut`), the label where it was grabbed.
+    fn drop(window: *Window, hwnd: win32.HWND, d: Drag, at: win32.POINT) void {
+        var screen = at;
+        var frame: RECT = undefined;
+        if (!win32.ClientToScreen(hwnd, &screen).toBool() or
+            !win32.GetWindowRect(window.hwnd, &frame).toBool()) return;
+        if (contains(frame, screen.x, screen.y)) return;
+        window.dropTabOut(d.index, .{ .at = screen, .grab = d.grab });
+    }
+
+    /// The capture was taken away: the button will come up unseen, so a
+    /// drag puts its tab back where it began. Not while the core may not
+    /// be re-entered (`dragTo`): a prompt taking the capture disables the
+    /// window (WM_CANCELMODE), and its caller may count on the order, so
+    /// the drag then ends where it is.
+    fn cancelDrag(self: *Bar, window: *Window) void {
+        const d = self.drag orelse return;
+        self.endDrag();
+        if (!d.active or !window.app.canReenterCore()) return;
+        if (d.index >= window.tabs.items.len or d.from >= window.tabs.items.len) return;
+        window.reorderTab(d.index, d.from);
+    }
+
+    /// End a press or a drag where it is, and stop the drag's timer.
+    fn endDrag(self: *Bar) void {
+        const d = self.drag orelse return;
+        self.drag = null;
+        if (!d.active) return;
+        if (self.hwnd) |hwnd| _ = win32.KillTimer(hwnd, drag_timer);
+        // Drawn again without the tab under the pointer.
         self.invalidate();
     }
 
@@ -135,6 +252,60 @@ pub const Bar = struct {
         return font;
     }
 };
+
+/// A left press on a tab's label and, once the pointer has moved past the
+/// system's drag threshold with the button down, the drag of that tab
+/// (`Bar.dragTo`): the tab is drawn under the pointer, held where it was
+/// grabbed, and the others make room as it passes them. The bar holds the
+/// mouse capture throughout, as for any press. Released inside the window
+/// the tab stays where it is; outside, it moves to a new window
+/// (`Bar.drop`). A capture taken away puts it back (`Bar.cancelDrag`).
+pub const Drag = struct {
+    /// The tab's index now: the drag moves it (`Window.reorderTab`).
+    index: usize,
+    /// Its index when pressed, where a cancelled drag puts it back.
+    from: usize,
+    /// Where the button went down, in the bar's client coordinates.
+    press: win32.POINT,
+    /// Where the label was grabbed, from its top-left corner.
+    grab: win32.POINT,
+    /// How far the pointer may go from `press` and still click: SM_CXDRAG
+    /// and SM_CYDRAG at the bar's DPI, read at the press.
+    threshold: win32.POINT,
+    /// The pointer's last place, in the bar's client coordinates.
+    pointer: win32.POINT,
+    /// Whether the pointer went past the threshold: the tab follows it.
+    active: bool = false,
+};
+
+/// The bar's timer while a tab is dragged (`Bar.autoScroll`), and how often
+/// it fires: about once a frame at 60 Hz.
+pub const drag_timer: win32.UINT_PTR = 1;
+const drag_timer_ms: win32.UINT = 16;
+
+/// Whether the pointer at `now` is past the drag threshold from a press at
+/// `press`: more than `threshold`'s pixels away on either side, across or
+/// down, as SM_CXDRAG and SM_CYDRAG are documented ("the number of pixels
+/// on either side of a mouse-down point that the mouse pointer can move
+/// before a drag operation begins"), whatever their sign.
+pub fn pastDragThreshold(press: win32.POINT, now: win32.POINT, threshold: win32.POINT) bool {
+    return @abs(now.x - press.x) > @abs(threshold.x) or @abs(now.y - press.y) > @abs(threshold.y);
+}
+
+/// SM_CXDRAG and SM_CYDRAG at `dpi`, from GetSystemMetricsForDpi, which is
+/// looked up as GetDpiForWindow is (Windows 10 1607; see `App.init`); else
+/// GetSystemMetrics's. Windows 11 25H2 gives the same at 96 and 192 DPI
+/// (4 by default): it does not scale these two, so the fallback does not
+/// either.
+fn dragThreshold(dpi: u32) win32.POINT {
+    if (win32.GetModuleHandleW(L("user32.dll"))) |user32| {
+        if (win32.GetProcAddress(user32, "GetSystemMetricsForDpi")) |p| {
+            const f: win32.GetSystemMetricsForDpiFn = @ptrCast(@alignCast(p));
+            return .{ .x = f(win32.SM_CXDRAG, dpi), .y = f(win32.SM_CYDRAG, dpi) };
+        }
+    }
+    return .{ .x = win32.GetSystemMetrics(win32.SM_CXDRAG), .y = win32.GetSystemMetrics(win32.SM_CYDRAG) };
+}
 
 /// The system's message font, the one the user sets for the UI, which
 /// varies by language (Segoe UI 9 points by default, Yu Gothic UI on
@@ -263,8 +434,19 @@ pub fn wndProc(
                 };
                 _ = win32.TrackMouseEvent(&track);
             }
-            bar.pointer = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+            bar.pointer = pointAt(lparam);
             bar.rehover(window);
+            // A button that came up unseen ends the drag where it is.
+            if (wparam & win32.MK_LBUTTON != 0) {
+                bar.dragTo(window, hwnd, pointAt(lparam));
+            } else {
+                bar.endDrag();
+            }
+            return 0;
+        },
+
+        win32.WM_TIMER => {
+            if (wparam == drag_timer) bar.autoScroll(window, hwnd);
             return 0;
         },
 
@@ -294,18 +476,30 @@ pub fn wndProc(
             if (at != .none and win32.GetCapture() != hwnd) _ = win32.SetCapture(hwnd);
             bar.pressed = at;
             switch (at) {
-                .tab => |index| window.clickTab(index),
-                else => {},
+                .tab => |index| {
+                    window.clickTab(index);
+                    bar.pressTab(window, hwnd, index, pointAt(lparam));
+                },
+                else => bar.endDrag(),
             }
             return 0;
         },
 
         win32.WM_LBUTTONUP => {
             const at = hitAt(window, hwnd, lparam);
-            // Read before ReleaseCapture, whose WM_CAPTURECHANGED cancels it.
+            // Its last place is where the button came up.
+            if (bar.drag) |d| if (d.active) bar.dragTo(window, hwnd, pointAt(lparam));
+            // Read before ReleaseCapture, whose WM_CAPTURECHANGED cancels them.
             const pressed = bar.pressed;
+            const drag = bar.drag;
             bar.pressed = .none;
+            bar.endDrag();
             if (win32.GetCapture() == hwnd and bar.middle == null) _ = win32.ReleaseCapture();
+            // A drag is no click: its press already showed the tab.
+            if (drag) |d| if (d.active) {
+                Bar.drop(window, hwnd, d, pointAt(lparam));
+                return 0;
+            };
             if (!std.meta.eql(at, pressed)) return 0;
             switch (at) {
                 .close => |index| _ = window.closeTabs(index, .this),
@@ -342,6 +536,7 @@ pub fn wndProc(
         win32.WM_CAPTURECHANGED => {
             bar.pressed = .none;
             bar.middle = null;
+            bar.cancelDrag(window);
             return 0;
         },
 
@@ -367,6 +562,7 @@ pub fn wndProc(
         },
 
         win32.WM_DESTROY => {
+            bar.endDrag();
             bar.freeFont();
             // Nothing draws into, or places, a destroyed window.
             bar.hwnd = null;
@@ -388,6 +584,11 @@ fn layoutOf(window: *Window, hwnd: win32.HWND) Layout {
 /// What a mouse message's `lparam` points at in the bar.
 fn hitAt(window: *Window, hwnd: win32.HWND, lparam: win32.LPARAM) Hit {
     return layoutOf(window, hwnd).hit(win32.xLparam(lparam), win32.yLparam(lparam));
+}
+
+/// A mouse message's point, in the bar's client coordinates.
+fn pointAt(lparam: win32.LPARAM) win32.POINT {
+    return .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
 }
 
 /// The tab a hit is on, its close glyph included.
@@ -429,31 +630,25 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     };
     _ = win32.SetBkMode(mem, win32.TRANSPARENT);
 
-    const alloc = window.app.core_app.alloc;
+    // A dragged tab is drawn last, over the others, under the pointer;
+    // nothing is highlighted meanwhile.
+    const drag: ?Drag = if (window.bar.drag) |d| (if (d.active) d else null) else null;
     for (window.tabs.items, 0..) |t, index| {
-        const r = l.tabRect(index);
-        if (r.right <= 0 or r.left >= l.width) continue;
-        const shown = index == window.selected;
-        const hovered = std.meta.eql(window.bar.hover, Hit{ .tab = index }) or
-            std.meta.eql(window.bar.hover, Hit{ .close = index });
-        if (shown or hovered) fill(mem, r, if (shown) colors.shown else colors.hover);
-
-        // The title, cut short with an ellipsis where it does not fit.
-        var text_rect: RECT = .{
-            .left = r.left + l.m.pad,
-            .top = r.top,
-            .right = l.closeRect(index).left - @divTrunc(l.m.pad, 2),
-            .bottom = r.bottom,
-        };
-        _ = win32.SetTextColor(mem, if (shown) colors.text else colors.dim);
-        const title = wideFromUtf8(alloc, Window.tabTitle(t) orelse "Ghostty") catch null;
-        defer if (title) |w| alloc.free(w);
-        if (title) |w| _ = win32.DrawTextW(mem, w.ptr, @intCast(w.len), &text_rect, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_END_ELLIPSIS | win32.DT_NOPREFIX);
-
-        var close = l.closeRect(index);
-        if (std.meta.eql(window.bar.hover, Hit{ .close = index })) fill(mem, close, colors.shown);
-        _ = win32.SetTextColor(mem, colors.dim);
-        _ = win32.DrawTextW(mem, L("\u{00D7}"), 1, &close, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_CENTER | win32.DT_NOPREFIX);
+        if (drag) |d| if (d.index == index) continue;
+        const hover: Hover = if (drag != null)
+            .none
+        else if (std.meta.eql(window.bar.hover, Hit{ .close = index }))
+            .close
+        else if (std.meta.eql(window.bar.hover, Hit{ .tab = index }))
+            .tab
+        else
+            .none;
+        drawTab(window, mem, l, t, l.tabRect(index), index == window.selected, hover, colors);
+    }
+    if (drag) |d| {
+        const left = l.dragLeft(d.grab.x, d.pointer.x);
+        const r: RECT = .{ .left = left, .top = 0, .right = left + l.tab, .bottom = l.m.height };
+        drawTab(window, mem, l, window.tabs.items[d.index], r, d.index == window.selected, .tab, colors);
     }
 
     // Over any tab scrolled under it.
@@ -463,6 +658,43 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     _ = win32.DrawTextW(mem, L("+"), 1, &plus, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_CENTER | win32.DT_NOPREFIX);
 
     _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
+}
+
+/// What of a tab the pointer is over, for its highlight.
+const Hover = enum { none, tab, close };
+
+/// Draw tab `t` in `r`: the shown one or one under the pointer filled, its
+/// title, and its close glyph.
+fn drawTab(
+    window: *Window,
+    hdc: win32.HDC,
+    l: Layout,
+    t: *const Window.Tab,
+    r: RECT,
+    shown: bool,
+    hover: Hover,
+    colors: Colors,
+) void {
+    if (r.right <= 0 or r.left >= l.width) return;
+    if (shown or hover != .none) fill(hdc, r, if (shown) colors.shown else colors.hover);
+
+    // The title, cut short with an ellipsis where it does not fit.
+    var close = closeIn(l.m, r);
+    var text_rect: RECT = .{
+        .left = r.left + l.m.pad,
+        .top = r.top,
+        .right = close.left - @divTrunc(l.m.pad, 2),
+        .bottom = r.bottom,
+    };
+    _ = win32.SetTextColor(hdc, if (shown) colors.text else colors.dim);
+    const alloc = window.app.core_app.alloc;
+    const title = wideFromUtf8(alloc, Window.tabTitle(t) orelse "Ghostty") catch null;
+    defer if (title) |w| alloc.free(w);
+    if (title) |w| _ = win32.DrawTextW(hdc, w.ptr, @intCast(w.len), &text_rect, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_END_ELLIPSIS | win32.DT_NOPREFIX);
+
+    if (hover == .close) fill(hdc, close, colors.shown);
+    _ = win32.SetTextColor(hdc, colors.dim);
+    _ = win32.DrawTextW(hdc, L("\u{00D7}"), 1, &close, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_CENTER | win32.DT_NOPREFIX);
 }
 
 fn fill(hdc: win32.HDC, r: RECT, color: win32.COLORREF) void {
@@ -481,6 +713,9 @@ pub const Metrics = struct {
     /// The close glyph's box, square, inset `pad` from a tab's right edge.
     close: i32,
     pad: i32,
+    /// How near either end of the tabs a dragged tab's pointer scrolls
+    /// them (`Layout.autoScrollStep`).
+    edge: i32,
 
     pub fn init(dpi: u32) Metrics {
         return .{
@@ -490,6 +725,7 @@ pub const Metrics = struct {
             .plus = scale(34, dpi),
             .close = scale(16, dpi),
             .pad = scale(8, dpi),
+            .edge = scale(32, dpi),
         };
     }
 
@@ -534,14 +770,7 @@ pub const Layout = struct {
 
     /// The close glyph's box in tab `index`.
     pub fn closeRect(self: Layout, index: usize) RECT {
-        const t = self.tabRect(index);
-        const top = @divTrunc(self.m.height - self.m.close, 2);
-        return .{
-            .left = t.right - self.m.pad - self.m.close,
-            .top = top,
-            .right = t.right - self.m.pad,
-            .bottom = top + self.m.close,
-        };
+        return closeIn(self.m, self.tabRect(index));
     }
 
     /// The "+" button: after the last tab, or at the right end once the
@@ -578,7 +807,61 @@ pub const Layout = struct {
         if (t.right > end) scroll += t.right - end;
         return std.math.clamp(scroll, 0, self.max_scroll);
     }
+
+    /// Where the left edge of a tab dragged with the pointer at `x`,
+    /// grabbed `grab` pixels from its left edge, is drawn: under the
+    /// pointer, kept within the part of the bar the tabs show in, from its
+    /// left end to the "+" button.
+    pub fn dragLeft(self: Layout, grab: i32, x: i32) i32 {
+        return @max(0, @min(x - grab, self.tabsEnd() - self.tab));
+    }
+
+    /// The index a tab dragged so goes to among the `count` tabs, itself
+    /// counted (`dragLeft`): the place it covers the most of, scroll
+    /// included. A neighbour makes room once the dragged tab's leading
+    /// edge passes the neighbour's centre, the dragged tab's centre then
+    /// in the neighbour's place; it can go no further than the first or
+    /// last place.
+    pub fn dropIndex(self: Layout, grab: i32, x: i32) usize {
+        if (self.count == 0) return 0;
+        const tab = @max(1, self.tab);
+        const left = self.dragLeft(grab, x) + self.scroll;
+        const place: i64 = @divFloor(left + @divTrunc(tab, 2), tab);
+        return @intCast(std.math.clamp(place, 0, @as(i64, @intCast(self.count - 1))));
+    }
+
+    /// How far, at each tick of a drag's timer, the tabs scroll with the
+    /// dragged tab's pointer at `x`, `y`: toward the end of the tabs it is
+    /// held within `Metrics.edge` of, or past, the faster the nearer, up to
+    /// a quarter of that edge a tick; 0 when the tabs all fit, when there
+    /// is no more to scroll that way, and with the pointer more than the
+    /// bar's height above or below it, as when it takes a tab out of it.
+    pub fn autoScrollStep(self: Layout, x: i32, y: i32) i32 {
+        if (self.max_scroll == 0) return 0;
+        if (y < -self.m.height or y >= 2 * self.m.height) return 0;
+        const edge = self.m.edge;
+        if (x < edge) return if (self.scroll > 0) -scrollSpeed(edge - x, edge) else 0;
+        const end = self.tabsEnd();
+        if (x >= end - edge) return if (self.scroll < self.max_scroll) scrollSpeed(x - (end - edge) + 1, edge) else 0;
+        return 0;
+    }
+
+    fn scrollSpeed(depth: i32, edge: i32) i32 {
+        return @max(1, @divTrunc(@min(depth, edge), 4));
+    }
 };
+
+/// The close glyph's box in a tab at `r`: `m.close` square, inset `m.pad`
+/// from its right edge, centred down the bar.
+fn closeIn(m: Metrics, r: RECT) RECT {
+    const top = @divTrunc(m.height - m.close, 2);
+    return .{
+        .left = r.right - m.pad - m.close,
+        .top = top,
+        .right = r.right - m.pad,
+        .bottom = top + m.close,
+    };
+}
 
 pub const Hit = union(enum) {
     none,
@@ -664,6 +947,109 @@ test "win32: the tab bar's font is the system's message font" {
     try testing.expectEqual(@sizeOf(win32.LOGFONTW), win32.GetObjectW(font, @sizeOf(win32.LOGFONTW), &made));
     try testing.expectEqualSlices(u16, &ncm.lfMessageFont.lfFaceName, &made.lfFaceName);
     try testing.expectEqual(2 * ncm.lfMessageFont.lfHeight, made.lfHeight);
+}
+
+test "win32: a press on a tab drags it only past the system's threshold" {
+    const testing = std.testing;
+    const press: win32.POINT = .{ .x = 100, .y = 10 };
+    const four: win32.POINT = .{ .x = 4, .y = 4 };
+    // As far as the threshold on either side, across or down: a click.
+    try testing.expect(!pastDragThreshold(press, .{ .x = 104, .y = 10 }, four));
+    try testing.expect(!pastDragThreshold(press, .{ .x = 96, .y = 14 }, four));
+    try testing.expect(!pastDragThreshold(press, .{ .x = 100, .y = 6 }, four));
+    // One pixel more, either way: a drag.
+    try testing.expect(pastDragThreshold(press, .{ .x = 105, .y = 10 }, four));
+    try testing.expect(pastDragThreshold(press, .{ .x = 95, .y = 10 }, four));
+    try testing.expect(pastDragThreshold(press, .{ .x = 100, .y = 15 }, four));
+    try testing.expect(pastDragThreshold(press, .{ .x = 100, .y = 5 }, four));
+    // A negative metric counts as its size.
+    try testing.expect(!pastDragThreshold(press, .{ .x = 104, .y = 10 }, .{ .x = -4, .y = -4 }));
+    try testing.expect(pastDragThreshold(press, .{ .x = 105, .y = 10 }, .{ .x = -4, .y = -4 }));
+
+    // Windows gives one at any DPI.
+    for ([_]u32{ 96, 144, 192 }) |dpi| {
+        const t = dragThreshold(dpi);
+        try testing.expect(t.x > 0 and t.y > 0);
+    }
+}
+
+test "win32: a dragged tab goes to the place it covers the most of" {
+    const testing = std.testing;
+    const m = Metrics.init(96);
+
+    // Three tabs 220 wide at 0, 220 and 440, grabbed 20 px in: the first
+    // stays first until it has moved half a tab, then makes the second
+    // room; it goes no further than the last place, nor before the first,
+    // and is drawn no further than the "+" or the bar's left end.
+    const l = Layout.init(m, 3, 1000, 0);
+    try testing.expectEqual(0, l.dropIndex(20, 20));
+    try testing.expectEqual(0, l.dropIndex(20, 20 + 109));
+    try testing.expectEqual(1, l.dropIndex(20, 20 + 110));
+    try testing.expectEqual(1, l.dropIndex(20, 20 + 329));
+    try testing.expectEqual(2, l.dropIndex(20, 20 + 330));
+    try testing.expectEqual(2, l.dropIndex(20, 5000));
+    try testing.expectEqual(0, l.dropIndex(20, -5000));
+    try testing.expectEqual(440, l.dragLeft(20, 5000));
+    try testing.expectEqual(0, l.dragLeft(20, -5000));
+    try testing.expectEqual(123, l.dragLeft(20, 143));
+    // The last, dragged left, likewise.
+    try testing.expectEqual(2, l.dropIndex(20, 460 - 110));
+    try testing.expectEqual(1, l.dropIndex(20, 460 - 111));
+
+    // Scrolled tabs: the scroll counts, and at either end of it the
+    // dragged tab reaches the first or the last place.
+    const s = Layout.init(m, 20, 1000, 100);
+    try testing.expectEqual(1, s.dropIndex(10, 10));
+    try testing.expectEqual(966 - 72, s.dragLeft(10, 5000));
+    try testing.expectEqual(14, s.dropIndex(10, 5000));
+    try testing.expectEqual(19, Layout.init(m, 20, 1000, 10_000).dropIndex(10, 5000));
+    try testing.expectEqual(0, Layout.init(m, 20, 1000, 0).dropIndex(10, -5));
+
+    // No room, and no tabs: the first place, nothing divides by zero.
+    try testing.expectEqual(0, Layout.init(m, 3, 0, 0).dropIndex(10, 500));
+    try testing.expectEqual(0, Layout.init(m, 3, 0, 0).dragLeft(10, 500));
+    try testing.expectEqual(0, Layout.init(m, 0, 500, 0).dropIndex(10, 500));
+}
+
+test "win32: a dragged tab held near an end of the bar scrolls the tabs" {
+    const testing = std.testing;
+    const m = Metrics.init(96);
+    try testing.expectEqual(32, m.edge);
+
+    // Twenty tabs in 1000 px, scrolled 100 of 474: the tabs end at the
+    // "+", 966. Within 32 px of either end, or past it, they scroll that
+    // way, by 1 px a tick at the edge's inner side up to 8 at the end.
+    const s = Layout.init(m, 20, 1000, 100);
+    try testing.expectEqual(0, s.autoScrollStep(500, 10));
+    try testing.expectEqual(-8, s.autoScrollStep(0, 10));
+    try testing.expectEqual(-1, s.autoScrollStep(31, 10));
+    try testing.expectEqual(0, s.autoScrollStep(32, 10));
+    try testing.expectEqual(-8, s.autoScrollStep(-300, 10));
+    try testing.expectEqual(0, s.autoScrollStep(933, 10));
+    try testing.expectEqual(1, s.autoScrollStep(934, 10));
+    try testing.expectEqual(8, s.autoScrollStep(965, 10));
+    try testing.expectEqual(8, s.autoScrollStep(2000, 10));
+    // Not with the pointer more than the bar's height above or below it.
+    try testing.expectEqual(-8, s.autoScrollStep(0, -34));
+    try testing.expectEqual(0, s.autoScrollStep(0, -35));
+    try testing.expectEqual(-8, s.autoScrollStep(0, 67));
+    try testing.expectEqual(0, s.autoScrollStep(0, 68));
+
+    // At the first and the last scroll, only the other way.
+    const first = Layout.init(m, 20, 1000, 0);
+    try testing.expectEqual(0, first.autoScrollStep(0, 10));
+    try testing.expectEqual(8, first.autoScrollStep(965, 10));
+    const last = Layout.init(m, 20, 1000, 10_000);
+    try testing.expectEqual(0, last.autoScrollStep(965, 10));
+    try testing.expectEqual(-8, last.autoScrollStep(0, 10));
+
+    // Tabs that all fit never scroll; nor does a bar with no room, but
+    // back to its start.
+    const fit = Layout.init(m, 3, 1000, 0);
+    try testing.expectEqual(0, fit.autoScrollStep(0, 10));
+    try testing.expectEqual(0, fit.autoScrollStep(999, 10));
+    try testing.expectEqual(0, Layout.init(m, 3, 0, 0).autoScrollStep(0, 10));
+    try testing.expectEqual(-8, Layout.init(m, 3, 0, 500).autoScrollStep(0, 10));
 }
 
 test "win32: the tab bar scrolls to show a tab" {
