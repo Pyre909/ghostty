@@ -1036,6 +1036,8 @@ pub const App = struct {
             .desktop_notification => self.desktopNotification(target, value),
             .start_search => startSearch(target, value),
             .end_search => endSearch(target),
+            .search_total => searchCount(target, .total, value.total),
+            .search_selected => searchCount(target, .selected, value.selected),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1106,6 +1108,22 @@ pub const App = struct {
             .surface => |v| end: {
                 SearchBar.finish(v.rt_surface);
                 break :end true;
+            },
+        };
+    }
+
+    /// `.search_total` and `.search_selected`, from the core's search
+    /// thread through its mailbox: the count the terminal's search bar
+    /// shows, `selected/total` as on GTK (`SearchBar.countLabel`).
+    fn searchCount(target: apprt.Target, comptime which: enum { total, selected }, value: ?usize) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| count: {
+                switch (which) {
+                    .total => SearchBar.setTotal(v.rt_surface, value),
+                    .selected => SearchBar.setSelected(v.rt_surface, value),
+                }
+                break :count true;
             },
         };
     }
@@ -8556,6 +8574,164 @@ test "win32: a search field gets the focus back, and takes its own keys" {
     try std.testing.expect(FocusSeen.last == edit);
     _ = win32.SendMessageW(bar.hwnd.?, win32.WM_LBUTTONUP, 0, testMid(l.label));
     try std.testing.expectEqualStrings("", SearchSeen.take());
+}
+
+/// For tests: whether the search bar `hwnd`'s timer has fired, taking its
+/// WM_TIMER from the queue without dispatching it.
+fn searchTimerDue(hwnd: win32.HWND) bool {
+    var msg: win32.MSG = undefined;
+    return win32.PeekMessageW(&msg, hwnd, win32.WM_TIMER, win32.WM_TIMER, win32.PM_REMOVE).toBool();
+}
+
+/// For tests: the search bar `hwnd`'s timer, as `run` would dispatch it.
+fn searchTimer(hwnd: win32.HWND) void {
+    _ = win32.SendMessageW(hwnd, win32.WM_TIMER, SearchBar.search_timer, 0);
+}
+
+test "win32: typing in a search field searches its terminal, and Enter walks the matches" {
+    // GTK's overlay: the text is searched for (`search:<text>`) once it
+    // has not changed for GtkSearchEntry's 150 ms, at once when emptied or
+    // given by start_search, and again when the bar opens again; Enter,
+    // Shift+Enter and the up and down buttons ask for the next and previous
+    // match, after a search still to be made. Under a prompt the search
+    // waits and navigation is dropped; end_search drops a search not yet
+    // made. search_total and search_selected make the count.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    SearchBar.test_perform = &SearchSeen.seen;
+    defer SearchBar.test_perform = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    const bar = &a.search_bar;
+    const hwnd = bar.hwnd.?;
+    const edit = bar.edit.?;
+    _ = SearchSeen.take();
+
+    // Typed text: searched for after the wait, from the timer, once.
+    _ = win32.SetWindowTextW(edit, L("alpha"));
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    win32.Sleep(40);
+    try std.testing.expect(!searchTimerDue(hwnd));
+    win32.Sleep(250);
+    try std.testing.expect(searchTimerDue(hwnd));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:alpha;", SearchSeen.take());
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    // And the timer stopped.
+    win32.Sleep(200);
+    try std.testing.expect(!searchTimerDue(hwnd));
+
+    // Changes inside the wait: one search, for the last text.
+    _ = win32.SetWindowTextW(edit, L("alp"));
+    _ = win32.SetWindowTextW(edit, L("alpha beta"));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:alpha beta;", SearchSeen.take());
+
+    // Emptied: at once, which stops the search.
+    _ = win32.SetWindowTextW(edit, L(""));
+    win32.Sleep(100);
+    try std.testing.expect(searchTimerDue(hwnd));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:;", SearchSeen.take());
+
+    // Enter: the search still to be made, then the next match; again,
+    // only the next match. Shift+Enter: the previous one.
+    _ = win32.SetWindowTextW(edit, L("gamma"));
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    try std.testing.expectEqualStrings("search:gamma;navigate_search:next;", SearchSeen.take());
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    try std.testing.expectEqualStrings("navigate_search:next;", SearchSeen.take());
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    var keys: [256]u8 = undefined;
+    try std.testing.expect(win32.GetKeyboardState(&keys).toBool());
+    const shift = keys[@intCast(win32.VK_SHIFT)];
+    keys[@intCast(win32.VK_SHIFT)] = 0x80;
+    try std.testing.expect(win32.SetKeyboardState(&keys).toBool());
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    keys[@intCast(win32.VK_SHIFT)] = shift;
+    _ = win32.SetKeyboardState(&keys);
+    try std.testing.expectEqualStrings("navigate_search:previous;", SearchSeen.take());
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("gamma", try fieldText(a, &buf));
+
+    // The buttons: up is the next match, down the previous one, as on GTK.
+    const l = searchLayout(a);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testMid(l.up));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, testMid(l.up));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testMid(l.down));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, testMid(l.down));
+    try std.testing.expectEqualStrings("navigate_search:next;navigate_search:previous;", SearchSeen.take());
+
+    // Under a prompt: the search waits for the next tick of its timer,
+    // and Enter is dropped.
+    _ = win32.SetWindowTextW(edit, L("delta"));
+    app.prompt_depth = 1;
+    searchTimer(hwnd);
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    app.prompt_depth = 0;
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    win32.Sleep(250);
+    try std.testing.expect(searchTimerDue(hwnd));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:delta;", SearchSeen.take());
+
+    // An unpaired surrogate is U+FFFD.
+    const lone = [_:0]u16{ 'a', 0xD800, 'b' };
+    _ = win32.SetWindowTextW(edit, &lone);
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:a\u{FFFD}b;", SearchSeen.take());
+
+    // end_search drops a search not yet made; opened again, the text it
+    // kept is searched for at once. Opened when open, nothing.
+    _ = win32.SetWindowTextW(edit, L("omega"));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    win32.Sleep(100);
+    try std.testing.expect(searchTimerDue(hwnd));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:omega;", SearchSeen.take());
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("", SearchSeen.take());
+
+    // A needle, as search_selection gives: searched for at once.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "needle" }));
+    win32.Sleep(100);
+    try std.testing.expect(searchTimerDue(hwnd));
+    searchTimer(hwnd);
+    try std.testing.expectEqualStrings("search:needle;", SearchSeen.take());
+
+    // The count: GTK's selected/total, the core's 0-based index plus one.
+    try std.testing.expect(!try app.performAction(.app, .search_total, .{ .total = 5 }));
+    try std.testing.expect(!try app.performAction(.app, .search_selected, .{ .selected = 2 }));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .search_total, .{ .total = 5 }));
+    try std.testing.expectEqualStrings("0/5", SearchBar.countLabel(buf[0..48], bar.total, bar.selected));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .search_selected, .{ .selected = 2 }));
+    try std.testing.expectEqualStrings("3/5", SearchBar.countLabel(buf[0..48], bar.total, bar.selected));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .search_total, .{ .total = null }));
+    try std.testing.expectEqualStrings("0/0", SearchBar.countLabel(buf[0..48], bar.total, bar.selected));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .search_selected, .{ .selected = null }));
+    try std.testing.expect(bar.selected == null);
 }
 
 test "win32: a search bar follows its terminal through zooms, tabs, splits and moves" {

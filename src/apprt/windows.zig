@@ -64,8 +64,13 @@
 //! button hides it and gives the terminal the focus back. The bar is a
 //! child window of the frame placed above the terminal, not of the
 //! terminal, whose flip-model swap chain would hide it, so every layout
-//! places it (`SearchBar.place`). Typing in the field does not search yet,
-//! and a key in it reaches the field, never a binding.
+//! places it (`SearchBar.place`). Typing in the field searches the
+//! terminal's scrollback through the core's `search:<text>` once the text
+//! has settled, as GTK's search entry waits (`SearchBar.Debounce`); Enter,
+//! Shift+Enter and the bar's buttons ask for the next and previous match,
+//! and `.search_total` and `.search_selected` make its count. The core's
+//! renderer draws the matches. A key in the field reaches the field, never
+//! a binding.
 //!
 //! ## What is still missing
 //!

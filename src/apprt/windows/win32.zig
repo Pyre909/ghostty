@@ -853,6 +853,12 @@ pub extern "user32" fn MsgWaitForMultipleObjectsEx(
 ) callconv(.winapi) DWORD;
 pub extern "user32" fn GetKeyState(vk: c_int) callconv(.winapi) SHORT;
 pub extern "user32" fn GetKeyboardState(key_state: *[256]BYTE) callconv(.winapi) BOOL;
+/// For tests: the calling thread's key state, as GetKeyState reads it.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setkeyboardstate
+pub extern "user32" fn SetKeyboardState(key_state: *const [256]BYTE) callconv(.winapi) BOOL;
+/// For tests: wait without pumping messages.
+/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-sleep
+pub extern "kernel32" fn Sleep(ms: DWORD) callconv(.winapi) void;
 pub extern "user32" fn MapVirtualKeyW(code: UINT, map_type: UINT) callconv(.winapi) UINT;
 pub extern "user32" fn GetKeyboardLayout(thread_id: DWORD) callconv(.winapi) ?HKL;
 pub extern "user32" fn ToUnicodeEx(

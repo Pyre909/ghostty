@@ -38,6 +38,7 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
+const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 
 const RECT = win32.RECT;
 const L = win32.L;
@@ -82,6 +83,25 @@ pub const Bar = struct {
     /// The field's background brush for WM_CTLCOLOREDIT, of `brush_color`.
     brush: ?win32.HGDIOBJ = null,
     brush_color: win32.COLORREF = 0,
+    /// A change of the field's text not yet searched for, and its timer
+    /// (`search_timer`).
+    debounce: Debounce = .{},
+
+    /// Search for the field's text once `delay` milliseconds have passed
+    /// with no other change (`search_timer`); a new call starts the wait
+    /// again, as SetTimer replaces a timer of the same id.
+    fn arm(self: *Bar, delay: u32) void {
+        const hwnd = self.hwnd orelse return;
+        if (win32.SetTimer(hwnd, search_timer, @max(delay, win32.USER_TIMER_MINIMUM), null) == 0) {
+            log.warn("cannot start the search field's timer err={}", .{win32.GetLastError()});
+        }
+    }
+
+    /// Drop a search not yet made.
+    fn disarm(self: *Bar) void {
+        self.debounce.cancel();
+        if (self.hwnd) |hwnd| _ = win32.KillTimer(hwnd, search_timer);
+    }
 
     /// Make the bar's window and its field, hidden, in the terminal's
     /// frame, unless it has them already. False, logged, if they cannot be
@@ -230,6 +250,41 @@ fn textHeight(edit: win32.HWND, font: win32.HGDIOBJ) i32 {
     return tm.tmHeight;
 }
 
+/// The bar's timer for a search not yet made (`Bar.arm`).
+pub const search_timer: win32.UINT_PTR = 1;
+
+/// When a change of the field's text goes to the core as a search, as
+/// GTK's GtkSearchEntry, which the overlay's entry is, emits
+/// search-changed: once the text has not changed for its `search-delay`,
+/// 150 ms by default (the overlay's blueprint sets none), and at once when
+/// it was emptied. Both are GTK 4's documented behaviour, not checked in
+/// this tree. A search not yet made goes first when Enter asks for the
+/// next match (`take`), and is dropped when the bar closes.
+pub const Debounce = struct {
+    pub const delay_ms: u32 = 150;
+
+    pending: bool = false,
+
+    /// The text changed, `empty` if it was emptied: how many milliseconds
+    /// to wait before searching.
+    pub fn changed(self: *Debounce, empty: bool) u32 {
+        self.pending = true;
+        return if (empty) 0 else delay_ms;
+    }
+
+    /// Whether a search is due, the wait over or Enter pressed: once for
+    /// each change.
+    pub fn take(self: *Debounce) bool {
+        const due = self.pending;
+        self.pending = false;
+        return due;
+    }
+
+    pub fn cancel(self: *Debounce) void {
+        self.pending = false;
+    }
+};
+
 /// The procedure every EDIT had before it was subclassed (`Bar.create`).
 var edit_proc: ?win32.WNDPROC = null;
 
@@ -256,6 +311,11 @@ pub fn start(surface: *Surface, needle: [:0]const u8) bool {
     const bar = &surface.search_bar;
     if (!bar.create(surface)) return false;
     const edit = bar.edit.?;
+    // A needle is searched for at once, as GTK's `setSearchContents`
+    // emits search-changed itself; so is the text a closed bar kept when
+    // it opens again (`setSearchActive`). From a timer all the same: this
+    // runs inside a core frame.
+    const now = needle.len > 0 or (!bar.open and win32.GetWindowTextLengthW(edit) > 0);
     if (needle.len > 0) {
         const alloc = surface.app.core_app.alloc;
         const wide = wideFromUtf8(alloc, needle) catch |err| {
@@ -263,7 +323,12 @@ pub fn start(surface: *Surface, needle: [:0]const u8) bool {
             return false;
         };
         defer alloc.free(wide);
+        // Its EN_CHANGE arms the usual wait, which this replaces.
         _ = win32.SetWindowTextW(edit, wide.ptr);
+    }
+    if (now) {
+        _ = bar.debounce.changed(false);
+        bar.arm(0);
     }
     bar.open = true;
     bar.field_focus = true;
@@ -283,16 +348,73 @@ pub fn finish(surface: *Surface) void {
     bar.open = false;
     bar.field_focus = false;
     bar.pressed = .none;
+    // A search still to be made would start the search again.
+    bar.disarm();
     bar.hideWindow();
     if (had_focus) surface.app.search_focus = surface;
+}
+
+/// `search_total` and `search_selected`: the count the bar shows
+/// (`countLabel`), kept while it is closed too.
+pub fn setTotal(surface: *Surface, total: ?usize) void {
+    surface.search_bar.total = total;
+    if (surface.search_bar.hwnd) |hwnd| _ = win32.InvalidateRect(hwnd, null, .FALSE);
+}
+
+pub fn setSelected(surface: *Surface, selected: ?usize) void {
+    surface.search_bar.selected = selected;
+    if (surface.search_bar.hwnd) |hwnd| _ = win32.InvalidateRect(hwnd, null, .FALSE);
+}
+
+/// The field's text changed (EN_CHANGE, sent synchronously, so also from
+/// `start` inside a core frame): searched for after the wait
+/// (`Debounce`), from the bar's timer, which `run`'s loop dispatches.
+fn textChanged(surface: *Surface) void {
+    const bar = &surface.search_bar;
+    const edit = bar.edit orelse return;
+    bar.arm(bar.debounce.changed(win32.GetWindowTextLengthW(edit) == 0));
+}
+
+/// The bar's timer, or Enter: perform `search:<text>` with the field's
+/// text if a change is still to be searched for, as GTK's overlay does on
+/// search-changed; empty text stops the search (`CoreSurface`'s `.search`).
+/// While the core may not be re-entered, as under a prompt whose loop
+/// dispatches timers, the search waits for the next tick of the timer.
+fn searchNow(surface: *Surface) void {
+    const bar = &surface.search_bar;
+    if (!bar.debounce.pending) return;
+    if (!surface.app.canReenterCore()) return bar.arm(Debounce.delay_ms);
+    _ = bar.debounce.take();
+    if (bar.hwnd) |hwnd| _ = win32.KillTimer(hwnd, search_timer);
+    const edit = bar.edit orelse return;
+    const alloc = surface.app.core_app.alloc;
+    const len: usize = @intCast(@max(win32.GetWindowTextLengthW(edit), 0));
+    const wide = alloc.alloc(u16, len + 1) catch |err| return log.warn("cannot read the search field err={}", .{err});
+    defer alloc.free(wide);
+    const n: usize = @intCast(@max(win32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len)), 0));
+    // An unpaired surrogate becomes U+FFFD.
+    const text = utf8FromWide(alloc, wide[0..n]) catch |err| return log.warn("cannot read the search field err={}", .{err});
+    defer alloc.free(text);
+    perform(surface, .{ .search = text });
+}
+
+/// Enter, Shift+Enter or the up and down buttons: the next or previous
+/// match, as GTK's overlay asks for them, after any search still to be
+/// made for the text as it is now, as GtkSearchEntry emits a pending
+/// search-changed before activating. Nothing while the core may not be
+/// re-entered, as under a prompt.
+fn navigate(surface: *Surface, to: input.Binding.Action.NavigateSearch) void {
+    if (!surface.app.canReenterCore()) return;
+    searchNow(surface);
+    perform(surface, .{ .navigate_search = to });
 }
 
 /// The bar's close button, or Escape in its field: `end_search` on the
 /// terminal, as GTK's close button and Escape do (D4). The core answers
 /// with the apprt `end_search` (`finish`); a terminal whose core cannot
 /// answer, as one that is stopping, closes its bar all the same. Nothing
-/// while the core may not be re-entered (`perform`), when the search it
-/// runs could not be stopped.
+/// while the core may not be re-entered, as under a prompt, when the
+/// search it runs could not be stopped.
 fn close(surface: *Surface) void {
     if (!surface.app.canReenterCore()) return;
     perform(surface, .end_search);
@@ -302,10 +424,9 @@ fn close(surface: *Surface) void {
 
 /// Perform `action` on the terminal's core, as GTK's overlay does
 /// (`performBindingAction`), from a message `run`'s loop dispatched to the
-/// bar. Nothing while the core may not be re-entered, as under a prompt,
-/// where a key is dropped too (`Surface.handleMessage`).
+/// bar. Each caller first checks that the core may be re-entered, as a
+/// key is dropped under a prompt (`Surface.handleMessage`).
 fn perform(surface: *Surface, action: input.Binding.Action) void {
-    if (!surface.app.canReenterCore()) return;
     if (builtin.is_test) if (test_perform) |seen| return seen(surface, action);
     const core = surface.liveCore() orelse return;
     _ = core.performBindingAction(action) catch |err|
@@ -406,6 +527,18 @@ pub fn wndProc(
             return @bitCast(@intFromPtr(brush));
         },
 
+        win32.WM_COMMAND => {
+            if (win32.hiword(wparam) == win32.EN_CHANGE) textChanged(surface);
+            return 0;
+        },
+
+        win32.WM_TIMER => {
+            if (wparam == search_timer) {
+                searchNow(surface);
+                return 0;
+            }
+        },
+
         win32.WM_MOUSEMOVE => {
             if (!bar.tracking) {
                 var track: win32.TRACKMOUSEEVENT = .{
@@ -449,9 +582,13 @@ pub fn wndProc(
             if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
             bar.invalidate();
             if (at == .none or at != pressed) return 0;
+            // As GTK's buttons: up is the next match, which goes toward
+            // older output, as on macOS too (search-overlay.blp).
             switch (at) {
                 .close => close(surface),
-                .up, .down, .none => {},
+                .up => navigate(surface, .next),
+                .down => navigate(surface, .previous),
+                .none => {},
             }
             return 0;
         },
@@ -526,9 +663,17 @@ fn editProc(
         surface.window.setFocused(surface);
     }
 
-    switch (editKey(msg, wparam)) {
+    switch (editKey(msg, wparam, win32.GetKeyState(win32.VK_SHIFT) < 0)) {
         .pass => {},
         .swallow => return 0,
+        .next => {
+            navigate(surface, .next);
+            return 0;
+        },
+        .previous => {
+            navigate(surface, .previous);
+            return 0;
+        },
         .close => {
             close(surface);
             return 0;
@@ -553,15 +698,20 @@ pub const EditKey = enum {
     swallow,
     /// Escape: `end_search` (D4, as GTK).
     close,
+    /// Enter and Shift+Enter: the next and previous match, as GTK's
+    /// overlay takes them (`searchEntryKeyPressed`).
+    next,
+    previous,
     /// Ctrl+Backspace's WM_CHAR, U+007F, which the EDIT would insert:
     /// delete the word before the caret instead.
     delete_word,
 };
 
-pub fn editKey(msg: win32.UINT, wparam: win32.WPARAM) EditKey {
+pub fn editKey(msg: win32.UINT, wparam: win32.WPARAM, shift: bool) EditKey {
     return switch (msg) {
         win32.WM_KEYDOWN => switch (wparam) {
             win32.VK_ESCAPE => .close,
+            win32.VK_RETURN => if (shift) .previous else .next,
             else => .pass,
         },
         win32.WM_CHAR => switch (wparam) {
@@ -960,16 +1110,41 @@ test "win32: Ctrl+Backspace in the search field deletes back to a word's start" 
 
 test "win32: the search field's keys" {
     const testing = std.testing;
-    try testing.expectEqual(EditKey.close, editKey(win32.WM_KEYDOWN, win32.VK_ESCAPE));
-    for ([_]win32.WPARAM{ '\r', '\n', '\t', 0x1B }) |c| {
-        try testing.expectEqual(EditKey.swallow, editKey(win32.WM_CHAR, c));
+    for ([_]bool{ false, true }) |shift| {
+        try testing.expectEqual(EditKey.close, editKey(win32.WM_KEYDOWN, win32.VK_ESCAPE, shift));
+        for ([_]win32.WPARAM{ '\r', '\n', '\t', 0x1B }) |c| {
+            try testing.expectEqual(EditKey.swallow, editKey(win32.WM_CHAR, c, shift));
+        }
+        try testing.expectEqual(EditKey.delete_word, editKey(win32.WM_CHAR, 0x7F, shift));
+        try testing.expectEqual(EditKey.pass, editKey(win32.WM_CHAR, 'a', shift));
+        try testing.expectEqual(EditKey.pass, editKey(win32.WM_CHAR, 0x08, shift));
+        try testing.expectEqual(EditKey.pass, editKey(win32.WM_CHAR, 0x01, shift));
+        try testing.expectEqual(EditKey.pass, editKey(win32.WM_KEYUP, win32.VK_ESCAPE, shift));
+        try testing.expectEqual(EditKey.pass, editKey(win32.WM_KEYUP, win32.VK_RETURN, shift));
+        try testing.expectEqual(EditKey.pass, editKey(win32.WM_KEYDOWN, win32.VK_TAB, shift));
     }
-    try testing.expectEqual(EditKey.delete_word, editKey(win32.WM_CHAR, 0x7F));
-    try testing.expectEqual(EditKey.pass, editKey(win32.WM_CHAR, 'a'));
-    try testing.expectEqual(EditKey.pass, editKey(win32.WM_CHAR, 0x08));
-    try testing.expectEqual(EditKey.pass, editKey(win32.WM_CHAR, 0x01));
-    try testing.expectEqual(EditKey.pass, editKey(win32.WM_KEYDOWN, win32.VK_RETURN));
-    try testing.expectEqual(EditKey.pass, editKey(win32.WM_KEYUP, win32.VK_ESCAPE));
+    // Enter is the next match, Shift+Enter the previous one.
+    try testing.expectEqual(EditKey.next, editKey(win32.WM_KEYDOWN, win32.VK_RETURN, false));
+    try testing.expectEqual(EditKey.previous, editKey(win32.WM_KEYDOWN, win32.VK_RETURN, true));
+}
+
+test "win32: the search waits for the text to settle, but not for an empty field" {
+    const testing = std.testing;
+    var d: Debounce = .{};
+    // Nothing to search for until the text changes.
+    try testing.expect(!d.take());
+    try testing.expectEqual(150, d.changed(false));
+    try testing.expectEqual(150, d.changed(false));
+    // One search for any number of changes, once.
+    try testing.expect(d.take());
+    try testing.expect(!d.take());
+    // Emptied: at once.
+    try testing.expectEqual(0, d.changed(true));
+    try testing.expect(d.take());
+    // Dropped.
+    _ = d.changed(false);
+    d.cancel();
+    try testing.expect(!d.take());
 }
 
 test "win32: the search count is GTK's" {
