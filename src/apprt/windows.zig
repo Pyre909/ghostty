@@ -85,11 +85,14 @@
 //! terminal's title from it is shown wherever its title shows, in place of
 //! the program's, which OSC titles keep changing underneath
 //! (`Surface.effectiveTitle`); the core's own title stays the program's.
-//! The dialog is modeless, its keys handed to IsDialogMessageW by `run`,
-//! so output and requests keep running in every window, and modal to its
+//! The dialog is modeless, its keys handed to IsDialogMessageW by `run`
+//! (and by a teardown's wait), so output and requests keep running in
+//! every window, and modal to its
 //! window, whose frame it holds disabled; a frame is enabled only when
 //! neither it nor a confirmation prompt holds it (`App.beginPrompt`).
-//! `.prompt_title` for a window is not supported, as on macOS.
+//! `.prompt_title` for a window is not supported: a window has no title
+//! of its own here, its caption being its shown tab's, and the binding is
+//! documented as Linux-only (`App.requestTitlePrompt`).
 //!
 //! ## What is still missing
 //!

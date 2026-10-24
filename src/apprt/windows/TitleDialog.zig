@@ -23,19 +23,37 @@
 //! prompt also holds the dialog itself, as it holds every window of the
 //! app.
 //!
+//! A confirmation prompt asked for by a terminal of the frame is owned by
+//! the dialog (`App.promptOwner`), so that MessageBoxW disables the dialog
+//! itself and, as it returns, enables it and gives it the activation back,
+//! as it does for any owner; owned by the disabled frame, the activation
+//! would have nowhere to go.
+//!
 //! Opened from `App.run` (`App.Request.title_prompt`), never inside the
 //! core frame that asked: disabling the frame takes the keyboard focus
-//! from its terminal, and the dialog takes it next. It closes when its
-//! terminal begins to close (`forget`), which a window's close begins with
-//! (`Window.destroy`) and the app's quit too (`App.terminate`), and when
-//! the terminal's tab moves to a new window (`followMove`). Windows
+//! from its terminal, and the dialog takes it next. A frame not on screen
+//! yet shows it when it is shown (`frameShown`), and presenting the frame
+//! brings the dialog forward (`Window.present`). A terminal's prompt
+//! closes when that terminal begins to close (`forget`); a tab's prompt
+//! belongs to the tab, as GTK's does (src/apprt/gtk/class/tab.zig), and
+//! passes to another terminal of it instead, closing when the tab goes
+//! (`tabRemoved`). Either closes when its tab moves to a new window
+//! (`followMove`), and first thing in a window's close (`Window.destroy`),
+//! which the app's quit goes through too (`App.terminate`). Windows
 //! destroys it with its frame in any case, as an owned window.
+//!
+//! IsDialogMessageW, which gives Tab, Enter and Escape their meaning in
+//! the dialog, runs in `App.run`'s loop and in the pump of a teardown's
+//! wait (`App.waitForThread`). Not in the other nested loops: a
+//! confirmation prompt's disables the dialog, and the size, move and menu
+//! loops deliver it no keys.
 
 const std = @import("std");
 
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
+const Tab = @import("Tab.zig");
 const App = @import("App.zig").App;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
@@ -51,14 +69,16 @@ pub const Target = enum { surface, tab };
 pub const Prompt = struct {
     /// The dialog; null while none is open.
     hwnd: ?win32.HWND = null,
-    /// The terminal that asked, live while the dialog is open: it closes
-    /// the dialog when it begins to close (`forget`).
+    /// The terminal the title is for, live while the dialog is open: the
+    /// one that asked, or for a tab's prompt another terminal of the tab
+    /// once that one closes (`forget`).
     surface: ?*Surface = null,
     target: Target = .surface,
+    /// A tab's prompt: the tab, which the prompt belongs to; it closes
+    /// when the tab goes (`tabRemoved`). Null for a terminal's.
+    tab: ?*Tab = null,
     /// Disabled by `App.beginPrompt`, for `App.endPrompt` to enable again.
     prompt_disabled: bool = false,
-    /// The title bar was made dark (`setDark`).
-    dark: bool = false,
 };
 
 /// The field's control id.
@@ -81,19 +101,21 @@ pub fn open(surface: *Surface, target: Target) bool {
     }
     if (surface.closing or window.closing) return false;
 
+    const tab: ?*Tab = switch (target) {
+        .surface => null,
+        .tab => window.tabOf(surface) orelse return false,
+    };
+
     // The field starts with the title shown now: the override, else the
     // program's, as GTK starts it (surface.zig `promptTitle`, tab.zig
     // `promptTabTitle`).
-    const initial: []const u8 = switch (target) {
-        .surface => surface.effectiveTitle(),
-        .tab => if (window.tabOf(surface)) |t| Window.tabTitle(t) else null,
-    } orelse "";
+    const initial: []const u8 = (if (tab) |t| Window.tabTitle(t) else surface.effectiveTitle()) orelse "";
 
     var buf: [template_capacity]u16 align(4) = undefined;
     // `spec` is fixed, and a test checks that it fits.
     const template = build(&buf, spec(target)) catch unreachable;
 
-    window.title_prompt = .{ .surface = surface, .target = target };
+    window.title_prompt = .{ .surface = surface, .target = target, .tab = tab };
     const hwnd = win32.CreateDialogIndirectParamW(
         app.hinstance,
         @ptrCast(template.ptr),
@@ -117,7 +139,6 @@ pub fn open(surface: *Surface, target: Target) bool {
         _ = win32.SendMessageW(e, win32.EM_SETSEL, 0, -1);
     }
     setDark(window, window.dark_frame);
-    placeOverOwner(hwnd, window.hwnd);
 
     // Disabled after the dialog exists and before it shows, the order
     // DialogBox keeps, so that the activation goes from the frame straight
@@ -126,12 +147,49 @@ pub fn open(surface: *Surface, target: Target) bool {
     _ = win32.EnableWindow(window.hwnd, .FALSE);
 
     // Shown with its window: a frame not on screen yet has no place for
-    // it, and showing it would take the activation from another app.
-    if (win32.IsWindowVisible(window.hwnd).toBool()) {
-        _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
-        if (edit) |e| _ = win32.SetFocus(e);
-    }
+    // it, and showing it would take the activation from another app. Such
+    // a frame shows it as it is shown (`frameShown`), so that it is never
+    // held disabled with nothing on screen to answer.
+    if (win32.IsWindowVisible(window.hwnd).toBool()) show(window);
     return true;
+}
+
+/// `window` was shown (`Window.show`): a prompt opened while it was not on
+/// screen shows now, with the keyboard focus in its field.
+pub fn frameShown(window: *Window) void {
+    const hwnd = window.title_prompt.hwnd orelse return;
+    if (win32.IsWindowVisible(hwnd).toBool()) return;
+    show(window);
+}
+
+/// Centre the dialog over its frame, show it and focus its field.
+fn show(window: *Window) void {
+    const hwnd = window.title_prompt.hwnd orelse return;
+    placeOverOwner(hwnd, window.hwnd);
+    _ = win32.ShowWindow(hwnd, win32.SW_SHOW);
+    if (win32.GetDlgItem(hwnd, edit_id)) |e| _ = win32.SetFocus(e);
+}
+
+/// The window to bring forward for `window` (`Window.present`): its
+/// prompt if one is open, which is where the keyboard goes, as Windows
+/// itself activates an owner's last active popup from Alt+Tab or the
+/// taskbar; else the frame, which the prompt holds disabled.
+pub fn front(window: *const Window) win32.HWND {
+    return window.title_prompt.hwnd orelse window.hwnd;
+}
+
+/// After `Window.present` brought `window`'s prompt forward: its field
+/// has the keyboard focus, unless a control of the dialog has it already
+/// (the dialog manager gives back the one that had it when the dialog is
+/// activated again). Only once the dialog is the active window: SetFocus
+/// would activate it otherwise, and the foreground was refused.
+pub fn focusField(window: *const Window) void {
+    const hwnd = window.title_prompt.hwnd orelse return;
+    if (win32.GetActiveWindow() != hwnd) return;
+    if (win32.GetFocus()) |f| {
+        if (f == hwnd or win32.IsChild(hwnd, f).toBool()) return;
+    }
+    if (win32.GetDlgItem(hwnd, edit_id)) |e| _ = win32.SetFocus(e);
 }
 
 /// Close `window`'s title prompt, if it has one, and let go of its frame
@@ -154,24 +212,77 @@ fn release(window: *Window) void {
     }
 }
 
-/// `surface` is beginning to close, or is freed: the prompt it asked for,
-/// in whichever window, closes. Called by `App.forgetClosing` and
-/// `App.surfaceDestroyed`.
+/// `surface` is beginning to close, or is freed. A terminal's prompt it
+/// asked for, in whichever window, closes. A tab's passes to another
+/// terminal of the tab that is not closing, as the tab lives on, and
+/// closes only if there is none (GTK ties the tab's dialog to the tab).
+/// Called by `App.forgetClosing` and `App.surfaceDestroyed`.
 pub fn forget(app: *App, surface: *Surface) void {
     for (app.windows.items) |window| {
-        if (window.title_prompt.surface == surface) close(window);
+        if (window.title_prompt.surface != surface) continue;
+        if (window.title_prompt.tab) |t| {
+            if (heir(t, surface)) |next| {
+                window.title_prompt.surface = next;
+                continue;
+            }
+        }
+        close(window);
     }
 }
 
-/// A tab of `old` moved to a new window: if it took the terminal that
-/// asked, the prompt closes as Cancel would. It is modal to `old`, which
-/// it would otherwise keep disabled for a terminal now elsewhere; taking
-/// it to the new frame would move the hold with it and change the owner
-/// of a window on screen, for a move that can only come from another
-/// window while this one takes no input.
+/// A terminal of `t` other than `gone` and not closing, for its tab's
+/// prompt to pass to (`forget`). `Surface.destroy` takes `gone` out of the
+/// tree before its core stops, but a terminal freed without a core may
+/// still be in it.
+fn heir(t: *Tab, gone: *const Surface) ?*Surface {
+    if (t.focused) |f| {
+        if (f != gone and !f.closing) return f;
+    }
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        if (entry.view != gone and !entry.view.closing) return entry.view;
+    }
+    return null;
+}
+
+/// `t` is leaving `window` (`Window.removeTab`): its tab's prompt closes
+/// with it, before `t` is freed.
+pub fn tabRemoved(window: *Window, t: *const Tab) void {
+    if (window.title_prompt.tab == t) close(window);
+}
+
+/// A tab of `old` moved to a new window: if it was the prompt's tab, or
+/// took the terminal a terminal's prompt is for, the prompt closes as
+/// Cancel would. It is modal to `old`, which it would otherwise keep
+/// disabled for a tab now elsewhere; taking it to the new frame would move
+/// the hold with it and change the owner of a window on screen, for a move
+/// that can only come from another window while this one takes no input.
 pub fn followMove(old: *Window) void {
-    const surface = old.title_prompt.surface orelse return;
-    if (surface.window != old) close(old);
+    const prompt = old.title_prompt;
+    if (prompt.hwnd == null) return;
+    const moved = if (prompt.tab) |t|
+        old.tabIndex(t) == null
+    else if (prompt.surface) |s|
+        s.window != old
+    else
+        false;
+    if (moved) close(old);
+}
+
+/// The key-down `msg`, which IsDialogMessageW took (`App.dialogMessage`),
+/// closed `window`'s prompt: Enter or Escape. Closing it there
+/// enables the frame, which takes the activation and gives its focused
+/// terminal the keyboard focus (its WM_SETFOCUS) before the key is
+/// released, so the key-up goes to that terminal. It never saw the press,
+/// and a release without one would reach a program that asked for key
+/// releases (kitty's report-events flag), so the terminal withholds it
+/// (`Surface.withholdKeyUp`). Not when the focus goes to the terminal's
+/// search field, which takes the key-up as an edit control does.
+pub fn closedByKey(window: *Window, msg: *const win32.MSG) void {
+    if (msg.message != win32.WM_KEYDOWN and msg.message != win32.WM_SYSKEYDOWN) return;
+    const surface = window.tab().focused orelse return;
+    if (Window.focusTarget(surface) != surface.hwnd) return;
+    surface.withholdKeyUp(msg.lParam);
 }
 
 /// OK: the title in the field becomes the terminal's or the tab's, or an
@@ -224,9 +335,7 @@ pub fn setDark(window: *Window, dark: bool) void {
     );
     if (hr < 0) {
         log.warn("cannot set the title prompt's mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
-        return;
     }
-    window.title_prompt.dark = dark;
 }
 
 /// Centre the dialog over its frame, kept inside the work area of the
@@ -240,7 +349,7 @@ fn placeOverOwner(hwnd: win32.HWND, owner: win32.HWND) void {
     var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
     info.cbSize = @sizeOf(win32.MONITORINFO);
     if (!win32.GetMonitorInfoW(monitor, &info).toBool()) return;
-    const at = centred(frame, dialog.right - dialog.left, dialog.bottom - dialog.top, info.rcWork);
+    const at = placement(frame, dialog, info);
     _ = win32.SetWindowPos(
         hwnd,
         null,
@@ -250,6 +359,13 @@ fn placeOverOwner(hwnd: win32.HWND, owner: win32.HWND) void {
         0,
         win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
     );
+}
+
+/// Where `placeOverOwner` puts `dialog`, its current rect, over `frame` on
+/// the monitor `info` describes: centred, inside the work area, which
+/// leaves out the taskbar, not the whole monitor.
+pub fn placement(frame: win32.RECT, dialog: win32.RECT, info: win32.MONITORINFO) win32.RECT {
+    return centred(frame, dialog.right - dialog.left, dialog.bottom - dialog.top, info.rcWork);
 }
 
 /// The rect of a `width` x `height` window centred over `owner`, kept
@@ -565,5 +681,17 @@ test "win32: the title prompt is centred over its window, inside the work area" 
     try std.testing.expectEqual(
         win32.RECT{ .left = 1620, .top = 340, .right = 1920, .bottom = 460 },
         centred(off, 300, 120, work),
+    );
+
+    // On a monitor whose taskbar takes its bottom 40 pixels, a frame
+    // reaching below the work area: the dialog stays above the taskbar.
+    var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
+    info.rcMonitor = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+    info.rcWork = work;
+    const low: win32.RECT = .{ .left = 100, .top = 900, .right = 900, .bottom = 1300 };
+    const dialog: win32.RECT = .{ .left = 0, .top = 0, .right = 300, .bottom = 120 };
+    try std.testing.expectEqual(
+        win32.RECT{ .left = 350, .top = 920, .right = 650, .bottom = 1040 },
+        placement(low, dialog, info),
     );
 }

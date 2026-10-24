@@ -194,8 +194,9 @@ pub const Surface = struct {
         /// Keys whose key-down the core never saw, by `scanSlot`: the IME
         /// claimed it (VK_PROCESSKEY), it was a digit of Alt+numpad entry
         /// (`isAltNumpad`), it opened the window menu
-        /// (`isWindowMenuKey`), or it arrived while a prompt was open
-        /// (`App.canReenterCore`). Their key-up is kept from the core as
+        /// (`isWindowMenuKey`), it arrived while a prompt was open
+        /// (`App.canReenterCore`), or it went to a title prompt that it
+        /// closed (`withholdKeyUp`). Their key-up is kept from the core as
         /// well.
         swallow_up: std.bit_set.Static(512) = .empty,
 
@@ -820,6 +821,14 @@ pub const Surface = struct {
     /// See `ref`.
     pub fn unref(self: *Surface) void {
         _ = self;
+    }
+
+    /// The key whose key-down message had `lparam` was pressed in another
+    /// window, which closed and left the keyboard focus here
+    /// (`TitleDialog.closedByKey`): its key-up is withheld from the core,
+    /// as one whose press the IME took (`Ime.swallow_up`).
+    pub fn withholdKeyUp(self: *Surface, lparam: win32.LPARAM) void {
+        self.ime.swallow_up.set(Ime.scanSlot(lparam));
     }
 
     /// The core surface, if message handlers may call into it.

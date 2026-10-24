@@ -299,6 +299,8 @@ fn hideTab(t: *Tab) void {
 /// browser's do.
 pub fn removeTab(self: *Window, t: *Tab) void {
     const index = self.tabIndex(t) orelse return;
+    // Its title prompt goes with it, before it is freed.
+    TitleDialog.tabRemoved(self, t);
     // The next tab first, then the closing terminal hidden, so that it is
     // not shown, nor clicked, while its core stops (`Surface.destroy`).
     if (self.unlinkTab(index)) {
@@ -855,6 +857,10 @@ pub fn show(self: *Window) void {
 
     if (!maximize) _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNORMAL);
     _ = win32.UpdateWindow(self.hwnd);
+
+    // A title prompt opened before the window was on screen, which holds
+    // it disabled, shows with it.
+    TitleDialog.frameShown(self);
 }
 
 /// The frame's window procedure.
@@ -1319,6 +1325,11 @@ fn destroyPosted(self: *Window) void {
 /// searched afresh after each, until no terminal of this window has a
 /// live core left.
 pub fn destroy(self: *Window) bool {
+    // The title prompt first, which would otherwise stay on screen until
+    // its own terminal's turn, while the cores before it stop and their
+    // threads are waited for, or after the frame was hidden
+    // (`destroyPosted`).
+    TitleDialog.close(self);
     search: while (true) {
         for (self.app.surfaces.items) |surface| {
             if (surface.window != self or surface.liveCore() == null) continue;
@@ -2238,19 +2249,40 @@ pub fn constrainToWorkArea(
 }
 
 /// Bring the window to the front, restoring it first if it is
-/// minimized, as GTK's `gtk.Window.present` does. SetForegroundWindow
-/// alone only activates a window: a minimized one stays minimized.
-pub fn present(hwnd: win32.HWND) bool {
-    if (win32.IsIconic(hwnd).toBool()) {
+/// minimized, as GTK's `gtk.Window.present` does; for `goto_window`,
+/// `present_terminal` and a toast's click. With a title prompt open over
+/// it, the prompt comes forward with the keyboard focus in its field, not
+/// the frame it holds disabled (`TitleDialog.front`).
+pub fn present(self: *Window) bool {
+    const ok = bringForward(self.hwnd, TitleDialog.front(self));
+    TitleDialog.focusField(self);
+    return ok;
+}
+
+/// For tests: told the window `bringForward` would give SetForegroundWindow,
+/// which it then does not call, as `test_set_focus` stands for SetFocus.
+pub var test_foreground: if (builtin.is_test) ?*const fn (win32.HWND) void else void =
+    if (builtin.is_test) null else {};
+
+/// Restore `frame` if it is minimized, then make `front`, the frame or a
+/// window it owns, the foreground window. SetForegroundWindow alone only
+/// activates a window: a minimized one stays minimized, and so do the
+/// windows it owns, which Windows hides with it.
+pub fn bringForward(frame: win32.HWND, front: win32.HWND) bool {
+    if (win32.IsIconic(frame).toBool()) {
         // The BOOL is the previous visibility, not success.
-        _ = win32.ShowWindow(hwnd, win32.SW_RESTORE);
+        _ = win32.ShowWindow(frame, win32.SW_RESTORE);
     }
+    if (builtin.is_test) if (test_foreground) |seen| {
+        seen(front);
+        return true;
+    };
 
     // SetForegroundWindow returning FALSE is the documented *normal*
     // outcome under Windows' foreground lock -- the calling process is
     // not foreground and has had no recent input -- so hard-coding true
     // here would lie in the common case rather than the rare one.
-    return win32.SetForegroundWindow(hwnd).toBool();
+    return win32.SetForegroundWindow(front).toBool();
 }
 
 /// `.toggle_fullscreen`: cover the monitor the window is mostly on, with
@@ -3189,7 +3221,7 @@ test "win32: modal loops are counted per window and returned on destroy" {
 
 test "win32: presenting a minimized window restores it" {
     // A top-level window created minimized and hidden stands in for a
-    // terminal window: `present` only uses the handle.
+    // frame: `bringForward`, behind `present`, only uses the handles.
     const hwnd = win32.CreateWindowExW(
         0,
         L("STATIC"),
@@ -3207,6 +3239,6 @@ test "win32: presenting a minimized window restores it" {
     defer _ = win32.DestroyWindow(hwnd);
     try std.testing.expect(win32.IsIconic(hwnd).toBool());
 
-    _ = present(hwnd);
+    _ = bringForward(hwnd, hwnd);
     try std.testing.expect(!win32.IsIconic(hwnd).toBool());
 }
