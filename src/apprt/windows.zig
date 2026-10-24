@@ -76,6 +76,21 @@
 //! is the field's: nothing typed there reaches the terminal. Leader
 //! sequences and key tables are not started from the field.
 //!
+//! ## Title prompts
+//!
+//! `.prompt_title` asks for a terminal's own title or its tab's in a
+//! dialog over its window, as GTK's title dialog does (`TitleDialog`),
+//! opened by `App.run` once the core frame that asked has returned. OK
+//! sets the title, an empty one clears it, Cancel changes nothing. The
+//! terminal's title from it is shown wherever its title shows, in place of
+//! the program's, which OSC titles keep changing underneath
+//! (`Surface.effectiveTitle`); the core's own title stays the program's.
+//! The dialog is modeless, its keys handed to IsDialogMessageW by `run`,
+//! so output and requests keep running in every window, and modal to its
+//! window, whose frame it holds disabled; a frame is enabled only when
+//! neither it nor a confirmation prompt holds it (`App.beginPrompt`).
+//! `.prompt_title` for a window is not supported, as on macOS.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
@@ -179,6 +194,7 @@ test {
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
     _ = @import("windows/TabBar.zig");
+    _ = @import("windows/TitleDialog.zig");
     _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/desktop_notifications.zig");

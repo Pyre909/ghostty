@@ -75,6 +75,13 @@ pub const Surface = struct {
     /// back to answer CSI 21 t; a native runtime has to store it itself.
     title: ?[:0]u8,
 
+    /// The title the user gave the terminal in its title prompt
+    /// (`TitleDialog`), shown in place of `title` wherever the terminal's
+    /// title shows (`effectiveTitle`), as GTK's `title_override`; null for
+    /// none. Owned by this struct. A title the program sets meanwhile
+    /// changes `title` only, and shows once this is cleared.
+    title_override: ?[:0]u8,
+
     /// The client size the core asked for through `.initial_size`, or null
     /// when `window-width`/`window-height` are unset. The core divides the
     /// cell area by the content scale but adds the padding in device pixels
@@ -621,6 +628,7 @@ pub const Surface = struct {
             // window receives, so it is set before anything can read it.
             .hwnd = undefined,
             .title = null,
+            .title_override = null,
             .initial_size = null,
             .closing = false,
             .destroy_deferred = false,
@@ -750,6 +758,8 @@ pub const Surface = struct {
         self.stopCore();
         if (self.title) |v| self.app.core_app.alloc.free(v);
         self.title = null;
+        if (self.title_override) |v| self.app.core_app.alloc.free(v);
+        self.title_override = null;
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
         self.notifications.deinit(self.app.core_app.alloc);
         self.search_bar.deinit();
@@ -1068,8 +1078,16 @@ pub const Surface = struct {
         return self.mouse.pos;
     }
 
+    /// The program's title, for the core (CSI 21 t): never the user's
+    /// override, as GTK's `getTitle` is not.
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
         return self.title;
+    }
+
+    /// The title shown for the terminal: the user's from its title prompt,
+    /// else the program's, as GTK's `getEffectiveTitle`.
+    pub fn effectiveTitle(self: *const Surface) ?[:0]const u8 {
+        return self.title_override orelse self.title;
     }
 
     /// Windows has exactly one system clipboard. There is no X11-style
@@ -1262,7 +1280,7 @@ pub const Surface = struct {
             self.app.core_app.alloc,
             notifier,
             self.hwnd,
-            .{ .title = title, .body = body, .attribution = self.title },
+            .{ .title = title, .body = body, .attribution = self.effectiveTitle() },
             self.app.nextToastTag(),
             self.focused,
             win32.GetTickCount64(),
@@ -1279,7 +1297,8 @@ pub const Surface = struct {
     /// caption if this is its focused terminal: a window is titled after
     /// its focused terminal (`Window.setFocused`), so another terminal's
     /// shows once it gets the focus. Returns false if the title could not
-    /// be stored or shown, which is what `.set_title` reports.
+    /// be stored or shown, which is what `.set_title` reports. While the
+    /// user's title is set (`title_override`), it is what stays shown.
     ///
     /// The core validates only OSC titles; one from the `title` config, a
     /// keybinding or a command's argv[0] can be any bytes. Invalid UTF-8 is
@@ -1292,7 +1311,28 @@ pub const Surface = struct {
         };
         if (self.title) |old| alloc.free(old);
         self.title = copy;
+        return self.showTitleChange();
+    }
 
+    /// The title from the terminal's title prompt (`TitleDialog.commit`):
+    /// shown in place of the program's wherever the terminal's title shows,
+    /// or, when empty, the program's again, as GTK's `titleDialogSet`.
+    /// Returns false if it could not be stored or shown.
+    pub fn setTitleOverride(self: *Surface, title: []const u8) bool {
+        const alloc = self.app.core_app.alloc;
+        const copy: ?[:0]u8 = if (title.len == 0) null else alloc.dupeSentinel(u8, title, 0) catch |err| {
+            log.warn("failed to store the terminal's title err={}", .{err});
+            return false;
+        };
+        if (self.title_override) |old| alloc.free(old);
+        self.title_override = copy;
+        return self.showTitleChange();
+    }
+
+    /// Show the terminal's title (`effectiveTitle`) where it changed: its
+    /// tab's label, if it is the focused terminal of its tab, and its
+    /// window's caption, if it is the focused terminal of the tab shown.
+    fn showTitleChange(self: *Surface) bool {
         // A tab's label shows its focused terminal's title, unless the tab
         // has one of its own; any other title changes no label, as on GTK,
         // whose tab binds only its active surface's title.

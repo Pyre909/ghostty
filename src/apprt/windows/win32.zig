@@ -1102,6 +1102,45 @@ comptime {
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-gettextmetricsw
 pub extern "gdi32" fn GetTextMetricsW(hdc: HDC, tm: *TEXTMETRICW) callconv(.winapi) BOOL;
 
+// The title prompt (TitleDialog.zig): a dialog box made from a template in
+// memory and run modeless, its keys handled by IsDialogMessageW from
+// `App.run`'s loop.
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nc-winuser-dlgproc
+pub const DLGPROC = *const fn (
+    hwnd: HWND,
+    msg: UINT,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) callconv(.winapi) isize;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createdialogindirectparamw
+pub extern "user32" fn CreateDialogIndirectParamW(
+    instance: ?HINSTANCE,
+    template: *const anyopaque,
+    owner: ?HWND,
+    proc: DLGPROC,
+    param: LPARAM,
+) callconv(.winapi) ?HWND;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isdialogmessagew
+pub extern "user32" fn IsDialogMessageW(dialog: HWND, msg: *MSG) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdlgitem
+pub extern "user32" fn GetDlgItem(dialog: HWND, id: c_int) callconv(.winapi) ?HWND;
+pub const WM_INITDIALOG: UINT = 0x0110;
+pub const IDCANCEL: c_int = 2;
+pub const SW_SHOW: c_int = 5;
+pub const WS_POPUP: DWORD = 0x80000000;
+pub const WS_SYSMENU: DWORD = 0x00080000;
+pub const WS_BORDER: DWORD = 0x00800000;
+pub const WS_GROUP: DWORD = 0x00020000;
+pub const WS_TABSTOP: DWORD = 0x00010000;
+/// The template names the dialog's font (its point size and face).
+pub const DS_SETFONT: DWORD = 0x0040;
+pub const DS_MODALFRAME: DWORD = 0x0080;
+pub const BS_PUSHBUTTON: DWORD = 0x0000;
+pub const BS_DEFPUSHBUTTON: DWORD = 0x0001;
+/// A static control shows its text with no "&" mnemonic.
+pub const SS_NOPREFIX: DWORD = 0x0080;
+
 /// The RGB macro of wingdi.h.
 pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
     return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);

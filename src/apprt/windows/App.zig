@@ -19,6 +19,7 @@ const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
+const TitleDialog = @import("TitleDialog.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
@@ -384,6 +385,13 @@ pub const App = struct {
             key: SearchBar.FieldKey,
         },
 
+        /// `.prompt_title`: ask for the title of `from`, or of its tab, in
+        /// a dialog over its window (`TitleDialog.open`).
+        title_prompt: struct {
+            from: *CoreSurface,
+            target: TitleDialog.Target,
+        },
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -665,10 +673,7 @@ pub const App = struct {
                     return Error.Win32MessageLoopFailed;
                 },
                 0 => break,
-                else => {
-                    _ = win32.TranslateMessage(&msg);
-                    _ = win32.DispatchMessageW(&msg);
-                },
+                else => self.dispatch(&msg),
             }
 
             // Drain whatever else is pending so a burst (a resize drag, a
@@ -678,8 +683,7 @@ pub const App = struct {
                     self.quit = true;
                     break;
                 }
-                _ = win32.TranslateMessage(&msg);
-                _ = win32.DispatchMessageW(&msg);
+                self.dispatch(&msg);
             }
             if (self.quit) break;
 
@@ -718,6 +722,29 @@ pub const App = struct {
             // reload in `requests` may just have made.
             self.syncColorScheme();
         }
+    }
+
+    /// Dispatch a message `run` took from the queue, first offering it to an
+    /// open title prompt (`dialogMessage`).
+    fn dispatch(self: *App, msg: *win32.MSG) void {
+        if (self.dialogMessage(msg)) return;
+        _ = win32.TranslateMessage(msg);
+        _ = win32.DispatchMessageW(msg);
+    }
+
+    /// Hand `msg` to IsDialogMessageW for an open title prompt, as a
+    /// modeless dialog's message loop does, so that Tab moves between its
+    /// controls, Enter presses OK and Escape Cancel; whether it took the
+    /// message, which is then handled. Only while one is open, and only for
+    /// a message to that dialog or one of its controls; a message for a
+    /// terminal never reaches it. The OK and Cancel it sends run from
+    /// `run`, outside any core frame (`TitleDialog.commit`).
+    fn dialogMessage(self: *App, msg: *win32.MSG) bool {
+        for (self.windows.items) |window| {
+            const dialog = window.title_prompt.hwnd orelse continue;
+            if (win32.IsDialogMessageW(dialog, msg).toBool()) return true;
+        }
+        return false;
     }
 
     /// Tick the core, unless a tick is already on the stack.
@@ -771,11 +798,23 @@ pub const App = struct {
     /// create them wait for `canReenterCore`: `run` (`createRequested`),
     /// and a tab dropped out of a bar, from whichever loop dispatched the
     /// release (`Window.dropTabOut`); and their teardown is deferred, so
-    /// `endPrompt` finds the windows disabled here.
+    /// `endPrompt` finds the windows disabled here. Nor are title prompts
+    /// opened (`createRequested`), and an open one is disabled too, so
+    /// that it takes no input either.
+    ///
+    /// A frame is enabled only when nothing holds it: this prompt (every
+    /// frame but its owner), MessageBoxW (its owner), or the frame's title
+    /// prompt (see TitleDialog.zig). A frame a title prompt holds is
+    /// already disabled, so it is not marked here: the title prompt lets
+    /// go of it when it closes, or leaves it to `endPrompt` if this
+    /// prompt is still open then (`TitleDialog.close`).
     pub fn beginPrompt(self: *App, owner: ?win32.HWND) void {
         self.prompt_depth += 1;
         if (self.prompt_depth > 1) return;
         for (self.windows.items) |window| {
+            if (window.title_prompt.hwnd) |dialog| {
+                if (!win32.EnableWindow(dialog, .FALSE).toBool()) window.title_prompt.prompt_disabled = true;
+            }
             if (owner != null and window.hwnd == owner.?) continue;
             if (win32.EnableWindow(window.hwnd, .FALSE).toBool()) continue;
             window.prompt_disabled = true;
@@ -804,10 +843,25 @@ pub const App = struct {
     /// and a prompt `run` opened outside a tick (`showConfigErrors`) has no
     /// tick after it to drain what they announced, nor to make what its
     /// answer recorded in `requests`. Inside a tick this costs one more tick.
+    ///
+    /// The outermost one enables the windows `beginPrompt` disabled, and
+    /// the frames of title prompts that closed meanwhile; a frame whose
+    /// title prompt is still open stays disabled, even if it owned the
+    /// prompt and MessageBoxW enabled it on the way out, and the title
+    /// prompt takes input again.
     pub fn endPrompt(self: *App) void {
         self.prompt_depth -= 1;
         if (self.prompt_depth > 0) return;
         for (self.windows.items) |window| {
+            if (window.title_prompt.hwnd) |dialog| {
+                window.prompt_disabled = false;
+                _ = win32.EnableWindow(window.hwnd, .FALSE);
+                if (window.title_prompt.prompt_disabled) {
+                    window.title_prompt.prompt_disabled = false;
+                    _ = win32.EnableWindow(dialog, .TRUE);
+                }
+                continue;
+            }
             if (!window.prompt_disabled) continue;
             window.prompt_disabled = false;
             _ = win32.EnableWindow(window.hwnd, .TRUE);
@@ -1061,6 +1115,7 @@ pub const App = struct {
             .end_search => endSearch(target),
             .search_total => searchCount(target, .total, value.total),
             .search_selected => searchCount(target, .selected, value.selected),
+            .prompt_title => self.requestTitlePrompt(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1149,6 +1204,32 @@ pub const App = struct {
                 break :count true;
             },
         };
+    }
+
+    /// `.prompt_title`, from `prompt_surface_title` and `prompt_tab_title`:
+    /// a dialog over the terminal's window asks for its title or its tab's
+    /// (`TitleDialog`), opened by `run`: a binding performs this inside the
+    /// core's key callback, and the dialog takes the keyboard focus from
+    /// the terminal. `false` for the app, and for `.window`, which this
+    /// runtime has no title of its own for, as on macOS.
+    fn requestTitlePrompt(self: *App, target: apprt.Target, value: apprt.action.PromptTitle) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        const which: TitleDialog.Target = switch (value) {
+            .surface => .surface,
+            .tab => .tab,
+            .window => return false,
+        };
+        self.requests.append(self.core_app.alloc, .{ .title_prompt = .{
+            .from = from,
+            .target = which,
+        } }) catch |err| {
+            log.warn("cannot record a title prompt err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     fn closeWindow(self: *App, target: apprt.Target) bool {
@@ -1766,7 +1847,8 @@ pub const App = struct {
     /// waits on it: windows it asked for lose it as their parent, splits,
     /// changes to splits and focus moves it asked for are dropped, and so is
     /// a focus move to it; with a move of its tab to a new window, so is
-    /// what waits behind that move (`dropBehind`).
+    /// what waits behind that move (`dropBehind`); and a title prompt it
+    /// opened closes (`TitleDialog.forget`).
     /// Called by `Surface.detachCore`, the first step of every teardown,
     /// while the address is still that surface's, so that a surface created
     /// later at the same address cannot pass for it.
@@ -1819,6 +1901,9 @@ pub const App = struct {
             .search_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
+            .title_prompt => |prompt| {
+                if (prompt.from == core_surface) request.* = .dropped;
+            },
             .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
@@ -1832,6 +1917,9 @@ pub const App = struct {
         if (self.search_hide) |surface| {
             if (&surface.core_surface == core_surface) self.search_hide = null;
         }
+        // And the title prompt it asked for closes, last: its frame, enabled
+        // again, may take the activation and give a terminal the focus.
+        TitleDialog.forget(self, core_surface.rt_surface);
     }
 
     /// `.goto_split`: whether there is a terminal to go to from the one the
@@ -1979,17 +2067,18 @@ pub const App = struct {
         return true;
     }
 
-    /// `.copy_title_to_clipboard`: the terminal's title, written as a copy
-    /// is (`Surface.setClipboard`), as GTK copies it; `false` with none, or
-    /// an empty one, on which the binding's documentation says it has no
-    /// effect. Made at once, as a copy is: nothing is laid out and no focus
-    /// moves.
+    /// `.copy_title_to_clipboard`: the terminal's title as it shows, the
+    /// user's from its title prompt if it has one (`Surface.effectiveTitle`),
+    /// written as a copy is (`Surface.setClipboard`), as GTK copies it;
+    /// `false` with none, or an empty one, on which the binding's
+    /// documentation says it has no effect. Made at once, as a copy is:
+    /// nothing is laid out and no focus moves.
     fn copyTitleToClipboard(target: apprt.Target) bool {
         const surface = switch (target) {
             .app => return false,
             .surface => |v| v.rt_surface,
         };
-        const title = surface.getTitle() orelse return false;
+        const title = surface.effectiveTitle() orelse return false;
         if (title.len == 0) return false;
         surface.setClipboard(.standard, &.{.{
             .mime = "text/plain",
@@ -2344,6 +2433,7 @@ pub const App = struct {
                 },
                 .overlay_key => |key| overlay_keys.replay(key.from, key.trigger),
                 .search_key => |key| SearchBar.replay(key.from, key.key),
+                .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
                 .dropped => {},
             }
         }
@@ -2464,6 +2554,8 @@ pub const App = struct {
         const moved = try old.moveTabTo(index, window);
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
+        // A title prompt over `old` for a terminal of the tab closes.
+        TitleDialog.followMove(old);
 
         // Shown once it is owned, as a new window is.
         window.show();
@@ -2583,6 +2675,7 @@ pub const App = struct {
         // A terminal with no core never passed through `forgetClosing`.
         if (self.search_focus == surface) self.search_focus = null;
         if (self.search_hide == surface) self.search_hide = null;
+        TitleDialog.forget(self, surface);
         surface.deinit();
         self.core_app.alloc.destroy(surface);
 
@@ -3264,7 +3357,10 @@ test "win32: a prompt disables the other windows until the outermost one ends an
     a.hwnd = owner;
     b.hwnd = other;
     c.hwnd = off;
-    for ([_]*Window{ &a, &b, &c }) |window| window.prompt_disabled = false;
+    for ([_]*Window{ &a, &b, &c }) |window| {
+        window.prompt_disabled = false;
+        window.title_prompt = .{};
+    }
 
     var app: App = undefined;
     app.prompt_depth = 0;
@@ -3462,6 +3558,7 @@ fn testFrame(app: *App) !*Window {
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
+        .title_prompt = .{},
         .closing = false,
         .destroy_deferred = false,
     };
@@ -3488,6 +3585,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     // Only the way back from the core surface: actions name it.
     surface.core_surface.rt_surface = surface;
     surface.title = null;
+    surface.title_override = null;
     surface.initial_size = null;
     surface.ime = .{};
     surface.closing = false;
@@ -7782,9 +7880,378 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
 
     _ = pane.setTitle("vim café");
     try std.testing.expect(try app.performAction(target, .copy_title_to_clipboard, {}));
+    {
+        const text = (try readClipboardText(alloc, pane.hwnd)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("vim café", text);
+    }
+
+    // The title shown, as GTK copies its effective title: the one the user
+    // gave the terminal in its title prompt.
+    try testAnswer(try testPrompt(&app, pane, .surface), "mine", win32.IDOK);
+    try std.testing.expect(try app.performAction(target, .copy_title_to_clipboard, {}));
     const text = (try readClipboardText(alloc, pane.hwnd)) orelse return error.TestUnexpectedResult;
     defer alloc.free(text);
-    try std.testing.expectEqualStrings("vim café", text);
+    try std.testing.expectEqualStrings("mine", text);
+}
+
+/// For tests: `pane`'s title prompt for `which`, opened as a binding opens
+/// it: the action, then `run`'s requests (`createRequested`).
+fn testPrompt(app: *App, pane: *Surface, which: apprt.action.PromptTitle) !win32.HWND {
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .prompt_title, which));
+    app.createRequested();
+    return pane.window.title_prompt.hwnd orelse error.TestUnexpectedResult;
+}
+
+/// For tests: a title prompt's field.
+fn testField(dialog: win32.HWND) !win32.HWND {
+    return win32.GetDlgItem(dialog, TitleDialog.edit_id) orelse error.TestUnexpectedResult;
+}
+
+/// For tests: put `text` in a title prompt's field, then press `button`
+/// (IDOK or IDCANCEL), as a click on it sends.
+fn testAnswer(dialog: win32.HWND, comptime text: []const u8, button: c_int) !void {
+    _ = win32.SetWindowTextW(try testField(dialog), L(text));
+    _ = win32.SendMessageW(dialog, win32.WM_COMMAND, @intCast(button), 0);
+}
+
+/// For tests: `hwnd`'s text is `want`.
+fn expectText(comptime want: []const u8, hwnd: win32.HWND) !void {
+    var buf: [128]u16 = undefined;
+    const n = win32.GetWindowTextW(hwnd, &buf, buf.len);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral(want), buf[0..@intCast(n)]);
+}
+
+test "win32: prompt_title waits for run, and the terminal's title from it shows over the program's" {
+    // The dialog takes the keyboard focus from the terminal, so the action
+    // is recorded and the dialog opened by createRequested. OK sets the
+    // terminal's own title, which OSC titles do not replace; an empty one
+    // shows the program's latest again; Cancel changes nothing. The core's
+    // title stays the program's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
+    try std.testing.expect(pane.setTitle("cmd"));
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+
+    // Not for the app, nor for a window, which has no title of its own on
+    // this platform, as on macOS.
+    try std.testing.expect(!try app.performAction(.app, .prompt_title, .surface));
+    try std.testing.expect(!try app.performAction(target, .prompt_title, .window));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Recorded, and opened by run.
+    try std.testing.expect(try app.performAction(target, .prompt_title, .surface));
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+    app.createRequested();
+    const dialog = window.title_prompt.hwnd orelse return error.TestUnexpectedResult;
+    // Modal to its window, and not on screen while the window is not;
+    // GTK's heading, and the field holds the title shown.
+    try std.testing.expect(!win32.IsWindowEnabled(window.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindowVisible(dialog).toBool());
+    try expectText("Change Terminal Title", dialog);
+    try expectText("cmd", try testField(dialog));
+
+    // Asked again while it is open: it stays as it is.
+    try std.testing.expect(try app.performAction(target, .prompt_title, .tab));
+    app.createRequested();
+    try std.testing.expect(window.title_prompt.hwnd == dialog);
+    try expectText("Change Terminal Title", dialog);
+
+    // OK: the terminal's title is the user's, the window takes input
+    // again, and the core still reads the program's.
+    try testAnswer(dialog, "mine", win32.IDOK);
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(!win32.IsWindow(dialog).toBool());
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+    try expectText("mine", window.hwnd);
+    try std.testing.expectEqualStrings("mine", Window.tabTitle(window.tab()).?);
+    try std.testing.expectEqualStrings("cmd", pane.getTitle().?);
+
+    // An OSC title changes the program's, not what shows.
+    try std.testing.expect(try app.performAction(target, .set_title, .{ .title = "osc" }));
+    try expectText("mine", window.hwnd);
+    try std.testing.expectEqualStrings("osc", pane.getTitle().?);
+
+    // The field starts with the user's title; Cancel changes nothing.
+    const again = try testPrompt(&app, pane, .surface);
+    try expectText("mine", try testField(again));
+    try testAnswer(again, "other", win32.IDCANCEL);
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+    try expectText("mine", window.hwnd);
+
+    // Enter in the field is OK, as `run` dispatches it (`dispatch`, which
+    // hands the dialog its messages); one for the terminal is not the
+    // dialog's. Empty, it shows the program's latest title again.
+    const third = try testPrompt(&app, pane, .surface);
+    const field = try testField(third);
+    var msg: win32.MSG = .{
+        .hwnd = pane.hwnd,
+        .message = win32.WM_KEYDOWN,
+        .wParam = win32.VK_RETURN,
+        .lParam = 0,
+        .time = 0,
+        .pt = .{ .x = 0, .y = 0 },
+    };
+    try std.testing.expect(!app.dialogMessage(&msg));
+    try std.testing.expect(window.title_prompt.hwnd == third);
+    _ = win32.SetWindowTextW(field, L(""));
+    msg.hwnd = field;
+    app.dispatch(&msg);
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(pane.title_override == null);
+    try expectText("osc", window.hwnd);
+}
+
+test "win32: a tab's title prompt names the tab, over its terminals' own titles" {
+    // As GTK computes a tab's title: the tab's own, else its focused
+    // terminal's own, else the program's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const b = try testTab(&app, window);
+    const ta = window.tabOf(a).?;
+    const tb = window.tabOf(b).?;
+    try std.testing.expect(a.setTitle("vim"));
+    try std.testing.expect(b.setTitle("cmd"));
+
+    // The terminal's own title labels its tab.
+    try testAnswer(try testPrompt(&app, a, .surface), "edit", win32.IDOK);
+    try std.testing.expectEqualStrings("edit", Window.tabTitle(ta).?);
+
+    // The tab's, which starts from that, shows over it.
+    const dialog = try testPrompt(&app, a, .tab);
+    try expectText("Change Tab Title", dialog);
+    try expectText("edit", try testField(dialog));
+    try testAnswer(dialog, "build", win32.IDOK);
+    try std.testing.expectEqualStrings("build", ta.title_override.?);
+    try std.testing.expectEqualStrings("edit", a.title_override.?);
+    try expectText("build", window.hwnd);
+
+    // Empty, it ends the tab's: the terminal's own shows again.
+    const again = try testPrompt(&app, a, .tab);
+    try expectText("build", try testField(again));
+    try testAnswer(again, "", win32.IDOK);
+    try std.testing.expect(ta.title_override == null);
+    try expectText("edit", window.hwnd);
+
+    // A hidden tab's: its label changes, the caption does not.
+    try testAnswer(try testPrompt(&app, b, .tab), "logs", win32.IDOK);
+    try std.testing.expectEqualStrings("logs", Window.tabTitle(tb).?);
+    try expectText("edit", window.hwnd);
+}
+
+test "win32: a title prompt closes with its terminal, and never opens for a closing one" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const a2 = try testPane(&app, window);
+    const a3 = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, a2, a3 });
+    window.tab().focused = a;
+
+    // Asked for by a terminal that begins to close before run: dropped.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .prompt_title, .surface));
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expect(window.title_prompt.hwnd == null);
+
+    // Open when it begins to close: it closes, and its window takes input.
+    const dialog = try testPrompt(&app, a, .surface);
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(!win32.IsWindow(dialog).toBool());
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // Another terminal of the window closing leaves it open.
+    const kept = try testPrompt(&app, a, .surface);
+    app.forgetClosing(&a2.core_surface);
+    try std.testing.expect(window.title_prompt.hwnd == kept);
+    try std.testing.expect(!win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // Destroyed by anything but its own close, it lets go of the window.
+    try std.testing.expect(win32.DestroyWindow(kept).toBool());
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // A terminal torn down with no core, which never passes through
+    // forgetClosing: its prompt closes as it is freed.
+    const freed = try testPrompt(&app, a3, .surface);
+    try std.testing.expect(a3.destroy());
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(!win32.IsWindow(freed).toBool());
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // None opens for a terminal already closing, nor in a closing window.
+    a2.requestClose();
+    try std.testing.expect(try app.performAction(.{ .surface = &a2.core_surface }, .prompt_title, .surface));
+    app.createRequested();
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    window.requestClose();
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .prompt_title, .tab));
+    app.createRequested();
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+}
+
+test "win32: a title prompt closes when its terminal's tab moves to a new window" {
+    // It is modal to the window it opened over, which a move from another
+    // window would leave disabled for a terminal no longer in it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const b = try testTab(&app, window);
+    _ = try testTab(&app, window);
+
+    const dialog = try testPrompt(&app, a, .surface);
+
+    // Another tab's move leaves it.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expect(window.title_prompt.hwnd == dialog);
+    try std.testing.expect(!win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // Its terminal's: it closes, and the window takes input again.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(3, app.windows.items.len);
+    try std.testing.expect(a.window != window);
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(!win32.IsWindow(dialog).toBool());
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+}
+
+test "win32: a frame is enabled only when neither a prompt nor its title prompt holds it" {
+    // Three things hold a frame: a confirmation prompt (every frame but
+    // its owner), MessageBoxW (its owner) and the frame's title prompt.
+    // Whichever lets go last enables it. MessageBoxW itself is never
+    // called here: it would block the test.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, a);
+    f.tab().focused = a;
+    const g = try testFrame(&app);
+    const b = try testPane(&app, g);
+    g.tab().tree = try .init(alloc, b);
+    g.tab().focused = b;
+    const enabled = struct {
+        fn check(hwnd: win32.HWND) bool {
+            return win32.IsWindowEnabled(hwnd).toBool();
+        }
+    }.check;
+
+    // A prompt of the other window's opens over the title prompt, which
+    // it disables too, and the title prompt closes first: the frame waits
+    // for the prompt's end.
+    const dialog = try testPrompt(&app, a, .surface);
+    app.beginPrompt(g.hwnd);
+    try std.testing.expect(!enabled(dialog));
+    try std.testing.expect(!enabled(f.hwnd));
+    try std.testing.expect(enabled(g.hwnd));
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(f.title_prompt.hwnd == null);
+    try std.testing.expect(!enabled(f.hwnd));
+    app.endPrompt();
+    try std.testing.expect(enabled(f.hwnd));
+    try std.testing.expect(enabled(g.hwnd));
+
+    // A prompt owned by the frame itself, which ends first: the title
+    // prompt still holds the frame, even if MessageBoxW enabled its owner
+    // on the way out, and takes input again.
+    const again = try testPrompt(&app, a, .surface);
+    app.beginPrompt(f.hwnd);
+    try std.testing.expect(!enabled(again));
+    try std.testing.expect(!enabled(f.hwnd));
+    try std.testing.expect(!enabled(g.hwnd));
+    _ = win32.EnableWindow(f.hwnd, .TRUE);
+    app.endPrompt();
+    try std.testing.expect(!enabled(f.hwnd));
+    try std.testing.expect(enabled(again));
+    try std.testing.expect(enabled(g.hwnd));
+    try testAnswer(again, "t", win32.IDOK);
+    try std.testing.expect(enabled(f.hwnd));
+}
+
+test "win32: a title prompt's title bar follows its window's" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.config.@"window-theme" = .dark;
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    window.applyTheme();
+    try std.testing.expect(window.dark_frame);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
+
+    _ = try testPrompt(&app, pane, .surface);
+    try std.testing.expect(window.title_prompt.dark);
+
+    // A new configuration re-themes it with the frame.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .light;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(!window.dark_frame);
+    try std.testing.expect(!window.title_prompt.dark);
 }
 
 test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {

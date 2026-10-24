@@ -34,6 +34,7 @@ const Surface = @import("Surface.zig").Surface;
 pub const Tab = @import("Tab.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
+const TitleDialog = @import("TitleDialog.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -110,9 +111,14 @@ modal_loops: ModalLoops,
 /// which ITaskbarList3 asks to wait for (`showProgress`).
 taskbar_button: bool,
 
-/// Disabled by `App.beginPrompt` for a prompt in another window, for
-/// `App.endPrompt` to enable again.
+/// Disabled by `App.beginPrompt` for a prompt in another window, or left
+/// disabled by a title prompt that closed while a prompt was open
+/// (`TitleDialog.close`), for `App.endPrompt` to enable again.
 prompt_disabled: bool,
+
+/// The window's title prompt, open or not (`TitleDialog`), which holds the
+/// frame disabled while it is open.
+title_prompt: TitleDialog.Prompt,
 
 /// The tab the window shows, whose terminals are laid out in its client
 /// area.
@@ -168,12 +174,14 @@ pub fn tabIndex(self: *const Window, t: *Tab) ?usize {
     return std.mem.indexOfScalar(*Tab, self.tabs.items, t);
 }
 
-/// What the window is titled after while `t` is shown: its title from
-/// `set_tab_title`, or else its focused terminal's.
+/// What the window is titled after while `t` is shown, and its tab's
+/// label: its title from `set_tab_title` or the tab's title prompt, or
+/// else its focused terminal's (`Surface.effectiveTitle`), as GTK's tab
+/// computes its title.
 pub fn tabTitle(t: *const Tab) ?[:0]const u8 {
     if (t.title_override) |title| return title;
     const surface = t.focused orelse return null;
-    return surface.title;
+    return surface.effectiveTitle();
 }
 
 /// Put `surface`, a new terminal not yet shown, in a tab of its own after
@@ -675,9 +683,9 @@ pub fn gotoTabIndex(self: *const Window, to: apprt.action.GotoTab) ?usize {
     return if (index == current) null else index;
 }
 
-/// `set_tab_title` for the tab holding `surface`: `title` shows in place
-/// of its focused terminal's, or an empty one ends that. False if it could
-/// not be stored.
+/// `set_tab_title`, and OK in a tab's title prompt (`TitleDialog.commit`),
+/// for the tab holding `surface`: `title` shows in place of its focused
+/// terminal's, or an empty one ends that. False if it could not be stored.
 pub fn setTabTitle(self: *Window, surface: *const Surface, title: [:0]const u8) bool {
     const alloc = self.app.core_app.alloc;
     const t = self.tabOf(surface) orelse return false;
@@ -740,6 +748,7 @@ pub fn createBare(app: *App) !*Window {
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
+        .title_prompt = .{},
         .closing = false,
         .destroy_deferred = false,
     };
@@ -2021,6 +2030,8 @@ pub fn applyTheme(self: *Window) void {
         return;
     }
     self.dark_frame = dark;
+    // And its title prompt's title bar, if one is open.
+    TitleDialog.setDark(self, dark);
     self.bar.invalidate();
     for (self.tabs.items) |t| {
         var it = t.tree.iterator();
@@ -2212,7 +2223,7 @@ pub fn resizeToTerminal(self: *Window, surface: *Surface, size: apprt.action.Res
 /// work area `work` as macOS keeps a window on screen
 /// (`NSWindow.constrainToScreen`): it is moved up or left until it fits, and
 /// made smaller only if it is larger than the work area.
-fn constrainToWorkArea(
+pub fn constrainToWorkArea(
     x: i32,
     y: i32,
     width: i32,
