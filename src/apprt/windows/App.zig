@@ -11149,6 +11149,75 @@ test "win32: the wheel over the command palette scrolls its list, and a modified
     try std.testing.expect(!p.wheeling);
 }
 
+test "win32: the command palette's tooltip follows the row under the pointer, and goes with the palette" {
+    // The pointer over a row puts that row's description in the tooltip;
+    // a refill, a scroll or the pointer leaving the list forgets the row.
+    // Without a tooltip, which a process with no Common Controls v6
+    // manifest may not get, all of it works the same. The tooltip, owned
+    // by the frame, is destroyed with the palette.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    try togglePalette(&app, a);
+    const p = &window.palette;
+    const list = p.list.?;
+    const tip = p.tip;
+    if (tip) |t| try std.testing.expect(win32.IsWindow(t).toBool());
+    try std.testing.expect(p.hover_row == null);
+
+    // Row by row, then the same row again.
+    for ([_]usize{ 0, 1, 3, 3 }) |row| {
+        _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, paletteRowPoint(window, row));
+        try std.testing.expectEqual(@as(?usize, row), p.hover_row);
+        try std.testing.expect(paletteEntry(window, row).tooltip() != null);
+    }
+    // Off the rows (above the list's client area), no row.
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, testPoint(20, -5));
+    try std.testing.expect(p.hover_row == null);
+
+    // A query refills the list: the row is forgotten, and found again.
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, paletteRowPoint(window, 2));
+    try std.testing.expectEqual(@as(?usize, 2), p.hover_row);
+    paletteQuery(window, L("split"));
+    try std.testing.expect(paletteRows(window) > 2);
+    try std.testing.expect(p.hover_row == null);
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, paletteRowPoint(window, 2));
+    try std.testing.expectEqual(@as(?usize, 2), p.hover_row);
+    try std.testing.expect(paletteEntry(window, 2).tooltip() != null);
+
+    // Leaving the list, and a scroll, forget it.
+    _ = win32.SendMessageW(list, win32.WM_MOUSELEAVE, 0, 0);
+    try std.testing.expect(p.hover_row == null);
+    try std.testing.expect(!p.tracking_leave);
+    paletteQuery(window, L(""));
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, paletteRowPoint(window, 1));
+    try std.testing.expectEqual(@as(?usize, 1), p.hover_row);
+    _ = win32.SendMessageW(list, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    try std.testing.expect(p.hover_row == null);
+
+    // Closed, the palette takes its tooltip with it.
+    CommandPalette.close(window);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(p.tip == null);
+    if (tip) |t| try std.testing.expect(!win32.IsWindow(t).toBool());
+}
+
 test "win32: a terminal closing while the command palette is open leaves its selection where it was" {
     // Every terminal has a jump, so any one that closes, anywhere, lists
     // the palette's entries again. The entry the user moved the selection

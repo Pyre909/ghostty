@@ -142,7 +142,8 @@ pub const Entry = struct {
     action_key: []const u8 = "",
     /// The command's description; a jump's terminal's working directory,
     /// unless its title shows it already, as GTK and macOS describe a
-    /// jump. Shown on the second line when there is no action key.
+    /// jump. Shown on the second line when there is no action key, else
+    /// as the row's tooltip (`tooltip`).
     description: []const u8 = "",
     /// The shortcut the action is bound to (`shortcutLabel`), or empty.
     shortcut: []const u8 = "",
@@ -169,6 +170,15 @@ pub const Entry = struct {
     /// The second line: the action key, else the description.
     pub fn subtitle(self: *const Entry) []const u8 {
         return if (self.action_key.len > 0) self.action_key else self.description;
+    }
+
+    /// The row's tooltip: the description, as GTK's row binds it to its
+    /// tooltip and macOS's to its help; null when there is none, or when
+    /// the second line shows it already (`subtitle`), as a jump's
+    /// working directory.
+    pub fn tooltip(self: *const Entry) ?[]const u8 {
+        if (self.description.len == 0 or self.action_key.len == 0) return null;
+        return self.description;
     }
 };
 
@@ -514,6 +524,16 @@ pub const Palette = struct {
     pressed: ?usize = null,
     /// While a wheel message is being forwarded to the list (`wndProc`).
     wheeling: bool = false,
+    /// The tooltip showing the description of the row under the pointer
+    /// (`hover`), owned by the frame; null where the system could not
+    /// make one.
+    tip: ?win32.HWND = null,
+    /// The list's row under the pointer, whose description the tooltip
+    /// holds; null while the pointer is off the rows.
+    hover_row: ?usize = null,
+    /// Whether the list has asked for the WM_MOUSELEAVE that ends
+    /// `hover_row`.
+    tracking_leave: bool = false,
     /// Whether the list has the dark theme class, null before it has had
     /// either (`applyListTheme`).
     list_dark: ?bool = null,
@@ -573,6 +593,15 @@ pub const Palette = struct {
 
     /// Free everything, as its window is destroyed.
     fn free(self: *Palette, alloc: Allocator) void {
+        // The palette is a child, so the tooltip's owner is its top-level
+        // ancestor, the frame (an owned window's owner cannot be a child),
+        // which would keep it until the frame goes: it is destroyed here.
+        // When the frame itself is being destroyed, DestroyWindow may have
+        // destroyed its owned windows, the tooltip among them, before its
+        // children, the palette among them: hence IsWindow.
+        if (self.tip) |t| if (win32.IsWindow(t).toBool()) {
+            _ = win32.DestroyWindow(t);
+        };
         if (self.entries) |*e| e.deinit();
         self.shown.deinit(alloc);
         if (self.font) |f| _ = win32.DeleteObject(f);
@@ -701,11 +730,122 @@ pub fn open(surface: *Surface) bool {
     if (list_proc == null) list_proc = @ptrFromInt(@as(usize, @bitCast(old_list)));
     if (p.font) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
     applyListTheme(window);
+    p.tip = makeTip(hwnd, list, app.hinstance);
     refill(window, "");
     p.open = true;
     if (!place(window)) return false;
     window.setKeyboardFocus(edit, true);
     return true;
+}
+
+/// Whether `makeTip` has said once that there is no tooltip.
+var tip_missing_logged = false;
+
+/// The tooltip for `list`'s descriptions, one tool covering the list, its
+/// text set row by row (`hover`). Made by class name: the app's manifest
+/// asks for Common Controls v6, which registers the class. A process with
+/// no such manifest, the test runner, may get none; the palette works
+/// without it, and says so once.
+fn makeTip(owner: win32.HWND, list: win32.HWND, hinstance: ?win32.HINSTANCE) ?win32.HWND {
+    const tip = win32.CreateWindowExW(
+        win32.WS_EX_TOPMOST,
+        L(win32.TOOLTIPS_CLASS),
+        null,
+        win32.WS_POPUP | win32.TTS_NOPREFIX | win32.TTS_ALWAYSTIP,
+        win32.CW_USEDEFAULT,
+        win32.CW_USEDEFAULT,
+        win32.CW_USEDEFAULT,
+        win32.CW_USEDEFAULT,
+        owner,
+        null,
+        hinstance,
+        null,
+    ) orelse {
+        tipMissing("cannot make one", win32.GetLastError());
+        return null;
+    };
+    var info = toolInfo(list);
+    info.lpszText = L("");
+    if (win32.SendMessageW(tip, win32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&info))) == 0) {
+        tipMissing("cannot add the list to it", win32.GetLastError());
+        _ = win32.DestroyWindow(tip);
+        return null;
+    }
+    return tip;
+}
+
+fn tipMissing(why: []const u8, err: anytype) void {
+    if (tip_missing_logged) return;
+    tip_missing_logged = true;
+    log.info("no tooltips for the command palette's descriptions, {s} err={}", .{ why, err });
+}
+
+/// The palette's one tool: all of the list.
+fn toolInfo(list: win32.HWND) win32.TOOLINFOW {
+    return .{ .uFlags = win32.TTF_IDISHWND, .hwnd = list, .uId = @intFromPtr(list) };
+}
+
+/// The pointer is over the list's `row`, or off its rows (null): the
+/// tooltip takes that row's description (`Entry.tooltip`), or nothing,
+/// which it does not show, once the pointer moves to another row.
+fn hover(window: *Window, row: ?usize) void {
+    const p = &window.palette;
+    if (row == p.hover_row) return;
+    p.hover_row = row;
+    const entry = if (row) |r| rowEntry(window, r) else null;
+    setTip(window, if (entry) |e| e.tooltip() orelse "" else "");
+}
+
+/// Forget the row under the pointer and hide the tooltip: the rows under
+/// it changed (`refill`, a scroll), or it left the list.
+fn unhover(window: *Window) void {
+    window.palette.hover_row = null;
+    setTip(window, "");
+}
+
+/// The tooltip, hidden, with `text`, shown again after the pointer rests.
+fn setTip(window: *Window, text: []const u8) void {
+    const p = &window.palette;
+    const tip = p.tip orelse return;
+    const list = p.list orelse return;
+    _ = win32.SendMessageW(tip, win32.TTM_POP, 0, 0);
+    const wide = wideFromUtf8(window.app.core_app.alloc, text) catch return;
+    defer window.app.core_app.alloc.free(wide);
+    // A long description wraps at the list's width.
+    var client: RECT = undefined;
+    if (win32.GetClientRect(list, &client).toBool() and client.right > 0) {
+        _ = win32.SendMessageW(tip, win32.TTM_SETMAXTIPWIDTH, 0, client.right);
+    }
+    var info = toolInfo(list);
+    info.lpszText = wide.ptr;
+    _ = win32.SendMessageW(tip, win32.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&info)));
+}
+
+/// The entry on the list's `row`, if there is one.
+fn rowEntry(window: *Window, row: usize) ?*const Entry {
+    const p = &window.palette;
+    const list = p.list orelse return null;
+    const entries = p.entries orelse return null;
+    const data = win32.SendMessageW(list, win32.LB_GETITEMDATA, row, 0);
+    if (data < 0 or @as(usize, @intCast(data)) >= entries.items.len) return null;
+    return &entries.items[@intCast(data)];
+}
+
+/// Pass a mouse message of the list's to the tooltip, which shows itself
+/// when the pointer rests and hides on a click.
+fn relay(window: *Window, list: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+    const tip = window.palette.tip orelse return;
+    var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+    _ = win32.ClientToScreen(list, &pt);
+    var m: win32.MSG = .{
+        .hwnd = list,
+        .message = msg,
+        .wParam = wparam,
+        .lParam = lparam,
+        .time = 0,
+        .pt = pt,
+    };
+    _ = win32.SendMessageW(tip, win32.TTM_RELAYEVENT, 0, @bitCast(@intFromPtr(&m)));
 }
 
 /// A child of a palette being opened could not be made: logged, and the
@@ -926,6 +1066,7 @@ fn refill(window: *Window, query: []const u8) void {
         log.warn("cannot filter the command palette err={}", .{err});
         p.shown.clearRetainingCapacity();
     };
+    unhover(window);
     _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 0, 0);
     _ = win32.SendMessageW(list, win32.LB_RESETCONTENT, 0, 0);
     for (p.shown.items) |index| {
@@ -1240,7 +1381,28 @@ fn listProc(
     const window = windowOfChild(hwnd) orelse return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
     const p = &window.palette;
     switch (msg) {
+        // The tooltip follows the row under the pointer until it leaves.
+        win32.WM_MOUSEMOVE => {
+            if (!p.tracking_leave) {
+                var tme: win32.TRACKMOUSEEVENT = .{
+                    .cbSize = @sizeOf(win32.TRACKMOUSEEVENT),
+                    .dwFlags = win32.TME_LEAVE,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                p.tracking_leave = win32.TrackMouseEvent(&tme).toBool();
+            }
+            hover(window, rowAt(hwnd, lparam));
+            relay(window, hwnd, msg, wparam, lparam);
+        },
+        win32.WM_MOUSELEAVE => {
+            p.tracking_leave = false;
+            unhover(window);
+        },
+        // The rows move under a still pointer.
+        win32.WM_MOUSEWHEEL, win32.WM_VSCROLL => unhover(window),
         win32.WM_LBUTTONDOWN, win32.WM_LBUTTONDBLCLK => {
+            relay(window, hwnd, msg, wparam, lparam);
             if (p.edit) |edit| window.setKeyboardFocus(edit, true);
             const row = rowAt(hwnd, lparam) orelse return 0;
             _ = win32.SendMessageW(hwnd, win32.LB_SETCURSEL, row, 0);
@@ -1644,6 +1806,41 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     try testing.expect(focus[2].run.jump == one);
     try testing.expectEqualStrings("", focus[3].shortcut);
     try testing.expectEqualStrings("", focus[3].action_key);
+}
+
+test "win32: a palette row's tooltip is its description, unless the row shows it already" {
+    const jump: Entry.Run = .{ .jump = @ptrFromInt(0x10000) };
+    const action: Entry.Run = .{ .action = .new_tab };
+    // A command's description, which its second line (the action) does
+    // not show.
+    const described: Entry = .{ .title = "New Tab", .action_key = "new_tab", .description = "Open a new tab.", .run = action };
+    try testing.expectEqualStrings("Open a new tab.", described.tooltip().?);
+    // A command with none.
+    const bare: Entry = .{ .title = "New Tab", .action_key = "new_tab", .run = action };
+    try testing.expect(bare.tooltip() == null);
+    // A jump's working directory is its second line already; a jump with
+    // none has nothing.
+    const dir: Entry = .{ .title = "Focus: vim", .description = "C:\\src", .run = jump };
+    try testing.expectEqualStrings("C:\\src", dir.subtitle());
+    try testing.expect(dir.tooltip() == null);
+    const plain: Entry = .{ .title = "Focus: vim", .run = jump };
+    try testing.expect(plain.tooltip() == null);
+
+    // The default commands as listed: each has its description as its
+    // tooltip, and the default configuration describes them all.
+    const alloc = testing.allocator;
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    const jumps = [_]Jump{.{ .surface = @ptrFromInt(0x10000), .title = "vim", .pwd = "C:\\src" }};
+    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &jumps);
+    defer entries.deinit();
+    for (entries.items) |*e| switch (e.run) {
+        .action => {
+            try testing.expect(e.description.len > 0);
+            try testing.expectEqualStrings(e.description, e.tooltip().?);
+        },
+        .jump => try testing.expect(e.tooltip() == null),
+    };
 }
 
 test "win32: the palette sorts as GTK's does" {

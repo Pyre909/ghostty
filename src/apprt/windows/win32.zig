@@ -1203,11 +1203,53 @@ pub const MEASUREITEMSTRUCT = extern struct {
 /// (`CommandPalette.applyListTheme`).
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-setwindowtheme
 pub extern "uxtheme" fn SetWindowTheme(hwnd: HWND, sub_app_name: ?LPCWSTR, sub_id_list: ?LPCWSTR) callconv(.winapi) HRESULT;
+
+// The palette's tooltip, a system tooltip control made by its class name,
+// which the manifest's Common Controls v6 registers: nothing is imported
+// from comctl32. It is fed the list's mouse messages (TTM_RELAYEVENT)
+// rather than subclassing the list itself.
+
+/// https://learn.microsoft.com/en-us/windows/win32/controls/wm-vscroll
+pub const WM_VSCROLL: UINT = 0x0115;
+/// TOOLTIPS_CLASSW.
+/// https://learn.microsoft.com/en-us/windows/win32/controls/tooltip-controls
+pub const TOOLTIPS_CLASS = "tooltips_class32";
+/// https://learn.microsoft.com/en-us/windows/win32/controls/tooltip-styles
+pub const TTS_ALWAYSTIP: DWORD = 0x01;
+pub const TTS_NOPREFIX: DWORD = 0x02;
+/// TOOLINFOW's uId is the window the tool covers, all of its client area.
+pub const TTF_IDISHWND: UINT = 0x0001;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/ttm-relayevent
+pub const TTM_RELAYEVENT: UINT = WM_USER + 7;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/ttm-setmaxtipwidth
+pub const TTM_SETMAXTIPWIDTH: UINT = WM_USER + 24;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/ttm-pop
+pub const TTM_POP: UINT = WM_USER + 28;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/ttm-addtool
+pub const TTM_ADDTOOLW: UINT = WM_USER + 50;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/ttm-updatetiptext
+pub const TTM_UPDATETIPTEXTW: UINT = WM_USER + 57;
+/// The whole structure, lpReserved included, as Common Controls v6 wants
+/// cbSize (TTTOOLINFOW_V3_SIZE).
+/// https://learn.microsoft.com/en-us/windows/win32/api/commctrl/ns-commctrl-ttoolinfow
+pub const TOOLINFOW = extern struct {
+    cbSize: UINT = @sizeOf(TOOLINFOW),
+    uFlags: UINT = 0,
+    hwnd: ?HWND = null,
+    uId: usize = 0,
+    rect: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    hinst: ?HINSTANCE = null,
+    lpszText: ?LPCWSTR = null,
+    lParam: LPARAM = 0,
+    lpReserved: ?*anyopaque = null,
+};
 comptime {
     // The SDK's sizes on 64-bit Windows.
     if (@sizeOf(usize) == 8) {
         std.debug.assert(@sizeOf(DRAWITEMSTRUCT) == 64);
         std.debug.assert(@sizeOf(MEASUREITEMSTRUCT) == 32);
+        std.debug.assert(@sizeOf(TOOLINFOW) == 72);
+        std.debug.assert(@sizeOf(MSG) == 48);
     }
 }
 
