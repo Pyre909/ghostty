@@ -466,6 +466,8 @@ pub const Palette = struct {
     /// The row the left button went down on; it runs if the button comes
     /// up on it too.
     pressed: ?usize = null,
+    /// While a wheel message is being forwarded to the list (`wndProc`).
+    wheeling: bool = false,
     /// The system's message font at `font_dpi`, and the height of a line
     /// of it, as the search bar's (`applyFont`).
     font: ?win32.HGDIOBJ = null,
@@ -1013,8 +1015,21 @@ pub fn wndProc(
         },
 
         // The wheel over the field, which passes it here, scrolls the list.
+        // The system list hands a wheel it does not take (one with Ctrl or
+        // Shift held, in the reference sources) to DefWindowProcW, which
+        // sends it to the parent, this window: forwarded to the list again,
+        // it would go round, each turn a nested SendMessage on this thread,
+        // until the stack overflowed and took the process with it. So a
+        // wheel that arrives while one is being forwarded is dropped: the
+        // palette has nothing else to do with it, and its frame should not
+        // zoom a terminal under it. A guard rather than a test of the
+        // modifiers, as which wheels the list passes up is not documented.
         win32.WM_MOUSEWHEEL => {
-            if (p.list) |list| return win32.SendMessageW(list, msg, wparam, lparam);
+            if (p.wheeling) return 0;
+            const list = p.list orelse return 0;
+            p.wheeling = true;
+            defer p.wheeling = false;
+            return win32.SendMessageW(list, msg, wparam, lparam);
         },
 
         WM_PALETTE_CLOSE => {

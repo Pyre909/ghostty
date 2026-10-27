@@ -11017,6 +11017,71 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     try std.testing.expectEqual(0, app.windows.items.len);
 }
 
+test "win32: the wheel over the command palette scrolls its list, and a modified one returns" {
+    // A plain notch over the list or the field scrolls the list. The system
+    // list hands a wheel it does not take (one with Ctrl or Shift) to its
+    // parent, the palette, which forwards the wheel to the list: that one
+    // is dropped there rather than sent round again until the stack runs
+    // out. Each call returns, and the palette stays open.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    try togglePalette(&app, a);
+    const p = &window.palette;
+    const list = p.list.?;
+    const edit = p.edit.?;
+    try std.testing.expect(paletteRows(window) > 2 * CommandPalette.Metrics.init(96).rows);
+
+    // A notch toward the user, over the list, then over the field: the
+    // list scrolls down each time.
+    const top = struct {
+        fn of(l: win32.HWND) isize {
+            return win32.SendMessageW(l, win32.LB_GETTOPINDEX, 0, 0);
+        }
+    }.of;
+    try std.testing.expectEqual(0, top(list));
+    _ = win32.SendMessageW(list, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    const after_list = top(list);
+    try std.testing.expect(after_list > 0);
+    _ = win32.SendMessageW(edit, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    try std.testing.expect(top(list) > after_list);
+
+    // With Ctrl or Shift, over the list, the field or the palette itself:
+    // the call returns, the palette is open, and the wheel is used for
+    // nothing.
+    for ([_]win32.WPARAM{ win32.MK_CONTROL, win32.MK_SHIFT, win32.MK_CONTROL | win32.MK_SHIFT }) |mods| {
+        for ([_]win32.HWND{ list, edit, p.hwnd.? }) |to| {
+            const before = top(list);
+            _ = win32.SendMessageW(to, win32.WM_MOUSEWHEEL, mods | testWheel(-120), 0);
+            try std.testing.expect(p.hwnd != null);
+            try std.testing.expect(p.open);
+            try std.testing.expectEqual(before, top(list));
+        }
+    }
+    // A plain one over the field, which the palette forwards, still
+    // scrolls after them.
+    const before = top(list);
+    _ = win32.SendMessageW(edit, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    try std.testing.expect(top(list) > before);
+    try std.testing.expect(!p.wheeling);
+}
+
 test "win32: keys in the command palette perform the terminal's bindings for its window, and act on the field" {
     // The field follows the search field's rules (`overlay_keys`): a
     // binding for the window, its tabs and splits or the palette acts, and
