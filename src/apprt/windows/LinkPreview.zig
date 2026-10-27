@@ -6,7 +6,9 @@
 //! instead, as GTK shows `url_right` while the pointer is over `url_left`.
 //! GTK's label does not ellipsize, so a URL wider than its terminal is cut
 //! at the terminal's edge: at the left the URL's start shows, at the right
-//! its end.
+//! its end. Control, bidirectional and zero-width code points show
+//! escaped, as the macOS app's preview shows them (`displayText`); GTK's
+//! label shows them as they are.
 //!
 //! Like the search bar (SearchBar.zig), the preview is a child window of
 //! the terminal's **frame**, placed above the terminal's own window: GDI
@@ -27,8 +29,18 @@
 //! its renderer's lock held. Showing, moving, hiding and retitling the
 //! preview send messages to it and to the terminal it uncovers, none of
 //! which enter the core (the terminal's paint comes later, from the
-//! loop); making a window there is not done (`App.requests`). So the
-//! preview's window is made, hidden, with its terminal's (`create`).
+//! loop). What waits for the core's frame to return is narrower than
+//! any window: terminals, since "Creating a terminal there would register
+//! a surface with the core in the middle of that frame" and "laying
+//! terminals out sends them WM_SIZE, which enters the core"
+//! (`App.requests`), and the focus, since "moving the focus inside it
+//! would send WM_KILLFOCUS into a surface whose key callback is on the
+//! stack" (`App.search_focus`). A passive window may be made there, as
+//! `SearchBar.start` makes the search bar's. The preview's window is made,
+//! hidden, with its terminal's (`create`) so that the first preview
+//! shows without a window being made as the pointer reaches a link, and
+//! nothing about the window can fail then. The cost is one hidden window
+//! for every terminal, also when `link-previews` is false.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,6 +51,7 @@ const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
+const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 
 const RECT = win32.RECT;
 const L = win32.L;
@@ -98,6 +111,15 @@ pub const Preview = struct {
         if (self.font) |f| _ = win32.DeleteObject(f);
         self.font = null;
         self.font_dpi = 0;
+    }
+
+    /// Take `url`, not empty, and the text shown for it (`displayText`),
+    /// while there is none.
+    fn take(self: *Preview, alloc: std.mem.Allocator, url: []const u8) !void {
+        const copy = try alloc.dupe(u8, url);
+        errdefer alloc.free(copy);
+        self.text = try displayText(alloc, url);
+        self.url = copy;
     }
 
     /// Forget the URL.
@@ -182,8 +204,8 @@ pub fn create(surface: *Surface) void {
 /// `mouse_over_link` on `surface`: show `url` in its preview, over its
 /// terminal's bottom-left corner, or hide the preview when `url` is
 /// empty, as GTK's label shows while the URL is not empty. False if the
-/// terminal has no preview, or the URL cannot be copied (the preview is
-/// hidden then: an older URL would name another link).
+/// terminal has no preview, or the URL cannot be copied or its text made
+/// (the preview is hidden then: an older URL would name another link).
 ///
 /// The core performs this inside its cursor and key callbacks, which
 /// send the same URL again on every move over a link; nothing is drawn
@@ -195,26 +217,47 @@ pub fn show(surface: *Surface, url: []const u8) bool {
     const same = if (preview.url) |v| std.mem.eql(u8, v, url) else url.len == 0;
     if (!same) {
         preview.clear(alloc);
-        if (url.len > 0) set: {
-            const copy = alloc.dupe(u8, url) catch break :set;
-            const text = wideFromUtf8(alloc, url) catch {
-                alloc.free(copy);
-                break :set;
-            };
-            preview.url = copy;
-            preview.text = text;
-        }
+        const taken = if (url.len > 0) preview.take(alloc, url) else {};
         // Its name, for what reads windows' text, as screen readers do.
         _ = win32.SetWindowTextW(hwnd, if (preview.text) |t| t.ptr else L(""));
         _ = win32.InvalidateRect(hwnd, null, .FALSE);
-        if (url.len > 0 and preview.url == null) {
-            log.warn("cannot show a link preview", .{});
+        taken catch |err| {
+            log.warn("cannot show a link preview len={d} err={}", .{ url.len, err });
             preview.hideWindow();
             return false;
-        }
+        };
     }
     place(surface);
     return true;
+}
+
+/// `url` as its preview shows it, NUL-terminated: each code point that can
+/// hide part of the target or add a line (`unsafeCodepoint`) written as
+/// its value in upper-case hex without leading zeros, `\u{202E}` or
+/// `\u{85}`, as the macOS app's preview writes it
+/// (`UntrustedURL.displayString`); each invalid UTF-8 sequence as U+FFFD.
+/// The caller frees it.
+fn displayText(alloc: std.mem.Allocator, url: []const u8) ![:0]u16 {
+    const wide = try wideFromUtf8(alloc, url);
+    // Unit by unit: every such code point is in the BMP and none is a
+    // surrogate, so a unit of a surrogate pair is never one.
+    for (wide) |unit| {
+        if (unsafeCodepoint(unit)) break;
+    } else return wide;
+    defer alloc.free(wide);
+
+    var out: std.ArrayList(u16) = .empty;
+    errdefer out.deinit(alloc);
+    for (wide) |unit| {
+        if (!unsafeCodepoint(unit)) {
+            try out.append(alloc, unit);
+            continue;
+        }
+        var buf: ["\\u{FEFF}".len]u8 = undefined;
+        const escaped = std.fmt.bufPrint(&buf, "\\u{{{X}}}", .{unit}) catch unreachable;
+        for (escaped) |c| try out.append(alloc, c);
+    }
+    return out.toOwnedSliceSentinel(alloc, 0);
 }
 
 /// The pointer moved over `surface`'s terminal, to `at` in its client

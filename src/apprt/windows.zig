@@ -122,8 +122,8 @@
 //! child window of the frame, just above its terminal and under the search
 //! bar and the command palette, placed by every layout. It is passive: the
 //! pointer and clicks over it go to the terminal under it. Its window is
-//! made with the terminal's, as the core shows it from inside its own
-//! callbacks.
+//! made, hidden, with the terminal's, so that none is made as the pointer
+//! reaches a link; every terminal has one.
 //!
 //! ## What is still missing
 //!

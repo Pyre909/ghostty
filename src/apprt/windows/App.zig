@@ -3280,6 +3280,21 @@ fn hasProgram(extension: [*:0]const u16) bool {
     return hr >= 0;
 }
 
+/// Whether `cp` in a link's target can hide part of it or add a display
+/// line: control, bidirectional and zero-width code points. The macOS
+/// app's set (`isUnsafeCharacter` in
+/// macos/Sources/Helpers/UntrustedURL.swift), which refuses such a link
+/// (`untrustedLinkAllowed`) and shows each one escaped in its preview
+/// (`LinkPreview`). All of them are in the BMP and none is a surrogate.
+pub fn unsafeCodepoint(cp: u21) bool {
+    return switch (cp) {
+        0x00...0x1F, 0x7F...0x9F => true, // C0 and C1 controls
+        0x061C, 0x200B...0x200F, 0x202A...0x202E, 0x2066...0x2069 => true, // bidi, zero width
+        0x2028, 0x2029, 0x2060, 0xFEFF => true, // line separators, word joiner, BOM
+        else => false,
+    };
+}
+
 /// Whether `openUrl` refuses a link: OSC 8 targets and links found in the
 /// terminal's text come from program output and must pass
 /// `untrustedLinkAllowed`, as the macOS app treats them (upstream
@@ -3299,17 +3314,10 @@ fn linkRefused(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
 /// std.Uri); what that policy confirms or inspects (`file:`, custom
 /// schemes) is refused here outright.
 fn untrustedLinkAllowed(url: []const u8) bool {
-    // Control, bidirectional and zero-width code points can hide part of
-    // the target or add a display line; invalid UTF-8 cannot be shown.
+    // Invalid UTF-8 cannot be shown.
     var it = (std.unicode.Utf8View.init(url) catch return false).iterator();
     while (it.nextCodepoint()) |cp| {
-        const unsafe = switch (cp) {
-            0x00...0x1F, 0x7F...0x9F => true, // C0 and C1 controls
-            0x061C, 0x200B...0x200F, 0x202A...0x202E, 0x2066...0x2069 => true, // bidi, zero width
-            0x2028, 0x2029, 0x2060, 0xFEFF => true, // line separators, word joiner, BOM
-            else => false,
-        };
-        if (unsafe) return false;
+        if (unsafeCodepoint(cp)) return false;
     }
 
     const uri = std.Uri.parse(url) catch return false;
@@ -11601,6 +11609,50 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
 }
 
+test "win32: a link preview shows control, bidirectional and zero-width code points escaped, as macOS does" {
+    // The URL comes from program output, and a code point the link
+    // policy refuses (`unsafeCodepoint`) could reorder or hide part of it,
+    // or add a line, where the preview is the way to see the target. The
+    // macOS app's preview writes each as `\u{...}`, in upper-case hex
+    // without leading zeros (UntrustedURLTests.swift).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    // macOS's own case: a right-to-left override.
+    var buf: [1024]u8 = undefined;
+    try std.testing.expect(try testLink(&app, a, "https://example.com/a\u{202E}b"));
+    try expectPreviewAt(window, a, .left);
+    try std.testing.expectEqualStrings("https://example.com/a\\u{202E}b", try previewText(a, &buf));
+
+    // A zero-width space, an isolate, the Arabic letter mark, a C1 and a
+    // C0 control, a line separator, a BOM and a word joiner; around them,
+    // code points that show as they are, one past the BMP, and invalid
+    // UTF-8, shown as U+FFFD.
+    const url = "https://example.com/a\u{200B}b\u{2066}c\u{061C}d\u{0085}e\nf\u{2028}g\u{FEFF}h\u{2060}i\u{00E9}\u{00A0}\u{1F600}\xffj";
+    try std.testing.expect(try testLink(&app, a, url));
+    try expectPreviewAt(window, a, .left);
+    try std.testing.expectEqualStrings(
+        "https://example.com/a\\u{200B}b\\u{2066}c\\u{61C}d\\u{85}e\\u{A}f\\u{2028}g\\u{FEFF}h\\u{2060}i\u{00E9}\u{00A0}\u{1F600}\u{FFFD}j",
+        try previewText(a, &buf),
+    );
+    // The URL itself is kept as the core sent it, which it sends again
+    // on every move over the link.
+    try std.testing.expectEqualStrings(url, a.link_preview.url.?);
+}
+
 test "win32: a link preview shows at the bottom-right while the pointer is over its place, and back" {
     // GTK shows `url_right` while the pointer is over `url_left`, as
     // macOS's banner does. The pointer over the preview is the terminal's
@@ -11773,12 +11825,27 @@ test "win32: a link preview follows its terminal through layouts, zooms and tabs
     window.selectTab(0);
     try expectPreviewAt(window, a, .left);
 
-    // Minimized and restored: laid out again.
+    // Minimized, given a new URL and a shorter restored size: nothing is
+    // laid out while the frame is minimized, so the restore lays out the
+    // terminals at the new size and the preview over them, as wide as the
+    // new URL.
+    const shown_before = try childRect(window, hwnd);
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMINNOACTIVE);
+    try std.testing.expect(win32.IsIconic(window.hwnd).toBool());
+    try std.testing.expect(try testLink(&app, a, "https://example.com/some/long/path/and/more"));
+    var wp = std.mem.zeroes(win32.WINDOWPLACEMENT);
+    wp.length = @sizeOf(win32.WINDOWPLACEMENT);
+    try std.testing.expect(win32.GetWindowPlacement(window.hwnd, &wp).toBool());
+    wp.rcNormalPosition.bottom -= 100;
+    wp.showCmd = @intCast(win32.SW_SHOWMINNOACTIVE);
+    try std.testing.expect(win32.SetWindowPlacement(window.hwnd, &wp).toBool());
     try std.testing.expect(win32.IsIconic(window.hwnd).toBool());
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     try std.testing.expect(!win32.IsIconic(window.hwnd).toBool());
     try expectPreviewAt(window, a, .left);
+    const restored = try childRect(window, hwnd);
+    try std.testing.expect(restored.bottom < shown_before.bottom);
+    try std.testing.expect(restored.right > shown_before.right);
 }
 
 test "win32: a link preview moves with its tab to a new window, and follows its scale, font and theme" {

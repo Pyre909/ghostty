@@ -1040,6 +1040,8 @@ pub const GWLP_WNDPROC: c_int = -4;
 /// SetWindowPos's place in the Z order: above every sibling.
 pub const HWND_TOP: ?HWND = null;
 pub const GW_HWNDNEXT: UINT = 2;
+/// GetWindow: the window above, in the Z order.
+pub const GW_HWNDPREV: UINT = 3;
 pub const GW_CHILD: UINT = 5;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindow
 pub extern "user32" fn GetWindow(hwnd: HWND, cmd: UINT) callconv(.winapi) ?HWND;
@@ -1249,11 +1251,9 @@ pub const TOOLINFOW = extern struct {
 
 /// https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nchittest
 pub const WM_NCHITTEST: UINT = 0x0084;
-/// WM_NCHITTEST: the window is covered by another of the same thread,
-/// which gets the mouse message instead.
+/// WM_NCHITTEST: the message is sent on to the windows under this one in
+/// the same thread, until one of them returns another code.
 pub const HTTRANSPARENT: LRESULT = -1;
-/// GetWindow: the window above, in the Z order.
-pub const GW_HWNDPREV: UINT = 3;
 
 comptime {
     // The SDK's sizes on 64-bit Windows.

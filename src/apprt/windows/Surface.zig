@@ -675,8 +675,8 @@ pub const Surface = struct {
         // will not free a surface that is not yet in App.surfaces.
         errdefer _ = win32.DestroyWindow(hwnd);
 
-        // Its link preview, hidden: the core shows it from inside its own
-        // callbacks, where no window is made (`LinkPreview`).
+        // Its link preview, hidden, so that no window is made as the
+        // pointer reaches a link (`LinkPreview`).
         LinkPreview.create(self);
         errdefer self.link_preview.destroy();
 
