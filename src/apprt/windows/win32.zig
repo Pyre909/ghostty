@@ -1243,6 +1243,18 @@ pub const TOOLINFOW = extern struct {
     lParam: LPARAM = 0,
     lpReserved: ?*anyopaque = null,
 };
+
+// The link preview (LinkPreview.zig): a window of our own that the pointer
+// passes through to the terminal under it, placed just above that one.
+
+/// https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nchittest
+pub const WM_NCHITTEST: UINT = 0x0084;
+/// WM_NCHITTEST: the window is covered by another of the same thread,
+/// which gets the mouse message instead.
+pub const HTTRANSPARENT: LRESULT = -1;
+/// GetWindow: the window above, in the Z order.
+pub const GW_HWNDPREV: UINT = 3;
+
 comptime {
     // The SDK's sizes on 64-bit Windows.
     if (@sizeOf(usize) == 8) {

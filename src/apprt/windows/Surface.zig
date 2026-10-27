@@ -21,6 +21,7 @@ const Window = @import("Window.zig");
 const taskbar = @import("taskbar.zig");
 const DesktopNotifications = @import("desktop_notifications.zig");
 const SearchBar = @import("SearchBar.zig");
+const LinkPreview = @import("LinkPreview.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -148,6 +149,11 @@ pub const Surface = struct {
     /// The terminal's search bar (`SearchBar`), a window of the frame's
     /// over this one's top-right corner once `start_search` opened it.
     search_bar: SearchBar.Bar,
+
+    /// The terminal's link preview (`LinkPreview`), a window of the
+    /// frame's over this one's bottom-left corner while the core shows a
+    /// URL in it; made, hidden, with this one.
+    link_preview: LinkPreview.Preview,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -644,6 +650,7 @@ pub const Surface = struct {
             .progress_expires = 0,
             .notifications = .{},
             .search_bar = .{},
+            .link_preview = .{},
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -667,6 +674,11 @@ pub const Surface = struct {
         // invariant on App.surfaceDestroyed: WM_DESTROY reenters the app but
         // will not free a surface that is not yet in App.surfaces.
         errdefer _ = win32.DestroyWindow(hwnd);
+
+        // Its link preview, hidden: the core shows it from inside its own
+        // callbacks, where no window is made (`LinkPreview`).
+        LinkPreview.create(self);
+        errdefer self.link_preview.destroy();
 
         // Registration comes before init: every surface message the core
         // routes is checked with `CoreApp.hasSurface`, so a
@@ -764,6 +776,7 @@ pub const Surface = struct {
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
         self.notifications.deinit(self.app.core_app.alloc);
         self.search_bar.deinit();
+        self.link_preview.deinit(self.app.core_app.alloc);
     }
 
     /// Stop the core surface and destroy its window. The last terminal in a
@@ -793,18 +806,22 @@ pub const Surface = struct {
                 window.removeTab(t);
             }
         }
-        // Its search bar, a window of the frame's, goes with it, before
-        // its core stops: nothing shows it, nor is clicked, meanwhile.
+        // Its search bar and link preview, windows of the frame's, go with
+        // it, before its core stops: nothing shows them, nor is clicked,
+        // meanwhile.
         self.search_bar.destroy();
+        self.link_preview.destroy();
         self.stopCore();
         return win32.DestroyWindow(self.hwnd).toBool();
     }
 
     /// Undo a `create` that succeeded, for a terminal no window holds yet:
-    /// stop its core, destroy its window, and free it. Its window's
-    /// WM_DESTROY frees nothing, as it is not in `App.surfaces`.
+    /// stop its core, destroy its window and its link preview's, and free
+    /// it. Its window's WM_DESTROY frees nothing, as it is not in
+    /// `App.surfaces`.
     pub fn discard(self: *Surface) void {
         const alloc = self.app.core_app.alloc;
+        self.link_preview.destroy();
         self.stopCore();
         _ = win32.DestroyWindow(self.hwnd);
         self.deinit();
@@ -1707,6 +1724,10 @@ pub const Surface = struct {
             },
 
             win32.WM_MOUSEMOVE => {
+                // Before the core, which may show a link preview: whether
+                // the pointer is over its place, which the preview passes
+                // through to here (`LinkPreview.pointerAt`).
+                LinkPreview.pointerAt(self, .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) });
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 if (!self.syncMouse(core_surface, Mouse.Button.downIn(wparam))) return 0;
@@ -1718,6 +1739,7 @@ pub const Surface = struct {
             win32.WM_MOUSELEAVE => {
                 // Win32 has cancelled the tracking.
                 self.mouse.tracking = false;
+                LinkPreview.pointerAt(self, null);
                 if (self.liveCore()) |core_surface| {
                     // During a drag the captured moves keep the core
                     // informed, negative positions included, which drag

@@ -113,16 +113,28 @@
 //! its frame is deactivated, when the layout leaves no room for it, and
 //! with its terminal or window; the terminal gets the focus back.
 //!
+//! ## Link previews
+//!
+//! `.mouse_over_link` shows the URL of the link under the pointer over the
+//! bottom-left corner of its terminal, and an empty one hides it, as GTK's
+//! label does (`LinkPreview`); while the pointer is over that place, the
+//! URL shows at the bottom-right instead. Like the search bar, it is a
+//! child window of the frame, just above its terminal and under the search
+//! bar and the command palette, placed by every layout. It is passive: the
+//! pointer and clicks over it go to the terminal under it. Its window is
+//! made with the terminal's, as the core shows it from inside its own
+//! callbacks.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
-//! window, dragging the dividers between splits, a context menu,
-//! link previews and precision-touchpad scrolling. Without a menu, a
-//! right click with the default `right-click-action` only selects the word
-//! or link under the pointer.
+//! window, dragging the dividers between splits, a context menu and
+//! precision-touchpad scrolling. Without a menu, a right click with the
+//! default `right-click-action` only selects the word or link under the
+//! pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",
-//! for `.mouse_over_link` and every other action it does not
-//! name; this runtime never claims an action it did not carry out.
+//! for every action it does not name; this runtime never claims an action
+//! it did not carry out.
 //!
 //! Links open through the shell's `open` verb (`App.openLink`); a text
 //! file of a kind no program is registered for opens with the program for
@@ -213,6 +225,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
     _ = @import("windows/CommandPalette.zig");
+    _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
