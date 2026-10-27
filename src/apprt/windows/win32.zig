@@ -1246,8 +1246,8 @@ pub const TOOLINFOW = extern struct {
     lpReserved: ?*anyopaque = null,
 };
 
-// The link preview (LinkPreview.zig): a window of our own that the pointer
-// passes through to the terminal under it, placed just above that one.
+// The overlays (Overlays.zig): windows of our own that the pointer passes
+// through to the terminal under them, placed just above that one.
 
 /// https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nchittest
 pub const WM_NCHITTEST: UINT = 0x0084;

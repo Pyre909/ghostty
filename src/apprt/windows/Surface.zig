@@ -22,6 +22,7 @@ const taskbar = @import("taskbar.zig");
 const DesktopNotifications = @import("desktop_notifications.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
+const Overlays = @import("Overlays.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -150,10 +151,10 @@ pub const Surface = struct {
     /// over this one's top-right corner once `start_search` opened it.
     search_bar: SearchBar.Bar,
 
-    /// The terminal's link preview (`LinkPreview`), a window of the
-    /// frame's over this one's bottom-left corner while the core shows a
-    /// URL in it; made, hidden, with this one.
-    link_preview: LinkPreview.Preview,
+    /// The terminal's overlays (`Overlays`), windows of the frame's just
+    /// above this one that show something about it and take no input: its
+    /// link preview, made, hidden, with this one.
+    overlays: Overlays,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -650,7 +651,7 @@ pub const Surface = struct {
             .progress_expires = 0,
             .notifications = .{},
             .search_bar = .{},
-            .link_preview = .{},
+            .overlays = .{},
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -677,8 +678,8 @@ pub const Surface = struct {
 
         // Its link preview, hidden, so that no window is made as the
         // pointer reaches a link (`LinkPreview`).
-        LinkPreview.create(self);
-        errdefer self.link_preview.destroy();
+        Overlays.create(self);
+        errdefer self.overlays.destroy();
 
         // Registration comes before init: every surface message the core
         // routes is checked with `CoreApp.hasSurface`, so a
@@ -776,7 +777,7 @@ pub const Surface = struct {
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
         self.notifications.deinit(self.app.core_app.alloc);
         self.search_bar.deinit();
-        self.link_preview.deinit(self.app.core_app.alloc);
+        self.overlays.deinit(self.app.core_app.alloc);
     }
 
     /// Stop the core surface and destroy its window. The last terminal in a
@@ -806,22 +807,22 @@ pub const Surface = struct {
                 window.removeTab(t);
             }
         }
-        // Its search bar and link preview, windows of the frame's, go with
-        // it, before its core stops: nothing shows them, nor is clicked,
+        // Its search bar and overlays, windows of the frame's, go with it,
+        // before its core stops: nothing shows them, nor is clicked,
         // meanwhile.
         self.search_bar.destroy();
-        self.link_preview.destroy();
+        self.overlays.destroy();
         self.stopCore();
         return win32.DestroyWindow(self.hwnd).toBool();
     }
 
     /// Undo a `create` that succeeded, for a terminal no window holds yet:
-    /// stop its core, destroy its window and its link preview's, and free
-    /// it. Its window's WM_DESTROY frees nothing, as it is not in
+    /// stop its core, destroy its window and its overlays', and free it.
+    /// Its window's WM_DESTROY frees nothing, as it is not in
     /// `App.surfaces`.
     pub fn discard(self: *Surface) void {
         const alloc = self.app.core_app.alloc;
-        self.link_preview.destroy();
+        self.overlays.destroy();
         self.stopCore();
         _ = win32.DestroyWindow(self.hwnd);
         self.deinit();

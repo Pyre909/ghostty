@@ -10,20 +10,13 @@
 //! escaped, as the macOS app's preview shows them (`displayText`); GTK's
 //! label shows them as they are.
 //!
-//! Like the search bar (SearchBar.zig), the preview is a child window of
-//! the terminal's **frame**, placed above the terminal's own window: GDI
-//! drawn in a child of the window that owns a flip-model swap chain is
-//! never composed. So every path that lays terminals out places it
-//! (`place`, from `Window.relayout`), a hidden tab's is hidden with its
-//! terminals, and it follows its terminal to a new frame. It sits just
-//! above its own terminal, under the terminal's search bar and the
-//! window's command palette.
-//!
-//! It is passive: it answers WM_NCHITTEST with HTTRANSPARENT, so the
-//! pointer and clicks over it go to the terminal under it, which keeps
-//! tracking the link, and it is never given the focus. Whether the
-//! pointer is over its place is the terminal's to say (`pointerAt`, from
-//! its WM_MOUSEMOVE).
+//! It is one of the terminal's overlays (Overlays.zig): a child window of
+//! the terminal's frame, just above the terminal's own window and under
+//! its search bar and the window's command palette, which every layout
+//! places, hidden with its terminal and following it to a new frame. It
+//! is passive: the pointer and clicks over it go to the terminal under
+//! it, which keeps tracking the link. Whether the pointer is over its
+//! place is the terminal's to say (`pointerAt`, from its WM_MOUSEMOVE).
 //!
 //! The core gives the URL from its cursor and key callbacks, mostly with
 //! its renderer's lock held. Showing, moving, hiding and retitling the
@@ -37,19 +30,17 @@
 //! would send WM_KILLFOCUS into a surface whose key callback is on the
 //! stack" (`App.search_focus`). A passive window may be made there, as
 //! `SearchBar.start` makes the search bar's. The preview's window is made,
-//! hidden, with its terminal's (`create`) so that the first preview
-//! shows without a window being made as the pointer reaches a link, and
-//! nothing about the window can fail then. The cost is one hidden window
-//! for every terminal, also when `link-previews` is false.
+//! hidden, with its terminal's (`Overlays.create`) so that the first
+//! preview shows without a window being made as the pointer reaches a
+//! link, and nothing about the window can fail then. The cost is one
+//! hidden window for every terminal, also when `link-previews` is false.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
-const Window = @import("Window.zig");
+const Overlays = @import("Overlays.zig");
 const SearchBar = @import("SearchBar.zig");
-const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 
@@ -59,12 +50,7 @@ const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttyLinkPreviewClass";
 
-/// For tests: how many messages a preview's window got after its terminal
-/// had let go of it (`Preview.deinit`), which the default procedure
-/// handled.
-pub var test_detached: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
-
-/// A terminal's preview (`Surface.link_preview`).
+/// A terminal's preview (`Overlays.link_preview`).
 pub const Preview = struct {
     /// The preview's window, a child of the terminal's frame, made with
     /// the terminal; null if it could not be made, and once it is
@@ -74,7 +60,8 @@ pub const Preview = struct {
     /// null while there is none.
     url: ?[]u8 = null,
     text: ?[:0]u16 = null,
-    /// The size of `text` in `font`; measured again when either changes.
+    /// The size of `text` in the overlays' font; measured again when
+    /// either changes.
     text_size: Size = .{ .width = 0, .height = 0 },
     measured: bool = false,
     /// Where the pointer is over the terminal, in its client coordinates,
@@ -82,35 +69,10 @@ pub const Preview = struct {
     pointer: ?win32.POINT = null,
     /// The corner it shows at, as it was last placed.
     side: Side = .left,
-    /// The system's message font at `font_dpi` (`applyFont`).
-    font: ?win32.HGDIOBJ = null,
-    font_dpi: u32 = 0,
 
-    /// Hide the window, as when its terminal is hidden; the URL stays.
-    pub fn hideWindow(self: *const Preview) void {
-        const hwnd = self.hwnd orelse return;
-        if (SearchBar.visibleStyle(hwnd)) _ = win32.ShowWindow(hwnd, win32.SW_HIDE);
-    }
-
-    /// Destroy the window, for a terminal leaving its window
-    /// (`Surface.destroy`) or never put in one (`Surface.discard`).
-    pub fn destroy(self: *const Preview) void {
-        const hwnd = self.hwnd orelse return;
-        _ = win32.DestroyWindow(hwnd);
-    }
-
-    /// Let go of the window and free the URL and the font, as the terminal
-    /// is freed (`Surface.deinit`). The window may outlive the terminal by
-    /// a few messages: when a frame is destroyed, Windows sends WM_DESTROY
-    /// to its children in an order of its own, so the window loses its
-    /// back-pointer, as the search bar's does, and goes with its frame.
+    /// Free the URL, as the terminal is freed (`Overlays.deinit`).
     pub fn deinit(self: *Preview, alloc: std.mem.Allocator) void {
-        if (self.hwnd) |hwnd| _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
-        self.hwnd = null;
         self.clear(alloc);
-        if (self.font) |f| _ = win32.DeleteObject(f);
-        self.font = null;
-        self.font_dpi = 0;
     }
 
     /// Take `url`, not empty, and the text shown for it (`displayText`),
@@ -131,75 +93,25 @@ pub const Preview = struct {
         self.measured = false;
     }
 
-    /// Draw it again: the theme changed.
-    pub fn invalidate(self: *const Preview) void {
-        if (self.hwnd) |hwnd| _ = win32.InvalidateRect(hwnd, null, .FALSE);
+    /// Where the preview goes over a terminal `pane` big at `dpi`, in the
+    /// terminal's client coordinates (`Overlays.place`): over its
+    /// bottom-left corner, or its bottom-right while the pointer is over
+    /// the bottom-left place (`sideFor`), drawn again when it changes
+    /// corners; null for a terminal with no area.
+    pub fn placeIn(self: *Preview, dpi: u32, pane: Size) ?Overlays.Placed {
+        const m = Metrics.init(dpi);
+        const side = sideFor(m, pane, self.text_size, self.pointer);
+        const in = rectIn(m, pane, self.text_size, side) orelse return null;
+        defer self.side = side;
+        return .{ .in = in, .redraw = side != self.side };
     }
 
-    /// The system's message font changed: made again at the next placement.
-    pub fn fontChanged(self: *Preview) void {
-        self.font_dpi = 0;
-    }
-
-    /// The message font at `dpi`, made once for each DPI, the new one
-    /// before the old one goes, which is kept if it cannot be made; and
-    /// the text measured in it.
-    fn applyFont(self: *Preview, dpi: u32) void {
-        if (self.font == null or self.font_dpi != dpi) {
-            if (messageFont(dpi)) |font| {
-                if (self.font) |old| _ = win32.DeleteObject(old);
-                self.font = font;
-                self.font_dpi = dpi;
-                self.measured = false;
-            }
-        }
-        if (!self.measured) self.measure();
-    }
-
-    fn measure(self: *Preview) void {
-        self.measured = true;
-        self.text_size = .{ .width = 0, .height = 0 };
-        const text = self.text orelse return;
-        const hwnd = self.hwnd orelse return;
-        const hdc = win32.GetDC(hwnd) orelse return;
-        defer _ = win32.ReleaseDC(hwnd, hdc);
-        const old = if (self.font) |f| win32.SelectObject(hdc, f) else null;
-        defer if (old) |o| {
-            _ = win32.SelectObject(hdc, o);
-        };
-        var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        _ = win32.DrawTextW(hdc, text.ptr, std.math.lossyCast(c_int, text.len), &r, text_format | win32.DT_CALCRECT);
-        self.text_size = .{ .width = r.right - r.left, .height = r.bottom - r.top };
+    /// Where the text goes in the preview, `width` wide at `dpi`
+    /// (`textRect`).
+    pub fn textIn(self: *const Preview, dpi: u32, width: i32) RECT {
+        return textRect(.init(dpi), width, self.text_size, self.side);
     }
 };
-
-/// One line, `&` drawn as itself: CR and LF in a URL break nothing.
-const text_format = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
-
-/// Make `surface`'s preview window, hidden, in its frame, as its
-/// terminal's own is made (`Surface.create`). Without one, logged, the
-/// terminal shows no previews.
-pub fn create(surface: *Surface) void {
-    const preview = &surface.link_preview;
-    if (preview.hwnd != null) return;
-    preview.hwnd = win32.CreateWindowExW(
-        0,
-        L(class_name),
-        null,
-        win32.WS_CHILD | win32.WS_CLIPSIBLINGS,
-        0,
-        0,
-        0,
-        0,
-        surface.window.hwnd,
-        null,
-        surface.app.hinstance,
-        surface,
-    ) orelse {
-        log.warn("cannot make a link preview err={}", .{win32.GetLastError()});
-        return;
-    };
-}
 
 /// `mouse_over_link` on `surface`: show `url` in its preview, over its
 /// terminal's bottom-left corner, or hide the preview when `url` is
@@ -211,7 +123,7 @@ pub fn create(surface: *Surface) void {
 /// send the same URL again on every move over a link; nothing is drawn
 /// again unless something changed.
 pub fn show(surface: *Surface, url: []const u8) bool {
-    const preview = &surface.link_preview;
+    const preview = &surface.overlays.link_preview;
     const hwnd = preview.hwnd orelse return false;
     const alloc = surface.app.core_app.alloc;
     const same = if (preview.url) |v| std.mem.eql(u8, v, url) else url.len == 0;
@@ -223,11 +135,11 @@ pub fn show(surface: *Surface, url: []const u8) bool {
         _ = win32.InvalidateRect(hwnd, null, .FALSE);
         taken catch |err| {
             log.warn("cannot show a link preview len={d} err={}", .{ url.len, err });
-            preview.hideWindow();
+            Overlays.hideWindow(preview.hwnd);
             return false;
         };
     }
-    place(surface);
+    Overlays.place(surface);
     return true;
 }
 
@@ -264,162 +176,13 @@ fn displayText(alloc: std.mem.Allocator, url: []const u8) ![:0]u16 {
 /// coordinates, or left it (null): a preview that shows goes to the
 /// other corner if the pointer came over its place or left it.
 pub fn pointerAt(surface: *Surface, at: ?win32.POINT) void {
-    const preview = &surface.link_preview;
+    const preview = &surface.overlays.link_preview;
     preview.pointer = at;
     const hwnd = preview.hwnd orelse return;
-    if (preview.text != null and SearchBar.visibleStyle(hwnd)) place(surface);
+    if (preview.text != null and SearchBar.visibleStyle(hwnd)) Overlays.place(surface);
 }
 
-/// Place `surface`'s preview over its terminal's bottom-left corner, or
-/// its bottom-right while the pointer is over the bottom-left place
-/// (`sideFor`), just above the terminal; or hide it while it has no URL
-/// or the terminal is hidden (a hidden tab, a zoom). A preview whose
-/// terminal moved to another frame (`Window.moveTabTo`) goes there first;
-/// one that cannot is destroyed, logged, and the terminal shows no more
-/// previews.
-///
-/// The terminals tile their area, and the search bars and the command
-/// palette are placed above all of them (`SearchBar.place`,
-/// `CommandPalette.place`), so just above its own terminal the preview
-/// covers nothing but that terminal, under its search bar and the
-/// palette, wherever it is placed from.
-pub fn place(surface: *Surface) void {
-    const preview = &surface.link_preview;
-    const hwnd = preview.hwnd orelse return;
-    const window = surface.window;
-    if (win32.GetAncestor(hwnd, win32.GA_PARENT) != window.hwnd) {
-        if (win32.SetParent(hwnd, window.hwnd) == null) {
-            log.warn("cannot move a link preview to its terminal's new frame err={}", .{win32.GetLastError()});
-            _ = win32.DestroyWindow(hwnd);
-            return;
-        }
-    }
-    if (preview.text == null or !SearchBar.visibleStyle(surface.hwnd)) return preview.hideWindow();
-    var pane: RECT = undefined;
-    if (!win32.GetWindowRect(surface.hwnd, &pane).toBool() or !window.toClient(&pane)) return preview.hideWindow();
-    const dpi = Window.dpiOf(surface.app, window.hwnd);
-    preview.applyFont(dpi);
-    const m = Metrics.init(dpi);
-    const size: Size = .{ .width = pane.right - pane.left, .height = pane.bottom - pane.top };
-    const side = sideFor(m, size, preview.text_size, preview.pointer);
-    const in = rectIn(m, size, preview.text_size, side) orelse return preview.hideWindow();
-    const at: RECT = .{ .left = pane.left + in.left, .top = pane.top + in.top, .right = pane.left + in.right, .bottom = pane.top + in.bottom };
-
-    const above = win32.GetWindow(surface.hwnd, win32.GW_HWNDPREV);
-    var now: RECT = undefined;
-    const in_place = SearchBar.visibleStyle(hwnd) and above == hwnd and
-        win32.GetWindowRect(hwnd, &now).toBool() and window.toClient(&now) and
-        std.meta.eql(now, at);
-    if (in_place and side == preview.side) return;
-    preview.side = side;
-    if (!in_place) {
-        // Just under the window above the terminal, or the top if none is.
-        const flags = win32.SWP_NOACTIVATE | win32.SWP_SHOWWINDOW | if (above == hwnd) win32.SWP_NOZORDER else 0;
-        _ = win32.SetWindowPos(hwnd, above, at.left, at.top, at.right - at.left, at.bottom - at.top, flags);
-    }
-    _ = win32.InvalidateRect(hwnd, null, .FALSE);
-}
-
-/// The terminal whose preview the window `hwnd` is, null once it is freed.
-fn surfaceOf(hwnd: win32.HWND) ?*Surface {
-    const v = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
-    if (v == 0) return null;
-    return @ptrFromInt(@as(usize, @bitCast(v)));
-}
-
-/// The preview's window procedure. WM_NCCREATE brings its terminal.
-pub fn wndProc(
-    hwnd: win32.HWND,
-    msg: win32.UINT,
-    wparam: win32.WPARAM,
-    lparam: win32.LPARAM,
-) callconv(.winapi) win32.LRESULT {
-    switch (msg) {
-        win32.WM_NCCREATE => {
-            const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            if (cs.lpCreateParams) |param| {
-                _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(param)));
-            }
-            return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-        },
-        // The pointer and clicks over it are the terminal's under it,
-        // which Windows gives them to instead, being of the same thread.
-        win32.WM_NCHITTEST => return win32.HTTRANSPARENT,
-        else => {},
-    }
-    const surface = surfaceOf(hwnd) orelse {
-        if (builtin.is_test) test_detached += 1;
-        return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-    };
-    const preview = &surface.link_preview;
-
-    switch (msg) {
-        // All of it is painted, from a bitmap.
-        win32.WM_ERASEBKGND => return 1,
-
-        win32.WM_PAINT => {
-            paint(surface, hwnd);
-            return 0;
-        },
-
-        win32.WM_DESTROY => {
-            // Nothing places or draws into a destroyed window; the URL and
-            // the font are freed with the terminal.
-            preview.hwnd = null;
-            return 0;
-        },
-
-        win32.WM_NCDESTROY => {
-            _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
-        },
-
-        else => {},
-    }
-    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-}
-
-/// The URL on the search bar's colours, framed as GTK's label is.
-fn paint(surface: *Surface, hwnd: win32.HWND) void {
-    const preview = &surface.link_preview;
-    var ps: win32.PAINTSTRUCT = undefined;
-    const hdc = win32.BeginPaint(hwnd, &ps) orelse return;
-    defer _ = win32.EndPaint(hwnd, &ps);
-
-    var client: RECT = undefined;
-    if (!win32.GetClientRect(hwnd, &client).toBool()) return;
-    if (client.right <= 0 or client.bottom <= 0) return;
-
-    // Drawn off the screen, then copied at once, so that it never flickers.
-    const mem = win32.CreateCompatibleDC(hdc) orelse return;
-    defer _ = win32.DeleteDC(mem);
-    const bitmap = win32.CreateCompatibleBitmap(hdc, client.right, client.bottom) orelse return;
-    defer _ = win32.DeleteObject(bitmap);
-    const old_bitmap = win32.SelectObject(mem, bitmap);
-    defer if (old_bitmap) |b| {
-        _ = win32.SelectObject(mem, b);
-    };
-
-    const dpi = Window.dpiOf(surface.app, hwnd);
-    const colors = SearchBar.Colors.of(surface.window.dark_frame);
-    const line = @max(1, SearchBar.Metrics.scale(1, dpi));
-    SearchBar.fill(mem, client, colors.border);
-    SearchBar.fill(mem, SearchBar.inset(client, line), colors.bar);
-
-    if (preview.text) |text| {
-        _ = win32.SetBkMode(mem, win32.TRANSPARENT);
-        _ = win32.SetTextColor(mem, colors.text);
-        const old_font = if (preview.font) |f| win32.SelectObject(mem, f) else null;
-        defer if (old_font) |f| {
-            _ = win32.SelectObject(mem, f);
-        };
-        var r = textRect(.init(dpi), client.right, preview.text_size, preview.side);
-        _ = win32.DrawTextW(mem, text.ptr, std.math.lossyCast(c_int, text.len), &r, text_format);
-    }
-
-    _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
-}
-
-pub const Size = struct { width: i32, height: i32 };
+pub const Size = Overlays.Size;
 
 /// The corner a preview shows at.
 pub const Side = enum { left, right };

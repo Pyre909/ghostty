@@ -20,6 +20,7 @@ const taskbar = @import("taskbar.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
+const Overlays = @import("Overlays.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -3040,29 +3041,9 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     }
     errdefer _ = win32.UnregisterClassW(L(CommandPalette.class_name), hinstance);
 
-    // The link preview draws itself through GDI and is invalidated when it
-    // is placed, its URL changes or the theme does (`LinkPreview.place`).
-    // Its cursor never shows: the terminal under it takes the pointer
-    // (WM_NCHITTEST).
-    const preview_class: win32.WNDCLASSEXW = .{
-        .cbSize = @sizeOf(win32.WNDCLASSEXW),
-        .style = 0,
-        .lpfnWndProc = &LinkPreview.wndProc,
-        .cbClsExtra = 0,
-        .cbWndExtra = 0,
-        .hInstance = hinstance,
-        .hIcon = null,
-        .hCursor = arrow,
-        .hbrBackground = null,
-        .lpszMenuName = null,
-        .lpszClassName = L(LinkPreview.class_name),
-        .hIconSm = null,
-    };
-    if (win32.RegisterClassExW(&preview_class) == 0) {
-        log.err("failed to register the link preview class err={}", .{win32.GetLastError()});
-        return App.Error.Win32ClassRegistrationFailed;
-    }
-    errdefer _ = win32.UnregisterClassW(L(LinkPreview.class_name), hinstance);
+    // The overlays' classes (`Overlays.registerClasses`).
+    try Overlays.registerClasses(hinstance, arrow);
+    errdefer Overlays.unregisterClasses(hinstance);
 
     const app_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
@@ -3091,7 +3072,7 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(TabBar.class_name), hinstance);
     _ = win32.UnregisterClassW(L(SearchBar.class_name), hinstance);
     _ = win32.UnregisterClassW(L(CommandPalette.class_name), hinstance);
-    _ = win32.UnregisterClassW(L(LinkPreview.class_name), hinstance);
+    Overlays.unregisterClasses(hinstance);
 }
 
 /// The text of `showConfigErrors`: GTK's dialog's, then each diagnostic on
@@ -3766,7 +3747,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.progress_expires = 0;
     surface.notifications = .{ .id = @intFromPtr(surface) };
     surface.search_bar = .{};
-    surface.link_preview = .{};
+    surface.overlays = .{};
     surface.preedit = .none;
     _ = win32.CreateWindowExW(
         0,
@@ -3786,7 +3767,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
         return error.TestUnexpectedResult;
     };
     // As `Surface.create` makes it.
-    LinkPreview.create(surface);
+    Overlays.create(surface);
     app.surfaces.appendAssumeCapacity(surface);
     return surface;
 }
@@ -5122,7 +5103,7 @@ test "win32: a tab whose terminal cannot change frames stays where it was" {
     try std.testing.expect(win32.DestroyWindow(z.hwnd).toBool());
     // And its link preview's, which a teardown destroys with it
     // (`Surface.destroy`): freed below, z never lets go of it.
-    try std.testing.expect(win32.DestroyWindow(z.link_preview.hwnd.?).toBool());
+    try std.testing.expect(win32.DestroyWindow(z.overlays.link_preview.hwnd.?).toBool());
     const tb = window.tabOf(b).?;
     tb.tree.deinit();
     // z on the left: a split keeps the node it adds before the one split
@@ -11498,7 +11479,7 @@ fn testLink(app: *App, surface: *Surface, url: [:0]const u8) !bool {
 /// `buf`.
 fn previewText(surface: *const Surface, buf: []u8) ![]const u8 {
     var wide: [512]u16 = undefined;
-    const n = win32.GetWindowTextW(surface.link_preview.hwnd.?, &wide, wide.len);
+    const n = win32.GetWindowTextW(surface.overlays.link_preview.hwnd.?, &wide, wide.len);
     const len = try std.unicode.utf16LeToUtf8(buf, wide[0..@intCast(n)]);
     return buf[0..len];
 }
@@ -11507,7 +11488,7 @@ fn previewText(surface: *const Surface, buf: []u8) ![]const u8 {
 /// terminal's bottom `side` corner, as big as its URL with GTK's padding
 /// but no wider than the terminal, and just above the terminal.
 fn expectPreviewAt(window: *const Window, surface: *const Surface, side: LinkPreview.Side) !void {
-    const p = &surface.link_preview;
+    const p = &surface.overlays.link_preview;
     const hwnd = p.hwnd.?;
     try std.testing.expect(shown(hwnd));
     try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
@@ -11556,8 +11537,8 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     window.relayout();
 
     // Made with each terminal, hidden.
-    const hwnd = b.link_preview.hwnd.?;
-    try std.testing.expect(!shown(a.link_preview.hwnd.?));
+    const hwnd = b.overlays.link_preview.hwnd.?;
+    try std.testing.expect(!shown(a.overlays.link_preview.hwnd.?));
     try std.testing.expect(!shown(hwnd));
 
     // Not for the app.
@@ -11567,7 +11548,7 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     try std.testing.expect(try testLink(&app, b, "https://example.com/some/long/path"));
     try expectPreviewAt(window, b, .left);
     try std.testing.expectEqualStrings("https://example.com/some/long/path", try previewText(b, &buf));
-    try std.testing.expect(!shown(a.link_preview.hwnd.?));
+    try std.testing.expect(!shown(a.overlays.link_preview.hwnd.?));
     const short = try childRect(window, hwnd);
 
     // The same URL again, as each move over the link sends it: the same.
@@ -11585,7 +11566,7 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     try std.testing.expect(try testLink(&app, b, ""));
     try std.testing.expect(!shown(hwnd));
     try std.testing.expectEqualStrings("", try previewText(b, &buf));
-    try std.testing.expect(b.link_preview.url == null);
+    try std.testing.expect(b.overlays.link_preview.url == null);
     window.relayout();
     try std.testing.expect(!shown(hwnd));
     // An empty one again changes nothing.
@@ -11601,7 +11582,7 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     try std.testing.expect(try testLink(&app, b, long));
     try expectPreviewAt(window, b, .left);
     const pane = try paneRect(window, b);
-    try std.testing.expect(b.link_preview.text_size.width > pane.right - pane.left);
+    try std.testing.expect(b.overlays.link_preview.text_size.width > pane.right - pane.left);
     try std.testing.expectEqual(pane.right - pane.left, (try childRect(window, hwnd)).right - (try childRect(window, hwnd)).left);
     try std.testing.expectEqualStrings(long, try previewText(b, &buf));
 
@@ -11650,7 +11631,7 @@ test "win32: a link preview shows control, bidirectional and zero-width code poi
     );
     // The URL itself is kept as the core sent it, which it sends again
     // on every move over the link.
-    try std.testing.expectEqualStrings(url, a.link_preview.url.?);
+    try std.testing.expectEqualStrings(url, a.overlays.link_preview.url.?);
 }
 
 test "win32: a link preview shows at the bottom-right while the pointer is over its place, and back" {
@@ -11678,7 +11659,7 @@ test "win32: a link preview shows at the bottom-right while the pointer is over 
     try std.testing.expect(try testLink(&app, a, url));
     try expectPreviewAt(window, a, .left);
     const pane = try paneRect(window, a);
-    const place = try childRect(window, a.link_preview.hwnd.?);
+    const place = try childRect(window, a.overlays.link_preview.hwnd.?);
     // Its place, in the terminal's client coordinates.
     const x = place.left - pane.left;
     const y = place.top - pane.top;
@@ -11710,7 +11691,7 @@ test "win32: a link preview shows at the bottom-right while the pointer is over 
     // shows at the right at once.
     try std.testing.expect(try testLink(&app, a, ""));
     testPointer(a, x + 5, y + 2);
-    try std.testing.expect(!shown(a.link_preview.hwnd.?));
+    try std.testing.expect(!shown(a.overlays.link_preview.hwnd.?));
     try std.testing.expect(try testLink(&app, a, url));
     try expectPreviewAt(window, a, .right);
 
@@ -11751,7 +11732,7 @@ test "win32: a link preview follows its terminal through layouts, zooms and tabs
 
     try std.testing.expect(try testLink(&app, a, "https://example.com/some/long/path"));
     try expectPreviewAt(window, a, .left);
-    const hwnd = a.link_preview.hwnd.?;
+    const hwnd = a.overlays.link_preview.hwnd.?;
 
     // The frame resized: with its terminal's bottom.
     const was = try childRect(window, hwnd);
@@ -11786,7 +11767,7 @@ test "win32: a link preview follows its terminal through layouts, zooms and tabs
     window.toggleZoom(b);
     try std.testing.expect(!shown(a.hwnd));
     try std.testing.expect(!shown(hwnd));
-    try std.testing.expect(a.link_preview.url != null);
+    try std.testing.expect(a.overlays.link_preview.url != null);
     window.toggleZoom(b);
     try expectPreviewAt(window, a, .left);
     window.toggleZoom(a);
@@ -11820,8 +11801,8 @@ test "win32: a link preview follows its terminal through layouts, zooms and tabs
     // again with them.
     window.selectTab(1);
     try std.testing.expect(!shown(hwnd));
-    try std.testing.expect(a.link_preview.url != null);
-    try std.testing.expect(!shown(c.link_preview.hwnd.?));
+    try std.testing.expect(a.overlays.link_preview.url != null);
+    try std.testing.expect(!shown(c.overlays.link_preview.hwnd.?));
     window.selectTab(0);
     try expectPreviewAt(window, a, .left);
 
@@ -11876,7 +11857,7 @@ test "win32: a link preview moves with its tab to a new window, and follows its 
     window.relayout();
     try std.testing.expect(try testLink(&app, a, "https://example.com/some/long/path"));
     try expectPreviewAt(window, a, .left);
-    const hwnd = a.link_preview.hwnd.?;
+    const hwnd = a.overlays.link_preview.hwnd.?;
 
     // The tab moved to a new window: the preview goes to its frame.
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
@@ -11885,13 +11866,13 @@ test "win32: a link preview moves with its tab to a new window, and follows its 
     const moved = a.window;
     try std.testing.expect(moved != window);
     try expectPreviewAt(moved, a, .left);
-    try std.testing.expect(a.link_preview.hwnd.? == hwnd);
+    try std.testing.expect(a.overlays.link_preview.hwnd.? == hwnd);
     // One not showing goes with its terminal too, for when it shows.
-    try std.testing.expect(win32.GetAncestor(b.link_preview.hwnd.?, win32.GA_PARENT) == moved.hwnd);
+    try std.testing.expect(win32.GetAncestor(b.overlays.link_preview.hwnd.?, win32.GA_PARENT) == moved.hwnd);
 
     // A new scale: the font and the padding at it.
-    const before = a.link_preview.text_size;
-    try std.testing.expect(a.link_preview.font_dpi > 0 and a.link_preview.font_dpi < 192);
+    const before = a.overlays.link_preview.text_size;
+    try std.testing.expect(a.overlays.font_dpi > 0 and a.overlays.font_dpi < 192);
     const Dpi = struct {
         fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
             return 192;
@@ -11900,15 +11881,15 @@ test "win32: a link preview moves with its tab to a new window, and follows its 
     app.get_dpi_for_window = &Dpi.of;
     var suggested = try windowRect(moved.hwnd);
     _ = win32.SendMessageW(moved.hwnd, win32.WM_DPICHANGED, 192 << 16 | 192, @bitCast(@intFromPtr(&suggested)));
-    try std.testing.expectEqual(192, a.link_preview.font_dpi);
-    try std.testing.expect(a.link_preview.text_size.height > before.height);
-    try std.testing.expect(a.link_preview.text_size.width > before.width);
+    try std.testing.expectEqual(192, a.overlays.font_dpi);
+    try std.testing.expect(a.overlays.link_preview.text_size.height > before.height);
+    try std.testing.expect(a.overlays.link_preview.text_size.width > before.width);
     try expectPreviewAt(moved, a, .left);
 
     // The system's message font changed: made again as it is placed.
-    const font = a.link_preview.font.?;
+    const font = a.overlays.font.?;
     _ = win32.SendMessageW(moved.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETNONCLIENTMETRICS, 0);
-    try std.testing.expect(a.link_preview.font.? != font);
+    try std.testing.expect(a.overlays.font.? != font);
     try expectPreviewAt(moved, a, .left);
 
     // The title bar's theme: drawn again in its colours, each way.
@@ -11961,12 +11942,12 @@ test "win32: a link preview goes with its terminal, shown or not" {
 
     // Closing while it shows.
     try std.testing.expect(try testLink(&app, a, "https://example.com/a"));
-    const ha = a.link_preview.hwnd.?;
+    const ha = a.overlays.link_preview.hwnd.?;
     try std.testing.expect(shown(ha));
     try std.testing.expect(a.destroy());
     try std.testing.expect(!win32.IsWindow(ha).toBool());
     // And one that never showed.
-    const hb = b.link_preview.hwnd.?;
+    const hb = b.overlays.link_preview.hwnd.?;
     try std.testing.expect(b.destroy());
     try std.testing.expect(!win32.IsWindow(hb).toBool());
 
@@ -11974,16 +11955,16 @@ test "win32: a link preview goes with its terminal, shown or not" {
     // first; d raised above its own.
     try std.testing.expect(try testLink(&app, c, "https://example.com/c"));
     try std.testing.expect(try testLink(&app, d, "https://example.com/d"));
-    const hc = c.link_preview.hwnd.?;
-    const hd = d.link_preview.hwnd.?;
+    const hc = c.overlays.link_preview.hwnd.?;
+    const hd = d.overlays.link_preview.hwnd.?;
     _ = win32.SetWindowPos(d.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
     try std.testing.expect(above(window.hwnd, d.hwnd, hd));
     try std.testing.expect(above(window.hwnd, hc, c.hwnd));
-    LinkPreview.test_detached = 0;
+    Overlays.test_detached = 0;
     try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
     try std.testing.expect(!win32.IsWindow(hc).toBool());
     try std.testing.expect(!win32.IsWindow(hd).toBool());
     try std.testing.expectEqual(0, app.windows.items.len);
     try std.testing.expectEqual(0, app.surfaces.items.len);
-    try std.testing.expect(LinkPreview.test_detached > 0);
+    try std.testing.expect(Overlays.test_detached > 0);
 }

@@ -226,6 +226,7 @@ test {
     _ = @import("windows/App.zig");
     _ = @import("windows/CommandPalette.zig");
     _ = @import("windows/LinkPreview.zig");
+    _ = @import("windows/Overlays.zig");
     _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");

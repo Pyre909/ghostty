@@ -34,7 +34,7 @@ const Surface = @import("Surface.zig").Surface;
 pub const Tab = @import("Tab.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
-const LinkPreview = @import("LinkPreview.zig");
+const Overlays = @import("Overlays.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
@@ -294,9 +294,9 @@ fn hideTab(t: *Tab) void {
     while (it.next()) |entry| {
         _ = win32.ShowWindow(entry.view.hwnd, win32.SW_HIDE);
         // Its search bar with it; it stays open for when the tab shows.
-        // So does its link preview's URL.
+        // So does what its overlays show.
         entry.view.search_bar.hideWindow();
-        entry.view.link_preview.hideWindow();
+        entry.view.overlays.hideWindows();
         entry.view.occlusionChanged(false);
     }
 }
@@ -987,16 +987,16 @@ fn handleMessage(
             if (wparam == win32.SPI_SETNONCLIENTMETRICS) {
                 self.bar.freeFont();
                 self.bar.invalidate();
-                // And the search bars' and link previews', made again as
-                // they are placed.
+                // And the search bars' and overlays', made again as they
+                // are placed.
                 for (self.tabs.items) |t| {
                     var it = t.tree.iterator();
                     while (it.next()) |entry| {
                         entry.view.search_bar.fontChanged();
-                        entry.view.link_preview.fontChanged();
+                        entry.view.overlays.fontChanged();
                     }
                 }
-                self.placeLinkPreviews();
+                self.placeOverlays();
                 self.placeSearchBars();
                 // And the command palette's.
                 CommandPalette.fontChanged(self);
@@ -1761,14 +1761,14 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
 }
 
 /// Lay the terminals out over the client area (`layout`), then place their
-/// link previews and search bars over them. Not while the window is
-/// minimized and its client area is empty (see WM_SIZE).
+/// overlays and search bars over them. Not while the window is minimized
+/// and its client area is empty (see WM_SIZE).
 pub fn relayout(self: *Window) void {
     if (self.tab().tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
     self.placeBar();
     const client = self.layoutArea() orelse return;
     self.placeTerminals(client);
-    self.placeLinkPreviews();
+    self.placeOverlays();
     self.placeSearchBars();
     // Above them all, or closed if it no longer fits.
     _ = CommandPalette.place(self);
@@ -1783,12 +1783,12 @@ pub fn placeSearchBars(self: *Window) void {
     while (it.next()) |entry| SearchBar.place(entry.view);
 }
 
-/// Place each link preview of the shown tab's terminals where its terminal
-/// is now, just above it, or hide it (`LinkPreview.place`), as
+/// Place the overlays of each of the shown tab's terminals where the
+/// terminal is now, just above it, or hide them (`Overlays.place`), as
 /// `placeSearchBars` places their search bars.
-pub fn placeLinkPreviews(self: *Window) void {
+pub fn placeOverlays(self: *Window) void {
     var it = self.tab().tree.iterator();
-    while (it.next()) |entry| LinkPreview.place(entry.view);
+    while (it.next()) |entry| Overlays.place(entry.view);
 }
 
 /// The window that gets the keyboard focus for `surface`: the field of its
@@ -2088,7 +2088,7 @@ pub fn applyTheme(self: *Window) void {
         var it = t.tree.iterator();
         while (it.next()) |entry| {
             entry.view.search_bar.invalidate();
-            entry.view.link_preview.invalidate();
+            entry.view.overlays.invalidate();
         }
     }
     CommandPalette.invalidate(self);
