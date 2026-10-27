@@ -3,10 +3,10 @@
 //! list it: the configuration's `command-palette-entry` commands whose
 //! action this runtime performs (`supported`), and one entry per terminal
 //! that focuses it, "Focus: <title>"; sorted by title as both sort them
-//! (`lessThan`); filtered by a case-insensitive substring of the title or
-//! the action, the entries whose title matches first (`filter`); each with
-//! the shortcut its action is bound to, in Windows' key names
-//! (`shortcutLabel`).
+//! (`lessThan`); filtered by a substring of the title or the action,
+//! ignoring case as Unicode folds it, the entries whose title matches
+//! first (`filter`); each with the shortcut its action is bound to, in
+//! Windows' key names (`shortcutLabel`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,6 +16,7 @@ const Surface = @import("Surface.zig").Surface;
 const App = @import("App.zig").App;
 
 const Binding = input.Binding;
+const uucode = @import("uucode");
 
 /// Whether this runtime carries out `key`, and so lists a command with
 /// it. An exhaustive switch, as `actionCommands` in src/input/command.zig
@@ -148,9 +149,15 @@ pub const Entry = struct {
     /// What choosing it does.
     run: Run,
     /// A jump's order among jumps of the same title: its terminal's place
-    /// in the app's list, the order they were made in, as GTK orders
-    /// them by the core's surface id.
+    /// in `App.surfaces`, which is not the order they were made in once a
+    /// terminal has closed (the last one takes its place). GTK's and
+    /// macOS's orders among such jumps are arbitrary too: GTK's sorts by
+    /// the core's surface id, a random number, macOS by object identity.
     sort_key: usize = 0,
+    /// `title` and `action_key` case-folded (`fold`), as the filter
+    /// compares them; made once, by `build`.
+    folded_title: []const u8 = "",
+    folded_key: []const u8 = "",
 
     pub const Run = union(enum) {
         /// Perform this binding action on the palette's terminal.
@@ -209,23 +216,23 @@ pub fn build(
             var w: std.Io.Writer.Allocating = .init(a);
             if (shortcutLabel(&w.writer, trigger) catch return error.OutOfMemory) shortcut = w.written();
         }
-        list.appendAssumeCapacity(.{
+        list.appendAssumeCapacity(try withFolded(a, .{
             .title = cloned.title,
             .action_key = try a.print("{f}", .{cloned.action}),
             .description = cloned.description,
             .shortcut = shortcut,
             .run = .{ .action = cloned.action },
-        });
+        }));
     }
     for (jumps, 0..) |jump, i| {
         const shown = jump.title orelse "Untitled";
         const pwd = jump.pwd orelse "";
-        list.appendAssumeCapacity(.{
+        list.appendAssumeCapacity(try withFolded(a, .{
             .title = try a.print("Focus: {s}", .{shown}),
             .description = if (pwd.len > 0 and std.mem.indexOf(u8, shown, pwd) == null) try a.dupe(u8, pwd) else "",
             .run = .{ .jump = jump.surface },
             .sort_key = i,
-        });
+        }));
     }
     // Stable, as GTK's sort is.
     std.mem.sort(Entry, list.items, {}, lessThan);
@@ -277,28 +284,65 @@ pub const Match = enum {
     title,
 };
 
-/// Whether `entry` matches `query`: a substring of its title, else of its
-/// action key, ignoring ASCII case, as GTK's palette filters on either
-/// (its StringFilters on `title` and `action-key`). An empty query
-/// matches every title.
-pub fn match(entry: *const Entry, query: []const u8) Match {
-    if (containsIgnoreCase(entry.title, query)) return .title;
-    if (entry.action_key.len > 0 and containsIgnoreCase(entry.action_key, query)) return .action_key;
+/// Whether `entry` matches `folded`, a query already case-folded
+/// (`fold`): a substring of its title, else of its action key, both
+/// folded, as GTK's palette filters on either (its StringFilters on
+/// `title` and `action-key`, which ignore case). An empty query matches
+/// every title.
+pub fn match(entry: *const Entry, folded: []const u8) Match {
+    if (std.mem.indexOf(u8, entry.folded_title, folded) != null) return .title;
+    if (entry.action_key.len > 0 and std.mem.indexOf(u8, entry.folded_key, folded) != null) return .action_key;
     return .none;
 }
 
-fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (needle.len > haystack.len) return false;
-    for (0..haystack.len - needle.len + 1) |i| {
-        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+/// `text` case-folded, as GTK's StringFilter folds both the query and
+/// the text with `g_utf8_casefold`: each code point by Unicode's full
+/// case folding (uucode's `case_folding_full`, as `Binding.Trigger`
+/// folds a key), so that "Ü" matches "ü", "Σ" matches "σ" and "SS"
+/// matches "ß". A byte that is not UTF-8 is kept as it is. In memory of
+/// `alloc`.
+pub fn fold(alloc: Allocator, text: []const u8) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = try .initCapacity(alloc, text.len);
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < text.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        const cp: ?u21 = if (len > 0 and i + len <= text.len)
+            std.unicode.utf8Decode(text[i..][0..len]) catch null
+        else
+            null;
+        const c = cp orelse {
+            try out.append(alloc, text[i]);
+            i += 1;
+            continue;
+        };
+        i += len;
+        if (c < 0x80) {
+            try out.append(alloc, std.ascii.toLower(@intCast(c)));
+            continue;
+        }
+        var single: [1]u21 = undefined;
+        for (uucode.get(.case_folding_full, c).with(&single, c)) |f| {
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(f, &buf) catch continue;
+            try out.appendSlice(alloc, buf[0..n]);
+        }
     }
-    return false;
+    return out.toOwnedSlice(alloc);
+}
+
+/// `entry` with its title and action key folded (`fold`) for the filter.
+fn withFolded(a: Allocator, entry: Entry) Allocator.Error!Entry {
+    var e = entry;
+    e.folded_title = try fold(a, entry.title);
+    e.folded_key = try fold(a, entry.action_key);
+    return e;
 }
 
 /// The indices into `entries` of those that match `query`, into `out`
 /// (cleared first): those whose title matches, then those whose action
 /// key alone does, as macOS ranks a title match over the rest; each kind
-/// in the entries' order.
+/// in the entries' order. The query is folded here, once (`match`).
 pub fn filter(
     alloc: Allocator,
     entries: []const Entry,
@@ -307,11 +351,13 @@ pub fn filter(
 ) Allocator.Error!void {
     out.clearRetainingCapacity();
     try out.ensureTotalCapacity(alloc, entries.len);
+    const folded = try fold(alloc, query);
+    defer alloc.free(folded);
     for (entries, 0..) |*entry, i| {
-        if (match(entry, query) == .title) out.appendAssumeCapacity(@intCast(i));
+        if (match(entry, folded) == .title) out.appendAssumeCapacity(@intCast(i));
     }
     for (entries, 0..) |*entry, i| {
-        if (match(entry, query) == .action_key) out.appendAssumeCapacity(@intCast(i));
+        if (match(entry, folded) == .action_key) out.appendAssumeCapacity(@intCast(i));
     }
 }
 
@@ -468,6 +514,9 @@ pub const Palette = struct {
     pressed: ?usize = null,
     /// While a wheel message is being forwarded to the list (`wndProc`).
     wheeling: bool = false,
+    /// Whether the list has the dark theme class, null before it has had
+    /// either (`applyListTheme`).
+    list_dark: ?bool = null,
     /// The system's message font at `font_dpi`, and the height of a line
     /// of it, as the search bar's (`applyFont`).
     font: ?win32.HGDIOBJ = null,
@@ -603,8 +652,11 @@ pub fn open(surface: *Surface) bool {
         return false;
     };
     // From here its WM_DESTROY frees all of it. It is for the window's
-    // focused terminal, as GTK's runs on its window's active surface, which
-    // is the one that asked unless an `all:` binding asked from every one.
+    // focused terminal, as GTK's runs on its window's active surface. An
+    // `all:` binding asks from every terminal, and each request toggles
+    // its window's palette, as each surface's toggles GTK's: a window's
+    // palette is left open only when it has an odd number of terminals,
+    // counting those in hidden tabs.
     p.hwnd = hwnd;
     p.entries = entries;
     p.surface = window.tab().focused orelse surface;
@@ -648,6 +700,7 @@ pub fn open(surface: *Surface) bool {
     const old_list = win32.SetWindowLongPtrW(list, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&listProc)));
     if (list_proc == null) list_proc = @ptrFromInt(@as(usize, @bitCast(old_list)));
     if (p.font) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
+    applyListTheme(window);
     refill(window, "");
     p.open = true;
     if (!place(window)) return false;
@@ -681,12 +734,16 @@ pub fn close(window: *Window) void {
 /// would reach the terminal that took the focus, which never saw it
 /// pressed, and a program that asked for key releases would see one
 /// alone, so the terminal withholds it, as after a title prompt
-/// (`TitleDialog.closedByKey`).
-fn closedByKey(window: *Window, lparam: win32.LPARAM) void {
-    const surface = window.tab().focused orelse return;
-    if (Window.focusTarget(surface) != surface.hwnd) return;
-    if (Window.keyboardFocus() != surface.hwnd) return;
-    surface.withholdKeyUp(lparam);
+/// (`TitleDialog.closedByKey`). Whichever terminal holds the keyboard
+/// focus now, in any window: Enter on a jump to another window's terminal
+/// leaves the focus there.
+fn closedByKey(app: *App, lparam: win32.LPARAM) void {
+    const focus = Window.keyboardFocus() orelse return;
+    for (app.surfaces.items) |surface| {
+        if (surface.hwnd != focus) continue;
+        surface.withholdKeyUp(lparam);
+        return;
+    }
 }
 
 /// `window` was deactivated (its WM_ACTIVATE): its palette closes, as GTK's
@@ -719,17 +776,53 @@ pub fn forget(app: *App, surface: *Surface) void {
 }
 
 /// List `window`'s palette's entries again, without `gone`, keeping the
-/// query.
+/// query and the selected entry, which the user may have moved to before
+/// pressing Enter: its new row is selected (`sameEntry`), with the list
+/// scrolled as it was if that row is still in view; the first row, as
+/// when the query changes, if it was `gone`'s jump.
 fn relist(window: *Window, gone: *const Surface) void {
     const p = &window.palette;
+    const list = p.list orelse return;
     const fresh = forApp(window.app, gone) catch |err| {
         // Its jump would focus a freed terminal: no palette rather than that.
         log.warn("cannot list the command palette's entries again err={}", .{err});
         return close(window);
     };
-    if (p.entries) |*old| old.deinit();
+    // The old entries are freed only once the selected one is found again.
+    var old = p.entries;
+    defer if (old) |*o| o.deinit();
+    const selected: ?Entry = selected: {
+        const entries = old orelse break :selected null;
+        const cur = win32.SendMessageW(list, win32.LB_GETCURSEL, 0, 0);
+        if (cur < 0) break :selected null;
+        const data = win32.SendMessageW(list, win32.LB_GETITEMDATA, @intCast(cur), 0);
+        if (data < 0 or @as(usize, @intCast(data)) >= entries.items.len) break :selected null;
+        break :selected entries.items[@intCast(data)];
+    };
+    const top = win32.SendMessageW(list, win32.LB_GETTOPINDEX, 0, 0);
     p.entries = fresh;
     textChanged(window);
+    const was = selected orelse return;
+    for (p.shown.items, 0..) |index, row| {
+        if (!sameEntry(&fresh.items[index], &was)) continue;
+        // Back to the top it had, then the row selected, which scrolls the
+        // list only if the row is out of view from there.
+        if (top > 0) _ = win32.SendMessageW(list, win32.LB_SETTOPINDEX, @intCast(top), 0);
+        _ = win32.SendMessageW(list, win32.LB_SETCURSEL, row, 0);
+        return;
+    }
+}
+
+/// Whether `a` and `b`, from two listings of the palette's entries, are
+/// the same entry: jumps to the same terminal, or commands of the same
+/// title and action (two commands alike in both are one to the user).
+pub fn sameEntry(a: *const Entry, b: *const Entry) bool {
+    return switch (a.run) {
+        .jump => |s| b.run == .jump and b.run.jump == s,
+        .action => b.run == .action and
+            std.mem.eql(u8, a.title, b.title) and
+            std.mem.eql(u8, a.action_key, b.action_key),
+    };
 }
 
 /// `surface` took the focus in its window's shown tab
@@ -748,9 +841,29 @@ pub fn focusMoved(window: *Window, surface: *Surface) void {
 /// Draw the palette again, as the theme changed.
 pub fn invalidate(window: *Window) void {
     const p = &window.palette;
+    applyListTheme(window);
     if (p.hwnd) |h| _ = win32.InvalidateRect(h, null, .TRUE);
     if (p.edit) |h| _ = win32.InvalidateRect(h, null, .TRUE);
     if (p.list) |h| _ = win32.InvalidateRect(h, null, .TRUE);
+}
+
+/// The list's scrollbar in the frame's mode. The list is a system LISTBOX:
+/// WM_CTLCOLORLISTBOX colours its rows' background, but Windows draws its
+/// scrollbar with the window's visual style, light by default, a white
+/// track beside the dark rows. So in a dark frame the list takes the
+/// "DarkMode_Explorer" theme class, which gives it the dark scrollbar, as
+/// Explorer, Notepad++ and Windows Terminal give their controls; and
+/// "Explorer" back in a light frame. The class name is not documented: a
+/// Windows without it keeps the light scrollbar. Only when the mode
+/// changes, as each call sends the list WM_THEMECHANGED.
+fn applyListTheme(window: *Window) void {
+    const p = &window.palette;
+    const list = p.list orelse return;
+    if (p.list_dark) |dark| if (dark == window.dark_frame) return;
+    p.list_dark = window.dark_frame;
+    const class = if (window.dark_frame) L("DarkMode_Explorer") else L("Explorer");
+    const hr = win32.SetWindowTheme(list, class, null);
+    if (hr < 0) log.info("cannot set the command palette list's theme hr=0x{x}", .{@as(u32, @bitCast(hr))});
 }
 
 /// The system's message font changed: made again and placed.
@@ -1088,14 +1201,16 @@ fn editProc(
         .pass => {},
         .swallow => return 0,
         // Nothing of the field is touched after either: it is destroyed.
+        // The release is withheld wherever the focus went, a jump's
+        // terminal in another window included.
         .next, .previous => {
             runSelected(window);
-            closedByKey(window, lparam);
+            closedByKey(window.app, lparam);
             return 0;
         },
         .close => {
             close(window);
-            closedByKey(window, lparam);
+            closedByKey(window.app, lparam);
             return 0;
         },
         .delete_word => {
@@ -1565,15 +1680,24 @@ fn testFiltered(buf: []u8, entries: []const Entry, query: []const u8) ![]const u
     return w.buffered();
 }
 
+/// For tests: `entries` folded for the filter (`withFolded`), in `arena`.
+fn testFolded(arena: Allocator, comptime entries: []const Entry) ![entries.len]Entry {
+    var out: [entries.len]Entry = undefined;
+    for (entries, &out) |e, *o| o.* = try withFolded(arena, e);
+    return out;
+}
+
 test "win32: the palette filters on title and action, title matches first" {
-    const entries = [_]Entry{
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const entries = try testFolded(arena.allocator(), &.{
         .{ .title = "Previous", .action_key = "previous_tab", .run = .{ .action = .ignore } },
         .{ .title = "Close Tab", .action_key = "close_tab:this", .run = .{ .action = .ignore } },
         .{ .title = "New Split", .action_key = "new_split:right", .run = .{ .action = .ignore } },
         .{ .title = "Split Zoom", .action_key = "toggle_split_zoom", .run = .{ .action = .ignore } },
         .{ .title = "Focus: tab", .description = "C:\\split", .run = .{ .jump = @ptrFromInt(0x10000) } },
         .{ .title = "Next", .action_key = "next_tab", .run = .{ .action = .ignore } },
-    };
+    });
     var buf: [256]u8 = undefined;
     // Empty: everything, in order.
     try testing.expectEqualStrings("Previous|Close Tab|New Split|Split Zoom|Focus: tab|Next", try testFiltered(&buf, &entries, ""));
@@ -1591,16 +1715,74 @@ test "win32: the palette filters on title and action, title matches first" {
     try testing.expectEqual(Match.none, match(&entries[4], "split"));
 }
 
+test "win32: two listings' entries are the same entry by jump target, or title and action" {
+    const one: *Surface = @ptrFromInt(0x10000);
+    const two: *Surface = @ptrFromInt(0x20000);
+    const jump: Entry = .{ .title = "Focus: a", .run = .{ .jump = one } };
+    // A jump by its terminal, whatever its title now.
+    try testing.expect(sameEntry(&jump, &.{ .title = "Focus: b", .run = .{ .jump = one } }));
+    try testing.expect(!sameEntry(&jump, &.{ .title = "Focus: a", .run = .{ .jump = two } }));
+    try testing.expect(!sameEntry(&jump, &.{ .title = "Focus: a", .action_key = "ignore", .run = .{ .action = .ignore } }));
+    // A command by its title and its action.
+    const command: Entry = .{ .title = "Split Right", .action_key = "new_split:right", .run = .{ .action = .{ .new_split = .right } } };
+    try testing.expect(sameEntry(&command, &.{ .title = "Split Right", .action_key = "new_split:right", .run = .{ .action = .{ .new_split = .right } } }));
+    try testing.expect(!sameEntry(&command, &.{ .title = "Split", .action_key = "new_split:right", .run = .{ .action = .{ .new_split = .right } } }));
+    try testing.expect(!sameEntry(&command, &.{ .title = "Split Right", .action_key = "new_split:left", .run = .{ .action = .{ .new_split = .left } } }));
+    try testing.expect(!sameEntry(&command, &.{ .title = "Split Right", .run = .{ .jump = one } }));
+}
+
+test "win32: the palette's filter ignores case beyond ASCII, as GTK's folds it" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Unicode's full folding: one code point to its folded form, or to
+    // several ("ß" is "ss"); ASCII to lower case; what is not UTF-8 kept.
+    try testing.expectEqualStrings("focus: überblick", try fold(a, "Focus: ÜBERBLICK"));
+    try testing.expectEqualStrings("σύνοψη", try fold(a, "ΣΎΝΟΨΗ"));
+    try testing.expectEqualStrings("обзор", try fold(a, "ОБЗОР"));
+    try testing.expectEqualStrings("strasse", try fold(a, "Straße"));
+    try testing.expectEqualStrings("strasse", try fold(a, "STRASSE"));
+    try testing.expectEqualStrings("a\xffb\xc3", try fold(a, "A\xffB\xc3"));
+    try testing.expectEqualStrings("", try fold(a, ""));
+
+    const entries = try testFolded(a, &.{
+        .{ .title = "Focus: Überblick", .run = .{ .jump = @ptrFromInt(0x10000) } },
+        .{ .title = "Focus: σύνοψη", .run = .{ .jump = @ptrFromInt(0x20000) } },
+        .{ .title = "Focus: ОБЗОР", .run = .{ .jump = @ptrFromInt(0x30000) } },
+        .{ .title = "Focus: Straße", .run = .{ .jump = @ptrFromInt(0x40000) } },
+        .{ .title = "Focus: STRASSE 2", .run = .{ .jump = @ptrFromInt(0x50000) } },
+        .{ .title = "Ändern", .action_key = "prompt_tab_title", .run = .{ .action = .ignore } },
+    });
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("Focus: Überblick", try testFiltered(&buf, &entries, "focus: überblick"));
+    try testing.expectEqualStrings("Focus: Überblick", try testFiltered(&buf, &entries, "ÜBER"));
+    try testing.expectEqualStrings("Focus: σύνοψη", try testFiltered(&buf, &entries, "ΣΎΝΟ"));
+    try testing.expectEqualStrings("Focus: ОБЗОР", try testFiltered(&buf, &entries, "обзор"));
+    // "ß" and "SS" find each other.
+    try testing.expectEqualStrings("Focus: Straße|Focus: STRASSE 2", try testFiltered(&buf, &entries, "straße"));
+    try testing.expectEqualStrings("Focus: Straße|Focus: STRASSE 2", try testFiltered(&buf, &entries, "STRASSE"));
+    // Title matches still first, then the action key's.
+    try testing.expectEqualStrings("Ändern", try testFiltered(&buf, &entries, "äNDERN"));
+    try testing.expectEqualStrings("Ändern", try testFiltered(&buf, &entries, "TAB_TITLE"));
+}
+
 test "win32: the palette's filter narrows as the query grows, and keeps the order" {
-    // Metamorphic, over the default commands and their shortcuts and every
-    // prefix of queries made from their own titles and action keys:
-    // extending a query never adds an entry; within the title matches and
-    // within the rest the entries' order is kept; and each result is
-    // exactly the entries that match.
+    // Metamorphic, over the default commands and their shortcuts, jumps
+    // titled in scripts with case beyond ASCII, and every prefix (whole
+    // code points) of queries made from their own titles and action keys,
+    // in a random case: extending a query never adds an entry; within the
+    // title matches and within the rest the entries' order is kept; and
+    // each result is exactly the entries that match.
     const alloc = testing.allocator;
     var config: Config = try .default(alloc);
     defer config.deinit();
-    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &.{});
+    const jumps = [_]Jump{
+        .{ .surface = @ptrFromInt(0x10000), .title = "Überblick" },
+        .{ .surface = @ptrFromInt(0x20000), .title = "σύνοψη ΣΎΝΟΨΗ" },
+        .{ .surface = @ptrFromInt(0x30000), .title = "Обзор" },
+        .{ .surface = @ptrFromInt(0x40000), .title = "Straße" },
+    };
+    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &jumps);
     defer entries.deinit();
     const items = entries.items;
 
@@ -1611,43 +1793,86 @@ test "win32: the palette's filter narrows as the query grows, and keeps the orde
     var seed: std.Random.DefaultPrng = .init(0x9a1e77e);
     const rand = seed.random();
     var checked: usize = 0;
-    for (0..200) |_| {
-        // Part of an entry's title or action key, in a random case.
-        const from = items[rand.uintLessThan(usize, items.len)];
-        const source = if (rand.boolean()) from.title else from.action_key;
-        const start = rand.uintLessThan(usize, source.len);
-        var query_buf: [64]u8 = undefined;
-        const len = @min(source.len - start, query_buf.len);
-        for (source[start..][0..len], 0..) |c, i| {
-            query_buf[i] = if (rand.boolean()) std.ascii.toUpper(c) else std.ascii.toLower(c);
+    // Upper and lower case of the letters beyond ASCII the jumps use.
+    const cases = [_][2][]const u8{
+        .{ "ü", "Ü" },
+        .{ "σ", "Σ" },
+        .{ "ύ", "Ύ" },
+        .{ "ν", "Ν" },
+        .{ "ο", "Ο" },
+        .{ "ψ", "Ψ" },
+        .{ "η", "Η" },
+        .{ "о", "О" },
+        .{ "б", "Б" },
+        .{ "з", "З" },
+        .{ "р", "Р" },
+        .{ "ß", "SS" },
+    };
+    var wide_queries: usize = 0;
+    for (0..300) |round| {
+        // Part of an entry's title or action key, from a code point on,
+        // each letter in a random case; every fourth from a jump.
+        const index: usize = if (round % 4 != 0)
+            rand.uintLessThan(usize, items.len)
+        else for (items, 0..) |e, k| {
+            if (e.run == .jump and e.sort_key == round / 4 % jumps.len) break k;
+        } else unreachable;
+        const from = items[index];
+        const source = if (from.action_key.len == 0 or rand.boolean()) from.title else from.action_key;
+        var start = rand.uintLessThan(usize, source.len);
+        while (start > 0 and source[start] & 0xC0 == 0x80) start -= 1;
+        var query_buf: [96]u8 = undefined;
+        var len: usize = 0;
+        var at = start;
+        var wide = false;
+        while (at < source.len) {
+            const n = std.unicode.utf8ByteSequenceLength(source[at]) catch unreachable;
+            const ch = source[at..][0..n];
+            at += n;
+            var one: [1]u8 = .{if (rand.boolean()) std.ascii.toUpper(ch[0]) else std.ascii.toLower(ch[0])};
+            const piece: []const u8 = if (n == 1) &one else for (cases) |c| {
+                if (std.mem.eql(u8, ch, c[0]) or std.mem.eql(u8, ch, c[1])) break c[rand.uintLessThan(usize, 2)];
+            } else ch;
+            if (len + piece.len > 64) break;
+            if (n > 1) wide = true;
+            @memcpy(query_buf[len..][0..piece.len], piece);
+            len += piece.len;
         }
+        if (wide) wide_queries += 1;
         try filter(alloc, items, "", &prev);
         for (0..len + 1) |n| {
+            // Whole code points only.
+            if (n < len and query_buf[n] & 0xC0 == 0x80) continue;
             const query = query_buf[0..n];
+            const folded = try fold(alloc, query);
+            defer alloc.free(folded);
             try filter(alloc, items, query, &next);
             // Narrower: everything in `next` was in `prev`.
             for (next.items) |i| try testing.expect(std.mem.indexOfScalar(u32, prev.items, i) != null);
             // Exactly the matches, title matches first, each kind in order.
             var count: usize = 0;
             for (items) |*e| {
-                if (match(e, query) != .none) count += 1;
+                if (match(e, folded) != .none) count += 1;
             }
             try testing.expectEqual(count, next.items.len);
             var past_titles = false;
             for (next.items, 0..) |i, k| {
-                const m = match(&items[i], query);
+                const m = match(&items[i], folded);
                 try testing.expect(m != .none);
                 if (m == .action_key) past_titles = true;
                 if (past_titles) try testing.expectEqual(Match.action_key, m);
-                if (k > 0 and match(&items[next.items[k - 1]], query) == m) {
+                if (k > 0 and match(&items[next.items[k - 1]], folded) == m) {
                     try testing.expect(next.items[k - 1] < i);
                 }
             }
+            // The entry the query was made from is among them, whatever
+            // the case of each letter.
+            try testing.expect(std.mem.indexOfScalar(u32, next.items, @intCast(index)) != null);
             std.mem.swap(std.ArrayList(u32), &prev, &next);
             checked += 1;
         }
-        // The query it was made from finds its entry.
-        try testing.expect(prev.items.len > 0);
     }
-    try testing.expect(checked > 200);
+    try testing.expect(checked > 300);
+    // Enough of them reach beyond ASCII.
+    try testing.expect(wide_queries > 30);
 }

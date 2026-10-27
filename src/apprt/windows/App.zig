@@ -10334,9 +10334,14 @@ test "win32: a search bar hides once the focus has left it, and opens only where
 
 test "win32: the command palette lists only what performAction carries out" {
     // `CommandPalette.supported` against `performAction` for the binding
-    // actions the core hands to this runtime, where a test can perform
-    // what they become without a core: each listed one is performed (or
-    // recorded for `run`), and each left out is refused.
+    // actions the core hands to this runtime (its arms in
+    // CoreSurface.performBindingAction and CoreApp.performAction), each
+    // with the target the core gives it: each listed one is performed (or
+    // recorded for `run`), and each left out is refused. In the order
+    // below the tab moves are queued behind the new tab, and the closes
+    // and tab moves behind the move to a new window, so that none of them
+    // closes or moves anything here. Not `open_config`, which starts a
+    // program (the VM scenario runs it).
     @setEvalBranchQuota(100_000);
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
@@ -10348,10 +10353,20 @@ test "win32: the command palette lists only what performAction carries out" {
     defer testCleanup(&app);
 
     const window = try testFrame(&app);
+    testResize(window, 1000, 700);
     const a = try testPane(&app, window);
     window.tab().tree = try .init(alloc, a);
     window.tab().focused = a;
+    window.relayout();
+    // A second window, for goto_window.
+    const other = try testFrame(&app);
+    const d = try testPane(&app, other);
+    other.tab().tree = try .init(alloc, d);
+    other.tab().focused = d;
     const target: apprt.Target = .{ .surface = &a.core_surface };
+    // The size the core gives every terminal as it is made, which
+    // reset_window_size goes back to.
+    try std.testing.expect(try app.performAction(target, .initial_size, .{ .width = 800, .height = 600 }));
 
     const Case = struct { input.Binding.Action.Key, apprt.Action.Key };
     const cases = [_]Case{
@@ -10384,6 +10399,28 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .toggle_maximize, .toggle_maximize },
         .{ .toggle_window_decorations, .toggle_window_decorations },
         .{ .toggle_window_float_on_top, .float_window },
+        // Behind the queued new tab and move.
+        .{ .close_tab, .close_tab },
+        .{ .close_window, .close_window },
+        .{ .previous_tab, .goto_tab },
+        .{ .next_tab, .goto_tab },
+        .{ .last_tab, .goto_tab },
+        .{ .move_tab, .move_tab },
+        // Behind the queued split.
+        .{ .goto_split, .goto_split },
+        .{ .resize_split, .resize_split },
+        .{ .goto_window, .goto_window },
+        .{ .set_tab_title, .set_tab_title },
+        .{ .set_surface_title, .set_title },
+        .{ .copy_title_to_clipboard, .copy_title_to_clipboard },
+        .{ .start_search, .start_search },
+        .{ .search_selection, .start_search },
+        .{ .end_search, .end_search },
+        .{ .reset_window_size, .reset_window_size },
+        .{ .toggle_command_palette, .toggle_command_palette },
+        // The app's.
+        .{ .reload_config, .reload_config },
+        .{ .quit, .quit },
     };
     var listed: usize = 0;
     inline for (cases) |case| {
@@ -10391,22 +10428,42 @@ test "win32: the command palette lists only what performAction carries out" {
             .prompt_window_title => .window,
             .prompt_tab_title => .tab,
             .prompt_surface_title => .surface,
-            .set_window_title => .{ .title = "t" },
+            .set_window_title, .set_tab_title, .set_surface_title => .{ .title = "t" },
             .inspector => .toggle,
             .toggle_secure_input, .toggle_window_float_on_top => .toggle,
             .new_split => .right,
-            .goto_tab => .next,
+            .goto_tab, .next_tab => .next,
+            .previous_tab => .previous,
+            .last_tab => .last,
             .toggle_fullscreen => .native,
+            .close_tab => .this,
+            .move_tab => .{ .amount = 1 },
+            .goto_split => .right,
+            .resize_split => .{ .amount = 10, .direction = .right },
+            .goto_window => .next,
+            .start_search => .{ .needle = "" },
+            .search_selection => .{ .needle = "t" },
+            .reload_config => .{},
             else => if (apprt.Action.Value(case[1]) == void) {} else unreachable,
         };
-        const performed = try app.performAction(target, case[1], value);
+        const to: apprt.Target = switch (case[0]) {
+            .reload_config, .quit => .app,
+            else => target,
+        };
+        // Answered before it would ask the core whether to confirm, or
+        // post WM_QUIT to the test's thread.
+        if (case[0] == .quit) app.quit = true;
+        defer if (case[0] == .quit) {
+            app.quit = false;
+        };
+        const performed = try app.performAction(to, case[1], value);
         if (CommandPalette.supported(case[0]) != performed) {
             std.debug.print("{t}: listed={} performed={}\n", .{ case[0], CommandPalette.supported(case[0]), performed });
             return error.TestUnexpectedResult;
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(13, listed);
+    try std.testing.expectEqual(32, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
     _ = try app.performAction(target, .float_window, .off);
@@ -10900,13 +10957,23 @@ test "win32: a jump in the command palette focuses its terminal, in its tab and 
     try std.testing.expect(FocusSeen.last == c.hwnd);
     try std.testing.expect(ForegroundSeen.last == null);
 
-    // In another window: brought forward, and focused.
+    // Its Enter's release withheld from the terminal that took the focus,
+    // which never saw it pressed.
+    try std.testing.expectEqual(1, c.ime.swallow_up.count());
+    c.ime.swallow_up = .empty;
+
+    // In another window: brought forward, and focused; the release is
+    // withheld there, by the terminal that has the focus now, and not by
+    // the one the palette was open for.
     try togglePalette(&app, c);
     try std.testing.expect(p.surface == c);
     paletteQuery(window, L("focus: delta"));
     paletteKey(window, win32.VK_RETURN);
     try std.testing.expect(ForegroundSeen.last == other.hwnd);
     try std.testing.expect(FocusSeen.last == d.hwnd);
+    try std.testing.expectEqual(1, d.ime.swallow_up.count());
+    try std.testing.expectEqual(0, c.ime.swallow_up.count());
+    d.ime.swallow_up = .empty;
 
     // A terminal that begins to close while it is open: listed no more,
     // the query kept.
@@ -11080,6 +11147,155 @@ test "win32: the wheel over the command palette scrolls its list, and a modified
     _ = win32.SendMessageW(edit, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
     try std.testing.expect(top(list) > before);
     try std.testing.expect(!p.wheeling);
+}
+
+test "win32: a terminal closing while the command palette is open leaves its selection where it was" {
+    // Every terminal has a jump, so any one that closes, anywhere, lists
+    // the palette's entries again. The entry the user moved the selection
+    // to stays selected, in its new row, the list scrolled as it was; the
+    // first row is selected if it was the closing terminal's own jump.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const other = try testFrame(&app);
+    const d = try testPane(&app, other);
+    const e = try testPane(&app, other);
+    const f = try testPane(&app, other);
+    other.tab().tree = try testRow(alloc, &.{ d, e, f });
+    other.tab().focused = d;
+    a.title = try alloc.dupeSentinel(u8, "main", 0);
+    b.title = try alloc.dupeSentinel(u8, "notes", 0);
+    d.title = try alloc.dupeSentinel(u8, "logs", 0);
+    e.title = try alloc.dupeSentinel(u8, "kilo", 0);
+    f.title = try alloc.dupeSentinel(u8, "zeta", 0);
+    defer for ([_]*Surface{ d, e, f }) |s| {
+        s.closing = false;
+    };
+    const p = &window.palette;
+    const list_top = struct {
+        fn of(w: *const Window) isize {
+            return win32.SendMessageW(w.palette.list.?, win32.LB_GETTOPINDEX, 0, 0);
+        }
+    }.of;
+
+    // A command further down, the list scrolled to it, the selection then
+    // moved up off the last row shown: the same command, the same top.
+    try togglePalette(&app, a);
+    paletteKey(window, win32.VK_NEXT);
+    paletteKey(window, win32.VK_NEXT);
+    paletteKey(window, win32.VK_DOWN);
+    for (0..3) |_| paletteKey(window, win32.VK_UP);
+    const row = paletteSelected(window);
+    try std.testing.expect(row > CommandPalette.Metrics.init(96).rows);
+    const chosen = paletteEntry(window, @intCast(row)).*;
+    try std.testing.expect(chosen.run == .action);
+    var title_buf: [64]u8 = undefined;
+    const title = try std.mem.print(&title_buf, "{s}", .{chosen.title});
+    var key_buf: [64]u8 = undefined;
+    const key = try std.mem.print(&key_buf, "{s}", .{chosen.action_key});
+    const top = list_top(window);
+    try std.testing.expect(top > 0);
+    d.closing = true;
+    app.forgetClosing(&d.core_surface);
+    try std.testing.expect(p.hwnd != null);
+    const now = paletteEntry(window, @intCast(paletteSelected(window)));
+    try std.testing.expectEqualStrings(title, now.title);
+    try std.testing.expectEqualStrings(key, now.action_key);
+    try std.testing.expectEqual(top, list_top(window));
+
+    // A jump to another terminal, the closing one's jump above it: the
+    // same jump, a row up.
+    paletteQuery(window, L("focus:"));
+    try std.testing.expectEqual(4, paletteRows(window));
+    paletteKey(window, win32.VK_DOWN);
+    paletteKey(window, win32.VK_DOWN);
+    try std.testing.expect(paletteEntry(window, 2).run.jump == b);
+    try std.testing.expectEqual(2, paletteSelected(window));
+    e.closing = true;
+    app.forgetClosing(&e.core_surface);
+    try std.testing.expectEqual(3, paletteRows(window));
+    try std.testing.expectEqual(1, paletteSelected(window));
+    try std.testing.expect(paletteEntry(window, 1).run.jump == b);
+
+    // The closing terminal's own jump: the first row.
+    paletteKey(window, win32.VK_DOWN);
+    try std.testing.expect(paletteEntry(window, 2).run.jump == f);
+    f.closing = true;
+    app.forgetClosing(&f.core_surface);
+    try std.testing.expectEqual(2, paletteRows(window));
+    try std.testing.expectEqual(0, paletteSelected(window));
+    try std.testing.expectEqual(0, list_top(window));
+}
+
+test "win32: a search bar opened while the command palette is open stays under it" {
+    // The palette is above the terminals and their search bars. A bar
+    // opened from the palette's field, Ctrl+Shift+F as `start_search`,
+    // is placed outside a layout: under the palette, not over it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = b;
+    window.relayout();
+    try togglePalette(&app, b);
+    const p = &window.palette;
+    const palette = p.hwnd.?;
+
+    // The core's answer to the binding from the field.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
+    const bar = b.search_bar.hwnd.?;
+    try std.testing.expect(shown(bar));
+    try std.testing.expect(above(window.hwnd, palette, bar));
+    // Over its terminal still.
+    try std.testing.expect(above(window.hwnd, bar, b.hwnd));
+    // The two overlap: the bar at the right terminal's top right, the
+    // palette across the middle.
+    const pr = try childRect(window, palette);
+    const br = try childRect(window, bar);
+    try std.testing.expect(br.left < pr.right and br.right > pr.left and br.top < pr.bottom and br.bottom > pr.top);
+    // The focus move it asks for keeps the keyboard in the palette.
+    app.applyPendingFocus();
+    try std.testing.expect(FocusSeen.last == p.edit.?);
+    try std.testing.expect(above(window.hwnd, palette, bar));
+    // And again from the other terminal, whose bar is made now.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "x" }));
+    try std.testing.expect(above(window.hwnd, palette, a.search_bar.hwnd.?));
+    // Once the palette has closed, a bar placed goes to the top.
+    try togglePalette(&app, b);
+    try std.testing.expect(p.hwnd == null);
+    SearchBar.place(b);
+    try std.testing.expect(above(window.hwnd, bar, a.hwnd));
 }
 
 test "win32: keys in the command palette perform the terminal's bindings for its window, and act on the field" {

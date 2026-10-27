@@ -1198,6 +1198,11 @@ pub const MEASUREITEMSTRUCT = extern struct {
     itemHeight: UINT,
     itemData: usize,
 };
+/// The visual style a control is drawn with: the command palette's list
+/// takes the dark one for its scrollbar in a dark frame
+/// (`CommandPalette.applyListTheme`).
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-setwindowtheme
+pub extern "uxtheme" fn SetWindowTheme(hwnd: HWND, sub_app_name: ?LPCWSTR, sub_id_list: ?LPCWSTR) callconv(.winapi) HRESULT;
 comptime {
     // The SDK's sizes on 64-bit Windows.
     if (@sizeOf(usize) == 8) {

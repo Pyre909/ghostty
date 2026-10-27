@@ -575,9 +575,13 @@ pub fn place(surface: *Surface) void {
     const p = placement(surface) orelse return hide(surface);
     const width = p.at.right - p.at.left;
     const height = p.at.bottom - p.at.top;
+    // Above the terminals, but just under the window's command palette
+    // while that is open: a bar placed outside a layout, as `start` places
+    // one, would otherwise cover the palette, which only a layout raises
+    // (`CommandPalette.place`).
     _ = win32.SetWindowPos(
         hwnd,
-        win32.HWND_TOP,
+        window.palette.hwnd orelse win32.HWND_TOP,
         p.at.left,
         p.at.top,
         width,
