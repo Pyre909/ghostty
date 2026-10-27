@@ -1237,11 +1237,11 @@ pub const App = struct {
         };
     }
 
-    /// `.key_sequence`, from the core's key callback: the terminal's
-    /// key-state indicator adds the key to the pending sequence or clears
-    /// it, as GTK's overlay does (`KeyState.sequence`). `false` for the
-    /// app, and for a terminal whose indicator could not take the key or
-    /// be made.
+    /// `.key_sequence`, from the core's key callback, and its `.end` from
+    /// a configuration change too: the terminal's key-state indicator adds
+    /// the key to the pending sequence or clears it, as GTK's overlay does
+    /// (`KeyState.sequence`). `false` for the app, and for a terminal whose
+    /// indicator could not take the key or be made.
     fn keySequence(target: apprt.Target, value: apprt.action.KeySequence) bool {
         return switch (target) {
             .app => false,
@@ -12138,10 +12138,24 @@ test "win32: key_table and key_sequence show the active tables and pending keys 
     try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
 }
 
-test "win32: the key state makes no window for nothing pending, and keeps the core's eight tables" {
+/// For tests: the most key tables the core keeps active, read from its
+/// source (`max_active_key_tables` in src/Surface.zig), as the constant is
+/// not public; an error if it is not found there.
+fn coreMaxKeyTables() !usize {
+    const source = @embedFile("../../Surface.zig");
+    const decl = "\nconst max_active_key_tables = ";
+    const at = std.mem.indexOf(u8, source, decl) orelse return error.TestUnexpectedResult;
+    const rest = source[at + decl.len ..];
+    const end = std.mem.indexOfScalar(u8, rest, ';') orelse return error.TestUnexpectedResult;
+    return std.fmt.parseInt(usize, rest[0..end], 10);
+}
+
+test "win32: the key state makes no window for nothing pending, and shows as many tables as the core keeps" {
     // The core ends a sequence on almost every bound key, whether one was
     // pending or not, and pops tables that may not be there: none of that
-    // makes a window. It keeps at most eight tables active.
+    // makes a window. It keeps at most `max_active_key_tables` active,
+    // which the indicator keeps a copy of (`KeyState.max_tables`): all of
+    // the core's show, so the core keeping more fails this.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -12163,17 +12177,28 @@ test "win32: the key state makes no window for nothing pending, and keeps the co
     try std.testing.expect(try testKeyTable(&app, a, .deactivate_all));
     try std.testing.expect(a.overlays.key_state.hwnd == null);
 
-    var buf: [256]u8 = undefined;
-    const names = [_][]const u8{ "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8" };
-    for (names) |name| try std.testing.expect(try testKeyTable(&app, a, .{ .activate = name }));
+    // The core's most, t1 to tN: all of them, in order.
+    const n = try coreMaxKeyTables();
+    try std.testing.expect(n > 1);
+    var all: std.Io.Writer.Allocating = .init(alloc);
+    defer all.deinit();
+    var name: [24]u8 = undefined;
+    for (1..n + 1) |i| {
+        const t = try std.fmt.bufPrint(&name, "t{d}", .{i});
+        try std.testing.expect(try testKeyTable(&app, a, .{ .activate = t }));
+        if (i > 1) try all.writer.writeAll(" > ");
+        try all.writer.writeAll(t);
+    }
     try expectKeyStateAt(window, a);
-    const eight = "t1 > t2 > t3 > t4 > t5 > t6 > t7 > t8";
-    try std.testing.expectEqualStrings(eight, try keyStateText(a, &buf));
-    // A ninth, which the core never sends: refused, nothing changed.
-    try std.testing.expect(!try testKeyTable(&app, a, .{ .activate = "t9" }));
-    try std.testing.expectEqualStrings(eight, try keyStateText(a, &buf));
+    var buf: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings(all.written(), try keyStateText(a, &buf));
+    // One more, which the core never sends: refused, nothing changed.
+    try std.testing.expect(!try testKeyTable(&app, a, .{ .activate = "past" }));
+    try std.testing.expectEqualStrings(all.written(), try keyStateText(a, &buf));
+    // The innermost popped: the others.
     try std.testing.expect(try testKeyTable(&app, a, .deactivate));
-    try std.testing.expectEqualStrings("t1 > t2 > t3 > t4 > t5 > t6 > t7", try keyStateText(a, &buf));
+    const last = std.mem.lastIndexOf(u8, all.written(), " > ").?;
+    try std.testing.expectEqualStrings(all.written()[0..last], try keyStateText(a, &buf));
     // Left active: freed with the terminal (the testing allocator).
 }
 
@@ -12287,4 +12312,145 @@ test "win32: the key state shows above the link preview, and hides with its term
     // It goes with its terminal.
     try std.testing.expect(a.destroy());
     try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: the key state moves with its tab to a new window, above its link preview, and follows its scale and font" {
+    // A tab moved to a new window takes its terminals' indicators into
+    // the new frame, shown or not, each still above its link preview and
+    // showing what it did. A change of DPI measures the text again in the
+    // font at the new scale; a change of the system's message font makes
+    // the font again, and the indicator is placed in it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    _ = try testTab(&app, window);
+    window.relayout();
+
+    // a: a table and a key, over a long URL; b: one made, then emptied.
+    var buf: [256]u8 = undefined;
+    const url = "https://example.com/some/long/path/that/goes/on/past/the/middle/of/the/terminal";
+    try std.testing.expect(try testLink(&app, a, url));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try std.testing.expect(try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .unicode = 'a' }, .mods = .{ .ctrl = true } } }));
+    const text = "nav \u{203A} Ctrl+A \u{2026}";
+    try std.testing.expectEqualStrings(text, try keyStateText(a, &buf));
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+    const hwnd = a.overlays.key_state.hwnd.?;
+    try std.testing.expect(try testKeyTable(&app, b, .{ .activate = "x" }));
+    try std.testing.expect(try testKeyTable(&app, b, .deactivate));
+    const hidden = b.overlays.key_state.hwnd.?;
+    try std.testing.expect(!shown(hidden));
+
+    // The tab moved to a new window: both go to its frame, a's in its
+    // place above its preview, with its text.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, app.windows.items.len);
+    const moved = a.window;
+    try std.testing.expect(moved != window);
+    try std.testing.expect(a.overlays.key_state.hwnd.? == hwnd);
+    try expectPreviewAt(moved, a, .left);
+    try expectKeyStateAt(moved, a);
+    try std.testing.expect(above(moved.hwnd, hwnd, a.overlays.link_preview.hwnd.?));
+    try std.testing.expectEqualStrings(text, try keyStateText(a, &buf));
+    try std.testing.expect(b.overlays.key_state.hwnd.? == hidden);
+    try std.testing.expect(win32.GetAncestor(hidden, win32.GA_PARENT) == moved.hwnd);
+    try std.testing.expect(!shown(hidden));
+    // And b's shows there when it has something to show.
+    try std.testing.expect(try testKeyTable(&app, b, .{ .activate = "y" }));
+    try expectKeyStateAt(moved, b);
+    try std.testing.expectEqualStrings("y", try keyStateText(b, &buf));
+
+    // A new scale: the text measured in the font at it.
+    const before = a.overlays.key_state.text_size;
+    try std.testing.expect(a.overlays.font_dpi > 0 and a.overlays.font_dpi < 192);
+    const Dpi = struct {
+        fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 192;
+        }
+    };
+    app.get_dpi_for_window = &Dpi.of;
+    var suggested = try windowRect(moved.hwnd);
+    _ = win32.SendMessageW(moved.hwnd, win32.WM_DPICHANGED, 192 << 16 | 192, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expectEqual(192, a.overlays.font_dpi);
+    try std.testing.expect(a.overlays.key_state.text_size.height > before.height);
+    try std.testing.expect(a.overlays.key_state.text_size.width > before.width);
+    try expectKeyStateAt(moved, a);
+    try expectKeyStateAt(moved, b);
+
+    // The system's message font changed: made again as they are placed,
+    // and they are placed in it.
+    const font = a.overlays.font.?;
+    _ = win32.SendMessageW(moved.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETNONCLIENTMETRICS, 0);
+    try std.testing.expect(a.overlays.font.? != font);
+    try expectKeyStateAt(moved, a);
+}
+
+test "win32: a key state whose window cannot be made returns false, frees its text, and is made at its next change" {
+    // CreateWindowExW fails when the process has used up its window
+    // handles: the action returns false and the text made for the window
+    // is freed (the testing allocator), the tables and keys kept, and the
+    // window is made at the next change, showing them all.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    const NoWindow = struct {
+        var asked: usize = 0;
+        var class: []const u8 = "";
+        fn make(c: []const u8) ?win32.HWND {
+            asked += 1;
+            class = c;
+            return null;
+        }
+    };
+    NoWindow.asked = 0;
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+
+    // A table, then a key: neither shows, each tried again.
+    try std.testing.expect(!try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try std.testing.expect(a.overlays.key_state.hwnd == null);
+    try std.testing.expectEqual(1, NoWindow.asked);
+    try std.testing.expectEqualStrings(KeyState.class_name, NoWindow.class);
+    try std.testing.expect(!try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .unicode = 'k' }, .mods = .{ .ctrl = true } } }));
+    try std.testing.expect(a.overlays.key_state.hwnd == null);
+    try std.testing.expectEqual(2, NoWindow.asked);
+
+    // Windows can be made again: the next change makes it, with all that
+    // was kept.
+    Overlays.test_make = null;
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "resize" }));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav > resize \u{203A} Ctrl+K \u{2026}", try keyStateText(a, &buf));
+    try std.testing.expectEqual(2, NoWindow.asked);
 }

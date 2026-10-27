@@ -50,8 +50,11 @@ const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttyKeyStateClass";
 
-/// The most tables the core keeps active (`max_active_key_tables` in
-/// src/Surface.zig); it activates no more, and says nothing.
+/// The most tables the core keeps active, a copy of its
+/// `max_active_key_tables` (src/Surface.zig:62), which is not public;
+/// it activates no more, and says nothing. A test reads the core's from
+/// its source (`coreMaxKeyTables` in App.zig) and activates that many,
+/// so it fails if the core's grows past this one.
 pub const max_tables = 8;
 
 /// A terminal's indicator (`Overlays.key_state`).

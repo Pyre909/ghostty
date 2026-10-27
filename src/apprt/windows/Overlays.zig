@@ -167,10 +167,18 @@ pub fn create(surface: *Surface) void {
     };
 }
 
+/// For tests: answers in place of CreateWindowExW in `make`, given the
+/// overlay's class, as `Window.test_get_focus` stands for GetFocus, so
+/// that a test sees what an overlay does when its window cannot be made,
+/// as when the process has used up its window handles.
+pub var test_make: if (builtin.is_test) ?*const fn ([]const u8) ?win32.HWND else void =
+    if (builtin.is_test) null else {};
+
 /// A hidden window of the overlay class `class` in `surface`'s frame,
 /// whose procedure finds `surface` from its WM_NCCREATE; null if it cannot
 /// be made.
 pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
+    if (builtin.is_test) if (test_make) |answer| return answer(class);
     return win32.CreateWindowExW(
         0,
         L(class),
@@ -192,8 +200,11 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// each other one just above the one under it in `stack`; or hide those
 /// with nothing to show, and all of them while the terminal is hidden (a
 /// hidden tab, a zoom). Overlays whose terminal moved to another frame
-/// (`Window.moveTabTo`) go there first; one that cannot is destroyed,
-/// logged, and the terminal shows no more of it.
+/// (`Window.moveTabTo`) go there first; one that cannot is destroyed and
+/// logged. The link preview, made only with its terminal, is not made
+/// again, so the terminal shows no more previews; the key-state
+/// indicator is made again at its next change that leaves something to
+/// show (`KeyState.update`).
 ///
 /// The terminals tile their area, and the search bars and the command
 /// palette are placed above all of them (`SearchBar.place`,
