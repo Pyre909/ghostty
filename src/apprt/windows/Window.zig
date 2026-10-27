@@ -35,6 +35,7 @@ pub const Tab = @import("Tab.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
+const CommandPalette = @import("CommandPalette.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -119,6 +120,9 @@ prompt_disabled: bool,
 /// The window's title prompt, open or not (`TitleDialog`), which holds the
 /// frame disabled while it is open.
 title_prompt: TitleDialog.Prompt,
+
+/// The window's command palette, open or not (`CommandPalette`).
+palette: CommandPalette.Palette,
 
 /// The tab the window shows, whose terminals are laid out in its client
 /// area.
@@ -751,6 +755,7 @@ pub fn createBare(app: *App) !*Window {
         .taskbar_button = false,
         .prompt_disabled = false,
         .title_prompt = .{},
+        .palette = .{},
         .closing = false,
         .destroy_deferred = false,
     };
@@ -985,7 +990,16 @@ fn handleMessage(
                     while (it.next()) |entry| entry.view.search_bar.fontChanged();
                 }
                 self.placeSearchBars();
+                // And the command palette's.
+                CommandPalette.fontChanged(self);
             }
+        },
+
+        // Deactivated: an open command palette closes, as GTK's dialog
+        // does, once the deactivation is over (`CommandPalette.deactivated`).
+        // DefWindowProcW below as well.
+        win32.WM_ACTIVATE => if (@as(u16, @truncate(wparam)) == win32.WA_INACTIVE) {
+            CommandPalette.deactivated(self);
         },
 
         // Keyboard focus belongs to a terminal: the frame gets it on
@@ -1328,8 +1342,9 @@ pub fn destroy(self: *Window) bool {
     // The title prompt first, which would otherwise stay on screen until
     // its own terminal's turn, while the cores before it stop and their
     // threads are waited for, or after the frame was hidden
-    // (`destroyPosted`).
+    // (`destroyPosted`). The command palette too.
     TitleDialog.close(self);
+    CommandPalette.close(self);
     search: while (true) {
         for (self.app.surfaces.items) |surface| {
             if (surface.window != self or surface.liveCore() == null) continue;
@@ -1649,6 +1664,8 @@ pub fn setFocused(self: *Window, surface: *Surface) void {
     // Its label is its focused terminal's title, shown or not.
     self.bar.invalidate();
     if (t != self.tab()) return;
+    // An open command palette runs on the terminal with the focus.
+    CommandPalette.focusMoved(self, surface);
     _ = self.showTitle(tabTitle(t));
     self.showProgress();
 }
@@ -1744,6 +1761,8 @@ pub fn relayout(self: *Window) void {
     const client = self.layoutArea() orelse return;
     self.placeTerminals(client);
     self.placeSearchBars();
+    // Above them all, or closed if it no longer fits.
+    _ = CommandPalette.place(self);
 }
 
 /// Place each search bar of the shown tab's terminals where its terminal
@@ -1755,11 +1774,15 @@ pub fn placeSearchBars(self: *Window) void {
     while (it.next()) |entry| SearchBar.place(entry.view);
 }
 
-/// The window that gets the keyboard focus for `surface`: its search
-/// field while the field had it last and shows, else the terminal
-/// (`SearchBar.Bar.focusTarget`).
+/// The window that gets the keyboard focus for `surface`: the field of its
+/// window's command palette while that is open and shows, which holds the
+/// keyboard until it closes (`CommandPalette.Palette.focusTarget`); else
+/// its search field while the field had it last and shows, else the
+/// terminal (`SearchBar.Bar.focusTarget`).
 pub fn focusTarget(surface: *const Surface) win32.HWND {
-    return surface.search_bar.focusTarget() orelse surface.hwnd;
+    return surface.window.palette.focusTarget() orelse
+        surface.search_bar.focusTarget() orelse
+        surface.hwnd;
 }
 
 /// For tests: told the window SetFocus would be given by `giveFocus` and
@@ -2048,6 +2071,7 @@ pub fn applyTheme(self: *Window) void {
         var it = t.tree.iterator();
         while (it.next()) |entry| entry.view.search_bar.invalidate();
     }
+    CommandPalette.invalidate(self);
 }
 
 /// Whether a WM_SETTINGCHANGE is about the light or dark mode of apps,

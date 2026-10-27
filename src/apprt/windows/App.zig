@@ -371,12 +371,28 @@ pub const App = struct {
             behind: usize,
         },
 
-        /// A binding a key in `from`'s search field found while the core
-        /// could not be re-entered, by the trigger it was found under, to
-        /// be looked up again and performed (`overlay_keys.replay`).
+        /// A binding a key in `from`'s search field, or in the command
+        /// palette open for it, found while the core could not be
+        /// re-entered, by the trigger it was found under, to be looked up
+        /// again and performed (`overlay_keys.replay`).
         overlay_key: struct {
             from: *CoreSurface,
             trigger: input.Binding.Trigger,
+            field: overlay_keys.Field = .search,
+        },
+
+        /// `.toggle_command_palette`: open the command palette over the
+        /// window of `from`, or close it (`CommandPalette.toggle`).
+        palette: *CoreSurface,
+
+        /// An entry chosen in the command palette open for `from` while
+        /// the core could not be re-entered, the palette already closed:
+        /// its action performed on `from`, or its terminal focused
+        /// (`CommandPalette.replay`). The request owns `pending`, freed
+        /// when it is carried out or dropped (`freeRequest`).
+        palette_run: struct {
+            from: *CoreSurface,
+            pending: *CommandPalette.Pending,
         },
 
         /// Enter, Escape or a button of `from`'s search bar while the core
@@ -598,7 +614,7 @@ pub const App = struct {
         self.surfaces.deinit(self.core_app.alloc);
 
         // Windows asked for and never created: the process is quitting.
-        self.requests.deinit(self.core_app.alloc);
+        self.freeRequests();
 
         self.stopQuitTimer();
 
@@ -625,6 +641,21 @@ pub const App = struct {
         // Logged by `create`.
         self.taskbar_list = taskbar.create() catch return null;
         return self.taskbar_list;
+    }
+
+    /// Free `requests`, never carried out, and what they own.
+    fn freeRequests(self: *App) void {
+        for (self.requests.items) |*request| self.freeRequest(request);
+        self.requests.deinit(self.core_app.alloc);
+    }
+
+    /// Free what `request` owns, and make it `.dropped`.
+    fn freeRequest(self: *App, request: *Request) void {
+        switch (request.*) {
+            .palette_run => |chosen| chosen.pending.destroy(self.core_app.alloc),
+            else => {},
+        }
+        request.* = .dropped;
     }
 
     /// The Win32 message loop.
@@ -1142,6 +1173,7 @@ pub const App = struct {
             .search_total => searchCount(target, .total, value.total),
             .search_selected => searchCount(target, .selected, value.selected),
             .prompt_title => self.requestTitlePrompt(target, value),
+            .toggle_command_palette => self.requestPalette(target),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1260,6 +1292,24 @@ pub const App = struct {
             .target = which,
         } }) catch |err| {
             log.warn("cannot record a title prompt err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.toggle_command_palette`: the command palette opens over the
+    /// terminal's window, or closes if it is open there, as GTK toggles its
+    /// window's palette (`CommandPalette.toggle`). Carried out by `run`: a
+    /// binding performs this inside the core's key callback, and the
+    /// palette takes the keyboard focus from the terminal, or gives it
+    /// back. `false` for the app.
+    fn requestPalette(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .palette = from }) catch |err| {
+            log.warn("cannot record a command palette to toggle err={}", .{err});
             return false;
         };
         return true;
@@ -1931,6 +1981,13 @@ pub const App = struct {
             .overlay_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
+            .palette => |from| {
+                if (from == core_surface) request.* = .dropped;
+            },
+            // And an entry chosen to focus it.
+            .palette_run => |chosen| {
+                if (chosen.from == core_surface or chosen.pending.jumpsTo(core_surface.rt_surface)) self.freeRequest(request);
+            },
             .search_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
@@ -1950,6 +2007,9 @@ pub const App = struct {
         if (self.search_hide) |surface| {
             if (&surface.core_surface == core_surface) self.search_hide = null;
         }
+        // The command palette open for it closes, and one with a jump to it
+        // lists it no more.
+        CommandPalette.forget(self, core_surface.rt_surface);
         // And the title prompt it asked for closes, last: its frame, enabled
         // again, may take the activation and give a terminal the focus.
         TitleDialog.forget(self, core_surface.rt_surface);
@@ -2464,7 +2524,13 @@ pub const App = struct {
                     const t = from.window.tabOf(from) orelse continue;
                     from.window.toggleZoom(t.focused orelse from);
                 },
-                .overlay_key => |key| overlay_keys.replay(key.from, key.trigger),
+                .overlay_key => |key| overlay_keys.replay(key.from, key.trigger, key.field),
+                .palette => |from| CommandPalette.toggle(from.rt_surface),
+                // Freed here; `pending` is not used after.
+                .palette_run => |chosen| {
+                    self.requests.items[i] = .dropped;
+                    CommandPalette.replay(chosen.from.rt_surface, chosen.pending);
+                },
                 .search_key => |key| SearchBar.replay(key.from, key.key),
                 .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
                 .dropped => {},
@@ -2587,7 +2653,9 @@ pub const App = struct {
         const moved = try old.moveTabTo(index, window);
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
-        // A title prompt over `old` for a terminal of the tab closes.
+        // A title prompt over `old` for a terminal of the tab closes. A
+        // command palette open there now runs on the terminal of the tab
+        // shown in its place (`CommandPalette.focusMoved`).
         TitleDialog.followMove(old);
 
         // Shown once it is owned, as a new window is.
@@ -2708,6 +2776,7 @@ pub const App = struct {
         // A terminal with no core never passed through `forgetClosing`.
         if (self.search_focus == surface) self.search_focus = null;
         if (self.search_hide == surface) self.search_hide = null;
+        CommandPalette.forget(self, surface);
         TitleDialog.forget(self, surface);
         surface.deinit();
         self.core_app.alloc.destroy(surface);
@@ -2940,6 +3009,26 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     }
     errdefer _ = win32.UnregisterClassW(L(SearchBar.class_name), hinstance);
 
+    const palette_class: win32.WNDCLASSEXW = .{
+        .cbSize = @sizeOf(win32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &CommandPalette.wndProc,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = arrow,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = L(CommandPalette.class_name),
+        .hIconSm = null,
+    };
+    if (win32.RegisterClassExW(&palette_class) == 0) {
+        log.err("failed to register the command palette class err={}", .{win32.GetLastError()});
+        return App.Error.Win32ClassRegistrationFailed;
+    }
+    errdefer _ = win32.UnregisterClassW(L(CommandPalette.class_name), hinstance);
+
     const app_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
         .style = 0,
@@ -2966,6 +3055,7 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
     _ = win32.UnregisterClassW(L(TabBar.class_name), hinstance);
     _ = win32.UnregisterClassW(L(SearchBar.class_name), hinstance);
+    _ = win32.UnregisterClassW(L(CommandPalette.class_name), hinstance);
 }
 
 /// The text of `showConfigErrors`: GTK's dialog's, then each diagnostic on
@@ -3594,6 +3684,7 @@ fn testFrame(app: *App) !*Window {
         .taskbar_button = false,
         .prompt_disabled = false,
         .title_prompt = .{},
+        .palette = .{},
         .closing = false,
         .destroy_deferred = false,
     };
@@ -3662,7 +3753,7 @@ pub fn testCleanup(app: *App) void {
     }
     app.surfaces.deinit(alloc);
     app.windows.deinit(alloc);
-    app.requests.deinit(alloc);
+    app.freeRequests();
     app.config.deinit();
     _ = win32.DestroyWindow(app.msg_hwnd);
 }
@@ -10348,7 +10439,7 @@ test "win32: the command palette has a jump to each terminal that is not closing
     d.closing = true;
     defer d.closing = false;
 
-    var entries = try CommandPalette.forApp(&app);
+    var entries = try CommandPalette.forApp(&app, null);
     defer entries.deinit();
     var jumps: [4]?*Surface = .{ null, null, null, null };
     var titles: [4][]const u8 = undefined;
@@ -10371,4 +10462,628 @@ test "win32: the command palette has a jump to each terminal that is not closing
     try std.testing.expect(jumps[1] == a);
     try std.testing.expectEqualStrings("Focus: Untitled", titles[2]);
     try std.testing.expect(jumps[2] == c);
+}
+
+/// For tests: the binding actions command palettes performed
+/// (`SearchBar.test_perform`), as the configuration writes them, each
+/// followed by ";", the terminal they were performed on, and whether a
+/// palette was still open in `window` when one was.
+const PaletteSeen = struct {
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    var window: ?*Window = null;
+    var on: ?*Surface = null;
+    var open_then: bool = false;
+    fn seen(surface: *Surface, action: input.Binding.Action) bool {
+        on = surface;
+        if (window) |w| {
+            if (w.palette.hwnd != null) open_then = true;
+        }
+        const s = std.mem.print(buf[len..], "{f};", .{action}) catch return true;
+        len += s.len;
+        return true;
+    }
+    fn take() []const u8 {
+        const s = buf[0..len];
+        len = 0;
+        return s;
+    }
+    fn reset(w: ?*Window) void {
+        len = 0;
+        window = w;
+        on = null;
+        open_then = false;
+    }
+};
+
+/// For tests: toggle the command palette from `surface`, as a binding
+/// does, and carry it out, as `run` does.
+fn togglePalette(app: *App, surface: *Surface) !void {
+    try std.testing.expect(try app.performAction(.{ .surface = &surface.core_surface }, .toggle_command_palette, {}));
+    app.createRequested();
+}
+
+/// For tests: put `text` in `window`'s palette's field, as typing would.
+fn paletteQuery(window: *Window, text: win32.LPCWSTR) void {
+    _ = win32.SetWindowTextW(window.palette.edit.?, text);
+}
+
+fn paletteRows(window: *const Window) isize {
+    return win32.SendMessageW(window.palette.list.?, win32.LB_GETCOUNT, 0, 0);
+}
+
+fn paletteSelected(window: *const Window) isize {
+    return win32.SendMessageW(window.palette.list.?, win32.LB_GETCURSEL, 0, 0);
+}
+
+/// For tests: the entry on `window`'s palette's `row`.
+fn paletteEntry(window: *const Window, row: usize) *const CommandPalette.Entry {
+    const data = win32.SendMessageW(window.palette.list.?, win32.LB_GETITEMDATA, row, 0);
+    return &window.palette.entries.?.items[@intCast(data)];
+}
+
+/// For tests: the client point of `window`'s palette's list in the middle
+/// of `row`.
+fn paletteRowPoint(window: *const Window, row: usize) win32.LPARAM {
+    const h = win32.SendMessageW(window.palette.list.?, win32.LB_GETITEMHEIGHT, 0, 0);
+    const y: i32 = @intCast(@as(isize, @intCast(row)) * h + @divTrunc(h, 2));
+    return testPoint(20, y);
+}
+
+fn paletteKey(window: *const Window, vk: win32.WPARAM) void {
+    _ = win32.SendMessageW(window.palette.edit.?, win32.WM_KEYDOWN, vk, 0);
+}
+
+test "win32: toggle_command_palette opens the command palette over its window, and closes it" {
+    // GTK's toggle: the palette opens over the window, at the top centre
+    // of the area under the tab bar, above every terminal, its field with
+    // the focus, every entry listed and the first selected; again, it
+    // closes and the terminal gets the focus back. It is the frame's
+    // child, as the search bar is, and runs on the window's focused
+    // terminal; opened and closed by `run`, after the core's key callback.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = b;
+    window.relayout();
+    const p = &window.palette;
+
+    // Not for the app.
+    try std.testing.expect(!try app.performAction(.app, .toggle_command_palette, {}));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Recorded, and opened by `run`, for the focused terminal, whichever
+    // asked (an `all:` binding asks from every one).
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_command_palette, {}));
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .palette);
+    app.createRequested();
+    try std.testing.expect(p.open);
+    const hwnd = p.hwnd.?;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(above(window.hwnd, hwnd, a.hwnd));
+    try std.testing.expect(above(window.hwnd, hwnd, b.hwnd));
+    try std.testing.expect(p.surface == b);
+    try std.testing.expect(p.text_height > 0);
+    const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
+    const want = CommandPalette.paletteRect(m, window.layoutArea().?, p.text_height).?;
+    try std.testing.expectEqual(want, try childRect(window, hwnd));
+    try std.testing.expectEqual(m.width, want.right - want.left);
+    // Centred, under the top of the area.
+    try std.testing.expectEqual(@divTrunc((try clientRect(window.hwnd)).right - m.width, 2), want.left);
+    try std.testing.expectEqual(window.layoutArea().?.top + m.margin, want.top);
+    try std.testing.expect(FocusSeen.last == p.edit.?);
+    // Every entry, the first selected, its rows two lines tall.
+    try std.testing.expectEqual(@as(isize, @intCast(p.entries.?.items.len)), paletteRows(window));
+    try std.testing.expect(paletteRows(window) > 50);
+    try std.testing.expectEqual(0, paletteSelected(window));
+    // Shown from its top, the selected row in view.
+    try std.testing.expectEqual(0, win32.SendMessageW(p.list.?, win32.LB_GETTOPINDEX, 0, 0));
+    try std.testing.expectEqual(m.rowHeight(p.text_height), win32.SendMessageW(p.list.?, win32.LB_GETITEMHEIGHT, 0, 0));
+    try std.testing.expect(win32.SendMessageW(p.edit.?, win32.WM_GETFONT, 0, 0) != 0);
+
+    // The frame's focus goes to the field while it is open.
+    FocusSeen.last = null;
+    _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(FocusSeen.last == p.edit.?);
+
+    // Laid out again, it stays above the terminals.
+    _ = win32.SetWindowPos(a.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+    window.relayout();
+    try std.testing.expect(above(window.hwnd, hwnd, a.hwnd));
+
+    // Again: closed, the terminal with the focus.
+    try togglePalette(&app, b);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(!p.open);
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+    try std.testing.expect(FocusSeen.last == b.hwnd);
+    _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(FocusSeen.last == b.hwnd);
+
+    // Twice before `run`: open, then closed.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .toggle_command_palette, {}));
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .toggle_command_palette, {}));
+    app.createRequested();
+    try std.testing.expect(p.hwnd == null);
+
+    // Not over a title prompt, which holds the frame.
+    window.title_prompt.hwnd = window.hwnd;
+    try togglePalette(&app, b);
+    window.title_prompt.hwnd = null;
+    try std.testing.expect(p.hwnd == null);
+
+    // A request from a terminal that begins to close is dropped.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .toggle_command_palette, {}));
+    app.forgetClosing(&b.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expect(p.hwnd == null);
+
+    // Left open: the frame's destruction frees it (testCleanup).
+    try togglePalette(&app, b);
+    try std.testing.expect(p.hwnd != null);
+}
+
+test "win32: the command palette's field filters its list, moves the selection and takes its own keys" {
+    // GTK's filter on the title or the action key, title matches first;
+    // Up, Down, PgUp and PgDn move the list's selection from the field,
+    // within its rows; the WM_CHARs of Enter, Tab and Escape never reach
+    // the EDIT, and Ctrl+Backspace deletes a word, as in the search field.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    PaletteSeen.reset(window);
+    try togglePalette(&app, a);
+    const p = &window.palette;
+    const edit = p.edit.?;
+
+    // What the filter keeps, in its order.
+    paletteQuery(window, L("split"));
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(alloc);
+    try CommandPalette.filter(alloc, p.entries.?.items, "split", &want);
+    try std.testing.expect(want.items.len > 4);
+    try std.testing.expectEqual(@as(isize, @intCast(want.items.len)), paletteRows(window));
+    for (want.items, 0..) |index, row| {
+        try std.testing.expect(paletteEntry(window, row) == &p.entries.?.items[index]);
+    }
+    // Title matches first: "Split Right" before any entry whose action
+    // alone says split.
+    try std.testing.expect(CommandPalette.match(paletteEntry(window, 0), "split") == .title);
+    try std.testing.expectEqual(0, paletteSelected(window));
+    paletteQuery(window, L("SPLIT RIGHT"));
+    try std.testing.expectEqualStrings("Split Right", paletteEntry(window, 0).title);
+    try std.testing.expectEqual(0, paletteSelected(window));
+
+    // The selection moves, within the rows.
+    paletteQuery(window, L("split"));
+    const last: isize = paletteRows(window) - 1;
+    paletteKey(window, win32.VK_DOWN);
+    try std.testing.expectEqual(1, paletteSelected(window));
+    paletteKey(window, win32.VK_DOWN);
+    try std.testing.expectEqual(2, paletteSelected(window));
+    paletteKey(window, win32.VK_UP);
+    try std.testing.expectEqual(1, paletteSelected(window));
+    paletteKey(window, win32.VK_UP);
+    paletteKey(window, win32.VK_UP);
+    try std.testing.expectEqual(0, paletteSelected(window));
+    // A page is the rows the list shows; past the end, the last.
+    paletteKey(window, win32.VK_NEXT);
+    const page = paletteSelected(window);
+    try std.testing.expect(page > 1);
+    try std.testing.expectEqual(@min(last, @as(isize, CommandPalette.Metrics.init(96).rows)), page);
+    for (0..10) |_| paletteKey(window, win32.VK_NEXT);
+    try std.testing.expectEqual(last, paletteSelected(window));
+    paletteKey(window, win32.VK_PRIOR);
+    try std.testing.expectEqual(last - page, paletteSelected(window));
+    for (0..10) |_| paletteKey(window, win32.VK_PRIOR);
+    try std.testing.expectEqual(0, paletteSelected(window));
+    // Nothing matches: no rows, and Enter does nothing.
+    paletteQuery(window, L("zzzzzz"));
+    try std.testing.expectEqual(0, paletteRows(window));
+    paletteKey(window, win32.VK_DOWN);
+    paletteKey(window, win32.VK_RETURN);
+    try std.testing.expect(p.hwnd != null);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+
+    // Enter, Ctrl+Enter, Tab and Escape's WM_CHARs dropped; others typed.
+    var buf: [64]u16 = undefined;
+    paletteQuery(window, L("new split"));
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 9, 9);
+    const forwarded = CommandPalette.test_forwarded;
+    for ([_]win32.WPARAM{ '\r', '\n', '\t', 0x1B }) |c| _ = win32.SendMessageW(edit, win32.WM_CHAR, c, 0);
+    try std.testing.expectEqual(forwarded, CommandPalette.test_forwarded);
+    _ = win32.SendMessageW(edit, win32.WM_CHAR, 'x', 0);
+    try std.testing.expectEqual(forwarded + 1, CommandPalette.test_forwarded);
+    var n = win32.GetWindowTextW(edit, &buf, buf.len);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("new splitx"), buf[0..@intCast(n)]);
+    // Ctrl+Backspace: back to the word's start.
+    _ = win32.SendMessageW(edit, win32.WM_CHAR, 0x7F, 0);
+    n = win32.GetWindowTextW(edit, &buf, buf.len);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("new "), buf[0..@intCast(n)]);
+    try std.testing.expectEqual(forwarded + 1, CommandPalette.test_forwarded);
+    try std.testing.expect(p.hwnd != null);
+}
+
+test "win32: the command palette runs the chosen entry on its terminal once it has closed" {
+    // Enter or a click on a row: the palette closes first, giving the
+    // terminal back the focus, as GTK's closes before its action runs so
+    // that a dialog the action opens is not held up, then the action is
+    // performed on the terminal; under a prompt, recorded for `run` with
+    // what it needs, and dropped, freed, if the terminal begins to close.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = b;
+    window.relayout();
+    const p = &window.palette;
+    PaletteSeen.reset(window);
+
+    // Enter: closed, the focus back to the terminal, then performed on it.
+    try togglePalette(&app, b);
+    paletteQuery(window, L("split right"));
+    try std.testing.expectEqual(1, paletteRows(window));
+    paletteKey(window, win32.VK_RETURN);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expectEqualStrings("new_split:right;", PaletteSeen.take());
+    try std.testing.expect(PaletteSeen.on == b);
+    try std.testing.expect(!PaletteSeen.open_then);
+    try std.testing.expect(FocusSeen.last == b.hwnd);
+
+    // The selected row, not the first.
+    try togglePalette(&app, b);
+    paletteQuery(window, L("split"));
+    paletteKey(window, win32.VK_DOWN);
+    paletteKey(window, win32.VK_DOWN);
+    var want_buf: [64]u8 = undefined;
+    const want = try std.mem.print(&want_buf, "{f};", .{paletteEntry(window, 2).run.action});
+    paletteKey(window, win32.VK_RETURN);
+    try std.testing.expectEqualStrings(want, PaletteSeen.take());
+
+    // A click: pressed and released on a row runs it; released on another
+    // row, nothing runs, though the press selected its row.
+    try togglePalette(&app, b);
+    paletteQuery(window, L("split"));
+    const list = p.list.?;
+    _ = win32.SendMessageW(list, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, paletteRowPoint(window, 1));
+    try std.testing.expectEqual(1, paletteSelected(window));
+    try std.testing.expect(win32.GetCapture() == list);
+    _ = win32.SendMessageW(list, win32.WM_LBUTTONUP, 0, paletteRowPoint(window, 2));
+    try std.testing.expect(win32.GetCapture() == null);
+    try std.testing.expect(p.hwnd != null);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    const clicked = try std.mem.print(&want_buf, "{f};", .{paletteEntry(window, 3).run.action});
+    _ = win32.SendMessageW(list, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, paletteRowPoint(window, 3));
+    _ = win32.SendMessageW(list, win32.WM_LBUTTONUP, 0, paletteRowPoint(window, 3));
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expectEqualStrings(clicked, PaletteSeen.take());
+    try std.testing.expect(!PaletteSeen.open_then);
+
+    // Under a prompt: closed, recorded, performed by `run`.
+    try togglePalette(&app, b);
+    paletteQuery(window, L("split right"));
+    app.prompt_depth = 1;
+    paletteKey(window, win32.VK_RETURN);
+    app.prompt_depth = 0;
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try std.testing.expectEqual(1, app.requests.items.len);
+    switch (app.requests.items[0]) {
+        .palette_run => |chosen| try std.testing.expect(chosen.from == &b.core_surface),
+        else => return error.TestUnexpectedResult,
+    }
+    app.createRequested();
+    try std.testing.expectEqualStrings("new_split:right;", PaletteSeen.take());
+    try std.testing.expect(PaletteSeen.on == b);
+    try std.testing.expectEqual(0, app.requests.items.len);
+    // Dropped, and freed, when the terminal begins to close.
+    try togglePalette(&app, b);
+    paletteQuery(window, L("split right"));
+    app.prompt_depth = 1;
+    paletteKey(window, win32.VK_RETURN);
+    app.prompt_depth = 0;
+    app.forgetClosing(&b.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    // And left in `requests` at quit: freed with them (testCleanup).
+    try togglePalette(&app, a);
+    paletteQuery(window, L("split right"));
+    app.prompt_depth = 1;
+    paletteKey(window, win32.VK_RETURN);
+    app.prompt_depth = 0;
+    try std.testing.expectEqual(1, app.requests.items.len);
+}
+
+test "win32: a jump in the command palette focuses its terminal, in its tab and window" {
+    // GTK's and macOS's jump entries present their terminal: its tab is
+    // shown and it gets the focus, its window brought forward if it is
+    // another. A terminal that closes while the palette is open is listed
+    // no more.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    Window.test_foreground = &ForegroundSeen.seen;
+    defer Window.test_foreground = null;
+    ForegroundSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const c = try testTab(&app, window);
+    window.selectTab(0);
+    const other = try testFrame(&app);
+    testResize(other, 1000, 700);
+    const d = try testPane(&app, other);
+    other.tab().tree = try .init(alloc, d);
+    other.tab().focused = d;
+    other.relayout();
+    a.title = try alloc.dupeSentinel(u8, "alpha", 0);
+    c.title = try alloc.dupeSentinel(u8, "gamma", 0);
+    d.title = try alloc.dupeSentinel(u8, "delta", 0);
+    const p = &window.palette;
+
+    // In a hidden tab of the same window: shown, and focused.
+    try togglePalette(&app, a);
+    paletteQuery(window, L("focus: gamma"));
+    try std.testing.expectEqual(1, paletteRows(window));
+    try std.testing.expect(paletteEntry(window, 0).run.jump == c);
+    paletteKey(window, win32.VK_RETURN);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expectEqual(1, window.selected);
+    try std.testing.expect(window.tab().focused == c);
+    try std.testing.expect(FocusSeen.last == c.hwnd);
+    try std.testing.expect(ForegroundSeen.last == null);
+
+    // In another window: brought forward, and focused.
+    try togglePalette(&app, c);
+    try std.testing.expect(p.surface == c);
+    paletteQuery(window, L("focus: delta"));
+    paletteKey(window, win32.VK_RETURN);
+    try std.testing.expect(ForegroundSeen.last == other.hwnd);
+    try std.testing.expect(FocusSeen.last == d.hwnd);
+
+    // A terminal that begins to close while it is open: listed no more,
+    // the query kept.
+    try togglePalette(&app, c);
+    paletteQuery(window, L("focus: delta"));
+    try std.testing.expectEqual(1, paletteRows(window));
+    app.forgetClosing(&d.core_surface);
+    try std.testing.expect(p.hwnd != null);
+    try std.testing.expectEqual(0, paletteRows(window));
+    paletteQuery(window, L("focus:"));
+    try std.testing.expectEqual(2, paletteRows(window));
+    // A jump recorded under a prompt is dropped with its terminal.
+    paletteQuery(window, L("focus: alpha"));
+    app.prompt_depth = 1;
+    paletteKey(window, win32.VK_RETURN);
+    app.prompt_depth = 0;
+    try std.testing.expect(app.requests.items[0] == .palette_run);
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+}
+
+test "win32: the command palette closes when its frame is deactivated, has no room, or its terminal or window goes" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const p = &window.palette;
+
+    // Deactivated: closed once the deactivation is over, by a message to
+    // itself, and the terminal gets the focus it had.
+    try togglePalette(&app, a);
+    const hwnd = p.hwnd.?;
+    _ = Window.wndProc(window.hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, 0);
+    try std.testing.expect(p.hwnd != null);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    // Escape: closed, the focus back to the terminal; its release withheld
+    // from the terminal, which never saw it pressed.
+    try togglePalette(&app, a);
+    try std.testing.expect(FocusSeen.last == p.edit.?);
+    try std.testing.expectEqual(0, a.ime.swallow_up.count());
+    paletteKey(window, win32.VK_ESCAPE);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try std.testing.expectEqual(1, a.ime.swallow_up.count());
+    a.ime.swallow_up = .empty;
+
+    // No room after a layout: closed; and not opened where there is none.
+    try togglePalette(&app, a);
+    testResize(window, 1000, 120);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try togglePalette(&app, a);
+    try std.testing.expect(p.hwnd == null);
+    testResize(window, 1000, 700);
+    // A narrower window: narrower, and placed again.
+    try togglePalette(&app, a);
+    testResize(window, 500, 700);
+    try std.testing.expect(p.hwnd != null);
+    const narrow = try childRect(window, p.hwnd.?);
+    const margin = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd)).margin;
+    try std.testing.expectEqual((try clientRect(window.hwnd)).right - 2 * margin, narrow.right - narrow.left);
+    try std.testing.expectEqual(margin, narrow.left);
+
+    // Its terminal begins to close: closed. Another one: still open.
+    app.forgetClosing(&b.core_surface);
+    try std.testing.expect(p.hwnd != null);
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(p.hwnd == null);
+
+    // The terminal with the focus is the one it runs on; but a closing one
+    // passing the focus on keeps it, and it closes with that one.
+    try togglePalette(&app, a);
+    window.setFocused(b);
+    try std.testing.expect(p.surface == b);
+    window.setFocused(a);
+    try std.testing.expect(p.surface == a);
+    a.closing = true;
+    window.setFocused(b);
+    try std.testing.expect(p.surface == a);
+    app.forgetClosing(&a.core_surface);
+    a.closing = false;
+    try std.testing.expect(p.hwnd == null);
+
+    // Its window closing: closed first, before the terminals.
+    try togglePalette(&app, a);
+    try std.testing.expect(window.destroy());
+    try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+test "win32: keys in the command palette perform the terminal's bindings for its window, and act on the field" {
+    // The field follows the search field's rules (`overlay_keys`): a
+    // binding for the window, its tabs and splits or the palette acts, and
+    // select all acts on the field, also when recorded under a prompt and
+    // replayed by `run`; Ctrl+Shift+P, the palette's own binding, toggles
+    // it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    const arena = app.config._arena.?.allocator();
+    try app.config.keybind.parseCLI(arena, "ctrl+shift+m=new_split:right");
+    try app.config.keybind.parseCLI(arena, "chain=select_all");
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    PaletteSeen.reset(window);
+    try togglePalette(&app, a);
+    const p = &window.palette;
+    const edit = p.edit.?;
+
+    try fieldKey(edit, 'T', .{ .ctrl = true, .shift = true }, 0x14);
+    try std.testing.expectEqualStrings("new_tab;", PaletteSeen.take());
+    try std.testing.expect(PaletteSeen.on == a);
+    try fieldKey(edit, 'P', .{ .ctrl = true, .shift = true }, 0x10);
+    try std.testing.expectEqualStrings("toggle_command_palette;", PaletteSeen.take());
+    try std.testing.expect(p.hwnd != null);
+
+    // Select all: on the field.
+    paletteQuery(window, L("ab"));
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 1);
+    try fieldKey(edit, 'A', .{ .ctrl = true, .shift = true }, null);
+    var from: win32.DWORD = 0;
+    var to: win32.DWORD = 0;
+    _ = win32.SendMessageW(edit, win32.EM_GETSEL, @intFromPtr(&from), @bitCast(@intFromPtr(&to)));
+    try std.testing.expectEqual([2]win32.DWORD{ 0, 2 }, [2]win32.DWORD{ from, to });
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    // A binding with an action for the core, recorded under a prompt as
+    // the palette's, and replayed: its select all onto the palette's
+    // field.
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 1);
+    app.prompt_depth = 1;
+    try fieldKey(edit, 'M', .{ .ctrl = true, .shift = true }, 0x0D);
+    app.prompt_depth = 0;
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try std.testing.expectEqual(1, app.requests.items.len);
+    switch (app.requests.items[0]) {
+        .overlay_key => |key| try std.testing.expectEqual(overlay_keys.Field.palette, key.field),
+        else => return error.TestUnexpectedResult,
+    }
+    app.createRequested();
+    try std.testing.expectEqualStrings("new_split:right;", PaletteSeen.take());
+    _ = win32.SendMessageW(edit, win32.EM_GETSEL, @intFromPtr(&from), @bitCast(@intFromPtr(&to)));
+    try std.testing.expectEqual([2]win32.DWORD{ 0, 2 }, [2]win32.DWORD{ from, to });
+    try std.testing.expect(p.hwnd != null);
 }

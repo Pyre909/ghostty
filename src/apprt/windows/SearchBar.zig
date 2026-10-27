@@ -250,7 +250,7 @@ pub const Bar = struct {
 
 /// The height of a line of `font`, as the field draws it; 0 if it cannot
 /// be measured.
-fn textHeight(edit: win32.HWND, font: win32.HGDIOBJ) i32 {
+pub fn textHeight(edit: win32.HWND, font: win32.HGDIOBJ) i32 {
     const hdc = win32.GetDC(edit) orelse return 0;
     defer _ = win32.ReleaseDC(edit, hdc);
     const old = win32.SelectObject(hdc, font);
@@ -618,7 +618,7 @@ fn hide(surface: *Surface) void {
 }
 
 /// Whether a window is shown itself, whatever its parent is.
-fn visibleStyle(hwnd: win32.HWND) bool {
+pub fn visibleStyle(hwnd: win32.HWND) bool {
     const visible: isize = win32.WS_VISIBLE;
     return win32.GetWindowLongPtrW(hwnd, win32.GWL_STYLE) & visible != 0;
 }
@@ -824,12 +824,12 @@ fn editProc(
             return 0;
         },
         .delete_word => {
-            deleteWord(surface, hwnd);
+            deleteWord(surface.app.core_app.alloc, hwnd);
             return 0;
         },
     }
     // Then the terminal's bindings that still act from the field.
-    if (overlay_keys.keyDown(surface, hwnd, proc, msg, wparam, lparam)) return 0;
+    if (overlay_keys.keyDown(surface, hwnd, proc, msg, wparam, lparam, .search)) return 0;
     if (builtin.is_test) if (msg == win32.WM_CHAR or msg == win32.WM_SYSCHAR) {
         test_forwarded += 1;
     };
@@ -880,13 +880,13 @@ pub fn editKey(msg: win32.UINT, wparam: win32.WPARAM, shift: bool) EditKey {
 }
 
 /// Ctrl+Backspace in the field: the selection, or else the word before
-/// the caret (`wordStart`), goes, as one undoable replacement.
-fn deleteWord(surface: *Surface, edit: win32.HWND) void {
+/// the caret (`wordStart`), goes, as one undoable replacement. The
+/// command palette's field does the same.
+pub fn deleteWord(alloc: std.mem.Allocator, edit: win32.HWND) void {
     var from: win32.DWORD = 0;
     var to: win32.DWORD = 0;
     _ = win32.SendMessageW(edit, win32.EM_GETSEL, @intFromPtr(&from), @bitCast(@intFromPtr(&to)));
     if (from == to) {
-        const alloc = surface.app.core_app.alloc;
         const len: usize = @intCast(@max(win32.GetWindowTextLengthW(edit), 0));
         const text = alloc.alloc(u16, len + 1) catch return;
         defer alloc.free(text);
@@ -933,8 +933,9 @@ pub fn countLabel(buf: *[48]u8, total: ?usize, selected: ?usize) []const u8 {
 }
 
 /// The bar's colours, by whether the title bar is dark
-/// (`Window.dark_frame`), as the tab bar's are.
-const Colors = struct {
+/// (`Window.dark_frame`), as the tab bar's are; the command palette's
+/// too.
+pub const Colors = struct {
     bar: win32.COLORREF,
     border: win32.COLORREF,
     field: win32.COLORREF,
@@ -942,7 +943,7 @@ const Colors = struct {
     dim: win32.COLORREF,
     hover: win32.COLORREF,
 
-    fn of(dark: bool) Colors {
+    pub fn of(dark: bool) Colors {
         return if (dark) .{
             .bar = win32.rgb(0x2b, 0x2b, 0x2b),
             .border = win32.rgb(0x4a, 0x4a, 0x4a),
@@ -1054,13 +1055,13 @@ fn drawGlyph(hdc: win32.HDC, r: RECT, glyph: Hit, color: win32.COLORREF, width: 
     }
 }
 
-fn fill(hdc: win32.HDC, r: RECT, color: win32.COLORREF) void {
+pub fn fill(hdc: win32.HDC, r: RECT, color: win32.COLORREF) void {
     const brush = win32.CreateSolidBrush(color) orelse return;
     defer _ = win32.DeleteObject(brush);
     _ = win32.FillRect(hdc, &r, brush);
 }
 
-fn inset(r: RECT, by: i32) RECT {
+pub fn inset(r: RECT, by: i32) RECT {
     return .{ .left = r.left + by, .top = r.top + by, .right = r.right - by, .bottom = r.bottom - by };
 }
 
@@ -1100,7 +1101,7 @@ pub const Metrics = struct {
         };
     }
 
-    fn scale(v: i32, dpi: u32) i32 {
+    pub fn scale(v: i32, dpi: u32) i32 {
         const base: i32 = win32.USER_DEFAULT_SCREEN_DPI;
         return @divTrunc(v * @as(i32, @intCast(dpi)) + @divTrunc(base, 2), base);
     }

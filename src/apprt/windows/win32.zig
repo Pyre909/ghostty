@@ -1141,6 +1141,71 @@ pub const BS_DEFPUSHBUTTON: DWORD = 0x0001;
 /// A static control shows its text with no "&" mnemonic.
 pub const SS_NOPREFIX: DWORD = 0x0080;
 
+// The command palette (CommandPalette.zig): a window of the frame's holding
+// an EDIT for the query above an owner-drawn LISTBOX.
+
+pub const WS_VSCROLL: DWORD = 0x00200000;
+pub const WM_USER: UINT = 0x0400;
+pub const WM_SETREDRAW: UINT = 0x000B;
+pub const WM_DRAWITEM: UINT = 0x002B;
+pub const WM_MEASUREITEM: UINT = 0x002C;
+pub const WM_CTLCOLORLISTBOX: UINT = 0x0134;
+/// WM_ACTIVATE's low word of wParam when the window is deactivated.
+pub const WA_INACTIVE: u16 = 0;
+pub const VK_PRIOR: WPARAM = 0x21;
+pub const VK_NEXT: WPARAM = 0x22;
+pub const VK_UP: WPARAM = 0x26;
+pub const VK_DOWN: WPARAM = 0x28;
+pub const LBS_NOTIFY: DWORD = 0x0001;
+pub const LBS_OWNERDRAWFIXED: DWORD = 0x0010;
+pub const LBS_HASSTRINGS: DWORD = 0x0040;
+pub const LBS_NOINTEGRALHEIGHT: DWORD = 0x0100;
+pub const LB_ADDSTRING: UINT = 0x0180;
+pub const LB_RESETCONTENT: UINT = 0x0184;
+pub const LB_SETCURSEL: UINT = 0x0186;
+pub const LB_GETCURSEL: UINT = 0x0188;
+pub const LB_GETCOUNT: UINT = 0x018B;
+pub const LB_GETTOPINDEX: UINT = 0x018E;
+pub const LB_SETTOPINDEX: UINT = 0x0197;
+pub const LB_GETITEMDATA: UINT = 0x0199;
+pub const LB_SETITEMDATA: UINT = 0x019A;
+pub const LB_SETITEMHEIGHT: UINT = 0x01A0;
+pub const LB_GETITEMHEIGHT: UINT = 0x01A1;
+pub const LB_ITEMFROMPOINT: UINT = 0x01A9;
+pub const LB_ERR: LRESULT = -1;
+/// DRAWITEMSTRUCT's itemState: the item is selected.
+pub const ODS_SELECTED: UINT = 0x0001;
+/// DrawTextW measures the text into the rect and draws nothing.
+pub const DT_CALCRECT: UINT = 0x0400;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-drawitemstruct
+pub const DRAWITEMSTRUCT = extern struct {
+    CtlType: UINT,
+    CtlID: UINT,
+    itemID: UINT,
+    itemAction: UINT,
+    itemState: UINT,
+    hwndItem: ?HWND,
+    hDC: HDC,
+    rcItem: RECT,
+    itemData: usize,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-measureitemstruct
+pub const MEASUREITEMSTRUCT = extern struct {
+    CtlType: UINT,
+    CtlID: UINT,
+    itemID: UINT,
+    itemWidth: UINT,
+    itemHeight: UINT,
+    itemData: usize,
+};
+comptime {
+    // The SDK's sizes on 64-bit Windows.
+    if (@sizeOf(usize) == 8) {
+        std.debug.assert(@sizeOf(DRAWITEMSTRUCT) == 64);
+        std.debug.assert(@sizeOf(MEASUREITEMSTRUCT) == 32);
+    }
+}
+
 /// The RGB macro of wingdi.h.
 pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
     return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);

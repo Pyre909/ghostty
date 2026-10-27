@@ -94,6 +94,25 @@
 //! of its own here, its caption being its shown tab's, and the binding is
 //! documented as Linux-only (`App.requestTitlePrompt`).
 //!
+//! ## Command palette
+//!
+//! `.toggle_command_palette` opens a window's command palette, or closes
+//! it, from `App.run` once the core frame that asked has returned
+//! (`CommandPalette`). As GTK's, it lists the configuration's
+//! `command-palette-entry` commands this runtime carries out
+//! (`CommandPalette.supported`, an exhaustive switch) with their
+//! shortcuts, and a "Focus: <title>" entry for each terminal, sorted by
+//! title; typing filters them by title or action, title matches first. It
+//! is a child window of the frame, at the top centre of the area under the
+//! tab bar and above the terminals, as the search bars are, with an EDIT
+//! over an owner-drawn LISTBOX. Up, Down, PgUp and PgDn move the
+//! selection, Enter or a click runs it, Escape closes; the field's other
+//! keys follow the search field's rules (`overlay_keys`). It closes before
+//! its entry runs, which happens on the window's focused terminal, or for
+//! a jump focuses that terminal in its tab and window; it also closes when
+//! its frame is deactivated, when the layout leaves no room for it, and
+//! with its terminal or window; the terminal gets the focus back.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another

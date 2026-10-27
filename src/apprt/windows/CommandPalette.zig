@@ -235,8 +235,9 @@ pub fn build(
 /// The entries for `app` now: its configuration's commands and shortcuts,
 /// as GTK's palette reads its window's configuration, and a jump to each
 /// terminal that is not closing, in every window, titled as it shows
-/// (`Surface.effectiveTitle`), as GTK's lists every surface of the core.
-pub fn forApp(app: *App) Allocator.Error!Entries {
+/// (`Surface.effectiveTitle`), as GTK's lists every surface of the core;
+/// none to `skip`, a terminal going away.
+pub fn forApp(app: *App, skip: ?*const Surface) Allocator.Error!Entries {
     const alloc = app.core_app.alloc;
     // The directories, read from the cores, only until `build` has copied
     // what it keeps.
@@ -245,7 +246,7 @@ pub fn forApp(app: *App) Allocator.Error!Entries {
     const s = scratch.allocator();
     var jumps: std.ArrayList(Jump) = try .initCapacity(s, app.surfaces.items.len);
     for (app.surfaces.items) |surface| {
-        if (surface.closing) continue;
+        if (surface.closing or surface == skip) continue;
         const pwd: ?[]const u8 = if (surface.liveCore()) |core| try core.pwd(s) else null;
         jumps.appendAssumeCapacity(.{ .surface = surface, .title = surface.effectiveTitle(), .pwd = pwd });
     }
@@ -398,8 +399,1006 @@ fn writeKey(w: *std.Io.Writer, key: input.Key) std.Io.Writer.Error!void {
     }
 }
 
+// The palette on screen.
+//
+// A child window of the frame, as the search bars are (SearchBar.zig), at
+// the top centre of the area under the tab bar, above the terminals: GDI in
+// a child of a terminal's window would never be composed over its
+// flip-model swap chain, while a sibling above it draws. An EDIT takes the
+// query and a LISTBOX, owner-drawn, shows the entries, two lines each (the
+// title, then the action key or the description) with the shortcut on the
+// right, as GTK's rows show them (command-palette.blp). The LISTBOX keeps
+// each title as its item's text, for accessibility, and the entry's index
+// as its data. The keyboard stays in the field: Up, Down, PgUp and PgDn
+// move the selection, Enter runs it, Escape closes; a click on a row runs
+// it.
+//
+// One per window (`Window.palette`), for the terminal with the focus in
+// its shown tab (`focusMoved`), which gets the focus back when it closes.
+// It closes on Escape, when it runs an entry, when its frame is
+// deactivated, when the layout leaves no room for it, and with its window
+// or its terminal; it is made anew each time it opens, with the entries
+// as they are then. An entry runs after the palette has closed, as GTK
+// closes its dialog first so that a dialog the action opens (a title
+// prompt) is not held up by it, on the terminal it was open for, never
+// inside a core frame (`App.requests`).
+
+const builtin = @import("builtin");
+const CoreSurface = @import("../../Surface.zig");
+const win32 = @import("win32.zig");
+const Window = @import("Window.zig");
+const SearchBar = @import("SearchBar.zig");
+const overlay_keys = @import("overlay_keys.zig");
+const messageFont = @import("TabBar.zig").messageFont;
+const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
+const utf8FromWide = @import("clipboard.zig").utf8FromWide;
+
+const RECT = win32.RECT;
+const L = win32.L;
+const log = std.log.scoped(.win32);
+
+pub const class_name = "GhosttyCommandPaletteClass";
+
+/// Posted to the palette's window when its frame is deactivated
+/// (`deactivated`).
+pub const WM_PALETTE_CLOSE: win32.UINT = win32.WM_USER + 1;
+
+/// A window's palette (`Window.palette`): its windows while it is open,
+/// none while it is closed.
+pub const Palette = struct {
+    /// The palette's window, a child of the frame; null while closed.
+    hwnd: ?win32.HWND = null,
+    /// The query, an EDIT child of `hwnd`.
+    edit: ?win32.HWND = null,
+    /// The entries, an owner-drawn LISTBOX child of `hwnd`.
+    list: ?win32.HWND = null,
+    /// From `open` until `close` starts: the keyboard focus the window
+    /// gives goes to the field (`focusTarget`).
+    open: bool = false,
+    /// The terminal entries run on, live while open: the one it was
+    /// opened for, then the one with the focus in the shown tab
+    /// (`focusMoved`).
+    surface: ?*Surface = null,
+    /// What it lists; the list's items hold indices into it.
+    entries: ?Entries = null,
+    /// The filter's result, reused for each query.
+    shown: std.ArrayList(u32) = .empty,
+    /// The row the left button went down on; it runs if the button comes
+    /// up on it too.
+    pressed: ?usize = null,
+    /// The system's message font at `font_dpi`, and the height of a line
+    /// of it, as the search bar's (`applyFont`).
+    font: ?win32.HGDIOBJ = null,
+    font_dpi: u32 = 0,
+    text_height: i32 = 0,
+    /// The brush the field and the list are painted with, of
+    /// `brush_color`.
+    brush: ?win32.HGDIOBJ = null,
+    brush_color: win32.COLORREF = 0,
+
+    /// Where the keyboard focus the window gives goes: the field while
+    /// the palette is open and shows; else null.
+    pub fn focusTarget(self: *const Palette) ?win32.HWND {
+        if (!self.open) return null;
+        const hwnd = self.hwnd orelse return null;
+        if (!SearchBar.visibleStyle(hwnd)) return null;
+        return self.edit;
+    }
+
+    /// Whether the keyboard focus is in the palette now.
+    fn holdsFocus(self: *const Palette) bool {
+        const hwnd = self.hwnd orelse return false;
+        const focus = Window.keyboardFocus() orelse return false;
+        return focus == hwnd or win32.IsChild(hwnd, focus).toBool();
+    }
+
+    /// Give the field and the list the message font at `dpi`, made once
+    /// for each DPI, measure a line of it, and size the rows for it.
+    fn applyFont(self: *Palette, dpi: u32) void {
+        if (self.font != null and self.font_dpi == dpi) return;
+        const edit = self.edit orelse return;
+        const font = messageFont(dpi) orelse return;
+        _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(font), 1);
+        if (self.list) |list| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(font), 0);
+        if (self.font) |old| _ = win32.DeleteObject(old);
+        self.font = font;
+        self.font_dpi = dpi;
+        self.text_height = SearchBar.textHeight(edit, font);
+        if (self.list) |list| {
+            const row: win32.LPARAM = Metrics.init(dpi).rowHeight(self.text_height);
+            _ = win32.SendMessageW(list, win32.LB_SETITEMHEIGHT, 0, row);
+        }
+    }
+
+    /// The brush for the field and the list, of `color`.
+    fn brushOf(self: *Palette, color: win32.COLORREF) ?win32.HGDIOBJ {
+        if (self.brush != null and self.brush_color == color) return self.brush;
+        const brush: win32.HGDIOBJ = win32.CreateSolidBrush(color) orelse return self.brush;
+        if (self.brush) |old| _ = win32.DeleteObject(old);
+        self.brush = brush;
+        self.brush_color = color;
+        return brush;
+    }
+
+    /// Free everything, as its window is destroyed.
+    fn free(self: *Palette, alloc: Allocator) void {
+        if (self.entries) |*e| e.deinit();
+        self.shown.deinit(alloc);
+        if (self.font) |f| _ = win32.DeleteObject(f);
+        if (self.brush) |b| _ = win32.DeleteObject(b);
+        self.* = .{};
+    }
+};
+
+/// An entry chosen while the core could not be re-entered, with the
+/// entries it is one of, for `run` to carry out (`App.Request.palette_run`).
+pub const Pending = struct {
+    entries: Entries,
+    index: usize,
+
+    pub fn entry(self: *const Pending) *const Entry {
+        return &self.entries.items[self.index];
+    }
+
+    /// Whether choosing it focuses `surface`.
+    pub fn jumpsTo(self: *const Pending, surface: *const Surface) bool {
+        return switch (self.entry().run) {
+            .jump => |s| s == surface,
+            .action => false,
+        };
+    }
+
+    pub fn destroy(self: *Pending, alloc: Allocator) void {
+        self.entries.deinit();
+        alloc.destroy(self);
+    }
+};
+
+/// `toggle_command_palette` on `surface`, carried out by `run`
+/// (`App.Request.palette`): its window's palette closes if it is open,
+/// else opens, as GTK's `toggle`.
+pub fn toggle(surface: *Surface) void {
+    const window = surface.window;
+    if (window.palette.hwnd != null) return close(window);
+    _ = open(surface);
+}
+
+/// Open `surface`'s window's palette, with every entry listed and the
+/// first selected, and give its field the keyboard focus; whether it
+/// opened. Not for a closing terminal or window, nor over a title prompt,
+/// which holds the frame disabled; nor where it does not fit (`place`).
+pub fn open(surface: *Surface) bool {
+    const window = surface.window;
+    const app = window.app;
+    const p = &window.palette;
+    if (p.hwnd != null) return true;
+    if (surface.closing or window.closing) return false;
+    if (window.title_prompt.hwnd != null) {
+        log.info("no command palette over a title prompt", .{});
+        return false;
+    }
+    const entries = forApp(app, null) catch |err| {
+        log.warn("cannot list the command palette's entries err={}", .{err});
+        return false;
+    };
+    const hwnd = win32.CreateWindowExW(
+        0,
+        L(class_name),
+        null,
+        win32.WS_CHILD | win32.WS_CLIPSIBLINGS | win32.WS_CLIPCHILDREN,
+        0,
+        0,
+        0,
+        0,
+        window.hwnd,
+        null,
+        app.hinstance,
+        window,
+    ) orelse {
+        log.warn("cannot make a command palette err={}", .{win32.GetLastError()});
+        var e = entries;
+        e.deinit();
+        return false;
+    };
+    // From here its WM_DESTROY frees all of it. It is for the window's
+    // focused terminal, as GTK's runs on its window's active surface, which
+    // is the one that asked unless an `all:` binding asked from every one.
+    p.hwnd = hwnd;
+    p.entries = entries;
+    p.surface = window.tab().focused orelse surface;
+    const edit = win32.CreateWindowExW(
+        0,
+        L("EDIT"),
+        L(""),
+        win32.WS_CHILD | win32.WS_VISIBLE | win32.ES_AUTOHSCROLL,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        app.hinstance,
+        null,
+    ) orelse return failed(hwnd, "field");
+    p.edit = edit;
+    const old_edit = win32.SetWindowLongPtrW(edit, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
+    if (edit_proc == null) edit_proc = @ptrFromInt(@as(usize, @bitCast(old_edit)));
+    // GTK's placeholder.
+    _ = win32.SendMessageW(edit, win32.EM_SETCUEBANNER, 0, @bitCast(@intFromPtr(L("Execute a command\u{2026}"))));
+    // Before the list, whose WM_MEASUREITEM reads the line's height.
+    p.applyFont(Window.dpiOf(app, window.hwnd));
+    const list = win32.CreateWindowExW(
+        0,
+        L("LISTBOX"),
+        null,
+        win32.WS_CHILD | win32.WS_VISIBLE | win32.WS_VSCROLL | win32.LBS_NOTIFY |
+            win32.LBS_OWNERDRAWFIXED | win32.LBS_HASSTRINGS | win32.LBS_NOINTEGRALHEIGHT,
+        0,
+        0,
+        0,
+        0,
+        hwnd,
+        null,
+        app.hinstance,
+        null,
+    ) orelse return failed(hwnd, "list");
+    p.list = list;
+    const old_list = win32.SetWindowLongPtrW(list, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&listProc)));
+    if (list_proc == null) list_proc = @ptrFromInt(@as(usize, @bitCast(old_list)));
+    if (p.font) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
+    refill(window, "");
+    p.open = true;
+    if (!place(window)) return false;
+    window.setKeyboardFocus(edit, true);
+    return true;
+}
+
+/// A child of a palette being opened could not be made: logged, and the
+/// palette destroyed, which frees it.
+fn failed(hwnd: win32.HWND, what: []const u8) bool {
+    log.warn("cannot make the command palette's {s} err={}", .{ what, win32.GetLastError() });
+    _ = win32.DestroyWindow(hwnd);
+    return false;
+}
+
+/// Close `window`'s palette, if it is open: the terminal gets the
+/// keyboard focus if the palette had it, then the palette's window is
+/// destroyed, which frees what it held.
+pub fn close(window: *Window) void {
+    const p = &window.palette;
+    const hwnd = p.hwnd orelse return;
+    const had_focus = p.holdsFocus();
+    p.open = false;
+    if (had_focus) {
+        if (window.tab().focused) |s| window.setKeyboardFocus(Window.focusTarget(s), true);
+    }
+    _ = win32.DestroyWindow(hwnd);
+}
+
+/// Escape or Enter in the field closed the palette: the key's release
+/// would reach the terminal that took the focus, which never saw it
+/// pressed, and a program that asked for key releases would see one
+/// alone, so the terminal withholds it, as after a title prompt
+/// (`TitleDialog.closedByKey`).
+fn closedByKey(window: *Window, lparam: win32.LPARAM) void {
+    const surface = window.tab().focused orelse return;
+    if (Window.focusTarget(surface) != surface.hwnd) return;
+    if (Window.keyboardFocus() != surface.hwnd) return;
+    surface.withholdKeyUp(lparam);
+}
+
+/// `window` was deactivated (its WM_ACTIVATE): its palette closes, as GTK's
+/// dialog does, once the deactivation is over, by a message to itself:
+/// inside WM_ACTIVATE the focus is still in the field, and destroying it
+/// there would hand the focus to the frame, and from there to a terminal,
+/// in a window that is losing it, perhaps to a confirmation prompt whose
+/// core frame is on the stack.
+pub fn deactivated(window: *Window) void {
+    const hwnd = window.palette.hwnd orelse return;
+    _ = win32.PostMessageW(hwnd, WM_PALETTE_CLOSE, 0, 0);
+}
+
+/// `surface` is beginning to close, or is freed: the palette open for it
+/// closes; another one lists it no more.
+pub fn forget(app: *App, surface: *Surface) void {
+    for (app.windows.items) |window| {
+        const p = &window.palette;
+        if (p.hwnd == null) continue;
+        if (p.surface == surface) {
+            close(window);
+            continue;
+        }
+        const entries = p.entries orelse continue;
+        const listed = for (entries.items) |e| {
+            if (e.run == .jump and e.run.jump == surface) break true;
+        } else false;
+        if (listed) relist(window, surface);
+    }
+}
+
+/// List `window`'s palette's entries again, without `gone`, keeping the
+/// query.
+fn relist(window: *Window, gone: *const Surface) void {
+    const p = &window.palette;
+    const fresh = forApp(window.app, gone) catch |err| {
+        // Its jump would focus a freed terminal: no palette rather than that.
+        log.warn("cannot list the command palette's entries again err={}", .{err});
+        return close(window);
+    };
+    if (p.entries) |*old| old.deinit();
+    p.entries = fresh;
+    textChanged(window);
+}
+
+/// `surface` took the focus in its window's shown tab
+/// (`Window.setFocused`): an open palette now runs on it. So the palette
+/// always runs on a terminal of its window's shown tab: one whose tab is
+/// replaced or moved to a new window hands it to the terminal of the tab
+/// shown next. Not from a terminal that is closing, which passes the focus
+/// on as it leaves its window: the palette closes with it (`forget`).
+pub fn focusMoved(window: *Window, surface: *Surface) void {
+    const p = &window.palette;
+    if (p.hwnd == null) return;
+    if (p.surface) |s| if (s.closing) return;
+    p.surface = surface;
+}
+
+/// Draw the palette again, as the theme changed.
+pub fn invalidate(window: *Window) void {
+    const p = &window.palette;
+    if (p.hwnd) |h| _ = win32.InvalidateRect(h, null, .TRUE);
+    if (p.edit) |h| _ = win32.InvalidateRect(h, null, .TRUE);
+    if (p.list) |h| _ = win32.InvalidateRect(h, null, .TRUE);
+}
+
+/// The system's message font changed: made again and placed.
+pub fn fontChanged(window: *Window) void {
+    if (window.palette.hwnd == null) return;
+    window.palette.font_dpi = 0;
+    _ = place(window);
+}
+
+/// Place `window`'s open palette at the top centre of the area under the
+/// tab bar, above the terminals and their search bars; whether it shows.
+/// One that no longer fits there (`paletteRect`) closes. Called by every
+/// layout (`Window.relayout`), which never runs inside a core frame.
+pub fn place(window: *Window) bool {
+    const p = &window.palette;
+    const hwnd = p.hwnd orelse return false;
+    if (!p.open) return false;
+    const dpi = Window.dpiOf(window.app, window.hwnd);
+    p.applyFont(dpi);
+    const m = Metrics.init(dpi);
+    const area = window.layoutArea() orelse return false;
+    const at = paletteRect(m, area, p.text_height) orelse {
+        log.info("no room for the command palette", .{});
+        close(window);
+        return false;
+    };
+    const width = at.right - at.left;
+    const height = at.bottom - at.top;
+    _ = win32.SetWindowPos(hwnd, win32.HWND_TOP, at.left, at.top, width, height, win32.SWP_NOACTIVATE | win32.SWP_SHOWWINDOW);
+    const l = Layout.init(m, width, height, p.text_height);
+    if (p.edit) |edit| _ = win32.SetWindowPos(edit, null, l.edit.left, l.edit.top, l.edit.right - l.edit.left, l.edit.bottom - l.edit.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    if (p.list) |list| _ = win32.SetWindowPos(list, null, l.list.left, l.list.top, l.list.right - l.list.left, l.list.bottom - l.list.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    invalidate(window);
+    return true;
+}
+
+/// The field's text changed (EN_CHANGE): the list shows what matches it,
+/// the first selected, as GTK's list selects its first item.
+fn textChanged(window: *Window) void {
+    const p = &window.palette;
+    const edit = p.edit orelse return;
+    const alloc = window.app.core_app.alloc;
+    const len: usize = @intCast(@max(win32.GetWindowTextLengthW(edit), 0));
+    const wide = alloc.alloc(u16, len + 1) catch |err| return log.warn("cannot read the command palette's field err={}", .{err});
+    defer alloc.free(wide);
+    const n: usize = @intCast(@max(win32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len)), 0));
+    const query = utf8FromWide(alloc, wide[0..n]) catch |err| return log.warn("cannot read the command palette's field err={}", .{err});
+    defer alloc.free(query);
+    refill(window, query);
+}
+
+/// Fill the list with the entries that match `query` (`filter`), the
+/// first selected.
+fn refill(window: *Window, query: []const u8) void {
+    const p = &window.palette;
+    const list = p.list orelse return;
+    const entries = p.entries orelse return;
+    const alloc = window.app.core_app.alloc;
+    filter(alloc, entries.items, query, &p.shown) catch |err| {
+        log.warn("cannot filter the command palette err={}", .{err});
+        p.shown.clearRetainingCapacity();
+    };
+    _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 0, 0);
+    _ = win32.SendMessageW(list, win32.LB_RESETCONTENT, 0, 0);
+    for (p.shown.items) |index| {
+        const wide = wideFromUtf8(alloc, entries.items[index].title) catch continue;
+        defer alloc.free(wide);
+        const row = win32.SendMessageW(list, win32.LB_ADDSTRING, 0, @bitCast(@intFromPtr(wide.ptr)));
+        if (row < 0) continue;
+        _ = win32.SendMessageW(list, win32.LB_SETITEMDATA, @intCast(row), index);
+    }
+    if (win32.SendMessageW(list, win32.LB_GETCOUNT, 0, 0) > 0) {
+        _ = win32.SendMessageW(list, win32.LB_SETCURSEL, 0, 0);
+        // A list with no room for a row, as this one is until `place`
+        // sizes it, scrolls past the row it selects (its top becomes row
+        // 1) and keeps that top once sized: so the top is set as well.
+        _ = win32.SendMessageW(list, win32.LB_SETTOPINDEX, 0, 0);
+    }
+    _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 1, 0);
+    _ = win32.InvalidateRect(list, null, .TRUE);
+}
+
+/// Up, Down, PgUp or PgDn in the field: the selection moves by `by` rows,
+/// a page being the rows the list shows (`step`).
+fn move(window: *Window, by: enum { up, down, page_up, page_down }) void {
+    const list = window.palette.list orelse return;
+    const count = win32.SendMessageW(list, win32.LB_GETCOUNT, 0, 0);
+    if (count <= 0) return;
+    const cur = win32.SendMessageW(list, win32.LB_GETCURSEL, 0, 0);
+    var client: RECT = undefined;
+    if (!win32.GetClientRect(list, &client).toBool()) client.bottom = 0;
+    const row = win32.SendMessageW(list, win32.LB_GETITEMHEIGHT, 0, 0);
+    const page: isize = if (row > 0) @max(1, @divTrunc(client.bottom, @as(i32, @intCast(row)))) else 1;
+    const delta: isize = switch (by) {
+        .up => -1,
+        .down => 1,
+        .page_up => -page,
+        .page_down => page,
+    };
+    const next = step(if (cur < 0) null else @intCast(cur), @intCast(count), delta) orelse return;
+    _ = win32.SendMessageW(list, win32.LB_SETCURSEL, next, 0);
+}
+
+/// The row `delta` rows from `cur` among `count`, kept within them, as a
+/// list's selection moves; from no selection, the first row down or the
+/// last up. Null with no rows.
+pub fn step(cur: ?usize, count: usize, delta: isize) ?usize {
+    if (count == 0) return null;
+    const from: isize = if (cur) |c| @intCast(@min(c, count - 1)) else if (delta > 0) -1 else @intCast(count);
+    return @intCast(std.math.clamp(from + delta, 0, @as(isize, @intCast(count - 1))));
+}
+
+/// Run the entry on the list's `row`: the palette closes, then the entry
+/// runs (`perform`). The entries are kept until it has.
+fn runRow(window: *Window, row: usize) void {
+    const p = &window.palette;
+    const list = p.list orelse return;
+    const surface = p.surface orelse return;
+    if (p.entries == null) return;
+    const data = win32.SendMessageW(list, win32.LB_GETITEMDATA, row, 0);
+    if (data < 0 or @as(usize, @intCast(data)) >= p.entries.?.items.len) return;
+    const entries = p.entries.?;
+    p.entries = null;
+    close(window);
+    perform(surface, entries, @intCast(data));
+}
+
+/// Enter in the field: the selected row runs, if there is one.
+fn runSelected(window: *Window) void {
+    const list = window.palette.list orelse return;
+    const cur = win32.SendMessageW(list, win32.LB_GETCURSEL, 0, 0);
+    if (cur < 0) return;
+    runRow(window, @intCast(cur));
+}
+
+/// Run `entries`' entry `index` on `surface`, owning `entries`: now if the
+/// core may be re-entered, as the search bar performs its keys; else
+/// recorded, with the entries, for `run` (`App.Request.palette_run`), as
+/// a key in the field is (`overlay_keys`).
+fn perform(surface: *Surface, entries: Entries, index: usize) void {
+    const app = surface.app;
+    const alloc = app.core_app.alloc;
+    var owned = entries;
+    if (!app.canReenterCore()) {
+        // Every surface a request names is live (`App.requests`).
+        const core = overlay_keys.coreOf(surface) orelse return owned.deinit();
+        const pending = alloc.create(Pending) catch |err| {
+            log.warn("cannot record a command palette entry err={}", .{err});
+            return owned.deinit();
+        };
+        pending.* = .{ .entries = owned, .index = index };
+        app.requests.append(alloc, .{ .palette_run = .{ .from = core, .pending = pending } }) catch |err| {
+            log.warn("cannot record a command palette entry err={}", .{err});
+            return pending.destroy(alloc);
+        };
+        app.wakeup();
+        return;
+    }
+    defer owned.deinit();
+    runNow(surface, owned.items[index].run);
+}
+
+/// An entry `perform` recorded, carried out by `run`, which frees it.
+pub fn replay(surface: *Surface, pending: *Pending) void {
+    defer pending.destroy(surface.app.core_app.alloc);
+    runNow(surface, pending.entry().run);
+}
+
+/// An entry's action, performed on `surface` as a key's binding would be
+/// (`SearchBar.perform`), then the focus move it chose; or the terminal
+/// a jump focuses, its window brought forward if it is another, its tab
+/// shown, as GTK presents it.
+fn runNow(surface: *Surface, run: Entry.Run) void {
+    switch (run) {
+        .action => |action| {
+            _ = SearchBar.perform(surface, action);
+            surface.app.applyPendingFocus();
+        },
+        .jump => |target| {
+            const window = target.window;
+            if (window != surface.window) _ = window.present();
+            window.focusFromGoto(target);
+        },
+    }
+}
+
+/// The procedure every EDIT and LISTBOX had before it was subclassed.
+var edit_proc: ?win32.WNDPROC = null;
+var list_proc: ?win32.WNDPROC = null;
+
+/// For tests: how many WM_CHARs the field's subclass passed on to the EDIT.
+pub var test_forwarded: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
+/// The window whose palette the window `hwnd` is, null once it is
+/// destroyed.
+fn windowOf(hwnd: win32.HWND) ?*Window {
+    const v = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
+    if (v == 0) return null;
+    return @ptrFromInt(@as(usize, @bitCast(v)));
+}
+
+/// The window whose palette holds the child `hwnd`, while it is open.
+fn windowOfChild(hwnd: win32.HWND) ?*Window {
+    const parent = win32.GetAncestor(hwnd, win32.GA_PARENT) orelse return null;
+    const window = windowOf(parent) orelse return null;
+    if (window.palette.hwnd != parent or !window.palette.open) return null;
+    return window;
+}
+
+/// The palette's window procedure. WM_NCCREATE brings its window.
+pub fn wndProc(
+    hwnd: win32.HWND,
+    msg: win32.UINT,
+    wparam: win32.WPARAM,
+    lparam: win32.LPARAM,
+) callconv(.winapi) win32.LRESULT {
+    if (msg == win32.WM_NCCREATE) {
+        const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
+        if (cs.lpCreateParams) |param| {
+            _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(param)));
+        }
+        return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    const window = windowOf(hwnd) orelse return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+    const p = &window.palette;
+
+    switch (msg) {
+        win32.WM_ERASEBKGND => return 1,
+
+        win32.WM_PAINT => {
+            paint(window, hwnd);
+            return 0;
+        },
+
+        // The field and the list in the palette's colours.
+        win32.WM_CTLCOLOREDIT, win32.WM_CTLCOLORLISTBOX => {
+            const colors = SearchBar.Colors.of(window.dark_frame);
+            const hdc: win32.HDC = @ptrFromInt(wparam);
+            _ = win32.SetTextColor(hdc, colors.text);
+            _ = win32.SetBkColor(hdc, colors.field);
+            const brush = p.brushOf(colors.field) orelse return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            return @bitCast(@intFromPtr(brush));
+        },
+
+        win32.WM_COMMAND => {
+            if (win32.hiword(wparam) == win32.EN_CHANGE and p.edit != null and
+                lparam == @as(win32.LPARAM, @bitCast(@intFromPtr(p.edit.?)))) textChanged(window);
+            return 0;
+        },
+
+        win32.WM_MEASUREITEM => {
+            const measure: *win32.MEASUREITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            measure.itemHeight = @intCast(Metrics.init(Window.dpiOf(window.app, hwnd)).rowHeight(p.text_height));
+            return 1;
+        },
+
+        win32.WM_DRAWITEM => {
+            const dis: *const win32.DRAWITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (p.list == null or dis.hwndItem != p.list) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            drawRow(window, dis);
+            return 1;
+        },
+
+        // The wheel over the field, which passes it here, scrolls the list.
+        win32.WM_MOUSEWHEEL => {
+            if (p.list) |list| return win32.SendMessageW(list, msg, wparam, lparam);
+        },
+
+        WM_PALETTE_CLOSE => {
+            // Unless the frame was activated again meanwhile.
+            if (win32.GetActiveWindow() != window.hwnd) close(window);
+            return 0;
+        },
+
+        win32.WM_DESTROY => {
+            p.free(window.app.core_app.alloc);
+            return 0;
+        },
+
+        win32.WM_NCDESTROY => {
+            _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
+        },
+
+        else => {},
+    }
+    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/// The field's subclass: the list's keys, Enter and Escape, the keys an
+/// EDIT gets wrong without a dialog manager, as in the search field
+/// (`SearchBar.editKey`), then the terminal's bindings that still act from
+/// a field (`overlay_keys`).
+fn editProc(
+    hwnd: win32.HWND,
+    msg: win32.UINT,
+    wparam: win32.WPARAM,
+    lparam: win32.LPARAM,
+) callconv(.winapi) win32.LRESULT {
+    const proc = edit_proc.?;
+    const window = windowOfChild(hwnd) orelse return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
+
+    if (msg == win32.WM_KEYDOWN) switch (wparam) {
+        win32.VK_UP => {
+            move(window, .up);
+            return 0;
+        },
+        win32.VK_DOWN => {
+            move(window, .down);
+            return 0;
+        },
+        win32.VK_PRIOR => {
+            move(window, .page_up);
+            return 0;
+        },
+        win32.VK_NEXT => {
+            move(window, .page_down);
+            return 0;
+        },
+        else => {},
+    };
+    switch (SearchBar.editKey(msg, wparam, false)) {
+        .pass => {},
+        .swallow => return 0,
+        // Nothing of the field is touched after either: it is destroyed.
+        .next, .previous => {
+            runSelected(window);
+            closedByKey(window, lparam);
+            return 0;
+        },
+        .close => {
+            close(window);
+            closedByKey(window, lparam);
+            return 0;
+        },
+        .delete_word => {
+            SearchBar.deleteWord(window.app.core_app.alloc, hwnd);
+            return 0;
+        },
+    }
+    if (window.palette.surface) |surface| {
+        if (overlay_keys.keyDown(surface, hwnd, proc, msg, wparam, lparam, .palette)) return 0;
+    }
+    if (builtin.is_test) if (msg == win32.WM_CHAR) {
+        test_forwarded += 1;
+    };
+    return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
+}
+
+/// The list's subclass: a click on a row selects it, and runs it when the
+/// button comes up on the same row, as GTK's list runs a row on a single
+/// click; the keyboard focus stays in the field.
+fn listProc(
+    hwnd: win32.HWND,
+    msg: win32.UINT,
+    wparam: win32.WPARAM,
+    lparam: win32.LPARAM,
+) callconv(.winapi) win32.LRESULT {
+    const proc = list_proc.?;
+    const window = windowOfChild(hwnd) orelse return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
+    const p = &window.palette;
+    switch (msg) {
+        win32.WM_LBUTTONDOWN, win32.WM_LBUTTONDBLCLK => {
+            if (p.edit) |edit| window.setKeyboardFocus(edit, true);
+            const row = rowAt(hwnd, lparam) orelse return 0;
+            _ = win32.SendMessageW(hwnd, win32.LB_SETCURSEL, row, 0);
+            // Captured first: SetCapture cancels a press the list held.
+            if (win32.GetCapture() != hwnd) _ = win32.SetCapture(hwnd);
+            p.pressed = row;
+            return 0;
+        },
+        win32.WM_LBUTTONUP => {
+            const pressed = p.pressed;
+            p.pressed = null;
+            if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
+            const row = rowAt(hwnd, lparam) orelse return 0;
+            if (pressed != row) return 0;
+            // Nothing of the list is touched after: it is destroyed.
+            runRow(window, row);
+            return 0;
+        },
+        win32.WM_CAPTURECHANGED => {
+            p.pressed = null;
+            return 0;
+        },
+        // Keys go to the field, which moves the list.
+        win32.WM_SETFOCUS => {
+            if (p.edit) |edit| window.setKeyboardFocus(edit, true);
+            return 0;
+        },
+        else => {},
+    }
+    return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
+}
+
+/// The row under the list's client point in `lparam`, if any.
+fn rowAt(list: win32.HWND, lparam: win32.LPARAM) ?usize {
+    const x = win32.xLparam(lparam);
+    const y = win32.yLparam(lparam);
+    if (x < 0 or y < 0) return null;
+    const at: usize = @bitCast(win32.SendMessageW(list, win32.LB_ITEMFROMPOINT, 0, lparam));
+    // The high word is 1 for a point past the last row.
+    if ((at >> 16) & 0xFFFF != 0) return null;
+    return at & 0xFFFF;
+}
+
+fn paint(window: *Window, hwnd: win32.HWND) void {
+    const p = &window.palette;
+    var ps: win32.PAINTSTRUCT = undefined;
+    const hdc = win32.BeginPaint(hwnd, &ps) orelse return;
+    defer _ = win32.EndPaint(hwnd, &ps);
+    var client: RECT = undefined;
+    if (!win32.GetClientRect(hwnd, &client).toBool()) return;
+    const dpi = Window.dpiOf(window.app, hwnd);
+    const colors = SearchBar.Colors.of(window.dark_frame);
+    const m = Metrics.init(dpi);
+    const l = Layout.init(m, client.right, client.bottom, p.text_height);
+    const line = @max(1, SearchBar.Metrics.scale(1, dpi));
+    // The palette, framed; the field's box, framed, behind the EDIT.
+    SearchBar.fill(hdc, client, colors.border);
+    SearchBar.fill(hdc, SearchBar.inset(client, line), colors.bar);
+    SearchBar.fill(hdc, l.field, colors.border);
+    SearchBar.fill(hdc, SearchBar.inset(l.field, line), colors.field);
+}
+
+/// One of the list's rows: its background, selected or not, the title and
+/// under it the action key or the description, and the shortcut on the
+/// right, centred down the row, as GTK's row shows them.
+fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
+    const p = &window.palette;
+    const colors = SearchBar.Colors.of(window.dark_frame);
+    const hdc = dis.hDC;
+    const selected = dis.itemState & win32.ODS_SELECTED != 0;
+    SearchBar.fill(hdc, dis.rcItem, if (selected) colors.hover else colors.field);
+    // An empty list's focus rect has no item.
+    if (dis.itemID == std.math.maxInt(win32.UINT)) return;
+    const entries = p.entries orelse return;
+    if (dis.itemData >= entries.items.len) return;
+    const entry = &entries.items[dis.itemData];
+    const alloc = window.app.core_app.alloc;
+
+    _ = win32.SetBkMode(hdc, win32.TRANSPARENT);
+    const old_font = if (p.font) |f| win32.SelectObject(hdc, f) else null;
+    defer if (old_font) |f| {
+        _ = win32.SelectObject(hdc, f);
+    };
+    const m = Metrics.init(Window.dpiOf(window.app, dis.hwndItem orelse window.hwnd));
+    const flags = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
+
+    // The shortcut's width first, as the title gives way to it.
+    var shortcut_w: i32 = 0;
+    const shortcut = wideFromUtf8(alloc, entry.shortcut) catch null;
+    defer if (shortcut) |s| alloc.free(s);
+    if (shortcut) |s| if (s.len > 0) {
+        var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_CALCRECT);
+        shortcut_w = r.right - r.left;
+    };
+    const row = Row.init(m, dis.rcItem, p.text_height, shortcut_w);
+    if (shortcut) |s| if (s.len > 0) {
+        var r = row.shortcut;
+        _ = win32.SetTextColor(hdc, colors.dim);
+        _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_RIGHT | win32.DT_VCENTER);
+    };
+    if (wideFromUtf8(alloc, entry.title)) |title| {
+        defer alloc.free(title);
+        var r = row.title;
+        _ = win32.SetTextColor(hdc, colors.text);
+        _ = win32.DrawTextW(hdc, title.ptr, @intCast(title.len), &r, flags | win32.DT_END_ELLIPSIS);
+    } else |_| {}
+    const sub = entry.subtitle();
+    if (sub.len > 0) if (wideFromUtf8(alloc, sub)) |text| {
+        defer alloc.free(text);
+        var r = row.subtitle;
+        _ = win32.SetTextColor(hdc, colors.dim);
+        _ = win32.DrawTextW(hdc, text.ptr, @intCast(text.len), &r, flags | win32.DT_END_ELLIPSIS);
+    } else |_| {};
+}
+
+/// The palette's sizes at a DPI, from their values at 96 DPI: GTK's
+/// dialog is 700 wide (command-palette.blp's `content-width`) and its list
+/// at least 300 tall (`min-content-height`), eight rows here.
+pub const Metrics = struct {
+    /// Between the palette and the top and sides of the area under the
+    /// tab bar.
+    margin: i32,
+    /// Its width, and the least it narrows to before it no longer fits.
+    width: i32,
+    min_width: i32,
+    /// Inside its edges, and between the field and the list.
+    pad: i32,
+    gap: i32,
+    /// Between the field's box and its text.
+    inset: i32,
+    /// Above and below a row's two lines, and either side of them.
+    row_pad: i32,
+    row_inset: i32,
+    /// The rows the list shows when there is room.
+    rows: i32,
+
+    pub fn init(dpi: u32) Metrics {
+        const s = SearchBar.Metrics.scale;
+        return .{
+            .margin = s(8, dpi),
+            .width = s(700, dpi),
+            .min_width = s(240, dpi),
+            .pad = s(8, dpi),
+            .gap = s(6, dpi),
+            .inset = s(4, dpi),
+            .row_pad = s(4, dpi),
+            .row_inset = s(8, dpi),
+            .rows = 8,
+        };
+    }
+
+    /// The field's box, for a line of text `text_height` tall.
+    pub fn boxHeight(self: Metrics, text_height: i32) i32 {
+        return @max(0, text_height) + 2 * self.inset;
+    }
+
+    /// A row: two lines of text.
+    pub fn rowHeight(self: Metrics, text_height: i32) i32 {
+        return 2 * @max(0, text_height) + 2 * self.row_pad;
+    }
+
+    /// Above the list: the edge and the field.
+    fn head(self: Metrics, text_height: i32) i32 {
+        return self.pad + self.boxHeight(text_height) + self.gap;
+    }
+};
+
+/// Where the palette goes in `area`, the frame's client area under the tab
+/// bar: `margin` below its top, centred across it, `width` wide or as wide
+/// as the area leaves, with as many rows up to `rows` as its height
+/// leaves; null when it leaves less than `min_width` or one row.
+pub fn paletteRect(m: Metrics, area: RECT, text_height: i32) ?RECT {
+    const room_w = area.right - area.left - 2 * m.margin;
+    const width = @min(m.width, room_w);
+    if (width < m.min_width) return null;
+    const row = m.rowHeight(text_height);
+    const room_h = area.bottom - area.top - 2 * m.margin - m.head(text_height) - m.pad;
+    if (row <= 0 or room_h < row) return null;
+    const rows = @min(m.rows, @divTrunc(room_h, row));
+    const left = area.left + @divTrunc(area.right - area.left - width, 2);
+    const top = area.top + m.margin;
+    return .{ .left = left, .top = top, .right = left + width, .bottom = top + m.head(text_height) + rows * row + m.pad };
+}
+
+/// What a palette `width` by `height` holds, in its own client
+/// coordinates: the field's box at the top (the EDIT inside it, as tall
+/// as a line of text), and the list under it to the bottom edge.
+pub const Layout = struct {
+    field: RECT,
+    edit: RECT,
+    list: RECT,
+
+    pub fn init(m: Metrics, width: i32, height: i32, text_height: i32) Layout {
+        const right = @max(m.pad, width - m.pad);
+        const field: RECT = .{ .left = m.pad, .top = m.pad, .right = right, .bottom = m.pad + m.boxHeight(text_height) };
+        const edit: RECT = .{
+            .left = field.left + m.inset,
+            .top = field.top + m.inset,
+            .right = @max(field.left + m.inset, field.right - m.inset),
+            .bottom = field.top + m.inset + @max(0, text_height),
+        };
+        const top = m.head(text_height);
+        const list: RECT = .{ .left = m.pad, .top = top, .right = right, .bottom = @max(top, height - m.pad) };
+        return .{ .field = field, .edit = edit, .list = list };
+    }
+};
+
+/// A row of the list at `item`: the title on the first line and the
+/// subtitle on the second, `row_inset` in from either side, leaving the
+/// shortcut, `shortcut_w` wide, on the right, centred down the row.
+pub const Row = struct {
+    title: RECT,
+    subtitle: RECT,
+    shortcut: RECT,
+
+    pub fn init(m: Metrics, item: RECT, text_height: i32, shortcut_w: i32) Row {
+        const right = @max(item.left + m.row_inset, item.right - m.row_inset);
+        const shortcut_left = @max(item.left + m.row_inset, right - @max(0, shortcut_w));
+        const text_right = if (shortcut_w > 0) @max(item.left + m.row_inset, shortcut_left - m.row_inset) else right;
+        const h = @max(0, text_height);
+        const top = item.top + m.row_pad;
+        return .{
+            .title = .{ .left = item.left + m.row_inset, .top = top, .right = text_right, .bottom = top + h },
+            .subtitle = .{ .left = item.left + m.row_inset, .top = top + h, .right = text_right, .bottom = top + 2 * h },
+            .shortcut = .{ .left = shortcut_left, .top = item.top, .right = right, .bottom = item.bottom },
+        };
+    }
+};
+
 const testing = std.testing;
 const Config = @import("../../config.zig").Config;
+
+test "win32: the command palette sits at the top centre of the area under the tab bar, or not at all" {
+    const m = Metrics.init(96);
+    try testing.expectEqual(16 + 8, m.boxHeight(16));
+    try testing.expectEqual(32 + 8, m.rowHeight(16));
+    try testing.expectEqual(1050, Metrics.init(144).width);
+    // A wide area: 700 wide, centred, 8 below its top, with eight rows.
+    const area: RECT = .{ .left = 0, .top = 30, .right = 1000, .bottom = 800 };
+    const head = 8 + 24 + 6;
+    try testing.expectEqual(RECT{ .left = 150, .top = 38, .right = 850, .bottom = 38 + head + 8 * 40 + 8 }, paletteRect(m, area, 16).?);
+    // A narrower one: the palette narrows to it, down to 240.
+    const narrow = paletteRect(m, .{ .left = 100, .top = 0, .right = 500, .bottom = 800 }, 16).?;
+    try testing.expectEqual(RECT{ .left = 108, .top = 8, .right = 492, .bottom = 8 + head + 8 * 40 + 8 }, narrow);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 256, .bottom = 800 }, 16) != null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 255, .bottom = 800 }, 16) == null);
+    // A short one: fewer rows, down to one.
+    const short = paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 8 + head + 3 * 40 + 39 + 8 + 8 }, 16).?;
+    try testing.expectEqual(head + 3 * 40 + 8, short.bottom - short.top);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 8 + head + 40 + 8 + 8 }, 16) != null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 8 + head + 40 + 8 + 7 }, 16) == null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, 16) == null);
+}
+
+test "win32: the command palette's field and list, and a row's parts" {
+    const m = Metrics.init(96);
+    const l = Layout.init(m, 700, 400, 16);
+    try testing.expectEqual(RECT{ .left = 8, .top = 8, .right = 692, .bottom = 32 }, l.field);
+    try testing.expectEqual(RECT{ .left = 12, .top = 12, .right = 688, .bottom = 28 }, l.edit);
+    try testing.expectEqual(RECT{ .left = 8, .top = 38, .right = 692, .bottom = 392 }, l.list);
+    // No room: nothing negative.
+    const none = Layout.init(m, 0, 0, 0);
+    try testing.expect(none.edit.right >= none.edit.left and none.list.bottom >= none.list.top);
+
+    const item: RECT = .{ .left = 0, .top = 40, .right = 600, .bottom = 80 };
+    const r = Row.init(m, item, 16, 100);
+    try testing.expectEqual(RECT{ .left = 492, .top = 40, .right = 592, .bottom = 80 }, r.shortcut);
+    try testing.expectEqual(RECT{ .left = 8, .top = 44, .right = 484, .bottom = 60 }, r.title);
+    try testing.expectEqual(RECT{ .left = 8, .top = 60, .right = 484, .bottom = 76 }, r.subtitle);
+    // No shortcut: the text goes to the right edge.
+    try testing.expectEqual(592, Row.init(m, item, 16, 0).title.right);
+}
+
+test "win32: the command palette's selection moves within its rows" {
+    try testing.expectEqual(1, step(0, 5, 1).?);
+    try testing.expectEqual(0, step(1, 5, -1).?);
+    // Kept within them, not wrapped.
+    try testing.expectEqual(0, step(0, 5, -1).?);
+    try testing.expectEqual(4, step(4, 5, 1).?);
+    try testing.expectEqual(4, step(1, 5, 8).?);
+    try testing.expectEqual(0, step(3, 5, -8).?);
+    // From no selection: the first down, the last up.
+    try testing.expectEqual(0, step(null, 5, 1).?);
+    try testing.expectEqual(4, step(null, 5, -1).?);
+    try testing.expect(step(null, 0, 1) == null);
+    try testing.expect(step(2, 0, -1) == null);
+}
 
 fn testLabel(buf: []u8, trigger: Binding.Trigger) ![]const u8 {
     var w: std.Io.Writer = .fixed(buf);

@@ -1,5 +1,6 @@
-//! Keys typed into an overlay's field, as the search bar's: which of the
-//! terminal's bindings still act while the field has the keyboard focus.
+//! Keys typed into an overlay's field, the search bar's or the command
+//! palette's: which of the terminal's bindings still act while the field
+//! has the keyboard focus.
 //!
 //! GTK's overlays keep the window's accelerators working while their entry
 //! has the focus; the entry takes everything else. Here the field's own
@@ -211,6 +212,11 @@ pub fn fieldOwns(vk: win32.UINT, mods: input.Mods, typed: bool) bool {
     };
 }
 
+/// Which field a key was typed in: a terminal's search field, or its
+/// window's command palette's, open for that terminal. Copy, paste and
+/// select all act on it.
+pub const Field = enum { search, palette };
+
 /// What a binding found for a field's key did.
 const Outcome = enum {
     /// Performed, or recorded to be (`App.requests`).
@@ -227,7 +233,7 @@ const Outcome = enum {
 /// queued characters were then taken from the queue, so that the EDIT
 /// does not act on them too (Ctrl+Shift+V's U+0016 would paste a second
 /// time), and given back to it after the key if the key goes on to it.
-/// `proc` is the EDIT's own procedure.
+/// `proc` is the EDIT's own procedure; `field` says which field it is.
 pub fn keyDown(
     surface: *Surface,
     edit: win32.HWND,
@@ -235,6 +241,7 @@ pub fn keyDown(
     msg: win32.UINT,
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
+    field: Field,
 ) bool {
     if (msg != win32.WM_KEYDOWN and msg != win32.WM_SYSKEYDOWN) return false;
     const vk: win32.UINT = @truncate(wparam);
@@ -263,7 +270,7 @@ pub fn keyDown(
 
     var taken: Queued.Taken = .{};
     taken.take(edit);
-    switch (perform(surface, edit, entry.key_ptr.*, &leaf, .now)) {
+    switch (perform(surface, edit, field, entry.key_ptr.*, &leaf, .now)) {
         .done => {},
         .done_and_field => {
             _ = win32.CallWindowProcW(proc, edit, msg, wparam, lparam);
@@ -280,8 +287,10 @@ pub fn keyDown(
 /// recorded in `App.requests` by its trigger and carried out by `run`: it
 /// is looked up again, so a reload in between gives the binding the
 /// configuration now has, and performed if it is still allowed. Copy,
-/// paste and select all act on `from`'s search field if it still has one.
-pub fn replay(from: *CoreSurface, trigger: Binding.Trigger) void {
+/// paste and select all act on the field the key was typed in, if it is
+/// still there: `from`'s search field, or its window's command palette's
+/// while that is open for it.
+pub fn replay(from: *CoreSurface, trigger: Binding.Trigger, field: Field) void {
     const surface = from.rt_surface;
     const set = bindingsOf(surface) orelse return;
     const entry = set.set.get(trigger) orelse return;
@@ -290,7 +299,15 @@ pub fn replay(from: *CoreSurface, trigger: Binding.Trigger) void {
         inline .leaf, .leaf_chained => |*v| v.generic(),
     };
     if (!allowed(&leaf)) return;
-    _ = perform(surface, surface.search_bar.edit, trigger, &leaf, .replay);
+    const edit: ?win32.HWND = switch (field) {
+        .search => surface.search_bar.edit,
+        .palette => palette: {
+            const p = &surface.window.palette;
+            if (!p.open or p.surface != surface) break :palette null;
+            break :palette p.edit;
+        },
+    };
+    _ = perform(surface, edit, field, trigger, &leaf, .replay);
     surface.app.applyPendingFocus();
 }
 
@@ -318,6 +335,7 @@ fn allowed(leaf: *const Binding.Set.GenericLeaf) bool {
 fn perform(
     surface: *Surface,
     edit: ?win32.HWND,
+    field: Field,
     trigger: Binding.Trigger,
     leaf: *const Binding.Set.GenericLeaf,
     when: enum { now, replay },
@@ -334,8 +352,9 @@ fn perform(
         app.requests.append(app.core_app.alloc, .{ .overlay_key = .{
             .from = core,
             .trigger = trigger,
+            .field = field,
         } }) catch |err| {
-            log.warn("cannot record a binding from a search field err={}", .{err});
+            log.warn("cannot record a binding from a field err={}", .{err});
             return .done;
         };
         app.wakeup();
