@@ -267,11 +267,15 @@ fn addLinuxAppResources(
         },
     });
 
+    // How the files below launch Ghostty. See -Dinstalled-exe-path.
+    const exe = cfg.installed_exe_path orelse "ghostty";
+
     // Variables used by the templates.
     // Fields are nullable since unused fields trigger a build failure.
     const Variables = struct {
         NAME: ?[]const u8 = null,
         APPID: ?[]const u8 = null,
+        GHOSTTY: ?[]const u8 = null,
     };
 
     // The templates that we will process. The templates are in
@@ -284,8 +288,9 @@ fn addLinuxAppResources(
 
         // Desktop file so that we have an icon and other metadata
         try ts.append(b.allocator, .{
-            b.path("dist/linux/app.desktop.in"), b.fmt("share/applications/{s}.desktop", .{app_id}),
-            .{ .NAME = name, .APPID = app_id },
+            b.path("dist/linux/app.desktop.in"),
+            b.fmt("share/applications/{s}.desktop", .{app_id}),
+            .{ .NAME = name, .APPID = app_id, .GHOSTTY = exe },
         });
 
         // Service for DBus activation.
@@ -295,7 +300,7 @@ fn addLinuxAppResources(
             else
                 b.path("dist/linux/dbus.service.in"),
             b.fmt("share/dbus-1/services/{s}.service", .{app_id}),
-            .{ .APPID = app_id },
+            .{ .APPID = app_id, .GHOSTTY = exe },
         });
 
         // `systemd` user service. This is kind of nasty but `systemd` looks for
@@ -324,7 +329,7 @@ fn addLinuxAppResources(
                     app_id,
                 },
             ),
-            .{ .NAME = name, .APPID = app_id },
+            .{ .NAME = name, .APPID = app_id, .GHOSTTY = exe },
         });
 
         // AppStream metainfo so that application has rich metadata

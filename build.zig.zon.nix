@@ -98,10 +98,10 @@
       url = "https://deps.files.ghostty.org/N-V-__8AAEbOfQBnvcFcCX2W5z7tDaN8vaNZGamEQtNOe0UI.tar.gz";
       hash = "sha256-/jVT7+874LCeSF/pdNVTFoSOfRisSqxCJnt5/SGCXPQ=";
     };
-    "N-V-__8AAI2WBQDrsjfyEiqnmYZ4VfGdJaZhN2mKsaTaIVWq" = fetchzip {
+    "N-V-__8AAJ3vBQAq1fLMh5J8uWLkeDLS6WAdR2x5KcrmEyz6" = fetchzip {
       name = "iterm2_themes";
-      url = "https://deps.files.ghostty.org/ghostty-themes-release-20261012-151317-d3e95e4.tgz";
-      hash = "sha256-cC8U6wYmluVf/7Pc2FoAs1C6xQNBgwLrfwJ5gkO5VTo=";
+      url = "https://deps.files.ghostty.org/ghostty-themes-release-20261019-151001-86a776d.tgz";
+      hash = "sha256-x/hcGF3iiHl9ZF3AWsASJS8biQdTL1vFHf1CvHU7KOE=";
     };
     "N-V-__8AAIC5lwAVPJJzxnCAahSvZTIlG-HhtOvnM1uh-66x" = fetchurl {
       url = "https://deps.files.ghostty.org/JetBrainsMono-2.304.tar.gz";
@@ -186,10 +186,10 @@
       url = "https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz";
       hash = "sha256-sOuwt3R6xG7oqXaA66QGUjFHrEjGnTXjwYs6rSRb+7I=";
     };
-    "z2d-0.12.2-pre-j5P_HilCEQDH_2RC0PZqYQd4rHTl13b-VXpaDQ1sE4kZ" = fetchzip {
+    "z2d-0.13.0-j5P_HgsRFABzZDH54gI35P0OSrg7HFyJwS2bXX5uBdU4" = fetchzip {
       name = "z2d";
-      url = "https://deps.files.ghostty.org/z2d-f3cf28188dae39946964c81475ff234c008125a6.tar.gz";
-      hash = "sha256-VF45ZKB+EWy219JTRSWSo+SnXJXsdztfWe8Wa5fGB+k=";
+      url = "https://deps.files.ghostty.org/z2d-40af3e84a4e15a9f31d126b3f281f23ce6a3dae5.tar.gz";
+      hash = "sha256-3fpPl8dvDhqJMa4xreFSKHSqaXSNdP+22kQUQobTOEY=";
     };
     "zf-0.11.0-OIRy8XCRAAB6FiMwIrtD6FqlagnFwpI6YyOu7bXeYH5J" = fetchzip {
       name = "zf";

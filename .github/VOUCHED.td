@@ -44,6 +44,7 @@ alex19ep
 alexbathome
 alexfeijoo44
 alexjuca
+aljohri
 alosarjos
 amadeus
 and-rs
@@ -177,6 +178,7 @@ hulet
 i999rri
 ibaios
 icodesign
+-ifmael
 illiakrauchanka
 j-c-m
 j0hnm4r5
@@ -223,6 +225,7 @@ kristofersoler
 kylesower
 laxystem
 lebdron
+lehni
 lepips
 liby
 linustalacko
@@ -289,6 +292,7 @@ nwehg
 ocean6954
 ollieatkinson
 ollioddi
+olrtg
 oshdubh
 otomn
 paaloeye
