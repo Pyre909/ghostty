@@ -21,6 +21,7 @@ const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
+const KeyState = @import("KeyState.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -1177,6 +1178,8 @@ pub const App = struct {
             .prompt_title => self.requestTitlePrompt(target, value),
             .toggle_command_palette => self.requestPalette(target),
             .mouse_over_link => linkPreview(target, value),
+            .key_sequence => keySequence(target, value),
+            .key_table => keyTable(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1231,6 +1234,30 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| LinkPreview.show(v.rt_surface, value.url),
+        };
+    }
+
+    /// `.key_sequence`, from the core's key callback: the terminal's
+    /// key-state indicator adds the key to the pending sequence or clears
+    /// it, as GTK's overlay does (`KeyState.sequence`). `false` for the
+    /// app, and for a terminal whose indicator could not take the key or
+    /// be made.
+    fn keySequence(target: apprt.Target, value: apprt.action.KeySequence) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| KeyState.sequence(v.rt_surface, value),
+        };
+    }
+
+    /// `.key_table`, from the core's key callback and a configuration
+    /// change: the terminal's key-state indicator pushes or pops a key
+    /// table, as GTK's overlay does (`KeyState.table`). `false` for the
+    /// app, and for a terminal whose indicator could not take the table or
+    /// be made.
+    fn keyTable(target: apprt.Target, value: apprt.action.KeyTable) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| KeyState.table(v.rt_surface, value),
         };
     }
 
@@ -11967,4 +11994,297 @@ test "win32: a link preview goes with its terminal, shown or not" {
     try std.testing.expectEqual(0, app.windows.items.len);
     try std.testing.expectEqual(0, app.surfaces.items.len);
     try std.testing.expect(Overlays.test_detached > 0);
+}
+
+/// For tests: the core's `key_table` on `surface`, as its key callback
+/// sends it.
+fn testKeyTable(app: *App, surface: *Surface, value: apprt.action.KeyTable) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .key_table, value);
+}
+
+/// For tests: the core's `key_sequence` on `surface`, as its key callback
+/// sends it.
+fn testKeySequence(app: *App, surface: *Surface, value: apprt.action.KeySequence) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .key_sequence, value);
+}
+
+/// For tests: the text of `surface`'s key-state indicator window, as UTF-8
+/// in `buf`.
+fn keyStateText(surface: *const Surface, buf: []u8) ![]const u8 {
+    var wide: [512]u16 = undefined;
+    const n = win32.GetWindowTextW(surface.overlays.key_state.hwnd.?, &wide, wide.len);
+    const len = try std.unicode.utf16LeToUtf8(buf, wide[0..@intCast(n)]);
+    return buf[0..len];
+}
+
+/// For tests: `surface`'s key-state indicator shows in `window` at its
+/// terminal's bottom centre, a margin above its bottom, as big as its
+/// text with GTK's padding, just above the terminal, or above its link
+/// preview while that shows.
+fn expectKeyStateAt(window: *const Window, surface: *const Surface) !void {
+    const k = &surface.overlays.key_state;
+    const hwnd = k.hwnd.?;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(k.text_size.width > 0 and k.text_size.height > 0);
+    const pane = try paneRect(window, surface);
+    const m = KeyState.Metrics.init(Window.dpiOf(window.app, window.hwnd));
+    const width = @min(k.text_size.width + 2 * m.pad_x, pane.right - pane.left - 2 * m.margin);
+    const height = k.text_size.height + 2 * m.pad_y;
+    const left = pane.left + @divTrunc(pane.right - pane.left - width, 2);
+    try std.testing.expectEqual(
+        win32.RECT{ .left = left, .top = pane.bottom - m.margin - height, .right = left + width, .bottom = pane.bottom - m.margin },
+        try childRect(window, hwnd),
+    );
+    const preview = surface.overlays.link_preview.hwnd.?;
+    const under = if (shown(preview)) preview else surface.hwnd;
+    try std.testing.expect(win32.GetWindow(under, win32.GW_HWNDPREV) == hwnd);
+}
+
+test "win32: key_table and key_sequence show the active tables and pending keys at the terminal's bottom centre" {
+    // GTK's key-state overlay: the tables joined with " > ", a chevron,
+    // the sequence's keys and an ellipsis for its spinner, at the bottom
+    // centre of the terminal, hidden while there is nothing to show. The
+    // window is made the first time there is.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+
+    // Not for the app.
+    try std.testing.expect(!try app.performAction(.app, .key_table, .{ .activate = "nav" }));
+    try std.testing.expect(!try app.performAction(.app, .key_sequence, .end));
+    try std.testing.expect(a.overlays.key_state.hwnd == null);
+
+    // A table: its name.
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav", try keyStateText(a, &buf));
+    const hwnd = a.overlays.key_state.hwnd.?;
+    const one = try childRect(window, hwnd);
+
+    // Another on it: both, wider.
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "resize" }));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav > resize", try keyStateText(a, &buf));
+    try std.testing.expect((try childRect(window, hwnd)).right > one.right);
+
+    // A sequence's keys after them, as Windows writes shortcuts.
+    try std.testing.expect(try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .unicode = 'a' }, .mods = .{ .ctrl = true, .shift = true } } }));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav > resize \u{203A} Ctrl+Shift+A \u{2026}", try keyStateText(a, &buf));
+    try std.testing.expect(try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .physical = .arrow_up } } }));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav > resize \u{203A} Ctrl+Shift+A Up \u{2026}", try keyStateText(a, &buf));
+
+    // The sequence ends: the tables again.
+    try std.testing.expect(try testKeySequence(&app, a, .end));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav > resize", try keyStateText(a, &buf));
+
+    // One popped: the other stays.
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("nav", try keyStateText(a, &buf));
+    try std.testing.expectEqual(one, try childRect(window, hwnd));
+
+    // The last popped: hidden, its text gone, the window kept; laid out
+    // again, still hidden; nothing more to pop changes nothing.
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expectEqualStrings("", try keyStateText(a, &buf));
+    try std.testing.expect(a.overlays.key_state.hwnd.? == hwnd);
+    window.relayout();
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try std.testing.expect(!shown(hwnd));
+
+    // A sequence alone, then ended.
+    try std.testing.expect(try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .unicode = 'k' }, .mods = .{ .ctrl = true } } }));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("Ctrl+K \u{2026}", try keyStateText(a, &buf));
+    try std.testing.expect(try testKeySequence(&app, a, .end));
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expectEqualStrings("", try keyStateText(a, &buf));
+
+    // Every table at once, with a sequence pending: the sequence stays.
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "x" }));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "y" }));
+    try std.testing.expect(try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .unicode = 'k' }, .mods = .{ .ctrl = true } } }));
+    try std.testing.expectEqualStrings("x > y \u{203A} Ctrl+K \u{2026}", try keyStateText(a, &buf));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate_all));
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqualStrings("Ctrl+K \u{2026}", try keyStateText(a, &buf));
+    try std.testing.expect(try testKeySequence(&app, a, .end));
+    try std.testing.expect(!shown(hwnd));
+
+    // The other terminal never had one.
+    try std.testing.expect(b.overlays.key_state.hwnd == null);
+
+    // Passive: Windows gives the pointer over it to the window under it.
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
+}
+
+test "win32: the key state makes no window for nothing pending, and keeps the core's eight tables" {
+    // The core ends a sequence on almost every bound key, whether one was
+    // pending or not, and pops tables that may not be there: none of that
+    // makes a window. It keeps at most eight tables active.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    try std.testing.expect(try testKeySequence(&app, a, .end));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate_all));
+    try std.testing.expect(a.overlays.key_state.hwnd == null);
+
+    var buf: [256]u8 = undefined;
+    const names = [_][]const u8{ "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8" };
+    for (names) |name| try std.testing.expect(try testKeyTable(&app, a, .{ .activate = name }));
+    try expectKeyStateAt(window, a);
+    const eight = "t1 > t2 > t3 > t4 > t5 > t6 > t7 > t8";
+    try std.testing.expectEqualStrings(eight, try keyStateText(a, &buf));
+    // A ninth, which the core never sends: refused, nothing changed.
+    try std.testing.expect(!try testKeyTable(&app, a, .{ .activate = "t9" }));
+    try std.testing.expectEqualStrings(eight, try keyStateText(a, &buf));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try std.testing.expectEqualStrings("t1 > t2 > t3 > t4 > t5 > t6 > t7", try keyStateText(a, &buf));
+    // Left active: freed with the terminal (the testing allocator).
+}
+
+test "win32: the key state keeps its own copy of a table's name" {
+    // The core's name points into its configuration, which a reload
+    // frees while the table stays active.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    const name = try alloc.dupe(u8, "nav");
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = name }));
+    @memset(name, 'x');
+    alloc.free(name);
+    // The text is made again from what it kept.
+    var buf: [256]u8 = undefined;
+    try std.testing.expect(try testKeySequence(&app, a, .{ .trigger = .{ .key = .{ .unicode = 'a' }, .mods = .{ .ctrl = true } } }));
+    try std.testing.expectEqualStrings("nav \u{203A} Ctrl+A \u{2026}", try keyStateText(a, &buf));
+    try std.testing.expect(try testKeySequence(&app, a, .end));
+    try std.testing.expectEqualStrings("nav", try keyStateText(a, &buf));
+}
+
+test "win32: the key state shows above the link preview, and hides with its terminal" {
+    // GTK stacks its key-state overlay above its URL labels. Both are the
+    // frame's children just above their terminal, which every layout puts
+    // back in that order; a zoom or a hidden tab hides the indicator with
+    // its terminal, what it shows kept for when it shows again.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // A long URL, under the indicator's place: the indicator above it,
+    // shown after it or before it.
+    const url = "https://example.com/some/long/path/that/goes/on/past/the/middle/of/the/terminal";
+    try std.testing.expect(try testLink(&app, a, url));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    const hwnd = a.overlays.key_state.hwnd.?;
+    const preview = a.overlays.link_preview.hwnd.?;
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+    try std.testing.expect(above(window.hwnd, hwnd, preview));
+    try std.testing.expect(try testLink(&app, a, ""));
+    try expectKeyStateAt(window, a);
+    try std.testing.expect(try testLink(&app, a, url));
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+
+    // The terminal raised over both: laid out again, both back over it,
+    // in their order.
+    _ = win32.SetWindowPos(a.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+    try std.testing.expect(above(window.hwnd, a.hwnd, hwnd));
+    window.relayout();
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+
+    // A zoom on the other terminal hides it with its own, its text kept;
+    // back, shown. A zoom on its own: the whole window's bottom centre.
+    window.toggleZoom(b);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(a.overlays.key_state.text != null);
+    window.toggleZoom(b);
+    try expectKeyStateAt(window, a);
+    window.toggleZoom(a);
+    try expectKeyStateAt(window, a);
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, a));
+    window.toggleZoom(a);
+    try expectKeyStateAt(window, a);
+
+    // The other tab shown: hidden with its terminals; shown again with
+    // them.
+    _ = try testTab(&app, window);
+    window.relayout();
+    try expectKeyStateAt(window, a);
+    window.selectTab(1);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(a.overlays.key_state.text != null);
+    window.selectTab(0);
+    try expectKeyStateAt(window, a);
+
+    // It goes with its terminal.
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
 }

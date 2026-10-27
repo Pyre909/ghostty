@@ -1,10 +1,11 @@
 //! A terminal's passive overlays: windows that show something about the
 //! terminal over it and take no input, as GTK stacks overlays over its
-//! surface (src/apprt/gtk/ui/1.0/surface.blp). Today the link preview
-//! (LinkPreview.zig). This file does for each what they all need: their
-//! window class and procedure, their place in the Z order, their font,
-//! colours and frame, and their teardown; each overlay's own file says
-//! what it shows and where (`placeIn`, `textIn`).
+//! surface (src/apprt/gtk/ui/1.0/surface.blp): the link preview
+//! (LinkPreview.zig) and the key-state indicator (KeyState.zig). This
+//! file does for each what they all need: their window class and
+//! procedure, their place in the Z order, their font, colours and frame,
+//! and their teardown; each overlay's own file says what it shows and
+//! where (`placeIn`, `textIn`).
 //!
 //! Like the search bar (SearchBar.zig), an overlay is a child window of
 //! the terminal's **frame**, placed above the terminal's own window: GDI
@@ -32,6 +33,7 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
+const KeyState = @import("KeyState.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
 const RECT = win32.RECT;
@@ -40,6 +42,10 @@ const log = std.log.scoped(.win32);
 
 /// The link preview, made, hidden, with its terminal (`create`).
 link_preview: LinkPreview.Preview = .{},
+
+/// The key-state indicator, made the first time it has something to show
+/// (`KeyState.sequence`, `KeyState.table`).
+key_state: KeyState.Indicator = .{},
 
 /// The system's message font at `font_dpi`, which every overlay draws
 /// in, made as the first of them is placed with something to show
@@ -51,11 +57,11 @@ font_dpi: u32 = 0,
 /// its surface (surface.blp). Each has a window `hwnd`, the `text` it
 /// draws, `text_size` and `measured` for that text in `font`, and
 /// `placeIn`, `textIn` and `deinit`.
-const stack = [_][]const u8{"link_preview"};
+const stack = [_][]const u8{ "link_preview", "key_state" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{LinkPreview.class_name};
+const classes = [_][]const u8{ LinkPreview.class_name, KeyState.class_name };
 
 /// For tests: how many messages an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -164,7 +170,7 @@ pub fn create(surface: *Surface) void {
 /// A hidden window of the overlay class `class` in `surface`'s frame,
 /// whose procedure finds `surface` from its WM_NCCREATE; null if it cannot
 /// be made.
-fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
+pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
     return win32.CreateWindowExW(
         0,
         L(class),

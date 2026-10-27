@@ -153,7 +153,8 @@ pub const Surface = struct {
 
     /// The terminal's overlays (`Overlays`), windows of the frame's just
     /// above this one that show something about it and take no input: its
-    /// link preview, made, hidden, with this one.
+    /// link preview, made, hidden, with this one, and its key-state
+    /// indicator, made the first time it has something to show.
     overlays: Overlays,
 
     /// The lifecycle of `core_surface`.

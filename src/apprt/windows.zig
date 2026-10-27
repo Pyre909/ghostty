@@ -125,6 +125,17 @@
 //! made, hidden, with the terminal's, so that none is made as the pointer
 //! reaches a link; every terminal has one.
 //!
+//! ## Key sequences and key tables
+//!
+//! `.key_sequence` and `.key_table` show the pending sequence's keys and
+//! the active key tables at the bottom centre of the terminal, as GTK's
+//! key-state overlay does (`KeyState`): the tables joined with " > ",
+//! then "›" and the keys as Windows writes shortcuts, then "…" while the
+//! sequence waits for its next key. It is passive as the link preview is,
+//! and above it; its window is made the first time it has something to
+//! show. GTK's icon, its animated spinner and dragging it to the top are
+//! not done.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
@@ -225,6 +236,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
     _ = @import("windows/CommandPalette.zig");
+    _ = @import("windows/KeyState.zig");
     _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/Overlays.zig");
     _ = @import("windows/SearchBar.zig");
