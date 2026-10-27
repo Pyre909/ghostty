@@ -20,6 +20,7 @@ const taskbar = @import("taskbar.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
+const CommandPalette = @import("CommandPalette.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
@@ -10238,4 +10239,136 @@ test "win32: a search bar hides once the focus has left it, and opens only where
     const font = win32.SendMessageW(bar.edit.?, win32.WM_GETFONT, 0, 0);
     try std.testing.expect(font != 0);
     try std.testing.expectEqual(@intFromPtr(bar.font.?), @as(usize, @bitCast(font)));
+}
+
+test "win32: the command palette lists only what performAction carries out" {
+    // `CommandPalette.supported` against `performAction` for the binding
+    // actions the core hands to this runtime, where a test can perform
+    // what they become without a core: each listed one is performed (or
+    // recorded for `run`), and each left out is refused.
+    @setEvalBranchQuota(100_000);
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+
+    const Case = struct { input.Binding.Action.Key, apprt.Action.Key };
+    const cases = [_]Case{
+        // Left out.
+        .{ .toggle_tab_overview, .toggle_tab_overview },
+        .{ .prompt_window_title, .prompt_title },
+        .{ .set_window_title, .set_window_title },
+        .{ .close_all_windows, .close_all_windows },
+        .{ .toggle_quick_terminal, .toggle_quick_terminal },
+        .{ .toggle_visibility, .toggle_visibility },
+        .{ .check_for_updates, .check_for_updates },
+        .{ .undo, .undo },
+        .{ .redo, .redo },
+        .{ .inspector, .inspector },
+        .{ .show_gtk_inspector, .show_gtk_inspector },
+        .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
+        .{ .toggle_secure_input, .secure_input },
+        .{ .toggle_background_opacity, .toggle_background_opacity },
+        // Listed.
+        .{ .new_window, .new_window },
+        .{ .new_tab, .new_tab },
+        .{ .new_split, .new_split },
+        .{ .goto_tab, .goto_tab },
+        .{ .move_tab_to_new_window, .move_tab_to_new_window },
+        .{ .prompt_tab_title, .prompt_title },
+        .{ .prompt_surface_title, .prompt_title },
+        .{ .toggle_split_zoom, .toggle_split_zoom },
+        .{ .equalize_splits, .equalize_splits },
+        .{ .toggle_fullscreen, .toggle_fullscreen },
+        .{ .toggle_maximize, .toggle_maximize },
+        .{ .toggle_window_decorations, .toggle_window_decorations },
+        .{ .toggle_window_float_on_top, .float_window },
+    };
+    var listed: usize = 0;
+    inline for (cases) |case| {
+        const value: apprt.Action.Value(case[1]) = switch (case[0]) {
+            .prompt_window_title => .window,
+            .prompt_tab_title => .tab,
+            .prompt_surface_title => .surface,
+            .set_window_title => .{ .title = "t" },
+            .inspector => .toggle,
+            .toggle_secure_input, .toggle_window_float_on_top => .toggle,
+            .new_split => .right,
+            .goto_tab => .next,
+            .toggle_fullscreen => .native,
+            else => if (apprt.Action.Value(case[1]) == void) {} else unreachable,
+        };
+        const performed = try app.performAction(target, case[1], value);
+        if (CommandPalette.supported(case[0]) != performed) {
+            std.debug.print("{t}: listed={} performed={}\n", .{ case[0], CommandPalette.supported(case[0]), performed });
+            return error.TestUnexpectedResult;
+        }
+        if (performed) listed += 1;
+    }
+    try std.testing.expectEqual(13, listed);
+    // What the listed ones recorded is not carried out here.
+    app.requests.clearRetainingCapacity();
+    _ = try app.performAction(target, .float_window, .off);
+}
+
+test "win32: the command palette has a jump to each terminal that is not closing" {
+    // GTK's and macOS's "Focus: <title>" entries, one per terminal of
+    // every window, titled as each is shown (its title prompt's title over
+    // the program's), with the configuration's commands.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const other = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, other);
+    const d = try testPane(&app, other);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    other.tab().tree = try testRow(alloc, &.{ c, d });
+    a.title = try alloc.dupeSentinel(u8, "shell", 0);
+    b.title = try alloc.dupeSentinel(u8, "vim", 0);
+    b.title_override = try alloc.dupeSentinel(u8, "notes", 0);
+    d.closing = true;
+    defer d.closing = false;
+
+    var entries = try CommandPalette.forApp(&app);
+    defer entries.deinit();
+    var jumps: [4]?*Surface = .{ null, null, null, null };
+    var titles: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var commands: usize = 0;
+    for (entries.items) |*e| switch (e.run) {
+        .jump => |s| {
+            jumps[n] = s;
+            titles[n] = e.title;
+            n += 1;
+        },
+        .action => commands += 1,
+    };
+    try std.testing.expectEqual(3, n);
+    try std.testing.expect(commands > 50);
+    // Sorted by title: notes, shell, Untitled.
+    try std.testing.expectEqualStrings("Focus: notes", titles[0]);
+    try std.testing.expect(jumps[0] == b);
+    try std.testing.expectEqualStrings("Focus: shell", titles[1]);
+    try std.testing.expect(jumps[1] == a);
+    try std.testing.expectEqualStrings("Focus: Untitled", titles[2]);
+    try std.testing.expect(jumps[2] == c);
 }

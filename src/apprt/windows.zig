@@ -193,6 +193,7 @@ comptime {
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
+    _ = @import("windows/CommandPalette.zig");
     _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
