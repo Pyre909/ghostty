@@ -72,7 +72,8 @@ pub const WINDOWPOS = extern struct {
 pub const TRACKMOUSEEVENT = extern struct {
     cbSize: DWORD,
     dwFlags: DWORD,
-    hwndTrack: HWND,
+    /// Null in TME_QUERY's answer when nothing is tracked.
+    hwndTrack: ?HWND,
     dwHoverTime: DWORD,
 };
 pub const RECT = internal_os.windows.RECT;
@@ -250,6 +251,8 @@ pub const WHEEL_PAGESCROLL: UINT = std.math.maxInt(UINT);
 pub const SPI_GETNONCLIENTMETRICS: UINT = 0x0029;
 pub const SPI_SETNONCLIENTMETRICS: UINT = 0x002A;
 pub const TME_LEAVE: DWORD = 0x00000002;
+/// TrackMouseEvent: fill the structure with what is tracked now.
+pub const TME_QUERY: DWORD = 0x40000000;
 /// The client-area hit-test code (WM_NCHITTEST), which is the low word
 /// of WM_MOUSEACTIVATE's and WM_SETCURSOR's lParam.
 pub const HTCLIENT: u16 = 1;

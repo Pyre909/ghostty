@@ -1045,12 +1045,7 @@ pub const Surface = struct {
         if (self.closing) return;
         self.closing = true;
 
-        if (process_alive and !confirm(
-            self.app,
-            self.hwnd,
-            L("A process is still running in this terminal. Close it anyway?"),
-            .ok,
-        )) {
+        if (process_alive and !confirm(self.app, self.hwnd, self.closePrompt(), .ok)) {
             // `self` is still valid: `confirm` raises `prompt_depth`, so no
             // teardown can run inside its modal loop (destroyPosted defers),
             // and nothing but destroyPosted destroys a surface window.
@@ -1059,6 +1054,19 @@ pub const Surface = struct {
         }
 
         self.postDestroy();
+    }
+
+    /// What the prompt before this terminal closes says. The core asks for
+    /// a read-only terminal before it looks at its command
+    /// (`CoreSurface.needsConfirmQuit`, src/Surface.zig:1019 and 1023), so
+    /// once the command has exited that is the only reason, and the prompt
+    /// says the terminal is read-only; otherwise it says a process is still
+    /// running in it. The core's actions tell this runtime both
+    /// (`readonly`, `show_child_exited`).
+    fn closePrompt(self: *const Surface) win32.LPCWSTR {
+        if (self.overlays.readonly.on and self.overlays.child_exited.exited)
+            return L("This terminal is read-only. Close it anyway?");
+        return L("A process is still running in this terminal. Close it anyway?");
     }
 
     /// The Direct3D 11 device has no options: each renderer creates its

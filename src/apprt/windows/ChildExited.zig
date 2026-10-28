@@ -28,8 +28,11 @@
 //! arrow. A press and a release on the button close the terminal as its
 //! own WM_CLOSE does (`Surface.requestClose`); the core does not ask once
 //! the command has exited (`CoreSurface.needsConfirmQuit`), unless the
-//! terminal is read-only. The button lights up under the pointer and
-//! darkens while pressed, as the search bar's buttons do.
+//! terminal is read-only, and then the prompt says so (`Surface.close`).
+//! The button takes the search bar's hover colour under the pointer and
+//! its border colour while pressed, as the search bar's buttons do. A
+//! press off it lets go of a press whose release never came, and the
+//! banner hidden lets go of the press and the pointer.
 //!
 //! The window is made when the core asks, inside its tick, as
 //! `SearchBar.start` makes the search bar's inside the key callback: it is
@@ -38,7 +41,7 @@
 //! the middle of that frame", "laying terminals out sends them WM_SIZE,
 //! which enters the core"). The button's handler runs from the banner's
 //! own message, which a loop nested under a core frame can dispatch (a
-//! prompt's, a teardown's wait), so it closes the terminal only where
+//! prompt's), so it closes the terminal only where
 //! "a message handler may tick the core or tear a surface down right now"
 //! (`App.canReenterCore`), and records the close for `run` otherwise
 //! (`App.Request.close_surface`), as the command palette runs its entries.
@@ -81,6 +84,10 @@ pub const Banner = struct {
     text: ?[:0]const u16 = null,
     /// Whether the command failed, which colours it (`tint`).
     failed: bool = false,
+    /// Whether the core has said the command exited (`show`), whether or
+    /// not the banner could be made: a read-only terminal's close prompt
+    /// then says it is read-only (`Surface.close`).
+    exited: bool = false,
     /// The size of `text`, and of the button's label, in the overlays'
     /// font; measured again when the font changes.
     text_size: Size = .{ .width = 0, .height = 0 },
@@ -113,8 +120,9 @@ pub const Banner = struct {
 
     /// The banner, `client` big, drawn into `hdc` at `dpi` in `font`, by
     /// whether the title bar is `dark`: the tint, the title, and the
-    /// button in the search bar's colours, lit while the pointer is over it
-    /// and dark while it is pressed.
+    /// button in the search bar's colours, its face the bar's hover colour
+    /// while the pointer is over it and its border colour while it is
+    /// pressed.
     pub fn draw(self: *const Banner, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, font: ?win32.HGDIOBJ) void {
         const colors = SearchBar.Colors.of(dark);
         SearchBar.fill(hdc, client, tint(self.failed, dark));
@@ -140,6 +148,22 @@ pub const Banner = struct {
         if (hover == self.hover) return;
         self.hover = hover;
         _ = win32.InvalidateRect(hwnd, null, .FALSE);
+    }
+
+    /// The button comes up, unseen if it was pressed, and the banner lets
+    /// go of the capture it took for the press.
+    fn release(self: *Banner, hwnd: win32.HWND) void {
+        self.pressed = false;
+        if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
+    }
+
+    /// The banner's window `hwnd` is being hidden (`Overlays.hideWindows`,
+    /// `Overlays.place`): it shows again with its button neither lit nor
+    /// pressed, and asks for the pointer's leave again.
+    pub fn hidden(self: *Banner, hwnd: win32.HWND) void {
+        self.hover = false;
+        self.tracking = false;
+        self.release(hwnd);
     }
 
     /// The banner's own messages, which `Overlays.wndProc` hands it first:
@@ -184,7 +208,17 @@ pub const Banner = struct {
             // A press on the button closes the terminal when it comes up on
             // it, as a button does.
             win32.WM_LBUTTONDOWN => {
-                if (!self.onButton(surface, hwnd, win32.xLparam(lparam), win32.yLparam(lparam))) return 0;
+                if (!self.onButton(surface, hwnd, win32.xLparam(lparam), win32.yLparam(lparam))) {
+                    // Only the capture brings a press off the button here.
+                    // The press that took it never saw its release, as
+                    // when it came outside a frame in the background,
+                    // where the capture does not reach (SetCapture): it
+                    // comes up now, so that a release on the button after
+                    // this press closes nothing.
+                    if (self.pressed) _ = win32.InvalidateRect(hwnd, null, .FALSE);
+                    self.release(hwnd);
+                    return 0;
+                }
                 // Captured first: SetCapture sends WM_CAPTURECHANGED to the
                 // window that loses it, which cancels a press.
                 if (win32.GetCapture() != hwnd) _ = win32.SetCapture(hwnd);
@@ -196,8 +230,7 @@ pub const Banner = struct {
             win32.WM_LBUTTONUP => {
                 const on = self.onButton(surface, hwnd, win32.xLparam(lparam), win32.yLparam(lparam));
                 const pressed = self.pressed;
-                self.pressed = false;
-                if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
+                self.release(hwnd);
                 _ = win32.InvalidateRect(hwnd, null, .FALSE);
                 if (on and pressed) close(surface);
                 return 0;
@@ -222,6 +255,7 @@ pub const Banner = struct {
 /// cannot be made: the core then shows its own text.
 pub fn show(surface: *Surface, info: apprt.surface.Message.ChildExited) bool {
     const self = &surface.overlays.child_exited;
+    self.exited = true;
     const hwnd = self.hwnd orelse blk: {
         const made = Overlays.make(surface, class_name) orelse {
             log.warn("cannot make a child-exited banner err={}", .{win32.GetLastError()});
@@ -274,8 +308,9 @@ fn mix(a: win32.COLORREF, b: win32.COLORREF) win32.COLORREF {
     return out;
 }
 
-/// The banner's sizes at a DPI, from their values at 96: the search bar's
-/// button height and padding (`SearchBar.Metrics`).
+/// The banner's sizes at a DPI, from their values at 96: as short as its
+/// button and title allow, so that it hides as little of the terminal's
+/// bottom as it can, being opaque where GTK's is see-through.
 pub const Metrics = struct {
     /// Between the banner's edges and the button, and its least room
     /// above and below the title.
@@ -289,8 +324,8 @@ pub const Metrics = struct {
 
     pub fn init(dpi: u32) Metrics {
         return .{
-            .pad = SearchBar.Metrics.scale(6, dpi),
-            .button = SearchBar.Metrics.scale(28, dpi),
+            .pad = SearchBar.Metrics.scale(2, dpi),
+            .button = SearchBar.Metrics.scale(24, dpi),
             .button_pad = SearchBar.Metrics.scale(12, dpi),
             .gap = SearchBar.Metrics.scale(12, dpi),
         };
@@ -390,40 +425,40 @@ test "win32: the child-exited banner's title and colour follow the exit code, as
 test "win32: the child-exited banner lies across its terminal's bottom, its button at the right" {
     const testing = std.testing;
     const m = Metrics.init(96);
-    try testing.expectEqual(6, m.pad);
-    try testing.expectEqual(28, m.button);
+    try testing.expectEqual(2, m.pad);
+    try testing.expectEqual(24, m.button);
     try testing.expectEqual(12, m.button_pad);
     try testing.expectEqual(12, m.gap);
-    try testing.expectEqual(56, Metrics.init(192).button);
+    try testing.expectEqual(48, Metrics.init(192).button);
 
     const text: Size = .{ .width = 120, .height = 16 };
     const label: Size = .{ .width = 30, .height = 16 };
     // As tall as the button with the padding.
-    try testing.expectEqual(40, m.height(text, label));
-    try testing.expectEqual(RECT{ .left = 0, .top = 560, .right = 800, .bottom = 600 }, rectIn(m, .{ .width = 800, .height = 600 }, text, label).?);
+    try testing.expectEqual(28, m.height(text, label));
+    try testing.expectEqual(RECT{ .left = 0, .top = 572, .right = 800, .bottom = 600 }, rectIn(m, .{ .width = 800, .height = 600 }, text, label).?);
     // A taller title: as tall as it.
-    try testing.expectEqual(52, m.height(.{ .width = 120, .height = 40 }, label));
+    try testing.expectEqual(44, m.height(.{ .width = 120, .height = 40 }, label));
     // Room for the button alone; one pixel less, or too short: none.
-    try testing.expect(rectIn(m, .{ .width = 66, .height = 600 }, text, label) != null);
-    try testing.expect(rectIn(m, .{ .width = 65, .height = 600 }, text, label) == null);
-    try testing.expect(rectIn(m, .{ .width = 800, .height = 39 }, text, label) == null);
+    try testing.expect(rectIn(m, .{ .width = 58, .height = 600 }, text, label) != null);
+    try testing.expect(rectIn(m, .{ .width = 57, .height = 600 }, text, label) == null);
+    try testing.expect(rectIn(m, .{ .width = 800, .height = 27 }, text, label) == null);
 
-    // The button 6 in from the right, centred down; its label centred in
+    // The button 2 in from the right, centred down; its label centred in
     // it; the title centred across.
-    const l = Layout.init(m, 800, 40, text, label);
-    try testing.expectEqual(RECT{ .left = 740, .top = 6, .right = 794, .bottom = 34 }, l.button);
-    try testing.expectEqual(RECT{ .left = 752, .top = 12, .right = 782, .bottom = 28 }, l.label);
-    try testing.expectEqual(RECT{ .left = 340, .top = 12, .right = 460, .bottom = 28 }, l.title);
-    try testing.expect(l.onButton(740, 6));
-    try testing.expect(l.onButton(793, 33));
-    try testing.expect(!l.onButton(739, 20));
-    try testing.expect(!l.onButton(794, 20));
-    try testing.expect(!l.onButton(760, 5));
-    try testing.expect(!l.onButton(760, 34));
+    const l = Layout.init(m, 800, 28, text, label);
+    try testing.expectEqual(RECT{ .left = 744, .top = 2, .right = 798, .bottom = 26 }, l.button);
+    try testing.expectEqual(RECT{ .left = 756, .top = 6, .right = 786, .bottom = 22 }, l.label);
+    try testing.expectEqual(RECT{ .left = 340, .top = 6, .right = 460, .bottom = 22 }, l.title);
+    try testing.expect(l.onButton(744, 2));
+    try testing.expect(l.onButton(797, 25));
+    try testing.expect(!l.onButton(743, 14));
+    try testing.expect(!l.onButton(798, 14));
+    try testing.expect(!l.onButton(760, 1));
+    try testing.expect(!l.onButton(760, 26));
 
     // Narrow: the title moves left of the button, then is cut at it.
-    const narrow = Layout.init(m, 250, 40, text, label);
-    try testing.expectEqual(RECT{ .left = 58, .top = 12, .right = 178, .bottom = 28 }, narrow.title);
-    const cut = Layout.init(m, 150, 40, text, label);
-    try testing.expectEqual(RECT{ .left = 6, .top = 12, .right = 78, .bottom = 28 }, cut.title);
+    const narrow = Layout.init(m, 250, 28, text, label);
+    try testing.expectEqual(RECT{ .left = 62, .top = 6, .right = 182, .bottom = 22 }, narrow.title);
+    const cut = Layout.init(m, 150, 28, text, label);
+    try testing.expectEqual(RECT{ .left = 2, .top = 6, .right = 82, .bottom = 22 }, cut.title);
 }

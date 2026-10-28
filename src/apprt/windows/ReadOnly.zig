@@ -3,14 +3,16 @@
 //! (`readonly_overlay` in src/apprt/gtk/ui/1.0/surface.blp): "Read-only"
 //! in GTK's colour for it, framed in the same colour, with GTK's padding
 //! and margin (`.readonly_overlay` in src/apprt/gtk/css/style.css), on the
-//! search bar's background. GTK's lock icon is left out: it is one line of
-//! text.
+//! terminal's background (`Overlays.terminalBackground`), as GTK's, which
+//! has none of its own, shows over the terminal. GTK's lock icon is left
+//! out: it is one line of text.
 //!
 //! The core keeps the flag: the `toggle_readonly` binding flips it, then
 //! performs `readonly` with what it is now
 //! (`CoreSurface.performBindingAction`). While it is on, the core sends
 //! nothing to the terminal's program and asks before the terminal closes
-//! (`CoreSurface.needsConfirmQuit`).
+//! (`CoreSurface.needsConfirmQuit`), even once its command has exited;
+//! the prompt then says the terminal is read-only (`Surface.close`).
 //!
 //! It is one of the terminal's overlays (Overlays.zig), the lowest of them,
 //! as GTK stacks it: the link preview and the key-state indicator show
@@ -18,14 +20,16 @@
 //! covers it while it is open. The pointer and clicks over it go to the
 //! terminal under it, as GTK's takes none (`can-target: false`).
 //!
-//! The core performs the action inside its key callback. The window is
-//! made the first time the terminal is made read-only, there, as
-//! `SearchBar.start` makes the search bar's and `KeyState.update` the
-//! key-state indicator's.
+//! The core performs the action inside its `performBindingAction` frame,
+//! which a key callback enters, or the command palette's entry
+//! (`CommandPalette.runNow`). The window is made the first time the
+//! terminal is made read-only, there, as `SearchBar.start` makes the
+//! search bar's and `KeyState.update` the key-state indicator's.
 
 const std = @import("std");
 
 const apprt = @import("../../apprt.zig");
+const configpkg = @import("../../config.zig");
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Overlays = @import("Overlays.zig");
@@ -55,6 +59,10 @@ pub const Badge = struct {
     /// What it shows, `label`, while the terminal is read-only; null while
     /// it is not.
     text: ?[:0]const u16 = null,
+    /// Whether the terminal is read-only, as the core last said (`set`),
+    /// whether or not the badge could be made: its close prompt says so
+    /// (`Surface.close`).
+    on: bool = false,
     /// The size of `text` in the overlays' font; measured again when the
     /// font changes.
     text_size: Size = .{ .width = 0, .height = 0 },
@@ -89,18 +97,23 @@ pub const Badge = struct {
     }
 
     /// GTK's colour for the text and the frame around it (its outline),
-    /// on the search bar's background.
-    pub fn look(self: *const Badge, colors: SearchBar.Colors) Overlays.Look {
+    /// on the terminal's `background` (`Overlays.lookOf`), not the search
+    /// bar's: GTK's badge has no background, and its colour is too light to
+    /// read on the light bar.
+    pub fn look(self: *const Badge, colors: SearchBar.Colors, background: win32.COLORREF) Overlays.Look {
         _ = self;
-        return .{ .line = color, .fill = colors.bar, .text = color };
+        _ = colors;
+        return .{ .line = color, .fill = background, .text = color };
     }
 };
 
 /// `readonly` on `surface`: `.on` shows its badge, its window made first
 /// if it has none, and `.off` hides it. False if the window cannot be
-/// made; `.off` with no badge makes none.
+/// made; `.off` with no badge makes none. Either way the terminal is
+/// known to be read-only or not (`Badge.on`).
 pub fn set(surface: *Surface, value: apprt.action.Readonly) bool {
     const self = &surface.overlays.readonly;
+    self.on = value == .on;
     switch (value) {
         .on => if (self.hwnd == null) {
             self.hwnd = Overlays.make(surface, class_name) orelse {
@@ -179,4 +192,35 @@ test "win32: the read-only badge's colour is GTK's hsl(25 50 75)" {
         rgb[i] = @intFromFloat(@round(v * 255));
     }
     try std.testing.expectEqual(win32.rgb(rgb[0], rgb[1], rgb[2]), color);
+}
+
+/// For tests: WCAG 2's relative luminance of the sRGB colour `c`.
+fn luminance(c: win32.COLORREF) f64 {
+    const weights = [_]f64{ 0.2126, 0.7152, 0.0722 };
+    var sum: f64 = 0;
+    for (weights, 0..) |w, i| {
+        const shift: u5 = @intCast(8 * i);
+        const v = @as(f64, @floatFromInt((c >> shift) & 0xff)) / 255;
+        sum += w * if (v <= 0.04045) v / 12.92 else std.math.pow(f64, (v + 0.055) / 1.055, 2.4);
+    }
+    return sum;
+}
+
+/// For tests: WCAG 2's contrast ratio of `a` and `b`, 1 to 21.
+fn contrast(a: win32.COLORREF, b: win32.COLORREF) f64 {
+    const la = luminance(a);
+    const lb = luminance(b);
+    return (@max(la, lb) + 0.05) / (@min(la, lb) + 0.05);
+}
+
+test "win32: the read-only badge's text reads on Ghostty's default background" {
+    // WCAG asks text for a contrast of 4.5:1 at least. The badge is drawn
+    // on its terminal's background, the configuration's `background`: here
+    // its default, read from the configuration.
+    const testing = std.testing;
+    try testing.expectApproxEqAbs(21, contrast(win32.rgb(255, 255, 255), win32.rgb(0, 0, 0)), 1e-9);
+    try testing.expectApproxEqAbs(1, contrast(color, color), 1e-9);
+    const field = std.meta.fieldInfo(configpkg.Config, .background);
+    const bg = comptime field.attrs.defaultValue(field.type).?;
+    try testing.expect(contrast(color, win32.rgb(bg.r, bg.g, bg.b)) >= 4.5);
 }

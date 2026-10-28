@@ -72,14 +72,15 @@ font_dpi: u32 = 0,
 /// its surface (surface.blp). Each has a window `hwnd`, the `text` it
 /// draws, `text_size` and `measured` for that text in `font`, `placeIn`,
 /// `deinit`, and `textIn` or `draw`; and may have `look`, `measureMore`
-/// (more than its text to measure) and `handle` (messages of its own).
+/// (more than its text to measure), `handle` (messages of its own) and
+/// `hidden` (what it does as its window is hidden).
 pub const stack = [_][]const u8{ "readonly", "child_exited", "link_preview", "key_state" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
 const classes = [_][]const u8{ ReadOnly.class_name, ChildExited.class_name, LinkPreview.class_name, KeyState.class_name };
 
-/// For tests: how many messages an overlay's window got after its
+/// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
 /// handled.
 pub var test_detached: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
@@ -93,7 +94,8 @@ pub const Placed = struct { in: RECT, redraw: bool };
 
 /// What an overlay is drawn in: the line around it, inside that line, and
 /// its text. The search bar's colours (`SearchBar.Colors`) unless the
-/// overlay says otherwise (`look`).
+/// overlay says otherwise (`look`), from those or its terminal's
+/// background (`lookOf`).
 pub const Look = struct { line: win32.COLORREF, fill: win32.COLORREF, text: win32.COLORREF };
 
 /// One line, `&` drawn as itself: CR and LF in the text break nothing.
@@ -101,8 +103,16 @@ const text_format = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
 
 /// Hide the windows, as when their terminal is hidden; what they show
 /// stays.
-pub fn hideWindows(self: *const Overlays) void {
-    inline for (stack) |name| hideWindow(@field(self, name).hwnd);
+pub fn hideWindows(self: *Overlays) void {
+    inline for (stack) |name| hide(&@field(self, name));
+}
+
+/// Hide the overlay `o`'s window, if it has one, after its own `hidden`
+/// if it has that.
+fn hide(o: anytype) void {
+    const hwnd = o.hwnd orelse return;
+    if (@hasDecl(@TypeOf(o.*), "hidden")) o.hidden(hwnd);
+    hideWindow(hwnd);
 }
 
 /// Hide `hwnd`, if there is one and it shows.
@@ -252,7 +262,7 @@ pub fn place(surface: *Surface) void {
                 const moved = put(window, hwnd, under, at);
                 if (moved or p.redraw) _ = win32.InvalidateRect(hwnd, null, .FALSE);
                 under = hwnd;
-            } else hideWindow(hwnd);
+            } else hide(o);
         }
     }
 }
@@ -379,7 +389,7 @@ pub fn wndProc(
     const surface = surfaceOf(hwnd) orelse {
         // Passive, as below.
         if (msg == win32.WM_NCHITTEST) return win32.HTTRANSPARENT;
-        if (builtin.is_test) test_detached += 1;
+        if (builtin.is_test and msg == win32.WM_DESTROY) test_detached += 1;
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     };
 
@@ -454,9 +464,10 @@ fn draw(surface: *Surface, hwnd: win32.HWND, hdc: win32.HDC) void {
     };
 
     const dpi = Window.dpiOf(surface.app, hwnd);
+    const background = terminalBackground(surface);
     inline for (stack) |name| {
         const o = &@field(surface.overlays, name);
-        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, surface.window.dark_frame, surface.overlays.font);
+        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, surface.window.dark_frame, background, surface.overlays.font);
     }
 
     _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
@@ -465,10 +476,11 @@ fn draw(surface: *Surface, hwnd: win32.HWND, hdc: win32.HDC) void {
 /// The overlay `o`, `client` big, drawn into `hdc` at `dpi` by whether the
 /// title bar is `dark`: as it draws itself (`draw`), or its text in
 /// `font`, framed as GTK's labels are, where its own file puts it
-/// (`textIn`), in its colours (`lookOf`).
-fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, font: ?win32.HGDIOBJ) void {
+/// (`textIn`), in its colours (`lookOf`) over a terminal whose
+/// background is `background`.
+fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, background: win32.COLORREF, font: ?win32.HGDIOBJ) void {
     if (@hasDecl(@TypeOf(o.*), "draw")) return o.draw(hdc, client, dpi, dark, font);
-    const look = lookOf(o, SearchBar.Colors.of(dark));
+    const look = lookOf(o, SearchBar.Colors.of(dark), background);
     const line = @max(1, SearchBar.Metrics.scale(1, dpi));
     SearchBar.fill(hdc, client, look.line);
     SearchBar.fill(hdc, SearchBar.inset(client, line), look.fill);
@@ -489,9 +501,19 @@ pub fn drawText(hdc: win32.HDC, font: ?win32.HGDIOBJ, text: [:0]const u16, at: R
     _ = win32.DrawTextW(hdc, text.ptr, std.math.lossyCast(c_int, text.len), &r, format);
 }
 
-/// The colours the overlay `o` is drawn in: its own (`look`), or the
-/// search bar's.
-pub fn lookOf(o: anytype, colors: SearchBar.Colors) Look {
-    if (@hasDecl(@TypeOf(o.*), "look")) return o.look(colors);
+/// The colours the overlay `o` is drawn in, by the search bar's `colors`
+/// and its terminal's `background`: its own (`look`), or the search
+/// bar's.
+pub fn lookOf(o: anytype, colors: SearchBar.Colors, background: win32.COLORREF) Look {
+    if (@hasDecl(@TypeOf(o.*), "look")) return o.look(colors, background);
     return .{ .line = colors.border, .fill = colors.bar, .text = colors.text };
+}
+
+/// The background `surface`'s terminal shows, as far as this runtime
+/// knows: the configuration's `background`. A program can change it (OSC
+/// 11), which the core reports with `color_change`, an action this runtime
+/// does not take, so an overlay drawn on it keeps the configured colour.
+pub fn terminalBackground(surface: *const Surface) win32.COLORREF {
+    const bg = surface.app.config.background;
+    return win32.rgb(bg.r, bg.g, bg.b);
 }

@@ -1819,7 +1819,9 @@ pub const App = struct {
     /// and macOS keep theirs: new terminals derive theirs from it, the
     /// dividers take their color from it, and every other reader of
     /// `config` reads it when it needs it. The value only lives for the
-    /// call, so it is copied, and every window repaints its dividers. In a
+    /// call, so it is copied, and every window repaints its dividers, and
+    /// every terminal its overlays, which may be drawn on the
+    /// configuration's background (`Overlays.terminalBackground`). In a
     /// soft reload the value comes from `config` itself, and is `config`
     /// when the core could not apply the conditional state, so it is copied
     /// before `config` is freed. `CoreApp.updateConfig` does not touch the
@@ -1844,6 +1846,7 @@ pub const App = struct {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
         }
+        for (self.surfaces.items) |surface| surface.overlays.invalidate();
         // `window-decoration` may have changed, here or in a theme a soft
         // reload switched to; the frames change for it from `run`, since a
         // soft reload comes inside a core frame. `run` is woken for it: the
@@ -12034,8 +12037,9 @@ test "win32: a link preview goes with its terminal, shown or not" {
     // A terminal closing takes its preview's window with it, shown or
     // not, and its URL is freed with it (the testing allocator). A window
     // closing frees them whichever Windows destroys first: a terminal
-    // raised above its preview is destroyed, and freed, first, and its
-    // preview then has no terminal to write to.
+    // raised above its preview is destroyed, and freed, first, and lets go
+    // of its preview's window (`Overlays.deinit`), whose WM_DESTROY then
+    // has no terminal to write to.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -12083,7 +12087,8 @@ test "win32: a link preview goes with its terminal, shown or not" {
     try std.testing.expect(!win32.IsWindow(hd).toBool());
     try std.testing.expectEqual(0, app.windows.items.len);
     try std.testing.expectEqual(0, app.surfaces.items.len);
-    try std.testing.expect(Overlays.test_detached > 0);
+    // d's: c's own came while c was there.
+    try std.testing.expectEqual(1, Overlays.test_detached);
 }
 
 /// For tests: the core's `key_table` on `surface`, as its key callback
@@ -12718,9 +12723,12 @@ test "win32: readonly shows a read-only badge over its terminal's top-right corn
     try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
 }
 
-test "win32: the read-only badge is drawn in GTK's colour, framed in it, on the search bar's background" {
+test "win32: the read-only badge is drawn in GTK's colour, framed in it, on its terminal's background" {
     // GTK's `.readonly_overlay`: its text and outline in hsl(25 50 75),
-    // here on the search bar's colours, light or dark with the title bar.
+    // with no background of its own, over the terminal. Here on the
+    // configuration's background, light or dark title bar alike, and drawn
+    // again when a new configuration changes it, though the title bar
+    // stays as it was.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -12735,17 +12743,33 @@ test "win32: the read-only badge is drawn in GTK's colour, framed in it, on the 
     const a = try testPane(&app, window);
     window.tab().tree = try testRow(alloc, &.{a});
     window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
     window.relayout();
     try std.testing.expect(try testReadOnly(&app, a, .on));
     const hwnd = a.overlays.readonly.hwnd.?;
+    const pending = struct {
+        fn f(h: win32.HWND) bool {
+            return win32.GetUpdateRect(h, null, .FALSE).toBool();
+        }
+    }.f;
 
-    for ([_]configpkg.Config.WindowTheme{ .dark, .light }) |theme| {
+    const cases = [_]struct { theme: configpkg.Config.WindowTheme, r: u8, g: u8, b: u8 }{
+        .{ .theme = .dark, .r = 0x28, .g = 0x2c, .b = 0x34 },
+        .{ .theme = .dark, .r = 0, .g = 0, .b = 0 },
+        .{ .theme = .light, .r = 0xff, .g = 0xff, .b = 0xff },
+        .{ .theme = .light, .r = 0x28, .g = 0x2c, .b = 0x34 },
+    };
+    for (cases) |case| {
+        _ = win32.UpdateWindow(hwnd);
+        try std.testing.expect(!pending(hwnd));
         var changed: Config = try .default(alloc);
         defer changed.deinit();
-        changed.@"window-theme" = theme;
+        changed.@"window-theme" = case.theme;
+        changed.background = .{ .r = case.r, .g = case.g, .b = case.b };
         try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
-        try std.testing.expectEqual(theme == .dark, window.dark_frame);
-        const colors = SearchBar.Colors.of(window.dark_frame);
+        try std.testing.expectEqual(case.theme == .dark, window.dark_frame);
+        try std.testing.expect(pending(hwnd));
+        const background = win32.rgb(case.r, case.g, case.b);
 
         const printed = try Printed.of(hwnd);
         defer printed.deinit();
@@ -12755,10 +12779,10 @@ test "win32: the read-only badge is drawn in GTK's colour, framed in it, on the 
         try std.testing.expectEqual(ReadOnly.color, printed.at(0, 0));
         try std.testing.expectEqual(ReadOnly.color, printed.at(w - 1, h - 1));
         try std.testing.expectEqual(ReadOnly.color, printed.at(w - 1, 0));
-        try std.testing.expectEqual(colors.bar, printed.at(1, 1));
-        try std.testing.expectEqual(colors.bar, printed.at(w - 2, h - 2));
-        // The text: in GTK's colour, over the bar's.
-        try printed.expectBetween(.{ .left = 1, .top = 1, .right = w - 1, .bottom = h - 1 }, colors.bar, ReadOnly.color);
+        try std.testing.expectEqual(background, printed.at(1, 1));
+        try std.testing.expectEqual(background, printed.at(w - 2, h - 2));
+        // The text: in GTK's colour, over the background.
+        try printed.expectBetween(.{ .left = 1, .top = 1, .right = w - 1, .bottom = h - 1 }, background, ReadOnly.color);
     }
 }
 
@@ -13047,12 +13071,28 @@ fn expectBannerHits(surface: *const Surface) !void {
     for (off) |p| try std.testing.expectEqual(win32.HTTRANSPARENT, try bannerHit(surface, p[0], p[1]));
 }
 
+/// For tests: the left button pressed at `at`, in the client coordinates
+/// of `surface`'s banner.
+fn bannerDown(surface: *const Surface, at: [2]i32) void {
+    _ = win32.SendMessageW(surface.overlays.child_exited.hwnd.?, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(at[0], at[1]));
+}
+
+/// For tests: the left button released at `at`, in the client coordinates
+/// of `surface`'s banner.
+fn bannerUp(surface: *const Surface, at: [2]i32) void {
+    _ = win32.SendMessageW(surface.overlays.child_exited.hwnd.?, win32.WM_LBUTTONUP, 0, testPoint(at[0], at[1]));
+}
+
 /// For tests: the left button pressed at `down` and released at `up`, in
 /// the client coordinates of `surface`'s banner.
 fn bannerClick(surface: *const Surface, down: [2]i32, up: [2]i32) void {
-    const hwnd = surface.overlays.child_exited.hwnd.?;
-    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(down[0], down[1]));
-    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, testPoint(up[0], up[1]));
+    bannerDown(surface, down);
+    bannerUp(surface, up);
+}
+
+/// For tests: whether `surface`'s banner has the mouse captured.
+fn bannerCaptured(surface: *const Surface) bool {
+    return win32.GetCapture() == surface.overlays.child_exited.hwnd.?;
 }
 
 /// For tests: the middle of `r`.
@@ -13219,7 +13259,10 @@ test "win32: a click on the child-exited banner's Close closes its terminal, at 
     // WM_CLOSE does (`Surface.requestClose`): with no core here, it is
     // marked closing and its teardown posted. Under a core frame or a
     // prompt the close is recorded for `run`, which a terminal closing
-    // meanwhile takes back (`App.forgetClosing`).
+    // meanwhile takes back (`App.forgetClosing`). A press on the button
+    // takes the mouse, so that its release comes to the banner wherever
+    // it is, and its release, or a later press the capture brings off the
+    // button, lets go of it.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -13240,29 +13283,58 @@ test "win32: a click on the child-exited banner's Close closes its terminal, at 
     for ([_]*Surface{ a, b, c }) |s| try std.testing.expect(try testChildExited(&app, s, 0));
 
     // Clicks that are not on the button close nothing: a release off it,
-    // a press off it, a press whose capture was taken, a release alone.
+    // a press off it, a press whose capture was taken, a release alone,
+    // and a release on it after a press off it that came, by the capture,
+    // after a press on it whose release never did.
     const button = try bannerButton(b);
     const on = midOf(button);
     const beside: [2]i32 = .{ button.left - 1, on[1] };
-    bannerClick(b, on, beside);
-    bannerClick(b, beside, on);
-    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(on[0], on[1]));
+    bannerDown(b, on);
+    try std.testing.expect(bannerCaptured(b));
+    bannerUp(b, beside);
+    try std.testing.expect(!bannerCaptured(b));
+    bannerDown(b, beside);
+    try std.testing.expect(!bannerCaptured(b));
+    bannerUp(b, on);
+    bannerDown(b, on);
     _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_CAPTURECHANGED, 0, 0);
-    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_LBUTTONUP, 0, testPoint(on[0], on[1]));
-    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_LBUTTONUP, 0, testPoint(on[0], on[1]));
+    bannerUp(b, on);
+    try std.testing.expect(!bannerCaptured(b));
+    bannerUp(b, on);
+    bannerDown(b, on);
+    bannerDown(b, beside);
+    try std.testing.expect(!bannerCaptured(b));
+    bannerUp(b, on);
     try std.testing.expect(!b.closing);
     try std.testing.expect(!takeTeardown(b));
     try std.testing.expectEqual(0, app.requests.items.len);
 
-    // On the button: a closes at once.
-    bannerClick(a, midOf(try bannerButton(a)), midOf(try bannerButton(a)));
+    // On the button: a closes at once, and lets go of the mouse.
+    const on_a = midOf(try bannerButton(a));
+    bannerDown(a, on_a);
+    try std.testing.expect(bannerCaptured(a));
+    bannerUp(a, on_a);
+    try std.testing.expect(!bannerCaptured(a));
     try std.testing.expect(a.closing);
     try std.testing.expect(takeTeardown(a));
     try std.testing.expectEqual(0, app.requests.items.len);
 
-    // Under a tick: recorded, then carried out by `run`.
+    // Under a tick with no memory to record the close: logged, and
+    // nothing closes.
     app.ticking = true;
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    core_app.alloc = failing.allocator();
     bannerClick(b, on, on);
+    core_app.alloc = alloc;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(!bannerCaptured(b));
+    try std.testing.expect(!b.closing);
+    try std.testing.expect(!takeTeardown(b));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Under a tick: recorded, then carried out by `run`.
+    bannerClick(b, on, on);
+    try std.testing.expect(!bannerCaptured(b));
     try std.testing.expect(!b.closing);
     try std.testing.expect(!takeTeardown(b));
     try std.testing.expectEqual(1, app.requests.items.len);
@@ -13287,10 +13359,12 @@ test "win32: a click on the child-exited banner's Close closes its terminal, at 
     try std.testing.expect(!takeTeardown(c));
 }
 
-test "win32: the child-exited banner is drawn in libadwaita's colours, its button lit under the pointer and dark while pressed" {
+test "win32: the child-exited banner is drawn in libadwaita's colours, its button's face the bar's hover colour under the pointer and its border colour while pressed" {
     // GTK tints its banner with libadwaita's success or error colour at
     // 50%; here mixed half and half with the search bar's, light or dark
     // with the title bar, the title and the button in the bar's colours.
+    // The first move over it asks for the pointer's leave; hidden, it lets
+    // go of the pointer and of a press.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -13334,13 +13408,15 @@ test "win32: the child-exited banner is drawn in libadwaita's colours, its butto
             try printed.expectBetween(face, colors.bar, colors.text);
         }
 
-        // Lit under the pointer, dark while pressed, back once the capture
-        // goes and the pointer leaves.
+        // The hover colour under the pointer, the border colour while
+        // pressed, back once the capture goes and the pointer leaves.
         const hwnd = a.overlays.child_exited.hwnd.?;
         const button = try bannerButton(a);
         const line = @max(1, SearchBar.Metrics.scale(1, Window.dpiOf(&app, hwnd)));
         const face = SearchBar.inset(button, line);
         const at = midOf(button);
+        var leave: win32.MSG = undefined;
+        while (win32.PeekMessageW(&leave, hwnd, win32.WM_MOUSELEAVE, win32.WM_MOUSELEAVE, win32.PM_REMOVE).toBool()) {}
         const states = [_]struct { msg: win32.UINT, x: i32, face: win32.COLORREF }{
             .{ .msg = win32.WM_MOUSEMOVE, .x = at[0], .face = colors.hover },
             .{ .msg = win32.WM_LBUTTONDOWN, .x = at[0], .face = colors.border },
@@ -13349,16 +13425,65 @@ test "win32: the child-exited banner is drawn in libadwaita's colours, its butto
             .{ .msg = win32.WM_MOUSEMOVE, .x = at[0], .face = colors.hover },
             .{ .msg = win32.WM_MOUSELEAVE, .x = at[0], .face = colors.bar },
         };
-        for (states) |state| {
+        for (states, 0..) |state, i| {
             _ = win32.SendMessageW(hwnd, state.msg, if (state.msg == win32.WM_LBUTTONDOWN) win32.MK_LBUTTON else 0, testPoint(state.x, at[1]));
             const printed = try Printed.of(hwnd);
             defer printed.deinit();
             try std.testing.expectEqual(state.face, printed.at(face.left, face.top));
+            if (i == 0) try expectLeaveTracked(hwnd);
         }
         // The press's capture, which no release took.
         if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
         try std.testing.expect(!a.closing);
     }
+
+    // Hidden while lit, or while pressed with the mouse captured: shown
+    // again with neither, the mouse let go, and a release on the button
+    // closes nothing. Hidden for want of room, then with its tab.
+    const hwnd = a.overlays.child_exited.hwnd.?;
+    const colors = SearchBar.Colors.of(window.dark_frame);
+    const button = try bannerButton(a);
+    const face = SearchBar.inset(button, @max(1, SearchBar.Metrics.scale(1, Window.dpiOf(&app, hwnd))));
+    const at = midOf(button);
+    _ = try testTab(&app, window);
+    const hides = [_]enum { no_room, tab }{ .no_room, .tab };
+    for (hides) |how| {
+        for ([_]bool{ false, true }) |press| {
+            _ = win32.SendMessageW(hwnd, win32.WM_MOUSEMOVE, 0, testPoint(at[0], at[1]));
+            if (press) {
+                bannerDown(a, at);
+                try std.testing.expect(bannerCaptured(a));
+            }
+            switch (how) {
+                .no_room => testResize(window, 900, 20),
+                .tab => window.selectTab(1),
+            }
+            try std.testing.expect(!shown(hwnd));
+            try std.testing.expect(!bannerCaptured(a));
+            switch (how) {
+                .no_room => testResize(window, 900, 500),
+                .tab => window.selectTab(0),
+            }
+            try std.testing.expect(shown(hwnd));
+            const printed = try Printed.of(hwnd);
+            defer printed.deinit();
+            try std.testing.expectEqual(colors.bar, printed.at(face.left, face.top));
+            bannerUp(a, at);
+            try std.testing.expect(!a.closing);
+        }
+    }
+}
+
+/// For tests: the pointer's leave from `hwnd` is asked for
+/// (TrackMouseEvent): tracked now, or its WM_MOUSELEAVE posted already,
+/// which is taken, as Windows posts it at once to a window the pointer is
+/// not over.
+fn expectLeaveTracked(hwnd: win32.HWND) !void {
+    var query: win32.TRACKMOUSEEVENT = .{ .cbSize = @sizeOf(win32.TRACKMOUSEEVENT), .dwFlags = win32.TME_QUERY, .hwndTrack = null, .dwHoverTime = 0 };
+    try std.testing.expect(win32.TrackMouseEvent(&query).toBool());
+    if (query.dwFlags & win32.TME_LEAVE != 0 and query.hwndTrack == hwnd) return;
+    var leave: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(&leave, hwnd, win32.WM_MOUSELEAVE, win32.WM_MOUSELEAVE, win32.PM_REMOVE).toBool());
 }
 
 test "win32: the child-exited banner moves with its tab to a new window, and its button follows its scale" {
@@ -13469,4 +13594,108 @@ test "win32: a child-exited banner whose window cannot be made returns false, fo
     Overlays.test_make = null;
     try std.testing.expect(try testChildExited(&app, a, 3));
     try expectBannerAt(window, a, "Command Failed");
+}
+
+/// For tests: the last prompt `dialog.messageBox` would have shown, and
+/// how many it would have, each answered with `answer`
+/// (`dialog.test_message_box`).
+const PromptSeen = struct {
+    var text: [128]u16 = undefined;
+    var len: usize = 0;
+    var count: usize = 0;
+    var answer: c_int = win32.IDCANCEL;
+
+    fn seen(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
+        _ = owner;
+        _ = buttons;
+        const said = std.mem.span(prompt);
+        len = @min(said.len, text.len);
+        @memcpy(text[0..len], said[0..len]);
+        count += 1;
+        return answer;
+    }
+
+    fn expectSaid(said: []const u8) !void {
+        var buf: [256]u8 = undefined;
+        const n = try std.unicode.utf16LeToUtf8(&buf, text[0..len]);
+        try std.testing.expectEqualStrings(said, buf[0..n]);
+    }
+};
+
+test "win32: a read-only terminal whose command has exited asks to close as read-only, any other as running a process" {
+    // The core asks before a read-only terminal closes even once its
+    // command has exited (`CoreSurface.needsConfirmQuit`), when read-only
+    // is the only reason: the prompt says so. While the command runs, read
+    // only or not, it says a process is running. The runtime knows both
+    // from the core's actions, also when the windows for them cannot be
+    // made. Cancel keeps the terminal; OK closes it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &PromptSeen.seen;
+    defer message_box.* = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const running = "A process is still running in this terminal. Close it anyway?";
+    const read_only = "This terminal is read-only. Close it anyway?";
+    PromptSeen.answer = win32.IDCANCEL;
+
+    // The command running, read-only or not.
+    for ([_]apprt.action.Readonly{ .off, .on }) |value| {
+        try std.testing.expect(try testReadOnly(&app, a, value));
+        PromptSeen.count = 0;
+        a.close(true);
+        try std.testing.expectEqual(1, PromptSeen.count);
+        try PromptSeen.expectSaid(running);
+        try std.testing.expect(!a.closing);
+        try std.testing.expect(!takeTeardown(a));
+    }
+
+    // The command exited: read-only is the reason; not read-only any more,
+    // as for any other.
+    try std.testing.expect(try testChildExited(&app, a, 0));
+    a.close(true);
+    try PromptSeen.expectSaid(read_only);
+    try std.testing.expect(!a.closing);
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    a.close(true);
+    try PromptSeen.expectSaid(running);
+
+    // Read-only again, and OK: it closes.
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    PromptSeen.answer = win32.IDOK;
+    defer PromptSeen.answer = win32.IDCANCEL;
+    a.close(true);
+    try PromptSeen.expectSaid(read_only);
+    try std.testing.expect(a.closing);
+    try std.testing.expect(takeTeardown(a));
+    PromptSeen.answer = win32.IDCANCEL;
+
+    // Neither the badge nor the banner could be made: the same.
+    const NoWindow = struct {
+        fn make(_: []const u8) ?win32.HWND {
+            return null;
+        }
+    };
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+    try std.testing.expect(!try testReadOnly(&app, b, .on));
+    try std.testing.expect(!try testChildExited(&app, b, 1));
+    try std.testing.expect(b.overlays.readonly.hwnd == null);
+    try std.testing.expect(b.overlays.child_exited.hwnd == null);
+    b.close(true);
+    try PromptSeen.expectSaid(read_only);
+    try std.testing.expect(!b.closing);
 }

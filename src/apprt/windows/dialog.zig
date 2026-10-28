@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const win32 = @import("win32.zig");
 const L = win32.L;
@@ -43,6 +44,13 @@ pub fn notice(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) void {
     _ = messageBox(app, hwnd, text, win32.MB_OK);
 }
 
+/// For tests: answers in place of MessageBoxW in `messageBox`, given its
+/// owner, its text and its buttons, as `Overlays.test_make` stands for
+/// CreateWindowExW, so that a test sees what a prompt says and what each
+/// answer does without a modal loop.
+pub var test_message_box: if (builtin.is_test) ?*const fn (?win32.HWND, win32.LPCWSTR, win32.UINT) c_int else void =
+    if (builtin.is_test) null else {};
+
 /// The prompt behind `confirm`, `retry` and `notice`, with `buttons`.
 ///
 /// MessageBoxW runs a nested message loop. `prompt_depth` tells every
@@ -54,6 +62,7 @@ fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();
+    if (builtin.is_test) if (test_message_box) |answer| return answer(owner, text, buttons);
     return win32.MessageBoxW(owner, text, L("Ghostty"), buttons | win32.MB_ICONWARNING);
 }
 
