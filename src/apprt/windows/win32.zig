@@ -199,6 +199,8 @@ pub const WM_LBUTTONUP: UINT = 0x0202;
 pub const WM_LBUTTONDBLCLK: UINT = 0x0203;
 pub const WM_RBUTTONDOWN: UINT = 0x0204;
 pub const WM_RBUTTONUP: UINT = 0x0205;
+/// As WM_LBUTTONDBLCLK, for the right button.
+pub const WM_RBUTTONDBLCLK: UINT = 0x0206;
 pub const WM_MBUTTONDOWN: UINT = 0x0207;
 pub const WM_MBUTTONUP: UINT = 0x0208;
 /// As WM_LBUTTONDBLCLK, for the middle button.
@@ -206,6 +208,8 @@ pub const WM_MBUTTONDBLCLK: UINT = 0x0209;
 pub const WM_MOUSEWHEEL: UINT = 0x020A;
 pub const WM_XBUTTONDOWN: UINT = 0x020B;
 pub const WM_XBUTTONUP: UINT = 0x020C;
+/// As WM_LBUTTONDBLCLK, for an X button.
+pub const WM_XBUTTONDBLCLK: UINT = 0x020D;
 pub const WM_MOUSEHWHEEL: UINT = 0x020E;
 pub const WM_ENTERMENULOOP: UINT = 0x0211;
 pub const WM_EXITMENULOOP: UINT = 0x0212;
@@ -890,6 +894,9 @@ pub extern "user32" fn SetTimer(
 pub extern "user32" fn KillTimer(hwnd: ?HWND, id: UINT_PTR) callconv(.winapi) BOOL;
 pub extern "user32" fn SetCursor(cursor: ?HCURSOR) callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn GetCursor() callconv(.winapi) ?HCURSOR;
+/// GetClassLongW's index of the class's style (`CS_DBLCLKS`).
+pub const GCL_STYLE: c_int = -26;
+pub extern "user32" fn GetClassLongW(hwnd: HWND, index: c_int) callconv(.winapi) DWORD;
 pub extern "user32" fn MessageBeep(type_: UINT) callconv(.winapi) BOOL;
 pub extern "user32" fn MessageBoxW(
     hwnd: ?HWND,

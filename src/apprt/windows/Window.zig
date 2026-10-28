@@ -126,6 +126,10 @@ title_prompt: TitleDialog.Prompt,
 /// The window's command palette, open or not (`CommandPalette`).
 palette: CommandPalette.Palette,
 
+/// The divider being dragged with the pointer, from the press in its band
+/// until the drag ends (`Dividers.Drag`); null without one.
+divider_drag: ?Dividers.Drag,
+
 /// The tab the window shows, whose terminals are laid out in its client
 /// area.
 pub fn tab(self: *const Window) *Tab {
@@ -267,14 +271,16 @@ fn layoutAreaFor(self: *const Window, count: usize) ?win32.RECT {
 }
 
 /// Show the tab at `index` in place of the one shown, as GTK selects a
-/// tab: its terminals are laid out and shown, and its focused one gets the
-/// focus and titles the window; then the other's are hidden, and their
-/// renderers see themselves occluded. Never inside a core frame
-/// (`App.requests`): the layout sends WM_SIZE, and the focus moves.
+/// tab: a divider's drag in the other ends; its terminals are laid out and
+/// shown, and its focused one gets the focus and titles the window; then
+/// the other's are hidden, and their renderers see themselves occluded.
+/// Never inside a core frame (`App.requests`): the layout sends WM_SIZE,
+/// and the focus moves.
 pub fn selectTab(self: *Window, index: usize) void {
     assert(index < self.tabs.items.len);
     if (index == self.selected) return;
     const old = self.tab();
+    Dividers.tabChanged(self, old);
     self.selected = index;
     self.showTab();
     // A focus move a goto_split left waiting there would outlive its tab.
@@ -324,10 +330,11 @@ pub fn removeTab(self: *Window, t: *Tab) void {
 /// Take the tab at `index` out of `tabs`, for `removeTab` and `takeTab`,
 /// and return whether it was the one shown, whose place then goes to the
 /// tab after it, or else the one before; the caller shows that one. The
-/// bar's press is cancelled, as its indexes now name other tabs.
+/// bar's press is cancelled, as its indexes now name other tabs, and so is
+/// a divider's drag in the tab.
 fn unlinkTab(self: *Window, index: usize) bool {
     assert(self.tabs.items.len > 1);
-    _ = self.tabs.orderedRemove(index);
+    Dividers.tabChanged(self, self.tabs.orderedRemove(index));
     const shown = index == self.selected;
     if (index < self.selected or (shown and index == self.tabs.items.len)) self.selected -= 1;
     self.bar.tabsChanged(self);
@@ -470,8 +477,7 @@ fn keepLeftOut(self: *Window, t: *Tab, index: usize, to: win32.HWND) usize {
             skip += 1;
             continue;
         };
-        t.tree.deinit();
-        t.tree = tree;
+        self.setTree(t, tree);
         t.focused = focus;
         if (own) |o| {
             self.tabs.insertAssumeCapacity(index + 1 + kept, o);
@@ -760,6 +766,7 @@ pub fn createBare(app: *App) !*Window {
         .prompt_disabled = false,
         .title_prompt = .{},
         .palette = .{},
+        .divider_drag = null,
         .closing = false,
         .destroy_deferred = false,
     };
@@ -1061,6 +1068,22 @@ fn handleMessage(
         // and for the pointer over the frame's other windows,
         // DefWindowProcW below, as before.
         win32.WM_SETCURSOR => if (Dividers.setCursor(self, wparam, lparam)) return 1,
+
+        // Dragging a divider (`Dividers.Drag`): a press in a band starts
+        // it and takes the capture, so that the moves and the release
+        // come here wherever the pointer goes; a double click in a band
+        // equalizes the tab's splits. Elsewhere, and with no drag on,
+        // DefWindowProcW below, as before.
+        win32.WM_LBUTTONDOWN => if (Dividers.press(self, lparam)) return 0,
+        win32.WM_LBUTTONDBLCLK => if (Dividers.doubleClick(self, lparam)) return 0,
+        win32.WM_MOUSEMOVE => if (Dividers.dragTo(self, wparam, lparam)) return 0,
+        win32.WM_LBUTTONUP => if (Dividers.release(self, lparam)) return 0,
+
+        // The frame lost the capture, to another window or released, as
+        // DefWindowProcW releases it when a prompt disables the frame
+        // (WM_CANCELMODE): a drag ends where it is. DefWindowProcW below
+        // as well.
+        win32.WM_CAPTURECHANGED => Dividers.captureLost(self),
 
         // Erased by WM_PAINT below, all of it at once.
         win32.WM_ERASEBKGND => return 1,
@@ -1412,9 +1435,20 @@ pub fn split(
     defer single.deinit();
     const tree = try t.tree.split(alloc, handle, where, new_split_ratio, &single);
     errdefer comptime unreachable;
+    self.setTree(t, tree);
+    return surface;
+}
+
+/// Make `tree` `t`'s tree in place of the one it has, which is freed. A
+/// split, a resize or equalize (`adopt`) and a terminal leaving
+/// (`removePane`, `keepLeftOut`) put their new tree here, which ends a
+/// drag of a divider in the tab (`Dividers.tabChanged`): the split it
+/// moves may be gone, and its handle name another. A zoom ends it too
+/// (`toggleZoom`).
+pub fn setTree(self: *Window, t: *Tab, tree: Tree) void {
     t.tree.deinit();
     t.tree = tree;
-    return surface;
+    Dividers.tabChanged(self, t);
 }
 
 /// Where `pane` is in the client area with no zoom, as `layout` tiles it.
@@ -1535,7 +1569,12 @@ fn resizeShare(
 /// terminals on each side of it, as GTK and macOS do (`SplitTree.equalize`).
 /// Nothing moves if a terminal would shrink below a cell (`adopt`).
 pub fn equalize(self: *Window, from: *Surface) void {
-    const t = self.tabOf(from) orelse return;
+    self.equalizeTab(self.tabOf(from) orelse return);
+}
+
+/// `equalize` for the tab `t`, as a double click on a divider asks
+/// (`Dividers.doubleClick`).
+pub fn equalizeTab(self: *Window, t: *Tab) void {
     const client = self.layoutArea() orelse return;
     var tree = t.tree.equalize(self.app.core_app.alloc) catch |err| {
         log.warn("cannot equalize the splits err={}", .{err});
@@ -1556,8 +1595,7 @@ fn adopt(self: *Window, t: *Tab, tree: *Tree, client: win32.RECT) void {
         tree.deinit();
         return;
     }
-    t.tree.deinit();
-    t.tree = tree.*;
+    self.setTree(t, tree.*);
     if (t == self.tab()) self.relayout();
 }
 
@@ -1599,19 +1637,27 @@ fn keepsCellsAt(
 /// Whether `surface`, moving from `was` to `now`, keeps a cell across and
 /// down wherever it shrinks (`keepsCells`).
 fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
-    const cell = if (surface.liveCore()) |core| core.size.cell else null;
-    const min_w: i32 = if (cell) |c| @max(1, std.math.lossyCast(i32, c.width)) else 1;
-    const min_h: i32 = if (cell) |c| @max(1, std.math.lossyCast(i32, c.height)) else 1;
     const w = now.right - now.left;
     const h = now.bottom - now.top;
-    if (w < was.right - was.left and w < min_w) return false;
-    if (h < was.bottom - was.top and h < min_h) return false;
+    if (w < was.right - was.left and w < cellExtent(surface, true)) return false;
+    if (h < was.bottom - was.top and h < cellExtent(surface, false)) return false;
     return true;
 }
 
+/// The least a terminal is given across (`across`) or down by a change
+/// that shrinks it: a cell of its own font, or a pixel for a terminal with
+/// no core. `adopt` refuses a resize below it (`fitsCell`), and a
+/// divider's drag stops at it (`Dividers.minExtent`).
+pub fn cellExtent(surface: *Surface, across: bool) i32 {
+    const core = surface.liveCore() orelse return 1;
+    const cell = core.size.cell;
+    return @max(1, std.math.lossyCast(i32, if (across) cell.width else cell.height));
+}
+
 /// `toggle_split_zoom`: make `from` fill the window alone, or end the
-/// zoom, as GTK's `split-tree.zoom` does. Never inside a core frame: the
-/// layout sends WM_SIZE (`App.requests`).
+/// zoom, as GTK's `split-tree.zoom` does. A zoomed tab has no divider, so
+/// a divider's drag in it ends (`Dividers.tabChanged`). Never inside a
+/// core frame: the layout sends WM_SIZE (`App.requests`).
 pub fn toggleZoom(self: *Window, from: *Surface) void {
     const place = self.find(from) orelse return;
     const t = self.tabs.items[place.index];
@@ -1620,6 +1666,7 @@ pub fn toggleZoom(self: *Window, from: *Surface) void {
     } else {
         t.tree.zoom(place.handle);
     }
+    Dividers.tabChanged(self, t);
     if (t == self.tab()) self.relayout();
 }
 
@@ -1757,8 +1804,7 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
 
     const tree = try t.tree.remove(alloc, handle);
     errdefer comptime unreachable;
-    t.tree.deinit();
-    t.tree = tree;
+    self.setTree(t, tree);
     t.focused = focus;
 
     // A hidden tab's terminals are hidden already, and the focus and the
@@ -1972,7 +2018,7 @@ fn layoutNode(
 /// How a split divides `area` (`layout`): `divider` pixels for the line
 /// between its sides, fewer if it is narrower than that, and the rest by
 /// `ratio`, to the nearest pixel, for the first side (left or top).
-fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) struct {
+pub fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) struct {
     first: win32.RECT,
     divider: win32.RECT,
     second: win32.RECT,
@@ -1981,8 +2027,7 @@ fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) struct {
     const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
     const line = std.math.clamp(divider, 0, total);
     const rest = total - line;
-    const scaled = @round(@as(f32, @floatFromInt(rest)) * @as(f32, ratio));
-    const first = std.math.clamp(std.math.lossyCast(i32, scaled), 0, rest);
+    const first = firstExtent(rest, ratio);
 
     var a = area;
     var d = area;
@@ -1999,6 +2044,13 @@ fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) struct {
         b.top = d.bottom;
     }
     return .{ .first = a, .divider = d, .second = b, .line = line };
+}
+
+/// How many of `rest` pixels, a split's area less its line, `splitArea`
+/// gives its first side at `ratio`: to the nearest pixel.
+pub fn firstExtent(rest: i32, ratio: f16) i32 {
+    const scaled = @round(@as(f32, @floatFromInt(rest)) * @as(f32, ratio));
+    return std.math.clamp(std.math.lossyCast(i32, scaled), 0, rest);
 }
 
 /// Where `split` puts a new terminal beside one at `area`: the side

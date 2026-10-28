@@ -41,8 +41,10 @@
 //! (`Window.moveTabTo`). A tab dragged in the tab bar moves among the
 //! others, and dropped outside its window moves to a new one placed
 //! under the pointer (`TabBar.Drag`); a drop on another Ghostty window's
-//! bar also makes a new window. An action that lays out terminals, moves the
-//! focus to another window or tab, or frees core state, such as
+//! bar also makes a new window. A divider between terminals is dragged
+//! from its line or 3 DIP beside it, and a double click there equalizes
+//! the tab's splits (`Dividers`). An action that lays out terminals,
+//! moves the focus to another window or tab, or frees core state, such as
 //! `.new_split`, `.goto_tab`, `.toggle_fullscreen`,
 //! `.move_tab_to_new_window` or a full `.reload_config`, is recorded and
 //! carried out by `App.run` once the core frame that asked has returned,
@@ -161,8 +163,7 @@
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
-//! window, dragging the dividers between splits, a context menu and
-//! precision-touchpad scrolling. Without a menu, a right click with the
+//! window, a context menu and precision-touchpad scrolling. Without a menu, a right click with the
 //! default `right-click-action` only selects the word or link under the
 //! pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",

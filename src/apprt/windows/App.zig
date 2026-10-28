@@ -2998,9 +2998,17 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     // only wake its renderer for another frame of the same size. The frame
     // paints just its dividers, and Windows already invalidates what a
     // resize or a terminal's move uncovers of it.
+    //
+    // CS_DBLCLKS on the frame: a double click on a divider equalizes the
+    // splits (`Dividers.doubleClick`). With it every button's second quick
+    // press over the frame's own client area, the dividers and their
+    // bands, comes as a *BUTTONDBLCLK. The frame handles no other button,
+    // and DefWindowProcW does with their double-click messages what it did
+    // with their presses: nothing. The caption's double click is
+    // WM_NCLBUTTONDBLCLK, with or without it.
     const window_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
-        .style = 0,
+        .style = win32.CS_DBLCLKS,
         .lpfnWndProc = &Window.wndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
@@ -3775,6 +3783,7 @@ fn testFrame(app: *App) !*Window {
         .prompt_disabled = false,
         .title_prompt = .{},
         .palette = .{},
+        .divider_drag = null,
         .closing = false,
         .destroy_deferred = false,
     };
@@ -4781,6 +4790,408 @@ test "win32: the frame shows the resize pointer on a divider and beside it" {
             try std.testing.expect(now != we and now != ns);
         }
     }
+}
+
+/// For tests: the frame's mouse message `msg` at the point `x`, `y` of
+/// its client area, with the left button down but for a release, as
+/// Windows sends it in a band or to the frame holding the capture.
+fn testFrameMouse(window: *Window, msg: win32.UINT, x: i32, y: i32) void {
+    const down: win32.WPARAM = if (msg == win32.WM_LBUTTONUP) 0 else win32.MK_LBUTTON;
+    _ = win32.SendMessageW(window.hwnd, msg, down, testPoint(x, y));
+}
+
+/// For tests: a press at `x`, `y` in a band of `window`, which starts a
+/// divider's drag and takes the capture.
+fn testPressDivider(window: *Window, x: i32, y: i32) !void {
+    testFrameMouse(window, win32.WM_LBUTTONDOWN, x, y);
+    try std.testing.expect(window.divider_drag != null);
+    try std.testing.expect(win32.GetCapture() == window.hwnd);
+}
+
+/// For tests: that `window` has no divider's drag, nor the capture, and
+/// that a move to `x`, `y` with the button down leaves `pane` where it is.
+fn testDragEnded(window: *Window, pane: *const Surface, x: i32, y: i32) !void {
+    try std.testing.expect(window.divider_drag == null);
+    try std.testing.expect(win32.GetCapture() != window.hwnd);
+    const before = try paneRect(window, pane);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, x, y);
+    try std.testing.expectEqual(before, try paneRect(window, pane));
+}
+
+test "win32: a divider dragged with the pointer moves the terminals beside it" {
+    // (a | b) over c at 96 DPI. A press in a band takes the capture, and
+    // each move puts the line as far from where it was as the pointer has
+    // gone from the press, writing the split's ratio and laying the
+    // terminals out at once (`Dividers.Drag`); the release's own point
+    // counts, and lets the capture go. The line between a and b moves a
+    // and b only; the one over c, across the other way, moves all three.
+    // A press outside a band starts nothing. A resize or a DPI change
+    // during a drag leaves it on.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    try testSplits(window, a, b, c);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    defer _ = win32.ReleaseCapture();
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    const rc = try paneRect(window, c);
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+    const tree = &window.tab().tree;
+    const row = tree.nodes[Window.Tree.Node.Handle.root.idx()].split.left;
+
+    // Pressed 2 pixels left of the line, in a's pixels of the band; moved
+    // 40 right, then 30 left of the press, a little lower.
+    const x = ra.right - 2;
+    try testPressDivider(window, x, y);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, x + 40, y);
+    try std.testing.expectEqual(ra.right + 40, (try paneRect(window, a)).right);
+    try std.testing.expectEqual(win32.RECT{
+        .left = rb.left + 40,
+        .top = rb.top,
+        .right = rb.right,
+        .bottom = rb.bottom,
+    }, try paneRect(window, b));
+    try std.testing.expectEqual(rc, try paneRect(window, c));
+    testFrameMouse(window, win32.WM_MOUSEMOVE, x - 30, y + 7);
+    try std.testing.expectEqual(ra.right - 30, (try paneRect(window, a)).right);
+    try std.testing.expectEqual(rb.left - 30, (try paneRect(window, b)).left);
+    try std.testing.expectEqual(ra.bottom, (try paneRect(window, a)).bottom);
+
+    // Released 50 right of the press: the line there, its ratio written,
+    // the capture let go; a move after it moves nothing.
+    testFrameMouse(window, win32.WM_LBUTTONUP, x + 50, y);
+    try std.testing.expect(window.divider_drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+    const moved = try paneRect(window, a);
+    try std.testing.expectEqual(ra.right + 50, moved.right);
+    try std.testing.expectEqual(rb.left + 50, (try paneRect(window, b)).left);
+    const rest = rb.right - ra.left - 1;
+    try std.testing.expectEqual(moved.right - moved.left, Window.firstExtent(rest, tree.nodes[row.idx()].split.ratio));
+    testFrameMouse(window, win32.WM_MOUSEMOVE, x + 90, y);
+    try std.testing.expectEqual(moved, try paneRect(window, a));
+
+    // The line over c, pressed on it and moved 30 up: a and b end higher,
+    // c starts higher, and the line between a and b stays.
+    const xa = @divTrunc(moved.left + moved.right, 2);
+    try testPressDivider(window, xa, ra.bottom);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, xa + 9, ra.bottom - 30);
+    testFrameMouse(window, win32.WM_LBUTTONUP, xa + 9, ra.bottom - 30);
+    try std.testing.expectEqual(win32.RECT{
+        .left = moved.left,
+        .top = moved.top,
+        .right = moved.right,
+        .bottom = ra.bottom - 30,
+    }, try paneRect(window, a));
+    try std.testing.expectEqual(rb.bottom - 30, (try paneRect(window, b)).bottom);
+    try std.testing.expectEqual(win32.RECT{
+        .left = rc.left,
+        .top = rc.top - 30,
+        .right = rc.right,
+        .bottom = rc.bottom,
+    }, try paneRect(window, c));
+    try std.testing.expect(win32.GetCapture() == null);
+
+    // A press 4 pixels left of the line between a and b, past its band.
+    const now = try paneRect(window, a);
+    testFrameMouse(window, win32.WM_LBUTTONDOWN, now.right - 4, y);
+    try std.testing.expect(window.divider_drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, now.right + 40, y);
+    try std.testing.expectEqual(now, try paneRect(window, a));
+
+    // A resize and a DPI change during a drag leave it on, and the line
+    // still goes where the pointer puts it, 2 pixels wide at 144 DPI.
+    try testPressDivider(window, now.right, y);
+    testResize(window, 500, 300);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, now.right + 20, y);
+    try std.testing.expectEqual(now.right + 20, (try paneRect(window, a)).right);
+    TestDpi.dpi = 144;
+    defer TestDpi.dpi = 96;
+    var suggested = try windowRect(window.hwnd);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_DPICHANGED, 144 << 16 | 144, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expect(window.divider_drag != null);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, now.right + 30, y);
+    try std.testing.expectEqual(now.right + 30, (try paneRect(window, a)).right);
+    try std.testing.expectEqual(now.right + 32, (try paneRect(window, b)).left);
+    testFrameMouse(window, win32.WM_LBUTTONUP, now.right + 30, y);
+    try std.testing.expect(win32.GetCapture() == null);
+}
+
+test "win32: a dragged divider stops at a pixel for each terminal beyond it" {
+    // Without a core a terminal's least is a pixel, as `adopt` keeps it
+    // (`Window.cellExtent`). In a | b | c the line after a stops a pixel
+    // from the window's left edge, and, dragged right, where b, c and the
+    // line between them take three. In (d | e) over f the line over f
+    // stops a pixel below the top, d and e side by side needing a pixel
+    // each down, and a pixel above the bottom.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const row = try testFrame(&app);
+    testResize(row, 400, 300);
+    const a = try testPane(&app, row);
+    const b = try testPane(&app, row);
+    const c = try testPane(&app, row);
+    row.tab().tree = try testRow(alloc, &.{ a, b, c });
+    row.tab().focused = a;
+    row.relayout();
+    _ = win32.ShowWindow(row.hwnd, win32.SW_SHOWNOACTIVATE);
+    defer _ = win32.ReleaseCapture();
+    const client = row.layoutArea() orelse return error.TestUnexpectedResult;
+    const ra = try paneRect(row, a);
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+
+    try testPressDivider(row, ra.right, y);
+    testFrameMouse(row, win32.WM_MOUSEMOVE, -1000, y);
+    try std.testing.expectEqual(win32.RECT{
+        .left = client.left,
+        .top = ra.top,
+        .right = client.left + 1,
+        .bottom = ra.bottom,
+    }, try paneRect(row, a));
+    testFrameMouse(row, win32.WM_MOUSEMOVE, 5000, y);
+    const rb = try paneRect(row, b);
+    const rc = try paneRect(row, c);
+    try std.testing.expectEqual(1, rb.right - rb.left);
+    try std.testing.expectEqual(1, rc.right - rc.left);
+    try std.testing.expectEqual(client.right, rc.right);
+    try std.testing.expectEqual(rb.right + 1, rc.left);
+    try std.testing.expectEqual((try paneRect(row, a)).right + 1, rb.left);
+    testFrameMouse(row, win32.WM_LBUTTONUP, 5000, y);
+
+    const column = try testFrame(&app);
+    testResize(column, 400, 300);
+    const d = try testPane(&app, column);
+    const e = try testPane(&app, column);
+    const f = try testPane(&app, column);
+    try testSplits(column, d, e, f);
+    _ = win32.ShowWindow(column.hwnd, win32.SW_SHOWNOACTIVATE);
+    const area = column.layoutArea() orelse return error.TestUnexpectedResult;
+    const rd = try paneRect(column, d);
+    const x = @divTrunc(rd.left + rd.right, 2);
+    try testPressDivider(column, x, rd.bottom);
+    testFrameMouse(column, win32.WM_MOUSEMOVE, x, -1000);
+    try std.testing.expectEqual(area.top + 1, (try paneRect(column, d)).bottom);
+    try std.testing.expectEqual(area.top + 1, (try paneRect(column, e)).bottom);
+    try std.testing.expectEqual(area.top + 2, (try paneRect(column, f)).top);
+    testFrameMouse(column, win32.WM_MOUSEMOVE, x, 5000);
+    try std.testing.expectEqual(area.bottom - 1, (try paneRect(column, f)).top);
+    try std.testing.expectEqual(area.bottom, (try paneRect(column, f)).bottom);
+    testFrameMouse(column, win32.WM_LBUTTONUP, x, 5000);
+    try std.testing.expect(win32.GetCapture() == null);
+}
+
+test "win32: a divider drag ends with a lost capture or a change of its tab" {
+    // Each lets go of the capture if the frame still has it, and the
+    // moves after it move nothing: another window taking the capture, a
+    // prompt disabling the frame (WM_CANCELMODE), a move without the
+    // button, a zoom, a terminal closing, a new split, the tab hidden, and
+    // the tab moved to another window (`Dividers.tabChanged`). While the
+    // core may not be re-entered a move lays nothing out, and the drag
+    // goes on after. A tab added and not shown leaves the drag alone, and
+    // so does a change of its tree.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    try testSplits(window, a, b, c);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    defer _ = win32.ReleaseCapture();
+    const line = (try paneRect(window, a)).right;
+    const y = @divTrunc((try paneRect(window, a)).top + (try paneRect(window, a)).bottom, 2);
+
+    // Another window takes the capture.
+    try testPressDivider(window, line, y);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, line + 10, y);
+    try std.testing.expectEqual(line + 10, (try paneRect(window, a)).right);
+    _ = win32.SetCapture(a.hwnd);
+    try testDragEnded(window, a, line + 40, y);
+    _ = win32.ReleaseCapture();
+
+    // A prompt opens: every frame is disabled, which cancels the capture.
+    try testPressDivider(window, line + 10, y);
+    app.beginPrompt(null);
+    try testDragEnded(window, a, line + 40, y);
+    app.endPrompt();
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // A move without the button down, after a release unseen.
+    try testPressDivider(window, line + 10, y);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_MOUSEMOVE, 0, testPoint(line + 20, y));
+    try testDragEnded(window, a, line + 40, y);
+
+    // While the core may not be re-entered, as under a prompt the frame
+    // did not see, the line waits; then it follows.
+    try testPressDivider(window, line + 10, y);
+    app.prompt_depth = 1;
+    testFrameMouse(window, win32.WM_MOUSEMOVE, line + 30, y);
+    try std.testing.expectEqual(line + 10, (try paneRect(window, a)).right);
+    app.prompt_depth = 0;
+    testFrameMouse(window, win32.WM_MOUSEMOVE, line + 30, y);
+    try std.testing.expectEqual(line + 30, (try paneRect(window, a)).right);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, line, y);
+
+    // A zoom; in the zoomed tab a press starts nothing.
+    window.toggleZoom(a);
+    try testDragEnded(window, a, line + 40, y);
+    testFrameMouse(window, win32.WM_LBUTTONDOWN, line, y);
+    try std.testing.expect(window.divider_drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+    window.toggleZoom(a);
+    try std.testing.expectEqual(line, (try paneRect(window, a)).right);
+
+    // c closes.
+    try testPressDivider(window, line, y);
+    try std.testing.expect(c.destroy());
+    try testDragEnded(window, a, line + 40, y);
+
+    // d split off below a | b, as `Window.split` leaves the tree, and
+    // shown, as `App.newSplit` shows it.
+    const d = try testPane(&app, window);
+    try testPressDivider(window, line, y);
+    const with_d = tree: {
+        var below: Window.Tree = try .init(alloc, d);
+        defer below.deinit();
+        break :tree try window.tab().tree.split(alloc, .root, .down, Window.new_split_ratio, &below);
+    };
+    window.setTree(window.tab(), with_d);
+    window.showPane(d);
+    try testDragEnded(window, a, line + 40, y);
+
+    // A tab added and not shown leaves the drag, and so does a change of
+    // that tab's tree; the tab hidden ends it.
+    try testPressDivider(window, line, y);
+    const e = try testTab(&app, window);
+    window.equalize(e);
+    try std.testing.expect(window.divider_drag != null);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, line + 5, y);
+    const ya = @divTrunc((try paneRect(window, a)).top + (try paneRect(window, a)).bottom, 2);
+    try std.testing.expectEqual(line + 5, (try paneRect(window, a)).right);
+    window.selectTab(1);
+    try testDragEnded(window, e, line + 40, ya);
+    window.selectTab(0);
+
+    // The tab moved to a window of its own.
+    try testPressDivider(window, line + 5, ya);
+    const to = try testFrame(&app);
+    try std.testing.expect(try window.moveTabTo(0, to) == .whole);
+    try std.testing.expect(window.tab().focused == e);
+    try testDragEnded(window, e, line + 40, ya);
+    try std.testing.expect(to.divider_drag == null);
+}
+
+test "win32: a double click on a divider equalizes the tab's splits" {
+    // The frame's class has CS_DBLCLKS, so that the second press of a
+    // double click in a band comes as WM_LBUTTONDBLCLK: each split of the
+    // shown tab then gets its share (`Window.equalizeTab`). Not outside a
+    // band, not for another button's double click, not in a zoomed tab,
+    // nor while the core may not be re-entered.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    try std.testing.expect(win32.GetClassLongW(window.hwnd, win32.GCL_STYLE) & win32.CS_DBLCLKS != 0);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    try testSplits(window, a, b, c);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    defer _ = win32.ReleaseCapture();
+    const equal_a = try paneRect(window, a);
+    const equal_c = try paneRect(window, c);
+    const y = @divTrunc(equal_a.top + equal_a.bottom, 2);
+    const x = @divTrunc(equal_a.left + equal_a.right, 2);
+
+    // Both lines dragged off the middle.
+    const Lines = struct {
+        fn offCentre(w: *Window, pa: *const Surface, at_y: i32, at_x: i32) !void {
+            const ra = try paneRect(w, pa);
+            try testPressDivider(w, ra.right, at_y);
+            testFrameMouse(w, win32.WM_LBUTTONUP, ra.right + 60, at_y);
+            try testPressDivider(w, at_x, ra.bottom);
+            testFrameMouse(w, win32.WM_LBUTTONUP, at_x, ra.bottom - 40);
+        }
+    };
+    try Lines.offCentre(window, a, y, x);
+    const off = try paneRect(window, a);
+    try std.testing.expectEqual(equal_a.right + 60, off.right);
+    try std.testing.expectEqual(equal_a.bottom - 40, off.bottom);
+
+    // Outside a band, other buttons in it, and under a prompt: nothing.
+    testFrameMouse(window, win32.WM_LBUTTONDBLCLK, off.right - 4, y);
+    for ([_]win32.UINT{ win32.WM_MBUTTONDBLCLK, win32.WM_RBUTTONDBLCLK, win32.WM_XBUTTONDBLCLK }) |msg| {
+        _ = win32.SendMessageW(window.hwnd, msg, 0, testPoint(off.right, y));
+    }
+    app.prompt_depth = 1;
+    testFrameMouse(window, win32.WM_LBUTTONDBLCLK, off.right, y);
+    app.prompt_depth = 0;
+    try std.testing.expectEqual(off, try paneRect(window, a));
+    try std.testing.expect(window.divider_drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+
+    // In the band of the line between a and b: both lines in the middle
+    // again, a and b as wide, and a, b and c as high, as before the drags.
+    testFrameMouse(window, win32.WM_LBUTTONDBLCLK, off.right + 2, y);
+    try std.testing.expectEqual(equal_a, try paneRect(window, a));
+    try std.testing.expectEqual(equal_c, try paneRect(window, c));
+    try std.testing.expect(window.divider_drag == null);
+    try std.testing.expect(win32.GetCapture() == null);
+
+    // Off again; the line over c's band, below it, does as much.
+    try Lines.offCentre(window, a, y, x);
+    testFrameMouse(window, win32.WM_LBUTTONDBLCLK, x, (try paneRect(window, c)).top + 2);
+    try std.testing.expectEqual(equal_a, try paneRect(window, a));
+
+    // Zoomed: no band, so nothing; unzoomed, the lines where they were.
+    try Lines.offCentre(window, a, y, x);
+    const before = try paneRect(window, a);
+    window.toggleZoom(a);
+    testFrameMouse(window, win32.WM_LBUTTONDBLCLK, before.right, y);
+    window.toggleZoom(a);
+    try std.testing.expectEqual(before, try paneRect(window, a));
 }
 
 test "win32: a window is titled after its focused terminal" {
