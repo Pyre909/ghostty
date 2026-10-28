@@ -182,8 +182,10 @@ pub const Bar = struct {
     /// terminal by a few messages: when a frame is destroyed, Windows sends
     /// WM_DESTROY to its children in an order of its own, and the
     /// terminal's frees it (`App.surfaceDestroyed`) before or after its
-    /// bar's. So the window is not destroyed here but loses its
-    /// back-pointer, as the terminal's does, and is destroyed with its frame.
+    /// bar's. So the window is not destroyed here, and is destroyed with
+    /// its frame. If the bar's WM_DESTROY came first, the window let go of
+    /// its back-pointer there; if not, it loses it here, as the terminal's
+    /// does.
     pub fn deinit(self: *Bar) void {
         if (self.hwnd) |hwnd| _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
         self.hwnd = null;
@@ -324,8 +326,9 @@ var edit_proc: ?win32.WNDPROC = null;
 /// the EDIT.
 pub var test_forwarded: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
-/// For tests: how many messages a bar's window got after its terminal had
-/// let go of it (`Bar.deinit`), which the default procedure handled.
+/// For tests: how many WM_DESTROYs a bar's window or its field got after
+/// the window and its terminal had parted (at the window's WM_DESTROY, or
+/// in `Bar.deinit`), which the default procedure or the EDIT's handled.
 pub var test_detached: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
 /// For tests: the time the field's wait is measured with (`Debounce`), in
@@ -649,7 +652,7 @@ pub fn wndProc(
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     const surface = surfaceOf(hwnd) orelse {
-        if (builtin.is_test) test_detached += 1;
+        if (builtin.is_test and msg == win32.WM_DESTROY) test_detached += 1;
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     };
     const bar = &surface.search_bar;
@@ -760,6 +763,11 @@ pub fn wndProc(
             bar.pressed = .none;
             bar.hover = .none;
             bar.tracking = false;
+            // Nor does it, or its field, read the terminal again: a frame
+            // being destroyed may free the terminal before this window's
+            // WM_NCDESTROY and its field's last messages, and its
+            // `deinit` no longer knows this window to let go of it.
+            _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
             return 0;
         },
 
@@ -801,8 +809,10 @@ fn editProc(
 ) callconv(.winapi) win32.LRESULT {
     const proc = edit_proc.?;
     const parent = win32.GetAncestor(hwnd, win32.GA_PARENT);
-    const surface = (if (parent) |p| surfaceOf(p) else null) orelse
+    const surface = (if (parent) |p| surfaceOf(p) else null) orelse {
+        if (builtin.is_test and msg == win32.WM_DESTROY) test_detached += 1;
         return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
+    };
 
     if (msg == win32.WM_SETFOCUS) {
         // The terminal's WM_KILLFOCUS told its core; the window is now

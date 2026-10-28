@@ -10280,8 +10280,8 @@ test "win32: a search bar follows its terminal through zooms, tabs, splits and m
     // A window closing with a bar open frees both, whichever of the two
     // Windows destroys first. The terminal raised above its bar is
     // destroyed, and freed, first, as Windows destroys a frame's children
-    // from the top: its bar then lets go of it (`Bar.deinit`), and gets
-    // its own WM_DESTROY with no terminal to write to.
+    // from the top: it lets go of its bar's window (`Bar.deinit`), whose
+    // WM_DESTROY, and then its field's, have no terminal to write to.
     try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
     const b_bar = b.search_bar.hwnd.?;
     // In the new window, with the tab it moved in.
@@ -10293,7 +10293,46 @@ test "win32: a search bar follows its terminal through zooms, tabs, splits and m
     try std.testing.expect(win32.DestroyWindow(frame).toBool());
     try std.testing.expect(!win32.IsWindow(b_bar).toBool());
     try std.testing.expectEqual(1, app.windows.items.len);
-    try std.testing.expect(SearchBar.test_detached > 0);
+    try std.testing.expectEqual(2, SearchBar.test_detached);
+}
+
+test "win32: a search bar above its terminal lets go of it at its WM_DESTROY as its window closes" {
+    // The bar is placed above its terminal, and Windows sends WM_DESTROY
+    // to a frame's children from the top, each one's before its own
+    // children's: the bar's comes while its terminal is there, then its
+    // field's, then the terminal's, which frees the terminal before the
+    // bar's WM_NCDESTROY and its field's. The bar's window lets go of the
+    // terminal at its own WM_DESTROY, so that none of those reads it: its
+    // field's WM_DESTROY, the first of them, has no terminal to read.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    const bar = a.search_bar.hwnd.?;
+    try expectBarOver(window, a);
+
+    SearchBar.test_detached = 0;
+    try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindow(bar).toBool());
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(1, SearchBar.test_detached);
 }
 
 /// For tests: `SearchSeen`, and the core's answer to `end_search`, the
