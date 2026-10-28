@@ -3784,6 +3784,7 @@ fn testFrame(app: *App) !*Window {
         .title_prompt = .{},
         .palette = .{},
         .divider_drag = null,
+        .divider_wheel = false,
         .closing = false,
         .destroy_deferred = false,
     };
@@ -5234,6 +5235,145 @@ test "win32: a double click on a divider equalizes the tab's splits" {
     testFrameMouse(window, win32.WM_LBUTTONDBLCLK, before.right, y);
     window.toggleZoom(a);
     try std.testing.expectEqual(before, try paneRect(window, a));
+}
+
+/// For tests: the wheel messages the terminals' windows get, recorded by a
+/// subclass of each window `watch` is given, which passes every message on
+/// to the terminal's own procedure, but for a wheel that comes while one is
+/// being handled: a terminal with no core passes its wheel up to the
+/// frame, so a frame that sent it back would loop until the stack
+/// overflowed. That one is recorded and goes no further, and the loop
+/// shows as a second wheel.
+const TestWheels = struct {
+    const Got = struct { hwnd: win32.HWND, msg: win32.UINT };
+
+    /// The terminals' class procedure, the one each subclassed window had.
+    var proc: ?win32.WNDPROC = null;
+    var got: [8]Got = undefined;
+    var len: usize = 0;
+    var depth: usize = 0;
+
+    fn watch(surface: *const Surface) void {
+        const old = win32.SetWindowLongPtrW(surface.hwnd, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&wndProc)));
+        if (proc == null) proc = @ptrFromInt(@as(usize, @bitCast(old)));
+    }
+
+    fn wndProc(
+        hwnd: win32.HWND,
+        msg: win32.UINT,
+        wparam: win32.WPARAM,
+        lparam: win32.LPARAM,
+    ) callconv(.winapi) win32.LRESULT {
+        const is_wheel = msg == win32.WM_MOUSEWHEEL or msg == win32.WM_MOUSEHWHEEL;
+        if (is_wheel) {
+            if (len < got.len) {
+                got[len] = .{ .hwnd = hwnd, .msg = msg };
+                len += 1;
+            }
+            if (depth > 0) return 0;
+            depth += 1;
+        }
+        defer if (is_wheel) {
+            depth -= 1;
+        };
+        return win32.CallWindowProcW(proc.?, hwnd, msg, wparam, lparam);
+    }
+
+    /// That the watched terminals got `msg`, each of `to` once and in that
+    /// order, since the last call, and nothing else; then forget them.
+    fn expect(msg: win32.UINT, to: []const *const Surface) !void {
+        defer len = 0;
+        try std.testing.expectEqual(to.len, len);
+        for (to, got[0..len]) |surface, g| {
+            try std.testing.expect(surface.hwnd == g.hwnd);
+            try std.testing.expectEqual(msg, g.msg);
+        }
+    }
+};
+
+/// For tests: the wheel message `msg`, a notch away from the user, sent to
+/// `to` at the point `x`, `y` of `window`'s client area, with the point on
+/// the screen as Windows sends it.
+fn testWheelAt(to: win32.HWND, window: *const Window, msg: win32.UINT, x: i32, y: i32) !void {
+    var pt: win32.POINT = .{ .x = x, .y = y };
+    if (!win32.ClientToScreen(window.hwnd, &pt).toBool()) return error.TestUnexpectedResult;
+    _ = win32.SendMessageW(to, msg, testWheel(120), testPoint(pt.x, pt.y));
+}
+
+test "win32: a wheel in a divider's band goes on to the terminal there" {
+    // (a | b) over c at 96 DPI. In a band the terminal under the pointer
+    // lets it through to the frame, which gets the wheel: the frame passes
+    // both wheels on to the terminal whose rect holds the point, once,
+    // though a terminal with no core passes its wheel back up to the frame
+    // (DefWindowProcW). On a line, which no terminal holds, no terminal
+    // gets it; nor outside the bands, where a terminal's own wheel comes
+    // up to the frame and is not sent back; nor in a zoomed tab or from a
+    // tab not shown.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    try testSplits(window, a, b, c);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    for ([_]*Surface{ a, b, c }) |pane| TestWheels.watch(pane);
+    TestWheels.len = 0;
+    const ra = try paneRect(window, a);
+    const rc = try paneRect(window, c);
+    const line = ra.right;
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+    const x = @divTrunc(ra.left + ra.right, 2);
+    const frame = window.hwnd;
+
+    for ([_]win32.UINT{ win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL }) |msg| {
+        // In a's pixels of the band of the line between a and b, then in
+        // b's; above and below the line over c.
+        try testWheelAt(frame, window, msg, line - 2, y);
+        try TestWheels.expect(msg, &.{a});
+        try testWheelAt(frame, window, msg, line + 3, y);
+        try TestWheels.expect(msg, &.{b});
+        try testWheelAt(frame, window, msg, x, ra.bottom - 1);
+        try TestWheels.expect(msg, &.{a});
+        try testWheelAt(frame, window, msg, x, rc.top + 2);
+        try TestWheels.expect(msg, &.{c});
+
+        // On either line.
+        try testWheelAt(frame, window, msg, line, y);
+        try TestWheels.expect(msg, &.{});
+        try testWheelAt(frame, window, msg, x, ra.bottom);
+        try TestWheels.expect(msg, &.{});
+
+        // Outside the bands: sent to the frame, and sent to a, as Windows
+        // sends it there.
+        try testWheelAt(frame, window, msg, line - 10, y);
+        try TestWheels.expect(msg, &.{});
+        try testWheelAt(a.hwnd, window, msg, line - 10, y);
+        try TestWheels.expect(msg, &.{a});
+    }
+
+    // Zoomed to a: no band.
+    window.toggleZoom(a);
+    try testWheelAt(frame, window, win32.WM_MOUSEWHEEL, line - 2, y);
+    try TestWheels.expect(win32.WM_MOUSEWHEEL, &.{});
+    window.toggleZoom(a);
+
+    // Another tab shown alone: the hidden tab's bands are gone with it.
+    const e = try testTab(&app, window);
+    window.selectTab(1);
+    TestWheels.watch(e);
+    try testWheelAt(frame, window, win32.WM_MOUSEWHEEL, line - 2, y);
+    try TestWheels.expect(win32.WM_MOUSEWHEEL, &.{});
 }
 
 test "win32: a window is titled after its focused terminal" {

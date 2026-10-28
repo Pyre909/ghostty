@@ -130,6 +130,10 @@ palette: CommandPalette.Palette,
 /// until the drag ends (`Dividers.Drag`); null without one.
 divider_drag: ?Dividers.Drag,
 
+/// While a wheel from a divider's band is being passed on to a terminal
+/// (`Dividers.wheel`).
+divider_wheel: bool,
+
 /// The tab the window shows, whose terminals are laid out in its client
 /// area.
 pub fn tab(self: *const Window) *Tab {
@@ -767,6 +771,7 @@ pub fn createBare(app: *App) !*Window {
         .title_prompt = .{},
         .palette = .{},
         .divider_drag = null,
+        .divider_wheel = false,
         .closing = false,
         .destroy_deferred = false,
     };
@@ -1078,6 +1083,11 @@ fn handleMessage(
         win32.WM_LBUTTONDBLCLK => if (Dividers.doubleClick(self, lparam)) return 0,
         win32.WM_MOUSEMOVE => if (Dividers.dragTo(self, wparam, lparam)) return 0,
         win32.WM_LBUTTONUP => if (Dividers.release(self, lparam)) return 0,
+
+        // The wheel in a band, which the terminal there lets through to the
+        // frame: on to that terminal (`Dividers.wheel`). On a line, and
+        // outside the bands, DefWindowProcW below, as before.
+        win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => if (Dividers.wheel(self, msg, wparam, lparam)) return 0,
 
         // The frame lost the capture, to another window or released, as
         // DefWindowProcW releases it when a prompt disables the frame

@@ -11,7 +11,9 @@
 //! frame under it, as over the line itself; the frame's WM_SETCURSOR then
 //! shows the resize pointer across the divider (`setCursor`). The band
 //! takes those pixels from the terminals, where the default padding
-//! (`window-padding-x` and `window-padding-y`, 2 pt) covers most of them.
+//! (`window-padding-x` and `window-padding-y`, 2 pt) covers most of them;
+//! a wheel there goes on from the frame to the terminal under the pointer
+//! (`wheel`).
 //! GTK narrowed its separator's grab area to its line instead, because a
 //! wider one made the first column right of a split unselectable
 //! (src/apprt/gtk/css/style.css, ghostty#3020).
@@ -229,6 +231,76 @@ fn cursorPos() ?win32.POINT {
     if (!win32.GetCursorPos(&pos).toBool()) return null;
     return pos;
 }
+
+/// The frame's WM_MOUSEWHEEL and WM_MOUSEHWHEEL, `lparam` a point on the
+/// screen. In a band (`at`) the terminal under the pointer lets it through
+/// to the frame (`hitTest`), so that Windows, which sends the wheel to the
+/// window under the pointer ("Scroll inactive windows when I hover over
+/// them", on by default), gives it to the frame: it goes on to that
+/// terminal, the one whose rect holds the point (`paneAt`), as it went
+/// before the band, and the terminal scrolls, or reports the wheel at the
+/// cell under the pointer to a program that asked for the mouse
+/// (`Surface.wheelPoint`). On the line itself, no terminal's, and outside
+/// the bands, where the wheel came up from a window inside the frame,
+/// nothing: the frame's DefWindowProcW then drops it, a top-level window
+/// having no parent to pass it to. Returns whether it went on.
+///
+/// A terminal with no core passes the wheel up to its frame
+/// (DefWindowProcW): one that comes back while it is being passed on
+/// is not passed on again, or each would come back with the next until
+/// the stack overflowed.
+pub fn wheel(window: *Window, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
+    if (window.divider_wheel) return false;
+    var client = pointOf(lparam);
+    if (!win32.ScreenToClient(window.hwnd, &client).toBool()) return false;
+    if (at(window, client) == null) return false;
+    const surface = paneAt(window, client) orelse return false;
+    window.divider_wheel = true;
+    defer window.divider_wheel = false;
+    _ = win32.SendMessageW(surface.hwnd, msg, wparam, lparam);
+    return true;
+}
+
+/// The terminal of `window`'s shown tab whose rect holds `client`, a
+/// point in the frame's client area, laid out as `at` lays it out; null
+/// on a divider's line, which is no terminal's.
+fn paneAt(window: *const Window, client: win32.POINT) ?*Surface {
+    const area = window.layoutArea() orelse return null;
+    const divider = Window.dividerWidth(Window.dpiOf(window.app, window.hwnd));
+    var ctx: PaneAt = .{ .point = client };
+    Window.layout(&window.tab().tree, area, divider, &ctx);
+    return ctx.found;
+}
+
+/// What `paneAt` asks `Window.layout` for.
+const PaneAt = struct {
+    point: win32.POINT,
+    found: ?*Surface = null,
+
+    pub fn pane(self: *PaneAt, surface: *Surface, rect: win32.RECT) void {
+        const p = self.point;
+        if (p.x >= rect.left and p.x < rect.right and p.y >= rect.top and p.y < rect.bottom) self.found = surface;
+    }
+
+    pub fn hidden(self: *PaneAt, surface: *Surface) void {
+        _ = self;
+        _ = surface;
+    }
+
+    pub fn divider(
+        self: *PaneAt,
+        handle: Window.Tree.Node.Handle,
+        line: win32.RECT,
+        across: bool,
+        area: win32.RECT,
+    ) void {
+        _ = self;
+        _ = handle;
+        _ = line;
+        _ = across;
+        _ = area;
+    }
+};
 
 /// A divider being dragged (`Window.divider_drag`): from a press in its
 /// band (`press`) until the button comes up (`release`), a move comes
