@@ -152,10 +152,11 @@ pub const Surface = struct {
     search_bar: SearchBar.Bar,
 
     /// The terminal's overlays (`Overlays`), windows of the frame's just
-    /// above this one that show something about it and take no input: its
-    /// link preview, made, hidden, with this one, and its key-state
-    /// indicator and read-only badge, made the first time they have
-    /// something to show.
+    /// above this one that show something about it and take no input but
+    /// on the child-exited banner's button: its link preview, made, hidden,
+    /// with this one, and its key-state indicator, read-only badge and
+    /// child-exited banner, made the first time they have something to
+    /// show.
     overlays: Overlays,
 
     /// The lifecycle of `core_surface`.

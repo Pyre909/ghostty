@@ -146,6 +146,18 @@
 //! GTK stacks them. Its window is made the first time the terminal is made
 //! read-only. GTK's lock icon is not drawn.
 //!
+//! ## Child exited
+//!
+//! `.show_child_exited` shows a banner across the bottom of the terminal,
+//! as GTK's Adw.Banner does (`ChildExited`): "Command Succeeded" or
+//! "Command Failed" by the exit code, over libadwaita's success or error
+//! colour mixed with the search bar's, and a Close button that closes the
+//! terminal as its WM_CLOSE does. It stands in for the core's own text,
+//! also after an abnormal exit, whose command, runtime and exit code are
+//! then not shown. It is above the read-only badge and under the link
+//! preview; it takes the pointer over its button alone, and never the
+//! activation or the focus. Its window is made when the core asks.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
@@ -245,6 +257,7 @@ comptime {
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
+    _ = @import("windows/ChildExited.zig");
     _ = @import("windows/CommandPalette.zig");
     _ = @import("windows/KeyState.zig");
     _ = @import("windows/LinkPreview.zig");

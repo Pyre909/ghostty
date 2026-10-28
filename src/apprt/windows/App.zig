@@ -23,6 +23,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const KeyState = @import("KeyState.zig");
 const ReadOnly = @import("ReadOnly.zig");
+const ChildExited = @import("ChildExited.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -412,6 +413,11 @@ pub const App = struct {
             from: *CoreSurface,
             target: TitleDialog.Target,
         },
+
+        /// A click on the Close button of the child-exited banner of this
+        /// surface while the core could not be re-entered: it closes as its
+        /// own WM_CLOSE closes it (`Surface.requestClose`, `ChildExited`).
+        close_surface: *CoreSurface,
 
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
@@ -1182,6 +1188,7 @@ pub const App = struct {
             .key_sequence => keySequence(target, value),
             .key_table => keyTable(target, value),
             .readonly => readOnly(target, value),
+            .show_child_exited => childExited(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1271,6 +1278,19 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| ReadOnly.set(v.rt_surface, value),
+        };
+    }
+
+    /// `.show_child_exited`, from the core's tick once the terminal's
+    /// command has exited: its banner shows across its bottom, titled by
+    /// the exit code, with a button that closes it, as GTK's does
+    /// (`ChildExited.show`); true stands in for the core's own text.
+    /// `false` for the app, and for a terminal whose banner could not be
+    /// made, which the core then writes its text into.
+    fn childExited(target: apprt.Target, value: apprt.surface.Message.ChildExited) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| ChildExited.show(v.rt_surface, value),
         };
     }
 
@@ -2001,7 +2021,7 @@ pub const App = struct {
             .resize => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
-            .equalize, .fullscreen, .maximize, .zoom, .decorations, .reset_window_size => |from| {
+            .equalize, .fullscreen, .maximize, .zoom, .decorations, .reset_window_size, .close_surface => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .goto_window => |goto| {
@@ -2585,6 +2605,7 @@ pub const App = struct {
                 },
                 .search_key => |key| SearchBar.replay(key.from, key.key),
                 .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
+                .close_surface => |from| from.rt_surface.requestClose(),
                 .dropped => {},
             }
         }
@@ -12554,8 +12575,9 @@ const Printed = struct {
     }
 
     /// Each of `r`'s pixels is, channel by channel, between `from` and
-    /// `to`, as text drawn in `to` over `from` is, smoothed or not; and
-    /// some are more than half way to `to`: there is text.
+    /// `to`, as text drawn in `to` over `from` is, smoothed or not, give or
+    /// take the rounding of ClearType's gamma (a level was seen); and some
+    /// are more than half way to `to`: there is text.
     fn expectBetween(self: *const Printed, r: win32.RECT, from: win32.COLORREF, to: win32.COLORREF) !void {
         var farthest: u32 = 0;
         var y = r.top;
@@ -12569,7 +12591,8 @@ const Printed = struct {
                     const v: i32 = @intCast((c >> shift) & 0xff);
                     const a: i32 = @intCast((from >> shift) & 0xff);
                     const b: i32 = @intCast((to >> shift) & 0xff);
-                    if (v < @min(a, b) or v > @max(a, b)) {
+                    const slack = 3;
+                    if (v < @min(a, b) - slack or v > @max(a, b) + slack) {
                         std.debug.print("pixel {d},{d} is {x:0>6}, not between {x:0>6} and {x:0>6}\n", .{ x, y, c, from, to });
                         return error.TestUnexpectedResult;
                     }
@@ -12915,4 +12938,496 @@ test "win32: a read-only badge whose window cannot be made returns false, and is
     Overlays.test_make = null;
     try std.testing.expect(try testReadOnly(&app, a, .on));
     try expectBadgeAt(window, a);
+}
+
+/// For tests: the core's `show_child_exited` on `surface`, as its tick
+/// performs it once the terminal's command has exited with `code`.
+fn testChildExited(app: *App, surface: *Surface, code: u32) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .show_child_exited, .{ .exit_code = code, .runtime_ms = 1000 });
+}
+
+/// For tests: `surface`'s child-exited banner shows in `window` across its
+/// terminal's bottom, as tall as its title or its button with the
+/// padding, just above the overlays under it that show, or the terminal,
+/// and its window's text is `title`.
+fn expectBannerAt(window: *const Window, surface: *const Surface, title: []const u8) !void {
+    const c = &surface.overlays.child_exited;
+    const hwnd = c.hwnd.?;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(c.text_size.width > 0 and c.text_size.height > 0);
+    try std.testing.expect(c.label_size.width > 0 and c.label_size.height > 0);
+    const pane = try paneRect(window, surface);
+    const m = ChildExited.Metrics.init(Window.dpiOf(window.app, window.hwnd));
+    const button = @max(m.button, c.label_size.height + m.pad);
+    const height = @max(button, c.text_size.height) + 2 * m.pad;
+    try std.testing.expectEqual(
+        win32.RECT{ .left = pane.left, .top = pane.bottom - height, .right = pane.right, .bottom = pane.bottom },
+        try childRect(window, hwnd),
+    );
+    try std.testing.expect(win32.GetWindow(overlayUnder(surface, "child_exited"), win32.GW_HWNDPREV) == hwnd);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(title, try windowText(hwnd, &buf));
+}
+
+/// For tests: the Close button of `surface`'s banner, in the banner's
+/// client coordinates: as wide as its label with its padding, as tall as
+/// the search bar's buttons, `pad` in from the banner's right, centred
+/// down it.
+fn bannerButton(surface: *const Surface) !win32.RECT {
+    const c = &surface.overlays.child_exited;
+    const hwnd = c.hwnd.?;
+    const client = try clientRect(hwnd);
+    const m = ChildExited.Metrics.init(Window.dpiOf(surface.app, hwnd));
+    const width = c.label_size.width + 2 * m.button_pad;
+    const height = @max(m.button, c.label_size.height + m.pad);
+    const top = @divTrunc(client.bottom - height, 2);
+    return .{ .left = client.right - m.pad - width, .top = top, .right = client.right - m.pad, .bottom = top + height };
+}
+
+/// For tests: what `surface`'s banner answers WM_NCHITTEST for `x`, `y` in
+/// its client coordinates, which the message gives on the screen.
+fn bannerHit(surface: *const Surface, x: i32, y: i32) !win32.LRESULT {
+    const hwnd = surface.overlays.child_exited.hwnd.?;
+    var at: win32.POINT = .{ .x = x, .y = y };
+    if (!win32.ClientToScreen(hwnd, &at).toBool()) return error.TestUnexpectedResult;
+    return win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, testPoint(at.x, at.y));
+}
+
+/// For tests: `surface`'s banner takes the pointer on each corner and the
+/// middle of its button, and gives it to the terminal a pixel past each of
+/// the button's edges and over the rest of the banner.
+fn expectBannerHits(surface: *const Surface) !void {
+    const b = try bannerButton(surface);
+    const client = try clientRect(surface.overlays.child_exited.hwnd.?);
+    const x = @divTrunc(b.left + b.right, 2);
+    const y = @divTrunc(b.top + b.bottom, 2);
+    const on = [_][2]i32{ .{ b.left, b.top }, .{ b.right - 1, b.top }, .{ b.left, b.bottom - 1 }, .{ b.right - 1, b.bottom - 1 }, .{ x, y } };
+    for (on) |p| try std.testing.expectEqual(@as(win32.LRESULT, win32.HTCLIENT), try bannerHit(surface, p[0], p[1]));
+    const off = [_][2]i32{ .{ b.left - 1, y }, .{ b.right, y }, .{ x, b.top - 1 }, .{ x, b.bottom }, .{ @divTrunc(client.right, 2), y }, .{ 0, 0 }, .{ b.left - (b.right - b.left), y } };
+    for (off) |p| try std.testing.expectEqual(win32.HTTRANSPARENT, try bannerHit(surface, p[0], p[1]));
+}
+
+/// For tests: the left button pressed at `down` and released at `up`, in
+/// the client coordinates of `surface`'s banner.
+fn bannerClick(surface: *const Surface, down: [2]i32, up: [2]i32) void {
+    const hwnd = surface.overlays.child_exited.hwnd.?;
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(down[0], down[1]));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, testPoint(up[0], up[1]));
+}
+
+/// For tests: the middle of `r`.
+fn midOf(r: win32.RECT) [2]i32 {
+    return .{ @divTrunc(r.left + r.right, 2), @divTrunc(r.top + r.bottom, 2) };
+}
+
+/// For tests: whether a teardown is posted to `surface`'s window, which is
+/// taken from the queue.
+fn takeTeardown(surface: *const Surface) bool {
+    var msg: win32.MSG = undefined;
+    return win32.PeekMessageW(&msg, surface.hwnd, WM_GHOSTTY_DESTROY, WM_GHOSTTY_DESTROY, win32.PM_REMOVE).toBool();
+}
+
+test "win32: show_child_exited shows a banner across the bottom of its terminal, titled by the exit code" {
+    // GTK's Adw.Banner: "Command Succeeded" for 0, "Command Failed" for
+    // any other code, across the bottom of the terminal. The window is made
+    // when the core asks, and its text is the title. At 96 DPI (the move
+    // test has 192).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const Dpi = struct {
+        fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 96;
+        }
+    };
+    app.get_dpi_for_window = &Dpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+
+    // Not for the app.
+    try std.testing.expect(!try app.performAction(.app, .show_child_exited, .{ .exit_code = 0, .runtime_ms = 1000 }));
+    try std.testing.expect(a.overlays.child_exited.hwnd == null);
+
+    try std.testing.expect(try testChildExited(&app, a, 0));
+    try expectBannerAt(window, a, "Command Succeeded");
+    try std.testing.expect(!a.overlays.child_exited.failed);
+    try std.testing.expect(b.overlays.child_exited.hwnd == null);
+    const hwnd = a.overlays.child_exited.hwnd.?;
+    try std.testing.expect((try childRect(window, hwnd)).right <= (try paneRect(window, b)).left);
+
+    try std.testing.expect(try testChildExited(&app, b, 3));
+    try expectBannerAt(window, b, "Command Failed");
+    try std.testing.expect(b.overlays.child_exited.failed);
+
+    // The frame resized: with its terminal's bottom, as wide as it.
+    const was = try childRect(window, hwnd);
+    testResize(window, 1000, 600);
+    try expectBannerAt(window, a, "Command Succeeded");
+    try std.testing.expect((try childRect(window, hwnd)).bottom > was.bottom);
+    try std.testing.expect((try childRect(window, hwnd)).right > was.right);
+
+    // A click on it never activates the frame or moves the focus.
+    try std.testing.expectEqual(win32.MA_NOACTIVATE, win32.SendMessageW(hwnd, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), win32.HTCLIENT | (@as(win32.LPARAM, win32.WM_LBUTTONDOWN) << 16)));
+
+    // Its button takes the pointer, the rest of it is the terminal's.
+    try expectBannerHits(a);
+    try expectBannerHits(b);
+}
+
+test "win32: the child-exited banner is between the read-only badge and the link preview, under the search bar, and hides with its terminal" {
+    // GTK stacks its banner over the read-only badge and under its URL
+    // labels, its search overlay and its key-state overlay.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // The others first, then the banner: over the badge, under the rest.
+    const url = "https://example.com/some/long/path/that/goes/on/past/the/middle/of/the/terminal";
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try std.testing.expect(try testLink(&app, a, url));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try std.testing.expect(try testChildExited(&app, a, 3));
+    const hwnd = a.overlays.child_exited.hwnd.?;
+    const badge = a.overlays.readonly.hwnd.?;
+    const preview = a.overlays.link_preview.hwnd.?;
+    try expectBadgeAt(window, a);
+    try expectBannerAt(window, a, "Command Failed");
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+    try std.testing.expect(win32.GetWindow(badge, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(win32.GetWindow(hwnd, win32.GW_HWNDPREV) == preview);
+    // The badge gone and back, then the terminal raised: in order again.
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    try expectBannerAt(window, a, "Command Failed");
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try expectBadgeAt(window, a);
+    try expectBannerAt(window, a, "Command Failed");
+    _ = win32.SetWindowPos(a.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+    window.relayout();
+    try expectBadgeAt(window, a);
+    try expectBannerAt(window, a, "Command Failed");
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+
+    // Under an open search bar.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    const bar = a.search_bar.hwnd.?;
+    try std.testing.expect(above(window.hwnd, bar, hwnd));
+    window.relayout();
+    try std.testing.expect(above(window.hwnd, bar, hwnd));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    app.applyPendingFocus();
+
+    // A zoom on the other terminal hides it with its own; back, shown. A
+    // zoom on its own: across the whole window's bottom.
+    window.toggleZoom(b);
+    try std.testing.expect(!shown(hwnd));
+    window.toggleZoom(b);
+    try expectBannerAt(window, a, "Command Failed");
+    window.toggleZoom(a);
+    try expectBannerAt(window, a, "Command Failed");
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, a));
+    window.toggleZoom(a);
+    try expectBannerAt(window, a, "Command Failed");
+
+    // The other tab shown: hidden with its terminals; shown again.
+    _ = try testTab(&app, window);
+    window.relayout();
+    window.selectTab(1);
+    try std.testing.expect(!shown(hwnd));
+    window.selectTab(0);
+    try expectBannerAt(window, a, "Command Failed");
+
+    // It goes with its terminal.
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: a click on the child-exited banner's Close closes its terminal, at once or after the core's frame" {
+    // A press and a release on the button close the terminal as its own
+    // WM_CLOSE does (`Surface.requestClose`): with no core here, it is
+    // marked closing and its teardown posted. Under a core frame or a
+    // prompt the close is recorded for `run`, which a terminal closing
+    // meanwhile takes back (`App.forgetClosing`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 1200, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
+    window.tab().focused = a;
+    window.relayout();
+    for ([_]*Surface{ a, b, c }) |s| try std.testing.expect(try testChildExited(&app, s, 0));
+
+    // Clicks that are not on the button close nothing: a release off it,
+    // a press off it, a press whose capture was taken, a release alone.
+    const button = try bannerButton(b);
+    const on = midOf(button);
+    const beside: [2]i32 = .{ button.left - 1, on[1] };
+    bannerClick(b, on, beside);
+    bannerClick(b, beside, on);
+    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(on[0], on[1]));
+    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_CAPTURECHANGED, 0, 0);
+    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_LBUTTONUP, 0, testPoint(on[0], on[1]));
+    _ = win32.SendMessageW(b.overlays.child_exited.hwnd.?, win32.WM_LBUTTONUP, 0, testPoint(on[0], on[1]));
+    try std.testing.expect(!b.closing);
+    try std.testing.expect(!takeTeardown(b));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // On the button: a closes at once.
+    bannerClick(a, midOf(try bannerButton(a)), midOf(try bannerButton(a)));
+    try std.testing.expect(a.closing);
+    try std.testing.expect(takeTeardown(a));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Under a tick: recorded, then carried out by `run`.
+    app.ticking = true;
+    bannerClick(b, on, on);
+    try std.testing.expect(!b.closing);
+    try std.testing.expect(!takeTeardown(b));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .close_surface);
+    try std.testing.expect(app.requests.items[0].close_surface == &b.core_surface);
+    app.ticking = false;
+    app.createRequested();
+    try std.testing.expect(b.closing);
+    try std.testing.expect(takeTeardown(b));
+
+    // Under a prompt: recorded; the terminal begins to close otherwise
+    // first, and the record is dropped.
+    app.prompt_depth = 1;
+    bannerClick(c, midOf(try bannerButton(c)), midOf(try bannerButton(c)));
+    app.prompt_depth = 0;
+    try std.testing.expect(!c.closing);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    app.forgetClosing(&c.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expect(!c.closing);
+    try std.testing.expect(!takeTeardown(c));
+}
+
+test "win32: the child-exited banner is drawn in libadwaita's colours, its button lit under the pointer and dark while pressed" {
+    // GTK tints its banner with libadwaita's success or error colour at
+    // 50%; here mixed half and half with the search bar's, light or dark
+    // with the title bar, the title and the button in the bar's colours.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    for ([_]configpkg.Config.WindowTheme{ .dark, .light }) |theme| {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.@"window-theme" = theme;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        try std.testing.expectEqual(theme == .dark, window.dark_frame);
+        const colors = SearchBar.Colors.of(window.dark_frame);
+        for ([_]u32{ 0, 3 }) |code| {
+            try std.testing.expect(try testChildExited(&app, a, code));
+            const hwnd = a.overlays.child_exited.hwnd.?;
+            const button = try bannerButton(a);
+            const line = @max(1, SearchBar.Metrics.scale(1, Window.dpiOf(&app, hwnd)));
+            const face = SearchBar.inset(button, line);
+            const printed = try Printed.of(hwnd);
+            defer printed.deinit();
+            // The tint; the title over it, left of the button.
+            const tint = ChildExited.tint(code != 0, theme == .dark);
+            try std.testing.expectEqual(tint, printed.at(0, 0));
+            try std.testing.expectEqual(tint, printed.at(printed.width - 1, printed.height - 1));
+            try printed.expectBetween(.{ .left = 0, .top = 0, .right = button.left, .bottom = printed.height }, tint, colors.text);
+            // The button: framed, its label on the bar's colour.
+            try std.testing.expectEqual(colors.border, printed.at(button.left, button.top));
+            try std.testing.expectEqual(colors.border, printed.at(button.right - 1, button.bottom - 1));
+            try std.testing.expectEqual(colors.bar, printed.at(face.left, face.top));
+            try printed.expectBetween(face, colors.bar, colors.text);
+        }
+
+        // Lit under the pointer, dark while pressed, back once the capture
+        // goes and the pointer leaves.
+        const hwnd = a.overlays.child_exited.hwnd.?;
+        const button = try bannerButton(a);
+        const line = @max(1, SearchBar.Metrics.scale(1, Window.dpiOf(&app, hwnd)));
+        const face = SearchBar.inset(button, line);
+        const at = midOf(button);
+        const states = [_]struct { msg: win32.UINT, x: i32, face: win32.COLORREF }{
+            .{ .msg = win32.WM_MOUSEMOVE, .x = at[0], .face = colors.hover },
+            .{ .msg = win32.WM_LBUTTONDOWN, .x = at[0], .face = colors.border },
+            .{ .msg = win32.WM_CAPTURECHANGED, .x = at[0], .face = colors.hover },
+            .{ .msg = win32.WM_MOUSEMOVE, .x = button.left - 1, .face = colors.bar },
+            .{ .msg = win32.WM_MOUSEMOVE, .x = at[0], .face = colors.hover },
+            .{ .msg = win32.WM_MOUSELEAVE, .x = at[0], .face = colors.bar },
+        };
+        for (states) |state| {
+            _ = win32.SendMessageW(hwnd, state.msg, if (state.msg == win32.WM_LBUTTONDOWN) win32.MK_LBUTTON else 0, testPoint(state.x, at[1]));
+            const printed = try Printed.of(hwnd);
+            defer printed.deinit();
+            try std.testing.expectEqual(state.face, printed.at(face.left, face.top));
+        }
+        // The press's capture, which no release took.
+        if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
+        try std.testing.expect(!a.closing);
+    }
+}
+
+test "win32: the child-exited banner moves with its tab to a new window, and its button follows its scale" {
+    // A tab moved to a new window takes the banner into the new frame. A
+    // change of DPI measures its title and label again in the font at the
+    // new scale, and lays the banner and its button out at it, where the
+    // button still takes the pointer and closes the terminal.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    _ = try testTab(&app, window);
+    window.relayout();
+
+    try std.testing.expect(try testChildExited(&app, a, 0));
+    try std.testing.expect(try testChildExited(&app, b, 3));
+    const hwnd = a.overlays.child_exited.hwnd.?;
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, app.windows.items.len);
+    const moved = a.window;
+    try std.testing.expect(moved != window);
+    try std.testing.expect(a.overlays.child_exited.hwnd.? == hwnd);
+    try expectBannerAt(moved, a, "Command Succeeded");
+    try expectBannerAt(moved, b, "Command Failed");
+    try expectBannerHits(a);
+
+    // A new scale: measured again, laid out at it.
+    const before = a.overlays.child_exited;
+    const Dpi = struct {
+        fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 192;
+        }
+    };
+    app.get_dpi_for_window = &Dpi.of;
+    var suggested = try windowRect(moved.hwnd);
+    _ = win32.SendMessageW(moved.hwnd, win32.WM_DPICHANGED, 192 << 16 | 192, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expectEqual(192, a.overlays.font_dpi);
+    try std.testing.expect(a.overlays.child_exited.text_size.height > before.text_size.height);
+    try std.testing.expect(a.overlays.child_exited.label_size.width > before.label_size.width);
+    try expectBannerAt(moved, a, "Command Succeeded");
+    try expectBannerAt(moved, b, "Command Failed");
+    const button = try bannerButton(a);
+    try std.testing.expectEqual(ChildExited.Metrics.init(192).button, button.bottom - button.top);
+    try expectBannerHits(a);
+    try expectBannerHits(b);
+
+    // And its button closes the terminal there.
+    bannerClick(b, midOf(try bannerButton(b)), midOf(try bannerButton(b)));
+    try std.testing.expect(b.closing);
+    try std.testing.expect(takeTeardown(b));
+    try std.testing.expect(!a.closing);
+}
+
+test "win32: a child-exited banner whose window cannot be made returns false, for the core's own text" {
+    // CreateWindowExW fails when the process has used up its window
+    // handles: the action returns false, so that the core writes its text
+    // into the terminal, and nothing is made or kept.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    const NoWindow = struct {
+        var asked: usize = 0;
+        var class: []const u8 = "";
+        fn make(c: []const u8) ?win32.HWND {
+            asked += 1;
+            class = c;
+            return null;
+        }
+    };
+    NoWindow.asked = 0;
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+
+    try std.testing.expect(!try testChildExited(&app, a, 3));
+    try std.testing.expect(a.overlays.child_exited.hwnd == null);
+    try std.testing.expect(a.overlays.child_exited.text == null);
+    try std.testing.expectEqual(1, NoWindow.asked);
+    try std.testing.expectEqualStrings(ChildExited.class_name, NoWindow.class);
+
+    Overlays.test_make = null;
+    try std.testing.expect(try testChildExited(&app, a, 3));
+    try expectBannerAt(window, a, "Command Failed");
 }

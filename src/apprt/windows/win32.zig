@@ -257,6 +257,9 @@ pub const HTCLIENT: u16 = 1;
 pub const MA_ACTIVATE: LRESULT = 1;
 /// WM_MOUSEACTIVATE: activate the window and discard the mouse message.
 pub const MA_ACTIVATEANDEAT: LRESULT = 2;
+/// WM_MOUSEACTIVATE: leave the activation as it is, and pass the mouse
+/// message on.
+pub const MA_NOACTIVATE: LRESULT = 3;
 
 /// WM_SYSCOMMAND wParam (low four bits are reserved and must be masked).
 /// WM_SYSCOMMAND: the system uses wParam's low four bits internally; mask

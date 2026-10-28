@@ -1,12 +1,13 @@
-//! A terminal's passive overlays: windows that show something about the
-//! terminal over it and take no input, as GTK stacks overlays over its
-//! surface (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge
-//! (ReadOnly.zig), the link preview (LinkPreview.zig) and the key-state
-//! indicator (KeyState.zig). This file does for each what they all need:
-//! their window class and procedure, their place in the Z order, their
-//! font, colours and frame, and their teardown; each overlay's own file
-//! says what it shows and where (`placeIn`, `textIn`), and in what
-//! colours if not the search bar's (`look`).
+//! A terminal's overlays: windows that show something about the terminal
+//! over it, as GTK stacks overlays over its surface
+//! (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge (ReadOnly.zig),
+//! the child-exited banner (ChildExited.zig), the link preview
+//! (LinkPreview.zig) and the key-state indicator (KeyState.zig). This file
+//! does for each what they all need: their window class and procedure,
+//! their place in the Z order, their font, colours and frame, and their
+//! teardown; each overlay's own file says what it shows and where
+//! (`placeIn`, `textIn`), and in what colours if not the search bar's
+//! (`look`), or draws itself (`draw`).
 //!
 //! Like the search bar (SearchBar.zig), an overlay is a child window of
 //! the terminal's **frame**, placed above the terminal's own window: GDI
@@ -17,12 +18,14 @@
 //! just above their own terminal, in GTK's order (`stack`), under the
 //! terminal's search bar and the window's command palette.
 //!
-//! They are passive: each answers WM_NCHITTEST with HTTRANSPARENT, so the
-//! pointer and clicks over it go to the terminal under it, and none is
-//! ever given the focus. Each draws a line of text in the system's
-//! message font, one for all of a terminal's overlays (`font`), on the
-//! search bar's colours, framed as GTK's labels are, or in its own
-//! (`Look`).
+//! They are passive but for the child-exited banner's button: each answers
+//! WM_NCHITTEST with HTTRANSPARENT, so the pointer and clicks over it go
+//! to the terminal under it, and none is ever given the focus. The banner
+//! takes its own messages first (`handle`), and answers HTCLIENT over its
+//! button alone. Each draws a line of text in the system's message font,
+//! one for all of a terminal's overlays (`font`), on the search bar's
+//! colours, framed as GTK's labels are, or in its own (`Look`); the
+//! banner draws two (`draw`).
 
 const Overlays = @This();
 
@@ -36,6 +39,7 @@ const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const ReadOnly = @import("ReadOnly.zig");
+const ChildExited = @import("ChildExited.zig");
 const KeyState = @import("KeyState.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
@@ -46,6 +50,10 @@ const log = std.log.scoped(.win32);
 /// The read-only badge, made the first time the terminal is made
 /// read-only (`ReadOnly.set`).
 readonly: ReadOnly.Badge = .{},
+
+/// The child-exited banner, made when the core asks for it
+/// (`ChildExited.show`).
+child_exited: ChildExited.Banner = .{},
 
 /// The link preview, made, hidden, with its terminal (`create`).
 link_preview: LinkPreview.Preview = .{},
@@ -62,13 +70,14 @@ font_dpi: u32 = 0,
 
 /// The overlays, by their fields, bottom to top, as GTK stacks them over
 /// its surface (surface.blp). Each has a window `hwnd`, the `text` it
-/// draws, `text_size` and `measured` for that text in `font`, and
-/// `placeIn`, `textIn` and `deinit`, and may have `look`.
-pub const stack = [_][]const u8{ "readonly", "link_preview", "key_state" };
+/// draws, `text_size` and `measured` for that text in `font`, `placeIn`,
+/// `deinit`, and `textIn` or `draw`; and may have `look`, `measureMore`
+/// (more than its text to measure) and `handle` (messages of its own).
+pub const stack = [_][]const u8{ "readonly", "child_exited", "link_preview", "key_state" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, LinkPreview.class_name, KeyState.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, ChildExited.class_name, LinkPreview.class_name, KeyState.class_name };
 
 /// For tests: how many messages an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -155,7 +164,7 @@ fn applyFont(self: *Overlays, dpi: u32) void {
 
 /// The size of `text` in `font`, as `hwnd` draws it; none if it cannot be
 /// measured.
-fn measure(hwnd: win32.HWND, font: ?win32.HGDIOBJ, text: [:0]const u16) Size {
+pub fn measure(hwnd: win32.HWND, font: ?win32.HGDIOBJ, text: [:0]const u16) Size {
     const hdc = win32.GetDC(hwnd) orelse return .{ .width = 0, .height = 0 };
     defer _ = win32.ReleaseDC(hwnd, hdc);
     const old = if (font) |f| win32.SelectObject(hdc, f) else null;
@@ -217,7 +226,8 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// again, so the terminal shows no more previews; the key-state
 /// indicator is made again at its next change that leaves something to
 /// show (`KeyState.update`), and the read-only badge the next time the
-/// terminal is made read-only (`ReadOnly.set`).
+/// terminal is made read-only (`ReadOnly.set`); the child-exited banner,
+/// asked for once, is not.
 ///
 /// The terminals tile their area, and the search bars and the command
 /// palette are placed above all of them (`SearchBar.place`,
@@ -256,6 +266,7 @@ fn placed(self: *Overlays, o: anytype, hwnd: win32.HWND, dpi: u32, pane: Size) ?
     if (!o.measured) {
         o.measured = true;
         o.text_size = measure(hwnd, self.font, text);
+        if (@hasDecl(@TypeOf(o.*), "measureMore")) o.measureMore(hwnd, self.font);
     }
     return o.placeIn(dpi, pane);
 }
@@ -302,10 +313,11 @@ fn put(window: *const Window, hwnd: win32.HWND, under: win32.HWND, at: RECT) boo
     return true;
 }
 
-/// Register `classes`, with `cursor`, which never shows: the terminal
-/// under an overlay takes the pointer (WM_NCHITTEST). Each overlay draws
-/// itself through GDI and is invalidated when it is placed somewhere new,
-/// its text changes or the theme does (`place`, `invalidate`).
+/// Register `classes`, with `cursor`, which shows only over the
+/// child-exited banner's button: elsewhere the terminal under an overlay
+/// takes the pointer (WM_NCHITTEST). Each overlay draws itself through GDI
+/// and is invalidated when it is placed somewhere new, its text changes or
+/// the theme does (`place`, `invalidate`).
 pub fn registerClasses(hinstance: win32.HINSTANCE, cursor: ?win32.HCURSOR) App.Error!void {
     inline for (classes, 0..) |name, i| {
         const class: win32.WNDCLASSEXW = .{
@@ -362,17 +374,28 @@ pub fn wndProc(
             }
             return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
-        // The pointer and clicks over it are the terminal's under it,
-        // which Windows gives them to instead, being of the same thread.
-        win32.WM_NCHITTEST => return win32.HTTRANSPARENT,
         else => {},
     }
     const surface = surfaceOf(hwnd) orelse {
+        // Passive, as below.
+        if (msg == win32.WM_NCHITTEST) return win32.HTTRANSPARENT;
         if (builtin.is_test) test_detached += 1;
         return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     };
 
+    // An overlay that takes input sees its messages first.
+    inline for (stack) |name| {
+        const o = &@field(surface.overlays, name);
+        if (@hasDecl(@TypeOf(o.*), "handle") and o.hwnd == hwnd) {
+            if (o.handle(surface, hwnd, msg, wparam, lparam)) |result| return result;
+        }
+    }
+
     switch (msg) {
+        // The pointer and clicks over it are the terminal's under it,
+        // which Windows gives them to instead, being of the same thread.
+        win32.WM_NCHITTEST => return win32.HTTRANSPARENT,
+
         // All of it is painted, from a bitmap.
         win32.WM_ERASEBKGND => return 1,
 
@@ -393,11 +416,15 @@ pub fn wndProc(
 
         win32.WM_DESTROY => {
             // Nothing places or draws into a destroyed window; what it
-            // shows and the font are freed with the terminal.
+            // shows and the font are freed with the terminal. Nor does it
+            // read the terminal again: a frame being destroyed may free the
+            // terminal before this window's WM_NCDESTROY, and its `deinit`
+            // no longer knows this window to let go of it.
             inline for (stack) |name| {
                 const o = &@field(surface.overlays, name);
                 if (o.hwnd == hwnd) o.hwnd = null;
             }
+            _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
             return 0;
         },
 
@@ -427,32 +454,39 @@ fn draw(surface: *Surface, hwnd: win32.HWND, hdc: win32.HDC) void {
     };
 
     const dpi = Window.dpiOf(surface.app, hwnd);
-    const colors = SearchBar.Colors.of(surface.window.dark_frame);
     inline for (stack) |name| {
         const o = &@field(surface.overlays, name);
-        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, colors, surface.overlays.font);
+        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, surface.window.dark_frame, surface.overlays.font);
     }
 
     _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
 }
 
-/// The overlay `o`, `client` big, drawn into `hdc` at `dpi`: its text in
+/// The overlay `o`, `client` big, drawn into `hdc` at `dpi` by whether the
+/// title bar is `dark`: as it draws itself (`draw`), or its text in
 /// `font`, framed as GTK's labels are, where its own file puts it
 /// (`textIn`), in its colours (`lookOf`).
-fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, colors: SearchBar.Colors, font: ?win32.HGDIOBJ) void {
-    const look = lookOf(o, colors);
+fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, font: ?win32.HGDIOBJ) void {
+    if (@hasDecl(@TypeOf(o.*), "draw")) return o.draw(hdc, client, dpi, dark, font);
+    const look = lookOf(o, SearchBar.Colors.of(dark));
     const line = @max(1, SearchBar.Metrics.scale(1, dpi));
     SearchBar.fill(hdc, client, look.line);
     SearchBar.fill(hdc, SearchBar.inset(client, line), look.fill);
     const text = o.text orelse return;
+    drawText(hdc, font, text, o.textIn(dpi, client.right), look.text, text_format);
+}
+
+/// `text` drawn into `hdc` in `font` and `color` within `at`, as
+/// `DrawTextW` lays it out by `format`, over what is there.
+pub fn drawText(hdc: win32.HDC, font: ?win32.HGDIOBJ, text: [:0]const u16, at: RECT, color: win32.COLORREF, format: win32.UINT) void {
     _ = win32.SetBkMode(hdc, win32.TRANSPARENT);
-    _ = win32.SetTextColor(hdc, look.text);
+    _ = win32.SetTextColor(hdc, color);
     const old_font = if (font) |f| win32.SelectObject(hdc, f) else null;
     defer if (old_font) |f| {
         _ = win32.SelectObject(hdc, f);
     };
-    var r = o.textIn(dpi, client.right);
-    _ = win32.DrawTextW(hdc, text.ptr, std.math.lossyCast(c_int, text.len), &r, text_format);
+    var r = at;
+    _ = win32.DrawTextW(hdc, text.ptr, std.math.lossyCast(c_int, text.len), &r, format);
 }
 
 /// The colours the overlay `o` is drawn in: its own (`look`), or the
