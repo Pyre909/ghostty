@@ -1438,7 +1438,10 @@ pub fn split(
         @max(1, min),
     ) orelse return error.SplitTooSmall;
 
-    const surface = try Surface.create(self.app, self, rect, opts);
+    const surface = surface: {
+        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self);
+        break :surface try Surface.create(self.app, self, rect, opts);
+    };
     // Nothing owns the terminal until it is in the tree.
     errdefer surface.discard();
     var single: Tree = try .init(alloc, surface);
@@ -1448,6 +1451,12 @@ pub fn split(
     self.setTree(t, tree);
     return surface;
 }
+
+/// For tests: makes the terminal `split` opens, in place of
+/// `Surface.create`, which starts a core and its program; a test's
+/// terminals have no core.
+pub var test_create_pane: if (builtin.is_test) ?*const fn (*Window) anyerror!*Surface else void =
+    if (builtin.is_test) null else {};
 
 /// Make `tree` `t`'s tree in place of the one it has, which is freed. A
 /// split, a resize or equalize (`adopt`) and a terminal leaving

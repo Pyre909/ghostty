@@ -163,9 +163,9 @@
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
-//! window, a context menu and precision-touchpad scrolling. Without a menu, a right click with the
-//! default `right-click-action` only selects the word or link under the
-//! pointer.
+//! window, a context menu and precision-touchpad scrolling. Without a
+//! menu, a right click with the default `right-click-action` only selects
+//! the word or link under the pointer.
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for every action it does not name; this runtime never claims an action
 //! it did not carry out.

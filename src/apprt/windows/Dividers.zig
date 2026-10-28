@@ -34,10 +34,11 @@
 //! messages, which reach it from a message loop: `App.run`'s, a size, move
 //! or menu loop, or a teardown's wait (`App.waitForThread`), none of them
 //! with a core frame beneath. The one loop that can run inside a core
-//! frame, a prompt's, disables every frame first (`App.beginPrompt`),
-//! which takes the capture from a drag (WM_CANCELMODE) and gives the frame
-//! no mouse input; a move still lays nothing out while the core may not be
-//! re-entered (`follow`), as the tab bar's drag does.
+//! frame, a prompt's, disables every frame first (`App.beginPrompt`, and
+//! MessageBoxW its owner), which takes the capture from a drag
+//! (WM_CANCELMODE) and gives the frame no mouse input; a move still lays
+//! nothing out while the core may not be re-entered (`follow`), as the tab
+//! bar's drag does.
 
 const std = @import("std");
 const builtin = @import("builtin");

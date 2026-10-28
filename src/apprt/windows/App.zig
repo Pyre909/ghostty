@@ -5050,8 +5050,9 @@ test "win32: a divider drag ends with a lost capture or a change of its tab" {
     // Each lets go of the capture if the frame still has it, and the
     // moves after it move nothing: another window taking the capture, a
     // prompt disabling the frame (WM_CANCELMODE), a move without the
-    // button, a zoom, a terminal closing, a new split, the tab hidden, and
-    // the tab moved to another window (`Dividers.tabChanged`). While the
+    // button, a zoom, the tab's splits equalized or resized, a terminal
+    // closing, a new split, the tab hidden, and the tab moved to another
+    // window (`Dividers.tabChanged`). While the
     // core may not be re-entered a move lays nothing out, and the drag
     // goes on after. A tab added and not shown leaves the drag alone, and
     // so does a change of its tree.
@@ -5117,22 +5118,41 @@ test "win32: a divider drag ends with a lost capture or a change of its tab" {
     window.toggleZoom(a);
     try std.testing.expectEqual(line, (try paneRect(window, a)).right);
 
+    // With the line moved off centre, the tab's splits equalized, then
+    // resized (`Window.adopt`), then equalized again.
+    try testPressDivider(window, line, y);
+    testFrameMouse(window, win32.WM_LBUTTONUP, line + 30, y);
+    try testPressDivider(window, line + 30, y);
+    window.equalize(a);
+    try testDragEnded(window, a, line + 40, y);
+    try std.testing.expectEqual(line, (try paneRect(window, a)).right);
+    try testPressDivider(window, line, y);
+    window.resizeSplit(a, .{ .amount = 20, .direction = .right });
+    try testDragEnded(window, a, line + 40, y);
+    try std.testing.expect((try paneRect(window, a)).right > line);
+    window.equalize(a);
+    try std.testing.expectEqual(line, (try paneRect(window, a)).right);
+
     // c closes.
     try testPressDivider(window, line, y);
     try std.testing.expect(c.destroy());
     try testDragEnded(window, a, line + 40, y);
 
-    // d split off below a | b, as `Window.split` leaves the tree, and
-    // shown, as `App.newSplit` shows it.
-    const d = try testPane(&app, window);
-    try testPressDivider(window, line, y);
-    const with_d = tree: {
-        var below: Window.Tree = try .init(alloc, d);
-        defer below.deinit();
-        break :tree try window.tab().tree.split(alloc, .root, .down, Window.new_split_ratio, &below);
+    // d split off below a by `Window.split`, its terminal made without a
+    // core (`Window.test_create_pane`), and shown, as `App.newSplit` shows
+    // it. The split reads a's cell, which a core would have.
+    const Panes = struct {
+        fn create(w: *Window) anyerror!*Surface {
+            return testPane(w.app, w);
+        }
     };
-    window.setTree(window.tab(), with_d);
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+    a.core_surface.size.cell = .{ .width = 1, .height = 1 };
+    try testPressDivider(window, line, y);
+    const d = try window.split(a, .down, .{});
     window.showPane(d);
+    try std.testing.expect(window.tab().tree.locate(d) != null);
     try testDragEnded(window, a, line + 40, y);
 
     // A tab added and not shown leaves the drag, and so does a change of
