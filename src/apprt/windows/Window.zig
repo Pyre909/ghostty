@@ -35,6 +35,7 @@ pub const Tab = @import("Tab.zig");
 const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const Overlays = @import("Overlays.zig");
+const Dividers = @import("Dividers.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
@@ -1055,6 +1056,12 @@ fn handleMessage(
             };
         },
 
+        // The resize pointer on a divider, and beside it, where a terminal
+        // lets the pointer through to the frame (`Dividers`). Elsewhere,
+        // and for the pointer over the frame's other windows,
+        // DefWindowProcW below, as before.
+        win32.WM_SETCURSOR => if (Dividers.setCursor(self, wparam, lparam)) return 1,
+
         // Erased by WM_PAINT below, all of it at once.
         win32.WM_ERASEBKGND => return 1,
 
@@ -1431,9 +1438,12 @@ const PlaceOf = struct {
         if (surface == self.target) self.place = rect;
     }
 
-    pub fn divider(self: *PlaceOf, rect: win32.RECT) void {
+    pub fn divider(self: *PlaceOf, handle: Tree.Node.Handle, line: win32.RECT, across: bool, area: win32.RECT) void {
         _ = self;
-        _ = rect;
+        _ = handle;
+        _ = line;
+        _ = across;
+        _ = area;
     }
 
     pub fn hidden(self: *PlaceOf, surface: *Surface) void {
@@ -1902,15 +1912,21 @@ const Placer = struct {
 
     /// Nothing to place: the frame paints the gaps between terminals
     /// itself (WM_PAINT).
-    pub fn divider(self: *Placer, rect: win32.RECT) void {
+    pub fn divider(self: *Placer, handle: Tree.Node.Handle, line: win32.RECT, across: bool, area: win32.RECT) void {
         _ = self;
-        _ = rect;
+        _ = handle;
+        _ = line;
+        _ = across;
+        _ = area;
     }
 };
 
 /// Where each terminal of `tree` goes in `area`, and the dividers between
-/// them, in whole pixels: `ctx.pane(view, rect)` for every leaf and
-/// `ctx.divider(rect)` for every split. A split gives `divider` pixels to
+/// them, in whole pixels: `ctx.pane(view, rect)` for every leaf, and
+/// `ctx.divider(handle, line, across, area)` for every split that has a
+/// line, before the splits inside it: its handle, its line, whether its
+/// sides are left and right of the line (`.horizontal`) rather than above
+/// and below it, and the area it divides. A split gives `divider` pixels to
 /// the line between its sides, fewer if it is narrower than that, and
 /// divides the rest by its ratio, to the nearest pixel, so that the panes
 /// and dividers tile `area` exactly. `tree.spatial` describes the same
@@ -1944,8 +1960,9 @@ fn layoutNode(
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| ctx.pane(view, area),
         .split => |s| {
-            const sides = splitArea(area, s.layout == .horizontal, s.ratio, divider);
-            if (sides.line > 0) ctx.divider(sides.divider);
+            const across = s.layout == .horizontal;
+            const sides = splitArea(area, across, s.ratio, divider);
+            if (sides.line > 0) ctx.divider(handle, sides.divider, across, area);
             layoutNode(tree, s.left, sides.first, divider, ctx);
             layoutNode(tree, s.right, sides.second, divider, ctx);
         },
@@ -2810,8 +2827,11 @@ const TestLayout = struct {
         self.pane_count += 1;
     }
 
-    pub fn divider(self: *TestLayout, rect: win32.RECT) void {
-        self.dividers[self.divider_count] = rect;
+    pub fn divider(self: *TestLayout, handle: TestTree.Node.Handle, line: win32.RECT, across: bool, area: win32.RECT) void {
+        _ = handle;
+        _ = across;
+        _ = area;
+        self.dividers[self.divider_count] = line;
         self.divider_count += 1;
     }
 

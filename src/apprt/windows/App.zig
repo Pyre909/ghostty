@@ -21,6 +21,7 @@ const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
+const Dividers = @import("Dividers.zig");
 const KeyState = @import("KeyState.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
@@ -4510,6 +4511,276 @@ test "win32: queued split changes reach the window from its focused terminal" {
     const wx = (try paneRect(row, x)).right - (try paneRect(row, x)).left;
     const wz = (try paneRect(row, z)).right - (try paneRect(row, z)).left;
     try expectNear(wx, wz);
+}
+
+/// For tests: a GetDpiForWindow that answers `dpi` for every window, in
+/// place of the system DPI the tests would otherwise see.
+const TestDpi = struct {
+    var dpi: win32.UINT = 96;
+
+    fn of(hwnd: win32.HWND) callconv(.winapi) win32.UINT {
+        _ = hwnd;
+        return dpi;
+    }
+};
+
+/// For tests: `pane`'s answer to WM_NCHITTEST at `x`, `y` in its frame's
+/// client area, asked with the point on the screen as Windows asks it.
+fn testHitTest(window: *const Window, pane: *const Surface, x: i32, y: i32) !win32.LRESULT {
+    var pt: win32.POINT = .{ .x = x, .y = y };
+    if (!win32.ClientToScreen(window.hwnd, &pt).toBool()) return error.TestUnexpectedResult;
+    return win32.SendMessageW(pane.hwnd, win32.WM_NCHITTEST, 0, testPoint(pt.x, pt.y));
+}
+
+/// For tests: (a | b) over c in `window`, laid out.
+fn testSplits(window: *Window, a: *Surface, b: *Surface, c: *Surface) !void {
+    const alloc = window.app.core_app.alloc;
+    window.tab().tree = tree: {
+        var row = try testRow(alloc, &.{ a, b });
+        defer row.deinit();
+        var below: Window.Tree = try .init(alloc, c);
+        defer below.deinit();
+        break :tree try row.split(alloc, .root, .down, 0.5, &below);
+    };
+    window.tab().focused = a;
+    window.relayout();
+}
+
+test "win32: beside a divider a terminal lets the pointer through to the frame" {
+    // In (a | b) over c at 96 DPI: within 3 pixels of either line, each
+    // terminal answers WM_NCHITTEST with HTTRANSPARENT, so that Windows
+    // gives the pointer to the frame under it (`Dividers.hitTest`); a
+    // pixel further, and along the window's outer edges, it answers as
+    // before.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    try testSplits(window, a, b, c);
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    const rc = try paneRect(window, c);
+    // A line of a pixel between a and b, and one between them and c.
+    try std.testing.expectEqual(ra.right + 1, rb.left);
+    try std.testing.expectEqual(ra.bottom + 1, rc.top);
+    try std.testing.expectEqual(rb.bottom + 1, rc.top);
+
+    const through = win32.HTTRANSPARENT;
+    const client: win32.LRESULT = win32.HTCLIENT;
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+    const xa = @divTrunc(ra.left + ra.right, 2);
+    const xb = @divTrunc(rb.left + rb.right, 2);
+    for ([_]struct { *Surface, i32, i32, win32.LRESULT }{
+        // Left and right of the line between a and b.
+        .{ a, ra.right - 1, y, through },
+        .{ a, ra.right - 3, y, through },
+        .{ a, ra.right - 4, y, client },
+        .{ b, rb.left, y, through },
+        .{ b, rb.left + 2, y, through },
+        .{ b, rb.left + 3, y, client },
+        // Above and below the line over c, all along it.
+        .{ a, xa, ra.bottom - 1, through },
+        .{ a, xa, ra.bottom - 3, through },
+        .{ a, xa, ra.bottom - 4, client },
+        .{ b, xb, rb.bottom - 3, through },
+        .{ c, xa, rc.top, through },
+        .{ c, xb, rc.top + 2, through },
+        .{ c, rc.left, rc.top + 2, through },
+        .{ c, xa, rc.top + 3, client },
+        // Along the window's outer edges.
+        .{ a, ra.left, y, client },
+        .{ a, ra.left + 2, y, client },
+        .{ a, xa, ra.top, client },
+        .{ b, rb.right - 1, y, client },
+        .{ b, rb.right - 3, y, client },
+        .{ b, xb, rb.top + 2, client },
+        .{ c, rc.left, rc.bottom - 1, client },
+        .{ c, xa, rc.bottom - 3, client },
+        .{ c, rc.right - 1, rc.bottom - 10, client },
+    }) |case| {
+        try std.testing.expectEqual(case[3], try testHitTest(window, case[0], case[1], case[2]));
+    }
+}
+
+test "win32: a zoomed tab, and a tab not shown, have no band" {
+    // The frame draws no divider for either (`Window.layout`): a zoomed
+    // terminal covers the line, and a tab not shown has none of its lines
+    // in the window. Each comes back with its tab's layout.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const line = (try paneRect(window, a)).right;
+    const y = @divTrunc((try paneRect(window, a)).bottom, 2);
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, a, line - 1, y));
+
+    window.toggleZoom(a);
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, a));
+    for ([_]i32{ line - 3, line - 1, line, line + 1, line + 3 }) |x| {
+        try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, a, x, y));
+    }
+    window.toggleZoom(a);
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, a, line - 1, y));
+
+    // c in a tab of its own, shown over the whole layout area.
+    const c = try testTab(&app, window);
+    window.selectTab(window.tabIndex(window.tabOf(c).?).?);
+    try std.testing.expect(shown(c.hwnd) and !shown(a.hwnd));
+    const rc = try paneRect(window, c);
+    const yc = @divTrunc(rc.top + rc.bottom, 2);
+    for ([_]i32{ line - 3, line - 1, line, line + 1, line + 3 }) |x| {
+        try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, c, x, yc));
+    }
+    window.selectTab(window.tabIndex(window.tabOf(a).?).?);
+    const back = (try paneRect(window, a)).right;
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, a, back - 1, yc));
+}
+
+test "win32: the band follows a new split and a DPI change" {
+    // Laid out again for each hit test (`Dividers.at`): a new split's line
+    // has its band at once, and at 144 DPI the line is 2 pixels and the
+    // band 5 on each side, 4.5 rounded up.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    const whole = try paneRect(window, a);
+    const mid = @divTrunc(whole.left + whole.right, 2);
+    const y = @divTrunc(whole.top + whole.bottom, 2);
+    var x = mid - 6;
+    while (x <= mid + 6) : (x += 1) {
+        try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, a, x, y));
+    }
+
+    // a | b, as a split leaves it once shown (`Window.showPane`).
+    const b = try testPane(&app, window);
+    const row = try testRow(alloc, &.{ a, b });
+    window.tab().tree.deinit();
+    window.tab().tree = row;
+    window.relayout();
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    try std.testing.expectEqual(ra.right + 1, rb.left);
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, a, ra.right - 3, y));
+    try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, a, ra.right - 4, y));
+    try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, a, ra.right - 5, y));
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, b, rb.left + 2, y));
+    try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, b, rb.left + 4, y));
+
+    // The frame moved to a monitor at 144 DPI, its size kept.
+    TestDpi.dpi = 144;
+    var suggested = try windowRect(window.hwnd);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_DPICHANGED, 144 << 16 | 144, @bitCast(@intFromPtr(&suggested)));
+    const wa = try paneRect(window, a);
+    const wb = try paneRect(window, b);
+    try std.testing.expectEqual(wa.right + 2, wb.left);
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, a, wa.right - 5, y));
+    try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, a, wa.right - 6, y));
+    try std.testing.expectEqual(win32.HTTRANSPARENT, try testHitTest(window, b, wb.left + 4, y));
+    try std.testing.expectEqual(win32.HTCLIENT, try testHitTest(window, b, wb.left + 5, y));
+}
+
+test "win32: the frame shows the resize pointer on a divider and beside it" {
+    // Over the frame itself (its own WM_SETCURSOR, wParam the frame), on a
+    // line or in its band: left and right across the line between a and b,
+    // up and down across the one over c (`Dividers.setCursor`). Elsewhere,
+    // for the pointer over a terminal, and under a prompt (HTERROR: the
+    // frame is disabled), DefWindowProcW's pointer, as before. A seam
+    // stands in for GetCursorPos.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+    defer Dividers.test_cursor_pos = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    try testSplits(window, a, b, c);
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    const rc = try paneRect(window, c);
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+    const xa = @divTrunc(ra.left + ra.right, 2);
+
+    const ibeam = win32.LoadCursorW(null, win32.IDC_IBEAM).?;
+    const we = win32.LoadCursorW(null, win32.IDC_SIZEWE).?;
+    const ns = win32.LoadCursorW(null, win32.IDC_SIZENS).?;
+    const frame = window.hwnd;
+    const hterror: u16 = @bitCast(@as(i16, -2));
+    // Null: neither resize pointer, whichever DefWindowProcW sets.
+    for ([_]struct { win32.HWND, u16, i32, i32, ?win32.HCURSOR }{
+        .{ frame, win32.HTCLIENT, ra.right - 3, y, we },
+        .{ frame, win32.HTCLIENT, ra.right, y, we },
+        .{ frame, win32.HTCLIENT, rb.left + 2, y, we },
+        .{ frame, win32.HTCLIENT, xa, ra.bottom - 3, ns },
+        .{ frame, win32.HTCLIENT, xa, ra.bottom, ns },
+        .{ frame, win32.HTCLIENT, rc.right - 1, rc.top + 2, ns },
+        .{ frame, win32.HTCLIENT, ra.right - 4, y, null },
+        .{ frame, win32.HTCLIENT, xa, rc.top + 3, null },
+        .{ a.hwnd, win32.HTCLIENT, ra.right - 1, y, null },
+        .{ frame, hterror, ra.right - 1, y, null },
+    }) |case| {
+        _ = win32.SetCursor(ibeam);
+        var pt: win32.POINT = .{ .x = case[2], .y = case[3] };
+        try std.testing.expect(win32.ClientToScreen(frame, &pt).toBool());
+        Dividers.test_cursor_pos = pt;
+        const lparam: win32.LPARAM = (@as(win32.LPARAM, win32.WM_MOUSEMOVE) << 16) | case[1];
+        _ = win32.SendMessageW(frame, win32.WM_SETCURSOR, @intFromPtr(case[0]), lparam);
+        const now = win32.GetCursor();
+        if (case[4]) |want| {
+            try std.testing.expect(now == want);
+        } else {
+            try std.testing.expect(now != we and now != ns);
+        }
+    }
 }
 
 test "win32: a window is titled after its focused terminal" {

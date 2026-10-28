@@ -23,6 +23,7 @@ const DesktopNotifications = @import("desktop_notifications.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
+const Dividers = @import("Dividers.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -1863,6 +1864,9 @@ pub const Surface = struct {
                 }
                 return 0;
             },
+
+            // Beside a divider the pointer is the frame's (`Dividers`).
+            win32.WM_NCHITTEST => return Dividers.hitTest(self.window, hwnd, wparam, lparam),
 
             win32.WM_SETCURSOR => {
                 // Client area only. Elsewhere DefWindowProcW sets the arrow

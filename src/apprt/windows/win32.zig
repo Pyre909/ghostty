@@ -528,6 +528,7 @@ pub extern "user32" fn TrackMouseEvent(tme: *TRACKMOUSEEVENT) callconv(.winapi) 
 pub extern "user32" fn WindowFromPoint(pt: POINT) callconv(.winapi) ?HWND;
 pub extern "user32" fn ScreenToClient(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn ClientToScreen(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetCursorPos(pt: *POINT) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmetrics
 pub extern "user32" fn GetSystemMetrics(index: c_int) callconv(.winapi) c_int;
 /// The pixels on either side of a press the pointer may move before a
@@ -888,6 +889,7 @@ pub extern "user32" fn SetTimer(
 ) callconv(.winapi) UINT_PTR;
 pub extern "user32" fn KillTimer(hwnd: ?HWND, id: UINT_PTR) callconv(.winapi) BOOL;
 pub extern "user32" fn SetCursor(cursor: ?HCURSOR) callconv(.winapi) ?HCURSOR;
+pub extern "user32" fn GetCursor() callconv(.winapi) ?HCURSOR;
 pub extern "user32" fn MessageBeep(type_: UINT) callconv(.winapi) BOOL;
 pub extern "user32" fn MessageBoxW(
     hwnd: ?HWND,
