@@ -25,15 +25,16 @@
 //! A press in a band drags the divider (`Drag`): each move of the pointer
 //! writes its split's ratio and lays the terminals out at once, as GTK's
 //! and macOS's dividers resize their splits while they are dragged, and
-//! neither side shrinks below a cell of each of its terminals
-//! (`minExtent`). A double click in a band equalizes the tab's splits, as
-//! on macOS (`doubleClick`). These are the frame's own messages, which
-//! reach it from a message loop: `App.run`'s, a size, move or menu loop,
-//! or a teardown's wait (`App.waitForThread`), none of them with a core
-//! frame beneath. The one loop that can run inside a core frame, a
-//! prompt's, disables every frame first (`App.beginPrompt`), which takes
-//! the capture from a drag (WM_CANCELMODE) and gives the frame no mouse
-//! input; a move still lays nothing out while the core may not be
+//! the line stops where a terminal on either side, nested splits'
+//! included, would shrink below a cell, as `Window.adopt` refuses a resize
+//! that would (`dragRatio`). A double click in a band equalizes the tab's
+//! splits, as on macOS (`doubleClick`). These are the frame's own
+//! messages, which reach it from a message loop: `App.run`'s, a size, move
+//! or menu loop, or a teardown's wait (`App.waitForThread`), none of them
+//! with a core frame beneath. The one loop that can run inside a core
+//! frame, a prompt's, disables every frame first (`App.beginPrompt`),
+//! which takes the capture from a drag (WM_CANCELMODE) and gives the frame
+//! no mouse input; a move still lays nothing out while the core may not be
 //! re-entered (`follow`), as the tab bar's drag does.
 
 const std = @import("std");
@@ -384,14 +385,12 @@ fn pointOf(lparam: win32.LPARAM) win32.POINT {
 
 /// The ratio for the split at `handle` of `tree`, laid out in `area` with
 /// dividers `divider` pixels wide (`Window.splitArea`), that gives its
-/// first side (left or top) `first` pixels: clamped so that neither side
-/// has less than its least (`minExtent`), and as near as an `f16` ratio
-/// lays it out, which over 3840 pixels can place the line only every
-/// pixel or two. Null where that leaves the line where it is, and where
-/// no place of the line keeps both sides' least: in an area too small for
-/// both, or where no `f16` ratio lays out any of the few places left. The
-/// line then stays, as `Window.adopt` refuses a resize that shrinks a
-/// terminal below a cell.
+/// first side (left or top) `first` pixels: kept to the places where no
+/// terminal shrinks below a cell (`dragRange`), as `Window.adopt` keeps a
+/// resize, and as near as an `f16` ratio lays it out, which over 3840
+/// pixels can place the line only every pixel or two. Null where that
+/// leaves the line where it is, as where it already leaves a terminal its
+/// least on the side `first` would shrink.
 pub fn dragRatio(
     tree: *const Window.Tree,
     handle: Window.Tree.Node.Handle,
@@ -399,54 +398,101 @@ pub fn dragRatio(
     divider: i32,
     first: i32,
 ) ?f16 {
-    const s = tree.nodes[handle.idx()].split;
-    const across = s.layout == .horizontal;
-    const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
-    const rest = total - Window.splitArea(area, across, s.ratio, divider).line;
-    const lo = minExtent(tree, s.left, across, divider);
-    const hi = rest - minExtent(tree, s.right, across, divider);
-    if (lo > hi) return null;
-    const ratio = ratioFor(rest, std.math.clamp(first, lo, hi), lo, hi) orelse return null;
-    if (Window.firstExtent(rest, ratio) == Window.firstExtent(rest, s.ratio)) return null;
+    const range = dragRange(tree, handle, area, divider);
+    if (range.lo == range.hi) return null;
+    const ratio = ratioFor(range.rest, std.math.clamp(first, range.lo, range.hi), range.lo, range.hi);
+    if (Window.firstExtent(range.rest, ratio) == range.now) return null;
     return ratio;
 }
 
+/// Where a dragged split may put its line (`dragRange`): its first side
+/// from `lo` to `hi` of the `rest` pixels its line leaves, around `now`,
+/// where its ratio puts it.
+const Range = struct {
+    lo: i32,
+    hi: i32,
+    now: i32,
+    rest: i32,
+};
+
+/// The places of the line of the split at `handle` of `tree`, laid out in
+/// `area` with dividers `divider` pixels wide, where each terminal under
+/// it, laid out with the split's first side that many pixels, keeps a cell
+/// across and down wherever it shrinks: `Window.adopt`'s check of a resize
+/// (`Window.keepsCellsAt`), so that a nested split keeps each of its
+/// terminals a cell at its own ratio. Where the line is now nothing
+/// shrinks, so that place is one of them. As the first side grows by a
+/// pixel, each terminal in it grows by a pixel or not at all, and each in
+/// the second side shrinks by a pixel or not at all (for sides under 8192
+/// pixels, where `Window.firstExtent`'s product is exact), so the places
+/// are the pixels from the first that keeps the first side's terminals to
+/// the last that keeps the second's: each found by halving, each step a
+/// walk of the split's terminals.
+fn dragRange(
+    tree: *const Window.Tree,
+    handle: Window.Tree.Node.Handle,
+    area: win32.RECT,
+    divider: i32,
+) Range {
+    const s = tree.nodes[handle.idx()].split;
+    const across = s.layout == .horizontal;
+    const was = Window.splitArea(area, across, s.ratio, divider);
+    const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
+    const rest = total - was.line;
+    const now = Window.firstExtent(rest, s.ratio);
+    const fit: Fit = .{ .tree = tree, .split = s, .area = area, .across = across, .was = was, .divider = divider };
+
+    // The first place that fits, from 0 to `now`, where only the first
+    // side's terminals shrink.
+    var lo: i32 = 0;
+    var upper = now;
+    while (lo < upper) {
+        const mid = lo + @divTrunc(upper - lo, 2);
+        if (fit.keeps(mid)) upper = mid else lo = mid + 1;
+    }
+
+    // The last, from `now` to `rest`, where only the second side's do.
+    var hi = now;
+    var lower = rest;
+    while (hi < lower) {
+        const mid = hi + @divTrunc(lower - hi + 1, 2);
+        if (fit.keeps(mid)) hi = mid else lower = mid - 1;
+    }
+    return .{ .lo = lo, .hi = hi, .now = now, .rest = rest };
+}
+
+/// `dragRange`'s check of one place of the line: whether the terminals of
+/// both sides of `split`, laid out in `area` as `was` by its ratio, keep a
+/// cell wherever they shrink with its first side `first` pixels.
+const Fit = struct {
+    tree: *const Window.Tree,
+    split: Window.Tree.Split,
+    area: win32.RECT,
+    across: bool,
+    was: Window.Sides,
+    divider: i32,
+
+    fn keeps(self: Fit, first: i32) bool {
+        const now = Window.splitAt(self.area, self.across, self.was.line, first);
+        const t = self.tree;
+        return Window.keepsCellsAt(t, t, self.split.left, self.was.first, now.first, self.divider) and
+            Window.keepsCellsAt(t, t, self.split.right, self.was.second, now.second, self.divider);
+    }
+};
+
 /// The `f16` ratio nearest `first / rest` whose first side
 /// (`Window.firstExtent`) is from `lo` to `hi` pixels, where
-/// `1 <= lo <= first <= hi <= rest`; null if no `f16` ratio lays one out
-/// there, as where `lo` is `hi` and the ratios nearest it lay out the
-/// pixels on either side.
-fn ratioFor(rest: i32, first: i32, lo: i32, hi: i32) ?f16 {
-    assert(1 <= lo and lo <= first and first <= hi and hi <= rest);
+/// `0 <= lo <= first <= hi <= rest`, `lo < hi`, and some `f16` ratio lays
+/// one out there, as the split's own does (`dragRange`).
+fn ratioFor(rest: i32, first: i32, lo: i32, hi: i32) f16 {
+    assert(0 <= lo and lo < hi and lo <= first and first <= hi and hi <= rest);
     var ratio: f16 = @floatCast(@as(f32, @floatFromInt(first)) / @as(f32, @floatFromInt(rest)));
     // Each step is the next f16 and moves the side by at most a pixel or
     // two; a ratio of 1 gives all of `rest`, and one of 0 none of it.
     while (Window.firstExtent(rest, ratio) < lo) ratio = std.math.nextAfter(f16, ratio, 1);
     while (Window.firstExtent(rest, ratio) > hi) ratio = std.math.nextAfter(f16, ratio, 0);
-    if (Window.firstExtent(rest, ratio) < lo) return null;
+    assert(Window.firstExtent(rest, ratio) >= lo);
     return ratio;
-}
-
-/// The fewest pixels the terminals at and under `handle` of `tree` can be
-/// laid out in, across (`across`, left to right) or down: a terminal's
-/// cell that way (`Window.cellExtent`, the least `Window.adopt` leaves a
-/// terminal it shrinks); for a split that way, its two sides' and its
-/// line, `divider` pixels; for one the other way, the larger of its
-/// sides'.
-pub fn minExtent(
-    tree: *const Window.Tree,
-    handle: Window.Tree.Node.Handle,
-    across: bool,
-    divider: i32,
-) i32 {
-    return switch (tree.nodes[handle.idx()]) {
-        .leaf => |surface| Window.cellExtent(surface, across),
-        .split => |s| {
-            const a = minExtent(tree, s.left, across, divider);
-            const b = minExtent(tree, s.right, across, divider);
-            return if ((s.layout == .horizontal) == across) a +| divider +| b else @max(a, b);
-        },
-    };
 }
 
 /// For the pure tests: a view with a name and no reference count.
@@ -639,6 +685,7 @@ const TestCells = struct {
     var a: Surface = undefined;
     var b: Surface = undefined;
     var c: Surface = undefined;
+    var many: [6]Surface = undefined;
 
     /// `s` with a live core whose cells are `width` by `height`, or with
     /// none.
@@ -662,36 +709,44 @@ const TestCells = struct {
     }
 };
 
-test "win32: a subtree's least extent is its cells, with its lines along a split" {
-    // a | (b over c), lines 2 pixels: a's cells 10 by 20, b's 7 by 15, c
-    // without a core. Across, a, the line and the wider of b and c; down,
-    // the higher of a and b, the line and c.
+test "win32: a dragged divider keeps each terminal of a nested split a cell, at its ratio" {
+    // a | (b | c), lines 2 pixels, over 202 pixels: 200 for the sides, 100
+    // each. a's cells are 10 wide, b's 7 and c's 9, and the right side
+    // splits at 0.8: of its 98 pixels b has 78 and c 20. Dragged right,
+    // the line stops where c keeps 9 at that ratio: the right side 45
+    // pixels, 43 for b and c, 34 and 9; at 44, b and c would have 34 and
+    // 8. Every terminal's least added up, 18 pixels, would leave c 3.
     const s = TestCells;
     s.set(&s.a, .{ 10, 20 });
     s.set(&s.b, .{ 7, 15 });
-    s.set(&s.c, null);
+    s.set(&s.c, .{ 9, 5 });
     var ab = try s.pair(&s.a, &s.b, .right, 0.5);
     defer ab.deinit();
     var single: Window.Tree = try .init(std.testing.allocator, &s.c);
     defer single.deinit();
-    var tree = try ab.split(std.testing.allocator, ab.locate(&s.b).?, .down, 0.5, &single);
+    var tree = try ab.split(std.testing.allocator, ab.locate(&s.b).?, .right, 0.8, &single);
     defer tree.deinit();
     const root = Window.Tree.Node.Handle.root;
-    const right = tree.nodes[root.idx()].split.right;
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 202, .bottom = 100 };
+    try std.testing.expectEqual(78, testExtent(&tree, area, &s.b, true));
+    try std.testing.expectEqual(20, testExtent(&tree, area, &s.c, true));
 
-    try std.testing.expectEqual(10 + 2 + 7, minExtent(&tree, root, true, 2));
-    try std.testing.expectEqual(20, minExtent(&tree, root, false, 2));
-    try std.testing.expectEqual(7, minExtent(&tree, right, true, 2));
-    try std.testing.expectEqual(15 + 2 + 1, minExtent(&tree, right, false, 2));
-    try std.testing.expectEqual(1, minExtent(&tree, tree.locate(&s.c).?, true, 2));
-    try std.testing.expectEqual(20, minExtent(&tree, tree.locate(&s.a).?, false, 2));
+    const right = dragRatio(&tree, root, area, 2, 5000) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(155, Window.firstExtent(200, right));
+    tree.resizeInPlace(root, right);
+    try std.testing.expectEqual(34, testExtent(&tree, area, &s.b, true));
+    try std.testing.expectEqual(9, testExtent(&tree, area, &s.c, true));
 
-    // b's cells higher than a's: the right side is the higher down.
-    s.set(&s.b, .{ 7, 25 });
-    try std.testing.expectEqual(25 + 2 + 1, minExtent(&tree, root, false, 2));
-    // c's cells wider than b's: across, the right side is c's.
-    s.set(&s.c, .{ 9, 5 });
-    try std.testing.expectEqual(10 + 2 + 9, minExtent(&tree, root, true, 2));
+    // Dragged left from there, the line stops at a's 10 pixels.
+    const left = dragRatio(&tree, root, area, 2, -50) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(10, Window.firstExtent(200, left));
+
+    // b over c instead: each has the right side's whole width, so it stops
+    // at the wider of their cells, c's 9.
+    var across = try ab.split(std.testing.allocator, ab.locate(&s.b).?, .down, 0.8, &single);
+    defer across.deinit();
+    const below = dragRatio(&across, root, area, 2, 5000) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(191, Window.firstExtent(200, below));
 }
 
 test "win32: a dragged divider keeps each side its least, as near as an f16 lays it" {
@@ -712,9 +767,13 @@ test "win32: a dragged divider keeps each side its least, as near as an f16 lays
     try std.testing.expectEqual(10, Window.firstExtent(100, dragRatio(&row, root, wide, 1, -50).?));
     try std.testing.expectEqual(99, Window.firstExtent(100, dragRatio(&row, root, wide, 1, 200).?));
 
-    // b's cells 10 wide too, in 15 pixels: no place keeps both, so none.
-    s.set(&s.b, .{ 10, 20 });
+    // In 15 pixels, 7 each, a is already narrower than its cell: as
+    // `Window.adopt` keeps it, it may grow but not shrink. With b's cells
+    // as wide, neither may shrink, so the line stays.
     const narrow: win32.RECT = .{ .left = 0, .top = 0, .right = 15, .bottom = 40 };
+    try std.testing.expect(dragRatio(&row, root, narrow, 1, 0) == null);
+    try std.testing.expectEqual(13, Window.firstExtent(14, dragRatio(&row, root, narrow, 1, 20).?));
+    s.set(&s.b, .{ 10, 20 });
     for ([_]i32{ 0, 4, 7, 10, 14 }) |first| {
         try std.testing.expect(dragRatio(&row, root, narrow, 1, first) == null);
     }
@@ -740,21 +799,189 @@ test "win32: a dragged divider keeps each side its least, as near as an f16 lays
         try std.testing.expect(@abs(laid - want) <= 1);
     }
 
-    // A width no f16 ratio lays out, the one both sides' least leave: no
-    // place keeps both, so none. With a pixel more room, the one there is.
-    const gap: u32 = gap: {
-        var k: i32 = 3839;
-        while (k > 1920) : (k -= 1) {
-            if (!laysOut(3840, k) and laysOut(3840, k - 1)) break :gap @intCast(k);
+    // A side's least at a width no f16 ratio lays out, whose nearest ratio
+    // lays out the pixel past it: the line stops a pixel short instead.
+    // b's cell leaves a at most `over`, where the nearest is a pixel wider:
+    // dragged right from a quarter, the line stops a pixel narrower.
+    const over = try testGap(3840, 1);
+    s.set(&s.b, .{ @intCast(3840 - over), 1 });
+    row.resizeInPlace(root, 0.25);
+    const short = dragRatio(&row, root, screen, 1, 5000) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(over - 1, Window.firstExtent(3840, short));
+    // a's cell is `under`, where the nearest is a pixel narrower: dragged
+    // left from three quarters, the line stops a pixel wider.
+    const under = try testGap(3840, -1);
+    s.set(&s.a, .{ @intCast(under), 1 });
+    s.set(&s.b, null);
+    row.resizeInPlace(root, 0.75);
+    const wider = dragRatio(&row, root, screen, 1, -50) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(under + 1, Window.firstExtent(3840, wider));
+}
+
+test "win32: a drag's places for its line are those adopt's check allows" {
+    // Random trees of up to six terminals, with random ratios, cells (or
+    // no core), areas and DPIs. For a random split of each, the places
+    // `dragRange` finds by halving are exactly the first sides, from 0 to
+    // all of it, that `Window.keepsCells`, the check `Window.adopt` makes
+    // of a resize, allows for the whole tree with that split's ratio laying
+    // that side out; and the line goes where `dragRatio` is asked, as near
+    // as those places allow. Areas stay under 2048 pixels, where every
+    // first side has a ratio that lays it out.
+    const alloc = std.testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x5333_5231);
+    const random = prng.random();
+    const Handle = Window.Tree.Node.Handle;
+    var cases: usize = 0;
+    var inside: usize = 0;
+    var round: usize = 0;
+    while (round < 400) : (round += 1) {
+        const n = random.intRangeAtMost(usize, 2, TestCells.many.len);
+        for (TestCells.many[0..n]) |*leaf| {
+            TestCells.set(leaf, if (random.uintLessThan(u8, 3) == 0) null else .{
+                random.intRangeAtMost(u32, 1, 30),
+                random.intRangeAtMost(u32, 1, 40),
+            });
         }
-        return error.TestUnexpectedResult;
+        var tree = try testRandomTree(random, TestCells.many[0..n]);
+        defer tree.deinit();
+        const area: win32.RECT = .{
+            .left = random.intRangeAtMost(i32, -50, 50),
+            .top = random.intRangeAtMost(i32, -50, 50),
+            .right = 0,
+            .bottom = 0,
+        };
+        var whole = area;
+        whole.right = area.left + random.intRangeAtMost(i32, 1, 600);
+        whole.bottom = area.top + random.intRangeAtMost(i32, 1, 600);
+        const dpis = [_]u32{ 96, 120, 144, 192, 288 };
+        const divider = Window.dividerWidth(dpis[random.uintLessThan(usize, dpis.len)]);
+
+        // A split, if it has a line to drag.
+        var splits: [TestCells.many.len]Handle = undefined;
+        var count: usize = 0;
+        for (tree.nodes, 0..) |node, i| if (node == .split) {
+            splits[count] = Handle.root.offset(i);
+            count += 1;
+        };
+        const handle = splits[random.uintLessThan(usize, count)];
+        var found: AreaOf = .{ .handle = handle };
+        Window.layout(&tree, whole, divider, &found);
+        const split = found.area orelse continue;
+        cases += 1;
+
+        const range = dragRange(&tree, handle, split, divider);
+        try std.testing.expect(range.lo <= range.now and range.now <= range.hi);
+        if (range.lo > 0 and range.lo < range.hi and range.hi < range.rest) inside += 1;
+
+        // The ratio that first lays out each side, ratios rising.
+        var ratios: [2049]?f16 = @splat(null);
+        var bits: u16 = 0;
+        while (bits <= 0x3C00) : (bits += 1) {
+            const r: f16 = @bitCast(bits);
+            const p: usize = @intCast(Window.firstExtent(range.rest, r));
+            if (ratios[p] == null) ratios[p] = r;
+        }
+        var moved = try tree.clone(alloc);
+        defer moved.deinit();
+        var p: i32 = 0;
+        while (p <= range.rest) : (p += 1) {
+            const r = ratios[@intCast(p)] orelse return error.TestUnexpectedResult;
+            moved.resizeInPlace(handle, r);
+            const allowed = range.lo <= p and p <= range.hi;
+            try std.testing.expectEqual(Window.keepsCells(&tree, &moved, whole, divider), allowed);
+        }
+
+        const want = random.intRangeAtMost(i32, -20, range.rest + 20);
+        const to = std.math.clamp(want, range.lo, range.hi);
+        if (dragRatio(&tree, handle, split, divider, want)) |r| {
+            try std.testing.expectEqual(to, Window.firstExtent(range.rest, r));
+        } else {
+            try std.testing.expectEqual(range.now, to);
+        }
+    }
+    // Most rounds drag a line, and many of those stop short of both ends.
+    try std.testing.expect(cases > 200);
+    try std.testing.expect(inside > cases / 4);
+}
+
+/// For the pure tests: `leaves` in a tree, each split off a random one
+/// before it in a random direction, and every split at a random ratio,
+/// either end included.
+fn testRandomTree(random: std.Random, leaves: []Surface) !Window.Tree {
+    const alloc = std.testing.allocator;
+    var tree: Window.Tree = try .init(alloc, &leaves[0]);
+    errdefer tree.deinit();
+    for (leaves[1..]) |*leaf| {
+        var pick: Window.Tree.Node.Handle = .root;
+        var seen: usize = 0;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            seen += 1;
+            if (random.uintLessThan(usize, seen) == 0) pick = entry.handle;
+        }
+        var single: Window.Tree = try .init(alloc, leaf);
+        defer single.deinit();
+        const next = try tree.split(alloc, pick, random.enumValue(Window.Tree.Split.Direction), 0.5, &single);
+        tree.deinit();
+        tree = next;
+    }
+    for (tree.nodes, 0..) |node, i| if (node == .split) {
+        const ratio: f16 = switch (random.uintLessThan(u8, 8)) {
+            0 => 0,
+            1 => 1,
+            else => @floatCast(random.float(f32)),
+        };
+        tree.resizeInPlace(Window.Tree.Node.Handle.root.offset(i), ratio);
     };
-    s.set(&s.a, .{ gap, 1 });
-    s.set(&s.b, .{ 3840 - gap, 1 });
-    try std.testing.expect(dragRatio(&row, root, screen, 1, @intCast(gap)) == null);
-    s.set(&s.a, .{ gap - 1, 1 });
-    const fits = dragRatio(&row, root, screen, 1, @intCast(gap)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(i32, @intCast(gap)) - 1, Window.firstExtent(3840, fits));
+    return tree;
+}
+
+/// For the pure tests: how wide (`across`) or high `surface` is where
+/// `Window.layout` puts it in `area`, with lines 2 pixels wide.
+fn testExtent(tree: *const Window.Tree, area: win32.RECT, surface: *Surface, across: bool) i32 {
+    const Of = struct {
+        surface: *Surface,
+        rect: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+
+        pub fn pane(self: *@This(), view: *Surface, rect: win32.RECT) void {
+            if (view == self.surface) self.rect = rect;
+        }
+
+        pub fn hidden(self: *@This(), view: *Surface) void {
+            _ = self;
+            _ = view;
+        }
+
+        pub fn divider(
+            self: *@This(),
+            handle: Window.Tree.Node.Handle,
+            line: win32.RECT,
+            a: bool,
+            in: win32.RECT,
+        ) void {
+            _ = self;
+            _ = handle;
+            _ = line;
+            _ = a;
+            _ = in;
+        }
+    };
+    var of: Of = .{ .surface = surface };
+    Window.layout(tree, area, 2, &of);
+    return if (across) of.rect.right - of.rect.left else of.rect.bottom - of.rect.top;
+}
+
+/// For the tests: a first side of `rest` pixels, above half of it, that no
+/// f16 ratio lays out, while the f16 nearest its share lays out the pixel
+/// `side` past it (1 or -1).
+fn testGap(rest: i32, side: i32) !i32 {
+    var k = @divTrunc(rest, 2) + 1;
+    while (k < rest) : (k += 1) {
+        if (laysOut(rest, k)) continue;
+        const nearest: f16 = @floatCast(@as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(rest)));
+        if (Window.firstExtent(rest, nearest) == k + side) return k;
+    }
+    return error.TestUnexpectedResult;
 }
 
 /// For the tests: whether some f16 ratio gives a first side of `width` of

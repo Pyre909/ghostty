@@ -4937,7 +4937,11 @@ test "win32: a dragged divider stops at a pixel for each terminal beyond it" {
     // from the window's left edge, and, dragged right, where b, c and the
     // line between them take three. In (d | e) over f the line over f
     // stops a pixel below the top, d and e side by side needing a pixel
-    // each down, and a pixel above the bottom.
+    // each down, and a pixel above the bottom. In g | h | i, with the line
+    // between h and i dragged to its right stop first, which leaves i a
+    // pixel at a ratio near 1, the line after g, dragged right, stops where
+    // h and i keep a pixel each at that ratio: a pixel further, i would
+    // have none.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -5000,6 +5004,44 @@ test "win32: a dragged divider stops at a pixel for each terminal beyond it" {
     try std.testing.expectEqual(area.bottom - 1, (try paneRect(column, f)).top);
     try std.testing.expectEqual(area.bottom, (try paneRect(column, f)).bottom);
     testFrameMouse(column, win32.WM_LBUTTONUP, x, 5000);
+    try std.testing.expect(win32.GetCapture() == null);
+
+    const nested = try testFrame(&app);
+    testResize(nested, 400, 300);
+    const g = try testPane(&app, nested);
+    const h = try testPane(&app, nested);
+    const i = try testPane(&app, nested);
+    nested.tab().tree = try testRow(alloc, &.{ g, h, i });
+    nested.tab().focused = g;
+    nested.relayout();
+    _ = win32.ShowWindow(nested.hwnd, win32.SW_SHOWNOACTIVATE);
+    const yn = @divTrunc((try paneRect(nested, g)).top + (try paneRect(nested, g)).bottom, 2);
+    const right = nested.tab().tree.nodes[Window.Tree.Node.Handle.root.idx()].split.right;
+
+    // The line between h and i to its right stop: i a pixel wide.
+    try testPressDivider(nested, (try paneRect(nested, h)).right, yn);
+    testFrameMouse(nested, win32.WM_LBUTTONUP, 5000, yn);
+    try std.testing.expectEqual(1, (try paneRect(nested, i)).right - (try paneRect(nested, i)).left);
+    const ratio = nested.tab().tree.nodes[right.idx()].split.ratio;
+    try std.testing.expect(ratio > 0.9);
+
+    // The line after g to its right stop, then its left one.
+    try testPressDivider(nested, (try paneRect(nested, g)).right, yn);
+    testFrameMouse(nested, win32.WM_MOUSEMOVE, 5000, yn);
+    const ri = try paneRect(nested, i);
+    const rh = try paneRect(nested, h);
+    try std.testing.expect(rh.right - rh.left >= 1);
+    try std.testing.expectEqual(1, ri.right - ri.left);
+    try std.testing.expectEqual(rh.right + 1, ri.left);
+    try std.testing.expectEqual((try paneRect(nested, g)).right + 1, rh.left);
+    // A pixel further, h and i would share a pixel less at that ratio,
+    // which leaves i none.
+    const less = ri.right - rh.left - 2;
+    try std.testing.expectEqual(less, Window.firstExtent(less, ratio));
+    testFrameMouse(nested, win32.WM_MOUSEMOVE, -1000, yn);
+    try std.testing.expectEqual(1, (try paneRect(nested, g)).right - (try paneRect(nested, g)).left);
+    try std.testing.expect((try paneRect(nested, i)).right - (try paneRect(nested, i)).left >= 1);
+    testFrameMouse(nested, win32.WM_LBUTTONUP, -1000, yn);
     try std.testing.expect(win32.GetCapture() == null);
 }
 

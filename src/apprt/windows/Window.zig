@@ -1605,13 +1605,18 @@ fn adopt(self: *Window, t: *Tab, tree: *Tree, client: win32.RECT) void {
 /// with only its ratios changed (`SplitTree.resize` and `SplitTree.equalize`
 /// copy the nodes and rewrite ratios), so the two are laid out side by
 /// side, as `layout` would lay out each.
-fn keepsCells(old: *const Tree, new: *const Tree, area: win32.RECT, divider: i32) bool {
+pub fn keepsCells(old: *const Tree, new: *const Tree, area: win32.RECT, divider: i32) bool {
     assert(old.nodes.len == new.nodes.len);
     if (new.isEmpty()) return true;
     return keepsCellsAt(old, new, .root, area, area, divider);
 }
 
-fn keepsCellsAt(
+/// `keepsCells` for the terminals at and under `handle`: laid out by `old`
+/// in `was` and by `new` in `now`. A divider's drag asks it of each side of
+/// its split, laid out from where it is to where the drag would put it
+/// (`Dividers.dragRatio`), so that the drag and `adopt` keep the same
+/// least.
+pub fn keepsCellsAt(
     old: *const Tree,
     new: *const Tree,
     handle: Tree.Node.Handle,
@@ -1646,9 +1651,9 @@ fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
 
 /// The least a terminal is given across (`across`) or down by a change
 /// that shrinks it: a cell of its own font, or a pixel for a terminal with
-/// no core. `adopt` refuses a resize below it (`fitsCell`), and a
-/// divider's drag stops at it (`Dividers.minExtent`).
-pub fn cellExtent(surface: *Surface, across: bool) i32 {
+/// no core. `adopt` refuses a resize below it, and a divider's drag stops
+/// at it (`fitsCell`).
+fn cellExtent(surface: *Surface, across: bool) i32 {
     const core = surface.liveCore() orelse return 1;
     const cell = core.size.cell;
     return @max(1, std.math.lossyCast(i32, if (across) cell.width else cell.height));
@@ -2018,17 +2023,25 @@ fn layoutNode(
 /// How a split divides `area` (`layout`): `divider` pixels for the line
 /// between its sides, fewer if it is narrower than that, and the rest by
 /// `ratio`, to the nearest pixel, for the first side (left or top).
-pub fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) struct {
+pub fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) Sides {
+    const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
+    const line = std.math.clamp(divider, 0, total);
+    return splitAt(area, across, line, firstExtent(total - line, ratio));
+}
+
+/// A split's two sides and its line in its area (`splitArea`).
+pub const Sides = struct {
     first: win32.RECT,
     divider: win32.RECT,
     second: win32.RECT,
     line: i32,
-} {
-    const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
-    const line = std.math.clamp(divider, 0, total);
-    const rest = total - line;
-    const first = firstExtent(rest, ratio);
+};
 
+/// How a split divides `area` with its first side `first` pixels across
+/// (`across`) or down and its line `line` pixels after it, the second side
+/// taking the rest: `splitArea` for a ratio that lays out `first`, as a
+/// divider's drag tries places for its line (`Dividers.dragRatio`).
+pub fn splitAt(area: win32.RECT, across: bool, line: i32, first: i32) Sides {
     var a = area;
     var d = area;
     var b = area;
