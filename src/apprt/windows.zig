@@ -136,6 +136,16 @@
 //! show. GTK's icon, its animated spinner and dragging it to the top are
 //! not done.
 //!
+//! ## Read-only
+//!
+//! `.readonly`, which the core performs after its `toggle_readonly`
+//! binding has flipped its flag, shows "Read-only" over the terminal's
+//! top-right corner in GTK's colour for it, or hides it (`ReadOnly`). It is
+//! passive as the link preview is, under it and the key-state indicator,
+//! and under the terminal's search bar, which covers it while open, as
+//! GTK stacks them. Its window is made the first time the terminal is made
+//! read-only. GTK's lock icon is not drawn.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
@@ -239,6 +249,7 @@ test {
     _ = @import("windows/KeyState.zig");
     _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/Overlays.zig");
+    _ = @import("windows/ReadOnly.zig");
     _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");

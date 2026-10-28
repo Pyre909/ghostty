@@ -1,11 +1,12 @@
 //! A terminal's passive overlays: windows that show something about the
 //! terminal over it and take no input, as GTK stacks overlays over its
-//! surface (src/apprt/gtk/ui/1.0/surface.blp): the link preview
-//! (LinkPreview.zig) and the key-state indicator (KeyState.zig). This
-//! file does for each what they all need: their window class and
-//! procedure, their place in the Z order, their font, colours and frame,
-//! and their teardown; each overlay's own file says what it shows and
-//! where (`placeIn`, `textIn`).
+//! surface (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge
+//! (ReadOnly.zig), the link preview (LinkPreview.zig) and the key-state
+//! indicator (KeyState.zig). This file does for each what they all need:
+//! their window class and procedure, their place in the Z order, their
+//! font, colours and frame, and their teardown; each overlay's own file
+//! says what it shows and where (`placeIn`, `textIn`), and in what
+//! colours if not the search bar's (`look`).
 //!
 //! Like the search bar (SearchBar.zig), an overlay is a child window of
 //! the terminal's **frame**, placed above the terminal's own window: GDI
@@ -20,7 +21,8 @@
 //! pointer and clicks over it go to the terminal under it, and none is
 //! ever given the focus. Each draws a line of text in the system's
 //! message font, one for all of a terminal's overlays (`font`), on the
-//! search bar's colours, framed as GTK's labels are.
+//! search bar's colours, framed as GTK's labels are, or in its own
+//! (`Look`).
 
 const Overlays = @This();
 
@@ -33,12 +35,17 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
+const ReadOnly = @import("ReadOnly.zig");
 const KeyState = @import("KeyState.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
 const RECT = win32.RECT;
 const L = win32.L;
 const log = std.log.scoped(.win32);
+
+/// The read-only badge, made the first time the terminal is made
+/// read-only (`ReadOnly.set`).
+readonly: ReadOnly.Badge = .{},
 
 /// The link preview, made, hidden, with its terminal (`create`).
 link_preview: LinkPreview.Preview = .{},
@@ -56,12 +63,12 @@ font_dpi: u32 = 0,
 /// The overlays, by their fields, bottom to top, as GTK stacks them over
 /// its surface (surface.blp). Each has a window `hwnd`, the `text` it
 /// draws, `text_size` and `measured` for that text in `font`, and
-/// `placeIn`, `textIn` and `deinit`.
-const stack = [_][]const u8{ "link_preview", "key_state" };
+/// `placeIn`, `textIn` and `deinit`, and may have `look`.
+pub const stack = [_][]const u8{ "readonly", "link_preview", "key_state" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ LinkPreview.class_name, KeyState.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, LinkPreview.class_name, KeyState.class_name };
 
 /// For tests: how many messages an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -74,6 +81,11 @@ pub const Size = struct { width: i32, height: i32 };
 /// coordinates (`placeIn`), and whether it must be drawn again though it
 /// stays there.
 pub const Placed = struct { in: RECT, redraw: bool };
+
+/// What an overlay is drawn in: the line around it, inside that line, and
+/// its text. The search bar's colours (`SearchBar.Colors`) unless the
+/// overlay says otherwise (`look`).
+pub const Look = struct { line: win32.COLORREF, fill: win32.COLORREF, text: win32.COLORREF };
 
 /// One line, `&` drawn as itself: CR and LF in the text break nothing.
 const text_format = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
@@ -204,7 +216,8 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// logged. The link preview, made only with its terminal, is not made
 /// again, so the terminal shows no more previews; the key-state
 /// indicator is made again at its next change that leaves something to
-/// show (`KeyState.update`).
+/// show (`KeyState.update`), and the read-only badge the next time the
+/// terminal is made read-only (`ReadOnly.set`).
 ///
 /// The terminals tile their area, and the search bars and the command
 /// palette are placed above all of them (`SearchBar.place`,
@@ -364,7 +377,17 @@ pub fn wndProc(
         win32.WM_ERASEBKGND => return 1,
 
         win32.WM_PAINT => {
-            paint(surface, hwnd);
+            var ps: win32.PAINTSTRUCT = undefined;
+            const hdc = win32.BeginPaint(hwnd, &ps) orelse return 0;
+            defer _ = win32.EndPaint(hwnd, &ps);
+            draw(surface, hwnd, hdc);
+            return 0;
+        },
+
+        // Drawn into the DC it is given, as WM_PRINT's default asks of a
+        // window's client area (PrintWindow, without DWM's copy).
+        win32.WM_PRINTCLIENT => {
+            if (wparam != 0) draw(surface, hwnd, @ptrFromInt(wparam));
             return 0;
         },
 
@@ -387,13 +410,8 @@ pub fn wndProc(
     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
-/// The overlay's text on the search bar's colours, framed as GTK's labels
-/// are, where its own file puts it (`textIn`).
-fn paint(surface: *Surface, hwnd: win32.HWND) void {
-    var ps: win32.PAINTSTRUCT = undefined;
-    const hdc = win32.BeginPaint(hwnd, &ps) orelse return;
-    defer _ = win32.EndPaint(hwnd, &ps);
-
+/// The overlay whose window is `hwnd`, drawn into `hdc` (`drawOverlay`).
+fn draw(surface: *Surface, hwnd: win32.HWND, hdc: win32.HDC) void {
     var client: RECT = undefined;
     if (!win32.GetClientRect(hwnd, &client).toBool()) return;
     if (client.right <= 0 or client.bottom <= 0) return;
@@ -410,25 +428,36 @@ fn paint(surface: *Surface, hwnd: win32.HWND) void {
 
     const dpi = Window.dpiOf(surface.app, hwnd);
     const colors = SearchBar.Colors.of(surface.window.dark_frame);
-    const line = @max(1, SearchBar.Metrics.scale(1, dpi));
-    SearchBar.fill(mem, client, colors.border);
-    SearchBar.fill(mem, SearchBar.inset(client, line), colors.bar);
-
     inline for (stack) |name| {
         const o = &@field(surface.overlays, name);
-        if (o.hwnd == hwnd) {
-            if (o.text) |text| {
-                _ = win32.SetBkMode(mem, win32.TRANSPARENT);
-                _ = win32.SetTextColor(mem, colors.text);
-                const old_font = if (surface.overlays.font) |f| win32.SelectObject(mem, f) else null;
-                defer if (old_font) |f| {
-                    _ = win32.SelectObject(mem, f);
-                };
-                var r = o.textIn(dpi, client.right);
-                _ = win32.DrawTextW(mem, text.ptr, std.math.lossyCast(c_int, text.len), &r, text_format);
-            }
-        }
+        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, colors, surface.overlays.font);
     }
 
     _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
+}
+
+/// The overlay `o`, `client` big, drawn into `hdc` at `dpi`: its text in
+/// `font`, framed as GTK's labels are, where its own file puts it
+/// (`textIn`), in its colours (`lookOf`).
+fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, colors: SearchBar.Colors, font: ?win32.HGDIOBJ) void {
+    const look = lookOf(o, colors);
+    const line = @max(1, SearchBar.Metrics.scale(1, dpi));
+    SearchBar.fill(hdc, client, look.line);
+    SearchBar.fill(hdc, SearchBar.inset(client, line), look.fill);
+    const text = o.text orelse return;
+    _ = win32.SetBkMode(hdc, win32.TRANSPARENT);
+    _ = win32.SetTextColor(hdc, look.text);
+    const old_font = if (font) |f| win32.SelectObject(hdc, f) else null;
+    defer if (old_font) |f| {
+        _ = win32.SelectObject(hdc, f);
+    };
+    var r = o.textIn(dpi, client.right);
+    _ = win32.DrawTextW(hdc, text.ptr, std.math.lossyCast(c_int, text.len), &r, text_format);
+}
+
+/// The colours the overlay `o` is drawn in: its own (`look`), or the
+/// search bar's.
+pub fn lookOf(o: anytype, colors: SearchBar.Colors) Look {
+    if (@hasDecl(@TypeOf(o.*), "look")) return o.look(colors);
+    return .{ .line = colors.border, .fill = colors.bar, .text = colors.text };
 }

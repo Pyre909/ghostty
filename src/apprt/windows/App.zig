@@ -22,6 +22,7 @@ const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const KeyState = @import("KeyState.zig");
+const ReadOnly = @import("ReadOnly.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -1180,6 +1181,7 @@ pub const App = struct {
             .mouse_over_link => linkPreview(target, value),
             .key_sequence => keySequence(target, value),
             .key_table => keyTable(target, value),
+            .readonly => readOnly(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1258,6 +1260,17 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| KeyState.table(v.rt_surface, value),
+        };
+    }
+
+    /// `.readonly`, from the `toggle_readonly` binding, after the core has
+    /// flipped its flag: the terminal's read-only badge shows over its
+    /// top-right corner, or hides, as GTK's does (`ReadOnly.set`). `false`
+    /// for the app, and for a terminal whose badge could not be made.
+    fn readOnly(target: apprt.Target, value: apprt.action.Readonly) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| ReadOnly.set(v.rt_surface, value),
         };
     }
 
@@ -10476,6 +10489,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .end_search, .end_search },
         .{ .reset_window_size, .reset_window_size },
         .{ .toggle_command_palette, .toggle_command_palette },
+        .{ .toggle_readonly, .readonly },
         // The app's.
         .{ .reload_config, .reload_config },
         .{ .quit, .quit },
@@ -10502,6 +10516,7 @@ test "win32: the command palette lists only what performAction carries out" {
             .start_search => .{ .needle = "" },
             .search_selection => .{ .needle = "t" },
             .reload_config => .{},
+            .toggle_readonly => .on,
             else => if (apprt.Action.Value(case[1]) == void) {} else unreachable,
         };
         const to: apprt.Target = switch (case[0]) {
@@ -10521,7 +10536,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(32, listed);
+    try std.testing.expectEqual(33, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
     _ = try app.performAction(target, .float_window, .off);
@@ -11511,9 +11526,24 @@ fn previewText(surface: *const Surface, buf: []u8) ![]const u8 {
     return buf[0..len];
 }
 
+/// For tests: the window `surface`'s overlay `name` is placed just above:
+/// the highest of the overlays under it in `Overlays.stack` that shows,
+/// else the terminal.
+fn overlayUnder(surface: *const Surface, comptime name: []const u8) win32.HWND {
+    var under = surface.hwnd;
+    inline for (Overlays.stack) |n| {
+        if (std.mem.eql(u8, n, name)) break;
+        if (@field(surface.overlays, n).hwnd) |h| {
+            if (shown(h)) under = h;
+        }
+    }
+    return under;
+}
+
 /// For tests: `surface`'s link preview shows in `window` over its
 /// terminal's bottom `side` corner, as big as its URL with GTK's padding
-/// but no wider than the terminal, and just above the terminal.
+/// but no wider than the terminal, and just above the terminal, or above
+/// the overlays under it that show.
 fn expectPreviewAt(window: *const Window, surface: *const Surface, side: LinkPreview.Side) !void {
     const p = &surface.overlays.link_preview;
     const hwnd = p.hwnd.?;
@@ -11532,7 +11562,7 @@ fn expectPreviewAt(window: *const Window, surface: *const Surface, side: LinkPre
         win32.RECT{ .left = left, .top = pane.bottom - height, .right = left + width, .bottom = pane.bottom },
         try childRect(window, hwnd),
     );
-    try std.testing.expect(win32.GetWindow(surface.hwnd, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(win32.GetWindow(overlayUnder(surface, "link_preview"), win32.GW_HWNDPREV) == hwnd);
 }
 
 /// For tests: the pointer moved to `x`, `y` in `surface`'s client area.
@@ -12019,8 +12049,8 @@ fn keyStateText(surface: *const Surface, buf: []u8) ![]const u8 {
 
 /// For tests: `surface`'s key-state indicator shows in `window` at its
 /// terminal's bottom centre, a margin above its bottom, as big as its
-/// text with GTK's padding, just above the terminal, or above its link
-/// preview while that shows.
+/// text with GTK's padding, just above the terminal, or above the overlays
+/// under it that show, as its link preview.
 fn expectKeyStateAt(window: *const Window, surface: *const Surface) !void {
     const k = &surface.overlays.key_state;
     const hwnd = k.hwnd.?;
@@ -12036,9 +12066,7 @@ fn expectKeyStateAt(window: *const Window, surface: *const Surface) !void {
         win32.RECT{ .left = left, .top = pane.bottom - m.margin - height, .right = left + width, .bottom = pane.bottom - m.margin },
         try childRect(window, hwnd),
     );
-    const preview = surface.overlays.link_preview.hwnd.?;
-    const under = if (shown(preview)) preview else surface.hwnd;
-    try std.testing.expect(win32.GetWindow(under, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(win32.GetWindow(overlayUnder(surface, "key_state"), win32.GW_HWNDPREV) == hwnd);
 }
 
 test "win32: key_table and key_sequence show the active tables and pending keys at the terminal's bottom centre" {
@@ -12453,4 +12481,438 @@ test "win32: a key state whose window cannot be made returns false, frees its te
     try expectKeyStateAt(window, a);
     try std.testing.expectEqualStrings("nav > resize \u{203A} Ctrl+K \u{2026}", try keyStateText(a, &buf));
     try std.testing.expectEqual(2, NoWindow.asked);
+}
+
+/// For tests: the core's `readonly` on `surface`, as its `toggle_readonly`
+/// binding performs it once it has flipped its flag.
+fn testReadOnly(app: *App, surface: *Surface, value: apprt.action.Readonly) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .readonly, value);
+}
+
+/// For tests: the text of the window `hwnd`, as UTF-8 in `buf`.
+fn windowText(hwnd: win32.HWND, buf: []u8) ![]const u8 {
+    var wide: [256]u16 = undefined;
+    const n = win32.GetWindowTextW(hwnd, &wide, wide.len);
+    const len = try std.unicode.utf16LeToUtf8(buf, wide[0..@intCast(n)]);
+    return buf[0..len];
+}
+
+/// For tests: `surface`'s read-only badge shows in `window` over its
+/// terminal's top-right corner, a margin in from its edges, as big as its
+/// text with GTK's padding, just above the terminal, and says "Read-only",
+/// which is also its window's text.
+fn expectBadgeAt(window: *const Window, surface: *const Surface) !void {
+    const b = &surface.overlays.readonly;
+    const hwnd = b.hwnd.?;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(b.text_size.width > 0 and b.text_size.height > 0);
+    const pane = try paneRect(window, surface);
+    const m = ReadOnly.Metrics.init(Window.dpiOf(window.app, window.hwnd));
+    const width = b.text_size.width + 2 * m.pad;
+    const height = b.text_size.height + 2 * m.pad;
+    try std.testing.expectEqual(
+        win32.RECT{ .left = pane.right - m.margin - width, .top = pane.top + m.margin, .right = pane.right - m.margin, .bottom = pane.top + m.margin + height },
+        try childRect(window, hwnd),
+    );
+    try std.testing.expect(win32.GetWindow(surface.hwnd, win32.GW_HWNDPREV) == hwnd);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Read-only", try windowText(hwnd, &buf));
+}
+
+/// For tests: what the window `hwnd` draws into a DC for its
+/// WM_PRINTCLIENT, kept in a bitmap as big as its client area to read the
+/// colours of.
+const Printed = struct {
+    dc: win32.HDC,
+    bitmap: win32.HGDIOBJ,
+    old: ?win32.HGDIOBJ,
+    width: i32,
+    height: i32,
+
+    fn of(hwnd: win32.HWND) !Printed {
+        const client = try clientRect(hwnd);
+        if (client.right <= 0 or client.bottom <= 0) return error.TestUnexpectedResult;
+        const screen = win32.GetDC(null) orelse return error.TestUnexpectedResult;
+        defer _ = win32.ReleaseDC(null, screen);
+        const dc = win32.CreateCompatibleDC(screen) orelse return error.TestUnexpectedResult;
+        errdefer _ = win32.DeleteDC(dc);
+        const bitmap = win32.CreateCompatibleBitmap(screen, client.right, client.bottom) orelse return error.TestUnexpectedResult;
+        const old = win32.SelectObject(dc, bitmap);
+        _ = win32.SendMessageW(hwnd, win32.WM_PRINTCLIENT, @intFromPtr(dc), win32.PRF_CLIENT);
+        return .{ .dc = dc, .bitmap = bitmap, .old = old, .width = client.right, .height = client.bottom };
+    }
+
+    fn deinit(self: *const Printed) void {
+        if (self.old) |o| _ = win32.SelectObject(self.dc, o);
+        _ = win32.DeleteObject(self.bitmap);
+        _ = win32.DeleteDC(self.dc);
+    }
+
+    fn at(self: *const Printed, x: i32, y: i32) win32.COLORREF {
+        return win32.GetPixel(self.dc, x, y);
+    }
+
+    /// Each of `r`'s pixels is, channel by channel, between `from` and
+    /// `to`, as text drawn in `to` over `from` is, smoothed or not; and
+    /// some are more than half way to `to`: there is text.
+    fn expectBetween(self: *const Printed, r: win32.RECT, from: win32.COLORREF, to: win32.COLORREF) !void {
+        var farthest: u32 = 0;
+        var y = r.top;
+        while (y < r.bottom) : (y += 1) {
+            var x = r.left;
+            while (x < r.right) : (x += 1) {
+                const c = self.at(x, y);
+                var d: u32 = 0;
+                for (0..3) |i| {
+                    const shift: u5 = @intCast(8 * i);
+                    const v: i32 = @intCast((c >> shift) & 0xff);
+                    const a: i32 = @intCast((from >> shift) & 0xff);
+                    const b: i32 = @intCast((to >> shift) & 0xff);
+                    if (v < @min(a, b) or v > @max(a, b)) {
+                        std.debug.print("pixel {d},{d} is {x:0>6}, not between {x:0>6} and {x:0>6}\n", .{ x, y, c, from, to });
+                        return error.TestUnexpectedResult;
+                    }
+                    d += @intCast((v - a) * (v - a));
+                }
+                farthest = @max(farthest, d);
+            }
+        }
+        var whole: u32 = 0;
+        for (0..3) |i| {
+            const shift: u5 = @intCast(8 * i);
+            const a: i32 = @intCast((from >> shift) & 0xff);
+            const b: i32 = @intCast((to >> shift) & 0xff);
+            whole += @intCast((b - a) * (b - a));
+        }
+        try std.testing.expect(farthest * 4 > whole);
+    }
+};
+
+test "win32: readonly shows a read-only badge over its terminal's top-right corner, and hides it" {
+    // GTK's badge: "Read-only" over the terminal's top-right corner, a
+    // margin in, while the terminal is read-only. The core flips its flag,
+    // then performs `readonly` with what it is now. The window is made the
+    // first time it shows, and kept when it hides.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+
+    // Not for the app; off with no badge makes none.
+    try std.testing.expect(!try app.performAction(.app, .readonly, .on));
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    try std.testing.expect(a.overlays.readonly.hwnd == null);
+    try std.testing.expect(a.overlays.readonly.text == null);
+
+    // On: shown at the top right of its own terminal, the left one.
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try expectBadgeAt(window, a);
+    const hwnd = a.overlays.readonly.hwnd.?;
+    const place = try childRect(window, hwnd);
+    try std.testing.expect(place.right < (try paneRect(window, b)).left);
+    try std.testing.expect(b.overlays.readonly.hwnd == null);
+
+    // The frame resized: with its terminal's top-right corner.
+    testResize(window, 1000, 600);
+    try expectBadgeAt(window, a);
+    try std.testing.expect((try childRect(window, hwnd)).right > place.right);
+
+    // Off: hidden, its text gone, the window kept; laid out again, still
+    // hidden; off again changes nothing.
+    var buf: [64]u8 = undefined;
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expectEqualStrings("", try windowText(hwnd, &buf));
+    try std.testing.expect(a.overlays.readonly.hwnd.? == hwnd);
+    window.relayout();
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    try std.testing.expect(!shown(hwnd));
+
+    // On again: the same window, shown.
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try expectBadgeAt(window, a);
+    try std.testing.expect(a.overlays.readonly.hwnd.? == hwnd);
+
+    // The other terminal's, on its own.
+    try std.testing.expect(try testReadOnly(&app, b, .on));
+    try expectBadgeAt(window, b);
+    try expectBadgeAt(window, a);
+
+    // Passive: Windows gives the pointer over it to the window under it.
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
+}
+
+test "win32: the read-only badge is drawn in GTK's colour, framed in it, on the search bar's background" {
+    // GTK's `.readonly_overlay`: its text and outline in hsl(25 50 75),
+    // here on the search bar's colours, light or dark with the title bar.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    const hwnd = a.overlays.readonly.hwnd.?;
+
+    for ([_]configpkg.Config.WindowTheme{ .dark, .light }) |theme| {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.@"window-theme" = theme;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        try std.testing.expectEqual(theme == .dark, window.dark_frame);
+        const colors = SearchBar.Colors.of(window.dark_frame);
+
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        // The line around it, at each corner, then inside it.
+        const w = printed.width;
+        const h = printed.height;
+        try std.testing.expectEqual(ReadOnly.color, printed.at(0, 0));
+        try std.testing.expectEqual(ReadOnly.color, printed.at(w - 1, h - 1));
+        try std.testing.expectEqual(ReadOnly.color, printed.at(w - 1, 0));
+        try std.testing.expectEqual(colors.bar, printed.at(1, 1));
+        try std.testing.expectEqual(colors.bar, printed.at(w - 2, h - 2));
+        // The text: in GTK's colour, over the bar's.
+        try printed.expectBetween(.{ .left = 1, .top = 1, .right = w - 1, .bottom = h - 1 }, colors.bar, ReadOnly.color);
+    }
+}
+
+test "win32: the read-only badge is under the other overlays and the search bar, and hides with its terminal" {
+    // GTK stacks the badge under its URL labels, its search overlay and its
+    // key-state overlay. Here the overlays sit just above their terminal
+    // in that order, which every layout puts back, and the search bar above
+    // all of them, so an open one covers the badge. A zoom or a hidden tab
+    // hides it with its terminal, for it to show again with it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // The others first, then the badge: under both, just above the
+    // terminal; and when they show again after it.
+    const url = "https://example.com/some/long/path/that/goes/on/past/the/middle/of/the/terminal";
+    try std.testing.expect(try testLink(&app, a, url));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    const hwnd = a.overlays.readonly.hwnd.?;
+    const preview = a.overlays.link_preview.hwnd.?;
+    const keys = a.overlays.key_state.hwnd.?;
+    try expectBadgeAt(window, a);
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+    try std.testing.expect(win32.GetWindow(hwnd, win32.GW_HWNDPREV) == preview);
+    try std.testing.expect(win32.GetWindow(preview, win32.GW_HWNDPREV) == keys);
+    try std.testing.expect(try testLink(&app, a, ""));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try expectBadgeAt(window, a);
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try std.testing.expect(try testLink(&app, a, url));
+    try expectBadgeAt(window, a);
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+
+    // The terminal raised over them: laid out again, in their order.
+    _ = win32.SetWindowPos(a.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+    try std.testing.expect(above(window.hwnd, a.hwnd, hwnd));
+    window.relayout();
+    try expectBadgeAt(window, a);
+    try expectPreviewAt(window, a, .left);
+    try expectKeyStateAt(window, a);
+
+    // The terminal's search bar opened over it: above it, also when it is
+    // shown again or laid out while the bar is open.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    const bar = a.search_bar.hwnd.?;
+    try std.testing.expect(shown(bar));
+    try std.testing.expect(above(window.hwnd, bar, hwnd));
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try expectBadgeAt(window, a);
+    try std.testing.expect(above(window.hwnd, bar, hwnd));
+    window.relayout();
+    try expectBadgeAt(window, a);
+    try std.testing.expect(above(window.hwnd, bar, hwnd));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    app.applyPendingFocus();
+    try std.testing.expect(try testLink(&app, a, ""));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+
+    // A zoom on the other terminal hides it with its own, its text kept;
+    // back, shown. A zoom on its own: the whole window's top-right corner.
+    window.toggleZoom(b);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(a.overlays.readonly.text != null);
+    window.toggleZoom(b);
+    try expectBadgeAt(window, a);
+    window.toggleZoom(a);
+    try expectBadgeAt(window, a);
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, a));
+    window.toggleZoom(a);
+    try expectBadgeAt(window, a);
+
+    // The other tab shown: hidden with its terminals; shown again with
+    // them.
+    _ = try testTab(&app, window);
+    window.relayout();
+    try expectBadgeAt(window, a);
+    window.selectTab(1);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(a.overlays.readonly.text != null);
+    window.selectTab(0);
+    try expectBadgeAt(window, a);
+
+    // It goes with its terminal.
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: the read-only badge moves with its tab to a new window, and follows its scale and font" {
+    // A tab moved to a new window takes its terminals' badges into the new
+    // frame, shown or not. A change of DPI measures the text again in the
+    // font at the new scale, with GTK's padding and margin at it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    _ = try testTab(&app, window);
+    window.relayout();
+
+    // a's shown; b's made, then hidden.
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try expectBadgeAt(window, a);
+    const hwnd = a.overlays.readonly.hwnd.?;
+    try std.testing.expect(try testReadOnly(&app, b, .on));
+    try std.testing.expect(try testReadOnly(&app, b, .off));
+    const hidden = b.overlays.readonly.hwnd.?;
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, app.windows.items.len);
+    const moved = a.window;
+    try std.testing.expect(moved != window);
+    try std.testing.expect(a.overlays.readonly.hwnd.? == hwnd);
+    try expectBadgeAt(moved, a);
+    try std.testing.expect(win32.GetAncestor(hidden, win32.GA_PARENT) == moved.hwnd);
+    try std.testing.expect(!shown(hidden));
+    try std.testing.expect(try testReadOnly(&app, b, .on));
+    try expectBadgeAt(moved, b);
+
+    // A new scale: the text measured in the font at it.
+    const before = a.overlays.readonly.text_size;
+    try std.testing.expect(a.overlays.font_dpi > 0 and a.overlays.font_dpi < 192);
+    const Dpi = struct {
+        fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 192;
+        }
+    };
+    app.get_dpi_for_window = &Dpi.of;
+    var suggested = try windowRect(moved.hwnd);
+    _ = win32.SendMessageW(moved.hwnd, win32.WM_DPICHANGED, 192 << 16 | 192, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expectEqual(192, a.overlays.font_dpi);
+    try std.testing.expect(a.overlays.readonly.text_size.height > before.height);
+    try std.testing.expect(a.overlays.readonly.text_size.width > before.width);
+    try expectBadgeAt(moved, a);
+    try expectBadgeAt(moved, b);
+}
+
+test "win32: a read-only badge whose window cannot be made returns false, and is made the next time" {
+    // CreateWindowExW fails when the process has used up its window
+    // handles: `.on` returns false and makes nothing, `.off` has nothing to
+    // hide, and the next `.on` makes it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    const NoWindow = struct {
+        var asked: usize = 0;
+        var class: []const u8 = "";
+        fn make(c: []const u8) ?win32.HWND {
+            asked += 1;
+            class = c;
+            return null;
+        }
+    };
+    NoWindow.asked = 0;
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+
+    try std.testing.expect(!try testReadOnly(&app, a, .on));
+    try std.testing.expect(a.overlays.readonly.hwnd == null);
+    try std.testing.expect(a.overlays.readonly.text == null);
+    try std.testing.expectEqual(1, NoWindow.asked);
+    try std.testing.expectEqualStrings(ReadOnly.class_name, NoWindow.class);
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+    try std.testing.expectEqual(1, NoWindow.asked);
+
+    Overlays.test_make = null;
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try expectBadgeAt(window, a);
 }

@@ -942,6 +942,8 @@ pub extern "gdi32" fn BitBlt(
     src_y: c_int,
     rop: DWORD,
 ) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getpixel
+pub extern "gdi32" fn GetPixel(hdc: HDC, x: c_int, y: c_int) callconv(.winapi) COLORREF;
 pub const TRANSPARENT: c_int = 1;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbkmode
 pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: c_int) callconv(.winapi) c_int;
@@ -1254,6 +1256,10 @@ pub const WM_NCHITTEST: UINT = 0x0084;
 /// WM_NCHITTEST: the message is sent on to the windows under this one in
 /// the same thread, until one of them returns another code.
 pub const HTTRANSPARENT: LRESULT = -1;
+/// https://learn.microsoft.com/en-us/windows/win32/gdi/wm-printclient
+pub const WM_PRINTCLIENT: UINT = 0x0318;
+/// WM_PRINTCLIENT: draw the client area.
+pub const PRF_CLIENT: LPARAM = 0x0004;
 
 comptime {
     // The SDK's sizes on 64-bit Windows.

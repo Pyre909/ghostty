@@ -57,8 +57,6 @@ pub fn supported(key: Binding.Action.Key) bool {
         .write_scrollback_file,
         .write_screen_file,
         .write_selection_file,
-        // The core keeps the flag; this runtime shows no badge for it.
-        .toggle_readonly,
         .toggle_mouse_reporting,
         .activate_key_table,
         .activate_key_table_once,
@@ -67,6 +65,9 @@ pub fn supported(key: Binding.Action.Key) bool {
         .end_key_sequence,
         .crash,
         // Handed to this runtime, which performs what they become.
+        // `toggle_readonly` flips the core's flag, then hands over
+        // `readonly`, the badge.
+        .toggle_readonly,
         .copy_title_to_clipboard,
         .start_search,
         .search_selection,
