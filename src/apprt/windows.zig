@@ -160,12 +160,24 @@
 //! preview; it takes the pointer over its button alone, and never the
 //! activation or the focus. Its window is made when the core asks.
 //!
+//! ## Context menu
+//!
+//! A right click on a terminal shows GTK's context menu, less what this
+//! runtime does not carry out and plus macOS's checked "Read-only"
+//! (`ContextMenu`): the system's popup menu, owned by the frame, with each
+//! item's shortcut. It opens when the button comes up, if the core left
+//! the press to it: with the default `right-click-action`, once it has
+//! selected the word or link under the pointer, unless the selection held
+//! it already; a program with mouse reporting gets the click instead,
+//! unless Shift is held (`mouse-shift-capture`). The chosen item's action
+//! is then performed on the terminal. No key opens it, and a right click
+//! in a divider's band shows none. While it is open the app keeps
+//! ticking, and a terminal or window asked to close waits for it.
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
-//! window, a context menu and precision-touchpad scrolling. Without a
-//! menu, a right click with the default `right-click-action` only selects
-//! the word or link under the pointer.
+//! window and precision-touchpad scrolling.
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for every action it does not name; this runtime never claims an action
 //! it did not carry out.
@@ -260,6 +272,7 @@ test {
     _ = @import("windows/App.zig");
     _ = @import("windows/ChildExited.zig");
     _ = @import("windows/CommandPalette.zig");
+    _ = @import("windows/ContextMenu.zig");
     _ = @import("windows/Dividers.zig");
     _ = @import("windows/KeyState.zig");
     _ = @import("windows/LinkPreview.zig");

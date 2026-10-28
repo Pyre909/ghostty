@@ -27,6 +27,7 @@ const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const ContextMenu = @import("ContextMenu.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
@@ -230,6 +231,25 @@ pub const App = struct {
     /// teardowns run one after another, never one inside another's wait.
     teardown_depth: u32,
 
+    /// Number of modal loops a terminal's own message handler is running
+    /// (`beginTerminalLoop`): its context menu's, from its WM_RBUTTONUP
+    /// (`ContextMenu.show`). Such a loop dispatches every message posted
+    /// meanwhile, WM_GHOSTTY_DESTROY among them, and returns to that
+    /// handler when it ends; nothing holds the terminal alive
+    /// (`Surface.ref` counts nothing). While this is non-zero no teardown
+    /// runs (`canTearDown`), and the ones deferred meanwhile are posted
+    /// again when the last loop ends, unless something else still defers
+    /// them (`endTerminalLoop`).
+    ///
+    /// For the app, not per terminal, as `prompt_depth` and
+    /// `teardown_depth` are: the terminal is freed by its own teardown or
+    /// by its window's, which stops every terminal of the window and
+    /// destroys the frame that owns the menu (`Window.destroy`), and a
+    /// count per terminal would have to be read by both. The cost is that
+    /// every teardown waits until the loop ends, which for a menu is when
+    /// the user chooses or dismisses it.
+    terminal_loops: u32,
+
     /// Set for the whole of `terminate`. Teardown is driven from there
     /// synchronously, so posted closes and destroys are ignored meanwhile.
     terminating: bool,
@@ -401,6 +421,15 @@ pub const App = struct {
             pending: *CommandPalette.Pending,
         },
 
+        /// An item chosen in the context menu of `from` while the core
+        /// could not be re-entered: its action, one of the menu's own,
+        /// which points at no memory, performed on `from`
+        /// (`ContextMenu.replay`).
+        menu_action: struct {
+            from: *CoreSurface,
+            action: input.Binding.Action,
+        },
+
         /// Enter, Escape or a button of `from`'s search bar while the core
         /// could not be re-entered (`SearchBar.replay`).
         search_key: struct {
@@ -569,6 +598,7 @@ pub const App = struct {
             .prompt_depth = 0,
             .modal_loop_depth = 0,
             .teardown_depth = 0,
+            .terminal_loops = 0,
             .terminating = false,
         };
 
@@ -941,15 +971,37 @@ pub const App = struct {
     /// wait on threads blocked behind the undrained mailbox. Nor inside
     /// another teardown's wait (`teardown_depth`): it would nest a second
     /// wait in the first, and with several closing at once each would nest
-    /// inside the last.
+    /// inside the last. Nor inside a modal loop a terminal's handler runs
+    /// (`terminal_loops`): it would free that terminal, or its window,
+    /// under the handler.
     pub fn canTearDown(self: *const App) bool {
-        return self.canReenterCore() and self.teardown_depth == 0;
+        return self.canReenterCore() and self.teardown_depth == 0 and self.terminal_loops == 0;
+    }
+
+    /// Enter a modal loop that a terminal's message handler runs and that
+    /// returns to it: no teardown runs until the matching
+    /// `endTerminalLoop` (`terminal_loops`). Ticking is left alone: a loop
+    /// the frame hears of, as the menu's WM_ENTERMENULOOP, is counted in
+    /// `modal_loop_depth` there; one it does not, as DefWindowProcW's for
+    /// a click on a scroll bar, must count itself there as well.
+    pub fn beginTerminalLoop(self: *App) void {
+        self.terminal_loops += 1;
+    }
+
+    /// Leave the loop entered by the matching `beginTerminalLoop`. When the
+    /// last one has ended, the teardowns deferred meanwhile are posted again
+    /// (`repostDeferredDestroys`), if one may run now (`canTearDown`); else
+    /// whatever defers them posts them again later. Only posted, so that
+    /// none runs inside this call.
+    pub fn endTerminalLoop(self: *App) void {
+        self.terminal_loops -= 1;
+        if (self.terminal_loops == 0 and self.canTearDown()) self.repostDeferredDestroys();
     }
 
     /// Re-post WM_GHOSTTY_DESTROY for every terminal and every window whose
     /// teardown was deferred. Called where `canTearDown` holds: by `run`,
-    /// and by `Surface.destroyPosted` and `Window.destroyPosted` once their
-    /// own teardown is done.
+    /// by `Surface.destroyPosted` and `Window.destroyPosted` once their own
+    /// teardown is done, and by `endTerminalLoop`.
     pub fn repostDeferredDestroys(self: *App) void {
         for (self.surfaces.items) |surface| {
             if (!surface.destroy_deferred) continue;
@@ -2064,6 +2116,9 @@ pub const App = struct {
             .palette_run => |chosen| {
                 if (chosen.from == core_surface or chosen.pending.jumpsTo(core_surface.rt_surface)) self.freeRequest(request);
             },
+            .menu_action => |chosen| {
+                if (chosen.from == core_surface) request.* = .dropped;
+            },
             .search_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
@@ -2607,6 +2662,7 @@ pub const App = struct {
                     self.requests.items[i] = .dropped;
                     CommandPalette.replay(chosen.from.rt_surface, chosen.pending);
                 },
+                .menu_action => |chosen| ContextMenu.replay(chosen.from.rt_surface, chosen.action),
                 .search_key => |key| SearchBar.replay(key.from, key.key),
                 .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
                 .close_surface => |from| from.rt_surface.requestClose(),
@@ -3738,6 +3794,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.ticking = false;
     app.prompt_depth = 0;
     app.teardown_depth = 0;
+    app.terminal_loops = 0;
     app.surfaces = .empty;
     app.windows = .empty;
     app.requests = .empty;
@@ -14582,4 +14639,490 @@ test "win32: a read-only terminal whose command has exited asks to close as read
     b.close(true);
     try PromptSeen.expectSaid(read_only);
     try std.testing.expect(!b.closing);
+}
+
+/// For tests: the core's answers to a terminal's buttons
+/// (`Surface.test_mouse_button`): `right_press` to a right press,
+/// `release` to a right release, consumed to the others; null for one
+/// that does not reach it. The terminal keeps the buttons held and the
+/// capture as `mouseButton` does: it takes the capture with the first
+/// button pressed, drops a release whose press it did not keep, and lets
+/// go of the capture when the last button comes up, before the core has
+/// the release.
+const MenuCore = struct {
+    var right_press: ?bool = false;
+    var release: ?bool = true;
+    var calls: usize = 0;
+    fn answer(surface: *Surface, button: Surface.Mouse.Button, state: input.MouseButtonState) ?bool {
+        calls += 1;
+        const m = &surface.mouse;
+        switch (state) {
+            .press => {
+                if (m.held.count() == 0) _ = win32.SetCapture(surface.hwnd);
+                m.held.insert(button);
+            },
+            .release => {
+                if (!m.held.contains(button)) return null;
+                m.held.remove(button);
+                if (m.held.count() == 0) _ = win32.ReleaseCapture();
+            },
+        }
+        if (button != .right) return true;
+        return switch (state) {
+            .press => right_press,
+            .release => release,
+        };
+    }
+    fn reset() void {
+        right_press = false;
+        release = true;
+        calls = 0;
+    }
+};
+
+/// For tests: the context menus shown (`ContextMenu.test_track`), and the
+/// item to choose in each, by its label, or none.
+const MenuSeen = struct {
+    var count: usize = 0;
+    var owner: ?win32.HWND = null;
+    var at: win32.POINT = .{ .x = 0, .y = 0 };
+    /// Who had the mouse capture as the menu opened.
+    var capture: ?win32.HWND = null;
+    var choose: ?[]const u8 = null;
+    /// Run while the menu is open, as what its loop dispatches.
+    var during: ?*const fn () void = null;
+    fn track(menu: win32.HMENU, o: win32.HWND, pt: win32.POINT) u32 {
+        count += 1;
+        owner = o;
+        at = pt;
+        capture = win32.GetCapture();
+        if (during) |f| f();
+        const label = choose orelse return 0;
+        return menuIdOf(menu, label) orelse 0;
+    }
+    fn reset() void {
+        count = 0;
+        owner = null;
+        choose = null;
+        during = null;
+    }
+};
+
+/// For tests: the id of the item of `menu`, or of one of its submenus,
+/// whose text before its shortcut is `label`.
+fn menuIdOf(menu: win32.HMENU, label: []const u8) ?u32 {
+    var pos: c_int = 0;
+    while (pos < win32.GetMenuItemCount(menu)) : (pos += 1) {
+        if (win32.GetSubMenu(menu, pos)) |sub| {
+            if (menuIdOf(sub, label)) |id| return id;
+            continue;
+        }
+        var wide: [256]u16 = undefined;
+        const n = win32.GetMenuStringW(menu, @intCast(pos), &wide, wide.len, win32.MF_BYPOSITION);
+        const text = wide[0..@intCast(@max(n, 0))];
+        const tab = std.mem.indexOfScalar(u16, text, '\t') orelse text.len;
+        var utf8: [256]u8 = undefined;
+        const len = std.unicode.utf16LeToUtf8(&utf8, text[0..tab]) catch continue;
+        if (std.mem.eql(u8, utf8[0..len], label)) return win32.GetMenuItemID(menu, pos);
+    }
+    return null;
+}
+
+/// For tests: a right button message to `pane` at the point `x`, `y` of
+/// its client area, the button down for a press.
+fn testRight(pane: *const Surface, msg: win32.UINT, x: i32, y: i32) void {
+    const down: win32.WPARAM = if (msg == win32.WM_RBUTTONDOWN) win32.MK_RBUTTON else 0;
+    _ = win32.SendMessageW(pane.hwnd, msg, down, testPoint(x, y));
+}
+
+/// For tests: a right click on `pane` at `x`, `y`, pressed and released.
+fn testRightClick(pane: *const Surface, x: i32, y: i32) void {
+    testRight(pane, win32.WM_RBUTTONDOWN, x, y);
+    testRight(pane, win32.WM_RBUTTONUP, x, y);
+}
+
+test "win32: a right press the core leaves to the context menu shows it on its release, owned by the frame" {
+    // The core's answer to a right press waits for that button's release
+    // (`Surface.Mouse.menu`): false, "show your context menu", shows the
+    // menu there, once, at the release's point, owned by the frame, so
+    // that its loop is the frame's (WM_ENTERMENULOOP), and the terminal
+    // has the focus back after it. A consumed press, a release with no
+    // press, one the core did not get, one after the capture went, one
+    // with another button still down, one outside the terminal and a
+    // press the core never got (no core) show none; neither does a menu
+    // Windows cannot make.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    MenuSeen.reset();
+    MenuCore.reset();
+    PaletteSeen.reset(null);
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.relayout();
+    const client = try clientRect(a.hwnd);
+    // Shown, so that it can hold the capture.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    defer _ = win32.ReleaseCapture();
+
+    // No core: neither the press nor the release reaches one, and the
+    // WM_CONTEXTMENU DefWindowProcW makes of the release shows nothing.
+    testRightClick(a, 20, 30);
+    try std.testing.expectEqual(0, MenuSeen.count);
+    // A press from before the core, released once there is one.
+    testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    testRight(a, win32.WM_RBUTTONUP, 20, 30);
+    try std.testing.expectEqual(1, MenuCore.calls);
+    try std.testing.expectEqual(0, MenuSeen.count);
+
+    // Left to the menu: nothing on the press; on the release, the menu at
+    // its point on the screen, owned by the frame; then the focus back on
+    // the terminal, nothing chosen.
+    testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+    try std.testing.expectEqual(0, MenuSeen.count);
+    testRight(a, win32.WM_RBUTTONUP, 25, 35);
+    try std.testing.expectEqual(1, MenuSeen.count);
+    try std.testing.expect(MenuSeen.owner == window.hwnd);
+    try std.testing.expect(MenuSeen.capture == null);
+    var pt: win32.POINT = .{ .x = 25, .y = 35 };
+    try std.testing.expect(win32.ClientToScreen(a.hwnd, &pt).toBool());
+    try std.testing.expectEqual(pt, MenuSeen.at);
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try std.testing.expectEqual(0, app.terminal_loops);
+    // Once: another release with no press shows none.
+    testRight(a, win32.WM_RBUTTONUP, 25, 35);
+    try std.testing.expectEqual(1, MenuSeen.count);
+
+    // Consumed, as by a program with mouse reporting.
+    MenuCore.right_press = true;
+    testRightClick(a, 20, 30);
+    try std.testing.expectEqual(1, MenuSeen.count);
+    MenuCore.right_press = false;
+    // Its release did not reach the core.
+    MenuCore.release = null;
+    testRightClick(a, 20, 30);
+    try std.testing.expectEqual(1, MenuSeen.count);
+    MenuCore.release = true;
+    // A press the core never got leaves nothing waiting from an earlier
+    // one.
+    testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+    MenuCore.right_press = null;
+    testRightClick(a, 20, 30);
+    try std.testing.expectEqual(1, MenuSeen.count);
+    MenuCore.right_press = false;
+    // The capture went to another window before the release.
+    testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+    try std.testing.expect(win32.GetCapture() == a.hwnd);
+    _ = win32.SetCapture(window.hwnd);
+    testRight(a, win32.WM_RBUTTONUP, 20, 30);
+    _ = win32.ReleaseCapture();
+    try std.testing.expectEqual(1, MenuSeen.count);
+    // Released with the left button still down, which keeps the capture;
+    // nor does the left one's release show it.
+    _ = win32.SendMessageW(a.hwnd, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(20, 30));
+    testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+    testRight(a, win32.WM_RBUTTONUP, 20, 30);
+    try std.testing.expect(win32.GetCapture() == a.hwnd);
+    _ = win32.SendMessageW(a.hwnd, win32.WM_LBUTTONUP, 0, testPoint(20, 30));
+    try std.testing.expect(win32.GetCapture() == null);
+    try std.testing.expectEqual(1, MenuSeen.count);
+    // Released outside the terminal, which holds the capture.
+    for ([_][2]i32{ .{ -1, 30 }, .{ client.right, 30 }, .{ 20, -1 }, .{ 20, client.bottom } }) |out| {
+        testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+        testRight(a, win32.WM_RBUTTONUP, out[0], out[1]);
+    }
+    try std.testing.expectEqual(1, MenuSeen.count);
+    // Inside, at its last pixel.
+    testRight(a, win32.WM_RBUTTONDOWN, 20, 30);
+    testRight(a, win32.WM_RBUTTONUP, client.right - 1, client.bottom - 1);
+    try std.testing.expectEqual(2, MenuSeen.count);
+
+    // Windows cannot make the menu: none shows, and no loop stays
+    // counted.
+    ContextMenu.test_calls_left = 0;
+    defer ContextMenu.test_calls_left = null;
+    testRightClick(a, 20, 30);
+    ContextMenu.test_calls_left = null;
+    try std.testing.expectEqual(2, MenuSeen.count);
+    try std.testing.expectEqual(0, app.terminal_loops);
+    testRightClick(a, 20, 30);
+    try std.testing.expectEqual(3, MenuSeen.count);
+}
+
+test "win32: the context menu's choice is performed on its terminal, now or by run" {
+    // As the command palette performs an entry (`CommandPalette.perform`):
+    // on the terminal clicked, with the focus back on it first; under a
+    // prompt, recorded for `run`, and dropped if the terminal begins to
+    // close. A greyed item is not performed, nor is anything when the menu
+    // is dismissed.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    MenuCore.reset();
+    PaletteSeen.reset(null);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+
+    // Each item by its label, as the menu shows it, and the action it
+    // performs, written out by hand. Copy is greyed: a terminal with no
+    // core has no selection.
+    const cases = [_]struct { []const u8, []const u8 }{
+        .{ "Copy", "" },
+        .{ "Paste", "paste_from_clipboard;" },
+        .{ "Clear", "clear_screen;" },
+        .{ "Reset", "reset;" },
+        .{ "Read-only", "toggle_readonly;" },
+        .{ "Change Title\u{2026}", "prompt_surface_title;" },
+        .{ "Split Up", "new_split:up;" },
+        .{ "Split Down", "new_split:down;" },
+        .{ "Split Left", "new_split:left;" },
+        .{ "Split Right", "new_split:right;" },
+        .{ "Close Split", "close_surface;" },
+        .{ "Change Tab Title\u{2026}", "prompt_tab_title;" },
+        .{ "New Tab", "new_tab;" },
+        .{ "Close Tab", "close_tab:this;" },
+        .{ "New Window", "new_window;" },
+        .{ "Close Window", "close_window;" },
+        .{ "Open Configuration in OS Editor", "open_config:os_open;" },
+        .{ "Reload Configuration", "reload_config;" },
+    };
+    for (cases) |c| {
+        MenuSeen.choose = c[0];
+        FocusSeen.last = null;
+        PaletteSeen.on = null;
+        testRightClick(b, 20, 30);
+        try std.testing.expectEqualStrings(c[1], PaletteSeen.take());
+        if (c[1].len > 0) try std.testing.expect(PaletteSeen.on == b);
+        try std.testing.expect(FocusSeen.last == b.hwnd);
+    }
+    try std.testing.expectEqual(cases.len, MenuSeen.count);
+
+    // Dismissed: nothing, the focus back all the same.
+    MenuSeen.choose = null;
+    FocusSeen.last = null;
+    testRightClick(b, 20, 30);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try std.testing.expect(FocusSeen.last == b.hwnd);
+
+    // A prompt open when the menu returns: recorded, performed by `run`.
+    const Prompt = struct {
+        var app_: *App = undefined;
+        fn open() void {
+            app_.prompt_depth = 1;
+        }
+    };
+    Prompt.app_ = &app;
+    MenuSeen.during = &Prompt.open;
+    MenuSeen.choose = "Split Right";
+    testRightClick(b, 20, 30);
+    app.prompt_depth = 0;
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try std.testing.expectEqual(1, app.requests.items.len);
+    switch (app.requests.items[0]) {
+        .menu_action => |chosen| {
+            try std.testing.expect(chosen.from == &b.core_surface);
+            try std.testing.expect(chosen.action == .new_split and chosen.action.new_split == .right);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    PaletteSeen.on = null;
+    app.createRequested();
+    try std.testing.expectEqualStrings("new_split:right;", PaletteSeen.take());
+    try std.testing.expect(PaletteSeen.on == b);
+    try std.testing.expectEqual(0, app.requests.items.len);
+    // Dropped when the terminal begins to close.
+    testRightClick(b, 20, 30);
+    app.prompt_depth = 0;
+    app.forgetClosing(&b.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    // Nothing recorded when there is no memory for it.
+    app.requests.clearAndFree(alloc);
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    core_app.alloc = failing.allocator();
+    testRightClick(b, 20, 30);
+    core_app.alloc = alloc;
+    app.prompt_depth = 0;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+}
+
+test "win32: a teardown posted while a terminal's context menu is open waits for it to close" {
+    // The menu's loop runs under the terminal's WM_RBUTTONUP handler and
+    // dispatches what is posted meanwhile (`App.terminal_loops`): the
+    // terminal's own teardown, as its shell exiting posts it, and its
+    // window's, as a close from another window posts it, are deferred
+    // while the menu is open, so that the handler goes on with the
+    // terminal and its window alive, and are posted again when it closes,
+    // to run from the loop the handler returns to.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    MenuCore.reset();
+    PaletteSeen.reset(null);
+
+    const first = try testFrame(&app);
+    const a = try testPane(&app, first);
+    first.tab().tree = try .init(alloc, a);
+    first.relayout();
+    const second = try testFrame(&app);
+    const b = try testPane(&app, second);
+    second.tab().tree = try .init(alloc, b);
+    second.relayout();
+
+    const Posted = struct {
+        var app_: *App = undefined;
+        var surface: *Surface = undefined;
+        var window: *Window = undefined;
+        var close_window: bool = false;
+        /// What the loop saw after dispatching the teardown.
+        var alive: bool = false;
+        var deferred: bool = false;
+        fn post() void {
+            if (close_window) window.postDestroy() else surface.postDestroy();
+            testPump();
+            alive = std.mem.indexOfScalar(*Surface, app_.surfaces.items, surface) != null and
+                std.mem.indexOfScalar(*Window, app_.windows.items, window) != null;
+            if (!alive) return;
+            deferred = if (close_window) window.destroy_deferred else surface.destroy_deferred;
+        }
+    };
+    Posted.app_ = &app;
+    MenuSeen.during = &Posted.post;
+    // Chosen, as a dismissed one would be: performed on a live terminal.
+    MenuSeen.choose = "Paste";
+
+    for ([_]struct { *Surface, *Window, bool }{ .{ a, first, false }, .{ b, second, true } }) |c| {
+        Posted.surface = c[0];
+        Posted.window = c[1];
+        Posted.close_window = c[2];
+        Posted.alive = false;
+        Posted.deferred = false;
+        testRightClick(c[0], 20, 30);
+        try std.testing.expect(Posted.alive);
+        try std.testing.expect(Posted.deferred);
+        try std.testing.expectEqualStrings("paste_from_clipboard;", PaletteSeen.take());
+        // Posted again, not run, inside the handler.
+        try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, c[0]) != null);
+        testPump();
+        try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, c[0]) == null);
+        try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, c[1]) == null);
+    }
+    try std.testing.expectEqual(0, app.terminal_loops);
+}
+
+/// For tests: dispatch every message waiting on this thread, as a loop
+/// does.
+fn testPump() void {
+    var msg: win32.MSG = undefined;
+    while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE).toBool()) {
+        _ = win32.TranslateMessage(&msg);
+        _ = win32.DispatchMessageW(&msg);
+    }
+}
+
+test "win32: a right click in a divider's band shows no context menu" {
+    // The band is the divider's: a right press and release there reach
+    // the frame (`Dividers.hitTest`), which shows no menu, as on the line
+    // itself; a step further in, on the terminal, the same click shows
+    // the terminal's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    MenuSeen.reset();
+    MenuCore.reset();
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.relayout();
+    const ra = try paneRect(window, a);
+    const line = ra.right;
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+
+    // The band, 3 DIP each side of the line, and the line.
+    for ([_]i32{ line - 3, line, line + 3 }) |x| {
+        try std.testing.expect(Dividers.at(window, .{ .x = x, .y = y }) != null);
+        _ = win32.SendMessageW(window.hwnd, win32.WM_RBUTTONDOWN, win32.MK_RBUTTON, testPoint(x, y));
+        _ = win32.SendMessageW(window.hwnd, win32.WM_RBUTTONUP, 0, testPoint(x, y));
+    }
+    try std.testing.expectEqual(0, MenuSeen.count);
+    try std.testing.expectEqual(0, MenuCore.calls);
+    // Outside it, on a.
+    try std.testing.expect(Dividers.at(window, .{ .x = line - 4, .y = y }) == null);
+    testRightClick(a, line - 4 - ra.left, y - ra.top);
+    try std.testing.expectEqual(1, MenuSeen.count);
 }

@@ -13,7 +13,12 @@
 //! takes those pixels from the terminals, where the default padding
 //! (`window-padding-x` and `window-padding-y`, 2 pt) covers most of them;
 //! a wheel there goes on from the frame to the terminal under the pointer
-//! (`wheel`).
+//! (`wheel`). A right click there shows no context menu, as on the line:
+//! the resize pointer shows the click is the divider's, GTK's divider has
+//! no menu, nor does macOS's hit box (SplitView.Divider.swift), and
+//! passing the button on would need the terminal's activation and focus
+//! rules for a click (its WM_MOUSEACTIVATE) here, where the frame gets
+//! them. The middle and X buttons stop at the frame as well.
 //! GTK narrowed its separator's grab area to its line instead, because a
 //! wider one made the first column right of a split unselectable
 //! (src/apprt/gtk/css/style.css, ghostty#3020).

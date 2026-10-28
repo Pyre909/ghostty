@@ -24,6 +24,7 @@ const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
+const ContextMenu = @import("ContextMenu.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -102,9 +103,10 @@ pub const Surface = struct {
     closing: bool,
 
     /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
-    /// (`App.canReenterCore` was false, or another surface's teardown was
-    /// running, `App.teardown_depth`). It is re-posted by
-    /// `App.repostDeferredDestroys`.
+    /// (`App.canTearDown` was false: `App.canReenterCore` was, another
+    /// surface's teardown was running, `App.teardown_depth`, or a
+    /// terminal's modal loop was open, `App.terminal_loops`). It is
+    /// re-posted by `App.repostDeferredDestroys`.
     destroy_deferred: bool,
 
     /// Who put the text that is in the core's preedit slot: a dead key
@@ -428,6 +430,14 @@ pub const Surface = struct {
         cursor: ?win32.HCURSOR,
         /// `.mouse_visibility`: hidden while typing.
         hidden: bool,
+        /// The core left the last right press to the context menu (its
+        /// `mouseButtonCallback` returned false, "show your context
+        /// menu"), and its release, which shows the menu, has not come
+        /// (`ContextMenu`). Set by such a press and cleared by any other
+        /// right press while there is a core; cleared by the next right
+        /// release, whatever it does (`takeMenu`), and when the capture
+        /// goes (WM_CAPTURECHANGED).
+        menu: bool,
 
         /// "Not over the surface" to cursorPosCallback and link hover, which
         /// treat any negative coordinate that way
@@ -452,7 +462,15 @@ pub const Surface = struct {
                 .shape = .text,
                 .cursor = win32.LoadCursorW(null, cursorId(.text)),
                 .hidden = false,
+                .menu = false,
             };
+        }
+
+        /// Whether a right press waits for this release to show the
+        /// context menu (`menu`), which it then no longer does.
+        fn takeMenu(self: *Mouse) bool {
+            defer self.menu = false;
+            return self.menu;
         }
 
         /// What `syncMouse` sends the core, from `sync`.
@@ -992,7 +1010,10 @@ pub const Surface = struct {
     /// mailbox. So is a teardown dispatched by another surface's teardown
     /// (`App.teardown_depth`), from the pump in its wait: it would nest a
     /// second wait inside the first, and with several windows closing at
-    /// once each would nest inside the last.
+    /// once each would nest inside the last. So is one dispatched by a
+    /// modal loop a terminal's handler runs, as its context menu's
+    /// (`App.terminal_loops`): it would free that terminal, or its window,
+    /// while the handler is still on the stack.
     ///
     /// **`self` is freed by `destroy`**: only `app`, read beforehand, is
     /// used after it. A deferred teardown is re-posted by
@@ -1775,8 +1796,6 @@ pub const Surface = struct {
             => {
                 const button = Mouse.Button.fromMessage(msg, wparam) orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
-                const core_surface = self.liveCore() orelse
-                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 const state: input.MouseButtonState = switch (msg) {
                     win32.WM_LBUTTONDOWN,
                     win32.WM_RBUTTONDOWN,
@@ -1785,25 +1804,61 @@ pub const Surface = struct {
                     => .press,
                     else => .release,
                 };
-                self.mouseButton(
-                    core_surface,
-                    button,
-                    state,
-                    wparam,
-                    clientPos(lparam),
-                    self.mouseMods(wparam),
-                );
+                // Taken before the release lets go of the capture, whose
+                // WM_CAPTURECHANGED clears it.
+                const menu = button == .right and state == .release and self.mouse.takeMenu();
+                const consumed: ?bool = if (self.liveCore()) |core_surface|
+                    self.mouseButton(
+                        core_surface,
+                        button,
+                        state,
+                        wparam,
+                        clientPos(lparam),
+                        self.mouseMods(wparam),
+                    )
+                else if (testMouseButton(self, button, state)) |answer|
+                    answer
+                else
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+                // The context menu: the core's answer to a right press waits
+                // for that button's release, which shows the menu once the
+                // core has had it and the capture is gone, if it came up in
+                // the client area (`ContextMenu`).
+                if (button == .right) switch (state) {
+                    .press => self.mouse.menu = if (consumed) |c| !c else false,
+                    .release => if (menu and consumed != null and self.mouse.held.count() == 0) {
+                        const at: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+                        var client: win32.RECT = undefined;
+                        if (win32.GetClientRect(hwnd, &client).toBool() and
+                            at.x >= client.left and at.x < client.right and
+                            at.y >= client.top and at.y < client.bottom)
+                        {
+                            ContextMenu.show(self, at);
+                        }
+                    },
+                };
 
                 // Never DefWindowProcW once a button is handled: for X
                 // buttons it sends WM_APPCOMMAND (browser back/forward), and
                 // a handled X button must return TRUE; for WM_RBUTTONUP its
-                // only default is WM_CONTEXTMENU, and there is no menu. The
-                // class has no CS_DBLCLKS, so no *BUTTONDBLCLK arrives: the
-                // core counts clicks itself, within click-repeat-interval,
-                // which defaults to the system double-click time
+                // only default is WM_CONTEXTMENU, and the menu opens above
+                // instead, only for a press the core left to it. The class
+                // has no CS_DBLCLKS, so no *BUTTONDBLCLK arrives: the core
+                // counts clicks itself, within click-repeat-interval, which
+                // defaults to the system double-click time
                 // (`internal_os.clickInterval`).
                 const is_x = msg == win32.WM_XBUTTONDOWN or msg == win32.WM_XBUTTONUP;
                 return @intFromBool(is_x);
+            },
+
+            // The capture went to another window, a prompt's for one, or
+            // this one let it go: a right press waiting for its release
+            // shows no menu (`Mouse.menu`), as the release may come up
+            // elsewhere, or after a click there.
+            win32.WM_CAPTURECHANGED => {
+                self.mouse.menu = false;
+                return 0;
             },
 
             win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
@@ -2542,7 +2597,10 @@ pub const Surface = struct {
             log.warn("cursor pos callback failed err={}", .{err});
     }
 
-    /// A client-area button message, after handleMessage has mapped it.
+    /// A client-area button message, after handleMessage has mapped it:
+    /// whether the core consumed it, as `mouseButtonCallback` answers
+    /// (false for a right press it leaves to the context menu), true when
+    /// the callback failed; null when the event did not reach the core.
     fn mouseButton(
         self: *Surface,
         core_surface: *CoreSurface,
@@ -2551,14 +2609,14 @@ pub const Surface = struct {
         wparam: win32.WPARAM,
         pos: apprt.CursorPos,
         mods: input.Mods,
-    ) void {
+    ) ?bool {
         const m = &self.mouse;
         const down = Mouse.Button.downIn(wparam);
         switch (state) {
             .press => {
                 // Dropped entirely, capture included, so its release is
                 // dropped too (below).
-                if (!self.syncMouse(core_surface, down)) return;
+                if (!self.syncMouse(core_surface, down)) return null;
 
                 // Capture on the first button, so the release comes here
                 // even when it happens outside the window. Without it the
@@ -2574,13 +2632,13 @@ pub const Surface = struct {
                 // the core existed, or one whose release syncMouse already
                 // sent. A lone release is not harmless: a left one can open
                 // a link (`Surface.mouseButtonCallback`).
-                if (!m.held.contains(button)) return;
+                if (!m.held.contains(button)) return null;
                 m.held.remove(button);
                 if (m.held.count() == 0) _ = win32.ReleaseCapture();
 
                 if (!self.syncMouse(core_surface, down)) {
                     m.owed.insert(button);
-                    return;
+                    return null;
                 }
             },
         }
@@ -2590,12 +2648,14 @@ pub const Surface = struct {
         // only in cursorPosCallback.
         self.movePointer(core_surface, pos, mods);
 
-        // The result (false = "show your context menu" for a right press)
-        // has no consumer: there is no menu. With the default
-        // right-click-action, a right click therefore only selects the word
-        // or link under the pointer (`Surface.mouseButtonCallback`).
-        _ = core_surface.mouseButtonCallback(state, button.core(), mods) catch |err|
+        // False for a right press is "show your context menu": with the
+        // default right-click-action the core has selected the word or link
+        // under the pointer, unless the selection held it, and the release
+        // shows the menu (`handleMessage`). A failure shows none.
+        const consumed = core_surface.mouseButtonCallback(state, button.core(), mods) catch |err| consumed: {
             log.warn("mouse button callback failed err={}", .{err});
+            break :consumed true;
+        };
 
         // `self` and `core_surface` are still valid here. A press can open a
         // paste confirmation (clipboardRequest -> confirm), but a prompt only
@@ -2609,6 +2669,22 @@ pub const Surface = struct {
             // is the tracking the drag skipped.
             self.trackLeave();
         }
+        return consumed;
+    }
+
+    /// For tests: answers for the core of a terminal with no core, which
+    /// then takes its button messages as `mouseButton` would answer them,
+    /// whether the core consumed the event or null for one it did not
+    /// get, though without the capture or the core's own state. Unset, a
+    /// terminal with no core leaves its buttons to DefWindowProcW.
+    pub var test_mouse_button: if (builtin.is_test) ?*const fn (*Surface, Mouse.Button, input.MouseButtonState) ?bool else void =
+        if (builtin.is_test) null else {};
+
+    /// `test_mouse_button`'s answer, or null when it is unset.
+    fn testMouseButton(self: *Surface, button: Mouse.Button, state: input.MouseButtonState) ??bool {
+        if (!builtin.is_test) return null;
+        const answer = test_mouse_button orelse return null;
+        return answer(self, button, state);
     }
 
     /// Arm leave tracking when the pointer comes over the client area, but
@@ -3713,6 +3789,7 @@ test "win32: a teardown dispatched inside another waits for it" {
     app.terminating = false;
     app.ticking = false;
     app.prompt_depth = 0;
+    app.terminal_loops = 0;
     // A teardown that runs posts the deferred ones again; there are none.
     app.surfaces = .empty;
 
@@ -3786,6 +3863,7 @@ test "win32: a finished teardown posts the ones it deferred again" {
     app.ticking = false;
     app.prompt_depth = 0;
     app.teardown_depth = 0;
+    app.terminal_loops = 0;
     app.surfaces = .empty;
     defer app.surfaces.deinit(alloc);
 

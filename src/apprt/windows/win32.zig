@@ -33,7 +33,7 @@ pub const HMODULE = w.HMODULE;
 const HICON = w.HICON;
 pub const HCURSOR = w.HCURSOR;
 const HBRUSH = w.HBRUSH;
-const HMENU = w.HMENU;
+pub const HMENU = w.HMENU;
 const ATOM = w.ATOM;
 
 pub const LPARAM = w.LPARAM;
@@ -1262,6 +1262,51 @@ pub const TOOLINFOW = extern struct {
     lParam: LPARAM = 0,
     lpReserved: ?*anyopaque = null,
 };
+
+// A terminal's context menu (ContextMenu.zig): a system popup menu.
+
+/// Sent to the window a right click or Shift+F10 or the Menu key came to,
+/// by DefWindowProcW; lParam is the point on the screen, -1 for a key.
+pub const WM_CONTEXTMENU: UINT = 0x007B;
+/// AppendMenuW's flags. MF_STRING is 0: an item of text, enabled and not
+/// checked.
+pub const MF_STRING: UINT = 0x0000;
+pub const MF_GRAYED: UINT = 0x0001;
+pub const MF_CHECKED: UINT = 0x0008;
+/// The id is a submenu's HMENU, which the menu then owns.
+pub const MF_POPUP: UINT = 0x0010;
+pub const MF_SEPARATOR: UINT = 0x0800;
+/// GetMenuState's and GetMenuStringW's item is a place, not an id.
+pub const MF_BYPOSITION: UINT = 0x0400;
+/// TrackPopupMenuEx's flags: items are chosen with either button, and the
+/// chosen item's id is returned rather than sent as WM_COMMAND.
+pub const TPM_RIGHTBUTTON: UINT = 0x0002;
+pub const TPM_RETURNCMD: UINT = 0x0100;
+pub extern "user32" fn CreatePopupMenu() callconv(.winapi) ?HMENU;
+/// Destroys its submenus with it.
+pub extern "user32" fn DestroyMenu(menu: HMENU) callconv(.winapi) BOOL;
+pub extern "user32" fn AppendMenuW(menu: HMENU, flags: UINT, id: UINT_PTR, item: ?LPCWSTR) callconv(.winapi) BOOL;
+/// With TPM_RETURNCMD, the chosen item's id, or 0 for none (dismissed, or
+/// an error): declared as the int it is rather than a BOOL.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-trackpopupmenuex
+pub extern "user32" fn TrackPopupMenuEx(
+    menu: HMENU,
+    flags: UINT,
+    x: c_int,
+    y: c_int,
+    owner: HWND,
+    params: ?*anyopaque,
+) callconv(.winapi) c_int;
+pub extern "user32" fn GetMenuItemCount(menu: HMENU) callconv(.winapi) c_int;
+pub extern "user32" fn GetMenuItemID(menu: HMENU, pos: c_int) callconv(.winapi) UINT;
+pub extern "user32" fn GetSubMenu(menu: HMENU, pos: c_int) callconv(.winapi) ?HMENU;
+pub extern "user32" fn GetMenuState(menu: HMENU, item: UINT, flags: UINT) callconv(.winapi) UINT;
+pub extern "user32" fn GetMenuStringW(menu: HMENU, item: UINT, text: ?[*]u16, max: c_int, flags: UINT) callconv(.winapi) c_int;
+/// GetGuiResources' count of the process's USER objects, menus among them.
+pub const GR_USEROBJECTS: DWORD = 1;
+pub extern "user32" fn GetGuiResources(process: HANDLE, flags: DWORD) callconv(.winapi) DWORD;
+/// GetCurrentProcess's pseudo handle, which needs no closing.
+pub const current_process: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
 // The overlays (Overlays.zig): windows of our own that the pointer passes
 // through to the terminal under them, placed just above that one.
