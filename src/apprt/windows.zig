@@ -169,10 +169,11 @@
 //! the press to it: with the default `right-click-action`, once it has
 //! selected the word or link under the pointer, unless the selection held
 //! it already; a program with mouse reporting gets the click instead,
-//! unless Shift is held (`mouse-shift-capture`). The chosen item's action
-//! is then performed on the terminal. No key opens it, and a right click
-//! in a divider's band shows none. While it is open the app keeps
-//! ticking, and a terminal or window asked to close waits for it.
+//! unless Shift is held (`mouse-shift-capture`). The terminal then has
+//! the focus back, and the chosen item's action is performed on it. No
+//! key opens it, and a right click in a divider's band shows none. While
+//! it is open the app keeps ticking, and a terminal or window asked to
+//! close waits for it; an item chosen after that is dropped.
 //!
 //! ## What is still missing
 //!

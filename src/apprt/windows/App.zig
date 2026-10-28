@@ -421,15 +421,6 @@ pub const App = struct {
             pending: *CommandPalette.Pending,
         },
 
-        /// An item chosen in the context menu of `from` while the core
-        /// could not be re-entered: its action, one of the menu's own,
-        /// which points at no memory, performed on `from`
-        /// (`ContextMenu.replay`).
-        menu_action: struct {
-            from: *CoreSurface,
-            action: input.Binding.Action,
-        },
-
         /// Enter, Escape or a button of `from`'s search bar while the core
         /// could not be re-entered (`SearchBar.replay`).
         search_key: struct {
@@ -2116,9 +2107,6 @@ pub const App = struct {
             .palette_run => |chosen| {
                 if (chosen.from == core_surface or chosen.pending.jumpsTo(core_surface.rt_surface)) self.freeRequest(request);
             },
-            .menu_action => |chosen| {
-                if (chosen.from == core_surface) request.* = .dropped;
-            },
             .search_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
@@ -2662,7 +2650,6 @@ pub const App = struct {
                     self.requests.items[i] = .dropped;
                     CommandPalette.replay(chosen.from.rt_surface, chosen.pending);
                 },
-                .menu_action => |chosen| ContextMenu.replay(chosen.from.rt_surface, chosen.action),
                 .search_key => |key| SearchBar.replay(key.from, key.key),
                 .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
                 .close_surface => |from| from.rt_surface.requestClose(),
@@ -14867,12 +14854,10 @@ test "win32: a right press the core leaves to the context menu shows it on its r
     try std.testing.expectEqual(3, MenuSeen.count);
 }
 
-test "win32: the context menu's choice is performed on its terminal, now or by run" {
+test "win32: the context menu's choice is performed on its terminal" {
     // As the command palette performs an entry (`CommandPalette.perform`):
-    // on the terminal clicked, with the focus back on it first; under a
-    // prompt, recorded for `run`, and dropped if the terminal begins to
-    // close. A greyed item is not performed, nor is anything when the menu
-    // is dismissed.
+    // on the terminal clicked, with the focus back on it first. A greyed
+    // item is not performed, nor is anything when the menu is dismissed.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -14942,50 +14927,70 @@ test "win32: the context menu's choice is performed on its terminal, now or by r
     testRightClick(b, 20, 30);
     try std.testing.expectEqualStrings("", PaletteSeen.take());
     try std.testing.expect(FocusSeen.last == b.hwnd);
+}
 
-    // A prompt open when the menu returns: recorded, performed by `run`.
-    const Prompt = struct {
-        var app_: *App = undefined;
-        fn open() void {
-            app_.prompt_depth = 1;
-        }
-    };
-    Prompt.app_ = &app;
-    MenuSeen.during = &Prompt.open;
-    MenuSeen.choose = "Split Right";
-    testRightClick(b, 20, 30);
-    app.prompt_depth = 0;
-    try std.testing.expectEqualStrings("", PaletteSeen.take());
-    try std.testing.expectEqual(1, app.requests.items.len);
-    switch (app.requests.items[0]) {
-        .menu_action => |chosen| {
-            try std.testing.expect(chosen.from == &b.core_surface);
-            try std.testing.expect(chosen.action == .new_split and chosen.action.new_split == .right);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-    PaletteSeen.on = null;
-    app.createRequested();
-    try std.testing.expectEqualStrings("new_split:right;", PaletteSeen.take());
-    try std.testing.expect(PaletteSeen.on == b);
-    try std.testing.expectEqual(0, app.requests.items.len);
-    // Dropped when the terminal begins to close.
-    testRightClick(b, 20, 30);
-    app.prompt_depth = 0;
-    app.forgetClosing(&b.core_surface);
-    try std.testing.expect(app.requests.items[0] == .dropped);
-    app.createRequested();
-    try std.testing.expectEqualStrings("", PaletteSeen.take());
-    // Nothing recorded when there is no memory for it.
-    app.requests.clearAndFree(alloc);
-    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
-    core_app.alloc = failing.allocator();
-    testRightClick(b, 20, 30);
+test "win32: the context menu gives the focus back to its terminal, not to an open command palette" {
+    // The menu opens only on the terminal with the focus (a click that
+    // moves the focus there is eaten, WM_MOUSEACTIVATE), and an open
+    // command palette stays open when a terminal of its frame takes the
+    // focus. When the menu closes, chosen or not, that terminal gets the
+    // focus back, as GTK's popover gives it to its surface; not the
+    // palette's field, which the window's focus goes to while it is open
+    // (`Window.focusTarget`) and which would take the keys typed for the
+    // shell.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
-    app.prompt_depth = 0;
-    try std.testing.expect(failing.has_induced_failure);
-    try std.testing.expectEqual(0, app.requests.items.len);
-    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    MenuCore.reset();
+    PaletteSeen.reset(null);
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const p = &window.palette;
+
+    // Opened on a, its field with the focus; then b takes the focus, as
+    // the SetFocus of a click on it gives it (WM_SETFOCUS): the palette
+    // stays open, now on b, and the window's focus still goes to its field.
+    try togglePalette(&app, a);
+    const edit = p.edit.?;
+    try std.testing.expect(FocusSeen.last == edit);
+    _ = win32.SendMessageW(b.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(p.open);
+    try std.testing.expect(p.surface == b);
+    try std.testing.expect(Window.focusTarget(b) == edit);
+
+    // Dismissed, then Paste chosen: each time the focus back on b, and the
+    // palette still open.
+    for ([_]?[]const u8{ null, "Paste" }, [_][]const u8{ "", "paste_from_clipboard;" }, 1..) |choose, performed, n| {
+        MenuSeen.choose = choose;
+        FocusSeen.last = null;
+        testRightClick(b, 20, 30);
+        try std.testing.expectEqual(n, MenuSeen.count);
+        try std.testing.expectEqualStrings(performed, PaletteSeen.take());
+        try std.testing.expect(FocusSeen.last == b.hwnd);
+        try std.testing.expect(p.open and p.hwnd != null);
+    }
 }
 
 test "win32: a teardown posted while a terminal's context menu is open waits for it to close" {
@@ -15075,6 +15080,110 @@ fn testPump() void {
         _ = win32.TranslateMessage(&msg);
         _ = win32.DispatchMessageW(&msg);
     }
+}
+
+/// For tests: the core's `performBindingAction` for a context menu's
+/// item, once `PaletteSeen` has seen it. New Window and the splits ask the
+/// runtime for their window or split, which records it for `run`
+/// (`App.performAction`), as the core asks (`newWindow` in src/App.zig,
+/// `.new_split` in src/Surface.zig).
+const MenuActs = struct {
+    fn seen(surface: *Surface, action: input.Binding.Action) bool {
+        _ = PaletteSeen.seen(surface, action);
+        const target: apprt.Target = .{ .surface = &surface.core_surface };
+        return switch (action) {
+            .new_window => surface.app.performAction(target, .new_window, {}) catch false,
+            .new_split => |direction| surface.app.performAction(target, .new_split, switch (direction) {
+                .right, .auto => .right,
+                .down => .down,
+                .left => .left,
+                .up => .up,
+            }) catch false,
+            else => true,
+        };
+    }
+};
+
+test "win32: an item chosen in the context menu after its terminal or window began to close is dropped" {
+    // The terminal's shell exited, or its window was closed, while its
+    // menu was open: the teardown waits for the menu
+    // (`App.terminal_loops`) and runs after it, and the item chosen
+    // meanwhile is neither performed nor recorded for `run`, as GTK's
+    // popover goes with its surface. The terminal still has the focus back
+    // first.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &MenuActs.seen;
+    defer SearchBar.test_perform = null;
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    MenuCore.reset();
+    PaletteSeen.reset(null);
+
+    const first = try testFrame(&app);
+    testResize(first, 400, 300);
+    const a = try testPane(&app, first);
+    const b = try testPane(&app, first);
+    first.tab().tree = try testRow(alloc, &.{ a, b });
+    first.relayout();
+    const second = try testFrame(&app);
+    const c = try testPane(&app, second);
+    second.tab().tree = try .init(alloc, c);
+    second.relayout();
+
+    // On a terminal that is not closing, New Window is performed, and asks
+    // `run` for the window.
+    MenuSeen.choose = "New Window";
+    testRightClick(a, 20, 30);
+    try std.testing.expectEqualStrings("new_window;", PaletteSeen.take());
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .window);
+    app.requests.clearRetainingCapacity();
+
+    const Closing = struct {
+        var surface: *Surface = undefined;
+        var window: ?*Window = null;
+        /// The close, as the core asks it when the shell exits
+        /// (`Surface.close`) or as a close of the window does
+        /// (`Window.requestClose`), then the teardown it posts, dispatched
+        /// by the menu's loop.
+        fn start() void {
+            if (window) |w| w.requestClose() else surface.close(false);
+            testPump();
+        }
+    };
+    MenuSeen.during = &Closing.start;
+    for ([_]struct { *Surface, ?*Window, []const u8 }{
+        .{ b, null, "New Window" },
+        .{ c, second, "Split Right" },
+    }) |case| {
+        Closing.surface = case[0];
+        Closing.window = case[1];
+        MenuSeen.choose = case[2];
+        FocusSeen.last = null;
+        testRightClick(case[0], 20, 30);
+        try std.testing.expect(FocusSeen.last == case[0].hwnd);
+        try std.testing.expectEqualStrings("", PaletteSeen.take());
+        try std.testing.expectEqual(0, app.requests.items.len);
+        // The teardown, deferred while the menu was open, runs after it.
+        try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, case[0]) != null);
+        testPump();
+        try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, case[0]) == null);
+        if (case[1]) |w| try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, w) == null);
+    }
+    try std.testing.expectEqual(3, MenuSeen.count);
 }
 
 test "win32: a right click in a divider's band shows no context menu" {

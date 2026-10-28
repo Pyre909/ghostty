@@ -26,7 +26,8 @@
 //! whatever is posted meanwhile, so no teardown runs until it ends
 //! (`App.beginTerminalLoop`). The terminal has the focus back when it
 //! closes, and its chosen item's action is then performed on it, as the
-//! command palette performs an entry (`perform`).
+//! command palette performs an entry (`perform`), unless the terminal or
+//! its window began to close meanwhile.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,10 +37,8 @@ const win32 = @import("win32.zig");
 const App = @import("App.zig").App;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const Surface = @import("Surface.zig").Surface;
-const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const CommandPalette = @import("CommandPalette.zig");
-const overlay_keys = @import("overlay_keys.zig");
 
 const Binding = input.Binding;
 const log = std.log.scoped(.win32);
@@ -243,7 +242,10 @@ const Wide = struct {
 /// `surface` is alive when the menu returns: its loop is counted in
 /// `App.terminal_loops`, so a teardown posted meanwhile (its shell
 /// exiting, a close from another window) waits for it to end
-/// (`App.canTearDown`).
+/// (`App.canTearDown`). An item chosen once the terminal or its window
+/// began to close is not performed, as GTK's popover, a part of its
+/// surface, goes with it: what it did or asked `run` for would be for a
+/// terminal about to go.
 pub fn show(surface: *Surface, at: win32.POINT) void {
     const app = surface.app;
     const window = surface.window;
@@ -262,9 +264,15 @@ pub fn show(surface: *Surface, at: win32.POINT) void {
     app.endTerminalLoop();
     _ = win32.DestroyMenu(menu);
 
-    // Before the chosen item runs, so that one that moves the focus, as a
-    // split `run` makes does, moves it from the terminal.
-    window.setKeyboardFocus(Window.focusTarget(surface), true);
+    // To the terminal itself, not to whatever its window gives the focus
+    // to (`Window.focusTarget`): the menu opened only with the focus on the
+    // terminal, as a click that moves it there is eaten
+    // (WM_MOUSEACTIVATE), and an open command palette's field would take
+    // the keys meant for the shell. GTK's popover gives its surface the
+    // focus back in the same way. First, so that it comes back whether the
+    // item is then performed or not.
+    window.setKeyboardFocus(surface.hwnd, true);
+    if (surface.closing or window.closing) return;
     if (id == 0 or id > items.len) return;
     const item = &items[id - 1];
     // Windows chooses no greyed item, nor is one performed here.
@@ -281,49 +289,49 @@ pub var test_track: if (builtin.is_test) ?*const fn (win32.HMENU, win32.HWND, wi
     if (builtin.is_test) null else {};
 
 /// Run `menu`, owned by `owner`, at `at` on the screen until an item is
-/// chosen, its id, or it is dismissed, 0.
+/// chosen, its id, or it is dismissed, 0. A menu Windows cannot show is
+/// logged and answers 0 as well.
 fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
     if (builtin.is_test) return if (test_track) |seen| seen(menu, owner, at) else 0;
+    // TrackPopupMenuEx answers 0 both when the menu is dismissed and when
+    // it fails, which sets the last error.
+    win32.SetLastError(.SUCCESS);
     const id = win32.TrackPopupMenuEx(menu, win32.TPM_RETURNCMD | win32.TPM_RIGHTBUTTON, at.x, at.y, owner, null);
-    return if (id > 0) @intCast(id) else 0;
+    if (id > 0) return @intCast(id);
+    const err = win32.GetLastError();
+    if (err != .SUCCESS) log.warn("cannot show a context menu err={}", .{err});
+    return 0;
 }
 
-/// Perform `action`, the chosen item's, on `surface`, as the command
-/// palette performs an entry (`CommandPalette.perform`): now if the core
-/// may be re-entered, as a key's binding would be (`SearchBar.perform`),
-/// then the focus move it chose; else recorded for `run`
-/// (`App.Request.menu_action`). The menu opens only from a release that
-/// reached the core, so where it could be re-entered, and a prompt a tick
-/// opens inside the menu's loop ends before that loop does: from the menu
-/// it is performed now.
+/// Perform `action`, the chosen item's, on `surface`, as a key's binding
+/// would be (`SearchBar.perform`), then the focus move it chose, as the
+/// command palette performs an entry (`CommandPalette.perform`).
 ///
-/// Performed now, Copy, Paste, Clear, Reset, Read-only, Close Split,
-/// Close Tab, Close Window and Open Configuration take effect at once,
-/// a close posting its teardown or asking first (`Surface.close`,
-/// `Window.requestClose`). The splits, New Tab, New Window, the two title
-/// prompts and Reload Configuration are recorded by `App.performAction`
-/// itself, as they are from a key's binding (`App.requests`), and made by
-/// `run` once the terminal's handler has returned.
+/// The core may always be re-entered here: the menu opens only for a
+/// release that reached the core (`consumed` in `Surface.handleMessage`),
+/// which `Surface.syncMouse` lets through only while
+/// `App.canReenterCore`. Nothing between that and here changes it:
+/// a prompt opened meanwhile, by the release's own callback or by a tick
+/// the menu's loop dispatches, runs its loop inside that call and has
+/// closed when it returns (`App.endPrompt`), and `App.tick` clears
+/// `ticking` as it returns. Were it ever not so, the item is dropped with
+/// a warning rather than performed under a core frame or a prompt.
+///
+/// Copy, Paste, Clear, Reset, Read-only, Close Split, Close Tab, Close
+/// Window and Open Configuration take effect at once, a close posting its
+/// teardown or asking first (`Surface.close`, `Window.requestClose`). The
+/// splits, New Tab, New Window, the two title prompts and Reload
+/// Configuration are recorded by `App.performAction` itself, as they are
+/// from a key's binding (`App.requests`), and made by `run` once the
+/// terminal's handler has returned.
 fn perform(surface: *Surface, action: Binding.Action) void {
     const app = surface.app;
     if (!app.canReenterCore()) {
-        // Every surface a request names is live (`App.requests`).
-        const core = overlay_keys.coreOf(surface) orelse return;
-        app.requests.append(app.core_app.alloc, .{ .menu_action = .{ .from = core, .action = action } }) catch |err| {
-            log.warn("cannot record a context menu item err={}", .{err});
-            return;
-        };
-        app.wakeup();
+        log.warn("context menu item dropped, the core cannot be re-entered action={t}", .{action});
         return;
     }
-    replay(surface, action);
-}
-
-/// An item's action performed on `surface`, now or by `run` for one
-/// `perform` recorded, then the focus move it chose.
-pub fn replay(surface: *Surface, action: Binding.Action) void {
     _ = SearchBar.perform(surface, action);
-    surface.app.applyPendingFocus();
+    app.applyPendingFocus();
 }
 
 /// For tests: how many of the menu calls `build` makes may still
@@ -358,28 +366,30 @@ fn build(items: *const [count]Item) ?win32.HMENU {
         log.warn("cannot make a context menu err={}", .{win32.GetLastError()});
         return null;
     };
-    if (fill(menu, items)) return menu;
-    log.warn("cannot fill a context menu err={}", .{win32.GetLastError()});
+    const err = fill(menu, items) orelse return menu;
+    log.warn("cannot fill a context menu err={}", .{err});
     // With the submenus it holds.
     _ = win32.DestroyMenu(menu);
     return null;
 }
 
-fn fill(menu: win32.HMENU, items: *const [count]Item) bool {
+/// Put `items` in `menu`: null, or the error the call that failed left,
+/// read before anything is destroyed.
+fn fill(menu: win32.HMENU, items: *const [count]Item) ?win32.Win32Error {
     var i: usize = 0;
     while (i < items.len) {
         const first = &items[i];
         if (i > 0 and items[i - 1].section != first.section) {
-            if (!append(menu, win32.MF_SEPARATOR, 0, null)) return false;
+            if (!append(menu, win32.MF_SEPARATOR, 0, null)) return win32.GetLastError();
         }
         const sub = first.submenu orelse {
-            if (!appendItem(menu, first)) return false;
+            if (!appendItem(menu, first)) return win32.GetLastError();
             i += 1;
             continue;
         };
         var end = i;
         while (end < items.len and items[end].submenu == sub) end += 1;
-        const popup = createMenu() orelse return false;
+        const popup = createMenu() orelse return win32.GetLastError();
         var buf: [text_max:0]u16 = undefined;
         var out: Wide = .{ .buf = &buf };
         out.utf8(sub.label());
@@ -390,11 +400,12 @@ fn fill(menu: win32.HMENU, items: *const [count]Item) bool {
             i = end;
             continue;
         }
+        const err = win32.GetLastError();
         // Not yet the menu's, so not destroyed with it.
         _ = win32.DestroyMenu(popup);
-        return false;
+        return err;
     }
-    return true;
+    return null;
 }
 
 fn appendItem(menu: win32.HMENU, item: *const Item) bool {

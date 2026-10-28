@@ -387,6 +387,13 @@ pub const IsWindowArrangedFn = *const fn (hwnd: HWND) callconv(.winapi) BOOL;
 pub const GetSystemMetricsForDpiFn = *const fn (index: c_int, dpi: UINT) callconv(.winapi) c_int;
 
 pub const GetLastError = internal_os.windows.GetLastError;
+/// GetLastError's answer: `.SUCCESS`, or the error a failing call left.
+pub const Win32Error = w.Win32Error;
+/// Sets the thread's last error. Cleared to `.SUCCESS` before a call whose
+/// answer for a failure is also one of its results, it tells the two apart
+/// afterwards.
+/// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setlasterror
+pub extern "kernel32" fn SetLastError(code: Win32Error) callconv(.winapi) void;
 pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
 pub const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
 /// Milliseconds since the system started.
@@ -1265,9 +1272,6 @@ pub const TOOLINFOW = extern struct {
 
 // A terminal's context menu (ContextMenu.zig): a system popup menu.
 
-/// Sent to the window a right click or Shift+F10 or the Menu key came to,
-/// by DefWindowProcW; lParam is the point on the screen, -1 for a key.
-pub const WM_CONTEXTMENU: UINT = 0x007B;
 /// AppendMenuW's flags. MF_STRING is 0: an item of text, enabled and not
 /// checked.
 pub const MF_STRING: UINT = 0x0000;
