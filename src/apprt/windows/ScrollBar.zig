@@ -18,8 +18,9 @@
 //!
 //! What the user does on it, WM_VSCROLL, moves the viewport through the
 //! core's `scroll_to_row`, as GTK's adjustment does, to a row worked out
-//! from the core's rows (`rowFor`), and only when that row is another, as
-//! macOS asks for it (`scrolled`).
+//! from the core's rows (`rowFor`), or past its last for the thumb at the
+//! bar's end in a drag (`bottom_row`), and only when that row is another,
+//! as macOS asks for it (`scrolled`).
 //!
 //! A press on the bar, its thumb, track or an arrow, runs a modal loop
 //! inside the terminal's DefWindowProcW until the button comes up; and a
@@ -71,7 +72,13 @@ pub const State = struct {
     /// SB_THUMBTRACK, which only another program sends, is a single move
     /// and starts no drag: no loop's end would end one that no
     /// SB_ENDSCROLL does.
-    tracking: bool = false,
+    ///
+    /// It holds the thumb's last place in the bar's range at that first
+    /// SB_THUMBTRACK (`lastPlace`): Windows works the thumb's places out
+    /// from the range it takes there for the whole drag, whatever range the
+    /// bar is given meanwhile, so that place is the bar's end however far
+    /// the output has moved the bottom on since (`scrolled`).
+    tracking: ?i32 = null,
 
     /// The bar's loop that runs in the terminal's DefWindowProcW (`loop`),
     /// null outside one.
@@ -122,6 +129,22 @@ pub fn infoFor(rows: terminal.Scrollbar) Info {
         .pos = @intCast(@min(rows.offset, max_rows)),
     };
 }
+
+/// The thumb's last place in `info`'s range: nMax - nPage + 1, the largest
+/// position Windows keeps (SetScrollInfo), and 0 when the page holds the
+/// whole range.
+fn lastPlace(info: Info) i32 {
+    return @max(0, info.max - @as(i32, @intCast(info.page)) + 1);
+}
+
+/// The row asked of the core for the thumb at the bar's end (`scrolled`):
+/// past every row it can have, which it takes as its last, its active
+/// area, and follows the output from (src/terminal/PageList.zig:3337).
+/// The bar's own last row, `total - len` of the rows it has, can be behind
+/// the core's when it is asked: the rows come from the core's tick while
+/// the output goes on, and asked for, a row short of its last would pin
+/// the viewport there.
+pub const bottom_row: usize = std.math.maxInt(usize);
 
 /// The row WM_VSCROLL's request `code` moves the viewport's top to from
 /// `from`, the row it is at, in `rows`: one up or down (SB_LINEUP,
@@ -232,14 +255,14 @@ fn apply(surface: *Surface) void {
     rows.offset = s.asked orelse rows.offset;
     const want = infoFor(rows);
     if (s.set) |had| {
-        if (had.max == want.max and had.page == want.page and (s.tracking or had.pos == want.pos)) return;
+        if (had.max == want.max and had.page == want.page and (s.tracking != null or had.pos == want.pos)) return;
     }
     var mask = win32.SIF_RANGE | win32.SIF_PAGE | win32.SIF_DISABLENOSCROLL;
-    if (!s.tracking) mask |= win32.SIF_POS;
+    if (s.tracking == null) mask |= win32.SIF_POS;
     const info: win32.SCROLLINFO = .{ .fMask = mask, .nMax = want.max, .nPage = want.page, .nPos = want.pos };
     _ = win32.SetScrollInfo(surface.hwnd, win32.SB_VERT, &info, .TRUE);
     if (builtin.is_test) test_sets += 1;
-    const pos = if (!s.tracking) want.pos else if (s.set) |had| had.pos else 0;
+    const pos = if (s.tracking == null) want.pos else if (s.set) |had| had.pos else 0;
     s.set = .{ .max = want.max, .page = want.page, .pos = pos };
 }
 
@@ -262,12 +285,24 @@ fn apply(surface: *Surface) void {
 /// nothing: Windows sends SB_THUMBTRACK at the press on the thumb and at
 /// each place it moves to, and the release's SB_THUMBPOSITION names the
 /// last of those, which was taken when it came. Asked again once the
-/// output has moved the viewport on, as it does while a click on the
-/// thumb of a terminal following its output is held, it would pin the
-/// viewport back there. The bar's menu's SB_THUMBPOSITION (Scroll Here),
+/// viewport's row has moved on while the thumb was held, as the output
+/// moves it in a scrollback at its limit, which takes rows off the top,
+/// it would put the viewport back there. The bar's menu's
+/// SB_THUMBPOSITION (Scroll Here),
 /// and another program's, are taken. A terminal without the bar
 /// (`scrollbar = never`) takes none: it has no bar to send one, and its
 /// window's scroll info is the last bar's, if it had one.
+///
+/// In a drag, the thumb at the last place of the range Windows tracks it
+/// with (`State.tracking`) is at the bottom, rather than at the row that
+/// place names, which was the bottom when the drag began and which the
+/// output may have moved on from since: it asks for the core's last row
+/// as it is then (`bottom_row`), and the bar shows its own last row until
+/// the core reports. From there the core's viewport follows the output
+/// again, as GTK's does at its adjustment's end, so a thumb held there
+/// asks nothing more while the output comes. A range that has shrunk
+/// since, as a cleared scrollback shrinks it, is still kept to: a place
+/// past its last row asks for that row.
 pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
     const s = &surface.scroll_bar;
     // Without the bar, nothing of this window's sends it.
@@ -275,9 +310,10 @@ pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
     const code: u16 = @truncate(wparam);
     switch (code) {
         win32.SB_ENDSCROLL => return endDrag(surface),
-        // Only inside a loop, which ends the drag if no SB_ENDSCROLL does.
-        win32.SB_THUMBTRACK => if (s.in_loop != null) {
-            s.tracking = true;
+        // Only inside a loop, which ends the drag if no SB_ENDSCROLL does;
+        // the range is the bar's at the first.
+        win32.SB_THUMBTRACK => if (s.in_loop != null and s.tracking == null) {
+            s.tracking = lastPlace(infoFor(s.rows));
         },
         win32.SB_THUMBPOSITION => if (s.in_loop == .press) return,
         else => {},
@@ -286,15 +322,16 @@ pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
         win32.SB_THUMBTRACK, win32.SB_THUMBPOSITION => trackPos(surface.hwnd),
         else => null,
     };
+    const at_end = if (s.tracking) |end| if (thumb) |at| at >= end else false else false;
     const from = s.asked orelse s.rows.offset;
-    const row = rowFor(code, s.rows, from, thumb) orelse return;
+    const row = rowFor(if (at_end) win32.SB_BOTTOM else code, s.rows, from, thumb) orelse return;
     if (row == from) return;
     if (!surface.app.canReenterCore()) {
         log.debug("a scroll bar move is dropped, the core cannot be re-entered row={d}", .{row});
         return;
     }
     s.asked = row;
-    _ = SearchBar.perform(surface, .{ .scroll_to_row = row });
+    _ = SearchBar.perform(surface, .{ .scroll_to_row = if (at_end) bottom_row else row });
 }
 
 /// The thumb is no longer dragged: the bar takes the row the drag last
@@ -302,7 +339,7 @@ pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
 /// (`apply`).
 fn endDrag(surface: *Surface) void {
     const s = &surface.scroll_bar;
-    s.tracking = false;
+    s.tracking = null;
     if (s.on) apply(surface);
 }
 
@@ -384,7 +421,7 @@ pub fn loop(
     };
     s.in_loop = outer;
     app.modal_loop_depth -= 1;
-    if (s.tracking) endDrag(surface);
+    if (s.tracking != null) endDrag(surface);
     log.debug("scroll bar loop ended ms={d} updates={d}", .{ win32.GetTickCount64() - start, s.updates -% updates });
     app.endTerminalLoop();
     return result;
@@ -406,7 +443,7 @@ pub fn restyle(surface: *Surface) void {
     _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_STYLE, if (want) now | bit else now & ~bit);
     s.on = want;
     s.set = null;
-    s.tracking = false;
+    s.tracking = null;
     const flags = win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_NOOWNERZORDER |
         win32.SWP_NOACTIVATE | win32.SWP_FRAMECHANGED;
     _ = win32.SetWindowPos(hwnd, null, 0, 0, 0, 0, flags);
@@ -495,4 +532,20 @@ test "win32: a scroll bar's range saturates at what SetScrollInfo takes" {
     try testing.expectEqual(max, infoFor(.{ .total = rows + 2, .offset = 0, .len = 50 }).max);
     const past = infoFor(.{ .total = (1 << 32) + 5, .offset = (1 << 32) + 7, .len = (1 << 32) + 9 });
     try testing.expectEqual(Info{ .max = max, .page = @intCast(max), .pos = max }, past);
+}
+
+test "win32: the core takes a scroll bar's bottom row as its last, and follows the output from it" {
+    // What `bottom_row` relies on (src/terminal/PageList.zig:3337): asked
+    // for a row past its last, a viewport pinned in the scrollback becomes
+    // the active area, which stays at the bottom as the output adds rows.
+    var pages = try terminal.PageList.init(testing.allocator, .{ .cols = 10, .rows = 5 });
+    defer pages.deinit();
+    for (0..20) |_| _ = try pages.grow();
+    pages.scroll(.{ .row = 3 });
+    try testing.expectEqual(3, pages.scrollbar().offset);
+    pages.scroll(.{ .row = bottom_row });
+    try testing.expect(pages.viewport == .active);
+    _ = try pages.grow();
+    const rows = pages.scrollbar();
+    try testing.expectEqual(rows.total - rows.len, rows.offset);
 }

@@ -15505,10 +15505,13 @@ test "win32: a press on the thumb that does not move it asks for no row at its r
     // Windows sends SB_THUMBTRACK at a press on the thumb, for the place
     // the thumb is at, and SB_THUMBPOSITION for the same place at the
     // release, then SB_ENDSCROLL, with no move between them. Meanwhile the
-    // output moves on a terminal that follows it: asked for, the release's
-    // place would pin its viewport back where the press found it. In a
-    // press's loop SB_THUMBPOSITION asks nothing, and the bar takes the
-    // core's position at the end.
+    // output moves on a terminal that follows it, and the row of one
+    // pinned in a scrollback at its limit, which takes rows off the top:
+    // asked for, the release's place would put the viewport back where the
+    // press found it. In a press's loop SB_THUMBPOSITION asks nothing, and
+    // the bar takes the core's position at the end. (The following
+    // terminal's place is the thumb's end, which would ask for the bottom
+    // anyway: `ScrollBar.bottom_row`.)
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -15542,6 +15545,104 @@ test "win32: a press on the thumb that does not move it asks for no row at its r
     });
     try std.testing.expectEqualStrings("", PaletteSeen.take());
     try BarSteps.expectRead(0, 1199, 1150);
+
+    // Pinned half way, the scrollback at its limit: its rows stay 1000,
+    // and the viewport's moves up as the output takes 20 off the top, then
+    // 20 more (`PageList.fixupViewport`).
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    try BarSteps.press(a, &.{
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .rows = .{ 1000, 480, 50 } },
+        .{ .rows = .{ 1000, 460, 50 } },
+        .{ .scroll = .{ win32.SB_THUMBPOSITION, 0 } },
+        .{ .scroll = .{ win32.SB_ENDSCROLL, 0 } },
+        .read,
+    });
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try BarSteps.expectRead(0, 999, 460);
+}
+
+test "win32: a drag of the thumb back to its end follows the output, however far it has grown" {
+    // Windows works the thumb's places in a drag out from the bar's range
+    // at its first SB_THUMBTRACK, whatever range the bar is given
+    // meanwhile, so that the last of them names the row that was the
+    // bottom then. A terminal following its output has moved its bottom on
+    // since: at that place the thumb asks for the core's last row as it is
+    // then (`ScrollBar.bottom_row`), from which the core follows the output
+    // again, and the bar shows its own last row until the core reports; it
+    // asks nothing more while it is held there, and a place short of it is
+    // the row it names. A scrollback cleared during the drag shrinks the
+    // bar's range, not the one Windows tracks with: the thumb's end is
+    // still the press range's. Windows' thumb is stood in for through
+    // SIF_POS (`BarSteps.thumb`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    PaletteSeen.reset(null);
+    ScrollBar.test_loop = &BarSteps.run;
+    defer ScrollBar.test_loop = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    // At the bottom of 1000 rows, 50 shown: the press range's last place
+    // is 950. Dragged up, the core pinned there while the output adds 100
+    // rows; back down one place short of the end, then to the end.
+    try std.testing.expect(try testRows(&app, a, 1000, 950, 50));
+    try BarSteps.press(a, &.{
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .thumb = 500 },
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .rows = .{ 1000, 500, 50 } },
+        .{ .rows = .{ 1100, 500, 50 } },
+        .{ .thumb = 949 },
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .thumb = 950 },
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        // Held there while the core follows the output.
+        .{ .rows = .{ 1150, 1100, 50 } },
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .scroll = .{ win32.SB_THUMBPOSITION, 0 } },
+        .{ .scroll = .{ win32.SB_ENDSCROLL, 0 } },
+        .read,
+    });
+    const bottom = std.fmt.comptimePrint("scroll_to_row:{d};", .{ScrollBar.bottom_row});
+    try std.testing.expectEqualStrings("scroll_to_row:500;scroll_to_row:949;" ++ bottom, PaletteSeen.take());
+    try BarSteps.expectRead(0, 1149, 1100);
+    // After the drag the bar shows the core's rows as they come.
+    try std.testing.expect(try testRows(&app, a, 1200, 1150, 50));
+    try expectBar(a, 1199, 50, 1150);
+
+    // The scrollback cleared during the drag, which leaves the core's
+    // viewport at the top of what is left (`PageList.fixupViewport`), then
+    // filled again past the press range's end.
+    try std.testing.expect(try testRows(&app, a, 1000, 950, 50));
+    try BarSteps.press(a, &.{
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .thumb = 500 },
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .rows = .{ 1000, 500, 50 } },
+        .{ .rows = .{ 50, 0, 50 } },
+        .{ .rows = .{ 1100, 0, 50 } },
+        .{ .thumb = 950 },
+        .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },
+        .{ .scroll = .{ win32.SB_ENDSCROLL, 0 } },
+        .read,
+    });
+    try std.testing.expectEqualStrings("scroll_to_row:500;" ++ bottom, PaletteSeen.take());
+    // The bar at its own last row, the core not having reported.
+    try BarSteps.expectRead(0, 1099, 1050);
 }
 
 test "win32: the bar's requests scroll the terminal to their row, once each" {
@@ -15925,6 +16026,12 @@ const BarSteps = struct {
         /// The core's rows, as its tick reports them (`testRows`): the
         /// total, the offset and the length.
         rows: [3]usize,
+        /// Windows' thumb at this place, as a drag moves it: SetScrollInfo's
+        /// SIF_POS, which SIF_TRACKPOS reads back outside the system's own
+        /// drag, and which the bar leaves alone while its thumb is dragged
+        /// (`ScrollBar.apply`). A place Windows does not keep there, out of
+        /// the bar's range, fails the step.
+        thumb: i32,
         /// The bar's range and position, as Windows reads them back.
         read,
     };
@@ -15943,6 +16050,12 @@ const BarSteps = struct {
             .scroll => |w| testScroll(surface, w[0], w[1]),
             .rows => |r| if (!(testRows(surface.app, surface, r[0], r[1], r[2]) catch false)) {
                 failed = true;
+            },
+            .thumb => |at| {
+                const place: win32.SCROLLINFO = .{ .fMask = win32.SIF_POS, .nPos = at };
+                _ = win32.SetScrollInfo(surface.hwnd, win32.SB_VERT, &place, .FALSE);
+                var track: win32.SCROLLINFO = .{ .fMask = win32.SIF_TRACKPOS };
+                if (!win32.GetScrollInfo(surface.hwnd, win32.SB_VERT, &track).toBool() or track.nTrackPos != at) failed = true;
             },
             .read => {
                 if (reads == seen.len) {
