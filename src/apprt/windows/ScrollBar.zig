@@ -13,14 +13,16 @@
 //! changes nothing is skipped, as GTK skips one, and while the thumb is
 //! dragged its position is left alone, as macOS leaves it: the system
 //! draws the thumb where the pointer holds it, and when the drag ends the
-//! bar takes the row the drag last asked for, or the core's position.
-//! Past `i32` rows the range saturates (`infoFor`).
+//! bar takes the row the drag last moved the viewport to, until the core
+//! reports it (`State.asked`), or the core's position. Past `i32` rows the
+//! range saturates (`infoFor`).
 //!
 //! What the user does on it, WM_VSCROLL, moves the viewport through the
 //! core's `scroll_to_row`, as GTK's adjustment does, to a row worked out
-//! from the core's rows (`rowFor`), or past its last for the thumb at the
-//! bar's end in a drag (`bottom_row`), and only when that row is another,
-//! as macOS asks for it (`scrolled`).
+//! from the core's rows (`rowFor`), the last row for the thumb at the
+//! bar's end in a drag, and only when that row is another, as macOS asks
+//! for it. The last row is asked for past the core's last (`bottom_row`),
+//! as the bar's rows can be behind the core's (`scrolled`).
 //!
 //! A press on the bar, its thumb, track or an arrow, runs a modal loop
 //! inside the terminal's DefWindowProcW until the button comes up; and a
@@ -62,7 +64,8 @@ pub const State = struct {
     rows: terminal.Scrollbar = .zero,
 
     /// What SetScrollInfo was last given (`apply`), to skip an update that
-    /// changes nothing; null before the first, and after a restyle.
+    /// changes nothing; null before the first, after a restyle, and at the
+    /// end of a drag (`endDrag`).
     set: ?Info = null,
 
     /// The thumb is being dragged: from an SB_THUMBTRACK inside one of the
@@ -84,9 +87,10 @@ pub const State = struct {
     /// null outside one.
     in_loop: ?Loop = null,
 
-    /// The row last asked of the core (`scroll_to_row`) that it has not
-    /// reported back: a step up or down starts from it. Cleared by every
-    /// `.scrollbar`.
+    /// The row the viewport was last asked to go to (`scrolled`), which
+    /// the core has not reported back: a step up or down starts from it.
+    /// For the bar's last row it is that row, the core being asked past it
+    /// (`bottom_row`). Cleared by every `.scrollbar`.
     asked: ?usize = null,
 
     /// The bar was last given the dark theme (`applyTheme`); a new window's
@@ -137,14 +141,22 @@ fn lastPlace(info: Info) i32 {
     return @max(0, info.max - @as(i32, @intCast(info.page)) + 1);
 }
 
-/// The row asked of the core for the thumb at the bar's end (`scrolled`):
-/// past every row it can have, which it takes as its last, its active
-/// area, and follows the output from (src/terminal/PageList.zig:3337).
-/// The bar's own last row, `total - len` of the rows it has, can be behind
+/// The row asked of the core for every step to the bar's last row
+/// (`lastRow`, `scrolled`): the menu's Bottom, a line or a page down that
+/// reaches it or stops there, and the thumb there or at the bar's end in a
+/// drag. It is past every row the core can have, which it takes as its
+/// last, its active area, and follows the output from
+/// (src/terminal/PageList.zig:3337). The bar's own last row can be behind
 /// the core's when it is asked: the rows come from the core's tick while
 /// the output goes on, and asked for, a row short of its last would pin
 /// the viewport there.
 pub const bottom_row: usize = std.math.maxInt(usize);
+
+/// The last row the viewport can start at in `rows`, `total - len`, 0 when
+/// the screen holds them all: the bar's last row.
+fn lastRow(rows: terminal.Scrollbar) usize {
+    return rows.total -| rows.len;
+}
 
 /// The row WM_VSCROLL's request `code` moves the viewport's top to from
 /// `from`, the row it is at, in `rows`: one up or down (SB_LINEUP,
@@ -152,10 +164,10 @@ pub const bottom_row: usize = std.math.maxInt(usize);
 /// page increment is the page), the first or the last row (SB_TOP,
 /// SB_BOTTOM), or `thumb`, where the thumb is (SB_THUMBTRACK,
 /// SB_THUMBPOSITION); kept from 0 to the last row the viewport can start
-/// at, `total - len`. Null for SB_ENDSCROLL and any other request, and for
-/// a thumb whose place Windows did not give.
+/// at (`lastRow`). Null for SB_ENDSCROLL and any other request, and for a
+/// thumb whose place Windows did not give.
 pub fn rowFor(code: u16, rows: terminal.Scrollbar, from: usize, thumb: ?i32) ?usize {
-    const last = rows.total -| rows.len;
+    const last = lastRow(rows);
     const row: usize = switch (code) {
         win32.SB_LINEUP => from -| 1,
         win32.SB_LINEDOWN => from +| 1,
@@ -246,9 +258,9 @@ pub var test_sets: if (builtin.is_test) usize else void = if (builtin.is_test) 0
 
 /// Give `surface`'s bar its rows (`infoFor`), unless it has them: the range
 /// and the page, and the position unless the thumb is being dragged, at
-/// the row last asked of the core while it has not reported it (`asked`),
-/// as at the end of a drag released before the core caught up, else at
-/// the core's.
+/// the row the viewport was last asked to go to while the core has not
+/// reported it (`asked`), as at the end of a drag released before the core
+/// caught up, else at the core's.
 fn apply(surface: *Surface) void {
     const s = &surface.scroll_bar;
     var rows = s.rows;
@@ -280,29 +292,33 @@ fn apply(surface: *Surface) void {
 ///
 /// SB_THUMBTRACK inside one of the bar's loops starts a drag of the
 /// thumb, during which `apply` leaves its position alone; SB_ENDSCROLL
-/// ends it, and the bar takes the row last asked of the core, or the
-/// core's position (`apply`). In a press's loop SB_THUMBPOSITION asks
-/// nothing: Windows sends SB_THUMBTRACK at the press on the thumb and at
-/// each place it moves to, and the release's SB_THUMBPOSITION names the
-/// last of those, which was taken when it came. Asked again once the
-/// viewport's row has moved on while the thumb was held, as the output
-/// moves it in a scrollback at its limit, which takes rows off the top,
-/// it would put the viewport back there. The bar's menu's
-/// SB_THUMBPOSITION (Scroll Here),
-/// and another program's, are taken. A terminal without the bar
-/// (`scrollbar = never`) takes none: it has no bar to send one, and its
-/// window's scroll info is the last bar's, if it had one.
+/// ends it, and the bar takes the row the viewport was last asked to go
+/// to, or the core's position (`apply`). In a press's loop
+/// SB_THUMBPOSITION asks nothing: Windows sends SB_THUMBTRACK at the press
+/// on the thumb and at each place it moves to, and the release's
+/// SB_THUMBPOSITION names the last of those, which was taken when it came.
+/// Asked again once the viewport's row has moved on while the thumb was
+/// held, as the output moves it in a scrollback at its limit, which takes
+/// rows off the top, it would put the viewport back there. The bar's
+/// menu's SB_THUMBPOSITION (Scroll Here), and another program's, are
+/// taken. A terminal without the bar (`scrollbar = never`) takes none: it
+/// has no bar to send one, and its window's scroll info is the last bar's,
+/// if it had one.
 ///
 /// In a drag, the thumb at the last place of the range Windows tracks it
 /// with (`State.tracking`) is at the bottom, rather than at the row that
 /// place names, which was the bottom when the drag began and which the
-/// output may have moved on from since: it asks for the core's last row
-/// as it is then (`bottom_row`), and the bar shows its own last row until
-/// the core reports. From there the core's viewport follows the output
-/// again, as GTK's does at its adjustment's end, so a thumb held there
-/// asks nothing more while the output comes. A range that has shrunk
-/// since, as a cleared scrollback shrinks it, is still kept to: a place
-/// past its last row asks for that row.
+/// output may have moved on from since. Every step to the bar's last row
+/// (`lastRow`), the menu's Bottom, a line or a page down that reaches it
+/// or stops there, and the thumb there, asks for the core's last row as it
+/// is then (`bottom_row`), as the bar's rows can be behind the core's;
+/// `asked` holds the bar's own last row, which the bar shows when the
+/// scroll ends (`endDrag`) until the core reports. From there the core's
+/// viewport follows the output again, as GTK's does at its adjustment's
+/// end, so a thumb held there asks nothing more while the output comes,
+/// nor does a step at the bar's last row already. A range that has shrunk
+/// since the drag began, as a cleared scrollback shrinks it, is still kept
+/// to: a place past its last row is its last row.
 pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
     const s = &surface.scroll_bar;
     // Without the bar, nothing of this window's sends it.
@@ -331,15 +347,21 @@ pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
         return;
     }
     s.asked = row;
-    _ = SearchBar.perform(surface, .{ .scroll_to_row = if (at_end) bottom_row else row });
+    _ = SearchBar.perform(surface, .{ .scroll_to_row = if (row == lastRow(s.rows)) bottom_row else row });
 }
 
-/// The thumb is no longer dragged: the bar takes the row the drag last
-/// asked for until the core reports it, else the core's position
-/// (`apply`).
+/// The thumb is no longer dragged: the bar takes the row the viewport was
+/// last asked to go to until the core reports it (`State.asked`), else
+/// the core's position (`apply`), given to Windows even where the bar's
+/// record says Windows has it (`State.set`). SetScrollInfo keeps the
+/// position inside the range it is given, so a range given during the
+/// drag can have moved Windows' with no SIF_POS of the bar's: a cleared
+/// scrollback moves it to the top of what is left, and the output that
+/// fills the range again leaves it there.
 fn endDrag(surface: *Surface) void {
     const s = &surface.scroll_bar;
     s.tracking = null;
+    s.set = null;
     if (s.on) apply(surface);
 }
 
