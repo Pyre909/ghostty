@@ -12,9 +12,9 @@
 //! would change the grid's width and reflow the text. An update that
 //! changes nothing is skipped, as GTK skips one, and while the thumb is
 //! dragged its position is left alone, as macOS leaves it: the system
-//! draws the thumb where the pointer holds it, and the bar takes the
-//! core's position again when the drag ends. Past `i32` rows the range
-//! saturates (`infoFor`).
+//! draws the thumb where the pointer holds it, and when the drag ends the
+//! bar takes the row the drag last asked for, or the core's position.
+//! Past `i32` rows the range saturates (`infoFor`).
 //!
 //! What the user does on it, WM_VSCROLL, moves the viewport through the
 //! core's `scroll_to_row`, as GTK's adjustment does, to a row worked out
@@ -64,9 +64,18 @@ pub const State = struct {
     /// changes nothing; null before the first, and after a restyle.
     set: ?Info = null,
 
-    /// The thumb is being dragged: from SB_THUMBTRACK until SB_ENDSCROLL,
-    /// or the end of the bar's loop.
+    /// The thumb is being dragged: from an SB_THUMBTRACK inside one of the
+    /// bar's loops (`in_loop`), which Windows sends at the press on the
+    /// thumb and at each place it moves to, until SB_ENDSCROLL, the end of
+    /// that loop, or a restyle (`restyle`). Outside a loop an
+    /// SB_THUMBTRACK, which only another program sends, is a single move
+    /// and starts no drag: no loop's end would end one that no
+    /// SB_ENDSCROLL does.
     tracking: bool = false,
+
+    /// The bar's loop that runs in the terminal's DefWindowProcW (`loop`),
+    /// null outside one.
+    in_loop: ?Loop = null,
 
     /// The row last asked of the core (`scroll_to_row`) that it has not
     /// reported back: a step up or down starts from it. Cleared by every
@@ -82,6 +91,15 @@ pub const State = struct {
     updates: u32 = 0,
 };
 
+/// Which of the bar's loops runs (`State.in_loop`).
+pub const Loop = enum {
+    /// A press on the bar, its thumb, track or an arrow, until the button
+    /// comes up (WM_SYSCOMMAND).
+    press,
+    /// The system's menu for the bar, until it closes (WM_CONTEXTMENU).
+    menu,
+};
+
 /// What the bar is given (`infoFor`): the range from 0 to `max`, the page
 /// and the position.
 pub const Info = struct { max: i32, page: u32, pos: i32 };
@@ -92,10 +110,11 @@ const max_rows: usize = std.math.maxInt(i32);
 
 /// The bar for `rows`: from row 0 to the last, a page of `len` rows, at
 /// `offset`. Each value saturates at `max_rows` rather than wrapping, so
-/// that past it the thumb reaches the first `max_rows` rows, and the
-/// arrows and the track the rest (`rowFor`). An empty scrollback keeps
-/// one row, and the page at least one, so that the bar is disabled
-/// (SIF_DISABLENOSCROLL) rather than given an empty range.
+/// that past it the thumb's positions run from 0 to `max_rows - len + 1`
+/// (nMax - nPage + 1), and the arrows and the track reach the rest
+/// (`rowFor`). An empty scrollback keeps one row, and the page at least
+/// one, so that the bar is disabled (SIF_DISABLENOSCROLL) rather than
+/// given an empty range.
 pub fn infoFor(rows: terminal.Scrollbar) Info {
     return .{
         .max = @intCast(@min(@max(rows.total, 1) - 1, max_rows)),
@@ -154,26 +173,33 @@ pub fn made(surface: *Surface) void {
 /// (`Surface.getSize`), so what sizes a window for a grid adds it across.
 pub fn width(surface: *const Surface) i32 {
     if (!surface.scroll_bar.on) return 0;
-    return metric(surface.hwnd);
-}
-
-/// SM_CXVSCROLL at `hwnd`'s DPI, as Windows sizes the bar it draws: from
-/// GetDpiForWindow and GetSystemMetricsForDpi, which are looked up as
-/// `App.init` looks up the first (Windows 10 1607); else
-/// GetSystemMetrics', at the system DPI, the only one before them. The
-/// window's own DPI, not the one the app lays out with (`Window.dpiOf`),
-/// which a test may stand in for.
-fn metric(hwnd: win32.HWND) i32 {
-    if (win32.GetModuleHandleW(L("user32.dll"))) |user32| {
-        if (win32.GetProcAddress(user32, "GetDpiForWindow")) |d| if (win32.GetProcAddress(user32, "GetSystemMetricsForDpi")) |m| {
-            const dpi_of: win32.GetDpiForWindowFn = @ptrCast(@alignCast(d));
-            const metric_for: win32.GetSystemMetricsForDpiFn = @ptrCast(@alignCast(m));
-            const dpi = dpi_of(hwnd);
-            if (dpi != 0) return metric_for(win32.SM_CXVSCROLL, dpi);
-        };
+    const hwnd = surface.hwnd;
+    if (surface.app.bar_metric) |m| {
+        const dpi = m.dpi_of(hwnd);
+        if (dpi != 0) return m.metric_for(win32.SM_CXVSCROLL, dpi);
     }
     return win32.GetSystemMetrics(win32.SM_CXVSCROLL);
 }
+
+/// How `width` reads SM_CXVSCROLL at a window's DPI, as Windows sizes the
+/// bar it draws: GetDpiForWindow and GetSystemMetricsForDpi, which exist
+/// from Windows 10 1607 and are looked up once (`App.bar_metric`); without
+/// them, GetSystemMetrics', at the system DPI, the only one before them.
+/// Its own GetDpiForWindow, not the one the app lays out with
+/// (`App.get_dpi_for_window`, `Window.dpiOf`), which a test may stand in
+/// for: the bar is drawn at the window's real DPI.
+pub const Metric = struct {
+    dpi_of: win32.GetDpiForWindowFn,
+    metric_for: win32.GetSystemMetricsForDpiFn,
+
+    /// Both from `user32`, or null if either is missing.
+    pub fn resolve(user32: ?win32.HMODULE) ?Metric {
+        const m = user32 orelse return null;
+        const dpi_of = win32.GetProcAddress(m, "GetDpiForWindow") orelse return null;
+        const metric_for = win32.GetProcAddress(m, "GetSystemMetricsForDpi") orelse return null;
+        return .{ .dpi_of = @ptrCast(@alignCast(dpi_of)), .metric_for = @ptrCast(@alignCast(metric_for)) };
+    }
+};
 
 /// `.scrollbar`: the core's rows for `surface`'s bar (`apply`); false, the
 /// action not carried out, while the terminal has no bar
@@ -196,10 +222,15 @@ pub fn update(surface: *Surface, rows: terminal.Scrollbar) bool {
 pub var test_sets: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
 /// Give `surface`'s bar its rows (`infoFor`), unless it has them: the range
-/// and the page, and the position unless the thumb is being dragged.
+/// and the page, and the position unless the thumb is being dragged, at
+/// the row last asked of the core while it has not reported it (`asked`),
+/// as at the end of a drag released before the core caught up, else at
+/// the core's.
 fn apply(surface: *Surface) void {
     const s = &surface.scroll_bar;
-    const want = infoFor(s.rows);
+    var rows = s.rows;
+    rows.offset = s.asked orelse rows.offset;
+    const want = infoFor(rows);
     if (s.set) |had| {
         if (had.max == want.max and had.page == want.page and (s.tracking or had.pos == want.pos)) return;
     }
@@ -224,9 +255,17 @@ fn apply(surface: *Surface) void {
 /// core is still entered only while `App.canReenterCore` allows it, as a
 /// key is dropped under a prompt (`Surface.handleMessage`).
 ///
-/// SB_THUMBTRACK starts a drag of the thumb, during which `apply` leaves
-/// its position alone; SB_ENDSCROLL ends it, and the bar takes the
-/// position the core last reported. A terminal without the bar
+/// SB_THUMBTRACK inside one of the bar's loops starts a drag of the
+/// thumb, during which `apply` leaves its position alone; SB_ENDSCROLL
+/// ends it, and the bar takes the row last asked of the core, or the
+/// core's position (`apply`). In a press's loop SB_THUMBPOSITION asks
+/// nothing: Windows sends SB_THUMBTRACK at the press on the thumb and at
+/// each place it moves to, and the release's SB_THUMBPOSITION names the
+/// last of those, which was taken when it came. Asked again once the
+/// output has moved the viewport on, as it does while a click on the
+/// thumb of a terminal following its output is held, it would pin the
+/// viewport back there. The bar's menu's SB_THUMBPOSITION (Scroll Here),
+/// and another program's, are taken. A terminal without the bar
 /// (`scrollbar = never`) takes none: it has no bar to send one, and its
 /// window's scroll info is the last bar's, if it had one.
 pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
@@ -236,7 +275,11 @@ pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
     const code: u16 = @truncate(wparam);
     switch (code) {
         win32.SB_ENDSCROLL => return endDrag(surface),
-        win32.SB_THUMBTRACK => s.tracking = true,
+        // Only inside a loop, which ends the drag if no SB_ENDSCROLL does.
+        win32.SB_THUMBTRACK => if (s.in_loop != null) {
+            s.tracking = true;
+        },
+        win32.SB_THUMBPOSITION => if (s.in_loop == .press) return,
         else => {},
     }
     const thumb: ?i32 = switch (code) {
@@ -254,7 +297,9 @@ pub fn scrolled(surface: *Surface, wparam: win32.WPARAM) void {
     _ = SearchBar.perform(surface, .{ .scroll_to_row = row });
 }
 
-/// The thumb is no longer dragged: the bar takes the core's position.
+/// The thumb is no longer dragged: the bar takes the row the drag last
+/// asked for until the core reports it, else the core's position
+/// (`apply`).
 fn endDrag(surface: *Surface) void {
     const s = &surface.scroll_bar;
     s.tracking = false;
@@ -271,11 +316,12 @@ fn trackPos(hwnd: win32.HWND) ?i32 {
 
 /// Whether `msg` to a terminal runs one of the bar's loops in its
 /// DefWindowProcW (`loop`): WM_SYSCOMMAND's scroll commands, which
-/// DefWindowProcW sends for a press on the bar (WM_NCLBUTTONDOWN) and
-/// another program may send, and WM_CONTEXTMENU at a point on the bar,
-/// which a right click there sends (WM_NCRBUTTONUP). For a press on the
-/// vertical bar Windows 11 sends SC_HSCROLL, with HTVSCROLL in the four
-/// low bits SC_MASK leaves out, not SC_VSCROLL: both are taken.
+/// DefWindowProcW sends for a press on the bar (WM_NCLBUTTONDOWN) and for
+/// a double click on it (WM_NCLBUTTONDBLCLK), and another program may
+/// send, and WM_CONTEXTMENU at a point on the bar, which a right click
+/// there sends (WM_NCRBUTTONUP). For a press on the vertical bar Windows
+/// 11 sends SC_HSCROLL, with HTVSCROLL in the four low bits SC_MASK leaves
+/// out, and for a double click SC_VSCROLL, with HTVSCROLL: both are taken.
 pub fn runsLoop(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
     return switch (msg) {
         win32.WM_SYSCOMMAND => switch (wparam & win32.SC_MASK) {
@@ -311,8 +357,10 @@ pub var test_loop: if (builtin.is_test) ?*const fn (*Surface, win32.UINT, win32.
 /// follows the output that keeps coming. It is counted in
 /// `App.terminal_loops` as well, so that a teardown posted meanwhile, the
 /// shell exiting or the window closed, waits until it has returned
-/// (`App.beginTerminalLoop`). A drag of the thumb ends with it, SB_ENDSCROLL
-/// or not.
+/// (`App.beginTerminalLoop`). While it runs the bar knows which loop it is
+/// (`State.in_loop`), as only inside one is SB_THUMBTRACK a drag, and in a
+/// press's SB_THUMBPOSITION asks nothing (`scrolled`). A drag of the thumb
+/// ends with it, SB_ENDSCROLL or not.
 pub fn loop(
     surface: *Surface,
     hwnd: win32.HWND,
@@ -324,12 +372,17 @@ pub fn loop(
     const s = &surface.scroll_bar;
     const start = win32.GetTickCount64();
     const updates = s.updates;
+    // A loop inside another, as another program's WM_SYSCOMMAND could
+    // start, gives the outer one its own back.
+    const outer = s.in_loop;
     app.beginTerminalLoop();
     app.modal_loop_depth += 1;
+    s.in_loop = if (msg == win32.WM_CONTEXTMENU) .menu else .press;
     const result = result: {
         if (builtin.is_test) break :result if (test_loop) |run| run(surface, msg, wparam, lparam) else 0;
         break :result win32.DefWindowProcW(hwnd, msg, wparam, lparam);
     };
+    s.in_loop = outer;
     app.modal_loop_depth -= 1;
     if (s.tracking) endDrag(surface);
     log.debug("scroll bar loop ended ms={d} updates={d}", .{ win32.GetTickCount64() - start, s.updates -% updates });

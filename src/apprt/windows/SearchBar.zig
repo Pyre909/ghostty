@@ -536,16 +536,20 @@ pub fn replay(from: *CoreSurface, key: FieldKey) void {
 }
 
 /// Perform `action` on the terminal's core, as GTK's overlay does
-/// (`performBindingAction`), from a message `run`'s loop dispatched to the
-/// bar: whether it was performed. Each caller first checks that the core
-/// may be re-entered, as a key is dropped under a prompt
-/// (`Surface.handleMessage`); so do the bindings the field's keys perform
-/// (`overlay_keys`).
+/// (`performBindingAction`): whether it was performed. For the search
+/// bar's own requests, from a message `run`'s loop dispatched to the bar,
+/// and for the bindings the overlays' fields perform (`overlay_keys`), the
+/// command palette's entries (`CommandPalette.runNow`), the context
+/// menu's items (`ContextMenu.perform`) and the scroll bar's moves, from
+/// the loops the terminal's DefWindowProcW runs for it
+/// (`ScrollBar.scrolled`). Each caller performs it only where the core may
+/// be re-entered: from `run`, or after `App.canReenterCore` allowed it, as
+/// a key is dropped under a prompt (`Surface.handleMessage`).
 pub fn perform(surface: *Surface, action: input.Binding.Action) bool {
     if (builtin.is_test) if (test_perform) |seen| return seen(surface, action);
     const core = surface.liveCore() orelse return false;
     return core.performBindingAction(action) catch |err| {
-        log.warn("cannot perform a binding action from a search bar action={t} err={}", .{ action, err });
+        log.warn("cannot perform a binding action on a terminal action={t} err={}", .{ action, err });
         return false;
     };
 }

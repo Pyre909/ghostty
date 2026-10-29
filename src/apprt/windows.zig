@@ -175,8 +175,8 @@
 //! key opens it, and a right click in a divider's band shows none. While
 //! it is open the app keeps ticking, and a terminal or window asked to
 //! close waits for it; an item chosen after that is dropped. A right
-//! click on a terminal's scroll bar shows the bar's own menu instead (see
-//! Scrollbar).
+//! click on a terminal's scroll bar shows the bar's own menu instead, and
+//! none while the bar is disabled (see Scrollbar).
 //!
 //! ## Scrollbar
 //!
@@ -197,15 +197,17 @@
 //! both, and a terminal or window asked to close waits for them to end.
 //! The bar is dark in a dark frame. Beside a divider it keeps its pixels:
 //! the divider's band there is the line and the other side's 3 DIP. The
-//! overlays, the search bar and the command palette stay off it. With
-//! `never` no terminal has one, and a new configuration gives the
-//! terminals their bar, or takes it, from `App.run`.
+//! overlays and the search bar stay off it, and the command palette off
+//! the bars along the window's right edge: in a split it covers the
+//! terminals left of others, their bars with them. With `never` no
+//! terminal has one, and a new configuration gives the terminals their
+//! bar, or takes it, from `App.run`.
 //!
 //! GTK's scrollbar floats over the terminal, shows while it scrolls or the
 //! pointer is near it, and takes none of its width; macOS's is the same.
 //! Neither has the menu. Past 2^31 - 1 rows, which SetScrollInfo cannot
-//! take, the thumb reaches only that many, and the arrows and the track
-//! the rest.
+//! take, the thumb's positions run only from 0 to 2^31 less the screen's
+//! rows, and the arrows and the track reach the rest.
 //!
 //! ## What is still missing
 //!

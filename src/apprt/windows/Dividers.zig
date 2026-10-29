@@ -16,12 +16,14 @@
 //! (`wheel`). A terminal's scroll bar beside the line keeps its pixels, as
 //! only the client area lets the pointer through: the band on that side
 //! is the bar's, whose arrows and track are small targets already, and
-//! the divider is taken from the line and the other side. A right click there shows no context menu, as on the line:
-//! the resize pointer shows the click is the divider's, GTK's divider has
-//! no menu, nor does macOS's hit box (SplitView.Divider.swift), and
-//! passing the button on would need the terminal's activation and focus
-//! rules for a click (its WM_MOUSEACTIVATE) here, where the frame gets
-//! them. The middle and X buttons stop at the frame as well.
+//! the divider is taken from the line and the other side. A right click
+//! in the band shows no context menu, as on the line (on a bar beside
+//! it, the bar's own menu shows): the resize pointer shows the click is
+//! the divider's, GTK's divider has no menu, nor does macOS's hit box
+//! (SplitView.Divider.swift), and passing the button on would need the
+//! terminal's activation and focus rules for a click (its
+//! WM_MOUSEACTIVATE) here, where the frame gets them. The middle and X
+//! buttons stop at the frame as well.
 //! GTK narrowed its separator's grab area to its line instead, because a
 //! wider one made the first column right of a split unselectable
 //! (src/apprt/gtk/css/style.css, ghostty#3020).

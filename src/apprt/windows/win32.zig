@@ -1370,6 +1370,8 @@ pub const SC_HSCROLL: WPARAM = 0xF080;
 pub const HTVSCROLL: u16 = 7;
 /// https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nclbuttondown
 pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
+/// https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nclbuttondblclk
+pub const WM_NCLBUTTONDBLCLK: UINT = 0x00A3;
 /// https://learn.microsoft.com/en-us/windows/win32/menurc/wm-contextmenu
 pub const WM_CONTEXTMENU: UINT = 0x007B;
 /// The width of a vertical scroll bar.
