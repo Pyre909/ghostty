@@ -68,6 +68,7 @@ test {
     _ = path;
     _ = uri;
     _ = shell;
+    _ = hostname;
 
     if (comptime builtin.target.os.tag == .linux) {
         _ = kernel_info;
