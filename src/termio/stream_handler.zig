@@ -12,6 +12,7 @@ const renderer = @import("../renderer.zig");
 const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const terminfo = @import("../terminfo/main.zig");
+const windows_pwd = @import("windows_pwd.zig");
 const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
@@ -1535,8 +1536,14 @@ pub const StreamHandler = struct {
             return;
         }
 
-        if (builtin.target.os.tag == .windows) {
-            log.warn("reportPwd unimplemented on windows", .{});
+        // On Windows, OSC 7's URL or OSC 9;9's path, as a Windows path.
+        if (comptime builtin.target.os.tag == .windows) {
+            var arena: std.heap.ArenaAllocator = .init(self.alloc);
+            defer arena.deinit();
+            switch (try windows_pwd.parse(arena.allocator(), url, &isLocalHost)) {
+                .path => |path| try self.pwdChanged(path),
+                .refused => |why| log.warn("reported working directory refused ({t}): {s}", .{ why, url }),
+            }
             return;
         }
 
@@ -1593,7 +1600,20 @@ pub const StreamHandler = struct {
         var stack_alloc: std.heap.BufferFirstAllocator = .init(&stack_alloc_buf, arena_alloc.allocator());
         defer arena_alloc.deinit();
         const path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
+        try self.pwdChanged(path);
+    }
 
+    /// Whether an OSC 7 host names this machine, for `windows_pwd.parse`.
+    fn isLocalHost(host: []const u8) bool {
+        return internal_os.hostname.isLocal(host) catch |err| {
+            log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
+            return false;
+        };
+    }
+
+    /// The pwd the shell reported, for the terminal, the surface and, while
+    /// no title has been set, as the title.
+    fn pwdChanged(self: *StreamHandler, path: []const u8) !void {
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);
 

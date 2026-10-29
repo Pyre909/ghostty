@@ -157,6 +157,18 @@ pub const IO_STATUS_BLOCK = windows.IO_STATUS_BLOCK;
 pub const NTSTATUS = windows.NTSTATUS;
 pub const OBJECT_ATTRIBUTES = windows.OBJECT.ATTRIBUTES;
 
+/// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ne-sysinfoapi-computer_name_format
+pub const COMPUTER_NAME_FORMAT = enum(c_int) {
+    NetBIOS = 0,
+    DnsHostname = 1,
+    DnsDomain = 2,
+    DnsFullyQualified = 3,
+    PhysicalNetBIOS = 4,
+    PhysicalDnsHostname = 5,
+    PhysicalDnsDomain = 6,
+    PhysicalDnsFullyQualified = 7,
+};
+
 // Exported functions by library
 pub const exp = struct {
     pub const kernel32 = struct {
@@ -216,6 +228,12 @@ pub const exp = struct {
         ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getcomputernamea
         pub extern "kernel32" fn GetComputerNameA(
+            lpBuffer: LPSTR,
+            nSize: *DWORD,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getcomputernameexa
+        pub extern "kernel32" fn GetComputerNameExA(
+            NameType: COMPUTER_NAME_FORMAT,
             lpBuffer: LPSTR,
             nSize: *DWORD,
         ) callconv(.winapi) BOOL;
