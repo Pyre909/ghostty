@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const input = @import("../../input.zig");
 const Surface = @import("Surface.zig").Surface;
 const App = @import("App.zig").App;
+const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 
 const Binding = input.Binding;
 const uucode = @import("uucode");
@@ -143,8 +144,8 @@ pub const Entry = struct {
     action_key: []const u8 = "",
     /// The command's description; a jump's terminal's working directory,
     /// unless its title shows it already, as GTK and macOS describe a
-    /// jump. Shown on the second line when there is no action key, else
-    /// as the row's tooltip (`tooltip`).
+    /// jump, escaped (`escaped`). Shown on the second line when there is
+    /// no action key, else as the row's tooltip (`tooltip`).
     description: []const u8 = "",
     /// The shortcut the action is bound to (`shortcutLabel`), or empty.
     shortcut: []const u8 = "",
@@ -240,7 +241,7 @@ pub fn build(
         const pwd = jump.pwd orelse "";
         list.appendAssumeCapacity(try withFolded(a, .{
             .title = try a.print("Focus: {s}", .{shown}),
-            .description = if (pwd.len > 0 and std.mem.indexOf(u8, shown, pwd) == null) try a.dupe(u8, pwd) else "",
+            .description = if (pwd.len > 0 and std.mem.indexOf(u8, shown, pwd) == null) try escaped(a, pwd) else "",
             .run = .{ .jump = jump.surface },
             .sort_key = i,
         }));
@@ -248,6 +249,25 @@ pub fn build(
     // Stable, as GTK's sort is.
     std.mem.sort(Entry, list.items, {}, lessThan);
     return .{ .arena = arena, .items = list.items };
+}
+
+/// `text` with each code point that can reorder or hide text or add a
+/// line (`App.unsafeCodepoint`) written as "U+XXXX", as the context menu
+/// writes a shortcut's: for a jump's working directory, which its shell
+/// reports. Text that is not UTF-8 is kept as it is; the row leaves out a
+/// line it cannot convert (`drawRow`).
+fn escaped(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    const view = std.unicode.Utf8View.init(text) catch return a.dupe(u8, text);
+    var w: std.Io.Writer.Allocating = .init(a);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (unsafeCodepoint(cp)) {
+            w.writer.print("U+{X:0>4}", .{cp}) catch return error.OutOfMemory;
+        } else {
+            w.writer.print("{u}", .{cp}) catch return error.OutOfMemory;
+        }
+    }
+    return w.written();
 }
 
 /// The entries for `app` now: its configuration's commands and shortcuts,
@@ -1823,6 +1843,28 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     try testing.expect(focus[2].run.jump == one);
     try testing.expectEqualStrings("", focus[3].shortcut);
     try testing.expectEqualStrings("", focus[3].action_key);
+}
+
+test "win32: a jump's working directory cannot reorder or hide the palette's text" {
+    const alloc = testing.allocator;
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    // As a shell can report them (src/termio/windows_pwd.zig takes a bidi
+    // control); the text not UTF-8 stays, and its line is left out.
+    const jumps = [_]Jump{
+        .{ .surface = @ptrFromInt(0x10000), .title = "a", .pwd = "C:\\a\u{202E}gpj.exe" },
+        .{ .surface = @ptrFromInt(0x20000), .title = "b", .pwd = "C:\\b\u{200B}\u{2066}c\u{85}" },
+        .{ .surface = @ptrFromInt(0x30000), .title = "c", .pwd = "C:\\caf\u{E9}" },
+        .{ .surface = @ptrFromInt(0x40000), .title = "d", .pwd = "C:\\d\xff" },
+    };
+    var entries = try build(alloc, &.{}, &config.keybind.set, &jumps);
+    defer entries.deinit();
+    const want = [_][]const u8{ "C:\\aU+202Egpj.exe", "C:\\bU+200BU+2066cU+0085", "C:\\caf\u{E9}", "C:\\d\xff" };
+    try testing.expectEqual(want.len, entries.items.len);
+    for (entries.items) |e| {
+        const i = @intFromPtr(e.run.jump) / 0x10000 - 1;
+        try testing.expectEqualStrings(want[i], e.description);
+    }
 }
 
 test "win32: a palette row's tooltip is its description, unless the row shows it already" {
