@@ -633,7 +633,7 @@ pub const Surface = struct {
         /// `window-inherit-working-directory` or
         /// `split-inherit-working-directory` as `context` says; see
         /// `inheritWorkingDirectory`. Borrowed for the duration of
-        /// `create`. Null keeps newConfig's.
+        /// `create`. Null keeps newConfig's, once checked.
         working_directory: ?[]const u8 = null,
 
         /// What the terminal is opened as, for `apprt.surface.newConfig`.
@@ -725,7 +725,7 @@ pub const Surface = struct {
         // works on it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
-        if (opts.working_directory) |wd| inheritWorkingDirectory(&config, wd);
+        inheritWorkingDirectory(&config, app.config.@"working-directory", opts.working_directory);
         // A failing CoreSurface.init joins any thread it started (unpumped,
         // as CoreSurface.deinit does), so the errdefers above run with no
         // core thread left using this surface or its window.
@@ -752,41 +752,69 @@ pub const Surface = struct {
         return self;
     }
 
-    /// Make `wd`, the asking terminal's working directory, the new one's,
-    /// as the macOS runtime does (`Surface.init` in src/apprt/embedded.zig):
-    /// only an absolute path to an existing directory, otherwise the
-    /// directory `config` already names is kept.
+    /// Settle a new terminal's working directory in `config`, which
+    /// `apprt.surface.newConfig` made: `wd`, the asking terminal's
+    /// (`App.inheritedOptions`), or else the focused terminal's, which
+    /// newConfig may have put in. Either is taken only as an absolute path
+    /// to an existing directory, as the macOS runtime takes `wd`
+    /// (`Surface.init` in src/apprt/embedded.zig); otherwise `configured`,
+    /// the app's `working-directory`, goes back in.
     ///
-    /// Reachable today: a surface's working directory starts as its
-    /// subprocess's (src/termio/Exec.zig, `term.setPwd(cwd)`), which comes
-    /// from `working-directory` and may be relative. A relative one is not
-    /// resolved here, since this process's cwd is not the shell's, and
-    /// `openDirAbsolute` asserts an absolute path.
-    fn inheritWorkingDirectory(config: *configpkg.Config, wd: []const u8) void {
-        if (wd.len == 0) return;
-        if (!std.fs.path.isAbsolute(wd)) {
-            log.warn("the inherited working directory is not absolute dir={s}", .{wd});
+    /// A terminal's working directory is the last one its shell reported
+    /// (OSC 7 or 9;9, src/termio/windows_pwd.zig), or else where it started
+    /// (src/termio/Exec.zig, `term.setPwd(cwd)`), which comes from
+    /// `working-directory` and may be relative. Unchecked, a file's path
+    /// would reach CreateProcessW as the shell's current directory, which
+    /// fails, leaving the terminal without a shell: Exec drops only a path
+    /// it cannot access. A relative path is not resolved here, since this
+    /// process's cwd is not the shell's, and `openDirAbsolute` asserts an
+    /// absolute path.
+    fn inheritWorkingDirectory(
+        config: *configpkg.Config,
+        configured: ?configpkg.WorkingDirectory,
+        wd: ?[]const u8,
+    ) void {
+        const proposed = wd orelse inherited: {
+            const chosen = config.@"working-directory" orelse return;
+            if (chosen != .path) return;
+            if (configured) |c| if (c == .path and std.mem.eql(u8, c.path, chosen.path)) return;
+            break :inherited chosen.path;
+        };
+        if (proposed.len == 0) return;
+        if (!isDirectory(proposed)) {
+            config.@"working-directory" = configured;
             return;
         }
-        var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
-            log.warn("cannot open the inherited working directory dir={s} err={}", .{ wd, err });
-            return;
-        };
-        defer dir.close(global.io());
-        const stat = dir.stat(global.io()) catch |err| {
-            log.warn("cannot stat the inherited working directory dir={s} err={}", .{ wd, err });
-            return;
-        };
-        if (stat.kind != .directory) {
-            log.warn("the inherited working directory is not a directory dir={s}", .{wd});
-            return;
-        }
-        var value: configpkg.WorkingDirectory = .{ .path = wd };
+        var value: configpkg.WorkingDirectory = .{ .path = proposed };
         value.finalize(config.arenaAlloc()) catch |err| {
             log.warn("cannot finalize the inherited working directory err={}", .{err});
+            config.@"working-directory" = configured;
             return;
         };
         config.@"working-directory" = value;
+    }
+
+    /// Whether `path` is an absolute path to an existing directory, for
+    /// `inheritWorkingDirectory`, logging why not.
+    fn isDirectory(path: []const u8) bool {
+        if (!std.fs.path.isAbsolute(path)) {
+            log.warn("the inherited working directory is not absolute dir={s}", .{path});
+            return false;
+        }
+        var dir = std.Io.Dir.openDirAbsolute(global.io(), path, .{}) catch |err| {
+            log.warn("cannot open the inherited working directory dir={s} err={}", .{ path, err });
+            return false;
+        };
+        defer dir.close(global.io());
+        const stat = dir.stat(global.io()) catch |err| {
+            log.warn("cannot stat the inherited working directory dir={s} err={}", .{ path, err });
+            return false;
+        };
+        if (stat.kind != .directory) {
+            log.warn("the inherited working directory is not a directory dir={s}", .{path});
+            return false;
+        }
+        return true;
     }
 
     /// Release everything except the window and the allocation itself.
@@ -3951,7 +3979,7 @@ test "win32: a finished teardown posts the ones it deferred again" {
     ).toBool());
 }
 
-test "win32: a new window inherits only an existing working directory" {
+test "win32: a new terminal inherits only an existing working directory, else the configured one" {
     const testing = std.testing;
     const alloc = testing.allocator;
 
@@ -3965,19 +3993,41 @@ test "win32: a new window inherits only an existing working directory" {
     const missing_path = try std.fs.path.join(alloc, &.{ dir_path, "missing" });
     defer alloc.free(missing_path);
 
+    // A name no directory can have, and bytes that are not UTF-8, which
+    // CreateProcessW's environment block cannot take as PWD.
+    const bad_name = try std.mem.concat(alloc, u8, &.{ dir_path, "\\a|b" });
+    defer alloc.free(bad_name);
+    const not_utf8 = try std.mem.concat(alloc, u8, &.{ dir_path, "\\a\xffb" });
+    defer alloc.free(not_utf8);
+
     var config = try configpkg.Config.default(alloc);
     defer config.deinit();
     const configured = config.@"working-directory";
 
-    // A file, a missing path, nothing, or a path that is not absolute:
-    // the configured directory stays. A relative one would reach
-    // openDirAbsolute's assert.
-    for ([_][]const u8{ file_path, missing_path, "", "relative\\dir", "C:relative" }) |wd| {
-        Surface.inheritWorkingDirectory(&config, wd);
+    // A file, a missing path, a bad name, or a path that is not absolute:
+    // the configured directory goes back in, in place of the copy newConfig
+    // made of the same path. A relative one would reach openDirAbsolute's
+    // assert.
+    for ([_][]const u8{ file_path, missing_path, bad_name, not_utf8, "relative\\dir", "C:relative" }) |wd| {
+        config.@"working-directory" = .{ .path = wd };
+        Surface.inheritWorkingDirectory(&config, configured, wd);
         try testing.expectEqualDeep(configured, config.@"working-directory");
     }
+    // Nothing: newConfig's choice stands.
+    Surface.inheritWorkingDirectory(&config, configured, "");
+    try testing.expectEqualDeep(configured, config.@"working-directory");
 
-    Surface.inheritWorkingDirectory(&config, dir_path);
+    // No asking terminal: the focused terminal's, which newConfig put in,
+    // is checked the same way.
+    config.@"working-directory" = .{ .path = file_path };
+    Surface.inheritWorkingDirectory(&config, configured, null);
+    try testing.expectEqualDeep(configured, config.@"working-directory");
+    config.@"working-directory" = .{ .path = dir_path };
+    Surface.inheritWorkingDirectory(&config, configured, null);
+    try testing.expectEqualStrings(dir_path, config.@"working-directory".?.path);
+
+    config.@"working-directory" = configured;
+    Surface.inheritWorkingDirectory(&config, configured, dir_path);
     const got = config.@"working-directory" orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings(dir_path, got.path);
 }
