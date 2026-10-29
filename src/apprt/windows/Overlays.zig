@@ -293,10 +293,11 @@ fn reparent(hwnd: win32.HWND, window: *const Window, comptime name: []const u8) 
     }
 }
 
-/// `surface`'s client area in its frame's client coordinates; null while
-/// the terminal is hidden: a hidden tab's terminals are hidden
-/// (`Window.selectTab`), and so is one a zoom hides (`Window.layout`).
-fn paneRect(surface: *const Surface) ?RECT {
+/// `surface`'s client area in its frame's client coordinates, which leaves
+/// out its scroll bar (`ScrollBar`); null while the terminal is hidden: a
+/// hidden tab's terminals are hidden (`Window.selectTab`), and so is one a
+/// zoom hides (`Window.layout`).
+pub fn paneRect(surface: *const Surface) ?RECT {
     if (!SearchBar.visibleStyle(surface.hwnd)) return null;
     var client: RECT = undefined;
     var origin: win32.POINT = .{ .x = 0, .y = 0 };

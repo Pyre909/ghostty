@@ -1325,6 +1325,65 @@ pub const WM_PRINTCLIENT: UINT = 0x0318;
 /// WM_PRINTCLIENT: draw the client area.
 pub const PRF_CLIENT: LPARAM = 0x0004;
 
+// A terminal's scroll bar (ScrollBar.zig): the window's own vertical scroll
+// bar, WS_VSCROLL, and the loops DefWindowProcW runs for it.
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-scrollinfo
+pub const SCROLLINFO = extern struct {
+    cbSize: UINT = @sizeOf(SCROLLINFO),
+    fMask: UINT,
+    nMin: c_int = 0,
+    nMax: c_int = 0,
+    nPage: UINT = 0,
+    nPos: c_int = 0,
+    nTrackPos: c_int = 0,
+};
+/// SCROLLINFO's members to set or read.
+pub const SIF_RANGE: UINT = 0x0001;
+pub const SIF_PAGE: UINT = 0x0002;
+pub const SIF_POS: UINT = 0x0004;
+/// SetScrollInfo: a bar its new range makes needless is disabled, not
+/// removed.
+pub const SIF_DISABLENOSCROLL: UINT = 0x0008;
+pub const SIF_TRACKPOS: UINT = 0x0010;
+pub const SIF_ALL: UINT = SIF_RANGE | SIF_PAGE | SIF_POS | SIF_TRACKPOS;
+/// The window's own vertical scroll bar.
+pub const SB_VERT: c_int = 1;
+/// WM_VSCROLL's request, the low word of wParam.
+/// https://learn.microsoft.com/en-us/windows/win32/controls/wm-vscroll
+pub const SB_LINEUP: u16 = 0;
+pub const SB_LINEDOWN: u16 = 1;
+pub const SB_PAGEUP: u16 = 2;
+pub const SB_PAGEDOWN: u16 = 3;
+pub const SB_THUMBPOSITION: u16 = 4;
+pub const SB_THUMBTRACK: u16 = 5;
+pub const SB_TOP: u16 = 6;
+pub const SB_BOTTOM: u16 = 7;
+pub const SB_ENDSCROLL: u16 = 8;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setscrollinfo
+pub extern "user32" fn SetScrollInfo(hwnd: HWND, bar: c_int, info: *const SCROLLINFO, redraw: BOOL) callconv(.winapi) c_int;
+pub extern "user32" fn GetScrollInfo(hwnd: HWND, bar: c_int, info: *SCROLLINFO) callconv(.winapi) BOOL;
+/// WM_SYSCOMMAND's scroll bar commands, under SC_MASK.
+pub const SC_VSCROLL: WPARAM = 0xF070;
+pub const SC_HSCROLL: WPARAM = 0xF080;
+/// WM_NCHITTEST: on the vertical scroll bar.
+pub const HTVSCROLL: u16 = 7;
+/// https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nclbuttondown
+pub const WM_NCLBUTTONDOWN: UINT = 0x00A1;
+/// https://learn.microsoft.com/en-us/windows/win32/menurc/wm-contextmenu
+pub const WM_CONTEXTMENU: UINT = 0x007B;
+/// The width of a vertical scroll bar.
+pub const SM_CXVSCROLL: c_int = 2;
+/// Ends a scroll bar's tracking and a menu's loop, and releases the
+/// capture (DefWindowProcW).
+/// https://learn.microsoft.com/en-us/windows/win32/winmsg/wm-cancelmode
+pub const WM_CANCELMODE: UINT = 0x001F;
+pub extern "user32" fn EndMenu() callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/gdi/wm-print
+pub const WM_PRINT: UINT = 0x0317;
+/// WM_PRINT: draw the non-client area.
+pub const PRF_NONCLIENT: LPARAM = 0x0002;
+
 comptime {
     // The SDK's sizes on 64-bit Windows.
     if (@sizeOf(usize) == 8) {
@@ -1333,6 +1392,7 @@ comptime {
         std.debug.assert(@sizeOf(TOOLINFOW) == 72);
         std.debug.assert(@sizeOf(MSG) == 48);
     }
+    std.debug.assert(@sizeOf(SCROLLINFO) == 28);
 }
 
 /// The RGB macro of wingdi.h.

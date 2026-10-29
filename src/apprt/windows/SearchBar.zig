@@ -40,6 +40,7 @@ const CoreSurface = @import("../../Surface.zig");
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
+const Overlays = @import("Overlays.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -601,12 +602,12 @@ pub fn place(surface: *Surface) void {
 /// Where `surface`'s bar goes over its terminal now, in the frame's
 /// client coordinates, and the sizes it is laid out with, its field given
 /// the font for the frame's DPI first; null if the terminal is too small
-/// for it (`barRect`).
+/// for it (`barRect`). Over the terminal's client area, as the overlays
+/// are placed (`Overlays.paneRect`), so beside its scroll bar, not over it.
 fn placement(surface: *Surface) ?struct { at: RECT, metrics: Metrics } {
     const bar = &surface.search_bar;
     const window = surface.window;
-    var pane: RECT = undefined;
-    if (!win32.GetWindowRect(surface.hwnd, &pane).toBool() or !window.toClient(&pane)) return null;
+    const pane = Overlays.paneRect(surface) orelse return null;
     const dpi = Window.dpiOf(surface.app, window.hwnd);
     bar.applyFont(dpi);
     const m = Metrics.init(dpi);

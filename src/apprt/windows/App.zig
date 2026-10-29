@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const apprt = @import("../../apprt.zig");
@@ -28,6 +29,7 @@ const ChildExited = @import("ChildExited.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const ContextMenu = @import("ContextMenu.zig");
+const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const toast = @import("toast.zig");
 const confirm = @import("dialog.zig").confirm;
@@ -216,10 +218,10 @@ pub const App = struct {
     /// loop; see `canReenterCore`.
     prompt_depth: u32,
 
-    /// Number of system modal loops (window size/move, window menu) the main
-    /// thread is currently inside. `run` does not get control back until such
-    /// a loop ends, so while this is non-zero the wakeup handler ticks
-    /// instead; see `wndProc`.
+    /// Number of system modal loops (window size/move, window menu, a
+    /// terminal's scroll bar) the main thread is currently inside. `run`
+    /// does not get control back until such a loop ends, so while this is
+    /// non-zero the wakeup handler ticks instead; see `wndProc`.
     modal_loop_depth: u32,
 
     /// Number of surface teardowns (`Surface.stopCore`) on the stack.
@@ -233,7 +235,8 @@ pub const App = struct {
 
     /// Number of modal loops a terminal's own message handler is running
     /// (`beginTerminalLoop`): its context menu's, from its WM_RBUTTONUP
-    /// (`ContextMenu.show`). Such a loop dispatches every message posted
+    /// (`ContextMenu.show`), and its scroll bar's, from DefWindowProcW
+    /// (`ScrollBar.loop`). Such a loop dispatches every message posted
     /// meanwhile, WM_GHOSTTY_DESTROY among them, and returns to that
     /// handler when it ends; nothing holds the terminal alive
     /// (`Surface.ref` counts nothing). While this is non-zero no teardown
@@ -247,7 +250,8 @@ pub const App = struct {
     /// destroys the frame that owns the menu (`Window.destroy`), and a
     /// count per terminal would have to be read by both. The cost is that
     /// every teardown waits until the loop ends, which for a menu is when
-    /// the user chooses or dismisses it.
+    /// the user chooses or dismisses it, and for the scroll bar when the
+    /// button comes up.
     terminal_loops: u32,
 
     /// Set for the whole of `terminate`. Teardown is driven from there
@@ -326,7 +330,8 @@ pub const App = struct {
         decorations: *CoreSurface,
 
         /// Give every window the decorations the configuration now asks
-        /// for (`configChange`), and lay it out again, since
+        /// for (`configChange`), and every terminal the scroll bar it asks
+        /// for (`ScrollBar.restyle`), and lay each window out again, since
         /// `window-show-tab-bar` may have changed.
         redecorate,
 
@@ -827,8 +832,14 @@ pub const App = struct {
         if (self.ticking) return;
         self.ticking = true;
         defer self.ticking = false;
+        if (builtin.is_test) if (test_tick) |seen| return seen(self);
         try self.core_app.tick(self);
     }
+
+    /// For tests: told of each `tick`, in place of the core's, which a
+    /// test's app does not have (`testApp`).
+    pub var test_tick: if (builtin.is_test) ?*const fn (*App) void else void =
+        if (builtin.is_test) null else {};
 
     /// Tick from inside a message handler, where there is no caller to
     /// return an error to. Does nothing unless `canReenterCore`.
@@ -974,7 +985,8 @@ pub const App = struct {
     /// `endTerminalLoop` (`terminal_loops`). Ticking is left alone: a loop
     /// the frame hears of, as the menu's WM_ENTERMENULOOP, is counted in
     /// `modal_loop_depth` there; one it does not, as DefWindowProcW's for
-    /// a click on a scroll bar, must count itself there as well.
+    /// a click on a scroll bar, must count itself there as well
+    /// (`ScrollBar.loop`).
     pub fn beginTerminalLoop(self: *App) void {
         self.terminal_loops += 1;
     }
@@ -1233,6 +1245,7 @@ pub const App = struct {
             .key_table => keyTable(target, value),
             .readonly => readOnly(target, value),
             .show_child_exited => childExited(target, value),
+            .scrollbar => scrollBar(target, value),
 
             // Everything else, including
             // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
@@ -1335,6 +1348,16 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| ChildExited.show(v.rt_surface, value),
+        };
+    }
+
+    /// `.scrollbar`, from the core's tick when its rows change: the
+    /// terminal's scroll bar shows them (`ScrollBar.update`). `false` for
+    /// the app, and for a terminal with no bar (`scrollbar = never`).
+    fn scrollBar(target: apprt.Target, value: terminal.Scrollbar) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| ScrollBar.update(v.rt_surface, value),
         };
     }
 
@@ -1891,11 +1914,11 @@ pub const App = struct {
             window.applyTheme();
         }
         for (self.surfaces.items) |surface| surface.overlays.invalidate();
-        // `window-decoration` may have changed, here or in a theme a soft
-        // reload switched to; the frames change for it from `run`, since a
-        // soft reload comes inside a core frame. `run` is woken for it: the
-        // reload that `run`'s own syncColorScheme makes comes after its
-        // createRequested.
+        // `window-decoration` and `scrollbar` may have changed, here or in
+        // a theme a soft reload switched to; the frames and the terminals
+        // change for them from `run`, since a soft reload comes inside a
+        // core frame. `run` is woken for it: the reload that `run`'s own
+        // syncColorScheme makes comes after its createRequested.
         self.requests.append(self.core_app.alloc, .redecorate) catch |err| {
             log.warn("cannot record redecorating the windows err={}", .{err});
             return true;
@@ -2606,6 +2629,7 @@ pub const App = struct {
                 // And `window-show-tab-bar` may have changed.
                 .redecorate => for (self.windows.items) |window| {
                     window.applyDecorations();
+                    window.applyScrollBars();
                     window.relayout();
                 },
                 // A window covering its monitor is left as it is: maximized,
@@ -3841,8 +3865,9 @@ fn testFrame(app: *App) !*Window {
 }
 
 /// For tests: a hidden terminal window of the real class in `window`,
-/// owned by `app`, with no core surface: a teardown only destroys and
-/// frees it. The caller puts it in the window's tree. A test that
+/// owned by `app`, with no core surface, and the scroll bar the
+/// configuration asks for (`ScrollBar.style`): a teardown only destroys
+/// and frees it. The caller puts it in the window's tree. A test that
 /// activates its frame hands it the focus and takes it back at teardown,
 /// so it has what WM_SETFOCUS and WM_KILLFOCUS read.
 fn testPane(app: *App, window: *Window) !*Surface {
@@ -3867,12 +3892,13 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.notifications = .{ .id = @intFromPtr(surface) };
     surface.search_bar = .{};
     surface.overlays = .{};
+    surface.scroll_bar = .{};
     surface.preedit = .none;
     _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
         null,
-        win32.WS_CHILD,
+        win32.WS_CHILD | ScrollBar.style(&app.config),
         0,
         0,
         200,
@@ -3886,6 +3912,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
         return error.TestUnexpectedResult;
     };
     // As `Surface.create` makes it.
+    ScrollBar.made(surface);
     Overlays.create(surface);
     app.surfaces.appendAssumeCapacity(surface);
     return surface;
@@ -3958,7 +3985,8 @@ test "win32: a window's terminal fills it, and both are freed once" {
     window.tab().focused = surface;
 
     // The frame's WM_SIZE, sent even to a hidden window, lays the terminal
-    // out over the frame's new client area.
+    // out over the frame's new client area; its own is what its scroll bar
+    // leaves of it.
     try std.testing.expect(win32.SetWindowPos(
         window.hwnd,
         null,
@@ -3970,7 +3998,10 @@ test "win32: a window's terminal fills it, and both are freed once" {
     ).toBool());
     const frame_client = try clientRect(window.hwnd);
     try std.testing.expect(frame_client.right > 200);
-    try std.testing.expectEqual(frame_client, try clientRect(surface.hwnd));
+    try std.testing.expectEqual(frame_client, try paneRect(window, surface));
+    var inner = frame_client;
+    inner.right -= ScrollBar.width(surface);
+    try std.testing.expectEqual(inner, try clientRect(surface.hwnd));
 
     // DestroyWindow on the frame sends WM_DESTROY to the frame, then to the
     // terminal's window, and the frame's WM_NCDESTROY only after its child
@@ -3987,6 +4018,17 @@ fn paneRect(window: *const Window, pane: *const Surface) !win32.RECT {
     var rect: win32.RECT = undefined;
     if (!win32.GetWindowRect(pane.hwnd, &rect).toBool()) return error.TestUnexpectedResult;
     if (!window.toClient(&rect)) return error.TestUnexpectedResult;
+    return rect;
+}
+
+/// For tests: where `pane`'s client area, its window less its scroll bar,
+/// is inside its frame's client area, worked out here, not as the
+/// overlays work it out (`Overlays.paneRect`).
+fn paneClient(window: *const Window, pane: *const Surface) !win32.RECT {
+    var rect = try paneRect(window, pane);
+    const client = try clientRect(pane.hwnd);
+    rect.right = rect.left + client.right;
+    rect.bottom = rect.top + client.bottom;
     return rect;
 }
 
@@ -4611,6 +4653,9 @@ test "win32: beside a divider a terminal lets the pointer through to the frame" 
     core_app.alloc = alloc;
     var app: App = undefined;
     try testApp(&app, &core_app);
+    // Without scroll bars, which keep their pixels beside a line ("beside
+    // a divider a terminal's scroll bar keeps its pixels").
+    app.config.scrollbar = .never;
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -4677,6 +4722,9 @@ test "win32: a zoomed tab, and a tab not shown, have no band" {
     core_app.alloc = alloc;
     var app: App = undefined;
     try testApp(&app, &core_app);
+    // Without scroll bars, which keep their pixels beside a line ("beside
+    // a divider a terminal's scroll bar keeps its pixels").
+    app.config.scrollbar = .never;
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -4725,6 +4773,9 @@ test "win32: the band follows a new split and a DPI change" {
     core_app.alloc = alloc;
     var app: App = undefined;
     try testApp(&app, &core_app);
+    // Without scroll bars, which keep their pixels beside a line ("beside
+    // a divider a terminal's scroll bar keeps its pixels").
+    app.config.scrollbar = .never;
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -4992,6 +5043,9 @@ test "win32: a dragged divider stops at a pixel for each terminal beyond it" {
     core_app.alloc = alloc;
     var app: App = undefined;
     try testApp(&app, &core_app);
+    // Without scroll bars, which keep their pixels beside a line ("beside
+    // a divider a terminal's scroll bar keeps its pixels").
+    app.config.scrollbar = .never;
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -8458,7 +8512,7 @@ test "win32: toggle_fullscreen waits for run, covers the monitor and comes back"
     app.createRequested();
     try std.testing.expectEqual(info.rcMonitor, try windowRect(window.hwnd));
     try std.testing.expect(!captioned(window.hwnd));
-    try std.testing.expectEqual(try clientRect(window.hwnd), try clientRect(pane.hwnd));
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, pane));
 
     // Not maximized while it covers the monitor.
     try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_maximize, {}));
@@ -8856,10 +8910,14 @@ test "win32: resize_window waits for run and resizes the window of a lone termin
     try std.testing.expectEqual(1, app.requests.items.len);
     try std.testing.expectEqual(before, try clientRect(window.hwnd));
     app.createRequested();
+    // The terminal's grid, beside which its scroll bar goes.
     const wide = try clientRect(window.hwnd);
-    try std.testing.expectEqual(Window.scaledSize(300, scale.x), wide.right);
+    const bar = ScrollBar.width(pane);
+    try std.testing.expect(bar > 0);
+    try std.testing.expectEqual(Window.scaledSize(300, scale.x), (try clientRect(pane.hwnd)).right);
+    try std.testing.expectEqual(Window.scaledSize(300, scale.x) + bar, wide.right);
     try std.testing.expectEqual(before.bottom, wide.bottom);
-    try std.testing.expectEqual(wide, try clientRect(pane.hwnd));
+    try std.testing.expectEqual(wide, try paneRect(window, pane));
 
     // The height, and the width kept.
     try std.testing.expect(try app.performAction(target, .resize_window, .{ .width = 0, .height = 200 }));
@@ -8947,8 +9005,11 @@ test "win32: reset_window_size waits for run and gives the window a new one's si
     try std.testing.expect(try app.performAction(target, .reset_window_size, {}));
     try std.testing.expectEqual(before, try clientRect(window.hwnd));
     app.createRequested();
+    // The terminal's grid, beside which its scroll bar goes.
     const sized = try clientRect(window.hwnd);
-    try std.testing.expectEqual(Window.scaledSize(320, scale.x), sized.right);
+    try std.testing.expect(ScrollBar.width(pane) > 0);
+    try std.testing.expectEqual(Window.scaledSize(320, scale.x), (try clientRect(pane.hwnd)).right);
+    try std.testing.expectEqual(Window.scaledSize(320, scale.x) + ScrollBar.width(pane), sized.right);
     try std.testing.expectEqual(Window.scaledSize(180, scale.x), sized.bottom);
 
     // A maximized window is restored and given it, though it was
@@ -9794,7 +9855,7 @@ test "win32: toggle_window_decorations waits for run and takes the caption off o
     try std.testing.expect(!captioned(window.hwnd));
     try std.testing.expectEqual(placed, try windowRect(window.hwnd));
     try std.testing.expect((try clientRect(window.hwnd)).bottom > framed.bottom);
-    try std.testing.expectEqual(try clientRect(window.hwnd), try clientRect(pane.hwnd));
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, pane));
 
     // Leaving fullscreen keeps it so; and a toggle while it covers the
     // monitor changes nothing there, but shows when it leaves.
@@ -10383,7 +10444,7 @@ fn expectBarOver(window: *const Window, surface: *const Surface) !void {
     try std.testing.expect(shown(hwnd));
     try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
     const m = SearchBar.Metrics.init(Window.dpiOf(window.app, window.hwnd));
-    const want = SearchBar.barRect(m, try paneRect(window, surface), surface.search_bar.text_height) orelse
+    const want = SearchBar.barRect(m, try paneClient(window, surface), surface.search_bar.text_height) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqual(want, try childRect(window, hwnd));
     try std.testing.expect(above(window.hwnd, hwnd, surface.hwnd));
@@ -11705,11 +11766,16 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     try std.testing.expect(p.surface == b);
     try std.testing.expect(p.text_height > 0);
     const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
-    const want = CommandPalette.paletteRect(m, window.layoutArea().?, p.text_height).?;
+    // In the area under the tab bar, less the scroll bar of b, the
+    // terminal along its right edge.
+    var area = window.layoutArea().?;
+    area.right = (try paneClient(window, b)).right;
+    try std.testing.expect(area.right < window.layoutArea().?.right);
+    const want = CommandPalette.paletteRect(m, area, p.text_height).?;
     try std.testing.expectEqual(want, try childRect(window, hwnd));
     try std.testing.expectEqual(m.width, want.right - want.left);
     // Centred, under the top of the area.
-    try std.testing.expectEqual(@divTrunc((try clientRect(window.hwnd)).right - m.width, 2), want.left);
+    try std.testing.expectEqual(@divTrunc(area.right - m.width, 2), want.left);
     try std.testing.expectEqual(window.layoutArea().?.top + m.margin, want.top);
     try std.testing.expect(FocusSeen.last == p.edit.?);
     // Every entry, the first selected, its rows two lines tall.
@@ -12113,13 +12179,14 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     try togglePalette(&app, a);
     try std.testing.expect(p.hwnd == null);
     testResize(window, 1000, 700);
-    // A narrower window: narrower, and placed again.
+    // A narrower window: narrower, and placed again, left of b's scroll
+    // bar.
     try togglePalette(&app, a);
     testResize(window, 500, 700);
     try std.testing.expect(p.hwnd != null);
     const narrow = try childRect(window, p.hwnd.?);
     const margin = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd)).margin;
-    try std.testing.expectEqual((try clientRect(window.hwnd)).right - 2 * margin, narrow.right - narrow.left);
+    try std.testing.expectEqual((try paneClient(window, b)).right - 2 * margin, narrow.right - narrow.left);
     try std.testing.expectEqual(margin, narrow.left);
 
     // Its terminal begins to close: closed. Another one: still open.
@@ -12541,7 +12608,7 @@ fn expectPreviewAt(window: *const Window, surface: *const Surface, side: LinkPre
     try std.testing.expect(shown(hwnd));
     try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
     try std.testing.expect(p.text_size.width > 0 and p.text_size.height > 0);
-    const pane = try paneRect(window, surface);
+    const pane = try paneClient(window, surface);
     const m = LinkPreview.Metrics.init(Window.dpiOf(window.app, window.hwnd));
     const width = @min(p.text_size.width + 2 * m.pad_x, pane.right - pane.left);
     const height = p.text_size.height + 2 * m.pad_y;
@@ -12621,7 +12688,8 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     try std.testing.expect(try testLink(&app, b, ""));
     try std.testing.expect(!shown(hwnd));
 
-    // A URL wider than its terminal: as wide as the terminal, cut there.
+    // A URL wider than its terminal: as wide as the terminal's client
+    // area, left of its scroll bar, cut there.
     var long_buf: [321]u8 = undefined;
     @memcpy(long_buf[0..20], "https://example.com/");
     @memset(long_buf[20..320], 'x');
@@ -12629,7 +12697,7 @@ test "win32: mouse_over_link shows the URL over its terminal's bottom-left corne
     const long: [:0]const u8 = long_buf[0..320 :0];
     try std.testing.expect(try testLink(&app, b, long));
     try expectPreviewAt(window, b, .left);
-    const pane = try paneRect(window, b);
+    const pane = try paneClient(window, b);
     try std.testing.expect(b.overlays.link_preview.text_size.width > pane.right - pane.left);
     try std.testing.expectEqual(pane.right - pane.left, (try childRect(window, hwnd)).right - (try childRect(window, hwnd)).left);
     try std.testing.expectEqualStrings(long, try previewText(b, &buf));
@@ -13050,7 +13118,7 @@ fn expectKeyStateAt(window: *const Window, surface: *const Surface) !void {
     try std.testing.expect(shown(hwnd));
     try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
     try std.testing.expect(k.text_size.width > 0 and k.text_size.height > 0);
-    const pane = try paneRect(window, surface);
+    const pane = try paneClient(window, surface);
     const m = KeyState.Metrics.init(Window.dpiOf(window.app, window.hwnd));
     const width = @min(k.text_size.width + 2 * m.pad_x, pane.right - pane.left - 2 * m.margin);
     const height = k.text_size.height + 2 * m.pad_y;
@@ -13500,7 +13568,7 @@ fn expectBadgeAt(window: *const Window, surface: *const Surface) !void {
     try std.testing.expect(shown(hwnd));
     try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
     try std.testing.expect(b.text_size.width > 0 and b.text_size.height > 0);
-    const pane = try paneRect(window, surface);
+    const pane = try paneClient(window, surface);
     const m = ReadOnly.Metrics.init(Window.dpiOf(window.app, window.hwnd));
     const width = b.text_size.width + 2 * m.pad;
     const height = b.text_size.height + 2 * m.pad;
@@ -13948,7 +14016,7 @@ fn expectBannerAt(window: *const Window, surface: *const Surface, title: []const
     try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
     try std.testing.expect(c.text_size.width > 0 and c.text_size.height > 0);
     try std.testing.expect(c.label_size.width > 0 and c.label_size.height > 0);
-    const pane = try paneRect(window, surface);
+    const pane = try paneClient(window, surface);
     const m = ChildExited.Metrics.init(Window.dpiOf(window.app, window.hwnd));
     const button = @max(m.button, c.label_size.height + m.pad);
     const height = @max(button, c.text_size.height) + 2 * m.pad;
@@ -15196,6 +15264,9 @@ test "win32: a right click in a divider's band shows no context menu" {
     core_app.alloc = alloc;
     var app: App = undefined;
     try testApp(&app, &core_app);
+    // Without scroll bars, which keep their pixels beside a line ("beside
+    // a divider a terminal's scroll bar keeps its pixels").
+    app.config.scrollbar = .never;
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
@@ -15234,4 +15305,779 @@ test "win32: a right click in a divider's band shows no context menu" {
     try std.testing.expect(Dividers.at(window, .{ .x = line - 4, .y = y }) == null);
     testRightClick(a, line - 4 - ra.left, y - ra.top);
     try std.testing.expectEqual(1, MenuSeen.count);
+}
+
+/// For tests: the core's `scrollbar` on `surface`, as its tick performs it
+/// when the rows change.
+fn testRows(app: *App, surface: *Surface, total: usize, offset: usize, len: usize) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .scrollbar, .{ .total = total, .offset = offset, .len = len });
+}
+
+/// For tests: what `surface`'s scroll bar holds, as Windows reads it.
+fn testBarInfo(surface: *const Surface) !win32.SCROLLINFO {
+    var info: win32.SCROLLINFO = .{ .fMask = win32.SIF_ALL };
+    if (!win32.GetScrollInfo(surface.hwnd, win32.SB_VERT, &info).toBool()) return error.TestUnexpectedResult;
+    return info;
+}
+
+/// For tests: `surface`'s scroll bar holds the range from 0 to `max`, a
+/// page of `page`, at `pos`.
+fn expectBar(surface: *const Surface, max: c_int, page: c_uint, pos: c_int) !void {
+    const info = try testBarInfo(surface);
+    try std.testing.expectEqual(0, info.nMin);
+    try std.testing.expectEqual(max, info.nMax);
+    try std.testing.expectEqual(page, info.nPage);
+    try std.testing.expectEqual(pos, info.nPos);
+}
+
+/// For tests: whether `surface`'s window has its scroll bar.
+fn testHasBar(surface: *const Surface) bool {
+    const bit: isize = win32.WS_VSCROLL;
+    return win32.GetWindowLongPtrW(surface.hwnd, win32.GWL_STYLE) & bit != 0;
+}
+
+/// For tests: WM_VSCROLL to `surface` with the request `code`, and `high`
+/// in wParam's high word, as its scroll bar sends it.
+fn testScroll(surface: *const Surface, code: u16, high: u16) void {
+    const wparam = @as(win32.WPARAM, code) | (@as(win32.WPARAM, high) << 16);
+    _ = win32.SendMessageW(surface.hwnd, win32.WM_VSCROLL, wparam, 0);
+}
+
+/// For tests: `pane`'s window and client widths.
+fn testWidths(window: *const Window, pane: *const Surface) ![2]i32 {
+    const outer = try paneRect(window, pane);
+    return .{ outer.right - outer.left, (try clientRect(pane.hwnd)).right };
+}
+
+test "win32: scrollbar gives a terminal's bar the core's rows, and skips an update that changes none" {
+    // The bar's range is the scrollback's rows, its page the screen's, its
+    // position the viewport's top row, as Windows reads them back
+    // (GetScrollInfo); an update the bar already shows calls no
+    // SetScrollInfo. A scrollback no taller than the screen disables the
+    // bar rather than taking it away (SIF_DISABLENOSCROLL): the terminal
+    // keeps its width. Past what SetScrollInfo takes, the range stops
+    // there, where a wrap of 2^32 + 5 rows would give 4.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    // Made with the bar, `scrollbar = system` being the default, and
+    // disabled until the core's rows come: one row, a page of one.
+    try std.testing.expectEqual(.system, app.config.scrollbar);
+    try std.testing.expect(testHasBar(a));
+    const bar = ScrollBar.width(a);
+    try std.testing.expect(bar > 0);
+    const widths = try testWidths(window, a);
+    try std.testing.expectEqual(widths[0] - bar, widths[1]);
+    try expectBar(a, 0, 1, 0);
+
+    try std.testing.expect(!try app.performAction(.app, .scrollbar, .zero));
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    try expectBar(a, 999, 50, 500);
+
+    // The same again: nothing; then each value alone.
+    const sets = ScrollBar.test_sets;
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    try std.testing.expectEqual(sets, ScrollBar.test_sets);
+    for ([_][3]usize{ .{ 1000, 501, 50 }, .{ 1001, 501, 50 }, .{ 1001, 501, 49 } }, 1..) |r, n| {
+        try std.testing.expect(try testRows(&app, a, r[0], r[1], r[2]));
+        try std.testing.expectEqual(sets + n, ScrollBar.test_sets);
+        try expectBar(a, @intCast(r[0] - 1), @intCast(r[2]), @intCast(r[1]));
+    }
+
+    // No taller than the screen, or empty: disabled, the bar and the width
+    // kept.
+    for ([_]usize{ 50, 49, 0 }) |total| {
+        try std.testing.expect(try testRows(&app, a, total, 0, 50));
+        try std.testing.expect(testHasBar(a));
+        try std.testing.expectEqual(widths, try testWidths(window, a));
+    }
+
+    // Past what it takes.
+    try std.testing.expect(try testRows(&app, a, (1 << 32) + 5, 0, 50));
+    try std.testing.expectEqual(std.math.maxInt(i32), (try testBarInfo(a)).nMax);
+}
+
+test "win32: while its thumb is dragged the bar keeps its place, and takes the core's when the drag ends" {
+    // From SB_THUMBTRACK the core's rows reach the bar without their
+    // position, which the system keeps where the pointer holds the thumb,
+    // as macOS leaves its scroller alone while it is dragged; SB_ENDSCROLL
+    // gives it the position the core reported last. A loop that ends with
+    // no SB_ENDSCROLL ends the drag as well.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    PaletteSeen.reset(null);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    testScroll(a, win32.SB_THUMBTRACK, 0);
+    try std.testing.expect(try testRows(&app, a, 1100, 600, 50));
+    try expectBar(a, 1099, 50, 500);
+    testScroll(a, win32.SB_ENDSCROLL, 0);
+    try std.testing.expectEqual(600, (try testBarInfo(a)).nPos);
+    // And after it, every update in full.
+    try std.testing.expect(try testRows(&app, a, 1100, 610, 50));
+    try std.testing.expectEqual(610, (try testBarInfo(a)).nPos);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+
+    // The loop of a press on the thumb ends with no SB_ENDSCROLL.
+    const Drag = struct {
+        var during: c_int = -1;
+        fn run(surface: *Surface, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) win32.LRESULT {
+            _ = msg;
+            _ = wparam;
+            _ = lparam;
+            testScroll(surface, win32.SB_THUMBTRACK, 0);
+            _ = testRows(surface.app, surface, 1200, 700, 50) catch return 0;
+            during = (testBarInfo(surface) catch return 0).nPos;
+            return 0;
+        }
+    };
+    ScrollBar.test_loop = &Drag.run;
+    defer ScrollBar.test_loop = null;
+    _ = RealLoop.send(a.hwnd, win32.WM_SYSCOMMAND, 0xF087, 0);
+    try std.testing.expect(!RealLoop.ran);
+    try std.testing.expectEqual(610, Drag.during);
+    try expectBar(a, 1199, 50, 700);
+}
+
+test "win32: the bar's requests scroll the terminal to their row, once each" {
+    // WM_VSCROLL, as the bar sends it, performs the core's `scroll_to_row`
+    // with the row it names (`ScrollBar.rowFor`), from the row the core
+    // reported, or the one last asked of it that the core has not reported
+    // yet; and nothing when that is the row already: at either end, or the
+    // thumb where the core is. The thumb's row is the bar's 32-bit track
+    // position, not wParam's high word, which has 16 bits of it. Nothing
+    // reaches the core under a prompt, nor from a scroll bar control's
+    // WM_VSCROLL, which names the control.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    PaletteSeen.reset(null);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    // Each from 500, which the core reports first, of 1000 rows, 50 shown.
+    for ([_]struct { u16, []const u8 }{
+        .{ win32.SB_LINEDOWN, "scroll_to_row:501;" },
+        .{ win32.SB_LINEUP, "scroll_to_row:499;" },
+        .{ win32.SB_PAGEDOWN, "scroll_to_row:550;" },
+        .{ win32.SB_PAGEUP, "scroll_to_row:450;" },
+        .{ win32.SB_TOP, "scroll_to_row:0;" },
+        .{ win32.SB_BOTTOM, "scroll_to_row:950;" },
+    }) |c| {
+        try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+        testScroll(a, c[0], 0);
+        try std.testing.expectEqualStrings(c[1], PaletteSeen.take());
+        try std.testing.expect(PaletteSeen.on == a);
+    }
+
+    // Two steps before the core reports the first: the second from it.
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    testScroll(a, win32.SB_LINEDOWN, 0);
+    testScroll(a, win32.SB_LINEDOWN, 0);
+    try std.testing.expectEqualStrings("scroll_to_row:501;scroll_to_row:502;", PaletteSeen.take());
+
+    // At the ends, nothing to ask; nor at the end of a scroll.
+    try std.testing.expect(try testRows(&app, a, 1000, 0, 50));
+    for ([_]u16{ win32.SB_LINEUP, win32.SB_PAGEUP, win32.SB_TOP, win32.SB_ENDSCROLL }) |code| testScroll(a, code, 0);
+    try std.testing.expect(try testRows(&app, a, 1000, 950, 50));
+    for ([_]u16{ win32.SB_LINEDOWN, win32.SB_PAGEDOWN, win32.SB_BOTTOM }) |code| testScroll(a, code, 0);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+
+    // The thumb past what 16 bits hold. Outside the system's own drag
+    // Windows gives the bar's position as the thumb's: where the core is,
+    // nothing to ask, whatever the high word says.
+    try std.testing.expect(try testRows(&app, a, 200_000, 100_000, 50));
+    var track: win32.SCROLLINFO = .{ .fMask = win32.SIF_TRACKPOS };
+    try std.testing.expect(win32.GetScrollInfo(a.hwnd, win32.SB_VERT, &track).toBool());
+    try std.testing.expectEqual(100_000, track.nTrackPos);
+    testScroll(a, win32.SB_THUMBTRACK, 0x1234);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    // The core moved meanwhile, and the thumb stays where it was held: its
+    // row is now another, once.
+    try std.testing.expect(try testRows(&app, a, 200_000, 150_000, 50));
+    testScroll(a, win32.SB_THUMBTRACK, 0x1234);
+    testScroll(a, win32.SB_THUMBPOSITION, 0x1234);
+    try std.testing.expectEqualStrings("scroll_to_row:100000;", PaletteSeen.take());
+    testScroll(a, win32.SB_ENDSCROLL, 0);
+
+    // Under a prompt, nothing; after it, the request goes through.
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    app.beginPrompt(null);
+    testScroll(a, win32.SB_LINEDOWN, 0);
+    app.endPrompt();
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    testScroll(a, win32.SB_LINEDOWN, 0);
+    try std.testing.expectEqualStrings("scroll_to_row:501;", PaletteSeen.take());
+
+    // A control's.
+    _ = win32.SendMessageW(a.hwnd, win32.WM_VSCROLL, win32.SB_PAGEDOWN, @bitCast(@intFromPtr(window.hwnd)));
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+}
+
+test "win32: scrollbar = never makes terminals without a bar, and its action is not carried out" {
+    // The terminal's window has no bar and the grid all of its width; the
+    // core's rows are not given to SetScrollInfo, which would show a bar
+    // there for them, and the action answers false; no WM_VSCROLL moves
+    // the viewport.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.config.scrollbar = .never;
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    try std.testing.expect(!testHasBar(a));
+    try std.testing.expectEqual(0, ScrollBar.width(a));
+    const widths = try testWidths(window, a);
+    try std.testing.expectEqual(widths[0], widths[1]);
+    const sets = ScrollBar.test_sets;
+    try std.testing.expect(!try testRows(&app, a, 1000, 500, 50));
+    try std.testing.expectEqual(sets, ScrollBar.test_sets);
+    try std.testing.expect(!testHasBar(a));
+    try std.testing.expectEqual(widths, try testWidths(window, a));
+
+    // Nor are WM_VSCROLLs, which only the bar would send, taken.
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    PaletteSeen.reset(null);
+    for ([_]u16{ win32.SB_LINEDOWN, win32.SB_TOP, win32.SB_THUMBTRACK }) |code| testScroll(a, code, 0);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+}
+
+test "win32: a new configuration's scrollbar gives the terminals their bar, or takes it, from run" {
+    // `scrollbar` reaches the app with config_change, inside a core frame
+    // when a soft reload brings it, and the bar changes the client area,
+    // and the core's grid with it: so the terminals' windows change from
+    // `run` (`App.Request.redecorate`), in every tab, a hidden one's too.
+    // A bar given back shows the rows the core reported meanwhile.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    const c = try testTab(&app, window);
+    try std.testing.expect(!shown(c.hwnd));
+    try std.testing.expect(try testRows(&app, a, 1000, 500, 50));
+    const widths = try testWidths(window, a);
+    const bar = ScrollBar.width(a);
+    try std.testing.expect(bar > 0);
+
+    for ([_]configpkg.Config.Scrollbar{ .never, .system }) |want| {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.scrollbar = want;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        // Not yet.
+        try std.testing.expect(testHasBar(a) == (want == .never));
+        try std.testing.expect(testHasBar(c) == (want == .never));
+        try std.testing.expectEqual(widths[1] + @as(i32, if (want == .never) 0 else bar), (try testWidths(window, a))[1]);
+        try std.testing.expect(app.requests.items[app.requests.items.len - 1] == .redecorate);
+        app.createRequested();
+        try std.testing.expect(testHasBar(a) == (want == .system));
+        try std.testing.expect(testHasBar(c) == (want == .system));
+        try std.testing.expectEqual(widths[0], (try testWidths(window, a))[0]);
+        try std.testing.expectEqual(widths[1] + @as(i32, if (want == .never) bar else 0), (try testWidths(window, a))[1]);
+        // Meanwhile, the core's rows: not shown without the bar.
+        if (want == .never) {
+            try std.testing.expectEqual(0, ScrollBar.width(a));
+            try std.testing.expect(!try testRows(&app, a, 1200, 700, 50));
+            try std.testing.expect(!testHasBar(a));
+        }
+    }
+    try expectBar(a, 1199, 50, 700);
+}
+
+test "win32: beside a divider a terminal's scroll bar keeps its pixels" {
+    // In a | b, a's bar runs down the line between them: its pixels within
+    // 3 DIP of the line stay the bar's (HTVSCROLL), as `Dividers.hitTest`
+    // lets the pointer through over the client area alone, so that the
+    // bar's arrows and track keep their width. The band there is the line
+    // and b's side of it; a's client area, left of its bar, is a's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    const line = ra.right;
+    try std.testing.expectEqual(line + 1, rb.left);
+    const inner = (try paneClient(window, a)).right;
+    try std.testing.expect(inner < line - 3);
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+
+    const through = win32.HTTRANSPARENT;
+    const bar: win32.LRESULT = win32.HTVSCROLL;
+    const client: win32.LRESULT = win32.HTCLIENT;
+    for ([_]struct { *Surface, i32, win32.LRESULT }{
+        // a's bar, in the band and out of it, and a's client area.
+        .{ a, line - 1, bar },
+        .{ a, line - 3, bar },
+        .{ a, inner, bar },
+        .{ a, inner - 1, client },
+        // b's side of the line, a's band as before.
+        .{ b, rb.left, through },
+        .{ b, rb.left + 2, through },
+        .{ b, rb.left + 3, client },
+    }) |case| {
+        try std.testing.expectEqual(case[2], try testHitTest(window, case[0], case[1], y));
+    }
+    // The line itself is the frame's.
+    try std.testing.expect(Dividers.at(window, .{ .x = line, .y = y }) != null);
+}
+
+test "win32: a terminal's least width counts its scroll bar beside the cell" {
+    // A terminal with no core keeps a pixel (`Window.cellExtent`) of its
+    // client area, what its bar leaves of its window: a dragged divider
+    // stops there, resize_split does not go past it (`Window.adopt`), and a
+    // split needs it for each side.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    defer _ = win32.ReleaseCapture();
+    const bar = ScrollBar.width(a);
+    try std.testing.expect(bar > 1);
+    const ra = try paneRect(window, a);
+    const y = @divTrunc(ra.top + ra.bottom, 2);
+
+    // Dragged left, then right: each side keeps a pixel beside its bar.
+    try testPressDivider(window, ra.right, y);
+    testFrameMouse(window, win32.WM_MOUSEMOVE, -1000, y);
+    try std.testing.expectEqual([2]i32{ 1 + bar, 1 }, try testWidths(window, a));
+    testFrameMouse(window, win32.WM_MOUSEMOVE, 5000, y);
+    try std.testing.expectEqual([2]i32{ 1 + bar, 1 }, try testWidths(window, b));
+    testFrameMouse(window, win32.WM_LBUTTONUP, 5000, y);
+
+    // resize_split towards a, from the middle, by all but half its bar of
+    // its window: its client area would be gone, so nothing moves.
+    window.equalize(a);
+    const half = try testWidths(window, a);
+    const amount: u16 = @intCast(half[0] - @divTrunc(bar, 2));
+    window.resizeSplit(a, .{ .amount = amount, .direction = .left });
+    try std.testing.expectEqual(half, try testWidths(window, a));
+    // By less, leaving a pixel of it: it moves.
+    window.resizeSplit(a, .{ .amount = @intCast(half[1] - 2), .direction = .left });
+    try std.testing.expect((try testWidths(window, a))[1] >= 1);
+    try std.testing.expect((try testWidths(window, a))[0] < half[0]);
+
+    // a narrowed so that it holds two cells and the line, but not their
+    // two bars: it does not split; widened, it does.
+    const Panes = struct {
+        fn create(w: *Window) anyerror!*Surface {
+            return testPane(w.app, w);
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+    a.core_surface.size.cell = .{ .width = 1, .height = 1 };
+    try testPressDivider(window, (try paneRect(window, a)).right, y);
+    testFrameMouse(window, win32.WM_LBUTTONUP, ra.left + bar + 4, y);
+    const narrow = try testWidths(window, a);
+    try std.testing.expect(narrow[0] >= 2 + Window.dividerWidth(96) and narrow[0] < 2 * (1 + bar) + Window.dividerWidth(96));
+    // Not expectError, which would print the terminal it got.
+    if (window.split(a, .right, .{})) |_| return error.TestUnexpectedResult else |err| try std.testing.expectEqual(error.SplitTooSmall, err);
+    try testPressDivider(window, (try paneRect(window, a)).right, y);
+    testFrameMouse(window, win32.WM_LBUTTONUP, ra.left + 2 * (1 + bar) + 10, y);
+    const d = try window.split(a, .right, .{});
+    window.showPane(d);
+    try std.testing.expect(window.tab().tree.locate(d) != null);
+}
+
+/// For tests: `msg` sent to `hwnd`, which should reach a stand-in for one
+/// of the system's loops (`ScrollBar.test_loop`). Should the code let it
+/// reach DefWindowProcW instead, the real loop would wait for a button
+/// no test presses: a thread timer, which the loop dispatches, then ends
+/// it (WM_CANCELMODE ends a scroll bar's tracking, EndMenu a menu) and
+/// says so (`ran`), so that the test fails rather than waits.
+const RealLoop = struct {
+    var target: ?win32.HWND = null;
+    var ran: bool = false;
+    var timer: win32.UINT_PTR = 0;
+
+    fn send(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) win32.LRESULT {
+        target = hwnd;
+        ran = false;
+        timer = win32.SetTimer(null, 0, 1000, @ptrCast(&fire));
+        defer if (timer != 0) {
+            _ = win32.KillTimer(null, timer);
+            timer = 0;
+        };
+        return win32.SendMessageW(hwnd, msg, wparam, lparam);
+    }
+
+    fn fire(_: ?win32.HWND, _: win32.UINT, id: win32.UINT_PTR, _: win32.DWORD) callconv(.winapi) void {
+        _ = win32.KillTimer(null, id);
+        timer = 0;
+        ran = true;
+        if (target) |h| _ = win32.SendMessageW(h, win32.WM_CANCELMODE, 0, 0);
+        _ = win32.EndMenu();
+    }
+};
+
+/// For tests: what a scroll bar's loop saw (`ScrollBar.test_loop`), run
+/// in place of DefWindowProcW's: the counts the app holds, a wakeup
+/// posted and dispatched to the app's window procedure, and a teardown
+/// posted as the shell's exit or a close of the window posts one, and
+/// dispatched.
+const BarLoop = struct {
+    var calls: usize = 0;
+    var msg: win32.UINT = 0;
+    var wparam: win32.WPARAM = 0;
+    var depth: u32 = 0;
+    var loops: u32 = 0;
+    var ticks: usize = 0;
+    var ticked: usize = 0;
+    /// The teardown to post: the terminal's, or with `window` its window's.
+    var surface: ?*Surface = null;
+    var window: ?*Window = null;
+    var alive: bool = false;
+    var deferred: bool = false;
+
+    fn run(s: *Surface, m: win32.UINT, w: win32.WPARAM, l: win32.LPARAM) win32.LRESULT {
+        _ = l;
+        calls += 1;
+        msg = m;
+        wparam = w;
+        const app = s.app;
+        depth = app.modal_loop_depth;
+        loops = app.terminal_loops;
+        const before = ticks;
+        app.wakeup();
+        var posted: win32.MSG = undefined;
+        while (win32.PeekMessageW(&posted, app.msg_hwnd, WM_GHOSTTY_WAKEUP, WM_GHOSTTY_WAKEUP, win32.PM_REMOVE).toBool()) {
+            _ = App.wndProc(app.msg_hwnd, posted.message, posted.wParam, posted.lParam);
+        }
+        ticked = ticks - before;
+        const target = surface orelse return 7;
+        if (window) |win| win.postDestroy() else target.postDestroy();
+        testPump();
+        alive = std.mem.indexOfScalar(*Surface, app.surfaces.items, target) != null;
+        if (window) |win| alive = alive and std.mem.indexOfScalar(*Window, app.windows.items, win) != null;
+        if (!alive) return 7;
+        deferred = if (window) |win| win.destroy_deferred else target.destroy_deferred;
+        return 7;
+    }
+
+    fn tick(_: *App) void {
+        ticks += 1;
+    }
+
+    fn reset() void {
+        calls = 0;
+        msg = 0;
+        wparam = 0;
+        surface = null;
+        window = null;
+        alive = false;
+        deferred = false;
+    }
+};
+
+test "win32: a press on the scroll bar runs its loop counted, and a teardown posted in it waits" {
+    // Windows runs the bar's loop inside the terminal's DefWindowProcW,
+    // for WM_SYSCOMMAND's scroll commands, which a press on it sends,
+    // SC_HSCROLL with HTVSCROLL for the vertical bar on Windows 11, and for
+    // WM_CONTEXTMENU on the bar, its menu's. The frame hears of neither, so
+    // the loop is counted in terminal_loops: the terminal's own teardown,
+    // and its window's, posted meanwhile, are deferred, the handler goes on
+    // with the terminal alive, and they run after it; and in
+    // modal_loop_depth, so that a wakeup dispatched in it ticks the core.
+    // A WM_CONTEXTMENU off the bar runs none.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    App.test_tick = &BarLoop.tick;
+    defer App.test_tick = null;
+    ScrollBar.test_loop = &BarLoop.run;
+    defer ScrollBar.test_loop = null;
+    BarLoop.reset();
+
+    var frames: [3]*Window = undefined;
+    var panes: [3]*Surface = undefined;
+    for (&frames, &panes) |*f, *p| {
+        f.* = try testFrame(&app);
+        testResize(f.*, 400, 300);
+        p.* = try testPane(&app, f.*);
+        f.*.tab().tree = try .init(alloc, p.*);
+        f.*.relayout();
+    }
+
+    // The teardowns: a's own, then b's window's.
+    for ([_]struct { *Surface, ?*Window }{ .{ panes[0], null }, .{ panes[1], frames[1] } }) |c| {
+        BarLoop.surface = c[0];
+        BarLoop.window = c[1];
+        BarLoop.alive = false;
+        BarLoop.deferred = false;
+        _ = RealLoop.send(c[0].hwnd, win32.WM_SYSCOMMAND, 0xF087, 0);
+        try std.testing.expect(!RealLoop.ran);
+        try std.testing.expect(BarLoop.alive);
+        try std.testing.expect(BarLoop.deferred);
+        // Posted again, not run, inside the handler.
+        try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, c[0]) != null);
+        try std.testing.expectEqual(0, app.terminal_loops);
+        testPump();
+        try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, c[0]) == null);
+        if (c[1]) |w| try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, w) == null);
+    }
+    BarLoop.reset();
+
+    // A point on c's bar and one in its client area, on the screen.
+    const c = panes[2];
+    const client = try clientRect(c.hwnd);
+    var on_bar: win32.POINT = .{ .x = client.right + @divTrunc(ScrollBar.width(c), 2), .y = @divTrunc(client.bottom, 2) };
+    _ = win32.ClientToScreen(c.hwnd, &on_bar);
+    var in_client: win32.POINT = .{ .x = 10, .y = 10 };
+    _ = win32.ClientToScreen(c.hwnd, &in_client);
+    try std.testing.expectEqual(@as(win32.LRESULT, win32.HTVSCROLL), win32.SendMessageW(c.hwnd, win32.WM_NCHITTEST, 0, testPoint(on_bar.x, on_bar.y)));
+
+    // Each way in, its answer the loop's.
+    for ([_]struct { win32.UINT, win32.WPARAM, win32.LPARAM }{
+        .{ win32.WM_SYSCOMMAND, 0xF087, testPoint(on_bar.x, on_bar.y) },
+        .{ win32.WM_SYSCOMMAND, win32.SC_VSCROLL | win32.HTVSCROLL, testPoint(on_bar.x, on_bar.y) },
+        .{ win32.WM_CONTEXTMENU, @intFromPtr(c.hwnd), testPoint(on_bar.x, on_bar.y) },
+    }, 1..) |m, n| {
+        try std.testing.expectEqual(7, RealLoop.send(c.hwnd, m[0], m[1], m[2]));
+        try std.testing.expect(!RealLoop.ran);
+        try std.testing.expectEqual(n, BarLoop.calls);
+        try std.testing.expectEqual(m[0], BarLoop.msg);
+        try std.testing.expectEqual(m[1], BarLoop.wparam);
+        try std.testing.expectEqual(1, BarLoop.loops);
+        try std.testing.expectEqual(1, BarLoop.depth);
+        try std.testing.expectEqual(1, BarLoop.ticked);
+        try std.testing.expectEqual(0, app.modal_loop_depth);
+        try std.testing.expectEqual(0, app.terminal_loops);
+    }
+    // A press on the bar, as Windows takes it: its own DefWindowProcW
+    // sends the command, SC_HSCROLL for the vertical bar.
+    _ = RealLoop.send(c.hwnd, win32.WM_NCLBUTTONDOWN, win32.HTVSCROLL, testPoint(on_bar.x, on_bar.y));
+    try std.testing.expect(!RealLoop.ran);
+    try std.testing.expectEqual(4, BarLoop.calls);
+    try std.testing.expectEqual(win32.WM_SYSCOMMAND, BarLoop.msg);
+    try std.testing.expectEqual(win32.SC_HSCROLL | win32.HTVSCROLL, BarLoop.wparam);
+    // None for the menu asked for off the bar.
+    _ = win32.SendMessageW(c.hwnd, win32.WM_CONTEXTMENU, @intFromPtr(c.hwnd), testPoint(in_client.x, in_client.y));
+    try std.testing.expectEqual(4, BarLoop.calls);
+}
+
+test "win32: a terminal's overlays, its search bar and the command palette stay left of its scroll bar" {
+    // Each is placed over the terminal's client area, which leaves its bar
+    // out (`Overlays.paneRect`, `SearchBar.place`), and the palette in the
+    // area under the tab bar less the bar of the terminal along its right
+    // edge (`CommandPalette.paletteArea`): none covers the bar, even in a
+    // window narrow enough that the palette's margin is less than the
+    // bar.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 500, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    const pane = try paneClient(window, a);
+    const outer = try paneRect(window, a);
+    try std.testing.expect(pane.right < outer.right);
+    const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
+    try std.testing.expect(m.margin < outer.right - pane.right);
+
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try std.testing.expect(try testChildExited(&app, a, 0));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    try togglePalette(&app, a);
+    // The link preview, at the bottom-right while the pointer is over its
+    // place at the bottom-left.
+    try std.testing.expect(try testLink(&app, a, "https://example.com/"));
+    const client = try clientRect(a.hwnd);
+    testPointer(a, 2, client.bottom - 2);
+    try expectPreviewAt(window, a, .right);
+
+    const right = [_]win32.HWND{
+        a.overlays.readonly.hwnd.?,
+        a.overlays.child_exited.hwnd.?,
+        a.overlays.link_preview.hwnd.?,
+        a.overlays.key_state.hwnd.?,
+        a.search_bar.hwnd.?,
+        window.palette.hwnd.?,
+    };
+    for (right) |hwnd| {
+        try std.testing.expect(shown(hwnd));
+        const at = try childRect(window, hwnd);
+        try std.testing.expect(at.right <= pane.right);
+        try std.testing.expect(at.left >= pane.left);
+    }
+    // The banner across the whole of it, the preview to its edge.
+    try std.testing.expectEqual(pane.right, (try childRect(window, a.overlays.child_exited.hwnd.?)).right);
+    try std.testing.expectEqual(pane.right, (try childRect(window, a.overlays.link_preview.hwnd.?)).right);
+}
+
+/// For tests: the colour `hwnd` draws at `x`, `y` of its window rect,
+/// its non-client area with it, for WM_PRINT.
+fn testPrintedAt(hwnd: win32.HWND, x: i32, y: i32) !win32.COLORREF {
+    const r = try windowRect(hwnd);
+    const screen = win32.GetDC(null) orelse return error.TestUnexpectedResult;
+    defer _ = win32.ReleaseDC(null, screen);
+    const dc = win32.CreateCompatibleDC(screen) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteDC(dc);
+    const bitmap = win32.CreateCompatibleBitmap(screen, r.right - r.left, r.bottom - r.top) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteObject(bitmap);
+    const old = win32.SelectObject(dc, bitmap);
+    defer if (old) |o| {
+        _ = win32.SelectObject(dc, o);
+    };
+    _ = win32.SendMessageW(hwnd, win32.WM_PRINT, @intFromPtr(dc), win32.PRF_NONCLIENT);
+    return win32.GetPixel(dc, x, y);
+}
+
+/// For tests: the brightest of `c`'s red, green and blue.
+fn testBrightest(c: win32.COLORREF) u8 {
+    return @max(@as(u8, @truncate(c)), @max(@as(u8, @truncate(c >> 8)), @as(u8, @truncate(c >> 16))));
+}
+
+test "win32: a terminal's scroll bar takes its frame's dark or light theme" {
+    // In a dark frame the bar takes the "DarkMode_Explorer" class, as the
+    // command palette's list does, and the system's own in a light one,
+    // each way a configuration's `window-theme` turns the frame; its track
+    // is drawn dark or light, as WM_PRINT draws it. Its width, and the
+    // terminal's, stay.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    // The thumb at the top, a page of 1000 rows: the track under it.
+    try std.testing.expect(try testRows(&app, a, 1000, 0, 50));
+    const widths = try testWidths(window, a);
+    const outer = try paneRect(window, a);
+    const x = widths[1] + @divTrunc(ScrollBar.width(a), 2);
+    const y = @divTrunc((outer.bottom - outer.top) * 3, 4);
+
+    for ([_]configpkg.Config.WindowTheme{ .dark, .light, .dark }) |theme| {
+        var changed: Config = try .default(alloc);
+        defer changed.deinit();
+        changed.@"window-theme" = theme;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        try std.testing.expectEqual(theme == .dark, window.dark_frame);
+        const track = try testPrintedAt(a.hwnd, x, y);
+        if (theme == .dark) {
+            try std.testing.expect(testBrightest(track) < 0x40);
+        } else {
+            try std.testing.expect(testBrightest(track) > 0xC0);
+        }
+        try std.testing.expectEqual(widths, try testWidths(window, a));
+    }
 }

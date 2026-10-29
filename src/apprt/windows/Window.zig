@@ -36,6 +36,7 @@ const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
+const ScrollBar = @import("ScrollBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
@@ -853,9 +854,7 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
 /// live by now.
 pub fn show(self: *Window) void {
     if (self.tab().focused) |surface| {
-        if (surface.initial_size) |size| {
-            self.applyInitialSize((surface.getContentScale() catch unreachable).x, size);
-        }
+        if (surface.initial_size) |size| self.applyInitialSize(surface, size);
     }
 
     // `maximize` starts every window maximized, as on GTK, which applies it
@@ -1430,12 +1429,16 @@ pub fn split(
 
     const place = self.tiledPlace(parent) orelse return App.Error.Win32CallFailed;
     const cell = parent.core_surface.size.cell;
-    const min = std.math.lossyCast(i32, if (where == .left or where == .right) cell.width else cell.height);
+    const across = where == .left or where == .right;
+    const min = std.math.lossyCast(i32, if (across) cell.width else cell.height);
+    // Across, a cell and the scroll bar each side has, the new terminal's
+    // as the parent's (`fitsCell`).
+    const bar = if (across) ScrollBar.width(parent) else 0;
     const rect = newPaneArea(
         place,
         where,
         dividerWidth(dpiOf(self.app, self.hwnd)),
-        @max(1, min),
+        @max(1, min) +| bar,
     ) orelse return error.SplitTooSmall;
 
     const surface = surface: {
@@ -1659,11 +1662,12 @@ pub fn keepsCellsAt(
 }
 
 /// Whether `surface`, moving from `was` to `now`, keeps a cell across and
-/// down wherever it shrinks (`keepsCells`).
+/// down wherever it shrinks (`keepsCells`): in what its scroll bar leaves
+/// of its window across, the client area the grid is laid out in.
 fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
     const w = now.right - now.left;
     const h = now.bottom - now.top;
-    if (w < was.right - was.left and w < cellExtent(surface, true)) return false;
+    if (w < was.right - was.left and w - ScrollBar.width(surface) < cellExtent(surface, true)) return false;
     if (h < was.bottom - was.top and h < cellExtent(surface, false)) return false;
     return true;
 }
@@ -2190,6 +2194,7 @@ pub fn applyTheme(self: *Window) void {
         while (it.next()) |entry| {
             entry.view.search_bar.invalidate();
             entry.view.overlays.invalidate();
+            ScrollBar.applyTheme(entry.view);
         }
     }
     CommandPalette.invalidate(self);
@@ -2228,19 +2233,27 @@ pub fn dpiOf(app: *const App, hwnd: win32.HWND) u32 {
     return win32.USER_DEFAULT_SCREEN_DPI;
 }
 
-/// Resize the window so its client area is `size` scaled by `scale`, the
-/// window's content scale. The whole value is scaled, as macOS and GTK also
-/// treat it, so the core's device-pixel padding comes out larger by the
-/// scale factor: the grid is never smaller than requested, at most a little
-/// larger, unless the window would not fit its monitor's work area
-/// (`resizeClient`).
-pub fn applyInitialSize(self: *Window, scale: f32, size: apprt.action.InitialSize) void {
+/// Resize the window so that its client area, less `surface`'s scroll
+/// bar, is `size` scaled by `surface`'s content scale: the client area of
+/// a terminal that fills the window. The whole value is scaled,
+/// as macOS and GTK also treat it, so the core's device-pixel padding
+/// comes out larger by the scale factor: the grid is never smaller than
+/// requested, at most a little larger, unless the window would not fit its
+/// monitor's work area (`resizeClient`).
+pub fn applyInitialSize(self: *Window, surface: *const Surface, size: apprt.action.InitialSize) void {
+    const scale = (surface.getContentScale() catch unreachable).x;
     // SetWindowPos sends WM_SIZE synchronously; the core is live, so it
     // sees the new size before the first paint. That WM_SIZE also reports
     // the window visible (occlusionCallback) while it is still hidden,
     // which is harmless only because ShowWindow follows immediately. The
-    // bar, if it shows, comes on top of the terminal's size.
-    _ = resizeClient(self.hwnd, scaledSize(size.width, scale), scaledSize(size.height, scale) +| self.barHeight());
+    // tab bar, if it shows, comes on top of the terminal's size, and the
+    // terminal's scroll bar beside it, so that `window-width` counts the
+    // grid's columns.
+    _ = resizeClient(
+        self.hwnd,
+        scaledSize(size.width, scale) +| ScrollBar.width(surface),
+        scaledSize(size.height, scale) +| self.barHeight(),
+    );
 }
 
 /// `points` at `scale`, in device pixels, rounded up.
@@ -2349,8 +2362,7 @@ pub fn resetSize(self: *Window) void {
         .initial => |size| {
             if (!self.isRestored()) _ = win32.ShowWindow(self.hwnd, win32.SW_RESTORE);
             // defaultSize found one.
-            const surface = self.tab().focused.?;
-            self.applyInitialSize((surface.getContentScale() catch unreachable).x, size);
+            self.applyInitialSize(self.tab().focused.?, size);
         },
     }
 }
@@ -2367,10 +2379,11 @@ pub fn resizeToTerminal(self: *Window, surface: *Surface, size: apprt.action.Res
         log.warn("unable to read the client area, window not resized err={}", .{win32.GetLastError()});
         return;
     };
-    // The bar, if it shows, comes on top of the terminal's size.
+    // The tab bar, if it shows, comes on top of the terminal's size, and
+    // its scroll bar beside it.
     _ = resizeClient(
         self.hwnd,
-        if (size.width > 0) scaledSize(size.width, scale.x) else area.right - area.left,
+        if (size.width > 0) scaledSize(size.width, scale.x) +| ScrollBar.width(surface) else area.right - area.left,
         (if (size.height > 0) scaledSize(size.height, scale.y) else area.bottom - area.top) +| self.barHeight(),
     );
 }
@@ -2584,6 +2597,16 @@ pub fn applyDecorations(self: *Window) void {
     const reframe = win32.SWP_NOZORDER | win32.SWP_NOOWNERZORDER | win32.SWP_NOACTIVATE | win32.SWP_FRAMECHANGED;
     _ = win32.SetWindowPos(self.hwnd, null, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | reframe);
     self.refitMaximized(reframe);
+}
+
+/// Give each terminal of every tab the scroll bar the configuration asks
+/// for (`ScrollBar.restyle`). Their client areas change, so this never runs
+/// inside a core frame (`App.requests`), as `applyDecorations`.
+pub fn applyScrollBars(self: *Window) void {
+    for (self.tabs.items) |t| {
+        var it = t.tree.iterator();
+        while (it.next()) |entry| ScrollBar.restyle(entry.view);
+    }
 }
 
 /// Place a maximized window, not minimized, on its work area again

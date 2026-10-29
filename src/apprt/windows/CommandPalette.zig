@@ -485,6 +485,7 @@ const CoreSurface = @import("../../Surface.zig");
 const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
+const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -1015,9 +1016,9 @@ pub fn fontChanged(window: *Window) void {
 }
 
 /// Place `window`'s open palette at the top centre of the area under the
-/// tab bar, above the terminals and their search bars; whether it shows.
-/// One that no longer fits there (`paletteRect`) closes. Called by every
-/// layout (`Window.relayout`), which never runs inside a core frame.
+/// tab bar (`area`), above the terminals and their search bars; whether it
+/// shows. One that no longer fits there (`paletteRect`) closes. Called by
+/// every layout (`Window.relayout`), which never runs inside a core frame.
 pub fn place(window: *Window) bool {
     const p = &window.palette;
     const hwnd = p.hwnd orelse return false;
@@ -1025,7 +1026,7 @@ pub fn place(window: *Window) bool {
     const dpi = Window.dpiOf(window.app, window.hwnd);
     p.applyFont(dpi);
     const m = Metrics.init(dpi);
-    const area = window.layoutArea() orelse return false;
+    const area = paletteArea(window) orelse return false;
     const at = paletteRect(m, area, p.text_height) orelse {
         log.info("no room for the command palette", .{});
         close(window);
@@ -1572,10 +1573,25 @@ pub const Metrics = struct {
     }
 };
 
-/// Where the palette goes in `area`, the frame's client area under the tab
-/// bar: `margin` below its top, centred across it, `width` wide or as wide
-/// as the area leaves, with as many rows up to `rows` as its height
-/// leaves; null when it leaves less than `min_width` or one row.
+/// The area the palette goes in: the frame's client area under the tab
+/// bar (`Window.layoutArea`), less the scroll bar each terminal along its
+/// right edge has (`ScrollBar.width`), so that the palette never covers
+/// those. Over the terminals left of others it covers their bars as it
+/// covers them.
+pub fn paletteArea(window: *const Window) ?RECT {
+    var area = window.layoutArea() orelse return null;
+    // The window's terminals all have the bar or none has, as `run`
+    // gives it or takes it from all of them (`ScrollBar.restyle`).
+    const any = window.tab().focused orelse return area;
+    area.right = @max(area.left, area.right - ScrollBar.width(any));
+    return area;
+}
+
+/// Where the palette goes in `area`, the terminals' part of the frame's
+/// client area (`paletteArea`): `margin` below its top, centred across it,
+/// `width` wide or as wide as the area leaves, with as many rows up to
+/// `rows` as its height leaves; null when it leaves less than `min_width`
+/// or one row.
 pub fn paletteRect(m: Metrics, area: RECT, text_height: i32) ?RECT {
     const room_w = area.right - area.left - 2 * m.margin;
     const width = @min(m.width, room_w);

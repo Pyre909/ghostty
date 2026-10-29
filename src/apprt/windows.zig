@@ -48,8 +48,9 @@
 //! `.new_split`, `.goto_tab`, `.toggle_fullscreen`,
 //! `.move_tab_to_new_window` or a full `.reload_config`, is recorded and
 //! carried out by `App.run` once the core frame that asked has returned,
-//! and so is the frame change a new configuration's `window-decoration`
-//! makes (`App.requests`, which `App.Request` lists); `.goto_split` moves
+//! and so are the frame change a new configuration's `window-decoration`
+//! makes and the scroll bars its `scrollbar` gives the terminals or takes
+//! (`App.requests`, which `App.Request` lists); `.goto_split` moves
 //! the focus once the core's key callback has returned
 //! (`Tab.pending_focus`), or after such a request when it follows one,
 //! and ends a zoom or moves it (`Window.focusFromGoto`).
@@ -173,7 +174,38 @@
 //! the focus back, and the chosen item's action is performed on it. No
 //! key opens it, and a right click in a divider's band shows none. While
 //! it is open the app keeps ticking, and a terminal or window asked to
-//! close waits for it; an item chosen after that is dropped.
+//! close waits for it; an item chosen after that is dropped. A right
+//! click on a terminal's scroll bar shows the bar's own menu instead (see
+//! Scrollbar).
+//!
+//! ## Scrollbar
+//!
+//! With `scrollbar = system`, the default, each terminal's window has its
+//! own vertical scroll bar (WS_VSCROLL), which shows the scrollback's
+//! rows, the screen's page of them and the viewport's place (`ScrollBar`).
+//! It is always there, disabled while there is nothing to scroll, so that
+//! the grid's width never changes with the output, and it takes its
+//! width, SM_CXVSCROLL at the window's DPI, from the grid's: the grid is
+//! the client area, `window-width` still counts its columns, and a
+//! terminal's least width in a split is a cell beside its bar. Its arrows,
+//! its track, its thumb and the system's menu for it (Scroll Here, Top,
+//! Bottom, Page Up and Down, Scroll Up and Down) move the viewport through
+//! the core's `scroll_to_row`; while the thumb is dragged the bar keeps its
+//! place, as macOS's scroller does, and the output goes on. A press on
+//! the bar runs a loop inside the terminal's DefWindowProcW until the
+//! button comes up, and the menu another: the app keeps ticking through
+//! both, and a terminal or window asked to close waits for them to end.
+//! The bar is dark in a dark frame. Beside a divider it keeps its pixels:
+//! the divider's band there is the line and the other side's 3 DIP. The
+//! overlays, the search bar and the command palette stay off it. With
+//! `never` no terminal has one, and a new configuration gives the
+//! terminals their bar, or takes it, from `App.run`.
+//!
+//! GTK's scrollbar floats over the terminal, shows while it scrolls or the
+//! pointer is near it, and takes none of its width; macOS's is the same.
+//! Neither has the menu. Past 2^31 - 1 rows, which SetScrollInfo cannot
+//! take, the thumb reaches only that many, and the arrows and the track
+//! the rest.
 //!
 //! ## What is still missing
 //!
@@ -279,6 +311,7 @@ test {
     _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/Overlays.zig");
     _ = @import("windows/ReadOnly.zig");
+    _ = @import("windows/ScrollBar.zig");
     _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");

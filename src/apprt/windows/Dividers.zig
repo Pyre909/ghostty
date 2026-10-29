@@ -13,7 +13,10 @@
 //! takes those pixels from the terminals, where the default padding
 //! (`window-padding-x` and `window-padding-y`, 2 pt) covers most of them;
 //! a wheel there goes on from the frame to the terminal under the pointer
-//! (`wheel`). A right click there shows no context menu, as on the line:
+//! (`wheel`). A terminal's scroll bar beside the line keeps its pixels, as
+//! only the client area lets the pointer through: the band on that side
+//! is the bar's, whose arrows and track are small targets already, and
+//! the divider is taken from the line and the other side. A right click there shows no context menu, as on the line:
 //! the resize pointer shows the click is the divider's, GTK's divider has
 //! no menu, nor does macOS's hit box (SplitView.Divider.swift), and
 //! passing the button on would need the terminal's activation and focus
@@ -190,7 +193,7 @@ pub fn at(window: *const Window, client: win32.POINT) ?Grab {
 /// A terminal's WM_NCHITTEST, `lparam` a point on the screen: in a band of
 /// its frame's shown tab (`at`), HTTRANSPARENT, so that the frame under
 /// it gets the pointer; elsewhere DefWindowProcW's answer, and that one
-/// too wherever it is not HTCLIENT.
+/// too wherever it is not HTCLIENT, as on the terminal's scroll bar.
 pub fn hitTest(
     window: *const Window,
     hwnd: win32.HWND,
@@ -756,9 +759,9 @@ test "win32: a zoomed tree has no band" {
     for ([_]i32{ 47, 50, 53 }) |x| try std.testing.expect(testFind(&row, area, x, 25) == null);
 }
 
-/// For the pure tests of the drag: terminals with no window, whose least
-/// extent (`Window.cellExtent`) is a cell of their own or, without a
-/// core, a pixel. Static: a `Surface` is large.
+/// For the pure tests of the drag: terminals with no window, so no scroll
+/// bar, whose least extent (`Window.cellExtent`) is a cell of their own
+/// or, without a core, a pixel. Static: a `Surface` is large.
 const TestCells = struct {
     var a: Surface = undefined;
     var b: Surface = undefined;
@@ -768,6 +771,7 @@ const TestCells = struct {
     /// `s` with a live core whose cells are `width` by `height`, or with
     /// none.
     fn set(s: *Surface, cell: ?[2]u32) void {
+        s.scroll_bar = .{};
         const wh = cell orelse {
             s.core_state = .none;
             return;

@@ -25,6 +25,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
+const ScrollBar = @import("ScrollBar.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -161,6 +162,10 @@ pub const Surface = struct {
     /// child-exited banner, made the first time they have something to
     /// show.
     overlays: Overlays,
+
+    /// The terminal's scroll bar (`ScrollBar`), this window's own, with
+    /// `scrollbar = system`.
+    scroll_bar: ScrollBar.State,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -674,13 +679,14 @@ pub const Surface = struct {
             .notifications = .{},
             .search_bar = .{},
             .overlays = .{},
+            .scroll_bar = .{},
         };
 
         const hwnd = win32.CreateWindowExW(
             0,
             L(surface_class_name),
             null,
-            win32.WS_CHILD | win32.WS_CLIPSIBLINGS,
+            win32.WS_CHILD | win32.WS_CLIPSIBLINGS | ScrollBar.style(&app.config),
             rect.left,
             rect.top,
             rect.right - rect.left,
@@ -697,6 +703,7 @@ pub const Surface = struct {
         // invariant on App.surfaceDestroyed: WM_DESTROY reenters the app but
         // will not free a surface that is not yet in App.surfaces.
         errdefer _ = win32.DestroyWindow(hwnd);
+        ScrollBar.made(self);
 
         // Its link preview, hidden, so that no window is made as the
         // pointer reaches a link (`LinkPreview`).
@@ -1922,6 +1929,20 @@ pub const Surface = struct {
 
             // Beside a divider the pointer is the frame's (`Dividers`).
             win32.WM_NCHITTEST => return Dividers.hitTest(self.window, hwnd, wparam, lparam),
+
+            // A press on the scroll bar, and a right click on it: the
+            // loops DefWindowProcW runs for it, counted (`ScrollBar.loop`).
+            // Elsewhere DefWindowProcW below, as before: a WM_CONTEXTMENU
+            // goes on to the frame, which shows no menu for it.
+            win32.WM_SYSCOMMAND, win32.WM_CONTEXTMENU => if (ScrollBar.runsLoop(hwnd, msg, wparam, lparam)) {
+                return ScrollBar.loop(self, hwnd, msg, wparam, lparam);
+            },
+
+            // From the window's own scroll bar, whose lParam is null.
+            win32.WM_VSCROLL => if (lparam == 0) {
+                ScrollBar.scrolled(self, wparam);
+                return 0;
+            },
 
             win32.WM_SETCURSOR => {
                 // Client area only. Elsewhere DefWindowProcW sets the arrow
