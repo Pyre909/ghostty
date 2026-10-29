@@ -72,6 +72,15 @@ pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
         log.warn("error setting initial pwd err={}", .{err});
     };
 
+    // Our Windows pty is ConPTY, which keeps its own screen buffer without
+    // scrollback, reflows it itself, and repaints it from the top row after
+    // every resize. Rows the terminal pulled back out of scrollback, on a
+    // grow or when a reflow frees rows, would be painted over and lost, so
+    // they must stay in scrollback.
+    if (comptime builtin.target.os.tag == .windows) {
+        term.flags.resize_pull_scrollback = false;
+    }
+
     // Setup our initial grid/screen size from the terminal. This
     // can't fail because the pty should not exist at this point.
     self.resize(.{
@@ -2521,6 +2530,107 @@ test "init frees the env when it fails" {
             else => return err,
         };
         try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "initTerminal: growing pulls rows from scrollback except on ConPTY" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    var exec = try init(alloc, .{
+        .env = .init(alloc),
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .init(&config),
+        .rt_post_fork_info = .init(&config),
+    });
+    defer exec.deinit();
+
+    var term = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 5, .rows = 4 });
+    defer term.deinit(alloc);
+    exec.initTerminal(&term);
+
+    // With the cursor on the bottom row, halving the height moves rows 1
+    // and 2 into scrollback.
+    try term.printString("1\n2\n3\n4");
+    try term.resize(alloc, .{ .cols = 5, .rows = 2 });
+
+    // They must be kept there: with nothing in scrollback the grow has
+    // nothing to pull, and the checks below pass with or without the
+    // setting.
+    {
+        const str = try term.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(str);
+        try testing.expectEqualStrings("1\n2\n3\n4", str);
+    }
+
+    // Growing back either pulls them into the active area again or leaves
+    // them in scrollback. ConPTY repaints its two rows at the top after the
+    // grow, so the terminal must leave rows 1 and 2 in scrollback to match
+    // it. A POSIX pty keeps no screen, so pulling them back is right there.
+    try term.resize(alloc, .{ .cols = 5, .rows = 4 });
+    const conpty = builtin.target.os.tag == .windows;
+    try testing.expectEqual(
+        @as(terminal.size.CellCountInt, if (conpty) 1 else 3),
+        term.screens.active.cursor.y,
+    );
+    {
+        const str = try term.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings(if (conpty) "3\n4" else "1\n2\n3\n4", str);
+    }
+}
+
+test "initTerminal: widening pulls rows from scrollback except on ConPTY" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    var exec = try init(alloc, .{
+        .env = .init(alloc),
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .init(&config),
+        .rt_post_fork_info = .init(&config),
+    });
+    defer exec.deinit();
+
+    var term = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 5, .rows = 3 });
+    defer term.deinit(alloc);
+    exec.initTerminal(&term);
+
+    // A line wrapped in the active area, with two rows above it in
+    // scrollback.
+    try term.printString("1AAAA\n2BBBB\n3CCCCDD\n4E");
+    {
+        const str = try term.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("3CCCC\nDD\n4E", str);
+    }
+
+    // Widening unwraps the line, which frees a row. ConPTY reflows its own
+    // screen and repaints it from the top, so the terminal must keep its
+    // top row and leave the freed row blank at the bottom: "2BBBB" pulled
+    // back into view would be where ConPTY writes its first row, and lost.
+    // A POSIX pty keeps no screen, so pulling it back is right there.
+    try term.resize(alloc, .{ .cols = 10, .rows = 3 });
+    const conpty = builtin.target.os.tag == .windows;
+    try testing.expectEqual(
+        @as(terminal.size.CellCountInt, if (conpty) 1 else 2),
+        term.screens.active.cursor.y,
+    );
+    {
+        const str = try term.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings(
+            if (conpty) "3CCCCDD\n4E" else "2BBBB\n3CCCCDD\n4E",
+            str,
+        );
     }
 }
 
