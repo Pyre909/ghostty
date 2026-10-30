@@ -16,6 +16,7 @@ pub const Shell = enum {
     elvish,
     fish,
     nushell,
+    powershell,
     zsh,
 };
 
@@ -64,6 +65,12 @@ pub fn setup(
             command,
             resource_dir,
             env,
+        ),
+
+        .powershell => try setupPowerShell(
+            alloc_arena,
+            command,
+            resource_dir,
         ),
 
         .zsh => try setupZsh(
@@ -163,6 +170,19 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.mem.eql(u8, "nu", exe)) return .nushell;
     if (std.mem.eql(u8, "zsh", exe)) return .zsh;
 
+    // PowerShell 7 is `pwsh` and Windows PowerShell 5.1 is `powershell`.
+    // Unlike the names above these ignore case, as Windows file names do
+    // (`PowerShell.EXE`), and on Windows an `.exe` suffix. Elsewhere a
+    // `pwsh.exe` is the Windows one run through WSL's interop, which sees
+    // neither our environment nor our paths.
+    const name = if (builtin.target.os.tag == .windows and
+        std.ascii.endsWithIgnoreCase(exe, ".exe"))
+        exe[0 .. exe.len - ".exe".len]
+    else
+        exe;
+    if (std.ascii.eqlIgnoreCase(name, "pwsh") or
+        std.ascii.eqlIgnoreCase(name, "powershell")) return .powershell;
+
     return null;
 }
 
@@ -176,6 +196,28 @@ test detectShell {
     try testing.expectEqual(.fish, try detectShell(alloc, .{ .shell = "fish" }));
     try testing.expectEqual(.nushell, try detectShell(alloc, .{ .shell = "nu" }));
     try testing.expectEqual(.zsh, try detectShell(alloc, .{ .shell = "zsh" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "pwsh" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "powershell" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "PowerShell" }));
+    try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "/usr/local/bin/pwsh -NoLogo" }));
+    try testing.expect(try detectShell(alloc, .{ .shell = "pwshx" }) == null);
+    try testing.expect(try detectShell(alloc, .{ .shell = "powershell_ise" }) == null);
+
+    if (comptime builtin.target.os.tag == .windows) {
+        try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "pwsh.exe" }));
+        try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "PowerShell.EXE" }));
+        try testing.expectEqual(.powershell, try detectShell(alloc, .{
+            .shell = "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo",
+        }));
+        try testing.expectEqual(.powershell, try detectShell(alloc, .{ .direct = &.{
+            "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        } }));
+        try testing.expect(try detectShell(alloc, .{ .shell = "powershell_ise.exe" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = ".exe" }) == null);
+    } else {
+        // The Windows PowerShell run through WSL's interop.
+        try testing.expect(try detectShell(alloc, .{ .shell = "pwsh.exe" }) == null);
+    }
 
     if (comptime builtin.target.os.tag.isDarwin()) {
         try testing.expect(try detectShell(alloc, .{ .shell = "/bin/bash" }) == null);
@@ -915,6 +957,348 @@ test "nushell: missing resources" {
     try testing.expectEqual(0, env.count());
 }
 
+/// The command PowerShell runs to load our integration script. It reads
+/// the script as text and runs it in the global scope rather than
+/// dot-sourcing the file or passing it to `-File`, because the execution
+/// policy governs script files: Windows' default policy (Restricted)
+/// refuses both, and RemoteSigned refuses a downloaded copy (one with a
+/// Mark-of-the-Web), but neither stops this. The try/catch leaves a
+/// working shell, with one line on stderr, if the script fails. It has
+/// no double quotes, so a Windows command line needs no escapes for it.
+const powershell_loader = "try { . ([scriptblock]::Create([IO.File]::ReadAllText(" ++
+    "[IO.Path]::Combine($env:GHOSTTY_RESOURCES_DIR, 'shell-integration', " ++
+    "'powershell', 'ghostty.ps1')))) } catch { [Console]::Error.WriteLine(" ++
+    "'ghostty: shell integration failed: ' + $_) }";
+
+/// `powershell_loader` quoted for the POSIX shell that runs a `.shell`
+/// command (`/bin/sh -c`, or bash's `exec` on macOS): in single quotes,
+/// with each of its own single quotes closed, escaped and reopened.
+const powershell_loader_posix = quoted: {
+    @setEvalBranchQuota(10_000);
+    var out: []const u8 = "'";
+    for (powershell_loader) |c| {
+        if (c == '\'') out = out ++ "'\\''" else out = out ++ [1]u8{c};
+    }
+    break :quoted out ++ "'";
+};
+
+/// A PowerShell parameter that may come before our `-NoExit -Command`:
+/// one that neither runs a command or a file nor makes the session
+/// non-interactive. PowerShell takes any prefix of a parameter's name at
+/// least `min` letters long (`-nop` is `-NoProfile`), and a `-`, `--` or
+/// `/` in front of it (`MatchSwitch` and `GetSwitchKey` in PowerShell's
+/// CommandLineParameterParser.cs).
+const PowerShellParameter = struct {
+    name: []const u8,
+    min: usize,
+
+    /// Whether the parameter takes the next argument as its value.
+    value: bool = false,
+};
+
+/// The parameters we keep. Every other argument stops the integration,
+/// rather than only the ones that run something (`-Command`, `-File`,
+/// `-EncodedCommand`, ...): PowerShell takes a first argument that isn't
+/// a parameter as a file (`pwsh script.ps1`, or a command for Windows
+/// PowerShell), and a parameter by any long enough prefix, so a list of
+/// what to refuse would have to follow every name PowerShell knows. No
+/// prefix of these matches a parameter that PowerShell checks before
+/// them.
+const powershell_parameters = [_]PowerShellParameter{
+    .{ .name = "nologo", .min = 3 },
+    .{ .name = "noprofile", .min = 3 },
+    .{ .name = "noprofileloadtime", .min = 17 },
+    .{ .name = "login", .min = 1 },
+    .{ .name = "interactive", .min = 1 },
+    .{ .name = "sta", .min = 3 },
+    .{ .name = "mta", .min = 3 },
+    .{ .name = "executionpolicy", .min = 2, .value = true },
+    .{ .name = "ep", .min = 2, .value = true },
+    .{ .name = "windowstyle", .min = 1, .value = true },
+    .{ .name = "workingdirectory", .min = 2, .value = true },
+    .{ .name = "wd", .min = 2, .value = true },
+};
+
+/// The parameter an argument names, if it is one of
+/// `powershell_parameters`. We take only a `-` or `--` in front of it.
+fn powershellParameter(arg: []const u8) ?PowerShellParameter {
+    const key = if (std.mem.startsWith(u8, arg, "--"))
+        arg[2..]
+    else if (std.mem.startsWith(u8, arg, "-"))
+        arg[1..]
+    else
+        return null;
+
+    for (powershell_parameters) |param| {
+        if (key.len >= param.min and
+            std.ascii.startsWithIgnoreCase(param.name, key)) return param;
+    }
+
+    return null;
+}
+
+/// Set up the PowerShell automatic shell integration. PowerShell has no
+/// startup hook we can point at our script (like bash's ENV or zsh's
+/// ZDOTDIR), so we append `-NoExit -Command` with `powershell_loader`.
+/// It runs after the user's profile, so our script can wrap the prompt
+/// that the profile defines.
+///
+/// This works for PowerShell 7 (`pwsh`) on every platform and for Windows
+/// PowerShell 5.1 (`powershell`).
+fn setupPowerShell(
+    alloc: Allocator,
+    command: config.Command,
+    resource_dir: []const u8,
+) !?config.Command {
+    var args: std.ArrayList([:0]const u8) = .empty;
+
+    // Iterator that yields each argument in the original command line.
+    // This will allocate once proportionate to the command line length.
+    var iter = try command.argIterator(alloc);
+    defer iter.deinit();
+
+    const exe = iter.next() orelse return null;
+    try args.append(alloc, try alloc.dupeSentinel(u8, exe, 0));
+
+    // Walk through the rest of the given arguments. If we see one that
+    // isn't a parameter we know to keep, we bail out and skip loading our
+    // shell integration. Users can still manually load the shell
+    // integration script.
+    while (iter.next()) |arg| {
+        const param = powershellParameter(arg) orelse return null;
+        try args.append(alloc, try alloc.dupeSentinel(u8, arg, 0));
+        if (param.value) {
+            const value = iter.next() orelse return null;
+            // Windows writes an empty argument as nothing at all, which
+            // would make the next argument the value.
+            if (value.len == 0) return null;
+            try args.append(alloc, try alloc.dupeSentinel(u8, value, 0));
+        }
+    }
+
+    var script_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const script_path = try std.mem.print(
+        &script_path_buf,
+        "{s}/shell-integration/powershell/ghostty.ps1",
+        .{resource_dir},
+    );
+    if (std.Io.Dir.openFileAbsolute(global.io(), script_path, .{})) |file| {
+        file.close(global.io());
+    } else |err| {
+        log.warn("unable to open {s}: {}", .{ script_path, err });
+        return null;
+    }
+
+    // PowerShell takes everything after `-Command` as the command, so it
+    // must come last.
+    switch (command) {
+        .direct => {},
+        .shell => |v| if (comptime builtin.target.os.tag != .windows) {
+            // We append to the command as it was written, rather than
+            // joining the arguments we parsed, so that the shell that runs
+            // it (`/bin/sh -c`, or bash's `exec` on macOS) sees the same
+            // quoting and expansions as without us.
+            return .{ .shell = try alloc.printSentinel(
+                "{s} -NoExit -Command {s}",
+                .{ v, powershell_loader_posix },
+                0,
+            ) };
+        },
+    }
+
+    // A direct command, or a shell command on Windows, where execCommand
+    // splits it on whitespace without honoring quotes, which would split
+    // the loader.
+    try args.appendSlice(alloc, &.{ "-NoExit", "-Command", powershell_loader });
+    return .{ .direct = try args.toOwnedSlice(alloc) };
+}
+
+test "powershell" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.powershell);
+    defer res.deinit();
+
+    // A direct command keeps its arguments, and our own come last.
+    {
+        const command = try setupPowerShell(alloc, .{ .direct = &.{
+            "pwsh",
+            "-NoLogo",
+        } }, res.path);
+        try expectArgs(&.{
+            "pwsh",
+            "-NoLogo",
+            "-NoExit",
+            "-Command",
+            powershell_loader,
+        }, command.?.direct);
+    }
+
+    if (comptime builtin.target.os.tag == .windows) {
+        const command = try setupPowerShell(alloc, .{
+            .shell = "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoLogo",
+        }, res.path);
+        try expectArgs(&.{
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "-NoLogo",
+            "-NoExit",
+            "-Command",
+            powershell_loader,
+        }, command.?.direct);
+    } else {
+        const command = try setupPowerShell(alloc, .{
+            .shell = "\"/a b/pwsh\" -NoLogo",
+        }, res.path);
+        try testing.expectEqualStrings(
+            "\"/a b/pwsh\" -NoLogo -NoExit -Command " ++ powershell_loader_posix,
+            command.?.shell,
+        );
+
+        // The shell that runs the command must see our arguments as we
+        // meant them, the loader as one.
+        const run = try std.process.run(alloc, testing.io, .{ .argv = &.{
+            "/bin/sh",
+            "-c",
+            try alloc.print("printf '%s\\n' {s}", .{command.?.shell}),
+        } });
+        try testing.expect(run.term == .exited and run.term.exited == 0);
+        try testing.expectEqualStrings(
+            "/a b/pwsh\n-NoLogo\n-NoExit\n-Command\n" ++ powershell_loader ++ "\n",
+            run.stdout,
+        );
+    }
+}
+
+test "powershell: unsupported options" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.powershell);
+    defer res.deinit();
+
+    const cmdlines = [_][:0]const u8{
+        "pwsh -Command exit",
+        "pwsh -c exit",
+        "pwsh -com exit",
+        "pwsh -CommandWithArgs exit",
+        "pwsh -cwa exit",
+        "pwsh -File script.ps1",
+        "pwsh -f script.ps1",
+        "pwsh script.ps1",
+        "pwsh -EncodedCommand ZQB4AGkAdAA=",
+        "pwsh -e ZQB4AGkAdAA=",
+        "pwsh -ec ZQB4AGkAdAA=",
+        "pwsh -NonInteractive",
+        "pwsh -noni",
+        "pwsh -NoExit",
+        "pwsh -NoE",
+        "pwsh -Version",
+        "pwsh -v",
+        "pwsh -Help",
+        "pwsh -h",
+        "pwsh -?",
+        "pwsh -ConfigurationName x",
+        "pwsh -SettingsFile x",
+        "pwsh -OutputFormat Text",
+        "pwsh -InputFormat Text",
+        "pwsh -inp Text",
+        "pwsh -no",
+        "pwsh -st",
+        "pwsh -",
+        "pwsh --",
+        "pwsh ---NoLogo",
+        "pwsh /NoLogo",
+        "pwsh -ExecutionPolicy:Bypass",
+        "pwsh -ExecutionPolicy",
+        "pwsh -NoLogo -wd",
+        "pwsh -wd \"\"",
+        "pwsh -NoLogo -Command exit",
+    };
+
+    for (cmdlines) |cmdline| {
+        const command = try setupPowerShell(alloc, .{ .shell = cmdline }, res.path);
+        if (command != null) {
+            std.log.err("not refused: {s}", .{cmdline});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "powershell: empty value" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.powershell);
+    defer res.deinit();
+
+    // Windows writes an empty argument as nothing at all, so PowerShell
+    // would take the `-NoExit` after it as the value.
+    const args = [_][:0]const u8{ "pwsh", "-wd", "" };
+    try testing.expect(try setupPowerShell(alloc, .{ .direct = &args }, res.path) == null);
+}
+
+test "powershell: supported options" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.powershell);
+    defer res.deinit();
+
+    // Every parameter we keep, by its shortest name or another prefix, and
+    // with `-` or `--`.
+    const args = [_][:0]const u8{
+        "pwsh",
+        "-nol",
+        "--NoProfile",
+        "-NoProfileLoadTime",
+        "-l",
+        "-Interactive",
+        "-STA",
+        "-mta",
+        "-ex",
+        "Bypass",
+        "-EP",
+        "RemoteSigned",
+        "-w",
+        "Normal",
+        "-wo",
+        "/a b",
+        "--wd",
+        "/tmp",
+    };
+    const command = try setupPowerShell(alloc, .{ .direct = &args }, res.path);
+    try expectArgs(&(args ++ .{ "-NoExit", "-Command", powershell_loader }), command.?.direct);
+}
+
+test "powershell: missing resources" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The shell-integration/powershell directory, without the script.
+    var res: TmpResourcesDir = try .init(.elvish);
+    defer res.deinit();
+    try res.tmp_dir.dir.createDirPath(testing.io, "shell-integration/powershell");
+
+    try testing.expect(try setupPowerShell(alloc, .{ .shell = "pwsh" }, res.path) == null);
+}
+
+/// Expect a command's arguments to be the given ones.
+fn expectArgs(expected: []const []const u8, actual: []const [:0]const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |e, a| try std.testing.expectEqualStrings(e, a);
+}
+
 /// Setup the zsh automatic shell integration. This works by setting
 /// ZDOTDIR to our resources dir so that zsh will load our config. This
 /// config then loads the true user config.
@@ -1039,6 +1423,10 @@ const TmpResourcesDir = struct {
         switch (shell) {
             .bash => try tmp_dir.dir.writeFile(std.testing.io, .{
                 .sub_path = "shell-integration/bash/ghostty.bash",
+                .data = "",
+            }),
+            .powershell => try tmp_dir.dir.writeFile(std.testing.io, .{
+                .sub_path = "shell-integration/powershell/ghostty.ps1",
                 .data = "",
             }),
             else => {},

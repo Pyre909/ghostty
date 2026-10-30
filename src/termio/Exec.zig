@@ -923,6 +923,7 @@ const Subprocess = struct {
                 .elvish => .elvish,
                 .fish => .fish,
                 .nushell => .nushell,
+                .powershell => .powershell,
                 .zsh => .zsh,
             };
 
