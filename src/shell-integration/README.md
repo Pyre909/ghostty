@@ -94,6 +94,51 @@ source /Applications/Ghostty.app/Contents/Resources/ghostty/shell-integration/nu
 use ghostty *
 ```
 
+### PowerShell
+
+Automatic [PowerShell](https://learn.microsoft.com/powershell/) integration
+works for `pwsh` (PowerShell 7) and, on Windows, `powershell` (Windows
+PowerShell 5.1). PowerShell has no environment variable or directory that
+points it at a startup file, so Ghostty appends `-NoExit -Command` and a
+loader to the command. The loader runs after the user's profile. It reads
+`powershell/ghostty.ps1` as text and runs it in the global scope, so the
+execution policy, which governs script files, does not stop it; if it fails,
+it prints one line to stderr and the shell carries on without it.
+
+Only a command whose arguments all leave PowerShell interactive gains the
+loader: `-NoLogo`, `-NoProfile`, `-Login`, `-ExecutionPolicy`,
+`-WorkingDirectory` and a few more (`setupPowerShell` in
+`src/termio/shell_integration.zig`). A command that runs something, such as
+`pwsh -Command ...` or `pwsh script.ps1`, is left alone.
+
+The script wraps the `prompt` function and, when PSReadLine is loaded,
+PSReadLine's `PSConsoleHostReadLine`, which marks where a command's output
+starts. Without PSReadLine (removed, or not loaded because a screen reader
+is in use) nothing can mark that, so the prompt ends with `133;I` and the
+input ends at the end of its line. Unless the user has set their own,
+the script sets PSReadLine's `PromptText` to the last visible characters of
+the prompt: with our marks in the prompt string, PSReadLine finds none
+itself, and the prompt no longer turns red while the input does not parse.
+Of the features, `cursor`, `path` and `title` are supported; `sudo`,
+`ssh-env` and `ssh-terminfo` are not.
+
+With `-Command`, PowerShell prints no startup banner. A prompt function
+defined after the script has loaded, such as one from `oh-my-posh init pwsh`
+or `Import-Module posh-git` typed at the prompt, replaces the script's, and
+the prompts lose their marks; set it up in the profile instead. Prompt
+frameworks that write their own OSC 133 marks have not been tried with the
+script: both sets of marks would reach the terminal.
+
+To load it manually, at the end of the profile:
+
+```powershell
+# Ghostty shell integration for PowerShell. This must be at the end of your profile!
+if ($env:GHOSTTY_RESOURCES_DIR) {
+  . ([scriptblock]::Create([IO.File]::ReadAllText([IO.Path]::Combine(
+    $env:GHOSTTY_RESOURCES_DIR, 'shell-integration', 'powershell', 'ghostty.ps1'))))
+}
+```
+
 ### Zsh
 
 Automatic [Zsh](https://www.zsh.org/) integration works by temporarily setting
