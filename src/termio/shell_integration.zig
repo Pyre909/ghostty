@@ -13,6 +13,7 @@ const log = std.log.scoped(.shell_integration);
 /// Shell types we support
 pub const Shell = enum {
     bash,
+    cmd,
     elvish,
     fish,
     nushell,
@@ -59,6 +60,14 @@ pub fn setup(
             resource_dir,
             env,
         ),
+
+        // Only on Windows: elsewhere `PROMPT` is some other shell's (zsh
+        // reads it as its prompt).
+        .cmd => if (comptime builtin.target.os.tag == .windows) try setupCmd(
+            alloc_arena,
+            command,
+            env,
+        ) else null,
 
         .nushell => try setupNushell(
             alloc_arena,
@@ -115,7 +124,12 @@ test "force shell" {
             &env,
             shell,
         );
-        try testing.expectEqual(shell, result.?.shell);
+        if (comptime shell == .cmd and builtin.target.os.tag != .windows) {
+            // cmd is integrated only on Windows (the "cmd" test).
+            try testing.expect(result == null);
+        } else {
+            try testing.expectEqual(shell, result.?.shell);
+        }
     }
 }
 
@@ -183,6 +197,12 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.ascii.eqlIgnoreCase(name, "pwsh") or
         std.ascii.eqlIgnoreCase(name, "powershell")) return .powershell;
 
+    // cmd.exe, the default command on Windows (Exec), only there: elsewhere
+    // a `cmd` is some other program, and a `cmd.exe` is the Windows one run
+    // through WSL's interop, which sees none of our environment.
+    if (builtin.target.os.tag == .windows and
+        std.ascii.eqlIgnoreCase(name, "cmd")) return .cmd;
+
     return null;
 }
 
@@ -214,9 +234,20 @@ test detectShell {
         } }));
         try testing.expect(try detectShell(alloc, .{ .shell = "powershell_ise.exe" }) == null);
         try testing.expect(try detectShell(alloc, .{ .shell = ".exe" }) == null);
+
+        // The default command (Exec).
+        try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "cmd.exe" }));
+        try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "cmd" }));
+        try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "CMD.EXE /k init.bat" }));
+        try testing.expectEqual(.cmd, try detectShell(alloc, .{ .direct = &.{
+            "C:\\WINDOWS\\system32\\cmd.exe",
+        } }));
+        try testing.expect(try detectShell(alloc, .{ .shell = "cmdx.exe" }) == null);
     } else {
-        // The Windows PowerShell run through WSL's interop.
+        // The Windows PowerShell and cmd run through WSL's interop.
         try testing.expect(try detectShell(alloc, .{ .shell = "pwsh.exe" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = "cmd.exe" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = "cmd" }) == null);
     }
 
     if (comptime builtin.target.os.tag.isDarwin()) {
@@ -656,6 +687,197 @@ test "bash: missing resources" {
 
     try testing.expect(try setupBash(alloc, .{ .shell = "bash" }, resources_dir, &env) == null);
     try testing.expectEqual(0, env.count());
+}
+
+/// What cmd's prompt is wrapped in, in `PROMPT`'s own codes (`$E` is ESC,
+/// `$P` the current drive and directory). Before it, the start of the
+/// prompt (`redraw=0`: cmd does not redraw its prompt on a resize) and the
+/// working directory as ConEmu's OSC 9;9. After it, 133;I: input that
+/// ends at the end of its line, as nothing can mark where a command's
+/// output starts.
+const cmd_prompt_start = "$E]133;A;redraw=0$E\\$E]9;9;$P$E\\";
+const cmd_prompt_end = "$E]133;I$E\\";
+
+/// cmd's prompt when `PROMPT` is not set or empty.
+const cmd_prompt_default = "$P$G";
+
+/// Set up the cmd.exe automatic shell integration. cmd reads no startup
+/// file we could add to (its `AutoRun` registry value is the user's) and
+/// runs nothing before or after a command, but it expands `PROMPT` from
+/// its environment for every prompt. The integration is that value: the
+/// user's prompt, or cmd's default, between `cmd_prompt_start` and
+/// `cmd_prompt_end`. That gives prompt marks and the working directory.
+/// With no hook before a command and no `%ERRORLEVEL%` in `PROMPT` there
+/// is no 133;C or 133;D, so no `command_finished`, and none of the
+/// `shell-integration-features` apply. The command is unchanged.
+fn setupCmd(
+    alloc_arena: Allocator,
+    command: config.Command,
+    env: *EnvMap,
+) !config.Command {
+    try env.put("PROMPT", try cmdPrompt(alloc_arena, env.get("PROMPT")));
+    return try command.clone(alloc_arena);
+}
+
+/// The `PROMPT` value that wraps `prompt`, the user's value if set. A value
+/// already wrapped, which a cmd in Ghostty passes to a Ghostty it starts,
+/// is kept as it is.
+fn cmdPrompt(alloc: Allocator, prompt: ?[]const u8) ![]const u8 {
+    const user = prompt orelse "";
+    if (std.mem.startsWith(u8, user, cmd_prompt_start) and
+        std.mem.endsWith(u8, user, cmd_prompt_end)) return user;
+
+    return try std.mem.concat(alloc, u8, &.{
+        cmd_prompt_start,
+        if (user.len > 0) user else cmd_prompt_default,
+        cmd_prompt_end,
+    });
+}
+
+test "cmd" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.cmd);
+    defer res.deinit();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    const maybe = try setup(alloc, res.path, .{ .shell = "cmd.exe /k init.bat" }, &env, .cmd);
+    if (comptime builtin.target.os.tag != .windows) {
+        // Elsewhere even a forced cmd does nothing.
+        try testing.expect(maybe == null);
+        try testing.expectEqual(0, env.count());
+        return;
+    }
+    const result = maybe orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(.cmd, result.shell);
+    try testing.expectEqualStrings("cmd.exe /k init.bat", result.command.shell);
+    try testing.expectEqualStrings(
+        "$E]133;A;redraw=0$E\\$E]9;9;$P$E\\$P$G$E]133;I$E\\",
+        env.get("PROMPT") orelse "",
+    );
+    try testing.expectEqual(1, env.count());
+}
+
+test "cmd: the user's prompt" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("PROMPT", "$T $P$_$G");
+
+    _ = try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env);
+    try testing.expectEqualStrings(
+        cmd_prompt_start ++ "$T $P$_$G" ++ cmd_prompt_end,
+        env.get("PROMPT") orelse "",
+    );
+}
+
+test "cmd: a wrapped prompt is kept" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("PROMPT", "$N$G");
+
+    // A Ghostty started from a cmd in Ghostty sets it up again.
+    _ = try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env);
+    _ = try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env);
+    try testing.expectEqualStrings(
+        cmd_prompt_start ++ "$N$G" ++ cmd_prompt_end,
+        env.get("PROMPT") orelse "",
+    );
+}
+
+test "cmd: a half-wrapped prompt is wrapped again" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Only a value with both ends is ours, such as the README's line
+    // copied without its end.
+    inline for (.{
+        cmd_prompt_start ++ "$P$G",
+        "$P$G" ++ cmd_prompt_end,
+    }) |prompt| {
+        try testing.expectEqualStrings(
+            cmd_prompt_start ++ prompt ++ cmd_prompt_end,
+            try cmdPrompt(alloc, prompt),
+        );
+    }
+}
+
+/// `prompt` expanded as cmd does for these tests' codes (`PROMPT /?`).
+fn testCmdExpand(buf: []u8, prompt: []const u8, cwd: []const u8) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var i: usize = 0;
+    while (i < prompt.len) : (i += 1) {
+        if (prompt[i] != '$') {
+            try w.writeByte(prompt[i]);
+            continue;
+        }
+        i += 1;
+        if (i == prompt.len) return error.TestUnexpectedResult;
+        switch (std.ascii.toUpper(prompt[i])) {
+            'E' => try w.writeByte(0x1b),
+            'P' => try w.writeAll(cwd),
+            'G' => try w.writeByte('>'),
+            '_' => try w.writeAll("\r\n"),
+            '$' => try w.writeByte('$'),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    return w.buffered();
+}
+
+test "cmd: the prompt's marks, as cmd writes them" {
+    const testing = std.testing;
+    const Terminal = @import("../terminal/main.zig").Terminal;
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const prompt = try cmdPrompt(arena.allocator(), null);
+
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 40, .rows = 10 });
+    defer t.deinit(testing.allocator);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // The bytes cmd writes through ConPTY: the prompt at a drive's root
+    // (its path ends in a backslash right before ST), the typed command
+    // echoed, the Enter's CR LF, output, and the blank line and prompt
+    // that follow a command.
+    var buf: [256]u8 = undefined;
+    s.nextSlice(try testCmdExpand(&buf, prompt, "C:\\"));
+    try testing.expect(t.cursorIsAtPrompt());
+    try testing.expectEqual(.false, t.flags.shell_redraws_prompt);
+    try testing.expectEqualStrings("C:\\", t.getPwd() orelse "");
+    try testing.expectEqualStrings("C:\\>", try t.plainString(arena.allocator()));
+
+    // Typed input, which 133;I ends at the end of its line.
+    s.nextSlice("ping -t localhost");
+    try testing.expectEqual(.input, t.screens.active.cursor.semantic_content);
+    try testing.expect(t.screens.active.cursor.semantic_content_clear_eol);
+
+    s.nextSlice("\r\n\r\nPinging localhost [::1] with 32 bytes");
+    try testing.expect(!t.cursorIsAtPrompt());
+
+    s.nextSlice("\r\n\r\n");
+    s.nextSlice(try testCmdExpand(&buf, prompt, "C:\\Windows"));
+    try testing.expect(t.cursorIsAtPrompt());
+    try testing.expectEqual(.prompt, t.screens.active.cursor.page_row.semantic_prompt);
+    try testing.expectEqualStrings("C:\\Windows", t.getPwd() orelse "");
 }
 
 /// Setup automatic shell integration for shells that include

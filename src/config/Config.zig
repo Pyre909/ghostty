@@ -2953,8 +2953,21 @@ keybind: Keybinds = .{},
 ///
 ///   * `detect` - Detect the shell based on the filename.
 ///
-///   * `bash`, `elvish`, `fish`, `nushell`, `powershell`, `zsh` - Use this
-///     specific shell injection scheme.
+///   * `bash`, `cmd`, `elvish`, `fish`, `nushell`, `powershell`, `zsh` -
+///     Use this specific shell injection scheme.
+///
+/// `cmd` is Windows' cmd.exe, and only on Windows: it is detected only
+/// there and does nothing elsewhere. Its integration is the `PROMPT`
+/// environment variable: Ghostty wraps the user's prompt, or cmd's
+/// default, in marks for the prompt and the working directory. A `PROMPT`
+/// set with `env`, or by a `prompt` command (typed, or in cmd's
+/// `AutoRun`), replaces it, and the marks are gone. cmd also writes its
+/// prompt before each command it echoes, as in a batch file without
+/// `@echo off`, so those lines carry the marks too, in a file the output
+/// is redirected to as well; and every program cmd starts inherits the
+/// variable. It cannot tell when a command finishes
+/// (`notify-on-command-finish`), and `shell-integration-features` do not
+/// apply to it.
 ///
 /// The default value is `detect`.
 @"shell-integration": ShellIntegration = .detect,
@@ -8921,6 +8934,7 @@ pub const ShellIntegration = enum {
     none,
     detect,
     bash,
+    cmd,
     elvish,
     fish,
     nushell,

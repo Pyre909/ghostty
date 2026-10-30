@@ -35,6 +35,41 @@ fi
 > integration script (as shown above). You can also install a standard
 > version of Bash from Homebrew or elsewhere and set it as your shell.
 
+### cmd.exe
+
+Automatic integration for Windows' `cmd.exe`, the default command on
+Windows, has no script. cmd reads no startup file Ghostty could add to (its
+`AutoRun` registry value is the user's) and runs nothing before or after a
+command, but it expands the `PROMPT` environment variable for every prompt.
+Ghostty sets `PROMPT` to the user's value, or cmd's default `$P$G`, with
+`133;A;redraw=0` and an OSC 9;9 of `$P` (the working directory) before it
+and `133;I` after it, so the input ends at the end of its line (`setupCmd`
+in `src/termio/shell_integration.zig`).
+
+That gives prompt marks and the working directory. With no hook before a
+command and no `%ERRORLEVEL%` in `PROMPT`, nothing marks where a command's
+output starts or how it ended: there is no `notify-on-command-finish`, and
+none of the `shell-integration-features` apply. A `prompt` command, an
+`AutoRun` or a prompt replacer such as Clink (not tried) that sets its own
+prompt drops the marks, as does a `PROMPT` set by Ghostty's `env` option.
+
+`PROMPT` is not only the interactive prompt. cmd writes it before each
+command it echoes, as in a batch file without `@echo off` or a `for` whose
+command has no `@`, so those lines carry the marks too, and so does a file
+that output is redirected to; every program cmd starts inherits it.
+Windows Terminal's documentation suggests the same kind of `PROMPT` for
+cmd, set for every console with `setx`; here it is set only for the shells
+Ghostty starts. On Windows only: elsewhere `shell-integration = cmd` does
+nothing, as `PROMPT` belongs to other shells (zsh's prompt). Like the
+other integrations it is skipped when Ghostty finds no resources
+directory, although it uses no file from there.
+
+To set it up manually, for example in an `AutoRun` script:
+
+```bat
+prompt $E]133;A;redraw=0$E\$E]9;9;$P$E\$P$G$E]133;I$E\
+```
+
 ### Elvish
 
 For [Elvish](https://elv.sh), `$GHOSTTY_RESOURCES_DIR/src/shell-integration`
