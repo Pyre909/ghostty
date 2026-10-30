@@ -476,7 +476,9 @@ pub const Notifier = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Show `toast`; false, logged, if it could not be.
+        /// Show `toast`; false, logged, if it could not be. Its text is
+        /// read only during the call: a caller may format it on its stack
+        /// (`Surface.commandFinished`).
         show: *const fn (*anyopaque, Toast) bool,
         /// Remove one toast, shown or kept in the notification center.
         remove: *const fn (*anyopaque, group: u64, tag: u64) void,
@@ -500,8 +502,12 @@ pub const Notifier = struct {
 /// For tests: a stand-in for the system's notifications, which keeps what
 /// was asked of it.
 pub const TestNotifier = struct {
+    /// The toasts shown, their text in `text`.
     shown: [8]Toast = undefined,
     shown_len: usize = 0,
+    /// Each shown toast's text, copied, as the caller's is only lent for
+    /// the call (`Notifier.VTable.show`).
+    text: [8][512]u8 = undefined,
     /// Fail the next `show`.
     fail: bool = false,
     /// Group and tag.
@@ -526,7 +532,13 @@ pub const TestNotifier = struct {
             self.fail = false;
             return false;
         }
-        self.shown[self.shown_len] = t;
+        var fba: std.heap.FixedBufferAllocator = .init(&self.text[self.shown_len]);
+        const alloc = fba.allocator();
+        var copy = t;
+        copy.title = alloc.dupe(u8, t.title) catch @panic("TestNotifier: toast text too long");
+        copy.body = alloc.dupe(u8, t.body) catch @panic("TestNotifier: toast text too long");
+        if (t.attribution) |a| copy.attribution = alloc.dupe(u8, a) catch @panic("TestNotifier: toast text too long");
+        self.shown[self.shown_len] = copy;
         self.shown_len += 1;
         return true;
     }

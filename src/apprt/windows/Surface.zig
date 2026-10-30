@@ -151,6 +151,12 @@ pub const Surface = struct {
     /// The terminal's toasts (`notify`).
     notifications: DesktopNotifications,
 
+    /// The context menu's "Notify on Next Command Finish" is checked: the
+    /// next command to finish notifies whatever `notify-on-command-finish`
+    /// says, if it took longer than `notify-on-command-finish-after`, and
+    /// clears it either way (`commandFinished`).
+    notify_next_command: bool,
+
     /// The terminal's search bar (`SearchBar`), a window of the frame's
     /// over this one's top-right corner once `start_search` opened it.
     search_bar: SearchBar.Bar,
@@ -677,6 +683,7 @@ pub const Surface = struct {
             .progress = .{},
             .progress_expires = 0,
             .notifications = .{},
+            .notify_next_command = false,
             .search_bar = .{},
             .overlays = .{},
             .scroll_bar = .{},
@@ -1380,6 +1387,24 @@ pub const Surface = struct {
             self.focused,
             win32.GetTickCount64(),
         );
+    }
+
+    /// `.command_finished`: the bell, a toast, or both, for a command the
+    /// shell marked, as GTK's rule decides (`commandFinishedReply`). The
+    /// bell is the one BEL rings (`App.ringBell`), and the toast says how
+    /// the command ended and how long it took. The next command to finish
+    /// clears `notify_next_command`, whether it then notifies or not, as
+    /// GTK's does. False only if a toast was asked for and could not be
+    /// shown.
+    pub fn commandFinished(self: *Surface, value: apprt.action.CommandFinished) bool {
+        const next = self.notify_next_command;
+        self.notify_next_command = false;
+        const reply = commandFinishedReply(&self.app.config, value.duration, self.focused, next);
+        if (reply.bell) App.ringBell();
+        if (!reply.notify) return true;
+        var buf: [command_body_max]u8 = undefined;
+        const text = commandFinishedText(&buf, value);
+        return self.notify(text.title, text.body);
     }
 
     /// Remove the terminal's toasts, shown or kept in the notification
@@ -3063,6 +3088,60 @@ fn cursorId(shape: terminal.MouseShape) win32.ResourceW {
     };
 }
 
+/// What a finished command asks of its terminal (`commandFinishedReply`).
+pub const CommandReply = struct {
+    bell: bool = false,
+    notify: bool = false,
+};
+
+/// GTK's rule for a command that took `duration` to finish in a terminal
+/// with the focus or not (`commandFinished`,
+/// src/apprt/gtk/class/surface.zig:1172-1229): nothing with
+/// `notify-on-command-finish` at `never`, or at `unfocused` while the
+/// terminal has the focus, unless `next` (the context menu's "Notify on
+/// Next Command Finish") asks for this command; then nothing for one that
+/// took no longer than `notify-on-command-finish-after`; else what
+/// `notify-on-command-finish-action` lists.
+pub fn commandFinishedReply(
+    config: *const configpkg.Config,
+    duration: configpkg.Config.Duration,
+    focused: bool,
+    next: bool,
+) CommandReply {
+    if (!next) switch (config.@"notify-on-command-finish") {
+        .never => return .{},
+        .unfocused => if (focused) return .{},
+        .always => {},
+    };
+    if (duration.lte(config.@"notify-on-command-finish-after")) return .{};
+    const action = config.@"notify-on-command-finish-action";
+    return .{ .bell = action.bell, .notify = action.notify };
+}
+
+/// The bytes `commandFinishedText`'s body may take: the longest, which
+/// took 583y 51w 6d 23h 59m 59s 999ms and exited with code 255, takes 68.
+/// Config's `Duration.format` (src/config/Config.zig:10431-10447) treats a
+/// full buffer as unreachable; the toast text test fails if it grows.
+const command_body_max = 128;
+
+/// GTK's toast for a finished command, its body in `buf`: whether it
+/// succeeded, by its exit code if the shell gave one, how long it took to
+/// the millisecond, and the code.
+pub fn commandFinishedText(
+    buf: *[command_body_max]u8,
+    value: apprt.action.CommandFinished,
+) struct { title: []const u8, body: []const u8 } {
+    const took = value.duration.round(std.time.ns_per_ms);
+    const code = value.exit_code orelse return .{
+        .title = "Command Finished",
+        .body = std.fmt.bufPrint(buf, "Command took {f}.", .{took}) catch unreachable,
+    };
+    return .{
+        .title = if (code == 0) "Command Succeeded" else "Command Failed",
+        .body = std.fmt.bufPrint(buf, "Command took {f} and exited with code {d}.", .{ took, code }) catch unreachable,
+    };
+}
+
 test "win32: mouse lParam coordinates are signed" {
     // (-5, -7) as the system packs it: MAKELPARAM of two shorts.
     const pos = clientPos(@bitCast(@as(usize, 0xFFF9_FFFB)));
@@ -4081,4 +4160,77 @@ test "win32: a closing surface leaves the core and its window requests" {
     for (want, app.requests.items) |w, got| {
         try std.testing.expect(std.meta.eql(w, got));
     }
+}
+
+test "win32: a finished command notifies by GTK's rule" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    const s = std.time.ns_per_s;
+    config.@"notify-on-command-finish-after" = .{ .duration = 5 * s };
+    config.@"notify-on-command-finish-action" = .{ .bell = true, .notify = true };
+    const long: configpkg.Config.Duration = .{ .duration = 5 * s + 1 };
+    const both: CommandReply = .{ .bell = true, .notify = true };
+    const none: CommandReply = .{};
+
+    // By the mode, focused or not.
+    for ([_]bool{ false, true }) |focused| {
+        config.@"notify-on-command-finish" = .never;
+        try testing.expectEqual(none, commandFinishedReply(&config, long, focused, false));
+        config.@"notify-on-command-finish" = .always;
+        try testing.expectEqual(both, commandFinishedReply(&config, long, focused, false));
+        config.@"notify-on-command-finish" = .unfocused;
+        try testing.expectEqual(if (focused) none else both, commandFinishedReply(&config, long, focused, false));
+    }
+
+    // The menu's item overrides `never` and `unfocused` alike, but not the
+    // threshold.
+    for ([_]configpkg.Config.NotifyOnCommandFinish{ .never, .unfocused, .always }) |mode| {
+        config.@"notify-on-command-finish" = mode;
+        try testing.expectEqual(both, commandFinishedReply(&config, long, true, true));
+        try testing.expectEqual(none, commandFinishedReply(&config, .{ .duration = 5 * s }, true, true));
+    }
+
+    // Strictly longer than the threshold, as GTK's `lte` refuses.
+    config.@"notify-on-command-finish" = .always;
+    try testing.expectEqual(none, commandFinishedReply(&config, .{ .duration = 5 * s }, false, false));
+    try testing.expectEqual(none, commandFinishedReply(&config, .{ .duration = 1 }, false, false));
+    config.@"notify-on-command-finish-after" = .{ .duration = 0 };
+    try testing.expectEqual(both, commandFinishedReply(&config, .{ .duration = 1 }, false, false));
+    try testing.expectEqual(none, commandFinishedReply(&config, .{ .duration = 0 }, false, false));
+
+    // Each of the actions on its own.
+    config.@"notify-on-command-finish-action" = .{ .bell = false, .notify = true };
+    try testing.expectEqual(CommandReply{ .notify = true }, commandFinishedReply(&config, long, false, false));
+    config.@"notify-on-command-finish-action" = .{ .bell = true, .notify = false };
+    try testing.expectEqual(CommandReply{ .bell = true }, commandFinishedReply(&config, long, false, false));
+    config.@"notify-on-command-finish-action" = .{ .bell = false, .notify = false };
+    try testing.expectEqual(none, commandFinishedReply(&config, long, false, false));
+}
+
+test "win32: a finished command's toast says how it ended and how long it took" {
+    const testing = std.testing;
+    var buf: [command_body_max]u8 = undefined;
+    const took: configpkg.Config.Duration = .{ .duration = 2 * std.time.ns_per_s + 3 * std.time.ns_per_ms + 999 };
+
+    var text = commandFinishedText(&buf, .{ .exit_code = 0, .duration = took });
+    try testing.expectEqualStrings("Command Succeeded", text.title);
+    try testing.expectEqualStrings("Command took 2s 3ms and exited with code 0.", text.body);
+    text = commandFinishedText(&buf, .{ .exit_code = 3, .duration = took });
+    try testing.expectEqualStrings("Command Failed", text.title);
+    try testing.expectEqualStrings("Command took 2s 3ms and exited with code 3.", text.body);
+    text = commandFinishedText(&buf, .{ .exit_code = null, .duration = took });
+    try testing.expectEqualStrings("Command Finished", text.title);
+    try testing.expectEqualStrings("Command took 2s 3ms.", text.body);
+
+    // The longest body, every unit at its widest, fits; so does the
+    // longest duration.
+    const ms = std.time.ns_per_ms;
+    const widest = 583 * 365 * std.time.ns_per_day + 51 * std.time.ns_per_week + 6 * std.time.ns_per_day +
+        23 * std.time.ns_per_hour + 59 * std.time.ns_per_min + 59 * std.time.ns_per_s + 999 * ms + 999_999;
+    text = commandFinishedText(&buf, .{ .exit_code = 255, .duration = .{ .duration = widest } });
+    try testing.expectEqualStrings("Command took 583y 51w 6d 23h 59m 59s 999ms and exited with code 255.", text.body);
+    try testing.expectEqual(68, text.body.len);
+    text = commandFinishedText(&buf, .{ .exit_code = 255, .duration = .{ .duration = std.math.maxInt(u64) } });
+    try testing.expectEqualStrings("Command took 584y 49w 23h 34m 33s 709ms and exited with code 255.", text.body);
 }

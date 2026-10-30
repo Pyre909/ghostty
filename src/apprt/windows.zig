@@ -161,6 +161,21 @@
 //! preview; it takes the pointer over its button alone, and never the
 //! activation or the focus. Its window is made when the core asks.
 //!
+//! ## Command finished
+//!
+//! `.command_finished`, which the core sends when a command the shell
+//! marked with OSC 133 (C, then D) ends, rings the bell, shows a toast, or
+//! both, as `notify-on-command-finish`, its `-action` and its `-after` ask,
+//! by GTK's rule (`Surface.commandFinished`): with `unfocused`, only for a
+//! terminal without the keyboard focus, which one in another tab or in an
+//! inactive window lacks too. The bell is the system's sound that BEL
+//! plays (`App.ringBell`); the toast says whether the command succeeded,
+//! how long it took and its exit code, as GTK's does, and goes as the
+//! terminal's other toasts go. The context menu's "Notify on Next Command
+//! Finish" asks for the terminal's next command whatever the mode says,
+//! though not for one within `-after`, and that command clears it either
+//! way, as on GTK.
+//!
 //! ## Context menu
 //!
 //! A right click on a terminal shows GTK's context menu, less what this

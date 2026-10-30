@@ -1224,7 +1224,7 @@ pub const App = struct {
             .config_change => try self.configChange(target, value),
 
             .ring_bell => ring_bell: {
-                _ = win32.MessageBeep(win32.MB_ICONASTERISK);
+                ringBell();
                 break :ring_bell true;
             },
 
@@ -1243,6 +1243,7 @@ pub const App = struct {
             .float_window => floatWindow(target, value),
             .progress_report => progressReport(target, value),
             .desktop_notification => self.desktopNotification(target, value),
+            .command_finished => commandFinished(target, value),
             .start_search => startSearch(target, value),
             .end_search => endSearch(target),
             .search_total => searchCount(target, .total, value.total),
@@ -2383,6 +2384,33 @@ pub const App = struct {
             },
             .surface => |v| v.rt_surface.notify(value.title, value.body),
         };
+    }
+
+    /// `.command_finished`, from the core when a command the shell marked
+    /// (OSC 133 C, then D) has finished: the terminal's bell or toast, as
+    /// the configuration asks (`Surface.commandFinished`). `false` for the
+    /// app, which the core does not send, and for a toast that could not
+    /// be shown.
+    fn commandFinished(target: apprt.Target, value: apprt.action.CommandFinished) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| v.rt_surface.commandFinished(value),
+        };
+    }
+
+    /// For tests: how many times `ringBell` rang, in place of the sound.
+    pub var test_bells: if (builtin.is_test) usize else void =
+        if (builtin.is_test) 0 else {};
+
+    /// The bell, for BEL (`.ring_bell`) and a finished command
+    /// (`Surface.commandFinished`): the system's sound, which is all this
+    /// runtime does for it.
+    pub fn ringBell() void {
+        if (builtin.is_test) {
+            test_bells += 1;
+            return;
+        }
+        _ = win32.MessageBeep(win32.MB_ICONASTERISK);
     }
 
     /// WM_GHOSTTY_NOTIFICATION, a toast's click, made at once where the
@@ -3901,6 +3929,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.progress = .{};
     surface.progress_expires = 0;
     surface.notifications = .{ .id = @intFromPtr(surface) };
+    surface.notify_next_command = false;
     surface.search_bar = .{};
     surface.overlays = .{};
     surface.scroll_bar = .{};
@@ -10299,6 +10328,158 @@ test "win32: desktop_notification shows a toast for its terminal, which a click 
     try std.testing.expectEqual(0, fake.shown[fake.shown_len - 1].group);
 }
 
+test "win32: command_finished rings the bell or shows a toast for its terminal, as asked" {
+    // GTK's rule (`Surface.commandFinishedReply`, tested alone in
+    // Surface.zig) through the action: `unfocused` notifies only for a
+    // terminal without the focus, a command must take longer than the
+    // threshold, and the context menu's "Notify on Next Command Finish",
+    // chosen as a user chooses it, asks for the next command alone, which
+    // clears it, long enough or not; chosen, it sets the reverse of the
+    // check it showed.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var fake: toast.TestNotifier = .{};
+    app.notifier = fake.notifier();
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    Surface.test_mouse_button = &MenuCore.answer;
+    defer Surface.test_mouse_button = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    MenuCore.reset();
+    PaletteSeen.reset(null);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.relayout();
+    _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
+
+    app.config.@"notify-on-command-finish" = .unfocused;
+    app.config.@"notify-on-command-finish-after" = .{ .duration = std.time.ns_per_s };
+    app.config.@"notify-on-command-finish-action" = .{ .bell = true, .notify = true };
+    const long: Config.Duration = .{ .duration = 2 * std.time.ns_per_s };
+    const short: Config.Duration = .{ .duration = std.time.ns_per_s };
+    const finish = struct {
+        fn f(a: *App, pane: *Surface, code: ?u8, took: Config.Duration) !bool {
+            return a.performAction(
+                .{ .surface = &pane.core_surface },
+                .command_finished,
+                .{ .exit_code = code, .duration = took },
+            );
+        }
+    }.f;
+    const bells = App.test_bells;
+
+    // Without the focus, long enough: the bell and a toast in the
+    // terminal's group.
+    try std.testing.expect(try finish(&app, right, 3, long));
+    try std.testing.expectEqual(bells + 1, App.test_bells);
+    try std.testing.expectEqual(1, fake.shown_len);
+    try std.testing.expectEqualStrings("Command Failed", fake.shown[0].title);
+    try std.testing.expectEqualStrings("Command took 2s and exited with code 3.", fake.shown[0].body);
+    try std.testing.expectEqual(right.notifications.id, fake.shown[0].group);
+
+    // With the focus, or not long enough: nothing, and handled.
+    try std.testing.expect(try finish(&app, left, 0, long));
+    try std.testing.expect(try finish(&app, right, 0, short));
+    try std.testing.expectEqual(bells + 1, App.test_bells);
+    try std.testing.expectEqual(1, fake.shown_len);
+
+    // The menu's item, chosen on the focused terminal: set from then on,
+    // it asks for its next command, which clears it.
+    MenuSeen.choose = "Notify on Next Command Finish";
+    testRightClick(left, 20, 30);
+    try std.testing.expect(!MenuSeen.chosen_checked);
+    try std.testing.expect(left.notify_next_command);
+    try std.testing.expect(!right.notify_next_command);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    try std.testing.expect(try finish(&app, left, 0, long));
+    try std.testing.expectEqual(bells + 2, App.test_bells);
+    try std.testing.expectEqual(2, fake.shown_len);
+    try std.testing.expectEqualStrings("Command Succeeded", fake.shown[1].title);
+    try std.testing.expectEqual(left.notifications.id, fake.shown[1].group);
+    try std.testing.expect(!left.notify_next_command);
+    try std.testing.expect(try finish(&app, left, 0, long));
+    try std.testing.expectEqual(2, fake.shown_len);
+
+    // Spent by a command too quick to notify; and chosen again, shown
+    // checked, it is taken back.
+    testRightClick(left, 20, 30);
+    try std.testing.expect(left.notify_next_command);
+    try std.testing.expect(try finish(&app, left, 0, short));
+    try std.testing.expect(!left.notify_next_command);
+    try std.testing.expect(try finish(&app, left, 0, long));
+    testRightClick(left, 20, 30);
+    testRightClick(left, 20, 30);
+    try std.testing.expect(MenuSeen.chosen_checked);
+    try std.testing.expect(!left.notify_next_command);
+    try std.testing.expect(try finish(&app, left, 0, long));
+    try std.testing.expectEqual(bells + 2, App.test_bells);
+    try std.testing.expectEqual(2, fake.shown_len);
+
+    // The bell alone, and a toast alone, of which one that cannot be shown
+    // is reported. No exit code: "Command Finished".
+    app.config.@"notify-on-command-finish-action" = .{ .bell = true, .notify = false };
+    try std.testing.expect(try finish(&app, right, 1, long));
+    try std.testing.expectEqual(bells + 3, App.test_bells);
+    try std.testing.expectEqual(2, fake.shown_len);
+    app.config.@"notify-on-command-finish-action" = .{ .bell = false, .notify = true };
+    try std.testing.expect(try finish(&app, right, null, long));
+    try std.testing.expectEqual(bells + 3, App.test_bells);
+    try std.testing.expectEqualStrings("Command Finished", fake.shown[2].title);
+    try std.testing.expectEqualStrings("Command took 2s.", fake.shown[2].body);
+    fake.fail = true;
+    try std.testing.expect(!try finish(&app, right, 0, long));
+    try std.testing.expectEqual(3, fake.shown_len);
+
+    // The app runs no command.
+    try std.testing.expect(!try app.performAction(.app, .command_finished, .{ .exit_code = 0, .duration = long }));
+
+    // BEL rings the same bell.
+    try std.testing.expect(try app.performAction(.{ .surface = &right.core_surface }, .ring_bell, {}));
+    try std.testing.expectEqual(bells + 4, App.test_bells);
+
+    // Set, then a command finishes while the menu is open, as its loop
+    // ticks the app, and clears it: the item the menu shows checked,
+    // chosen to uncheck it, leaves it clear rather than setting it again.
+    testRightClick(left, 20, 30);
+    try std.testing.expect(left.notify_next_command);
+    const Meanwhile = struct {
+        var app_: *App = undefined;
+        var pane: *Surface = undefined;
+        fn end() void {
+            const done = app_.performAction(
+                .{ .surface = &pane.core_surface },
+                .command_finished,
+                .{ .exit_code = 0, .duration = .{ .duration = 2 * std.time.ns_per_s } },
+            ) catch @panic("command_finished failed");
+            if (!done) @panic("command_finished not handled");
+        }
+    };
+    Meanwhile.app_ = &app;
+    Meanwhile.pane = left;
+    MenuSeen.during = &Meanwhile.end;
+    testRightClick(left, 20, 30);
+    MenuSeen.during = null;
+    try std.testing.expectEqual(4, fake.shown_len);
+    try std.testing.expectEqual(left.notifications.id, fake.shown[3].group);
+    try std.testing.expect(MenuSeen.chosen_checked);
+    try std.testing.expect(!left.notify_next_command);
+}
+
 test "win32: float_window keeps a window on top, or puts it back" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
@@ -14755,6 +14936,8 @@ const MenuSeen = struct {
     /// Who had the mouse capture as the menu opened.
     var capture: ?win32.HWND = null;
     var choose: ?[]const u8 = null;
+    /// Whether the item chosen was shown checked.
+    var chosen_checked: bool = false;
     /// Run while the menu is open, as what its loop dispatches.
     var during: ?*const fn () void = null;
     fn track(menu: win32.HMENU, o: win32.HWND, pt: win32.POINT) u32 {
@@ -14764,12 +14947,16 @@ const MenuSeen = struct {
         capture = win32.GetCapture();
         if (during) |f| f();
         const label = choose orelse return 0;
-        return menuIdOf(menu, label) orelse 0;
+        const id = menuIdOf(menu, label) orelse return 0;
+        // By its id (MF_BYCOMMAND, 0), in a submenu too.
+        chosen_checked = win32.GetMenuState(menu, id, 0) & win32.MF_CHECKED != 0;
+        return id;
     }
     fn reset() void {
         count = 0;
         owner = null;
         choose = null;
+        chosen_checked = false;
         during = null;
     }
 };
@@ -14968,10 +15155,12 @@ test "win32: the context menu's choice is performed on its terminal" {
 
     // Each item by its label, as the menu shows it, and the action it
     // performs, written out by hand. Copy is greyed: a terminal with no
-    // core has no selection.
+    // core has no selection. Notify on Next Command Finish performs no
+    // binding's action, but checks the terminal's own flag.
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "Copy", "" },
         .{ "Paste", "paste_from_clipboard;" },
+        .{ "Notify on Next Command Finish", "" },
         .{ "Clear", "clear_screen;" },
         .{ "Reset", "reset;" },
         .{ "Read-only", "toggle_readonly;" },
@@ -14999,6 +15188,8 @@ test "win32: the context menu's choice is performed on its terminal" {
         try std.testing.expect(FocusSeen.last == b.hwnd);
     }
     try std.testing.expectEqual(cases.len, MenuSeen.count);
+    try std.testing.expect(b.notify_next_command);
+    try std.testing.expect(!a.notify_next_command);
 
     // Dismissed: nothing, the focus back all the same.
     MenuSeen.choose = null;

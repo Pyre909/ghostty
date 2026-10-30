@@ -1217,9 +1217,9 @@ command: ?Command = null,
 /// enabled, or that your shell sends OSC 133 escape sequences to mark the start
 /// and end of commands.
 ///
-/// On GTK, there is a context menu item that will enable command finished
-/// notifications for a single command, overriding the `never` and `unfocused`
-/// options.
+/// On GTK and Windows, there is a context menu item that will enable command
+/// finished notifications for a single command, overriding the `never` and
+/// `unfocused` options.
 ///
 /// Available since 1.3.0.
 @"notify-on-command-finish": NotifyOnCommandFinish = .never,

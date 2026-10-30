@@ -1,16 +1,18 @@
 //! A terminal's context menu, as GTK lists its items (`context_menu_model`
-//! in src/apprt/gtk/ui/1.0/surface.blp): Copy and Paste; Clear and Reset;
-//! the Split, Tab and Window submenus; the Config submenu. Left out are
-//! what this runtime does not carry out, Change Window Title… (a window's
-//! caption is its shown tab's) and Open Configuration in New Window
-//! (`App.openConfig`), and Notify on Next Command Finish, which needs
-//! `command_finished`. Added, as macOS has it ("Terminal Read-only" in
-//! `menu(for:)`, SurfaceView_AppKit.swift), is a checked "Read-only", after
-//! Reset. Copy is greyed without a selection, as GTK disables its action
-//! (`syncActions` in src/apprt/gtk/class/window.zig). Each item shows the
-//! shortcut its action is bound to after a tab, in Windows' key names, as
-//! the command palette shows one (`CommandPalette.shortcutLabel`)
-//! (`menuItems`).
+//! in src/apprt/gtk/ui/1.0/surface.blp): Copy, Paste and Notify on Next
+//! Command Finish; Clear and Reset; the Split, Tab and Window submenus;
+//! the Config submenu. Left out are what this runtime does not carry out,
+//! Change Window Title… (a window's caption is its shown tab's) and Open
+//! Configuration in New Window (`App.openConfig`). Added, as macOS has it
+//! ("Terminal Read-only" in `menu(for:)`, SurfaceView_AppKit.swift), is a
+//! checked "Read-only", after Reset. Copy is greyed without a selection, as
+//! GTK disables its action (`syncActions` in
+//! src/apprt/gtk/class/window.zig). Notify on Next Command Finish is no
+//! binding's action but GTK's surface's own, a check its next finished
+//! command clears (`Surface.notify_next_command`); it is checked while set,
+//! as GTK shows its state. Each other item shows the shortcut its action
+//! is bound to after a tab, in Windows' key names, as the command palette
+//! shows one (`CommandPalette.shortcutLabel`) (`menuItems`).
 //!
 //! It is the system's popup menu, light in dark mode as well, and the
 //! terminal's frame owns it (`TrackPopupMenuEx`), so that the frame hears
@@ -60,10 +62,18 @@ pub const Submenu = enum {
     }
 };
 
+/// What an item does: a binding's action, performed as a key's would be,
+/// or GTK's one item that is not one, which checks or clears the
+/// terminal's `notify_next_command`.
+pub const Command = union(enum) {
+    binding: Binding.Action,
+    notify_next_command,
+};
+
 /// An item as the menu always lists it.
 const Entry = struct {
     label: []const u8,
-    action: Binding.Action,
+    action: Command,
     /// GTK's section it is in; a line divides one section from the next.
     section: u8,
     /// The submenu it is in, null for the menu itself.
@@ -73,24 +83,25 @@ const Entry = struct {
 /// GTK's items in GTK's order, but for what this runtime leaves out and
 /// the read-only item it adds (see the top of this file).
 const layout = [_]Entry{
-    .{ .label = "Copy", .action = .{ .copy_to_clipboard = .mixed }, .section = 0 },
-    .{ .label = "Paste", .action = .paste_from_clipboard, .section = 0 },
-    .{ .label = "Clear", .action = .clear_screen, .section = 1 },
-    .{ .label = "Reset", .action = .reset, .section = 1 },
-    .{ .label = "Read-only", .action = .toggle_readonly, .section = 1 },
-    .{ .label = "Change Title\u{2026}", .action = .prompt_surface_title, .section = 2, .submenu = .split },
-    .{ .label = "Split Up", .action = .{ .new_split = .up }, .section = 2, .submenu = .split },
-    .{ .label = "Split Down", .action = .{ .new_split = .down }, .section = 2, .submenu = .split },
-    .{ .label = "Split Left", .action = .{ .new_split = .left }, .section = 2, .submenu = .split },
-    .{ .label = "Split Right", .action = .{ .new_split = .right }, .section = 2, .submenu = .split },
-    .{ .label = "Close Split", .action = .close_surface, .section = 2, .submenu = .split },
-    .{ .label = "Change Tab Title\u{2026}", .action = .prompt_tab_title, .section = 2, .submenu = .tab },
-    .{ .label = "New Tab", .action = .new_tab, .section = 2, .submenu = .tab },
-    .{ .label = "Close Tab", .action = .{ .close_tab = .this }, .section = 2, .submenu = .tab },
-    .{ .label = "New Window", .action = .new_window, .section = 2, .submenu = .window },
-    .{ .label = "Close Window", .action = .close_window, .section = 2, .submenu = .window },
-    .{ .label = "Open Configuration in OS Editor", .action = .{ .open_config = .os_open }, .section = 3, .submenu = .config },
-    .{ .label = "Reload Configuration", .action = .reload_config, .section = 3, .submenu = .config },
+    .{ .label = "Copy", .action = .{ .binding = .{ .copy_to_clipboard = .mixed } }, .section = 0 },
+    .{ .label = "Paste", .action = .{ .binding = .paste_from_clipboard }, .section = 0 },
+    .{ .label = "Notify on Next Command Finish", .action = .notify_next_command, .section = 0 },
+    .{ .label = "Clear", .action = .{ .binding = .clear_screen }, .section = 1 },
+    .{ .label = "Reset", .action = .{ .binding = .reset }, .section = 1 },
+    .{ .label = "Read-only", .action = .{ .binding = .toggle_readonly }, .section = 1 },
+    .{ .label = "Change Title\u{2026}", .action = .{ .binding = .prompt_surface_title }, .section = 2, .submenu = .split },
+    .{ .label = "Split Up", .action = .{ .binding = .{ .new_split = .up } }, .section = 2, .submenu = .split },
+    .{ .label = "Split Down", .action = .{ .binding = .{ .new_split = .down } }, .section = 2, .submenu = .split },
+    .{ .label = "Split Left", .action = .{ .binding = .{ .new_split = .left } }, .section = 2, .submenu = .split },
+    .{ .label = "Split Right", .action = .{ .binding = .{ .new_split = .right } }, .section = 2, .submenu = .split },
+    .{ .label = "Close Split", .action = .{ .binding = .close_surface }, .section = 2, .submenu = .split },
+    .{ .label = "Change Tab Title\u{2026}", .action = .{ .binding = .prompt_tab_title }, .section = 2, .submenu = .tab },
+    .{ .label = "New Tab", .action = .{ .binding = .new_tab }, .section = 2, .submenu = .tab },
+    .{ .label = "Close Tab", .action = .{ .binding = .{ .close_tab = .this } }, .section = 2, .submenu = .tab },
+    .{ .label = "New Window", .action = .{ .binding = .new_window }, .section = 2, .submenu = .window },
+    .{ .label = "Close Window", .action = .{ .binding = .close_window }, .section = 2, .submenu = .window },
+    .{ .label = "Open Configuration in OS Editor", .action = .{ .binding = .{ .open_config = .os_open } }, .section = 3, .submenu = .config },
+    .{ .label = "Reload Configuration", .action = .{ .binding = .reload_config }, .section = 3, .submenu = .config },
 };
 
 comptime {
@@ -99,8 +110,13 @@ comptime {
     // refused by `App.openConfig`. A submenu's items are next to one
     // another, all in one section.
     for (layout, 0..) |entry, i| {
-        if (!CommandPalette.supported(entry.action)) @compileError("not carried out: " ++ entry.label);
-        if (entry.action == .open_config and entry.action.open_config != .os_open) @compileError("refused: " ++ entry.label);
+        switch (entry.action) {
+            .binding => |action| {
+                if (!CommandPalette.supported(action)) @compileError("not carried out: " ++ entry.label);
+                if (action == .open_config and action.open_config != .os_open) @compileError("refused: " ++ entry.label);
+            },
+            .notify_next_command => {},
+        }
         if (i == 0) continue;
         const prev = layout[i - 1];
         if (entry.section < prev.section) @compileError("out of order: " ++ entry.label);
@@ -126,12 +142,13 @@ pub const Item = struct {
     /// TrackPopupMenuEx returns 0 when nothing is chosen.
     id: u16,
     label: []const u8,
-    action: Binding.Action,
+    action: Command,
     section: u8,
     submenu: ?Submenu,
     /// False for Copy without a selection, shown greyed.
     enabled: bool,
-    /// Shown with a check: Read-only, while the terminal is.
+    /// Shown with a check: Read-only, while the terminal is, and Notify on
+    /// Next Command Finish, while it is set.
     checked: bool,
     shortcut_buf: [shortcut_max]u8,
     shortcut_len: u8,
@@ -142,11 +159,21 @@ pub const Item = struct {
     }
 };
 
-/// The menu's items for a terminal with a selection or none, read-only
-/// or not, with the shortcuts `set` binds their actions to, as the
-/// command palette finds them (`Binding.Set.getTrigger`). Items keep what
-/// they show: nothing points into `set`, which a reload frees.
-pub fn menuItems(has_selection: bool, readonly: bool, set: *const Binding.Set) [count]Item {
+/// What the menu's items show of the terminal it is for.
+pub const State = struct {
+    /// Copy is enabled.
+    selection: bool = false,
+    /// Read-only is checked.
+    readonly: bool = false,
+    /// Notify on Next Command Finish is checked.
+    notify_next_command: bool = false,
+};
+
+/// The menu's items for a terminal in `state`, with the shortcuts `set`
+/// binds their actions to, as the command palette finds them
+/// (`Binding.Set.getTrigger`). Items keep what they show: nothing points
+/// into `set`, which a reload frees.
+pub fn menuItems(state: State, set: *const Binding.Set) [count]Item {
     var items: [count]Item = undefined;
     for (layout, &items, 0..) |entry, *item, i| {
         item.* = .{
@@ -156,14 +183,21 @@ pub fn menuItems(has_selection: bool, readonly: bool, set: *const Binding.Set) [
             .section = entry.section,
             .submenu = entry.submenu,
             .enabled = switch (entry.action) {
-                .copy_to_clipboard => has_selection,
-                else => true,
+                .binding => |action| action != .copy_to_clipboard or state.selection,
+                .notify_next_command => true,
             },
-            .checked = entry.action == .toggle_readonly and readonly,
+            .checked = switch (entry.action) {
+                .binding => |action| action == .toggle_readonly and state.readonly,
+                .notify_next_command => state.notify_next_command,
+            },
             .shortcut_buf = undefined,
             .shortcut_len = 0,
         };
-        const trigger = set.getTrigger(entry.action) orelse continue;
+        const action = switch (entry.action) {
+            .binding => |action| action,
+            .notify_next_command => continue,
+        };
+        const trigger = set.getTrigger(action) orelse continue;
         var w: std.Io.Writer = .fixed(&item.shortcut_buf);
         const shown = CommandPalette.shortcutLabel(&w, trigger) catch false;
         if (shown) item.shortcut_len = @intCast(w.buffered().len);
@@ -236,8 +270,9 @@ const Wide = struct {
 /// give the terminal the keyboard focus back, chosen or not, as GTK's
 /// popover gives it back when it closes, and perform the chosen item.
 /// Copy and Read-only follow the core's selection and flag; a terminal
-/// with no core has neither. Nothing shows if Windows cannot make the
-/// menu.
+/// with no core has neither. Notify on Next Command Finish follows the
+/// terminal's own flag, core or not. All three are read once, as the menu
+/// opens. Nothing shows if Windows cannot make the menu.
 ///
 /// `surface` is alive when the menu returns: its loop is counted in
 /// `App.terminal_loops`, so a teardown posted meanwhile (its shell
@@ -250,11 +285,11 @@ pub fn show(surface: *Surface, at: win32.POINT) void {
     const app = surface.app;
     const window = surface.window;
     const core = surface.liveCore();
-    const items = menuItems(
-        if (core) |c| c.hasSelection() else false,
-        if (core) |c| c.readonly else false,
-        &app.config.keybind.set,
-    );
+    const items = menuItems(.{
+        .selection = if (core) |c| c.hasSelection() else false,
+        .readonly = if (core) |c| c.readonly else false,
+        .notify_next_command = surface.notify_next_command,
+    }, &app.config.keybind.set);
     const menu = build(&items) orelse return;
     var screen = at;
     _ = win32.ClientToScreen(surface.hwnd, &screen);
@@ -277,7 +312,7 @@ pub fn show(surface: *Surface, at: win32.POINT) void {
     const item = &items[id - 1];
     // Windows chooses no greyed item, nor is one performed here.
     if (!item.enabled) return;
-    perform(surface, item.action);
+    perform(surface, item);
 }
 
 /// For tests: stands in for TrackPopupMenuEx (`track`), given the menu,
@@ -303,9 +338,14 @@ fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
     return 0;
 }
 
-/// Perform `action`, the chosen item's, on `surface`, as a key's binding
-/// would be (`SearchBar.perform`), then the focus move it chose, as the
-/// command palette performs an entry (`CommandPalette.perform`).
+/// Perform `item`, the chosen one, on `surface`: Notify on Next Command
+/// Finish sets the terminal's flag, which no core reads, to the reverse
+/// of the check the menu showed, not of the flag now: the app ticks while
+/// the menu is open, and a command that finished meanwhile cleared it, so
+/// unchecking would set it again. A binding's action is performed as a
+/// key's binding would be (`SearchBar.perform`), then the focus move it
+/// chose, as the command palette performs an entry
+/// (`CommandPalette.perform`).
 ///
 /// The core may always be re-entered here: the menu opens only for a
 /// release that reached the core (`consumed` in `Surface.handleMessage`),
@@ -324,7 +364,14 @@ fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
 /// Configuration are recorded by `App.performAction` itself, as they are
 /// from a key's binding (`App.requests`), and made by `run` once the
 /// terminal's handler has returned.
-fn perform(surface: *Surface, action: Binding.Action) void {
+fn perform(surface: *Surface, item: *const Item) void {
+    const action = switch (item.action) {
+        .binding => |action| action,
+        .notify_next_command => {
+            surface.notify_next_command = !item.checked;
+            return;
+        },
+    };
     const app = surface.app;
     if (!app.canReenterCore()) {
         log.warn("context menu item dropped, the core cannot be re-entered action={t}", .{action});
@@ -426,30 +473,43 @@ fn testItem(items: []const Item, label: []const u8) !*const Item {
     return error.TestUnexpectedResult;
 }
 
-test "win32: the context menu greys Copy without a selection and checks Read-only while read-only" {
+test "win32: the context menu greys Copy without a selection and checks Read-only and Notify on Next Command Finish while set" {
     var set: Binding.Set = .{};
     defer set.deinit(testing.allocator);
-    for ([_]bool{ false, true }) |selection| for ([_]bool{ false, true }) |readonly| {
-        const items = menuItems(selection, readonly, &set);
-        try testing.expectEqual(selection, (try testItem(&items, "Copy")).enabled);
-        try testing.expectEqual(readonly, (try testItem(&items, "Read-only")).checked);
-        // Nothing else follows either.
+    const copy = "Copy";
+    const readonly = "Read-only";
+    const notify = "Notify on Next Command Finish";
+    for (0..8) |bits| {
+        const state: State = .{
+            .selection = bits & 1 != 0,
+            .readonly = bits & 2 != 0,
+            .notify_next_command = bits & 4 != 0,
+        };
+        const items = menuItems(state, &set);
+        try testing.expectEqual(state.selection, (try testItem(&items, copy)).enabled);
+        try testing.expectEqual(state.readonly, (try testItem(&items, readonly)).checked);
+        try testing.expectEqual(state.notify_next_command, (try testItem(&items, notify)).checked);
+        // Nothing else follows any of them.
         for (&items) |*item| {
-            if (item.action != .copy_to_clipboard) try testing.expect(item.enabled);
-            if (item.action != .toggle_readonly) try testing.expect(!item.checked);
+            if (!std.mem.eql(u8, item.label, copy)) try testing.expect(item.enabled);
+            if (!std.mem.eql(u8, item.label, readonly) and !std.mem.eql(u8, item.label, notify)) {
+                try testing.expect(!item.checked);
+            }
         }
-    };
+    }
 }
 
 test "win32: the context menu is GTK's, less what this runtime does not carry out, and Read-only" {
     var set: Binding.Set = .{};
     defer set.deinit(testing.allocator);
-    const items = menuItems(true, false, &set);
+    const items = menuItems(.{ .selection = true }, &set);
     // Label, action, submenu, in order, written out by hand from
-    // surface.blp's `context_menu_model`.
+    // surface.blp's `context_menu_model`. GTK's own action is named as the
+    // union names it.
     const want = [_]struct { []const u8, []const u8, ?Submenu }{
         .{ "Copy", "copy_to_clipboard:mixed", null },
         .{ "Paste", "paste_from_clipboard", null },
+        .{ "Notify on Next Command Finish", "notify_next_command", null },
         .{ "Clear", "clear_screen", null },
         .{ "Reset", "reset", null },
         .{ "Read-only", "toggle_readonly", null },
@@ -471,14 +531,22 @@ test "win32: the context menu is GTK's, less what this runtime does not carry ou
     var buf: [64]u8 = undefined;
     for (want, &items, 1..) |w, *item, id| {
         try testing.expectEqualStrings(w[0], item.label);
-        try testing.expectEqualStrings(w[1], try std.fmt.bufPrint(&buf, "{f}", .{item.action}));
+        const name = switch (item.action) {
+            .binding => |action| try std.fmt.bufPrint(&buf, "{f}", .{action}),
+            .notify_next_command => @tagName(item.action),
+        };
+        try testing.expectEqualStrings(w[1], name);
         try testing.expectEqual(w[2], item.submenu);
         try testing.expectEqual(id, item.id);
         // Only what this runtime carries out: no window title of its own,
         // no configuration in a new window.
-        try testing.expect(CommandPalette.supported(item.action));
-        try testing.expect(item.action != .prompt_window_title);
-        if (item.action == .open_config) try testing.expect(item.action.open_config == .os_open);
+        const action = switch (item.action) {
+            .binding => |action| action,
+            .notify_next_command => continue,
+        };
+        try testing.expect(CommandPalette.supported(action));
+        try testing.expect(action != .prompt_window_title);
+        if (action == .open_config) try testing.expect(action.open_config == .os_open);
     }
 }
 
@@ -494,13 +562,13 @@ test "win32: a context menu item shows the shortcut its action is bound to" {
     var none: Binding.Set = .{};
     defer none.deinit(alloc);
 
-    const with = menuItems(true, false, &bound);
+    const with = menuItems(.{ .selection = true }, &bound);
     try testing.expectEqualStrings("Ctrl+Alt+R", (try testItem(&with, "Split Right")).shortcut());
     try testing.expectEqualStrings("Ctrl+Shift+C", (try testItem(&with, "Copy")).shortcut());
     try testing.expectEqualStrings("Ctrl+Alt+D", (try testItem(&with, "Split Left")).shortcut());
     try testing.expectEqualStrings("", (try testItem(&with, "Split Up")).shortcut());
     try testing.expectEqualStrings("", (try testItem(&with, "Paste")).shortcut());
-    const without = menuItems(true, false, &none);
+    const without = menuItems(.{ .selection = true }, &none);
     for (&without) |*item| try testing.expectEqualStrings("", item.shortcut());
 
     // As the menu shows it: after a tab.
@@ -528,7 +596,7 @@ test "win32: a context menu item's shortcut cannot underline, reorder or hide it
     try set.parseAndPut(alloc, "ctrl+\u{202E}=clear_screen");
     try set.parseAndPut(alloc, "ctrl+\u{0085}=reset");
     try set.parseAndPut(alloc, "ctrl+\u{1F600}=new_tab");
-    const items = menuItems(true, false, &set);
+    const items = menuItems(.{ .selection = true }, &set);
     var text: [text_max:0]u16 = undefined;
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Paste\tCtrl+&&"), itemText(&text, try testItem(&items, "Paste")));
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Clear\tCtrl+U+202E"), itemText(&text, try testItem(&items, "Clear")));
@@ -552,12 +620,12 @@ test "win32: the menu Windows shows has each item's text and state, GTK's lines 
     var buf: [text_max]u16 = undefined;
     var want: [text_max:0]u16 = undefined;
     for ([_]bool{ false, true }) |on| {
-        const items = menuItems(on, on, &set);
+        const items = menuItems(.{ .selection = on, .readonly = on, .notify_next_command = on }, &set);
         const menu = build(&items) orelse return error.TestUnexpectedResult;
         defer _ = win32.DestroyMenu(menu);
 
         // The menu itself: GTK's four sections, divided by lines.
-        const top = [_]?[]const u8{ "Copy", "Paste", null, "Clear", "Reset", "Read-only", null, "Split", "Tab", "Window", null, "Config" };
+        const top = [_]?[]const u8{ "Copy", "Paste", "Notify on Next Command Finish", null, "Clear", "Reset", "Read-only", null, "Split", "Tab", "Window", null, "Config" };
         try testing.expectEqual(@as(c_int, top.len), win32.GetMenuItemCount(menu));
         for (top, 0..) |label, i| {
             const pos: win32.UINT = @intCast(i);
@@ -573,11 +641,11 @@ test "win32: the menu Windows shows has each item's text and state, GTK's lines 
             const n = try std.unicode.utf16LeToUtf8(&utf8, text[0..tab]);
             try testing.expectEqualStrings(name, utf8[0..n]);
             // The submenus are popups, the others not.
-            try testing.expectEqual(i >= 7, win32.GetSubMenu(menu, @intCast(i)) != null);
+            try testing.expectEqual(i >= 8, win32.GetSubMenu(menu, @intCast(i)) != null);
         }
 
         // Each submenu holds its items in order.
-        for ([_]Submenu{ .split, .tab, .window, .config }, [_]c_int{ 7, 8, 9, 11 }) |sub, pos| {
+        for ([_]Submenu{ .split, .tab, .window, .config }, [_]c_int{ 8, 9, 10, 12 }) |sub, pos| {
             const popup = win32.GetSubMenu(menu, pos) orelse return error.TestUnexpectedResult;
             var k: c_int = 0;
             for (&items) |*item| {
@@ -601,6 +669,8 @@ test "win32: the menu Windows shows has each item's text and state, GTK's lines 
         try testing.expectEqual(!on, copy & win32.MF_GRAYED != 0);
         const readonly = win32.GetMenuState(menu, (try testItem(&items, "Read-only")).id, 0);
         try testing.expectEqual(on, readonly & win32.MF_CHECKED != 0);
+        const notify = win32.GetMenuState(menu, (try testItem(&items, "Notify on Next Command Finish")).id, 0);
+        try testing.expectEqual(on, notify & win32.MF_CHECKED != 0);
     }
 }
 
@@ -611,15 +681,15 @@ test "win32: a context menu Windows cannot make leaves no menu behind" {
     // menus among them, shows.
     var set: Binding.Set = .{};
     defer set.deinit(testing.allocator);
-    const items = menuItems(true, false, &set);
+    const items = menuItems(.{ .selection = true }, &set);
     defer test_calls_left = null;
     test_calls_left = 1000;
     const whole = build(&items) orelse return error.TestUnexpectedResult;
     _ = win32.DestroyMenu(whole);
     const calls = 1000 - test_calls_left.?;
-    // A menu, four submenus, twelve entries in the menu and thirteen in
+    // A menu, four submenus, thirteen entries in the menu and thirteen in
     // the submenus.
-    try testing.expectEqual(30, calls);
+    try testing.expectEqual(31, calls);
     const before = win32.GetGuiResources(win32.current_process, win32.GR_USEROBJECTS);
     for (0..calls) |n| {
         test_calls_left = n;
