@@ -76,9 +76,15 @@ pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
     // scrollback, reflows it itself, and repaints it from the top row after
     // every resize. Rows the terminal pulled back out of scrollback, on a
     // grow or when a reflow frees rows, would be painted over and lost, so
-    // they must stay in scrollback.
+    // they must stay in scrollback. The repaint also rewrites the prompt,
+    // without its OSC 133 marks, so a resize must not clear the prompt for
+    // the shell either: each line feed of the repaint marks the next row a
+    // continuation of the prompt, so a later clear can start above the
+    // prompt and blank rows that have since moved into scrollback, which
+    // ConPTY never repaints.
     if (comptime builtin.target.os.tag == .windows) {
         term.flags.resize_pull_scrollback = false;
+        term.flags.resize_prompt_redraw = false;
     }
 
     // Setup our initial grid/screen size from the terminal. This
@@ -2632,6 +2638,44 @@ test "initTerminal: widening pulls rows from scrollback except on ConPTY" {
             str,
         );
     }
+}
+
+test "initTerminal: a resize clears the prompt except on ConPTY" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    var exec = try init(alloc, .{
+        .env = .init(alloc),
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .init(&config),
+        .rt_post_fork_info = .init(&config),
+    });
+    defer exec.deinit();
+
+    var term = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer term.deinit(alloc);
+    exec.initTerminal(&term);
+
+    // A prompt marked with a plain OSC 133;A, which asks for a redraw.
+    try term.printString("out\n");
+    try term.semanticPrompt(.init(.fresh_line_new_prompt));
+    try term.printString("$ ");
+    try term.semanticPrompt(.init(.end_prompt_start_input));
+    try term.printString("ls");
+
+    // On a POSIX pty the shell redraws its prompt after a resize (on
+    // SIGWINCH), so the terminal clears it. ConPTY repaints the prompt
+    // itself, so the terminal must not clear it: after a repaint, a clear
+    // can reach rows in scrollback (see initTerminal).
+    try term.resize(alloc, .{ .cols = 12, .rows = 3 });
+    const conpty = builtin.target.os.tag == .windows;
+    const str = try term.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings(if (conpty) "out\n$ ls" else "out", str);
 }
 
 test "read thread windows: quit byte reaches the reader" {

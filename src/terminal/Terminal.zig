@@ -142,6 +142,16 @@ flags: packed struct {
     /// rather than terminal state so it is preserved across a full reset.
     resize_pull_scrollback: bool = true,
 
+    /// Whether a resize may clear the prompt for the shell to redraw, as
+    /// shell_redraws_prompt asks. This should be false if the pty repaints
+    /// its whole screen itself after a resize (e.g. Windows ConPTY): the
+    /// clear isn't needed there, and since the repaint carries no prompt
+    /// marks, a later clear can start at an earlier prompt and blank rows
+    /// the pty never repaints, such as rows in scrollback. This is
+    /// configuration rather than terminal state so it is preserved across
+    /// a full reset.
+    resize_prompt_redraw: bool = true,
+
     /// True if the terminal is in a password entry mode. This is set
     /// to true based on termios state. This is set
     /// to true based on termios state.
@@ -4305,7 +4315,10 @@ pub fn resize(
         .cols = opts.cols,
         .rows = opts.rows,
         .reflow = self.modes.get(.wraparound),
-        .prompt_redraw = self.flags.shell_redraws_prompt,
+        .prompt_redraw = if (self.flags.resize_prompt_redraw)
+            self.flags.shell_redraws_prompt
+        else
+            .false,
         .pull_scrollback = self.flags.resize_pull_scrollback,
     });
 
@@ -5212,9 +5225,10 @@ pub fn fullReset(self: *Terminal) void {
         // terminal reset must not make a hidden view potentially visible.
         .visible = self.flags.visible,
 
-        // This is configuration based on the pty rather than terminal
-        // state, so a terminal reset must not change it.
+        // These are configuration based on the pty rather than terminal
+        // state, so a terminal reset must not change them.
         .resize_pull_scrollback = self.flags.resize_pull_scrollback,
+        .resize_prompt_redraw = self.flags.resize_prompt_redraw,
 
         .xt_checksum = self.default_xt_checksum,
     };
@@ -17045,6 +17059,68 @@ test "Terminal: resize without scrollback pull" {
         defer alloc.free(str);
         try testing.expectEqualStrings("3\n4\n5", str);
     }
+}
+
+test "Terminal: resize clears a prompt the shell redraws" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // A plain OSC 133;A leaves shell_redraws_prompt at its default, so a
+    // resize clears the prompt and its input for the shell to redraw.
+    try t.printString("out\n");
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try t.resize(alloc, .{ .cols = 12, .rows = 3 });
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("out", str);
+    }
+}
+
+test "Terminal: resize without prompt redraw keeps rows in scrollback" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    t.flags.resize_prompt_redraw = false;
+
+    // This is configuration so it should survive a reset.
+    t.fullReset();
+    try testing.expect(!t.flags.resize_prompt_redraw);
+
+    // A command whose output arrives without OSC 133;C, so as input on
+    // rows marked as prompt continuations, then the next prompt. The
+    // command's own prompt is in scrollback.
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("cmd\na\nb\nc\n");
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    // Each resize is followed by a repaint of the screen, as ConPTY does.
+    // The repaint carries no prompt marks, so its line feeds turn the
+    // prompt's row into another continuation, and a clear for a redraw
+    // on the next resize would start at the command's prompt.
+    for ([_]size.CellCountInt{ 12, 10 }) |cols| {
+        try t.resize(alloc, .{ .cols = cols, .rows = 3 });
+        t.setCursorPos(1, 1);
+        for ([_][]const u8{ "b", "c", "$ " }, 0..) |row, i| {
+            if (i > 0) try t.printString("\n");
+            try t.printString(row);
+            t.eraseLine(.right, false);
+        }
+    }
+
+    const str = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+    defer alloc.free(str);
+    try testing.expectEqualStrings("$ cmd\na\nb\nc\n$ ", str);
 }
 
 // https://github.com/mitchellh/ghostty/issues/1343
