@@ -1,8 +1,9 @@
 //! A terminal's overlays: windows that show something about the terminal
 //! over it, as GTK stacks overlays over its surface
 //! (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge (ReadOnly.zig),
-//! the child-exited banner (ChildExited.zig), the link preview
-//! (LinkPreview.zig) and the key-state indicator (KeyState.zig). This file
+//! the bell border (BellBorder.zig), the child-exited banner
+//! (ChildExited.zig), the link preview (LinkPreview.zig) and the key-state
+//! indicator (KeyState.zig). This file
 //! does for each what they all need: their window class and procedure,
 //! their place in the Z order, their font, colours and frame, and their
 //! teardown; each overlay's own file says what it shows and where
@@ -25,7 +26,9 @@
 //! button alone. Each draws a line of text in the system's message font,
 //! one for all of a terminal's overlays (`font`), on the search bar's
 //! colours, framed as GTK's labels are, or in its own (`Look`); the
-//! banner draws two (`draw`).
+//! banner draws two (`draw`). The bell border has no text: it shows by a
+//! flag of its own (`shows`), draws itself, and its window is shaped to
+//! what it draws (`shape`).
 
 const Overlays = @This();
 
@@ -39,6 +42,7 @@ const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const ReadOnly = @import("ReadOnly.zig");
+const BellBorder = @import("BellBorder.zig");
 const ChildExited = @import("ChildExited.zig");
 const KeyState = @import("KeyState.zig");
 const messageFont = @import("TabBar.zig").messageFont;
@@ -50,6 +54,10 @@ const log = std.log.scoped(.win32);
 /// The read-only badge, made the first time the terminal is made
 /// read-only (`ReadOnly.set`).
 readonly: ReadOnly.Badge = .{},
+
+/// The bell border, made the first time the terminal's bell rings with
+/// `bell-features` `border` (`BellBorder.set`).
+bell_border: BellBorder.Border = .{},
 
 /// The child-exited banner, made when the core asks for it
 /// (`ChildExited.show`).
@@ -69,16 +77,18 @@ font: ?win32.HGDIOBJ = null,
 font_dpi: u32 = 0,
 
 /// The overlays, by their fields, bottom to top, as GTK stacks them over
-/// its surface (surface.blp). Each has a window `hwnd`, the `text` it
-/// draws, `text_size` and `measured` for that text in `font`, `placeIn`,
-/// `deinit`, and `textIn` or `draw`; and may have `look`, `measureMore`
-/// (more than its text to measure), `handle` (messages of its own) and
-/// `hidden` (what it does as its window is hidden).
-pub const stack = [_][]const u8{ "readonly", "child_exited", "link_preview", "key_state" };
+/// its surface (surface.blp). Each has a window `hwnd`, `placeIn`,
+/// `deinit`, and either the `text` it draws, `text_size` and `measured`
+/// for that text in `font`, or `shows` (whether it shows, with no text);
+/// and `textIn` or `draw`. It may have `look`, `measureMore` (more than
+/// its text to measure), `shape` (its window's region), `handle`
+/// (messages of its own) and `hidden` (what it does as its window is
+/// hidden).
+pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "link_preview", "key_state" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, ChildExited.class_name, LinkPreview.class_name, KeyState.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, LinkPreview.class_name, KeyState.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -167,7 +177,10 @@ fn applyFont(self: *Overlays, dpi: u32) void {
             if (self.font) |old| _ = win32.DeleteObject(old);
             self.font = font;
             self.font_dpi = dpi;
-            inline for (stack) |name| @field(self, name).measured = false;
+            inline for (stack) |name| {
+                const o = &@field(self, name);
+                if (@hasField(@TypeOf(o.*), "measured")) o.measured = false;
+            }
         }
     }
 }
@@ -235,9 +248,10 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// logged. The link preview, made only with its terminal, is not made
 /// again, so the terminal shows no more previews; the key-state
 /// indicator is made again at its next change that leaves something to
-/// show (`KeyState.update`), and the read-only badge the next time the
-/// terminal is made read-only (`ReadOnly.set`); the child-exited banner,
-/// asked for once, is not.
+/// show (`KeyState.update`), the read-only badge the next time the
+/// terminal is made read-only (`ReadOnly.set`), and the bell border the
+/// next time it shows (`BellBorder.set`); the child-exited banner, asked
+/// for once, is not.
 ///
 /// The terminals tile their area, and the search bars and the command
 /// palette are placed above all of them (`SearchBar.place`,
@@ -259,9 +273,14 @@ pub fn place(surface: *Surface) void {
         if (o.hwnd) |hwnd| {
             if (self.placed(o, hwnd, dpi, size)) |p| {
                 const at: RECT = .{ .left = pane.left + p.in.left, .top = pane.top + p.in.top, .right = pane.left + p.in.right, .bottom = pane.top + p.in.bottom };
-                const moved = put(window, hwnd, under, at);
-                if (moved or p.redraw) _ = win32.InvalidateRect(hwnd, null, .FALSE);
-                under = hwnd;
+                // Shaped before it shows, and not shown unshaped.
+                if (@hasDecl(@TypeOf(o.*), "shape") and !o.shape(hwnd, dpi, at)) {
+                    hide(o);
+                } else {
+                    const moved = put(window, hwnd, under, at);
+                    if (moved or p.redraw) _ = win32.InvalidateRect(hwnd, null, .FALSE);
+                    under = hwnd;
+                }
             } else hide(o);
         }
     }
@@ -271,6 +290,7 @@ pub fn place(surface: *Surface) void {
 /// `pane` big (`placeIn`), its text measured first in the font at `dpi`;
 /// null while it has nothing to show, or no place.
 fn placed(self: *Overlays, o: anytype, hwnd: win32.HWND, dpi: u32, pane: Size) ?Placed {
+    if (@hasDecl(@TypeOf(o.*), "shows")) return if (o.shows()) o.placeIn(dpi, pane) else null;
     const text = o.text orelse return null;
     self.applyFont(dpi);
     if (!o.measured) {
@@ -475,12 +495,12 @@ fn draw(surface: *Surface, hwnd: win32.HWND, hdc: win32.HDC) void {
 }
 
 /// The overlay `o`, `client` big, drawn into `hdc` at `dpi` by whether the
-/// title bar is `dark`: as it draws itself (`draw`), or its text in
+/// title bar is `dark`, over a terminal whose background is `background`:
+/// as it draws itself (`draw`), or its text in
 /// `font`, framed as GTK's labels are, where its own file puts it
-/// (`textIn`), in its colours (`lookOf`) over a terminal whose
-/// background is `background`.
+/// (`textIn`), in its colours (`lookOf`).
 fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, background: win32.COLORREF, font: ?win32.HGDIOBJ) void {
-    if (@hasDecl(@TypeOf(o.*), "draw")) return o.draw(hdc, client, dpi, dark, font);
+    if (@hasDecl(@TypeOf(o.*), "draw")) return o.draw(hdc, client, dpi, dark, background, font);
     const look = lookOf(o, SearchBar.Colors.of(dark), background);
     const line = @max(1, SearchBar.Metrics.scale(1, dpi));
     SearchBar.fill(hdc, client, look.line);

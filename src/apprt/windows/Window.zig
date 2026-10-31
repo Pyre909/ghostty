@@ -199,6 +199,26 @@ pub fn tabTitle(t: *const Tab) ?[:0]const u8 {
     return surface.effectiveTitle();
 }
 
+/// GTK's prefix to a ringing terminal's title (`bell-features` `title`),
+/// src/apprt/gtk/class/tab.zig:522.
+pub const bell_prefix = "🔔 ";
+
+/// What `t`'s label shows, and the window's caption while `t` is shown,
+/// in UTF-16: its title (`tabTitle`), or "Ghostty" while it has none,
+/// after `bell_prefix` while its focused terminal's bell rings
+/// (`Surface.bell_ringing`) and `bell-features` has `title`, as GTK
+/// computes its tab's title. The caller frees it.
+///
+/// Invalid UTF-8 is shown as U+FFFD, as macOS does (`Surface.setTitle`).
+pub fn shownTitle(self: *const Window, alloc: std.mem.Allocator, t: *const Tab) ![:0]u16 {
+    const title = tabTitle(t) orelse "Ghostty";
+    const ringing = if (t.focused) |s| s.bell_ringing else false;
+    if (!ringing or !self.app.config.@"bell-features".title) return wideFromUtf8(alloc, title);
+    const text = try std.mem.concat(alloc, u8, &.{ bell_prefix, title });
+    defer alloc.free(text);
+    return wideFromUtf8(alloc, text);
+}
+
 /// Put `surface`, a new terminal not yet shown, in a tab of its own after
 /// the shown one or at the end, as `window-new-tab-position` asks; its
 /// index. The tab is not shown yet (`selectTab`).
@@ -717,7 +737,7 @@ pub fn setTabTitle(self: *Window, surface: *const Surface, title: [:0]const u8) 
     if (t.title_override) |old| alloc.free(old);
     t.title_override = copy;
     self.bar.invalidate();
-    if (t == self.tab()) return self.showTitle(tabTitle(t));
+    if (t == self.tab()) return self.showTitle();
     return true;
 }
 
@@ -1759,7 +1779,7 @@ pub fn setFocused(self: *Window, surface: *Surface) void {
     if (t != self.tab()) return;
     // An open command palette runs on the terminal with the focus.
     CommandPalette.focusMoved(self, surface);
-    _ = self.showTitle(tabTitle(t));
+    _ = self.showTitle();
     self.showProgress();
 }
 
@@ -1773,13 +1793,11 @@ pub fn showProgress(self: *Window) void {
     list.show(self.hwnd, surface.progress);
 }
 
-/// Show `title`, the focused terminal's, as the window's caption, or
-/// "Ghostty" while it has none. Returns whether it is shown.
-///
-/// Invalid UTF-8 is shown as U+FFFD, as macOS does (`Surface.setTitle`).
-pub fn showTitle(self: *Window, title: ?[:0]const u8) bool {
+/// Show the shown tab's title (`shownTitle`) as the window's caption.
+/// Returns whether it is shown.
+pub fn showTitle(self: *Window) bool {
     const alloc = self.app.core_app.alloc;
-    const wide = wideFromUtf8(alloc, title orelse "Ghostty") catch |err| {
+    const wide = self.shownTitle(alloc, self.tab()) catch |err| {
         log.warn("failed to encode the window title err={}", .{err});
         return false;
     };

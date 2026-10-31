@@ -396,6 +396,8 @@ pub const Win32Error = w.Win32Error;
 pub extern "kernel32" fn SetLastError(code: Win32Error) callconv(.winapi) void;
 pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
 pub const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
+pub const LoadLibraryExW = internal_os.windows.exp.kernel32.LoadLibraryExW;
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32 = internal_os.windows.LOAD_LIBRARY_SEARCH_SYSTEM32;
 /// Milliseconds since the system started.
 /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
@@ -530,6 +532,9 @@ pub extern "user32" fn GetActiveWindow() callconv(.winapi) ?HWND;
 pub extern "user32" fn GetAncestor(hwnd: HWND, flags: UINT) callconv(.winapi) ?HWND;
 pub const GA_PARENT: UINT = 1;
 pub const GA_ROOT: UINT = 2;
+/// The top-level window at the end of a window's chain of parents and
+/// owners: a frame's, for one of its prompts.
+pub const GA_ROOTOWNER: UINT = 3;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setparent
 pub extern "user32" fn SetParent(child: HWND, parent: ?HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
@@ -750,6 +755,12 @@ pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
 pub const IID_IUnknown: w.GUID = w.GUID.parse("{00000000-0000-0000-c000-000000000046}");
 /// An object that may be called on any thread, with no marshaling.
 pub const IID_IAgileObject: w.GUID = w.GUID.parse("{94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90}");
+/// A length-prefixed UTF-16 string from SysAllocString.
+pub const BSTR = [*:0]u16;
+/// https://learn.microsoft.com/en-us/windows/win32/api/oleauto/nf-oleauto-sysallocstring
+pub extern "oleaut32" fn SysAllocString(text: LPCWSTR) callconv(.winapi) ?BSTR;
+/// https://learn.microsoft.com/en-us/windows/win32/api/oleauto/nf-oleauto-sysfreestring
+pub extern "oleaut32" fn SysFreeString(text: ?BSTR) callconv(.winapi) void;
 
 // Windows Runtime. Both import libraries are API sets, which Windows
 // resolves to combase.dll: mingw has them, the Windows SDK does not, so
@@ -905,6 +916,22 @@ pub extern "user32" fn GetCursor() callconv(.winapi) ?HCURSOR;
 pub const GCL_STYLE: c_int = -26;
 pub extern "user32" fn GetClassLongW(hwnd: HWND, index: c_int) callconv(.winapi) DWORD;
 pub extern "user32" fn MessageBeep(type_: UINT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-flashwinfo
+pub const FLASHWINFO = extern struct {
+    cbSize: UINT,
+    hwnd: HWND,
+    dwFlags: DWORD,
+    uCount: UINT,
+    dwTimeout: DWORD,
+};
+/// FLASHWINFO: flash the taskbar button.
+pub const FLASHW_TRAY: DWORD = 0x2;
+/// FLASHWINFO: flash until the window comes to the foreground.
+pub const FLASHW_TIMERNOFG: DWORD = 0xC;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-flashwindowex
+pub extern "user32" fn FlashWindowEx(info: *const FLASHWINFO) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getforegroundwindow
+pub extern "user32" fn GetForegroundWindow() callconv(.winapi) ?HWND;
 pub extern "user32" fn MessageBoxW(
     hwnd: ?HWND,
     text: LPCWSTR,
@@ -943,6 +970,22 @@ pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUS
 pub const HGDIOBJ = *anyopaque;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
 pub extern "gdi32" fn DeleteObject(object: HGDIOBJ) callconv(.winapi) BOOL;
+/// A region, a GDI object.
+pub const HRGN = HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createrectrgn
+pub extern "gdi32" fn CreateRectRgn(left: c_int, top: c_int, right: c_int, bottom: c_int) callconv(.winapi) ?HRGN;
+/// CombineRgn: the part of the first region not in the second.
+pub const RGN_DIFF: c_int = 4;
+/// CombineRgn's and GetWindowRgn's answer on failure.
+pub const RGN_ERROR: c_int = 0;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-combinergn
+pub extern "gdi32" fn CombineRgn(dst: HRGN, src1: HRGN, src2: HRGN, mode: c_int) callconv(.winapi) c_int;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-ptinregion
+pub extern "gdi32" fn PtInRegion(rgn: HRGN, x: c_int, y: c_int) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowrgn
+pub extern "user32" fn SetWindowRgn(hwnd: HWND, rgn: ?HRGN, redraw: BOOL) callconv(.winapi) c_int;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrgn
+pub extern "user32" fn GetWindowRgn(hwnd: HWND, rgn: HRGN) callconv(.winapi) c_int;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-selectobject
 pub extern "gdi32" fn SelectObject(hdc: HDC, object: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createcompatibledc
@@ -1393,6 +1436,7 @@ comptime {
         std.debug.assert(@sizeOf(MEASUREITEMSTRUCT) == 32);
         std.debug.assert(@sizeOf(TOOLINFOW) == 72);
         std.debug.assert(@sizeOf(MSG) == 48);
+        std.debug.assert(@sizeOf(FLASHWINFO) == 32);
     }
     std.debug.assert(@sizeOf(SCROLLINFO) == 28);
 }

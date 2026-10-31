@@ -18,7 +18,6 @@
 const std = @import("std");
 
 const win32 = @import("win32.zig");
-const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const Window = @import("Window.zig");
 
 const RECT = win32.RECT;
@@ -714,7 +713,7 @@ fn drawTab(
     };
     _ = win32.SetTextColor(hdc, if (shown) colors.text else colors.dim);
     const alloc = window.app.core_app.alloc;
-    const title = wideFromUtf8(alloc, Window.tabTitle(t) orelse "Ghostty") catch null;
+    const title = window.shownTitle(alloc, t) catch null;
     defer if (title) |w| alloc.free(w);
     if (title) |w| _ = win32.DrawTextW(hdc, w.ptr, @intCast(w.len), &text_rect, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_END_ELLIPSIS | win32.DT_NOPREFIX);
 

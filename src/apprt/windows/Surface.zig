@@ -23,6 +23,7 @@ const DesktopNotifications = @import("desktop_notifications.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
+const BellBorder = @import("BellBorder.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
@@ -156,6 +157,13 @@ pub const Surface = struct {
     /// says, if it took longer than `notify-on-command-finish-after`, and
     /// clears it either way (`commandFinished`).
     notify_next_command: bool,
+
+    /// Its bell rang while it did not have the focus, and it has not had
+    /// it since, nor been typed in or clicked (`ringBell`): its tab's
+    /// label and its window's caption show "🔔 " while it is its tab's
+    /// focused terminal, and the border shows around it, as `bell-features`
+    /// asks (`showBell`).
+    bell_ringing: bool,
 
     /// The terminal's search bar (`SearchBar`), a window of the frame's
     /// over this one's top-right corner once `start_search` opened it.
@@ -684,6 +692,7 @@ pub const Surface = struct {
             .progress_expires = 0,
             .notifications = .{},
             .notify_next_command = false,
+            .bell_ringing = false,
             .search_bar = .{},
             .overlays = .{},
             .scroll_bar = .{},
@@ -1391,7 +1400,7 @@ pub const Surface = struct {
 
     /// `.command_finished`: the bell, a toast, or both, for a command the
     /// shell marked, as GTK's rule decides (`commandFinishedReply`). The
-    /// bell is the one BEL rings (`App.ringBell`), and the toast says how
+    /// bell is the one BEL rings (`ringBell`), and the toast says how
     /// the command ended and how long it took. The next command to finish
     /// clears `notify_next_command`, whether it then notifies or not, as
     /// GTK's does. False only if a toast was asked for and could not be
@@ -1400,11 +1409,48 @@ pub const Surface = struct {
         const next = self.notify_next_command;
         self.notify_next_command = false;
         const reply = commandFinishedReply(&self.app.config, value.duration, self.focused, next);
-        if (reply.bell) App.ringBell();
+        if (reply.bell) self.ringBell();
         if (!reply.notify) return true;
         var buf: [command_body_max]u8 = undefined;
         const text = commandFinishedText(&buf, value);
         return self.notify(text.title, text.body);
+    }
+
+    /// The terminal's bell: BEL (`.ring_bell`) or a finished command
+    /// (`commandFinished`), as GTK's `setBellRinging(true)`. What
+    /// `bell-features` does for every bell happens each time (`App.bell`);
+    /// then, if the terminal does not have the focus, it rings
+    /// (`bell_ringing`) until it gets it or any mouse button is pressed
+    /// over it. With the focus it does not ring, as there is nothing to
+    /// draw the user to. GTK also stops it on a key the core takes; here
+    /// the core takes keys only from a terminal with the focus, which
+    /// stopped it already. A binding typed into its search bar or the
+    /// command palette is performed as an action (overlay_keys.zig), as
+    /// GTK's accelerators are, which does not stop it there either.
+    pub fn ringBell(self: *Surface) void {
+        self.app.bell(self.window);
+        if (!self.focused) self.setBellRinging(true);
+    }
+
+    /// Set `bell_ringing`, and show it where it changed.
+    fn setBellRinging(self: *Surface, ringing: bool) void {
+        if (self.bell_ringing == ringing) return;
+        self.bell_ringing = ringing;
+        self.showBell();
+    }
+
+    /// Show `bell_ringing` as `bell-features` asks, which may have changed
+    /// (`App.configChange`): in its tab's label and its window's caption,
+    /// if it is its tab's focused terminal, which GTK's tab takes its
+    /// title from (`Window.shownTitle`); and its border.
+    pub fn showBell(self: *Surface) void {
+        if (self.window.tabOf(self)) |t| {
+            if (t.focused == self) {
+                self.window.bar.invalidate();
+                if (t == self.window.tab()) _ = self.window.showTitle();
+            }
+        }
+        BellBorder.set(self, self.bell_ringing and self.app.config.@"bell-features".border);
     }
 
     /// Remove the terminal's toasts, shown or kept in the notification
@@ -1460,7 +1506,7 @@ pub const Surface = struct {
             if (t.focused == self and t.title_override == null) self.window.bar.invalidate();
         }
         if (self.window.tab().focused != self) return true;
-        return self.window.showTitle(Window.tabTitle(self.window.tab()));
+        return self.window.showTitle();
     }
 
     /// WM_CLOSE sent to this window: it closes alone. Windows sends the
@@ -1623,6 +1669,7 @@ pub const Surface = struct {
                     self.search_bar.field_focus = false;
                     self.window.setFocused(self);
                     self.clearNotifications();
+                    self.setBellRinging(false);
                 }
 
                 if (!self.focused) {
@@ -1864,6 +1911,9 @@ pub const Surface = struct {
                     => .press,
                     else => .release,
                 };
+                // Any button pressed stops the bell, as on GTK, whatever
+                // the core then does with it.
+                if (state == .press) self.setBellRinging(false);
                 // Taken before the release lets go of the capture, whose
                 // WM_CAPTURECHANGED clears it.
                 const menu = button == .right and state == .release and self.mouse.takeMenu();

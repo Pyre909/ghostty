@@ -123,7 +123,9 @@ pub const Banner = struct {
     /// button in the search bar's colours, its face the bar's hover colour
     /// while the pointer is over it and its border colour while it is
     /// pressed.
-    pub fn draw(self: *const Banner, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, font: ?win32.HGDIOBJ) void {
+    pub fn draw(self: *const Banner, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, background: win32.COLORREF, font: ?win32.HGDIOBJ) void {
+        // In its own colours, whatever the terminal's.
+        _ = background;
         const colors = SearchBar.Colors.of(dark);
         SearchBar.fill(hdc, client, tint(self.failed, dark));
         const l = Layout.init(.init(dpi), client.right, client.bottom, self.text_size, self.label_size);
@@ -298,7 +300,7 @@ pub fn tint(is_failed: bool, dark: bool) win32.COLORREF {
 }
 
 /// `a` and `b` half and half, each channel rounded up.
-fn mix(a: win32.COLORREF, b: win32.COLORREF) win32.COLORREF {
+pub fn mix(a: win32.COLORREF, b: win32.COLORREF) win32.COLORREF {
     var out: win32.COLORREF = 0;
     for (0..3) |i| {
         const shift: u5 = @intCast(8 * i);

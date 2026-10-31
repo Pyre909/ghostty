@@ -26,12 +26,14 @@ const Dividers = @import("Dividers.zig");
 const KeyState = @import("KeyState.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
+const BellBorder = @import("BellBorder.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const toast = @import("toast.zig");
+const media = @import("media.zig");
 const confirm = @import("dialog.zig").confirm;
 const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
@@ -116,6 +118,10 @@ pub const App = struct {
 
     /// Making `toasts` failed, logged once; it is not tried again.
     toasts_failed: bool,
+
+    /// The bell's sound (`bell`), its engine made at the first bell that
+    /// plays one.
+    bell_audio: media.Bell,
 
     /// The tag of the last toast shown (`toast.Toast.tag`).
     toast_tag: u64,
@@ -586,6 +592,7 @@ pub const App = struct {
             .toasts = null,
             .notifier = null,
             .toasts_failed = false,
+            .bell_audio = .{},
             .toast_tag = 0,
             .pending_click = null,
             .com_initialized = com_hr >= 0,
@@ -676,6 +683,8 @@ pub const App = struct {
             t.deinit();
             self.core_app.alloc.destroy(t);
         }
+        // A COM object, released before COM is uninitialized.
+        self.bell_audio.deinit(self.core_app.alloc);
         if (self.com_initialized) win32.CoUninitialize();
     }
 
@@ -1223,9 +1232,13 @@ pub const App = struct {
             .reload_config => try self.reloadConfig(target, value),
             .config_change => try self.configChange(target, value),
 
-            .ring_bell => ring_bell: {
-                ringBell();
-                break :ring_bell true;
+            // The core rings only a terminal's.
+            .ring_bell => switch (target) {
+                .app => false,
+                .surface => |v| ring_bell: {
+                    v.rt_surface.ringBell();
+                    break :ring_bell true;
+                },
             },
 
             .new_window => self.requestWindow(target),
@@ -1924,6 +1937,10 @@ pub const App = struct {
             window.applyTheme();
         }
         for (self.surfaces.items) |surface| surface.overlays.invalidate();
+        // `bell-features` may show a ringing bell otherwise now.
+        for (self.surfaces.items) |surface| {
+            if (surface.bell_ringing) surface.showBell();
+        }
         // `window-decoration` and `scrollbar` may have changed, here or in
         // a theme a soft reload switched to; the frames and the terminals
         // change for them from `run`, since a soft reload comes inside a
@@ -2398,19 +2415,72 @@ pub const App = struct {
         };
     }
 
-    /// For tests: how many times `ringBell` rang, in place of the sound.
+    /// For tests: how many bells rang (`bell`), and of those, how many
+    /// `bell-features` had beep and flash, in place of the beep and the
+    /// flash, and the last flash's FLASHWINFO; the sounds are
+    /// `media.test_record`.
     pub var test_bells: if (builtin.is_test) usize else void =
         if (builtin.is_test) 0 else {};
+    pub var test_beeps: if (builtin.is_test) usize else void =
+        if (builtin.is_test) 0 else {};
+    pub var test_flashes: if (builtin.is_test) usize else void =
+        if (builtin.is_test) 0 else {};
+    pub var test_flash: if (builtin.is_test) ?win32.FLASHWINFO else void =
+        if (builtin.is_test) null else {};
 
-    /// The bell, for BEL (`.ring_bell`) and a finished command
-    /// (`Surface.commandFinished`): the system's sound, which is all this
-    /// runtime does for it.
-    pub fn ringBell() void {
-        if (builtin.is_test) {
-            test_bells += 1;
-            return;
+    /// For tests: answers in place of GetForegroundWindow (`bell`), as
+    /// `Window.test_get_focus` stands for GetFocus.
+    pub var test_get_foreground: if (builtin.is_test) ?*const fn () ?win32.HWND else void =
+        if (builtin.is_test) null else {};
+
+    fn foregroundWindow() ?win32.HWND {
+        if (builtin.is_test) if (test_get_foreground) |get| return get();
+        return win32.GetForegroundWindow();
+    }
+
+    /// Whether `window` is in the foreground, or a window it owns is: one
+    /// of its prompts (dialog.zig) or the tab title's dialog
+    /// (TitleDialog.zig), over a window that GTK would keep active.
+    fn inForeground(window: *const Window) bool {
+        const front = foregroundWindow() orelse return false;
+        return win32.GetAncestor(front, win32.GA_ROOTOWNER) == window.hwnd;
+    }
+
+    /// What `bell-features` does for every bell of a terminal in `window`
+    /// (`Surface.ringBell`), as GTK's application and window `ring-bell`
+    /// actions do: `system` plays the system's Asterisk sound, as Sound
+    /// settings set it (GTK beeps the display, macOS plays the alert
+    /// sound); `attention` flashes the window's taskbar button until the
+    /// window comes to the foreground, unless it or a window it owns is
+    /// there (`inForeground`), as GTK sets the urgency hint unless the
+    /// window is active; and `audio` plays `bell-audio-path`
+    /// (`media.Bell`).
+    pub fn bell(self: *App, window: *const Window) void {
+        if (builtin.is_test) test_bells += 1;
+        const features = self.config.@"bell-features";
+        if (features.system) {
+            if (builtin.is_test) test_beeps += 1 else _ = win32.MessageBeep(win32.MB_ICONASTERISK);
         }
-        _ = win32.MessageBeep(win32.MB_ICONASTERISK);
+        if (features.attention and !inForeground(window)) {
+            const info: win32.FLASHWINFO = .{
+                .cbSize = @sizeOf(win32.FLASHWINFO),
+                .hwnd = window.hwnd,
+                .dwFlags = win32.FLASHW_TRAY | win32.FLASHW_TIMERNOFG,
+                .uCount = 0,
+                .dwTimeout = 0,
+            };
+            if (builtin.is_test) {
+                test_flashes += 1;
+                test_flash = info;
+            } else _ = win32.FlashWindowEx(&info);
+        }
+        if (features.audio) audio: {
+            const path, const required = switch (self.config.@"bell-audio-path" orelse break :audio) {
+                .optional => |p| .{ p, false },
+                .required => |p| .{ p, true },
+            };
+            self.bell_audio.ring(self.core_app.alloc, path, required, self.config.@"bell-audio-volume");
+        }
     }
 
     /// WM_GHOSTTY_NOTIFICATION, a toast's click, made at once where the
@@ -3834,6 +3904,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.toasts = null;
     app.notifier = null;
     app.toasts_failed = false;
+    app.bell_audio = .{};
     app.toast_tag = 0;
     app.pending_click = null;
     app.com_initialized = false;
@@ -3930,6 +4001,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.progress_expires = 0;
     surface.notifications = .{ .id = @intFromPtr(surface) };
     surface.notify_next_command = false;
+    surface.bell_ringing = false;
     surface.search_bar = .{};
     surface.overlays = .{};
     surface.scroll_bar = .{};
@@ -3968,6 +4040,7 @@ pub fn testCleanup(app: *App) void {
     app.surfaces.deinit(alloc);
     app.windows.deinit(alloc);
     app.freeRequests();
+    app.bell_audio.deinit(alloc);
     app.config.deinit();
     _ = win32.DestroyWindow(app.msg_hwnd);
 }
@@ -10478,6 +10551,522 @@ test "win32: command_finished rings the bell or shows a toast for its terminal, 
     try std.testing.expectEqual(left.notifications.id, fake.shown[3].group);
     try std.testing.expect(MenuSeen.chosen_checked);
     try std.testing.expect(!left.notify_next_command);
+}
+
+/// For tests: the core's `ring_bell` on `surface`, as BEL performs it.
+fn testBell(app: *App, surface: *Surface) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .ring_bell, {});
+}
+
+test "win32: a bell does what bell-features asks, each time it rings" {
+    // GTK's `ring-bell` actions, for every bell, whether the terminal has
+    // the focus or not: `system` beeps; `attention` flashes the window's
+    // taskbar button, unless the window or a window it owns is in the
+    // foreground, as GTK sets the urgency hint unless it is active;
+    // `audio` plays `bell-audio-path`, required or optional, at
+    // `bell-audio-volume` clamped to 0 to 1. The defaults flash alone. The
+    // core rings only a terminal's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const Foreground = struct {
+        var hwnd: ?win32.HWND = null;
+        fn get() ?win32.HWND {
+            return hwnd;
+        }
+    };
+    Foreground.hwnd = null;
+    App.test_get_foreground = &Foreground.get;
+    defer App.test_get_foreground = null;
+    App.test_flash = null;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "bell.wav", .data = "" });
+    try tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "quiet.mp3", .data = "" });
+    const dir = try tmp_dir.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const loud_path = try std.fs.path.joinZ(alloc, &.{ dir, "bell.wav" });
+    defer alloc.free(loud_path);
+    const quiet_path = try std.fs.path.joinZ(alloc, &.{ dir, "quiet.mp3" });
+    defer alloc.free(quiet_path);
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
+    window.relayout();
+    const bells = App.test_bells;
+    const beeps = App.test_beeps;
+    const flashes = App.test_flashes;
+    const played = media.test_record.plays;
+
+    // The defaults: a flash each time, no beep, no sound. The flash
+    // lasts until the window comes to the foreground.
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(bells + 2, App.test_bells);
+    try std.testing.expectEqual(beeps, App.test_beeps);
+    try std.testing.expectEqual(flashes + 2, App.test_flashes);
+    try std.testing.expectEqual(played, media.test_record.plays);
+    const flash = App.test_flash orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@sizeOf(win32.FLASHWINFO), flash.cbSize);
+    try std.testing.expect(flash.hwnd == window.hwnd);
+    try std.testing.expectEqual(win32.FLASHW_TRAY | win32.FLASHW_TIMERNOFG, flash.dwFlags);
+    try std.testing.expectEqual(0, flash.uCount);
+
+    // In the foreground, or a window it owns, as its prompts are: no
+    // flash; another window there, or one another window owns: a flash.
+    Foreground.hwnd = window.hwnd;
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(flashes + 2, App.test_flashes);
+    const owned = win32.CreateWindowExW(0, L("STATIC"), L(""), win32.WS_POPUP, 0, 0, 10, 10, window.hwnd, null, app.hinstance, null) orelse
+        return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(owned);
+    Foreground.hwnd = owned;
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(flashes + 2, App.test_flashes);
+    Foreground.hwnd = app.msg_hwnd;
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(flashes + 3, App.test_flashes);
+    const other = try testFrame(&app);
+    const theirs = win32.CreateWindowExW(0, L("STATIC"), L(""), win32.WS_POPUP, 0, 0, 10, 10, other.hwnd, null, app.hinstance, null) orelse
+        return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(theirs);
+    Foreground.hwnd = theirs;
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(flashes + 4, App.test_flashes);
+
+    // A beep and a required sound, loud past 1, without attention.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features" = .{ .system = true, .audio = true, .attention = false };
+    changed.@"bell-audio-path" = .{ .required = loud_path };
+    changed.@"bell-audio-volume" = 1.7;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(beeps + 1, App.test_beeps);
+    try std.testing.expectEqual(flashes + 4, App.test_flashes);
+    try std.testing.expectEqual(played + 1, media.test_record.plays);
+    try std.testing.expectEqualStrings(loud_path, media.test_record.lastPath());
+    try std.testing.expect(media.test_record.required);
+    try std.testing.expectEqual(1.0, media.test_record.volume);
+
+    // An optional one, quiet past 0.
+    changed.@"bell-audio-path" = .{ .optional = quiet_path };
+    changed.@"bell-audio-volume" = -0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(played + 2, media.test_record.plays);
+    try std.testing.expectEqualStrings(quiet_path, media.test_record.lastPath());
+    try std.testing.expect(!media.test_record.required);
+    try std.testing.expectEqual(0.0, media.test_record.volume);
+
+    // No path: no sound, the beep still.
+    changed.@"bell-audio-path" = null;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(try testBell(&app, pane));
+    try std.testing.expectEqual(played + 2, media.test_record.plays);
+    try std.testing.expectEqual(beeps + 3, App.test_beeps);
+
+    // The app's is not one the core sends.
+    try std.testing.expect(!try app.performAction(.app, .ring_bell, {}));
+    try std.testing.expectEqual(bells + 9, App.test_bells);
+}
+
+test "win32: a bell rings in a terminal without the focus until it has it or a button is pressed over it" {
+    // GTK's `setBellRinging`: a bell, or a finished command's, sets a
+    // terminal ringing only if it does not have the focus; the focus or
+    // any button pressed over it stops it. While its tab's focused
+    // terminal rings, with `bell-features` `title`, the tab's label and,
+    // while it is shown, the window's caption have "🔔 " before its title,
+    // the tab's own too, as GTK computes its tab's title.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
+    window.relayout();
+    _ = Surface.wndProc(left.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(left.setTitle("vim"));
+    try std.testing.expect(right.setTitle("logs"));
+    var buf: [64]u8 = undefined;
+    const bells = App.test_bells;
+    const shownIs = struct {
+        fn f(w: *const Window, t: *const Tab, want: []const u8) !void {
+            const a = std.testing.allocator;
+            const title = try w.shownTitle(a, t);
+            defer a.free(title);
+            var utf8: [64]u8 = undefined;
+            const n = try std.unicode.utf16LeToUtf8(&utf8, title);
+            try std.testing.expectEqualStrings(want, utf8[0..n]);
+        }
+    }.f;
+
+    // With the focus: the bell's actions alone.
+    try std.testing.expect(try testBell(&app, left));
+    try std.testing.expectEqual(bells + 1, App.test_bells);
+    try std.testing.expect(!left.bell_ringing);
+
+    // Without: it rings, in no title while its tab's focused terminal is
+    // the other; the focus stops it.
+    try std.testing.expect(try testBell(&app, right));
+    try std.testing.expectEqual(bells + 2, App.test_bells);
+    try std.testing.expect(right.bell_ringing);
+    try std.testing.expect(!left.bell_ringing);
+    try std.testing.expectEqualStrings("vim", try windowText(window.hwnd, &buf));
+    try shownIs(window, window.tab(), "vim");
+    _ = Surface.wndProc(left.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(!right.bell_ringing);
+    try std.testing.expectEqualStrings("logs", try windowText(window.hwnd, &buf));
+
+    // The frame lost the focus: its focused terminal rings, in the caption
+    // and the label, again and again; the tab's own title, after it.
+    _ = Surface.wndProc(right.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    try std.testing.expect(try testBell(&app, right));
+    try std.testing.expect(right.bell_ringing);
+    try std.testing.expectEqualStrings("🔔 logs", try windowText(window.hwnd, &buf));
+    try shownIs(window, window.tab(), "🔔 logs");
+    try std.testing.expect(try testBell(&app, right));
+    try std.testing.expectEqualStrings("🔔 logs", try windowText(window.hwnd, &buf));
+    try std.testing.expect(try app.performAction(.{ .surface = &right.core_surface }, .set_tab_title, .{ .title = "mine" }));
+    try std.testing.expectEqualStrings("🔔 mine", try windowText(window.hwnd, &buf));
+    try std.testing.expect(try app.performAction(.{ .surface = &right.core_surface }, .set_tab_title, .{ .title = "" }));
+    try std.testing.expectEqualStrings("🔔 logs", try windowText(window.hwnd, &buf));
+
+    // A release does not stop it; any press does.
+    _ = Surface.wndProc(right.hwnd, win32.WM_LBUTTONUP, 0, testPoint(20, 30));
+    try std.testing.expect(right.bell_ringing);
+    _ = Surface.wndProc(right.hwnd, win32.WM_MBUTTONDOWN, 0, testPoint(20, 30));
+    _ = Surface.wndProc(right.hwnd, win32.WM_MBUTTONUP, 0, testPoint(20, 30));
+    try std.testing.expect(!right.bell_ringing);
+    try std.testing.expectEqualStrings("logs", try windowText(window.hwnd, &buf));
+    try std.testing.expect(try testBell(&app, right));
+    try std.testing.expect(right.bell_ringing);
+    _ = Surface.wndProc(right.hwnd, win32.WM_LBUTTONDOWN, 0, testPoint(20, 30));
+    _ = Surface.wndProc(right.hwnd, win32.WM_LBUTTONUP, 0, testPoint(20, 30));
+    try std.testing.expect(!right.bell_ringing);
+
+    // A finished command's bell rings too.
+    app.config.@"notify-on-command-finish" = .unfocused;
+    app.config.@"notify-on-command-finish-after" = .{ .duration = std.time.ns_per_s };
+    app.config.@"notify-on-command-finish-action" = .{ .bell = true, .notify = false };
+    try std.testing.expect(try app.performAction(
+        .{ .surface = &right.core_surface },
+        .command_finished,
+        .{ .exit_code = 0, .duration = .{ .duration = 2 * std.time.ns_per_s } },
+    ));
+    try std.testing.expect(right.bell_ringing);
+    try std.testing.expectEqualStrings("🔔 logs", try windowText(window.hwnd, &buf));
+
+    // Its tab hidden: in its label, not the caption, until shown again.
+    const other = try testTab(&app, window);
+    window.selectTab(1);
+    try std.testing.expect(window.tab().focused == other);
+    try std.testing.expectEqualStrings("Ghostty", try windowText(window.hwnd, &buf));
+    try shownIs(window, window.tabOf(right).?, "🔔 logs");
+    window.selectTab(0);
+    try std.testing.expectEqualStrings("🔔 logs", try windowText(window.hwnd, &buf));
+
+    // A configuration without `title`: in neither, while it still rings;
+    // with it again, back.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features".title = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(right.bell_ringing);
+    try std.testing.expectEqualStrings("logs", try windowText(window.hwnd, &buf));
+    try shownIs(window, window.tab(), "logs");
+    changed.@"bell-features".title = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqualStrings("🔔 logs", try windowText(window.hwnd, &buf));
+
+    // Its label is drawn again as it starts ringing.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(bar));
+    _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
+    _ = Surface.wndProc(right.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    try std.testing.expect(!right.bell_ringing);
+    _ = win32.UpdateWindow(bar);
+    try std.testing.expect(!win32.GetUpdateRect(bar, null, .FALSE).toBool());
+    try std.testing.expect(try testBell(&app, right));
+    try std.testing.expect(right.bell_ringing);
+    try std.testing.expect(win32.GetUpdateRect(bar, null, .FALSE).toBool());
+}
+
+/// For tests: `surface`'s bell border shows in `window` over all of its
+/// terminal, shaped to a line `line` pixels wide along its edges, and
+/// passive.
+fn expectBorderAt(window: *const Window, surface: *const Surface, line: i32) !void {
+    const hwnd = surface.overlays.bell_border.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    const pane = try paneClient(window, surface);
+    try std.testing.expectEqual(pane, try childRect(window, hwnd));
+    const w = pane.right - pane.left;
+    const h = pane.bottom - pane.top;
+    const rgn = win32.CreateRectRgn(0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteObject(rgn);
+    try std.testing.expect(win32.GetWindowRgn(hwnd, rgn) != win32.RGN_ERROR);
+    const in = struct {
+        fn f(r: win32.HRGN, x: i32, y: i32) bool {
+            return win32.PtInRegion(r, x, y).toBool();
+        }
+    }.f;
+    // Each edge's last pixel of line, and the first inside it.
+    const mx = @divTrunc(w, 2);
+    const my = @divTrunc(h, 2);
+    try std.testing.expect(in(rgn, 0, 0) and in(rgn, w - 1, h - 1));
+    try std.testing.expect(in(rgn, line - 1, my) and !in(rgn, line, my));
+    try std.testing.expect(in(rgn, w - line, my) and !in(rgn, w - line - 1, my));
+    try std.testing.expect(in(rgn, mx, line - 1) and !in(rgn, mx, line));
+    try std.testing.expect(in(rgn, mx, h - line) and !in(rgn, mx, h - line - 1));
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
+}
+
+test "win32: the bell border shows around a ringing terminal, under its other overlays, and follows it" {
+    // GTK's and macOS's border, with `bell-features` `border`, while the
+    // terminal rings: over all of it, macOS's 3 points wide, in its amber
+    // over the terminal's background; the window shaped to the line, so
+    // the terminal shows inside it. It is just above the read-only badge,
+    // under the banner and the rest, as GTK stacks it; a resize, a new
+    // scale, a zoom, a hidden tab and a move to a new window take it with
+    // the terminal; a configuration turns it on or off while it rings.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // Off by default: a ring makes none.
+    try std.testing.expect(try testBell(&app, a));
+    try std.testing.expect(a.bell_ringing);
+    try std.testing.expect(a.overlays.bell_border.hwnd == null);
+
+    // A configuration with it, while it rings: shown, just above the
+    // terminal, in amber over the background; not b's.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features".border = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try expectBorderAt(window, a, 3);
+    const hwnd = a.overlays.bell_border.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(win32.GetWindow(a.hwnd, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(b.overlays.bell_border.hwnd == null);
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(win32.rgb(148, 124, 26), printed.at(0, 0));
+        try std.testing.expectEqual(win32.rgb(148, 124, 26), printed.at(printed.width - 1, printed.height - 1));
+    }
+
+    // A new background: drawn again, over it. Dark still, so that the
+    // frame's title bar, which repaints the overlays when it changes
+    // (`Window.applyTheme`), stays as it was.
+    _ = win32.UpdateWindow(hwnd);
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    changed.background = .{ .r = 0, .g = 0, .b = 0 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(win32.rgb(128, 102, 0), printed.at(0, 0));
+    }
+
+    // Over the badge, under the banner, the preview and the key state,
+    // and the search bar.
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try std.testing.expect(try testChildExited(&app, a, 1));
+    const url = "https://example.com/some/long/path/that/goes/on/past/the/middle/of/the/terminal";
+    try std.testing.expect(try testLink(&app, a, url));
+    try std.testing.expect(try testKeyTable(&app, a, .{ .activate = "nav" }));
+    try expectBorderAt(window, a, 3);
+    const badge = a.overlays.readonly.hwnd.?;
+    try std.testing.expect(win32.GetWindow(a.hwnd, win32.GW_HWNDPREV) == badge);
+    try std.testing.expect(win32.GetWindow(badge, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(win32.GetWindow(hwnd, win32.GW_HWNDPREV) == a.overlays.child_exited.hwnd.?);
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    try std.testing.expect(above(window.hwnd, a.search_bar.hwnd.?, hwnd));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+    app.applyPendingFocus();
+    try std.testing.expect(try testLink(&app, a, ""));
+    try std.testing.expect(try testKeyTable(&app, a, .deactivate));
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+
+    // Resized, and zoomed: around all of the terminal still.
+    testResize(window, 1000, 600);
+    try expectBorderAt(window, a, 3);
+    window.toggleZoom(a);
+    try expectBorderAt(window, a, 3);
+    try std.testing.expectEqual(try clientRect(window.hwnd), try paneRect(window, a));
+    window.toggleZoom(a);
+    try expectBorderAt(window, a, 3);
+    window.toggleZoom(b);
+    try std.testing.expect(!shown(hwnd));
+    window.toggleZoom(b);
+    try expectBorderAt(window, a, 3);
+
+    // The other tab shown: hidden with the terminal; back, shown.
+    _ = try testTab(&app, window);
+    window.relayout();
+    window.selectTab(1);
+    try std.testing.expect(!shown(hwnd));
+    window.selectTab(0);
+    try expectBorderAt(window, a, 3);
+
+    // The focus stops it, and hides it; a bell again shows it.
+    _ = Surface.wndProc(a.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(!a.bell_ringing);
+    try std.testing.expect(!shown(hwnd));
+    _ = Surface.wndProc(a.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    try std.testing.expect(try testBell(&app, a));
+    try expectBorderAt(window, a, 3);
+    try std.testing.expect(a.overlays.bell_border.hwnd == hwnd);
+
+    // Moved with its tab to a new window, and at twice the scale there.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    const moved = a.window;
+    try std.testing.expect(moved != window);
+    try std.testing.expect(a.overlays.bell_border.hwnd == hwnd);
+    try expectBorderAt(moved, a, 3);
+    const Dpi = struct {
+        fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 192;
+        }
+    };
+    app.get_dpi_for_window = &Dpi.of;
+    var suggested = try windowRect(moved.hwnd);
+    _ = win32.SendMessageW(moved.hwnd, win32.WM_DPICHANGED, 192 << 16 | 192, @bitCast(@intFromPtr(&suggested)));
+    try expectBorderAt(moved, a, 6);
+
+    // A configuration without it: hidden while it rings.
+    changed.@"bell-features".border = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(a.bell_ringing);
+    try std.testing.expect(!shown(hwnd));
+
+    // It goes with its terminal.
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: a bell border whose window cannot be made, or was destroyed, or shaped, is made the next time it shows" {
+    // CreateWindowExW fails when the process has used up its window
+    // handles: the terminal rings without it, and the next bell after it
+    // stopped makes it. One destroyed, as a frame that cannot take it
+    // destroys it (`Overlays.reparent`), is made again, and shaped again.
+    // One whose region cannot be made, as GDI's objects run out, is not
+    // shown, as it would cover the terminal, until it can be.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features".border = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+
+    const NoWindow = struct {
+        var asked: usize = 0;
+        var class: []const u8 = "";
+        fn make(c: []const u8) ?win32.HWND {
+            asked += 1;
+            class = c;
+            return null;
+        }
+    };
+    NoWindow.asked = 0;
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+
+    try std.testing.expect(try testBell(&app, a));
+    try std.testing.expect(a.bell_ringing);
+    try std.testing.expect(a.overlays.bell_border.hwnd == null);
+    try std.testing.expectEqual(1, NoWindow.asked);
+    try std.testing.expectEqualStrings(BellBorder.class_name, NoWindow.class);
+    _ = Surface.wndProc(a.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqual(1, NoWindow.asked);
+
+    Overlays.test_make = null;
+    _ = Surface.wndProc(a.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    try std.testing.expect(try testBell(&app, a));
+    try expectBorderAt(window, a, 3);
+
+    _ = win32.DestroyWindow(a.overlays.bell_border.hwnd orelse return error.TestUnexpectedResult);
+    try std.testing.expect(a.overlays.bell_border.hwnd == null);
+    _ = Surface.wndProc(a.hwnd, win32.WM_SETFOCUS, 0, 0);
+    _ = Surface.wndProc(a.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    try std.testing.expect(try testBell(&app, a));
+    try expectBorderAt(window, a, 3);
+
+    const NoRegion = struct {
+        fn create(_: i32, _: i32, _: i32, _: i32) ?win32.HRGN {
+            return null;
+        }
+    };
+    BellBorder.test_create_rgn = &NoRegion.create;
+    defer BellBorder.test_create_rgn = null;
+    testResize(window, 800, 400);
+    const hwnd = a.overlays.bell_border.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(a.bell_ringing);
+    try std.testing.expect(!shown(hwnd));
+    BellBorder.test_create_rgn = null;
+    testResize(window, 900, 500);
+    try expectBorderAt(window, a, 3);
 }
 
 test "win32: float_window keeps a window on top, or puts it back" {

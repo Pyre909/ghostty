@@ -3310,7 +3310,8 @@ keybind: Keybinds = .{},
 ///    for instance under the "Sound > Alert Sound" setting in GNOME,
 ///    or the "Accessibility > System Bell" settings in KDE Plasma.
 ///
-///    On macOS, this plays the system alert sound.
+///    On macOS, this plays the system alert sound. On Windows, this plays
+///    the "Asterisk" sound of the Sound settings.
 ///
 ///  * `audio`
 ///
@@ -3332,6 +3333,9 @@ keybind: Keybinds = .{},
 ///    - On Sway, the window may be decorated with a distinctly colored border;
 ///
 ///    - On other systems this may have no effect at all.
+///
+///    On Windows, the window's taskbar button flashes until the window
+///    comes to the foreground.
 ///
 ///  * `title` *(enabled by default)*
 ///
@@ -3355,6 +3359,12 @@ keybind: Keybinds = .{},
 /// configuration file that it is referenced from, or from the current working
 /// directory if this is used as a CLI flag. The path may be prefixed with `~/`
 /// to reference the user's home directory.
+///
+/// On Windows, the file is played with Media Foundation: WAV, MP3, FLAC
+/// and AAC (`.m4a`) files play on a standard installation; Ogg Vorbis
+/// does not, and nothing plays on an N or KN edition without the Media
+/// Feature Pack. `~/` is not expanded on Windows: use a full path, or one
+/// relative to the configuration file.
 ///
 /// Available since: 1.2.0 on GTK, 1.3.0 on macOS.
 @"bell-audio-path": ?Path = null,
