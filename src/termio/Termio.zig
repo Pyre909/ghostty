@@ -619,8 +619,9 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // Clear our scrollback
         if (history) self.terminal.eraseDisplay(.scrollback, false);
 
-        // If we're not at a prompt, we just delete above the cursor.
-        if (!self.terminal.cursorIsAtPrompt()) {
+        // If we're not at a prompt, or at one the shell cannot redraw, we
+        // just delete above the cursor.
+        if (!clearErasesPrompt(&self.terminal)) {
             if (self.terminal.screens.active.cursor.y > 0) {
                 self.terminal.screens.active.eraseActive(
                     self.terminal.screens.active.cursor.y - 1,
@@ -655,6 +656,38 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
 
     // If we reached here it means we're at a prompt, so we send a form-feed.
     try self.queueWrite(td, &[_]u8{0x0C}, false);
+}
+
+/// Whether clearScreen erases the whole screen, the prompt included, and
+/// sends the shell a form feed to redraw it: only at a prompt the shell can
+/// redraw. A shell that marks its prompt with `redraw=0` says it cannot
+/// (cmd.exe and PowerShell, through Ghostty's integration on Windows), and
+/// the form feed would leave its screen blank; there, as away from a
+/// prompt, the rows above the cursor are erased and the prompt row is kept.
+fn clearErasesPrompt(t: *terminalpkg.Terminal) bool {
+    return t.cursorIsAtPrompt() and t.flags.shell_redraws_prompt != .false;
+}
+
+test "clearScreen erases the prompt only when the shell can redraw it" {
+    const testing = std.testing;
+
+    const cases = [_]struct { []const u8, bool }{
+        // No marks: the cursor is on output.
+        .{ "$ ", false },
+        // A prompt the shell redraws, by default and as bash's says.
+        .{ "\x1b]133;A\x1b\\$ ", true },
+        .{ "\x1b]133;A;redraw=last\x1b\\$ ", true },
+        // cmd.exe's prompt through Ghostty's integration.
+        .{ "\x1b]133;A;redraw=0\x1b\\C:\\>\x1b]133;I\x1b\\", false },
+    };
+    for (cases) |c| {
+        var t: terminalpkg.Terminal = try .init(testing.io, testing.allocator, .{ .cols = 40, .rows = 5 });
+        defer t.deinit(testing.allocator);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(c[0]);
+        try testing.expectEqual(c[1], clearErasesPrompt(&t));
+    }
 }
 
 /// Scroll the viewport
