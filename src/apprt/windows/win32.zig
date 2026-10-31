@@ -342,7 +342,7 @@ pub const IDC_HELP: ResourceW = @ptrFromInt(32651);
 
 pub const CF_UNICODETEXT: UINT = 13;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
-pub const CP_UTF8: UINT = 65001;
+pub const CP_UTF8: UINT = internal_os.windows.CP_UTF8;
 
 pub const MB_OK: UINT = 0x00000000;
 pub const MB_OKCANCEL: UINT = 0x00000001;

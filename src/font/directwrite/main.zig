@@ -14,6 +14,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const global = @import("../../global.zig");
+const internal_os = @import("../../os/main.zig");
 const font = @import("../main.zig");
 pub const api = @import("api.zig");
 pub const TextAnalysisSource = @import("TextAnalysisSource.zig");
@@ -36,9 +37,6 @@ extern "kernel32" fn GetUserDefaultLocaleName(
 
 /// LOCALE_NAME_MAX_LENGTH, which counts the terminator.
 const locale_max = 85;
-
-/// The UTF-8 code page.
-const CP_UTF8 = 65001;
 
 pub const Error = api.Error;
 
@@ -203,7 +201,7 @@ const path_units = 1024;
 /// code page: only an ASCII path means the same there as in UTF-8, unless
 /// UTF-8 is that code page.
 pub fn freetypeCanOpen(path: []const u8) bool {
-    if (GetACP() == CP_UTF8) return true;
+    if (GetACP() == internal_os.windows.CP_UTF8) return true;
     for (path) |c| if (c >= 0x80) return false;
     return true;
 }
