@@ -84,8 +84,15 @@ pub const FALSE: windows.BOOL = .fromBool(false);
 pub const TRUE: windows.BOOL = .fromBool(true);
 
 // Bit-field and enum constant values
+/// AttachConsole dwProcessId: the console of the process that started us.
+pub const ATTACH_PARENT_PROCESS: DWORD = 0xFFFFFFFF;
+pub const CP_UTF8 = 65001;
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+pub const CTRL_BREAK_EVENT = 1;
+pub const CTRL_C_EVENT = 0;
 pub const DELETE = 0x00010000;
+pub const DUPLICATE_SAME_ACCESS = windows.DUPLICATE_SAME_ACCESS;
+pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING = windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
 pub const ERROR_SUCCESS = 0;
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
 pub const FILE_ATTRIBUTE_NORMAL = 0x80;
@@ -126,6 +133,10 @@ pub const PROC_THREAD_ATTRIBUTE_INPUT = 0x00020000;
 pub const PROC_THREAD_ATTRIBUTE_NUMBER = 0x0000FFFF;
 pub const PROC_THREAD_ATTRIBUTE_THREAD = 0x00010000;
 pub const S_OK = 0;
+/// GetStdHandle/SetStdHandle nStdHandle values ((DWORD)-12, -10, -11).
+pub const STD_ERROR_HANDLE: DWORD = 0xFFFFFFF4;
+pub const STD_INPUT_HANDLE: DWORD = 0xFFFFFFF6;
+pub const STD_OUTPUT_HANDLE: DWORD = 0xFFFFFFF5;
 pub const SYNCHRONIZE = 0x00100000;
 pub const VOLUME_NAME_DOS = 0x0;
 pub const WAIT_FAILED = 0xFFFFFFFF;
@@ -351,6 +362,72 @@ pub const exp = struct {
             hModule: HMODULE,
             lpProcName: [*:0]const u8,
         ) callconv(.winapi) ?*const anyopaque;
+        /// https://learn.microsoft.com/en-us/windows/console/attachconsole
+        pub extern "kernel32" fn AttachConsole(
+            dwProcessId: DWORD,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/console/getstdhandle
+        pub extern "kernel32" fn GetStdHandle(
+            nStdHandle: DWORD,
+        ) callconv(.winapi) ?HANDLE;
+        /// https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler
+        pub extern "kernel32" fn SetConsoleCtrlHandler(
+            HandlerRoutine: ?*const fn (dwCtrlType: DWORD) callconv(.winapi) BOOL,
+            Add: BOOL,
+        ) callconv(.winapi) BOOL;
+        /// Fails for a handle that is not a console's.
+        /// https://learn.microsoft.com/en-us/windows/console/getconsolemode
+        pub extern "kernel32" fn GetConsoleMode(
+            hConsoleHandle: HANDLE,
+            lpMode: *DWORD,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/console/setconsolemode
+        pub extern "kernel32" fn SetConsoleMode(
+            hConsoleHandle: HANDLE,
+            dwMode: DWORD,
+        ) callconv(.winapi) BOOL;
+        /// Returns 0 when the process has no console.
+        /// https://learn.microsoft.com/en-us/windows/console/getconsoleoutputcp
+        pub extern "kernel32" fn GetConsoleOutputCP() callconv(.winapi) UINT;
+        /// https://learn.microsoft.com/en-us/windows/console/setconsoleoutputcp
+        pub extern "kernel32" fn SetConsoleOutputCP(
+            wCodePageID: UINT,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/console/writeconsole
+        pub extern "kernel32" fn WriteConsoleW(
+            hConsoleOutput: HANDLE,
+            lpBuffer: [*]const u16,
+            nNumberOfCharsToWrite: DWORD,
+            lpNumberOfCharsWritten: ?*DWORD,
+            lpReserved: ?*anyopaque,
+        ) callconv(.winapi) BOOL;
+        /// Returns the value's length, the size it needs (with its NUL) when
+        /// the buffer is too small, or 0 when it is not set or empty.
+        /// https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-getenvironmentvariablew
+        pub extern "kernel32" fn GetEnvironmentVariableW(
+            lpName: LPCWSTR,
+            lpBuffer: ?[*]u16,
+            nSize: DWORD,
+        ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/processenv/nf-processenv-setenvironmentvariablew
+        pub extern "kernel32" fn SetEnvironmentVariableW(
+            lpName: LPCWSTR,
+            lpValue: ?LPCWSTR,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getstartupinfow
+        pub extern "kernel32" fn GetStartupInfoW(
+            lpStartupInfo: *STARTUPINFOW,
+        ) callconv(.winapi) void;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle
+        pub extern "kernel32" fn DuplicateHandle(
+            hSourceProcessHandle: HANDLE,
+            hSourceHandle: HANDLE,
+            hTargetProcessHandle: HANDLE,
+            lpTargetHandle: *HANDLE,
+            dwDesiredAccess: DWORD,
+            bInheritHandle: BOOL,
+            dwOptions: DWORD,
+        ) callconv(.winapi) BOOL;
     };
     pub const user32 = struct {
         /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclientrect
@@ -461,4 +538,92 @@ pub fn ProcThreadAttributeValue(
         (if (thread) PROC_THREAD_ATTRIBUTE_THREAD else 0) |
         (if (input) PROC_THREAD_ATTRIBUTE_INPUT else 0) |
         (if (additive) PROC_THREAD_ATTRIBUTE_ADDITIVE else 0);
+}
+
+/// The environment variable ghostty.com (src/main_launcher.zig) sets to
+/// its process ID, in decimal, for the ghostty.exe it runs a CLI action in.
+pub const launcher_env = std.unicode.utf8ToUtf16LeStringLiteral("GHOSTTY_LAUNCHER");
+
+/// A process ID in decimal, as the launcher's value: the digits end `buf`.
+pub fn formatPid(buf: *[10:0]u16, pid: DWORD) [:0]const u16 {
+    // An undefined buffer's sentinel is undefined too.
+    buf[buf.len] = 0;
+    var i: usize = buf.len;
+    var n = pid;
+    while (true) {
+        i -= 1;
+        buf[i] = '0' + @as(u16, @intCast(n % 10));
+        n /= 10;
+        if (n == 0) break;
+    }
+    return buf[i..buf.len :0];
+}
+
+/// The process ID in a launcher value, or null when it is not one: empty,
+/// anything but decimal digits, or over a DWORD.
+pub fn parsePid(value: []const u16) ?DWORD {
+    if (value.len == 0) return null;
+    var pid: DWORD = 0;
+    for (value) |c| {
+        if (c < '0' or c > '9') return null;
+        pid = std.math.mul(DWORD, pid, 10) catch return null;
+        pid = std.math.add(DWORD, pid, c - '0') catch return null;
+    }
+    return pid;
+}
+
+/// Whether ghostty.com started this process for a CLI action: the
+/// launcher's value names this process's parent. A value inherited further
+/// down (by a program an action starts, or anything that one starts) names
+/// some other process, so it never counts there. The launcher waits for
+/// ghostty.exe, so its ID cannot be reused meanwhile.
+fn startedByLauncher() bool {
+    var buf: [16]u16 = undefined;
+    const len = exp.kernel32.GetEnvironmentVariableW(launcher_env, &buf, buf.len);
+    if (len == 0 or len >= buf.len) return false;
+    const pid = parsePid(buf[0..len]) orelse return false;
+    var info: windows.PROCESS.BASIC_INFORMATION = undefined;
+    if (windows.ntdll.NtQueryInformationProcess(
+        windows.current_process,
+        .BasicInformation,
+        &info,
+        @sizeOf(windows.PROCESS.BASIC_INFORMATION),
+        null,
+    ) != .SUCCESS) return false;
+    return info.InheritedFromUniqueProcessId == pid;
+}
+
+/// Connects a CLI action (`ghostty +version`) that ghostty.com runs to
+/// the launcher's console. ghostty.exe is a GUI-subsystem program, so
+/// Windows gives it no console of its own: it inherits the launcher's std
+/// handles but is not attached, and the console calls behind isatty and
+/// the terminal UIs (+list-themes) fail. AttachConsole also gives a GUI
+/// program the console's std handles where its parent passed none, and
+/// keeps ones passed (a redirect).
+/// https://learn.microsoft.com/en-us/windows/console/attachconsole
+/// (Remarks).
+///
+/// Only under the launcher (startedByLauncher). ghostty.exe typed at a
+/// prompt runs beside the shell, which does not wait for it and goes on
+/// reading the same console, so an attached terminal UI (+list-themes,
+/// +boo) would take keys meant for the prompt. It keeps what its parent
+/// gave it instead, as any GUI program does: a file cmd redirects it to
+/// gets the output, and the console gets nothing.
+///
+/// Console output also gets VT processing: once isatty says a terminal,
+/// the actions write escape sequences (the OSC 8 link in +version,
+/// colors), and cmd starts programs with it off, which prints them as
+/// text. ghostty.com restores the mode after the action.
+pub fn attachLauncherConsole() void {
+    if (!startedByLauncher()) return;
+    if (exp.kernel32.AttachConsole(ATTACH_PARENT_PROCESS) == FALSE) return;
+    enableVirtualTerminal(STD_OUTPUT_HANDLE);
+    enableVirtualTerminal(STD_ERROR_HANDLE);
+}
+
+fn enableVirtualTerminal(which: DWORD) void {
+    const h = exp.kernel32.GetStdHandle(which) orelse return;
+    var mode: DWORD = 0;
+    if (exp.kernel32.GetConsoleMode(h, &mode) == FALSE) return;
+    _ = exp.kernel32.SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }

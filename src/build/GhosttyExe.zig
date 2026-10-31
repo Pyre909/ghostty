@@ -10,6 +10,10 @@ exe: *std.Build.Step.Compile,
 /// The install step for the executable.
 install_step: *std.Build.Step.InstallArtifact,
 
+/// The install step for ghostty.com, the console launcher installed
+/// beside ghostty.exe on Windows (src/main_launcher.zig).
+launcher_install_step: ?*std.Build.Step.InstallArtifact = null,
+
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
         .name = "ghostty",
@@ -40,11 +44,31 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     cfg.addPatchElf(exe, &install_step.step);
 
     // OS-specific
+    var launcher_install_step: ?*std.Build.Step.InstallArtifact = null;
     switch (cfg.target.result.os.tag) {
         .windows => {
             exe.subsystem = .windows;
             exe.root_module.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
+            });
+
+            // A console program needs no app dependencies. It imports the
+            // CLI action detection (cli/action.zig) and cli/ghostty.zig's
+            // Action, whose other imports Zig never analyses: only the
+            // action tags and detectSpecialCase are used.
+            const launcher = b.addExecutable(.{
+                .name = "ghostty-launcher",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/main_launcher.zig"),
+                    .target = cfg.target,
+                    .optimize = cfg.optimize,
+                    .strip = cfg.strip,
+                }),
+                .use_llvm = true,
+            });
+            launcher.subsystem = .console;
+            launcher_install_step = b.addInstallArtifact(launcher, .{
+                .dest_sub_path = "ghostty.com",
             });
         },
 
@@ -54,6 +78,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     return .{
         .exe = exe,
         .install_step = install_step,
+        .launcher_install_step = launcher_install_step,
     };
 }
 
@@ -61,6 +86,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
 pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
+    if (self.launcher_install_step) |step| b.getInstallStep().dependOn(&step.step);
 }
 
 /// If we're in NixOS but not in the shell environment then we issue

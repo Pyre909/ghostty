@@ -10,6 +10,7 @@ const macos = @import("macos");
 const cli = @import("cli.zig");
 const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");
+const internal_os = @import("os/main.zig");
 
 const App = @import("App.zig");
 const Ghostty = @import("main_c.zig").Ghostty;
@@ -29,6 +30,10 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
     // a global is because the C API needs to be able to access this state;
     // no other Zig code should EVER access the global state.
     global.init(.{ .main = minimal }) catch |err| {
+        // No window exists yet, so the message can only reach a console:
+        // under ghostty.com, the one that typed a bad `+action`, the usual
+        // cause.
+        if (comptime builtin.os.tag == .windows) internal_os.windows.attachLauncherConsole();
         var buffer: [1024]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(
             std.Io.Threaded.global_single_threaded.io(),
@@ -66,6 +71,7 @@ pub fn main(minimal: std.process.Init.Minimal) !MainReturn {
 
     // Execute our action if we have one
     if (global.action()) |action| {
+        if (comptime builtin.os.tag == .windows) internal_os.windows.attachLauncherConsole();
         std.log.info("executing CLI action={}", .{action});
         std.process.exit(action.run(alloc) catch |err| err: {
             std.log.err("CLI action failed error={}", .{err});
@@ -240,6 +246,7 @@ test {
     _ = @import("termio.zig");
     _ = @import("input.zig");
     _ = @import("cli.zig");
+    _ = @import("main_launcher.zig");
     _ = @import("surface_mouse.zig");
 
     // Libraries
