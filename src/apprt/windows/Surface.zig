@@ -95,6 +95,13 @@ pub const Surface = struct {
     /// 96-DPI units; see `Window.applyInitialSize`. `Window.show` applies it.
     initial_size: ?apprt.action.InitialSize,
 
+    /// The least client size the core asked for this terminal's window
+    /// through `.size_limit`, once, from CoreSurface.init: ten cells by
+    /// four of the font it started with (`min_window_width_cells` in
+    /// src/Surface.zig), in pixels at that font's DPI; null before then.
+    /// `Window.leastClient` scales it to the window's DPI.
+    min_size: ?MinSize,
+
     /// A close of this terminal alone has been requested and
     /// WM_GHOSTTY_DESTROY posted (or its confirmation is on screen): a
     /// close_surface binding, its shell exiting, or a WM_CLOSE sent to its
@@ -418,6 +425,13 @@ pub const Surface = struct {
         }
     };
 
+    /// `min_size`: a `.size_limit` minimum, `dpi` its pixels' DPI.
+    pub const MinSize = struct {
+        width: u32,
+        height: u32,
+        dpi: u16,
+    };
+
     /// What the core has been told about the mouse.
     ///
     /// Invariants:
@@ -679,6 +693,7 @@ pub const Surface = struct {
             .title = null,
             .title_override = null,
             .initial_size = null,
+            .min_size = null,
             .closing = false,
             .destroy_deferred = false,
             .preedit = .none,

@@ -68,8 +68,10 @@ pub const Restore = struct {
 
 app: *App,
 
-/// The frame. Written from WM_NCCREATE, the first message it receives, so
-/// it is valid in every other handler.
+/// The frame. Written from WM_NCCREATE; a message before it
+/// (WM_GETMINMAXINFO, for one) finds no pointer and goes to
+/// DefWindowProcW (`wndProc`), so it is valid in every handler that reads
+/// it.
 hwnd: win32.HWND,
 
 /// The window's tabs, in the order they show; never empty from `create`
@@ -100,6 +102,10 @@ closing: bool,
 /// `App.repostDeferredDestroys`, as a terminal's is
 /// (`Surface.destroy_deferred`).
 destroy_deferred: bool,
+
+/// WM_DPICHANGED is applying Windows' suggested rect, which
+/// `minTrackSize` leaves as it is; `growToLeast` keeps the least after it.
+dpi_changing: bool,
 
 /// Whether the title bar was last made dark (`applyTheme`). A new frame
 /// has a light one.
@@ -825,6 +831,7 @@ pub fn createBare(app: *App) !*Window {
         .divider_wheel = false,
         .closing = false,
         .destroy_deferred = false,
+        .dpi_changing = false,
     };
     // Before the frame: its first messages read the shown tab. The
     // errdefer comes first, as the list's room outlives a failure to make
@@ -1023,7 +1030,15 @@ fn handleMessage(
                 while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
             }
             if (self.fullscreen == null) {
+                // Windows' rect as it suggests it: the frame's least is
+                // measured from the frame (`minTrackSize`), which may still
+                // be the old DPI's here, as WM_NCCALCSIZE measures it again
+                // only after WM_WINDOWPOSCHANGING. The least is kept after,
+                // from the new frame.
+                self.dpi_changing = true;
                 applySuggestedRect(hwnd, lparam);
+                self.dpi_changing = false;
+                if (self.isRestored()) self.growToLeast();
             } else {
                 // The suggested rect is the window's, scaled, which no longer
                 // covers a monitor: it covers the monitor that rect is on.
@@ -1037,6 +1052,14 @@ fn handleMessage(
             // changes the client size, but the divider width depends on the
             // DPI too. Terminals already in place get no second WM_SIZE.
             self.relayout();
+            return 0;
+        },
+
+        // The least the frame may be made, by its borders or by
+        // SetWindowPos, which DefWindowProcW holds to it in
+        // WM_WINDOWPOSCHANGING.
+        win32.WM_GETMINMAXINFO => {
+            self.minTrackSize(@ptrFromInt(@as(usize, @bitCast(lparam))));
             return 0;
         },
 
@@ -2423,6 +2446,84 @@ pub fn applyInitialSize(self: *Window, surface: *const Surface, size: apprt.acti
 /// `points` at `scale`, in device pixels, rounded up.
 pub fn scaledSize(points: u32, scale: f32) i32 {
     return std.math.lossyCast(i32, @ceil(@as(f32, @floatFromInt(points)) * scale));
+}
+
+/// WM_GETMINMAXINFO: the least size the frame may be made, so that its
+/// terminals have what they need (`leastClient`), with its frame and the
+/// bar, the frame measured as `resizeClient` measures it. As GTK's window,
+/// which is never smaller than its content's minimum nor than the size
+/// its first terminal asks for (`setSizeRequest` in
+/// src/apprt/gtk/class/window.zig). No more than the work area of its
+/// monitor, so that it still fits there, and no less than Windows' own
+/// least. Not while it is minimized: its window rect is then the icon's.
+/// Nor while a DPI change applies Windows' suggested rect
+/// (`dpi_changing`): the frame may then still be the old DPI's, too large
+/// or too small for the new one; `growToLeast` keeps the least after.
+fn minTrackSize(self: *const Window, info: *win32.MINMAXINFO) void {
+    if (self.dpi_changing or win32.IsIconic(self.hwnd).toBool()) return;
+    var window: win32.RECT = undefined;
+    var client: win32.RECT = undefined;
+    if (!win32.GetWindowRect(self.hwnd, &window).toBool() or !win32.GetClientRect(self.hwnd, &client).toBool()) {
+        log.warn("unable to read the window frame for its least size err={}", .{win32.GetLastError()});
+        return;
+    }
+    const monitor = monitorInfo(win32.MonitorFromWindow(self.hwnd, win32.MONITOR_DEFAULTTONEAREST)) orelse return;
+    const work = monitor.rcWork;
+    const least = self.leastClient();
+    const frame_w = (window.right - window.left) - (client.right - client.left);
+    const frame_h = (window.bottom - window.top) - (client.bottom - client.top);
+    const width = @min(least.width +| frame_w, work.right - work.left);
+    const height = @min(least.height +| self.barHeight() +| frame_h, work.bottom - work.top);
+    info.ptMinTrackSize.x = @max(info.ptMinTrackSize.x, width);
+    info.ptMinTrackSize.y = @max(info.ptMinTrackSize.y, height);
+}
+
+/// The least client area under the bar the window's terminals need, the
+/// largest across and down of: each tab's tree's least (`leastUnder`),
+/// shown or not, and zoomed or not, so that showing it or ending its zoom
+/// still fits; and each terminal's `min_size`, from the DPI of its pixels
+/// to the window's.
+fn leastClient(self: *const Window) struct { width: i32, height: i32 } {
+    const dpi = dpiOf(self.app, self.hwnd);
+    const divider = dividerWidth(dpi);
+    var width: i32 = 0;
+    var height: i32 = 0;
+    for (self.tabs.items) |t| {
+        if (t.tree.isEmpty()) continue;
+        width = @max(width, leastUnder(&t.tree, .root, true, divider));
+        height = @max(height, leastUnder(&t.tree, .root, false, divider));
+        var it = t.tree.iterator();
+        while (it.next()) |entry| {
+            const min = entry.view.min_size orelse continue;
+            width = @max(width, atDpi(min.width, dpi, min.dpi));
+            height = @max(height, atDpi(min.height, dpi, min.dpi));
+        }
+    }
+    return .{ .width = width, .height = height };
+}
+
+/// After a DPI change applied Windows' suggested rect, which
+/// `minTrackSize` left as it was: if that left the client area less than
+/// its terminals need at the new DPI (`leastClient`) with the bar, grow it
+/// to that, the frame now measured at the new DPI (`resizeClient`, which
+/// keeps it in the work area).
+fn growToLeast(self: *Window) void {
+    var client: win32.RECT = undefined;
+    if (!win32.GetClientRect(self.hwnd, &client).toBool()) {
+        log.warn("unable to read the client area for its least size err={}", .{win32.GetLastError()});
+        return;
+    }
+    const least = self.leastClient();
+    const width = @max(client.right, least.width);
+    const height = @max(client.bottom, least.height +| self.barHeight());
+    if (width == client.right and height == client.bottom) return;
+    _ = resizeClient(self.hwnd, width, height);
+}
+
+/// `pixels` at DPI `from`, at DPI `to`, rounded down.
+fn atDpi(pixels: u32, to: u32, from: u16) i32 {
+    if (from == 0) return std.math.lossyCast(i32, pixels);
+    return std.math.lossyCast(i32, @as(u64, pixels) * to / from);
 }
 
 /// Resize the window so its client area is `client_w` by `client_h`

@@ -1275,10 +1275,8 @@ pub const App = struct {
             .show_child_exited => childExited(target, value),
             .scrollbar => scrollBar(target, value),
             .cell_size => self.cellSize(target),
+            .size_limit => sizeLimit(target, value),
 
-            // Everything else, including
-            // `.size_limit` (sent during CoreSurface.init; `false` is a
-            // valid answer).
             else => false,
         };
     }
@@ -1746,6 +1744,25 @@ pub const App = struct {
             .app => false,
             .surface => |v| stored: {
                 v.rt_surface.initial_size = value;
+                break :stored true;
+            },
+        };
+    }
+
+    /// `.size_limit`: the least the terminal's window may be, kept with
+    /// the DPI of the core's font, whose cells it counts, for the frame's
+    /// least size (`Window.leastClient`), as GTK keeps it for its window's
+    /// size request (`setMinSize`). Its maximum is ignored, as on GTK; the
+    /// core asks for none.
+    fn sizeLimit(target: apprt.Target, value: apprt.action.SizeLimit) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| stored: {
+                v.rt_surface.min_size = .{
+                    .width = value.min_width,
+                    .height = value.min_height,
+                    .dpi = v.font_size.xdpi,
+                };
                 break :stored true;
             },
         };
@@ -3999,6 +4016,7 @@ fn testFrame(app: *App) !*Window {
         .divider_wheel = false,
         .closing = false,
         .destroy_deferred = false,
+        .dpi_changing = false,
     };
     _ = try window.appendTab(alloc);
     errdefer window.deinitTabs(alloc);
@@ -4026,6 +4044,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.title = null;
     surface.title_override = null;
     surface.initial_size = null;
+    surface.min_size = null;
     surface.ime = .{};
     surface.closing = false;
     surface.destroy_deferred = false;
@@ -4860,6 +4879,139 @@ test "win32: a new cell lays a shown tab with splits out again in run" {
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .cell_size, cell));
     app.forgetClosing(&a.core_surface);
     try std.testing.expect(app.requests.items[0] == .dropped);
+}
+
+test "win32: size_limit keeps the least a terminal's window may be, at its font's DPI" {
+    // The core sends it once, from CoreSurface.init, in pixels of its
+    // font, whose DPI is kept with it for the frame's least size
+    // (`Window.leastClient`). Not for the app.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    a.core_surface.font_size.xdpi = 144;
+    const limit: apprt.action.SizeLimit = .{ .min_width = 140, .min_height = 128, .max_width = 0, .max_height = 0 };
+    try std.testing.expect(!try app.performAction(.app, .size_limit, limit));
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .size_limit, limit));
+    try std.testing.expectEqual(Surface.MinSize{ .width = 140, .height = 128, .dpi = 144 }, a.min_size.?);
+}
+
+test "win32: a frame is no smaller than its terminals need, nor than its monitor" {
+    // WM_GETMINMAXINFO: the frame and the bar around the least client area
+    // (`Window.leastClient`), the largest of each tab's tree's least, shown
+    // or not and zoomed or not, and each terminal's size_limit at the
+    // window's DPI. Never less than Windows asked for, never more than the
+    // monitor's work area, and nothing while the frame is minimized.
+    // SetWindowPos is held to it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 700);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    window.relayout();
+    const Frame = struct {
+        fn minTrack(w: *Window, from: win32.POINT) win32.POINT {
+            var info = std.mem.zeroes(win32.MINMAXINFO);
+            info.ptMinTrackSize = from;
+            _ = win32.SendMessageW(w.hwnd, win32.WM_GETMINMAXINFO, 0, @bitCast(@intFromPtr(&info)));
+            return info.ptMinTrackSize;
+        }
+
+        // What the frame adds to the client area under the bar.
+        fn around(w: *Window) !win32.POINT {
+            var outer: win32.RECT = undefined;
+            if (!win32.GetWindowRect(w.hwnd, &outer).toBool()) return error.TestUnexpectedResult;
+            const client = try clientRect(w.hwnd);
+            const area = w.layoutArea() orelse return error.TestUnexpectedResult;
+            return .{
+                .x = (outer.right - outer.left) - client.right,
+                .y = (outer.bottom - outer.top) - client.bottom + area.top,
+            };
+        }
+    };
+    const zero: win32.POINT = .{ .x = 0, .y = 0 };
+
+    // a | b with no cores: a pixel and its bar each, and the line.
+    const row = 2 * Window.leastExtent(a, true) + Window.dividerWidth(96);
+    var edge = try Frame.around(window);
+    try std.testing.expectEqual(win32.POINT{ .x = row + edge.x, .y = 1 + edge.y }, Frame.minTrack(window, zero));
+    // Zoomed to a, the row still, for when the zoom ends.
+    window.toggleZoom(a);
+    try std.testing.expect(window.tab().tree.zoomed != null);
+    try std.testing.expectEqual(win32.POINT{ .x = row + edge.x, .y = 1 + edge.y }, Frame.minTrack(window, zero));
+    window.toggleZoom(a);
+
+    // The terminal of a tab not shown asks for 801 by 601 pixels of a
+    // font at 192 DPI: 400 by 300 at the window's 96, rounded down. Two
+    // tabs show the bar, which `around` counts.
+    const c = try testTab(&app, window);
+    c.core_surface.font_size.xdpi = 192;
+    try std.testing.expect(try app.performAction(.{ .surface = &c.core_surface }, .size_limit, .{
+        .min_width = 801,
+        .min_height = 601,
+        .max_width = 0,
+        .max_height = 0,
+    }));
+    try std.testing.expect(row < 400);
+    edge = try Frame.around(window);
+    const least: win32.POINT = .{ .x = 400 + edge.x, .y = 300 + edge.y };
+    try std.testing.expectEqual(least, Frame.minTrack(window, zero));
+    try std.testing.expectEqual(win32.POINT{ .x = 5000, .y = 5000 }, Frame.minTrack(window, .{ .x = 5000, .y = 5000 }));
+
+    // SetWindowPos to 10 by 10 makes the frame its least, which is more
+    // than Windows' own at any DPI here.
+    _ = win32.SetWindowPos(window.hwnd, null, 0, 0, 10, 10, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOMOVE);
+    var outer: win32.RECT = undefined;
+    try std.testing.expect(win32.GetWindowRect(window.hwnd, &outer).toBool());
+    try std.testing.expectEqual(least.x, outer.right - outer.left);
+    try std.testing.expectEqual(least.y, outer.bottom - outer.top);
+
+    // A DPI change that suggests less: Windows' rect as it is, then the
+    // frame grown to its least (`Window.growToLeast`).
+    var suggested: win32.RECT = .{ .left = outer.left, .top = outer.top, .right = outer.left + 10, .bottom = outer.top + 10 };
+    _ = win32.SendMessageW(window.hwnd, win32.WM_DPICHANGED, 96 << 16 | 96, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expect(!window.dpi_changing);
+    try std.testing.expect(win32.GetWindowRect(window.hwnd, &outer).toBool());
+    try std.testing.expectEqual(least.x, outer.right - outer.left);
+    try std.testing.expectEqual(least.y, outer.bottom - outer.top);
+
+    // More than the monitor holds: its work area.
+    b.core_surface.font_size.xdpi = 96;
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .size_limit, .{
+        .min_width = 100_000,
+        .min_height = 100_000,
+        .max_width = 0,
+        .max_height = 0,
+    }));
+    var monitor = std.mem.zeroes(win32.MONITORINFO);
+    monitor.cbSize = @sizeOf(win32.MONITORINFO);
+    const on = win32.MonitorFromWindow(window.hwnd, win32.MONITOR_DEFAULTTONEAREST) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(win32.GetMonitorInfoW(on, &monitor).toBool());
+    const work = monitor.rcWork;
+    try std.testing.expectEqual(win32.POINT{ .x = work.right - work.left, .y = work.bottom - work.top }, Frame.minTrack(window, zero));
+
+    // Minimized: as Windows asked.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWMINNOACTIVE);
+    try std.testing.expectEqual(zero, Frame.minTrack(window, zero));
 }
 
 test "win32: queued split changes reach the window from its focused terminal" {
@@ -8220,10 +8372,10 @@ test "win32: the tab bar counts in every size it takes from the client area" {
     try expectNear(ra.bottom - ra.top, rb.bottom - rb.top);
     try std.testing.expectEqual((try clientRect(window.hwnd)).bottom, rb.bottom);
 
-    // a over b over c, under a bar that leaves a divider and a pixel: a
-    // has that pixel, b and c none, as the first side keeps its least
-    // first (`Window.splitArea`), so equalized nothing moves; with room
-    // they share it.
+    // a over b over c, the frame made a divider and a pixel high under
+    // the bar: it stops where each terminal has its pixel under the bar,
+    // with the lines between them (`Window.minTrackSize`), so equalized
+    // nothing moves; with room they share it.
     const c = try testPane(&app, window);
     window.tab().tree.deinit();
     window.tab().tree = try testLine(alloc, &.{ a, b, c }, .down);
@@ -8232,12 +8384,15 @@ test "win32: the tab bar counts in every size it takes from the client area" {
     const nonclient = (frame.bottom - frame.top) - (try clientRect(window.hwnd)).bottom;
     testResize(window, 400, nonclient + height + divider + 1);
     window.relayout();
-    try std.testing.expectEqual(height + divider + 1, (try clientRect(window.hwnd)).bottom);
-    const crowded = try paneRect(window, a);
-    try std.testing.expectEqual(height, crowded.top);
-    try std.testing.expectEqual(height + 1, crowded.bottom);
+    try std.testing.expectEqual(height + 3 + 2 * divider, (try clientRect(window.hwnd)).bottom);
+    const crowded = [3]win32.RECT{ try paneRect(window, a), try paneRect(window, b), try paneRect(window, c) };
+    for (crowded, 0..) |rect, i| {
+        const top = height + @as(i32, @intCast(i)) * (1 + divider);
+        try std.testing.expectEqual(top, rect.top);
+        try std.testing.expectEqual(top + 1, rect.bottom);
+    }
     window.equalize(a);
-    try std.testing.expectEqual(crowded, try paneRect(window, a));
+    try std.testing.expectEqual(crowded, [3]win32.RECT{ try paneRect(window, a), try paneRect(window, b), try paneRect(window, c) });
     testResize(window, 400, 400);
     window.equalize(a);
     const ea = try paneRect(window, a);

@@ -69,6 +69,14 @@ pub const WINDOWPOS = extern struct {
     cy: c_int,
     flags: UINT,
 };
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-minmaxinfo
+pub const MINMAXINFO = extern struct {
+    ptReserved: POINT,
+    ptMaxSize: POINT,
+    ptMaxPosition: POINT,
+    ptMinTrackSize: POINT,
+    ptMaxTrackSize: POINT,
+};
 pub const TRACKMOUSEEVENT = extern struct {
     cbSize: DWORD,
     dwFlags: DWORD,
@@ -170,6 +178,9 @@ pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_SETTINGCHANGE: UINT = 0x001A;
 pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_MOUSEACTIVATE: UINT = 0x0021;
+/// lParam is the MINMAXINFO, filled with Windows' own sizes, which the
+/// handler may change in place.
+pub const WM_GETMINMAXINFO: UINT = 0x0024;
 /// lParam is the WINDOWPOS about to be applied, which the handler may
 /// change in place.
 pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
