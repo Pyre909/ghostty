@@ -16379,10 +16379,9 @@ test "win32: a drag of the thumb back to its end follows the output, however far
     window.relayout();
 
     // The scrollback cleared during the drag, which leaves the core
-    // following its output (`PageList.fixupViewport`,
-    // src/terminal/PageList.zig:3949-3951), then filled again past the
-    // press range's end: the thumb back at that end is at the bar's last
-    // row, where the core already is.
+    // following its output (`PageList.fixupViewport`'s `.pin` case),
+    // then filled again past the press range's end: the thumb back at
+    // that end is at the bar's last row, where the core already is.
     try std.testing.expect(try testRows(&app, a, 1000, 950, 50));
     try BarSteps.press(a, &.{
         .{ .scroll = .{ win32.SB_THUMBTRACK, 0 } },

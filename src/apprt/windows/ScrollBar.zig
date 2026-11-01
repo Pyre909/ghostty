@@ -146,7 +146,7 @@ fn lastPlace(info: Info) i32 {
 /// reaches it or stops there, and the thumb there or at the bar's end in a
 /// drag. It is past every row the core can have, which it takes as its
 /// last, its active area, and follows the output from
-/// (src/terminal/PageList.zig:3337). The bar's own last row can be behind
+/// (`PageList.scroll`'s `.row` case). The bar's own last row can be behind
 /// the core's when it is asked: the rows come from the core's tick while
 /// the output goes on, and asked for, a row short of its last would pin
 /// the viewport there.
@@ -557,7 +557,7 @@ test "win32: a scroll bar's range saturates at what SetScrollInfo takes" {
 }
 
 test "win32: the core takes a scroll bar's bottom row as its last, and follows the output from it" {
-    // What `bottom_row` relies on (src/terminal/PageList.zig:3337): asked
+    // What `bottom_row` relies on (`PageList.scroll`'s `.row` case): asked
     // for a row past its last, a viewport pinned in the scrollback becomes
     // the active area, which stays at the bottom as the output adds rows.
     var pages = try terminal.PageList.init(testing.allocator, .{ .cols = 10, .rows = 5 });
