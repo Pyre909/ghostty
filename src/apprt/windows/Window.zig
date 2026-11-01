@@ -1478,17 +1478,15 @@ pub fn split(
     };
 
     const place = self.tiledPlace(parent) orelse return App.Error.Win32CallFailed;
-    const cell = parent.core_surface.size.cell;
     const across = where == .left or where == .right;
-    const min = std.math.lossyCast(i32, if (across) cell.width else cell.height);
-    // Across, a cell and the scroll bar each side has, the new terminal's
-    // as the parent's (`fitsCell`).
-    const bar = if (across) ScrollBar.width(parent) else 0;
+    // Each side needs the parent's least, the new terminal too: it has the
+    // parent's configuration and scroll bar, and by default its font size
+    // (`window-inherit-font-size`).
     const rect = newPaneArea(
         place,
         where,
         dividerWidth(dpiOf(self.app, self.hwnd)),
-        @max(1, min) +| bar,
+        leastExtent(parent, across),
     ) orelse return error.SplitTooSmall;
 
     const surface = surface: {
@@ -1596,8 +1594,11 @@ pub fn goto(self: *Window, from: *Surface, to: apprt.action.GotoSplit) ?*Surface
 /// For `resize_split`: move the divider of the split nearest `from` that
 /// runs across `value.direction`, by `value.amount` device-independent
 /// pixels measured against the whole window, as GTK does (`resize` in
-/// src/apprt/gtk/class/split_tree.zig, then `SplitTree.resize`). Nothing
-/// moves if a terminal would shrink below a cell (`adopt`).
+/// src/apprt/gtk/class/split_tree.zig, then `SplitTree.resize`). However
+/// far it moves, the layout keeps each side its least (`splitArea`). A
+/// split held at a side's least moves from where it shows its line, not
+/// from where its ratio would put it, as on GTK (`showHeld`): else a move
+/// back from the end would not show until it came past the least.
 pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSplit) void {
     const place = self.find(from) orelse return;
     const t = self.tabs.items[place.index];
@@ -1606,14 +1607,91 @@ pub fn resizeSplit(self: *Window, from: *Surface, value: apprt.action.ResizeSpli
     const across = value.direction == .left or value.direction == .right;
     const extent = if (across) client.right - client.left else client.bottom - client.top;
     if (extent <= 0) return;
-    const ratio = resizeShare(value.amount, dpiOf(self.app, self.hwnd), extent, value.direction);
+    const dpi = dpiOf(self.app, self.hwnd);
+    const ratio = resizeShare(value.amount, dpi, extent, value.direction);
 
     const layout_of: Tree.Split.Layout = if (across) .horizontal else .vertical;
-    var tree = t.tree.resize(self.app.core_app.alloc, handle, layout_of, ratio) catch |err| {
+    const held = showHeld(&t.tree, handle, layout_of, client, dividerWidth(dpi));
+    const tree = t.tree.resize(self.app.core_app.alloc, handle, layout_of, ratio) catch |err| {
+        // As it was: the ratio it had, which lays out as it showed.
+        if (held) |h| t.tree.resizeInPlace(h.handle, h.ratio);
         log.warn("cannot resize the split err={}", .{err});
         return;
     };
-    self.adopt(t, &tree, client);
+    self.adopt(t, tree);
+}
+
+/// A split's ratio from before `showHeld` wrote the one it shows.
+const Held = struct {
+    handle: Tree.Node.Handle,
+    ratio: f16,
+};
+
+/// For `resizeSplit`: if the split it moves in `tree`, laid out in `area`
+/// with dividers `divider` pixels wide, is held at a side's least, so that
+/// its line is not where its ratio puts it (`splitArea`), write the ratio
+/// that lays the line out where it is, and return the one it had. GTK
+/// writes it so before it resizes (`clamped_to_tree` in
+/// src/apprt/gtk/class/split_tree.zig, `syncSplitRatio`).
+fn showHeld(
+    tree: *Tree,
+    leaf: Tree.Node.Handle,
+    layout_of: Tree.Split.Layout,
+    area: win32.RECT,
+    divider: i32,
+) ?Held {
+    const found = switch (nearestSplit(tree, .root, leaf, layout_of, area, divider)) {
+        .found => |v| v,
+        .absent, .below => return null,
+    };
+    const s = tree.nodes[found.handle.idx()].split;
+    const sides = lineAndRest(found.area, s.layout == .horizontal, divider);
+    if (sides.rest == 0) return null;
+    const range = firstRange(sides.rest, sidesLeast(tree, s, divider));
+    const want = firstExtent(sides.rest, s.ratio);
+    const shown = std.math.clamp(want, range.lo, range.hi);
+    if (shown == want) return null;
+    const share = @as(f32, @floatFromInt(shown)) / @as(f32, @floatFromInt(sides.rest));
+    tree.resizeInPlace(found.handle, @floatCast(share));
+    return .{ .handle = found.handle, .ratio = s.ratio };
+}
+
+/// What `nearestSplit` found under a node: not `leaf`; `leaf`, but no
+/// split above it with the layout yet; or that split and the area it
+/// divides.
+const Nearest = union(enum) {
+    absent,
+    below,
+    found: struct { handle: Tree.Node.Handle, area: win32.RECT },
+};
+
+/// The split nearest `leaf` above it, at or under `at`, whose sides are
+/// laid out `layout_of`, which is the one `SplitTree.resize` moves
+/// (`findParentSplit`), with the area `layout` gives it when `at` is laid
+/// out in `area`. With no zoom: a resize moves the tree's ratios, not what
+/// a zoom shows.
+fn nearestSplit(
+    tree: *const Tree,
+    at: Tree.Node.Handle,
+    leaf: Tree.Node.Handle,
+    layout_of: Tree.Split.Layout,
+    area: win32.RECT,
+    divider: i32,
+) Nearest {
+    if (at == leaf) return .below;
+    const s = switch (tree.nodes[at.idx()]) {
+        .leaf => return .absent,
+        .split => |s| s,
+    };
+    const sides = splitArea(area, s.layout == .horizontal, s.ratio, divider, sidesLeast(tree, s, divider));
+    const under = switch (nearestSplit(tree, s.left, leaf, layout_of, sides.first, divider)) {
+        .absent => nearestSplit(tree, s.right, leaf, layout_of, sides.second, divider),
+        else => |v| v,
+    };
+    return switch (under) {
+        .below => if (s.layout == layout_of) .{ .found = .{ .handle = at, .area = area } } else .below,
+        .absent, .found => under,
+    };
 }
 
 /// `resize_split`'s move as `SplitTree.resize` takes it: `amount`
@@ -1639,7 +1717,7 @@ fn resizeShare(
 
 /// For `equalize_splits`: give each split a share by the number of
 /// terminals on each side of it, as GTK and macOS do (`SplitTree.equalize`).
-/// Nothing moves if a terminal would shrink below a cell (`adopt`).
+/// The layout still keeps each side its least (`splitArea`).
 pub fn equalize(self: *Window, from: *Surface) void {
     self.equalizeTab(self.tabOf(from) orelse return);
 }
@@ -1647,89 +1725,86 @@ pub fn equalize(self: *Window, from: *Surface) void {
 /// `equalize` for the tab `t`, as a double click on a divider asks
 /// (`Dividers.doubleClick`).
 pub fn equalizeTab(self: *Window, t: *Tab) void {
-    const client = self.layoutArea() orelse return;
-    var tree = t.tree.equalize(self.app.core_app.alloc) catch |err| {
+    const tree = t.tree.equalize(self.app.core_app.alloc) catch |err| {
         log.warn("cannot equalize the splits err={}", .{err});
         return;
     };
-    self.adopt(t, &tree, client);
+    self.adopt(t, tree);
 }
 
-/// Keep `tree`, a resized or equalized copy of `t.tree`, laying its
-/// terminals out if `t` is shown; or, if that would leave a terminal it
-/// shrinks less than a cell across or down in `client`, free it and change
-/// nothing. A split refuses the same (`newPaneArea`): a terminal with no
-/// room shows nothing, and `SplitTree.resize` would clamp a ratio as far
-/// as 0 or 1.
-fn adopt(self: *Window, t: *Tab, tree: *Tree, client: win32.RECT) void {
-    const divider = dividerWidth(dpiOf(self.app, self.hwnd));
-    if (!keepsCells(&t.tree, tree, client, divider)) {
-        tree.deinit();
-        return;
-    }
-    self.setTree(t, tree.*);
+/// Make `tree`, a resized or equalized copy of `t.tree`, its tree, and lay
+/// its terminals out if `t` is shown. Whatever its ratios, the layout
+/// keeps each terminal its least where the tab has room for them all
+/// (`splitArea`), as GTK keeps them whatever ratio its tree asks for, and
+/// the ratios stay for when it has room again.
+fn adopt(self: *Window, t: *Tab, tree: Tree) void {
+    self.setTree(t, tree);
     if (t == self.tab()) self.relayout();
 }
 
-/// Whether laying the terminals out by `new` instead of `old` in `area`
-/// leaves each one it shrinks at least a cell across and down: the cell of
-/// its own font, or a pixel for a terminal with no core. `new` is `old`
-/// with only its ratios changed (`SplitTree.resize` and `SplitTree.equalize`
-/// copy the nodes and rewrite ratios), so the two are laid out side by
-/// side, as `layout` would lay out each.
-pub fn keepsCells(old: *const Tree, new: *const Tree, area: win32.RECT, divider: i32) bool {
-    assert(old.nodes.len == new.nodes.len);
-    if (new.isEmpty()) return true;
-    return keepsCellsAt(old, new, .root, area, area, divider);
+/// The least `surface` is laid out across (`across`) or down in a split:
+/// a cell of its font and the padding the configuration asks for each
+/// side of it, as GTK keeps a terminal (`syncSplitMinSize` in
+/// src/apprt/gtk/class/surface.zig); across, also the scroll bar beside
+/// them, which here takes its width from the grid's (GTK counts no bar).
+/// With `window-padding-balance` too: the grid is what the configured
+/// padding leaves, and balancing spreads only what the grid does not fill
+/// (`renderer.Size.balancePadding`). In pixels at the DPI the core has its
+/// font at (`DesiredSize.xdpi`), as the core scales the padding
+/// (`DerivedConfig.scaledPadding` in src/Surface.zig): points times the
+/// DPI over 72, rounded down. The core computes that in f32, from the
+/// content scale times 96; integer division here gives the same for every
+/// integer DPI from 48 to 960 and every padding from 0 to 255 points,
+/// checked exhaustively. No test here can reach the core's function,
+/// which is private: the split scenario (dv.ps1, steps 6, 7 and 7b)
+/// compares this least with the cell and padding the real core logs. A
+/// terminal with no core needs a pixel.
+pub fn leastExtent(surface: *Surface, across: bool) i32 {
+    const bar = if (across) ScrollBar.width(surface) else 0;
+    const core = surface.liveCore() orelse return 1 +| bar;
+    const config = &core.config;
+    const cell: u64 = if (across) core.size.cell.width else core.size.cell.height;
+    const dpi: u64 = if (across) core.font_size.xdpi else core.font_size.ydpi;
+    const near: u64, const far: u64 = if (across)
+        .{ config.window_padding_left, config.window_padding_right }
+    else
+        .{ config.window_padding_top, config.window_padding_bottom };
+    const least = @max(1, cell + near * dpi / 72 + far * dpi / 72);
+    return std.math.lossyCast(i32, least) +| bar;
 }
 
-/// `keepsCells` for the terminals at and under `handle`: laid out by `old`
-/// in `was` and by `new` in `now`. A divider's drag asks it of each side of
-/// its split, laid out from where it is to where the drag would put it
-/// (`Dividers.dragRatio`), so that the drag and `adopt` keep the same
-/// least.
-pub fn keepsCellsAt(
-    old: *const Tree,
-    new: *const Tree,
-    handle: Tree.Node.Handle,
-    was: win32.RECT,
-    now: win32.RECT,
-    divider: i32,
-) bool {
-    switch (new.nodes[handle.idx()]) {
-        .leaf => |surface| {
-            assert(old.nodes[handle.idx()].leaf == surface);
-            return fitsCell(surface, was, now);
-        },
+/// The least `view` is laid out across (`across`) or down: a terminal's
+/// own (`leastExtent`), or what a test's view says.
+fn leastOf(view: anytype, across: bool) i32 {
+    if (@TypeOf(view) == *Surface) return leastExtent(view, across);
+    return view.least(across);
+}
+
+/// The least the terminals at and under `handle` of `tree` are laid out
+/// across (`across`) or down in, as `splitArea` keeps them: a terminal's
+/// own (`leastOf`); for a split along that axis, its sides' with its line,
+/// `divider` pixels, between them; and for one across it, the larger of
+/// its sides'. As GTK measures its split's least (gtk_paned_measure).
+pub fn leastUnder(tree: anytype, handle: @TypeOf(tree.*).Node.Handle, across: bool, divider: i32) i32 {
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |view| return leastOf(view, across),
         .split => |s| {
-            const across = s.layout == .horizontal;
-            const before = splitArea(was, across, old.nodes[handle.idx()].split.ratio, divider);
-            const after = splitArea(now, across, s.ratio, divider);
-            return keepsCellsAt(old, new, s.left, before.first, after.first, divider) and
-                keepsCellsAt(old, new, s.right, before.second, after.second, divider);
+            const first = leastUnder(tree, s.left, across, divider);
+            const second = leastUnder(tree, s.right, across, divider);
+            if ((s.layout == .horizontal) == across) return first +| divider +| second;
+            return @max(first, second);
         },
     }
 }
 
-/// Whether `surface`, moving from `was` to `now`, keeps a cell across and
-/// down wherever it shrinks (`keepsCells`): in what its scroll bar leaves
-/// of its window across, the client area the grid is laid out in.
-fn fitsCell(surface: *Surface, was: win32.RECT, now: win32.RECT) bool {
-    const w = now.right - now.left;
-    const h = now.bottom - now.top;
-    if (w < was.right - was.left and w - ScrollBar.width(surface) < cellExtent(surface, true)) return false;
-    if (h < was.bottom - was.top and h < cellExtent(surface, false)) return false;
-    return true;
-}
-
-/// The least a terminal is given across (`across`) or down by a change
-/// that shrinks it: a cell of its own font, or a pixel for a terminal with
-/// no core. `adopt` refuses a resize below it, and a divider's drag stops
-/// at it (`fitsCell`).
-fn cellExtent(surface: *Surface, across: bool) i32 {
-    const core = surface.liveCore() orelse return 1;
-    const cell = core.size.cell;
-    return @max(1, std.math.lossyCast(i32, if (across) cell.width else cell.height));
+/// The least of each side of the split `s` of `tree` along its axis
+/// (`leastUnder`), as `splitArea` keeps them.
+pub fn sidesLeast(tree: anytype, s: @TypeOf(tree.*).Split, divider: i32) Least {
+    const across = s.layout == .horizontal;
+    return .{
+        .first = leastUnder(tree, s.left, across, divider),
+        .second = leastUnder(tree, s.right, across, divider),
+    };
 }
 
 /// `toggle_split_zoom`: make `from` fill the window alone, or end the
@@ -2056,9 +2131,12 @@ const Placer = struct {
 /// and below it, and the area it divides. A split gives `divider` pixels to
 /// the line between its sides, fewer if it is narrower than that, and
 /// divides the rest by its ratio, to the nearest pixel, so that the panes
-/// and dividers tile `area` exactly. `tree.spatial` describes the same
-/// layout without dividers, but normalized to f16, which is up to two
-/// pixels off at 3840 pixels across.
+/// and dividers tile `area` exactly, while keeping each side its least
+/// (`splitArea`). `tree.spatial` describes the same layout without
+/// dividers or leasts, but normalized to f16, which is up to two pixels
+/// off at 3840 pixels across. Each split asks its sides' leasts, a walk of
+/// the terminals under it (`leastUnder`), so a terminal's least is read
+/// once for each split above it, without allocating.
 ///
 /// A zoomed terminal (`toggleZoom`) fills `area` alone, and every other
 /// one is `ctx.hidden(view)`, with no dividers.
@@ -2088,7 +2166,7 @@ fn layoutNode(
         .leaf => |view| ctx.pane(view, area),
         .split => |s| {
             const across = s.layout == .horizontal;
-            const sides = splitArea(area, across, s.ratio, divider);
+            const sides = splitArea(area, across, s.ratio, divider, sidesLeast(tree, s, divider));
             if (sides.line > 0) ctx.divider(handle, sides.divider, across, area);
             layoutNode(tree, s.left, sides.first, divider, ctx);
             layoutNode(tree, s.right, sides.second, divider, ctx);
@@ -2098,11 +2176,44 @@ fn layoutNode(
 
 /// How a split divides `area` (`layout`): `divider` pixels for the line
 /// between its sides, fewer if it is narrower than that, and the rest by
-/// `ratio`, to the nearest pixel, for the first side (left or top).
-pub fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32) Sides {
+/// `ratio`, to the nearest pixel, for the first side (left or top), but
+/// within `firstRange`: each side keeps its `least` where there is room
+/// for both, and else the first does as far as there is room for it. As
+/// GTK holds its split (`syncSplitRatio` in
+/// src/apprt/gtk/class/split_tree.zig), with its first side's least
+/// before the second's. The ratio is left as it is, for when the area
+/// grows again, as GTK's tree keeps it.
+pub fn splitArea(area: win32.RECT, across: bool, ratio: f16, divider: i32, least: Least) Sides {
+    const sides = lineAndRest(area, across, divider);
+    const range = firstRange(sides.rest, least);
+    const first = std.math.clamp(firstExtent(sides.rest, ratio), range.lo, range.hi);
+    return splitAt(area, across, sides.line, first);
+}
+
+/// The least pixels a split's sides are laid out in along its axis
+/// (`splitArea`): what the terminals of each need (`sidesLeast`).
+pub const Least = struct {
+    first: i32,
+    second: i32,
+};
+
+/// Of a split's `area`, the pixels across (`across`) or down its line
+/// takes, `divider` or fewer if the area is narrower, and the rest, which
+/// its sides share (`splitArea`).
+pub fn lineAndRest(area: win32.RECT, across: bool, divider: i32) struct { line: i32, rest: i32 } {
     const total = @max(0, if (across) area.right - area.left else area.bottom - area.top);
     const line = std.math.clamp(divider, 0, total);
-    return splitAt(area, across, line, firstExtent(total - line, ratio));
+    return .{ .line = line, .rest = total - line };
+}
+
+/// Where a split's first side may end, of the `rest` pixels its line
+/// leaves (`splitArea`): from `lo`, its least, to `hi`, what leaves the
+/// second side its least. Where `rest` holds only the first side's least,
+/// `lo` and `hi` are both that, or all of `rest` if it holds less.
+pub fn firstRange(rest: i32, least: Least) struct { lo: i32, hi: i32 } {
+    assert(rest >= 0 and least.first >= 0 and least.second >= 0);
+    const lo = @min(least.first, rest);
+    return .{ .lo = lo, .hi = @max(lo, rest - least.second) };
 }
 
 /// A split's two sides and its line in its area (`splitArea`).
@@ -2115,8 +2226,7 @@ pub const Sides = struct {
 
 /// How a split divides `area` with its first side `first` pixels across
 /// (`across`) or down and its line `line` pixels after it, the second side
-/// taking the rest: `splitArea` for a ratio that lays out `first`, as a
-/// divider's drag tries places for its line (`Dividers.dragRatio`).
+/// taking the rest: `splitArea` once it has found `first`.
 pub fn splitAt(area: win32.RECT, across: bool, line: i32, first: i32) Sides {
     var a = area;
     var d = area;
@@ -2135,8 +2245,9 @@ pub fn splitAt(area: win32.RECT, across: bool, line: i32, first: i32) Sides {
     return .{ .first = a, .divider = d, .second = b, .line = line };
 }
 
-/// How many of `rest` pixels, a split's area less its line, `splitArea`
-/// gives its first side at `ratio`: to the nearest pixel.
+/// How many of `rest` pixels, a split's area less its line, its first
+/// side has at `ratio`, to the nearest pixel, before `splitArea` keeps
+/// each side its least.
 pub fn firstExtent(rest: i32, ratio: f16) i32 {
     const scaled = @round(@as(f32, @floatFromInt(rest)) * @as(f32, ratio));
     return std.math.clamp(std.math.lossyCast(i32, scaled), 0, rest);
@@ -2144,17 +2255,17 @@ pub fn firstExtent(rest: i32, ratio: f16) i32 {
 
 /// Where `split` puts a new terminal beside one at `area`: the side
 /// `where` names of `area` split as `layout` will split it, at
-/// `new_split_ratio`. Null if it, or what it leaves of `area`, would be less
-/// than `min` pixels across the split: a terminal with no room takes the
+/// `new_split_ratio`, each side needing `least` pixels across the split.
+/// Null if either would have less: a terminal with no room takes the
 /// focus and shows nothing.
 fn newPaneArea(
     area: win32.RECT,
     where: Tree.Split.Direction,
     divider: i32,
-    min: i32,
+    least: i32,
 ) ?win32.RECT {
     const across = where == .left or where == .right;
-    const sides = splitArea(area, across, new_split_ratio, divider);
+    const sides = splitArea(area, across, new_split_ratio, divider, .{ .first = least, .second = least });
     const new, const left = switch (where) {
         .left, .up => .{ sides.first, sides.second },
         .right, .down => .{ sides.second, sides.first },
@@ -2164,7 +2275,7 @@ fn newPaneArea(
             return if (a) r.right - r.left else r.bottom - r.top;
         }
     }.extent;
-    if (extent(new, across) < min or extent(left, across) < min) return null;
+    if (extent(new, across) < least or extent(left, across) < least) return null;
     return new;
 }
 
@@ -2956,9 +3067,13 @@ test "win32: a maximized frame without decorations is moved onto the work area" 
     try testing.expectEqual(covering, onWorkArea(covering, larger, larger).?);
 }
 
-/// For the layout tests: a view with a name and no reference count.
+/// For the layout tests: a view with a name and no reference count, which
+/// needs `across` pixels across and `down` down (`leastOf`), none unless
+/// a test says.
 const TestPane = struct {
     name: u8,
+    across: i32 = 0,
+    down: i32 = 0,
 
     pub fn ref(self: *TestPane) *TestPane {
         return self;
@@ -2966,6 +3081,10 @@ const TestPane = struct {
 
     pub fn unref(self: *TestPane) void {
         _ = self;
+    }
+
+    pub fn least(self: *const TestPane, across: bool) i32 {
+        return if (across) self.across else self.down;
     }
 };
 
@@ -3304,27 +3423,166 @@ test "win32: a new split starts where the layout puts it" {
     }
 }
 
-test "win32: a split needs room for a cell on each side" {
+test "win32: a split needs room for its least on each side" {
     // A terminal with no room would take the focus and show nothing:
     // splitting the newest one again and again ends at no width at all.
     const divider = 2;
-    const cell = 10;
+    const least = 10;
     // 22 wide: 10 on each side of the divider, just enough.
     const fits: win32.RECT = .{ .left = 0, .top = 0, .right = 22, .bottom = 300 };
     for ([_]TestTree.Split.Direction{ .left, .right }) |where| {
-        try std.testing.expect(newPaneArea(fits, where, divider, cell) != null);
+        try std.testing.expect(newPaneArea(fits, where, divider, least) != null);
     }
     // 21 wide: one side gets 9.
     const narrow: win32.RECT = .{ .left = 0, .top = 0, .right = 21, .bottom = 300 };
     for ([_]TestTree.Split.Direction{ .left, .right }) |where| {
-        try std.testing.expect(newPaneArea(narrow, where, divider, cell) == null);
+        try std.testing.expect(newPaneArea(narrow, where, divider, least) == null);
     }
     // Across the other axis, the height counts.
     const short: win32.RECT = .{ .left = 0, .top = 0, .right = 300, .bottom = 21 };
     for ([_]TestTree.Split.Direction{ .up, .down }) |where| {
-        try std.testing.expect(newPaneArea(short, where, divider, cell) == null);
+        try std.testing.expect(newPaneArea(short, where, divider, least) == null);
     }
-    try std.testing.expect(newPaneArea(short, .right, divider, cell) != null);
+    try std.testing.expect(newPaneArea(short, .right, divider, least) != null);
+}
+
+test "win32: a split keeps each side its least, the first side's first" {
+    // a | b over 101 pixels and a line of 1: 100 for the two. a needs 30
+    // and b 20, so a's side ends from 30 to 80, whatever the ratio.
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a', .across = 30 };
+    var b: TestPane = .{ .name = 'b', .across = 20 };
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    var tree = try testSplit(&only_a, .root, .right, 0.5, &b);
+    defer tree.deinit();
+    const width = struct {
+        fn width(t: *const TestTree, view: *const TestPane, w: i32) !i32 {
+            const area: win32.RECT = .{ .left = 0, .top = 0, .right = w, .bottom = 40 };
+            var got: TestLayout = .{};
+            layout(t, area, 1, &got);
+            try got.expectTiles(area);
+            const r = got.rectOf(view);
+            return r.right - r.left;
+        }
+    }.width;
+    for ([_][2]f16{ .{ 0, 30 }, .{ 0.1, 30 }, .{ 0.3, 30 }, .{ 0.31, 31 }, .{ 0.5, 50 }, .{ 0.8, 80 }, .{ 0.9, 80 }, .{ 1, 80 } }) |c| {
+        tree.resizeInPlace(.root, c[0]);
+        try std.testing.expectEqual(@as(i32, @intFromFloat(c[1])), try width(&tree, &a, 101));
+    }
+    // The ratio is kept: wider, a has 0.9 of it again.
+    try std.testing.expectEqual(@as(f16, 1), tree.nodes[0].split.ratio);
+    tree.resizeInPlace(.root, 0.9);
+    try std.testing.expectEqual(80, try width(&tree, &a, 101));
+    try std.testing.expectEqual(270, try width(&tree, &a, 301));
+
+    // With room for less than both, a keeps its 30 and b has what is left;
+    // with less than a's 30, a has it all.
+    try std.testing.expectEqual(30, try width(&tree, &a, 41));
+    try std.testing.expectEqual(10, try width(&tree, &b, 41));
+    tree.resizeInPlace(.root, 0);
+    try std.testing.expectEqual(10, try width(&tree, &b, 41));
+    try std.testing.expectEqual(20, try width(&tree, &a, 21));
+    try std.testing.expectEqual(0, try width(&tree, &b, 21));
+}
+
+test "win32: a split's least adds up along it and is the larger across it" {
+    // a | (b over c), lines of 2: across, a's 30 and the larger of b's 20
+    // and c's 25 with a line, 57; down, the larger of a's 10 and b's 15
+    // and c's 5 with a line, 22.
+    const alloc = std.testing.allocator;
+    var a: TestPane = .{ .name = 'a', .across = 30, .down = 10 };
+    var b: TestPane = .{ .name = 'b', .across = 20, .down = 15 };
+    var c: TestPane = .{ .name = 'c', .across = 25, .down = 5 };
+    var only_a: TestTree = try .init(alloc, &a);
+    defer only_a.deinit();
+    var ab = try testSplit(&only_a, .root, .right, 0.5, &b);
+    defer ab.deinit();
+    var tree = try testSplit(&ab, ab.locate(&b).?, .down, 0.5, &c);
+    defer tree.deinit();
+    try std.testing.expectEqual(57, leastUnder(&tree, .root, true, 2));
+    try std.testing.expectEqual(22, leastUnder(&tree, .root, false, 2));
+    try std.testing.expectEqual(Least{ .first = 30, .second = 25 }, sidesLeast(&tree, tree.nodes[0].split, 2));
+
+    // In 57 by 22, each pane has its least or more.
+    const area: win32.RECT = .{ .left = 0, .top = 0, .right = 57, .bottom = 22 };
+    var got: TestLayout = .{};
+    layout(&tree, area, 2, &got);
+    try std.testing.expectEqual(win32.RECT{ .left = 0, .top = 0, .right = 30, .bottom = 22 }, got.rectOf(&a));
+    try std.testing.expectEqual(win32.RECT{ .left = 32, .top = 0, .right = 57, .bottom = 15 }, got.rectOf(&b));
+    try std.testing.expectEqual(win32.RECT{ .left = 32, .top = 17, .right = 57, .bottom = 22 }, got.rectOf(&c));
+}
+
+test "win32: with room for the tree's least, the layout keeps each terminal its own" {
+    // Random trees of up to six panes with random leasts, at random ratios
+    // (either end included), dividers and areas, some under the tree's
+    // least (`leastUnder`). The panes and dividers tile the area; with the
+    // tree's least each way, every pane has its own; and the ratios are
+    // left as they were. Many rounds hold a pane that its ratio alone
+    // would lay out smaller.
+    var prng: std.Random.DefaultPrng = .init(0x4133_4c45);
+    const random = prng.random();
+    var panes: [6]TestPane = undefined;
+    for (&panes, 0..) |*p, i| p.* = .{ .name = 'a' + @as(u8, @intCast(i)) };
+    var roomy: usize = 0;
+    var held: usize = 0;
+    var round: usize = 0;
+    while (round < 500) : (round += 1) {
+        const n = random.intRangeAtMost(usize, 1, panes.len);
+        for (panes[0..n]) |*p| {
+            p.across = random.intRangeAtMost(i32, 0, 60);
+            p.down = random.intRangeAtMost(i32, 0, 60);
+        }
+        var tree = try testRandomTree(TestTree, random, panes[0..n]);
+        defer tree.deinit();
+        const ratios = try std.testing.allocator.alloc(f16, tree.nodes.len);
+        defer std.testing.allocator.free(ratios);
+        for (tree.nodes, ratios) |node, *r| r.* = if (node == .split) node.split.ratio else 0;
+
+        const divider = random.intRangeAtMost(i32, 1, 3);
+        const need_w = leastUnder(&tree, .root, true, divider);
+        const need_h = leastUnder(&tree, .root, false, divider);
+        const fits = random.boolean();
+        const area: win32.RECT = .{
+            .left = random.intRangeAtMost(i32, -20, 20),
+            .top = random.intRangeAtMost(i32, -20, 20),
+            .right = 0,
+            .bottom = 0,
+        };
+        var whole = area;
+        whole.right = area.left + if (fits) need_w + random.intRangeAtMost(i32, 0, 200) else random.intRangeAtMost(i32, 0, need_w);
+        whole.bottom = area.top + if (fits) need_h + random.intRangeAtMost(i32, 0, 200) else random.intRangeAtMost(i32, 0, need_h);
+        var got: TestLayout = .{};
+        layout(&tree, whole, divider, &got);
+        try std.testing.expectEqual(n, got.pane_count);
+        try got.expectTiles(whole);
+        for (tree.nodes, ratios) |node, r| if (node == .split) try std.testing.expectEqual(r, node.split.ratio);
+        if (!fits) continue;
+        roomy += 1;
+
+        for (got.panes[0..got.pane_count]) |p| {
+            try std.testing.expect(p.rect.right - p.rect.left >= p.view.across);
+            try std.testing.expect(p.rect.bottom - p.rect.top >= p.view.down);
+        }
+
+        // Laid out as its ratios alone put it, with no leasts.
+        const kept = panes;
+        for (panes[0..n]) |*p| {
+            p.across = 0;
+            p.down = 0;
+        }
+        var by_ratio: TestLayout = .{};
+        layout(&tree, whole, divider, &by_ratio);
+        panes = kept;
+        for (by_ratio.panes[0..by_ratio.pane_count]) |p| {
+            if (p.rect.right - p.rect.left < p.view.across or p.rect.bottom - p.rect.top < p.view.down) {
+                held += 1;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(roomy > 200);
+    try std.testing.expect(held > roomy / 4);
 }
 
 test "win32: a resize is device-independent pixels over the window" {
@@ -3342,48 +3600,94 @@ test "win32: a resize is device-independent pixels over the window" {
     try std.testing.expectEqual(@as(f16, -1), resizeShare(std.math.maxInt(u16), 96, 1000, .left));
 }
 
-test "win32: a resize keeps each terminal its own cell where it shrinks" {
-    // b's font has cells 50 pixels wide and 20 high; a has no core, so a
-    // pixel will do for it. Over 200 pixels and a divider, b may shrink
-    // across to 50 but not to 40, and down to 30, more than its 20.
+test "win32: a terminal's least is a cell and its padding, at its font's DPI" {
+    // Cells 10 by 20 at 144 DPI, padding 2 and 3 points across, 5 and 7
+    // down, 2 pixels a point: 10 + 4 + 6 = 20 across, 20 + 10 + 14 = 44
+    // down. With no core, a pixel; no scroll bar until the end.
     const s = struct {
         var a: Surface = undefined;
-        var b: Surface = undefined;
     };
+    s.a.scroll_bar = .{};
     s.a.core_state = .none;
-    s.b.core_state = .live;
-    s.b.core_surface.size.cell = .{ .width = 50, .height = 20 };
+    try std.testing.expectEqual(1, leastExtent(&s.a, true));
+    try std.testing.expectEqual(1, leastExtent(&s.a, false));
 
-    var row = try testPair(&s.a, &s.b, .right);
-    defer row.deinit();
-    const wide: win32.RECT = .{ .left = 0, .top = 0, .right = 201, .bottom = 100 };
-    try std.testing.expect(!try keepsAt(&row, 0.8, wide));
-    try std.testing.expect(try keepsAt(&row, 0.75, wide));
+    s.a.core_state = .live;
+    const core = &s.a.core_surface;
+    core.size.cell = .{ .width = 10, .height = 20 };
+    core.font_size.xdpi = 144;
+    core.font_size.ydpi = 144;
+    core.config.window_padding_left = 2;
+    core.config.window_padding_right = 3;
+    core.config.window_padding_top = 5;
+    core.config.window_padding_bottom = 7;
+    try std.testing.expectEqual(20, leastExtent(&s.a, true));
+    try std.testing.expectEqual(44, leastExtent(&s.a, false));
 
-    var column = try testPair(&s.a, &s.b, .down);
-    defer column.deinit();
-    const tall: win32.RECT = .{ .left = 0, .top = 0, .right = 100, .bottom = 201 };
-    try std.testing.expect(try keepsAt(&column, 0.85, tall));
-    try std.testing.expect(!try keepsAt(&column, 0.95, tall));
+    // At 120 DPI, 5/3 pixels a point, each side rounds down on its own:
+    // 3.33 and 5 across, 18; 8.33 and 11.67 down, 39.
+    core.font_size.xdpi = 120;
+    core.font_size.ydpi = 120;
+    try std.testing.expectEqual(18, leastExtent(&s.a, true));
+    try std.testing.expectEqual(39, leastExtent(&s.a, false));
+
+    // With no padding, the cell; a cell of nothing still needs a pixel.
+    core.config.window_padding_left = 0;
+    core.config.window_padding_right = 0;
+    try std.testing.expectEqual(10, leastExtent(&s.a, true));
+    core.size.cell.width = 0;
+    try std.testing.expectEqual(1, leastExtent(&s.a, true));
+
+    // Across, the scroll bar beside them too, as wide as Windows draws it
+    // at the window's DPI (`ScrollBar.width`); not down.
+    const Bar = struct {
+        var app: App = undefined;
+        fn dpi(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 144;
+        }
+        fn metric(index: c_int, at: win32.UINT) callconv(.winapi) c_int {
+            return if (index == win32.SM_CXVSCROLL and at == 144) 25 else 0;
+        }
+    };
+    Bar.app.bar_metric = .{ .dpi_of = &Bar.dpi, .metric_for = &Bar.metric };
+    s.a.app = &Bar.app;
+    s.a.hwnd = @ptrFromInt(0x1000);
+    s.a.scroll_bar.on = true;
+    core.size.cell.width = 10;
+    try std.testing.expectEqual(10 + 25, leastExtent(&s.a, true));
+    try std.testing.expectEqual(39, leastExtent(&s.a, false));
 }
 
-/// For tests: `a` with `b` split off it in `where`, at half.
-fn testPair(a: *Surface, b: *Surface, where: Tree.Split.Direction) !Tree {
+/// For the tests: `leaves` in a tree of type `T`, each split off a random
+/// one before it in a random direction, and every split at a random
+/// ratio, either end included.
+pub fn testRandomTree(comptime T: type, random: std.Random, leaves: []T.View) !T {
     const alloc = std.testing.allocator;
-    var base: Tree = try .init(alloc, a);
-    defer base.deinit();
-    var single: Tree = try .init(alloc, b);
-    defer single.deinit();
-    return base.split(alloc, .root, where, 0.5, &single);
-}
-
-/// For tests: whether `keepsCells` lets `tree` have its root split at
-/// `ratio` in `area`, with a one-pixel divider.
-fn keepsAt(tree: *const Tree, ratio: f16, area: win32.RECT) !bool {
-    var new = try tree.clone(std.testing.allocator);
-    defer new.deinit();
-    new.resizeInPlace(.root, ratio);
-    return keepsCells(tree, &new, area, 1);
+    var tree: T = try .init(alloc, &leaves[0]);
+    errdefer tree.deinit();
+    for (leaves[1..]) |*leaf| {
+        var pick: T.Node.Handle = .root;
+        var seen: usize = 0;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            seen += 1;
+            if (random.uintLessThan(usize, seen) == 0) pick = entry.handle;
+        }
+        var single: T = try .init(alloc, leaf);
+        defer single.deinit();
+        const next = try tree.split(alloc, pick, random.enumValue(T.Split.Direction), 0.5, &single);
+        tree.deinit();
+        tree = next;
+    }
+    for (tree.nodes, 0..) |node, i| if (node == .split) {
+        const ratio: f16 = switch (random.uintLessThan(u8, 8)) {
+            0 => 0,
+            1 => 1,
+            else => @floatCast(random.float(f32)),
+        };
+        tree.resizeInPlace(T.Node.Handle.root.offset(i), ratio);
+    };
+    return tree;
 }
 
 test "win32: modal loops are counted per window and returned on destroy" {

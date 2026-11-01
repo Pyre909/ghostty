@@ -322,6 +322,10 @@ pub const App = struct {
         /// (`equalizeSplits`).
         equalize: *CoreSurface,
 
+        /// Lay the window of this surface out again, as its cell changed
+        /// (`cellSize`).
+        relayout: *CoreSurface,
+
         /// Read the configuration from disk again and give it to the core
         /// (`reloadConfig`).
         reload,
@@ -1270,10 +1274,11 @@ pub const App = struct {
             .readonly => readOnly(target, value),
             .show_child_exited => childExited(target, value),
             .scrollbar => scrollBar(target, value),
+            .cell_size => self.cellSize(target),
 
             // Everything else, including
-            // `.cell_size` and `.size_limit` (sent during CoreSurface.init;
-            // `false` is a valid answer to each).
+            // `.size_limit` (sent during CoreSurface.init; `false` is a
+            // valid answer).
             else => false,
         };
     }
@@ -2121,7 +2126,7 @@ pub const App = struct {
             .resize => |resize| {
                 if (resize.from == core_surface) request.* = .dropped;
             },
-            .equalize, .fullscreen, .maximize, .zoom, .decorations, .reset_window_size, .close_surface => |from| {
+            .equalize, .relayout, .fullscreen, .maximize, .zoom, .decorations, .reset_window_size, .close_surface => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             .goto_window => |goto| {
@@ -2266,6 +2271,30 @@ pub const App = struct {
             else => {},
         };
         return false;
+    }
+
+    /// `.cell_size`: a terminal's cell changed, as its font size did, so
+    /// its least in a split did (`Window.leastExtent`). The window of a
+    /// shown tab with splits is laid out again, so that each side keeps
+    /// its new least, as GTK's split measures its terminal again
+    /// (`setCellSize`); in `run`, as resize_split is, since the core sends
+    /// this from inside a binding's action (`setFontSize`) and the layout's
+    /// WM_SIZE would reach it there. Not for a terminal in no tab yet, as
+    /// during CoreSurface.init: the split that makes it lays it out
+    /// (`Window.showPane`).
+    fn cellSize(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        const surface = from.rt_surface;
+        const t = surface.window.tabOf(surface) orelse return true;
+        if (t != surface.window.tab() or !t.tree.isSplit()) return true;
+        self.requests.append(self.core_app.alloc, .{ .relayout = from }) catch |err| {
+            log.warn("cannot record laying the window out again err={}", .{err});
+            return false;
+        };
+        return true;
     }
 
     /// `.equalize_splits`: recorded for `run`, as `resizeSplit` is. Always
@@ -2709,7 +2738,7 @@ pub const App = struct {
                 },
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
-                    error.SplitTooSmall => log.info("no room for a split: a terminal would be smaller than a cell", .{}),
+                    error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
                     else => {
                         log.err("failed to create a split err={}", .{err});
                         notice(
@@ -2728,6 +2757,7 @@ pub const App = struct {
                     from.window.resizeSplit(t.focused orelse from, resize.value);
                 },
                 .equalize => |from| from.rt_surface.window.equalize(from.rt_surface),
+                .relayout => |from| from.rt_surface.window.relayout(),
                 .reload => self.reloadQueued(),
                 .fullscreen => |from| from.rt_surface.window.toggleFullscreen(),
                 .decorations => |from| from.rt_surface.window.toggleDecorations(),
@@ -4548,12 +4578,14 @@ test "win32: resize_split moves the nearest divider across it" {
     try std.testing.expectEqual(wider.right, shorter.right);
 }
 
-test "win32: resize_split never leaves a terminal less than a cell" {
-    // SplitTree.resize clamps a ratio to 0 or 1, which would leave b no
-    // room at all, so that move is refused (`Window.adopt`); a terminal
-    // with no core needs a pixel, one with a core a cell of its font. The
-    // largest amount also tests that the move is kept within the [-1, 1]
-    // that SplitTree.resize asserts.
+test "win32: resize_split goes as far as a terminal's least, and back from where it shows" {
+    // SplitTree.resize takes a ratio as far as 1, which would leave b no
+    // room: the layout holds b at its least, with no core a pixel beside
+    // its scroll bar (`Window.leastExtent`), and the tree keeps the 1. A
+    // move back starts from where the line shows, as on GTK
+    // (`Window.showHeld`): from the 1, a move shorter than b's least would
+    // not show. The largest amount also tests that the move is kept within
+    // the [-1, 1] that SplitTree.resize asserts.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -4562,20 +4594,113 @@ test "win32: resize_split never leaves a terminal less than a cell" {
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
 
     const window = try testFrame(&app);
+    testResize(window, 400, 300);
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     window.tab().tree = try testRow(alloc, &.{ a, b });
     window.relayout();
-    const before = try paneRect(window, b);
+    const least = Window.leastExtent(b, true);
+    try std.testing.expect(least > 10);
+    const client = window.layoutArea() orelse return error.TestUnexpectedResult;
 
     window.resizeSplit(a, .{ .amount = std.math.maxInt(u16), .direction = .right });
-    try std.testing.expectEqual(before, try paneRect(window, b));
+    const held = try paneRect(window, b);
+    try std.testing.expectEqual(least, held.right - held.left);
+    try std.testing.expectEqual(client.right, held.right);
+    const root = Window.Tree.Node.Handle.root.idx();
+    try std.testing.expectEqual(@as(f16, 1), window.tab().tree.nodes[root].split.ratio);
 
-    // A move that leaves room is still made.
-    window.resizeSplit(a, .{ .amount = 10, .direction = .right });
-    try std.testing.expect((try paneRect(window, b)).left > before.left);
+    // No memory for the resized tree: the split keeps the ratio it had.
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    core_app.alloc = failing.allocator();
+    window.resizeSplit(a, .{ .amount = 10, .direction = .left });
+    core_app.alloc = alloc;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(@as(f16, 1), window.tab().tree.nodes[root].split.ratio);
+
+    // 10 back: b is 10 wider.
+    window.resizeSplit(a, .{ .amount = 10, .direction = .left });
+    const back = try paneRect(window, b);
+    try expectNear(least + 10, back.right - back.left);
+}
+
+test "win32: resize_split of a split under a held one starts where its line shows" {
+    // a | (b | c), each terminal's least its scroll bar, made 60 wide so
+    // that the leasts are far apart. The root at 0 holds a at its least,
+    // and b | c at 1 holds c at its. b | c's line shows where its area,
+    // the root's second side as the root's clamp lays it out, puts it
+    // (`Window.nearestSplit`), so a move back starts there and c is as
+    // much wider as the move takes it. Laid out from the root's ratio
+    // alone, that area would be a's least wider, and the move would start
+    // so far right that c stayed held. Zoomed, as unzoomed: a resize moves
+    // the tree's ratios, not what the zoom shows.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+    const Wide = struct {
+        fn dpi(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return 96;
+        }
+        fn metric(index: c_int, _: win32.UINT) callconv(.winapi) c_int {
+            return if (index == win32.SM_CXVSCROLL) 60 else win32.GetSystemMetrics(index);
+        }
+    };
+    app.bar_metric = .{ .dpi_of = &Wide.dpi, .metric_for = &Wide.metric };
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
+    const least = Window.leastExtent(c, true);
+    try std.testing.expectEqual(61, least);
+    const client = window.layoutArea() orelse return error.TestUnexpectedResult;
+    const divider = Window.dividerWidth(96);
+    // b | c's room for its sides, and how far 10 pixels of the window's
+    // width move its line (`Window.resizeShare`).
+    const rest = client.right - client.left - least - 2 * divider;
+    const move = @divTrunc(10 * rest, client.right - client.left);
+    try std.testing.expect(move >= 5);
+
+    const Hold = struct {
+        fn hold(w: *Window) void {
+            const tree = &w.tab().tree;
+            tree.resizeInPlace(.root, 0);
+            for (tree.nodes, 0..) |node, i| {
+                if (node == .split and i != 0) tree.resizeInPlace(Window.Tree.Node.Handle.root.offset(i), 1);
+            }
+            w.relayout();
+        }
+    };
+    Hold.hold(window);
+    for ([_]*Surface{ a, c }) |held| {
+        const rect = try paneRect(window, held);
+        try std.testing.expectEqual(least, rect.right - rect.left);
+    }
+    window.resizeSplit(b, .{ .amount = 10, .direction = .left });
+    const moved = try paneRect(window, c);
+    try expectNear(least + move, moved.right - moved.left);
+
+    Hold.hold(window);
+    window.toggleZoom(b);
+    try std.testing.expect(window.tab().tree.zoomed != null);
+    window.resizeSplit(b, .{ .amount = 10, .direction = .left });
+    window.toggleZoom(b);
+    try std.testing.expect(window.tab().tree.zoomed == null);
+    const unzoomed = try paneRect(window, c);
+    try expectNear(least + move, unzoomed.right - unzoomed.left);
 }
 
 test "win32: equalize_splits gives each terminal an equal share" {
@@ -4672,6 +4797,69 @@ test "win32: resize_split and equalize_splits wait for run" {
     app.forgetClosing(&only.core_surface);
     app.forgetClosing(&a.core_surface);
     for (app.requests.items) |request| try std.testing.expect(request == .dropped);
+}
+
+test "win32: a new cell lays a shown tab with splits out again in run" {
+    // A terminal's least in a split follows its cell (`Window.leastExtent`),
+    // so `.cell_size` lays its window out again; not inside the core's
+    // binding action that sends it, where WM_SIZE would reach the core, but
+    // recorded for createRequested, as resize_split is. A terminal in no
+    // tab yet, as during CoreSurface.init, a lone terminal and one in a tab
+    // not shown record nothing. A terminal that starts closing takes its
+    // own with it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const cell: apprt.action.CellSize = .{ .width = 9, .height = 18 };
+
+    const alone = try testFrame(&app);
+    const only = try testPane(&app, alone);
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .cell_size, cell));
+    alone.tab().tree = try .init(alloc, only);
+    try std.testing.expect(try app.performAction(.{ .surface = &only.core_surface }, .cell_size, cell));
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    const c = try testTab(&app, window);
+    const d = try testPane(&app, window);
+    const hidden = window.tabOf(c) orelse return error.TestUnexpectedResult;
+    window.setTree(hidden, try testRow(alloc, &.{ c, d }));
+    window.relayout();
+    try std.testing.expect(try app.performAction(.{ .surface = &d.core_surface }, .cell_size, cell));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // No memory to record it: false, and nothing recorded.
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    core_app.alloc = failing.allocator();
+    try std.testing.expect(!try app.performAction(.{ .surface = &b.core_surface }, .cell_size, cell));
+    core_app.alloc = alloc;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // b moved off its place, as a layout from before the change would
+    // leave it: run puts it back.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .cell_size, cell));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .relayout);
+    try std.testing.expect(app.requests.items[0].relayout == &b.core_surface);
+    const placed = try paneRect(window, b);
+    _ = win32.SetWindowPos(b.hwnd, null, 0, 0, 5, 5, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    try std.testing.expect(!std.meta.eql(placed, try paneRect(window, b)));
+    app.createRequested();
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(placed, try paneRect(window, b));
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .cell_size, cell));
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
 }
 
 test "win32: queued split changes reach the window from its focused terminal" {
@@ -5145,16 +5333,16 @@ test "win32: a divider dragged with the pointer moves the terminals beside it" {
 }
 
 test "win32: a dragged divider stops at a pixel for each terminal beyond it" {
-    // Without a core a terminal's least is a pixel, as `adopt` keeps it
-    // (`Window.cellExtent`). In a | b | c the line after a stops a pixel
+    // Without a core a terminal's least is a pixel
+    // (`Window.leastExtent`). In a | b | c the line after a stops a pixel
     // from the window's left edge, and, dragged right, where b, c and the
     // line between them take three. In (d | e) over f the line over f
     // stops a pixel below the top, d and e side by side needing a pixel
     // each down, and a pixel above the bottom. In g | h | i, with the line
     // between h and i dragged to its right stop first, which leaves i a
-    // pixel at a ratio near 1, the line after g, dragged right, stops where
-    // h and i keep a pixel each at that ratio: a pixel further, i would
-    // have none.
+    // pixel at a ratio near 1, the line after g, dragged right, stops
+    // where h, i and their line take three pixels too: their split holds
+    // i at its pixel whatever its ratio (`Window.splitArea`).
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -5241,19 +5429,17 @@ test "win32: a dragged divider stops at a pixel for each terminal beyond it" {
     const ratio = nested.tab().tree.nodes[right.idx()].split.ratio;
     try std.testing.expect(ratio > 0.9);
 
-    // The line after g to its right stop, then its left one.
+    // The line after g to its right stop, then its left one, where h and
+    // i share the room by their ratio again.
     try testPressDivider(nested, (try paneRect(nested, g)).right, yn);
     testFrameMouse(nested, win32.WM_MOUSEMOVE, 5000, yn);
     const ri = try paneRect(nested, i);
     const rh = try paneRect(nested, h);
-    try std.testing.expect(rh.right - rh.left >= 1);
+    try std.testing.expectEqual(1, rh.right - rh.left);
     try std.testing.expectEqual(1, ri.right - ri.left);
     try std.testing.expectEqual(rh.right + 1, ri.left);
     try std.testing.expectEqual((try paneRect(nested, g)).right + 1, rh.left);
-    // A pixel further, h and i would share a pixel less at that ratio,
-    // which leaves i none.
-    const less = ri.right - rh.left - 2;
-    try std.testing.expectEqual(less, Window.firstExtent(less, ratio));
+    try std.testing.expectEqual(ratio, nested.tab().tree.nodes[right.idx()].split.ratio);
     testFrameMouse(nested, win32.WM_MOUSEMOVE, -1000, yn);
     try std.testing.expectEqual(1, (try paneRect(nested, g)).right - (try paneRect(nested, g)).left);
     try std.testing.expect((try paneRect(nested, i)).right - (try paneRect(nested, i)).left >= 1);
@@ -8035,9 +8221,9 @@ test "win32: the tab bar counts in every size it takes from the client area" {
     try std.testing.expectEqual((try clientRect(window.hwnd)).bottom, rb.bottom);
 
     // a over b over c, under a bar that leaves a divider and a pixel: a
-    // has that pixel, b and c none. Equalized, a would have none there, so
-    // nothing moves; over the whole client area each would keep a row, and
-    // with room they share it.
+    // has that pixel, b and c none, as the first side keeps its least
+    // first (`Window.splitArea`), so equalized nothing moves; with room
+    // they share it.
     const c = try testPane(&app, window);
     window.tab().tree.deinit();
     window.tab().tree = try testLine(alloc, &.{ a, b, c }, .down);
@@ -16985,10 +17171,10 @@ test "win32: beside a divider a terminal's scroll bar keeps its pixels" {
 }
 
 test "win32: a terminal's least width counts its scroll bar beside the cell" {
-    // A terminal with no core keeps a pixel (`Window.cellExtent`) of its
+    // A terminal with no core keeps a pixel (`Window.leastExtent`) of its
     // client area, what its bar leaves of its window: a dragged divider
-    // stops there, resize_split does not go past it (`Window.adopt`), and a
-    // split needs it for each side.
+    // stops there, so does resize_split (`Window.splitArea`), and a split
+    // needs it for each side.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -17023,16 +17209,12 @@ test "win32: a terminal's least width counts its scroll bar beside the cell" {
     testFrameMouse(window, win32.WM_LBUTTONUP, 5000, y);
 
     // resize_split towards a, from the middle, by all but half its bar of
-    // its window: its client area would be gone, so nothing moves.
+    // its window: a stops at a pixel beside its bar.
     window.equalize(a);
     const half = try testWidths(window, a);
     const amount: u16 = @intCast(half[0] - @divTrunc(bar, 2));
     window.resizeSplit(a, .{ .amount = amount, .direction = .left });
-    try std.testing.expectEqual(half, try testWidths(window, a));
-    // By less, leaving a pixel of it: it moves.
-    window.resizeSplit(a, .{ .amount = @intCast(half[1] - 2), .direction = .left });
-    try std.testing.expect((try testWidths(window, a))[1] >= 1);
-    try std.testing.expect((try testWidths(window, a))[0] < half[0]);
+    try std.testing.expectEqual([2]i32{ 1 + bar, 1 }, try testWidths(window, a));
 
     // a narrowed so that it holds two cells and the line, but not their
     // two bars: it does not split; widened, it does.
