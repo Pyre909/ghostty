@@ -85,8 +85,10 @@ pub fn supported(key: Binding.Action.Key) bool {
         .close_tab,
         .prompt_surface_title,
         .prompt_tab_title,
+        .prompt_window_title,
         .set_surface_title,
         .set_tab_title,
+        .set_window_title,
         .new_split,
         .goto_split,
         .toggle_split_zoom,
@@ -112,13 +114,10 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no tab overview, no window title of its own (its caption is its
-        // shown tab's), no inspector, quick terminal, updater, undo, secure
+        // no tab overview, inspector, quick terminal, updater, undo, secure
         // input or on-screen keyboard here, and the background's opacity
         // is not toggled.
         .toggle_tab_overview,
-        .prompt_window_title,
-        .set_window_title,
         .close_all_windows,
         .toggle_quick_terminal,
         .toggle_visibility,

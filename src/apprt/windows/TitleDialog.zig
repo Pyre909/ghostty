@@ -1,6 +1,7 @@
 //! The title prompt, GTK's title dialog (src/apprt/gtk/class/title_dialog.zig
 //! and title-dialog.blp): `prompt_surface_title` asks for a terminal's own
-//! title and `prompt_tab_title` for its tab's. The caption is the heading,
+//! title, `prompt_tab_title` for its tab's and `prompt_window_title` for
+//! its window's own (`Window.title_override`). The caption is the heading,
 //! the text under it says that an empty title restores the default one,
 //! and the field starts with the title shown now. OK, the default button,
 //! sets the title, or clears it when the field is empty; Cancel changes
@@ -38,9 +39,12 @@
 //! belongs to the tab, as GTK's does (src/apprt/gtk/class/tab.zig), and
 //! passes to another terminal of it instead, closing when the tab goes
 //! (`tabRemoved`). Either closes when its tab moves to a new window
-//! (`followMove`), and first thing in a window's close (`Window.destroy`),
-//! which the app's quit goes through too (`App.terminate`). Windows
-//! destroys it with its frame in any case, as an owned window.
+//! (`followMove`). A window's prompt belongs to the window, as GTK's does
+//! (src/apprt/gtk/class/window.zig `promptWindowTitle`), and stays open
+//! when the terminal that asked closes. Each closes first thing in a
+//! window's close (`Window.destroy`), which the app's quit goes through
+//! too (`App.terminate`). Windows destroys it with its frame in any case,
+//! as an owned window.
 //!
 //! IsDialogMessageW, which gives Tab, Enter and Escape their meaning in
 //! the dialog, runs in `App.run`'s loop and in the pump of a teardown's
@@ -61,8 +65,9 @@ const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 const log = std.log.scoped(.win32);
 
-/// Whose title the prompt asks for: the terminal's own, or its tab's.
-pub const Target = enum { surface, tab };
+/// Whose title the prompt asks for: the terminal's own, its tab's, or its
+/// window's own.
+pub const Target = enum { surface, tab, window };
 
 /// A window's title prompt (`Window.title_prompt`): at most one per
 /// window, as its frame takes no input while one is open.
@@ -71,7 +76,8 @@ pub const Prompt = struct {
     hwnd: ?win32.HWND = null,
     /// The terminal the title is for, live while the dialog is open: the
     /// one that asked, or for a tab's prompt another terminal of the tab
-    /// once that one closes (`forget`).
+    /// once that one closes (`forget`). Null for a window's prompt, which
+    /// is for the window whatever terminal asked.
     surface: ?*Surface = null,
     target: Target = .surface,
     /// A tab's prompt: the tab, which the prompt belongs to; it closes
@@ -87,11 +93,11 @@ pub const edit_id = 100;
 /// Room for either prompt's template, in 16-bit units (`spec`).
 pub const template_capacity = 512;
 
-/// Ask for `surface`'s title, or its tab's, in a dialog over its window;
-/// whether it opened. Not while the window or the terminal is closing, nor
-/// while the window has a prompt open already. Called by `App.run`, where
-/// `App.canReenterCore` holds: no confirmation prompt is open, so the
-/// frame is enabled now.
+/// Ask for `surface`'s title, its tab's or its window's, in a dialog over
+/// its window; whether it opened. Not while the window or the terminal is
+/// closing, nor while the window has a prompt open already. Called by
+/// `App.run`, where `App.canReenterCore` holds: no confirmation prompt is
+/// open, so the frame is enabled now.
 pub fn open(surface: *Surface, target: Target) bool {
     const window = surface.window;
     const app = window.app;
@@ -102,20 +108,30 @@ pub fn open(surface: *Surface, target: Target) bool {
     if (surface.closing or window.closing) return false;
 
     const tab: ?*Tab = switch (target) {
-        .surface => null,
+        .surface, .window => null,
         .tab => window.tabOf(surface) orelse return false,
     };
 
     // The field starts with the title shown now: the override, else the
     // program's, as GTK starts it (surface.zig `promptTitle`, tab.zig
-    // `promptTabTitle`).
-    const initial: []const u8 = (if (tab) |t| Window.tabTitle(t) else surface.effectiveTitle()) orelse "";
+    // `promptTabTitle`); for the window, its own, else its shown tab's
+    // (window.zig `promptWindowTitle`). Without the bell's prefix, which
+    // is not part of the title.
+    const initial: []const u8 = switch (target) {
+        .surface => surface.effectiveTitle(),
+        .tab => Window.tabTitle(tab.?),
+        .window => window.title_override orelse Window.tabTitle(window.tab()),
+    } orelse "";
 
     var buf: [template_capacity]u16 align(4) = undefined;
     // `spec` is fixed, and a test checks that it fits.
     const template = build(&buf, spec(target)) catch unreachable;
 
-    window.title_prompt = .{ .surface = surface, .target = target, .tab = tab };
+    window.title_prompt = .{
+        .surface = if (target == .window) null else surface,
+        .target = target,
+        .tab = tab,
+    };
     const hwnd = win32.CreateDialogIndirectParamW(
         app.hinstance,
         @ptrCast(template.ptr),
@@ -253,10 +269,11 @@ pub fn tabRemoved(window: *Window, t: *const Tab) void {
 
 /// A tab of `old` moved to a new window: if it was the prompt's tab, or
 /// took the terminal a terminal's prompt is for, the prompt closes as
-/// Cancel would. It is modal to `old`, which it would otherwise keep
-/// disabled for a tab now elsewhere; taking it to the new frame would move
-/// the hold with it and change the owner of a window on screen, for a move
-/// that can only come from another window while this one takes no input.
+/// Cancel would; a window's prompt stays with `old`. It is modal to `old`,
+/// which it would otherwise keep disabled for a tab now elsewhere; taking
+/// it to the new frame would move the hold with it and change the owner
+/// of a window on screen, for a move that can only come from another
+/// window while this one takes no input.
 pub fn followMove(old: *Window) void {
     const prompt = old.title_prompt;
     if (prompt.hwnd == null) return;
@@ -285,17 +302,18 @@ pub fn closedByKey(window: *Window, msg: *const win32.MSG) void {
     surface.withholdKeyUp(msg.lParam);
 }
 
-/// OK: the title in the field becomes the terminal's or the tab's, or an
-/// empty one clears it, as GTK's `titleDialogSet` does; then the dialog
-/// closes. Reached from `App.run`'s loop (IsDialogMessageW for Enter, the
-/// button's click), never inside a core frame, and only with no
-/// confirmation prompt open, which disables the dialog (`App.beginPrompt`).
-/// Neither title changes the core's; the frame's caption and the tab bar
-/// show it at once.
+/// OK: the title in the field becomes the terminal's, the tab's or the
+/// window's, or an empty one clears it, as GTK's `titleDialogSet` does;
+/// then the dialog closes. Reached from `App.run`'s loop
+/// (IsDialogMessageW for Enter, the button's click), never inside a core
+/// frame, and only with no confirmation prompt open, which disables the
+/// dialog (`App.beginPrompt`).
+/// None of the titles changes the core's; the frame's caption and the tab
+/// bar show it at once.
 pub fn commit(window: *Window) void {
     const prompt = window.title_prompt;
     const hwnd = prompt.hwnd orelse return;
-    const surface = prompt.surface orelse return;
+    if (prompt.target != .window and prompt.surface == null) return;
     const alloc = window.app.core_app.alloc;
     const text = fieldText(alloc, hwnd) catch |err| {
         log.warn("cannot read the title prompt's field err={}", .{err});
@@ -303,8 +321,9 @@ pub fn commit(window: *Window) void {
     };
     defer alloc.free(text);
     switch (prompt.target) {
-        .surface => _ = surface.setTitleOverride(text),
-        .tab => _ = surface.window.setTabTitle(surface, text),
+        .surface => _ = prompt.surface.?.setTitleOverride(text),
+        .tab => _ = prompt.surface.?.window.setTabTitle(prompt.surface.?, text),
+        .window => _ = window.setWindowTitle(text),
     }
     close(window);
 }
@@ -472,6 +491,7 @@ pub fn spec(target: Target) Spec {
         .caption = switch (target) {
             .surface => W("Change Terminal Title"),
             .tab => W("Change Tab Title"),
+            .window => W("Change Window Title"),
         },
         .point_size = 9,
         .face = W("Segoe UI"),
@@ -645,7 +665,7 @@ test "win32: a dialog template is laid out as DLGTEMPLATE says" {
 }
 
 test "win32: the title prompt's template fits, every control on a DWORD" {
-    for ([_]Target{ .surface, .tab }) |target| {
+    for (std.enums.values(Target)) |target| {
         var buf: [template_capacity]u16 align(4) = undefined;
         const s = spec(target);
         const got = try build(&buf, s);

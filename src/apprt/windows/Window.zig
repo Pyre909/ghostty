@@ -73,12 +73,18 @@ app: *App,
 hwnd: win32.HWND,
 
 /// The window's tabs, in the order they show; never empty from `create`
-/// until the window is freed (`deinitTabs`). Each is allocated, so that a
+/// until the window is freed (`deinit`). Each is allocated, so that a
 /// pointer to one stays put.
 tabs: std.ArrayListUnmanaged(*Tab),
 
 /// The index in `tabs` of the tab the window shows.
 selected: usize,
+
+/// The window's own title, from `set_window_title` or its title prompt,
+/// which its caption shows in place of its shown tab's (`showTitle`);
+/// null while it has none. GTK's window title override
+/// (`setTitleOverride` in src/apprt/gtk/class/window.zig).
+title_override: ?[:0]u8,
 
 /// The tab bar over the terminals, shown as `window-show-tab-bar` asks
 /// (`barShown`).
@@ -150,6 +156,12 @@ pub fn appendTab(self: *Window, alloc: Allocator) Allocator.Error!*Tab {
     return t;
 }
 
+/// Free what the window holds: its tabs (`deinitTabs`) and its title.
+pub fn deinit(self: *Window, alloc: Allocator) void {
+    self.deinitTabs(alloc);
+    if (self.title_override) |title| alloc.free(title);
+}
+
 /// Free the tabs, with what their trees still hold: nothing once the
 /// frame's WM_DESTROY has run.
 pub fn deinitTabs(self: *Window, alloc: Allocator) void {
@@ -189,10 +201,10 @@ pub fn tabIndex(self: *const Window, t: *Tab) ?usize {
     return std.mem.indexOfScalar(*Tab, self.tabs.items, t);
 }
 
-/// What the window is titled after while `t` is shown, and its tab's
-/// label: its title from `set_tab_title` or the tab's title prompt, or
-/// else its focused terminal's (`Surface.effectiveTitle`), as GTK's tab
-/// computes its title.
+/// What the window is titled after while `t` is shown, unless it has a
+/// title of its own (`title_override`), and its tab's label: its title
+/// from `set_tab_title` or the tab's title prompt, or else its focused
+/// terminal's (`Surface.effectiveTitle`), as GTK's tab computes its title.
 pub fn tabTitle(t: *const Tab) ?[:0]const u8 {
     if (t.title_override) |title| return title;
     const surface = t.focused orelse return null;
@@ -203,11 +215,12 @@ pub fn tabTitle(t: *const Tab) ?[:0]const u8 {
 /// src/apprt/gtk/class/tab.zig:522.
 pub const bell_prefix = "🔔 ";
 
-/// What `t`'s label shows, and the window's caption while `t` is shown,
-/// in UTF-16: its title (`tabTitle`), or "Ghostty" while it has none,
-/// after `bell_prefix` while its focused terminal's bell rings
-/// (`Surface.bell_ringing`) and `bell-features` has `title`, as GTK
-/// computes its tab's title. The caller frees it.
+/// What `t`'s label shows, and the window's caption while `t` is shown
+/// and the window has no title of its own, in UTF-16: its title
+/// (`tabTitle`), or "Ghostty" while it has none, after `bell_prefix`
+/// while its focused terminal's bell rings (`Surface.bell_ringing`) and
+/// `bell-features` has `title`, as GTK computes its tab's title. The
+/// caller frees it.
 ///
 /// Invalid UTF-8 is shown as U+FFFD, as macOS does (`Surface.setTitle`).
 pub fn shownTitle(self: *const Window, alloc: std.mem.Allocator, t: *const Tab) ![:0]u16 {
@@ -741,6 +754,22 @@ pub fn setTabTitle(self: *Window, surface: *const Surface, title: [:0]const u8) 
     return true;
 }
 
+/// `set_window_title`, and OK in the window's title prompt
+/// (`TitleDialog.commit`): `title` shows as the caption in place of the
+/// shown tab's, in every tab, or an empty one ends that, as GTK's
+/// `setWindowTitle` does. The tabs' labels keep their own titles. False
+/// if it could not be stored or shown.
+pub fn setWindowTitle(self: *Window, title: [:0]const u8) bool {
+    const alloc = self.app.core_app.alloc;
+    const copy: ?[:0]u8 = if (title.len == 0) null else alloc.dupeSentinel(u8, title, 0) catch |err| {
+        log.warn("failed to store the window title err={}", .{err});
+        return false;
+    };
+    if (self.title_override) |old| alloc.free(old);
+    self.title_override = copy;
+    return self.showTitle();
+}
+
 /// Create a window holding a new terminal, still hidden: `show` shows it
 /// once the app owns both (`App.newWindow`). The frame is created at
 /// CW_USEDEFAULT size so that the terminal, which fills it, starts with a
@@ -782,6 +811,7 @@ pub fn createBare(app: *App) !*Window {
         .hwnd = undefined,
         .tabs = .empty,
         .selected = 0,
+        .title_override = null,
         .bar = .{},
         .dark_frame = false,
         .fullscreen = null,
@@ -830,7 +860,7 @@ pub fn discard(self: *Window) void {
     };
     const alloc = self.app.core_app.alloc;
     _ = win32.DestroyWindow(self.hwnd);
-    self.deinitTabs(alloc);
+    self.deinit(alloc);
     alloc.destroy(self);
 }
 
@@ -1793,11 +1823,16 @@ pub fn showProgress(self: *Window) void {
     list.show(self.hwnd, surface.progress);
 }
 
-/// Show the shown tab's title (`shownTitle`) as the window's caption.
-/// Returns whether it is shown.
+/// Show the window's own title (`title_override`), else its shown tab's
+/// (`shownTitle`), as its caption, as GTK's window computes its title
+/// (`closureTitle`): the bell's prefix is the tab's, so its own title has
+/// none. Returns whether it is shown.
 pub fn showTitle(self: *Window) bool {
     const alloc = self.app.core_app.alloc;
-    const wide = self.shownTitle(alloc, self.tab()) catch |err| {
+    const wide = (if (self.title_override) |title|
+        wideFromUtf8(alloc, title)
+    else
+        self.shownTitle(alloc, self.tab())) catch |err| {
         log.warn("failed to encode the window title err={}", .{err});
         return false;
     };

@@ -1247,6 +1247,7 @@ pub const App = struct {
             .move_tab => self.moveTab(target, value),
             .move_tab_to_new_window => self.requestMoveTabToNewWindow(target),
             .set_tab_title => setTabTitle(target, value),
+            .set_window_title => setWindowTitle(target, value),
             .new_split => self.requestSplit(target, value),
             .goto_split => self.gotoSplit(target, value),
             .resize_split => self.resizeSplit(target, value),
@@ -1426,19 +1427,12 @@ pub const App = struct {
         };
     }
 
-    /// `.prompt_title`, from `prompt_surface_title` and `prompt_tab_title`:
-    /// a dialog over the terminal's window asks for its title or its tab's
-    /// (`TitleDialog`), opened by `run`: a binding performs this inside the
-    /// core's key callback, and the dialog takes the keyboard focus from
-    /// the terminal. `false` for the app, and for `.window`
-    /// (`prompt_window_title`): a window here has no title of its own to
-    /// ask for, as its caption is always its shown tab's
-    /// (`Window.tabTitle`), and the binding is documented as implemented
-    /// on Linux only (src/input/Binding.zig), where GTK gives the window a
-    /// title override. macOS takes it as the terminal's prompt instead
-    /// (its `Ghostty.Action` maps any other target to the surface); here
-    /// it does nothing, as on the platforms the binding documents as
-    /// unsupported, rather than open a prompt the user did not ask for.
+    /// `.prompt_title`, from `prompt_surface_title`, `prompt_tab_title` and
+    /// `prompt_window_title`: a dialog over the terminal's window asks for
+    /// its title, its tab's or the window's own (`TitleDialog`), opened by
+    /// `run`: a binding performs this inside the core's key callback, and
+    /// the dialog takes the keyboard focus from the terminal. `false` for
+    /// the app.
     fn requestTitlePrompt(self: *App, target: apprt.Target, value: apprt.action.PromptTitle) bool {
         const from = switch (target) {
             .app => return false,
@@ -1447,7 +1441,7 @@ pub const App = struct {
         const which: TitleDialog.Target = switch (value) {
             .surface => .surface,
             .tab => .tab,
-            .window => return false,
+            .window => .window,
         };
         self.requests.append(self.core_app.alloc, .{ .title_prompt = .{
             .from = from,
@@ -1717,6 +1711,15 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| v.rt_surface.window.setTabTitle(v.rt_surface, value.title),
+        };
+    }
+
+    /// `.set_window_title`, for the terminal's window: made at once, as
+    /// `set_tab_title` is.
+    fn setWindowTitle(target: apprt.Target, value: apprt.action.SetTitle) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| v.rt_surface.window.setWindowTitle(value.title),
         };
     }
 
@@ -3060,7 +3063,7 @@ pub const App = struct {
         _ = self.windows.orderedRemove(idx);
         // Its tabs' trees are empty already unless `terminate` gave up on
         // the frame, which then had no WM_DESTROY.
-        window.deinitTabs(self.core_app.alloc);
+        window.deinit(self.core_app.alloc);
         self.core_app.alloc.destroy(window);
     }
 
@@ -3952,6 +3955,7 @@ fn testFrame(app: *App) !*Window {
         .hwnd = undefined,
         .tabs = .empty,
         .selected = 0,
+        .title_override = null,
         .bar = .{},
         .dark_frame = false,
         .fullscreen = null,
@@ -9267,10 +9271,8 @@ test "win32: prompt_title waits for run, and the terminal's title from it shows 
     try std.testing.expect(pane.setTitle("cmd"));
     const target: apprt.Target = .{ .surface = &pane.core_surface };
 
-    // Not for the app, nor for a window, which has no title of its own on
-    // this platform: its caption is its shown tab's.
+    // Not for the app.
     try std.testing.expect(!try app.performAction(.app, .prompt_title, .surface));
-    try std.testing.expect(!try app.performAction(target, .prompt_title, .window));
     try std.testing.expectEqual(0, app.requests.items.len);
 
     // Recorded, and opened by run.
@@ -9384,6 +9386,131 @@ test "win32: a tab's title prompt names the tab, over its terminals' own titles"
     try testAnswer(try testPrompt(&app, b, .tab), "logs", win32.IDOK);
     try std.testing.expectEqualStrings("logs", Window.tabTitle(tb).?);
     try expectText("edit", window.hwnd);
+}
+
+test "win32: a window's own title shows in its caption over every tab's, without the bell's prefix" {
+    // GTK's window title override (`setTitleOverride`): set_window_title
+    // titles the terminal's window, whichever tab shows, and leaves the
+    // tabs' labels their own; an empty title ends it. The bell's prefix is
+    // the tab's (`closureTitle` returns the override as it is). The title
+    // stays with its window when a tab moves to a new one.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const b = try testTab(&app, window);
+    try std.testing.expect(a.setTitle("vim"));
+    try std.testing.expect(b.setTitle("cmd"));
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    var buf: [64]u8 = undefined;
+
+    try std.testing.expect(!try app.performAction(.app, .set_window_title, .{ .title = "x" }));
+
+    // Over the shown tab's title, which neither a program's title nor the
+    // tab's own then shows through; the tab's label keeps its own.
+    try std.testing.expect(try app.performAction(target, .set_window_title, .{ .title = "proj" }));
+    try std.testing.expectEqualStrings("proj", try windowText(window.hwnd, &buf));
+    try std.testing.expect(try app.performAction(target, .set_title, .{ .title = "osc" }));
+    try std.testing.expect(try app.performAction(target, .set_tab_title, .{ .title = "build" }));
+    try std.testing.expectEqualStrings("proj", try windowText(window.hwnd, &buf));
+    try std.testing.expectEqualStrings("build", Window.tabTitle(window.tab()).?);
+
+    // No memory to store another: false, and the window keeps its title.
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    core_app.alloc = failing.allocator();
+    try std.testing.expect(!try app.performAction(target, .set_window_title, .{ .title = "lost" }));
+    core_app.alloc = alloc;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqualStrings("proj", window.title_override.?);
+    try std.testing.expectEqualStrings("proj", try windowText(window.hwnd, &buf));
+
+    // The other tab shown, and ringing: the window's title still, with no
+    // prefix, which the tab's label has.
+    window.selectTab(1);
+    try std.testing.expect(window.tab().focused == b);
+    try std.testing.expectEqualStrings("proj", try windowText(window.hwnd, &buf));
+    try std.testing.expect(try testBell(&app, b));
+    try std.testing.expect(b.bell_ringing);
+    try std.testing.expectEqualStrings("proj", try windowText(window.hwnd, &buf));
+    const label = try window.shownTitle(alloc, window.tab());
+    defer alloc.free(label);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("🔔 cmd"), label);
+
+    // Empty: the shown tab's title again, with its prefix.
+    try std.testing.expect(try app.performAction(target, .set_window_title, .{ .title = "" }));
+    try std.testing.expect(window.title_override == null);
+    try std.testing.expectEqualStrings("🔔 cmd", try windowText(window.hwnd, &buf));
+
+    // A tab moved to a new window: the title stays with this one.
+    try std.testing.expect(try app.performAction(target, .set_window_title, .{ .title = "proj" }));
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .move_tab_to_new_window, {}));
+    app.createRequested();
+    try std.testing.expect(b.window != window);
+    try std.testing.expect(b.window.title_override == null);
+    try std.testing.expectEqualStrings("proj", window.title_override.?);
+    try std.testing.expectEqualStrings("proj", try windowText(window.hwnd, &buf));
+}
+
+test "win32: the window's title prompt asks for its own title, and stays when the terminal that asked closes" {
+    // GTK's `promptWindowTitle`: the field starts with the window's own
+    // title, else its shown tab's; the dialog belongs to the window.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    try std.testing.expect(a.setTitle("vim"));
+
+    // GTK's heading, and the shown tab's title.
+    const dialog = try testPrompt(&app, a, .window);
+    try expectText("Change Window Title", dialog);
+    try expectText("vim", try testField(dialog));
+
+    // The terminal that asked closes: the prompt stays, for the window.
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(window.title_prompt.hwnd == dialog);
+    try std.testing.expect(!win32.IsWindowEnabled(window.hwnd).toBool());
+
+    // OK: the window's title, and neither the tab's nor a terminal's.
+    try testAnswer(dialog, "proj", win32.IDOK);
+    try std.testing.expect(window.title_prompt.hwnd == null);
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+    try std.testing.expectEqualStrings("proj", window.title_override.?);
+    try expectText("proj", window.hwnd);
+    try std.testing.expect(window.tab().title_override == null);
+    try std.testing.expect(b.title_override == null);
+
+    // It starts with the window's own title; Cancel changes nothing, and
+    // an empty title ends it.
+    const again = try testPrompt(&app, b, .window);
+    try expectText("proj", try testField(again));
+    try testAnswer(again, "other", win32.IDCANCEL);
+    try expectText("proj", window.hwnd);
+    const third = try testPrompt(&app, b, .window);
+    try testAnswer(third, "", win32.IDOK);
+    try std.testing.expect(window.title_override == null);
+    try expectText("Ghostty", window.hwnd);
 }
 
 test "win32: a title prompt closes with its terminal, and never opens for a closing one" {
@@ -12276,8 +12403,6 @@ test "win32: the command palette lists only what performAction carries out" {
     const cases = [_]Case{
         // Left out.
         .{ .toggle_tab_overview, .toggle_tab_overview },
-        .{ .prompt_window_title, .prompt_title },
-        .{ .set_window_title, .set_window_title },
         .{ .close_all_windows, .close_all_windows },
         .{ .toggle_quick_terminal, .toggle_quick_terminal },
         .{ .toggle_visibility, .toggle_visibility },
@@ -12295,6 +12420,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .new_split, .new_split },
         .{ .goto_tab, .goto_tab },
         .{ .move_tab_to_new_window, .move_tab_to_new_window },
+        .{ .prompt_window_title, .prompt_title },
         .{ .prompt_tab_title, .prompt_title },
         .{ .prompt_surface_title, .prompt_title },
         .{ .toggle_split_zoom, .toggle_split_zoom },
@@ -12314,6 +12440,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .goto_split, .goto_split },
         .{ .resize_split, .resize_split },
         .{ .goto_window, .goto_window },
+        .{ .set_window_title, .set_window_title },
         .{ .set_tab_title, .set_tab_title },
         .{ .set_surface_title, .set_title },
         .{ .copy_title_to_clipboard, .copy_title_to_clipboard },
@@ -12369,7 +12496,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(33, listed);
+    try std.testing.expectEqual(35, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
     _ = try app.performAction(target, .float_window, .off);

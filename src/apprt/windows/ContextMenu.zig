@@ -1,18 +1,18 @@
 //! A terminal's context menu, as GTK lists its items (`context_menu_model`
 //! in src/apprt/gtk/ui/1.0/surface.blp): Copy, Paste and Notify on Next
 //! Command Finish; Clear and Reset; the Split, Tab and Window submenus;
-//! the Config submenu. Left out are what this runtime does not carry out,
-//! Change Window Title… (a window's caption is its shown tab's) and Open
-//! Configuration in New Window (`App.openConfig`). Added, as macOS has it
-//! ("Terminal Read-only" in `menu(for:)`, SurfaceView_AppKit.swift), is a
-//! checked "Read-only", after Reset. Copy is greyed without a selection, as
-//! GTK disables its action (`syncActions` in
-//! src/apprt/gtk/class/window.zig). Notify on Next Command Finish is no
-//! binding's action but GTK's surface's own, a check its next finished
-//! command clears (`Surface.notify_next_command`); it is checked while set,
-//! as GTK shows its state. Each other item shows the shortcut its action
-//! is bound to after a tab, in Windows' key names, as the command palette
-//! shows one (`CommandPalette.shortcutLabel`) (`menuItems`).
+//! the Config submenu. Left out is what this runtime does not carry out,
+//! Open Configuration in New Window (`App.openConfig`). Added, as macOS
+//! has it ("Terminal Read-only" in `menu(for:)`,
+//! SurfaceView_AppKit.swift), is a checked "Read-only", after Reset. Copy
+//! is greyed without a selection, as GTK disables its action
+//! (`syncActions` in src/apprt/gtk/class/window.zig). Notify on Next
+//! Command Finish is no binding's action but GTK's surface's own, a check
+//! its next finished command clears (`Surface.notify_next_command`); it is
+//! checked while set, as GTK shows its state. Each other item shows the
+//! shortcut its action is bound to after a tab, in Windows' key names, as
+//! the command palette shows one (`CommandPalette.shortcutLabel`)
+//! (`menuItems`).
 //!
 //! It is the system's popup menu, light in dark mode as well, and the
 //! terminal's frame owns it (`TrackPopupMenuEx`), so that the frame hears
@@ -98,6 +98,7 @@ const layout = [_]Entry{
     .{ .label = "Change Tab Title\u{2026}", .action = .{ .binding = .prompt_tab_title }, .section = 2, .submenu = .tab },
     .{ .label = "New Tab", .action = .{ .binding = .new_tab }, .section = 2, .submenu = .tab },
     .{ .label = "Close Tab", .action = .{ .binding = .{ .close_tab = .this } }, .section = 2, .submenu = .tab },
+    .{ .label = "Change Window Title\u{2026}", .action = .{ .binding = .prompt_window_title }, .section = 2, .submenu = .window },
     .{ .label = "New Window", .action = .{ .binding = .new_window }, .section = 2, .submenu = .window },
     .{ .label = "Close Window", .action = .{ .binding = .close_window }, .section = 2, .submenu = .window },
     .{ .label = "Open Configuration in OS Editor", .action = .{ .binding = .{ .open_config = .os_open } }, .section = 3, .submenu = .config },
@@ -522,6 +523,7 @@ test "win32: the context menu is GTK's, less what this runtime does not carry ou
         .{ "Change Tab Title\u{2026}", "prompt_tab_title", .tab },
         .{ "New Tab", "new_tab", .tab },
         .{ "Close Tab", "close_tab:this", .tab },
+        .{ "Change Window Title\u{2026}", "prompt_window_title", .window },
         .{ "New Window", "new_window", .window },
         .{ "Close Window", "close_window", .window },
         .{ "Open Configuration in OS Editor", "open_config:os_open", .config },
@@ -538,14 +540,13 @@ test "win32: the context menu is GTK's, less what this runtime does not carry ou
         try testing.expectEqualStrings(w[1], name);
         try testing.expectEqual(w[2], item.submenu);
         try testing.expectEqual(id, item.id);
-        // Only what this runtime carries out: no window title of its own,
-        // no configuration in a new window.
+        // Only what this runtime carries out: no configuration in a new
+        // window.
         const action = switch (item.action) {
             .binding => |action| action,
             .notify_next_command => continue,
         };
         try testing.expect(CommandPalette.supported(action));
-        try testing.expect(action != .prompt_window_title);
         if (action == .open_config) try testing.expect(action.open_config == .os_open);
     }
 }
@@ -687,9 +688,9 @@ test "win32: a context menu Windows cannot make leaves no menu behind" {
     const whole = build(&items) orelse return error.TestUnexpectedResult;
     _ = win32.DestroyMenu(whole);
     const calls = 1000 - test_calls_left.?;
-    // A menu, four submenus, thirteen entries in the menu and thirteen in
+    // A menu, four submenus, thirteen entries in the menu and fourteen in
     // the submenus.
-    try testing.expectEqual(31, calls);
+    try testing.expectEqual(32, calls);
     const before = win32.GetGuiResources(win32.current_process, win32.GR_USEROBJECTS);
     for (0..calls) |n| {
         test_calls_left = n;
