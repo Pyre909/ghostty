@@ -44,6 +44,8 @@ const writeClipboardText = @import("clipboard.zig").writeClipboardText;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const clipboardReadPrompt = @import("clipboard.zig").clipboardReadPrompt;
 const confirm = @import("dialog.zig").confirm;
+const drop = @import("drop.zig");
+const Shell = @import("../../termio/shell_integration.zig").Shell;
 const notice = @import("dialog.zig").notice;
 
 const log = std.log.scoped(.win32);
@@ -187,6 +189,11 @@ pub const Surface = struct {
     /// The terminal's scroll bar (`ScrollBar`), this window's own, with
     /// `scrollbar = system`.
     scroll_bar: ScrollBar.State,
+
+    /// The shell the terminal starts (`drop.shellOf`); null for one
+    /// Ghostty does not know. What a drop of files pastes is quoted for it
+    /// (`dropFiles`).
+    shell: ?Shell,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -711,10 +718,12 @@ pub const Surface = struct {
             .search_bar = .{},
             .overlays = .{},
             .scroll_bar = .{},
+            .shell = null,
         };
 
         const hwnd = win32.CreateWindowExW(
-            0,
+            // Files dropped on it come as WM_DROPFILES (`dropFiles`).
+            win32.WS_EX_ACCEPTFILES,
             L(surface_class_name),
             null,
             win32.WS_CHILD | win32.WS_CLIPSIBLINGS | ScrollBar.style(&app.config),
@@ -757,6 +766,12 @@ pub const Surface = struct {
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
         inheritWorkingDirectory(&config, app.config.@"working-directory", opts.working_directory);
+        // Before init, which clears `first`. Without it a drop takes the
+        // quoting for a shell Ghostty does not know, the most careful.
+        self.shell = drop.shellOf(alloc, &config, app.core_app.first) catch |err| shell: {
+            log.warn("unable to tell the shell a file drop is quoted for err={}", .{err});
+            break :shell null;
+        };
         // A failing CoreSurface.init joins any thread it started (unpumped,
         // as CoreSurface.deinit does), so the errdefers above run with no
         // core thread left using this surface or its window.
@@ -1275,45 +1290,106 @@ pub const Surface = struct {
         const text = (try readClipboardText(alloc, self.hwnd)) orelse return .unavailable;
         defer alloc.free(text);
 
+        try self.completePaste(state, text, false);
+        return .started;
+    }
+
+    /// Hand `text` to the core for `state`, a clipboard request or a drop
+    /// (`dropFiles`), asking first when the core finds it unsafe or
+    /// unauthorized, as GTK's `paste` does, or when `ask` (a drop the core
+    /// cannot tell is unsafe, `drop.asks`).
+    fn completePaste(self: *Surface, state: apprt.ClipboardRequest, text: []const u8, ask: bool) !void {
         const contents: []const terminal.clipboard.Content = &.{.{
             .mime = text_mime,
             .data = text,
         }};
 
+        if (ask) return self.confirmPaste(state, contents);
         self.core_surface.completeClipboardRequest(state, .{
             .contents = contents,
         }) catch |err| switch (err) {
             // The request is still alive in this case and the apprt owns the
             // confirmation flow.
-            //
-            // MessageBoxW runs a nested modal loop. Win32 messages keep
-            // pumping, but `core_app.tick` does not (`confirm` raises
-            // App.prompt_depth), so the mailbox goes undrained for as long as
-            // the prompt is up and renderer and IO output stalls behind it.
-            // That is deliberate: this runs inside a tick, and the same guard
-            // defers any surface teardown dispatched meanwhile, so `self` is
-            // still valid for the completeClipboardRequest calls below. The
-            // stall goes away when this becomes an in-window prompt driven
-            // from the core's own confirmation UI.
-            error.UnsafePaste, error.UnauthorizedPaste => {
-                if (confirm(
-                    self.app,
-                    self.hwnd,
-                    clipboardReadPrompt(state),
-                    .cancel,
-                )) {
-                    try self.core_surface.completeClipboardRequest(state, .{
-                        .contents = contents,
-                        .confirmed = true,
-                    });
-                } else {
-                    self.core_surface.denyClipboardRequest(state);
-                }
-            },
+            error.UnsafePaste, error.UnauthorizedPaste => try self.confirmPaste(state, contents),
             else => return err,
         };
+    }
 
-        return .started;
+    /// Paste `contents` for `state` if the user says so, else deny it
+    /// (`completePaste`).
+    fn confirmPaste(
+        self: *Surface,
+        state: apprt.ClipboardRequest,
+        contents: []const terminal.clipboard.Content,
+    ) !void {
+        // MessageBoxW runs a nested modal loop. Win32 messages keep
+        // pumping, but `core_app.tick` does not (`confirm` raises
+        // App.prompt_depth), so the mailbox goes undrained for as long as
+        // the prompt is up and renderer and IO output stalls behind it.
+        // That is deliberate: a clipboard request runs inside a tick, and
+        // the prompt defers any surface teardown dispatched meanwhile
+        // (`App.canTearDown`), for a drop too, so `self` is still valid
+        // for the completeClipboardRequest calls below. The stall goes
+        // away when this becomes an in-window prompt driven from the
+        // core's own confirmation UI.
+        if (confirm(
+            self.app,
+            self.hwnd,
+            clipboardReadPrompt(state),
+            .cancel,
+        )) {
+            try self.core_surface.completeClipboardRequest(state, .{
+                .contents = contents,
+                .confirmed = true,
+            });
+        } else {
+            self.core_surface.denyClipboardRequest(state);
+        }
+    }
+
+    /// Told the text a drop pastes and whether it asks first, in tests
+    /// only, where a terminal has no core to paste it.
+    pub var test_dropped: if (builtin.is_test) ?*const fn (*Surface, []const u8, bool) void else void =
+        if (builtin.is_test) null else {};
+
+    /// How many drops have been freed (DragFinish), in tests only.
+    pub var test_drops_freed: if (builtin.is_test) usize else void =
+        if (builtin.is_test) 0 else {};
+
+    /// WM_DROPFILES: paste the paths of the files dropped on the terminal,
+    /// quoted for its shell (`drop.text`), through the paste protection,
+    /// as macOS and GTK paste a drop, asking first where that quoting
+    /// leaves an unknown shell something to expand (`drop.asks`), unless
+    /// `clipboard-paste-protection` is off. Dropped while a prompt is
+    /// open, as key and mouse input are (`syncMouse`): its message loop
+    /// may have a core frame beneath it, and dispatches a drop posted
+    /// before it opened.
+    fn dropFiles(self: *Surface, hdrop: win32.HDROP) void {
+        const alloc = self.app.core_app.alloc;
+        const text = text: {
+            // The block comes with the message, to be freed whatever
+            // becomes of the drop.
+            defer {
+                win32.DragFinish(hdrop);
+                if (builtin.is_test) test_drops_freed += 1;
+            }
+            if (!self.app.canReenterCore()) {
+                log.info("file drop dropped while a prompt is open", .{});
+                return;
+            }
+            const text = drop.text(alloc, self.shell, hdrop) catch |err| {
+                log.warn("unable to read a file drop err={}", .{err});
+                return;
+            };
+            break :text text orelse return;
+        };
+        defer alloc.free(text);
+
+        const ask = drop.asks(self.shell, text);
+        if (builtin.is_test) if (test_dropped) |seen| seen(self, text, ask);
+        const live = self.liveCore() orelse return;
+        self.completePaste(.{ .paste = .standard }, text, ask and live.config.clipboard_paste_protection) catch |err|
+            log.warn("unable to paste a file drop err={}", .{err});
     }
 
     /// Write text to the clipboard.
@@ -2119,6 +2195,12 @@ pub const Surface = struct {
             // background. The first real frame follows the first WM_PAINT's
             // refresh.
             win32.WM_ERASEBKGND => return 1,
+
+            win32.WM_DROPFILES => {
+                const hdrop: ?win32.HDROP = @ptrFromInt(wparam);
+                if (hdrop) |files| self.dropFiles(files);
+                return 0;
+            },
 
             else => {},
         }

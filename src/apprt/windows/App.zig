@@ -4059,6 +4059,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.overlays = .{};
     surface.scroll_bar = .{};
     surface.preedit = .none;
+    surface.shell = null;
     _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
@@ -9561,6 +9562,85 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
     const text = (try readClipboardText(alloc, pane.hwnd)) orelse return error.TestUnexpectedResult;
     defer alloc.free(text);
     try std.testing.expectEqualStrings("mine", text);
+}
+
+test "win32: files dropped on a terminal paste their paths, quoted for its shell, freed always, unless a prompt is open" {
+    const alloc = std.testing.allocator;
+    const drop = @import("drop.zig");
+    const u = std.unicode.utf8ToUtf16LeStringLiteral;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+
+    // What each drop would paste, on which terminal, and whether it asks.
+    const Dropped = struct {
+        var on: ?*Surface = null;
+        var buf: [128]u8 = undefined;
+        var len: usize = 0;
+        var asked = false;
+        var count: usize = 0;
+        fn seen(surface: *Surface, pasted: []const u8, ask: bool) void {
+            on = surface;
+            len = @min(pasted.len, buf.len);
+            @memcpy(buf[0..len], pasted[0..len]);
+            asked = ask;
+            count += 1;
+        }
+        fn text() []const u8 {
+            return buf[0..len];
+        }
+    };
+    Surface.test_dropped = &Dropped.seen;
+    defer Surface.test_dropped = null;
+    const freed = Surface.test_drops_freed;
+    const names: []const []const u16 = &.{ u("C:\\a $b"), u("C:\\c") };
+
+    // To the terminal the files are dropped on, for its own shell, without
+    // asking for a shell Ghostty knows.
+    a.shell = .powershell;
+    b.shell = .bash;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_DROPFILES, @intFromPtr(try drop.testDrop(names)), 0);
+    try std.testing.expectEqual(1, Dropped.count);
+    try std.testing.expect(Dropped.on == a);
+    try std.testing.expectEqualStrings("'C:\\a $b' C:\\c", Dropped.text());
+    try std.testing.expect(!Dropped.asked);
+    _ = win32.SendMessageW(b.hwnd, win32.WM_DROPFILES, @intFromPtr(try drop.testDrop(names)), 0);
+    try std.testing.expectEqual(2, Dropped.count);
+    try std.testing.expect(Dropped.on == b);
+    try std.testing.expectEqualStrings("C:\\\\a\\ \\$b C:\\\\c", Dropped.text());
+    try std.testing.expect(!Dropped.asked);
+
+    // For one it does not know, the `$` its double quotes leave a POSIX
+    // shell to expand asks first.
+    b.shell = null;
+    _ = win32.SendMessageW(b.hwnd, win32.WM_DROPFILES, @intFromPtr(try drop.testDrop(names)), 0);
+    try std.testing.expectEqual(3, Dropped.count);
+    try std.testing.expectEqualStrings("\"C:\\a $b\" \"C:\\c\"", Dropped.text());
+    try std.testing.expect(Dropped.asked);
+    try std.testing.expectEqual(freed + 3, Surface.test_drops_freed);
+
+    // Not while a prompt is open, nor with no name to paste, nor with no
+    // drop; each drop freed even so.
+    app.prompt_depth = 1;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_DROPFILES, @intFromPtr(try drop.testDrop(names)), 0);
+    app.prompt_depth = 0;
+    try std.testing.expectEqual(freed + 4, Surface.test_drops_freed);
+    const bad = [_]u16{ 'C', ':', '\\', 0xD800 };
+    _ = win32.SendMessageW(a.hwnd, win32.WM_DROPFILES, @intFromPtr(try drop.testDrop(&.{&bad})), 0);
+    try std.testing.expectEqual(freed + 5, Surface.test_drops_freed);
+    try std.testing.expectEqual(0, win32.SendMessageW(a.hwnd, win32.WM_DROPFILES, 0, 0));
+    try std.testing.expectEqual(freed + 5, Surface.test_drops_freed);
+    try std.testing.expectEqual(3, Dropped.count);
 }
 
 /// For tests: `pane`'s title prompt for `which`, opened as a binding opens

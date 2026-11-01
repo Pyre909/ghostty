@@ -224,10 +224,29 @@
 //! take, the thumb's positions run only from 0 to 2^31 less the screen's
 //! rows, and the arrows and the track reach the rest.
 //!
+//! ## Dropped files
+//!
+//! Files dropped on a terminal (WM_DROPFILES; its window has
+//! WS_EX_ACCEPTFILES) paste their paths, joined by spaces with no newline
+//! after, as macOS joins them, through the paste protection, as macOS and
+//! GTK paste a drop (`Surface.dropFiles`). Each is quoted for the shell
+//! the terminal starts, as the shell integration names it, in any case
+//! and with or without `.exe` (`drop.shellOf`): left bare for cmd and
+//! PowerShell when it needs nothing, else cmd's double quotes,
+//! PowerShell's or elvish's single quotes, nushell's single quotes or raw
+//! string, and macOS's backslashes for bash, zsh and fish. A shell
+//! Ghostty does not know gets cmd's double quotes, always, and a drop
+//! holding `$`, a backtick or `!`, which a POSIX shell expands in them,
+//! asks first (`drop.asks`). An elevated Ghostty takes no drop from a
+//! program that is not, Explorer included: UIPI blocks WM_DROPFILES from
+//! a lower integrity level unless the window lets it through
+//! (ChangeWindowMessageFilterEx), which this one does not (not tried).
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
-//! window and precision-touchpad scrolling.
+//! window, dropped text (only files are taken) and precision-touchpad
+//! scrolling.
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for every action it does not name; this runtime never claims an action
 //! it did not carry out.
@@ -338,6 +357,7 @@ test {
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/desktop_notifications.zig");
     _ = @import("windows/dialog.zig");
+    _ = @import("windows/drop.zig");
     _ = @import("windows/key.zig");
     _ = @import("windows/overlay_keys.zig");
     _ = @import("windows/taskbar.zig");

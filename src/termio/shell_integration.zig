@@ -155,7 +155,10 @@ test "shell integration failure" {
     try testing.expectEqual(0, env.count());
 }
 
-fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
+/// The shell `command` runs, from its first argument's name; null for
+/// one we do not integrate with. Also how the Windows runtime quotes
+/// files dropped on a terminal (src/apprt/windows/drop.zig).
+pub fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     var arg_iter = try command.argIterator(alloc);
     defer arg_iter.deinit();
 

@@ -160,6 +160,9 @@ pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: HANDLE =
 pub const GWL_STYLE: c_int = -16;
 pub const GWL_EXSTYLE: c_int = -20;
 pub const WS_EX_TOPMOST: DWORD = 0x00000008;
+/// The window takes files dropped on it (WM_DROPFILES), as
+/// DragAcceptFiles sets.
+pub const WS_EX_ACCEPTFILES: DWORD = 0x00000010;
 /// SetWindowPos's place for a window above every window that is not on
 /// top, and back among them.
 pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
@@ -228,6 +231,8 @@ pub const WM_EXITMENULOOP: UINT = 0x0212;
 pub const WM_CAPTURECHANGED: UINT = 0x0215;
 pub const WM_ENTERSIZEMOVE: UINT = 0x0231;
 pub const WM_EXITSIZEMOVE: UINT = 0x0232;
+/// wParam is the drop's HDROP, which the window frees with DragFinish.
+pub const WM_DROPFILES: UINT = 0x0233;
 pub const WM_MOUSELEAVE: UINT = 0x02A3;
 pub const WM_DPICHANGED: UINT = 0x02E0;
 pub const WM_APP: UINT = 0x8000;
@@ -681,6 +686,27 @@ pub const SEE_MASK_NOASYNC: DWORD = 0x00000100;
 pub const SEE_MASK_FLAG_NO_UI: DWORD = 0x00000400;
 /// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw
 pub extern "shell32" fn ShellExecuteExW(info: *SHELLEXECUTEINFOW) callconv(.winapi) BOOL;
+/// The files of a drop: a global memory block that starts with DROPFILES.
+pub const HDROP = *opaque {};
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/ns-shlobj_core-dropfiles
+/// Followed, at `pFiles` bytes from its start, by the names, each ended
+/// by a NUL and the list by another.
+pub const DROPFILES = extern struct {
+    pFiles: DWORD,
+    pt: POINT,
+    fNC: BOOL,
+    fWide: BOOL,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-dragqueryfilew
+/// With index 0xFFFFFFFF, the number of files; with no buffer, the
+/// length of a name in characters, not counting its NUL.
+pub extern "shell32" fn DragQueryFileW(
+    drop: HDROP,
+    index: UINT,
+    buf: ?[*]u16,
+    len: UINT,
+) callconv(.winapi) UINT;
+pub extern "shell32" fn DragFinish(drop: HDROP) callconv(.winapi) void;
 pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
 pub const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
 pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
