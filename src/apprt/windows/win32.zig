@@ -45,7 +45,7 @@ const LONG_PTR = w.LONG_PTR;
 pub const WPARAM = usize;
 pub const LRESULT = isize;
 pub const UINT_PTR = usize;
-const HGLOBAL = *anyopaque;
+pub const HGLOBAL = *anyopaque;
 const SHORT = w.SHORT;
 
 /// Keyboard layout handle. Only ever passed back to user32.
@@ -1014,6 +1014,10 @@ pub extern "user32" fn EmptyClipboard() callconv(.winapi) BOOL;
 pub extern "user32" fn SetClipboardData(format: UINT, mem: ?HANDLE) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn GetClipboardData(format: UINT) callconv(.winapi) ?HANDLE;
 pub extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclipboardformatw
+pub extern "user32" fn RegisterClipboardFormatW(name: LPCWSTR) callconv(.winapi) UINT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumclipboardformats
+pub extern "user32" fn EnumClipboardFormats(format: UINT) callconv(.winapi) UINT;
 
 pub extern "gdi32" fn GetDeviceCaps(hdc: HDC, index: c_int) callconv(.winapi) c_int;
 

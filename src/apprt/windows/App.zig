@@ -41,7 +41,7 @@ const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
 const retry = @import("dialog.zig").retry;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
-const writeClipboardText = @import("clipboard.zig").writeClipboardText;
+const writeClipboard = @import("clipboard.zig").writeClipboard;
 
 const log = std.log.scoped(.win32);
 
@@ -9673,6 +9673,86 @@ test "win32: reset_window_size waits for run and gives the window a new one's si
     try std.testing.expect(app.requests.items[0] == .dropped);
 }
 
+test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the text alone after a prompt, or nothing it cannot hold" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+
+    const clipboard = @import("clipboard.zig");
+    const saved = try clipboard.readClipboardText(alloc, pane.hwnd);
+    defer if (saved) |text| {
+        writeClipboard(pane.hwnd, .{ .text = text }) catch {};
+        alloc.free(text);
+    };
+
+    // `copy_to_clipboard:mixed`, the default: the core's text, then its
+    // HTML (Surface.zig `copySelectionToClipboards`).
+    try pane.setClipboard(.standard, &.{
+        .{ .mime = "text/plain", .data = "red" },
+        .{ .mime = "text/html", .data = "<div style=\"color: red;\">red</div>" },
+    }, false);
+    try clipboard.expectClipboard(pane.hwnd, "red", "<div style=\"color: red;\">red</div>");
+
+    // Of two of a kind, the first.
+    try pane.setClipboard(.standard, &.{
+        .{ .mime = "text/html", .data = "<div>first</div>" },
+        .{ .mime = "text/plain", .data = "first" },
+        .{ .mime = "text/html", .data = "<div>second</div>" },
+        .{ .mime = "text/plain", .data = "second" },
+    }, false);
+    try clipboard.expectClipboard(pane.hwnd, "first", "<div>first</div>");
+
+    // `copy_to_clipboard:html`: the HTML alone.
+    try pane.setClipboard(.standard, &.{
+        .{ .mime = "text/html", .data = "<div>html</div>" },
+    }, false);
+    try clipboard.expectClipboard(pane.hwnd, null, "<div>html</div>");
+
+    // Text in this runtime's own spelling of its type, which `isTextMime`
+    // takes too. (`:plain` and an OSC 52 write give "text/plain", as the
+    // first write here does.)
+    try pane.setClipboard(.standard, &.{.{ .mime = clipboard.text_mime, .data = "plain" }}, false);
+    try clipboard.expectClipboard(pane.hwnd, "plain", null);
+
+    // A write that asks first writes the text alone, and with no text,
+    // nothing, without asking.
+    const Prompt = struct {
+        var boxes: usize = 0;
+        fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+            boxes += 1;
+            return win32.IDOK;
+        }
+    };
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &Prompt.box;
+    defer message_box.* = null;
+    try pane.setClipboard(.standard, &.{
+        .{ .mime = "text/plain", .data = "asked" },
+        .{ .mime = "text/html", .data = "<div>asked</div>" },
+    }, true);
+    try std.testing.expectEqual(1, Prompt.boxes);
+    try clipboard.expectClipboard(pane.hwnd, "asked", null);
+    try pane.setClipboard(.standard, &.{.{ .mime = "text/html", .data = "<div>asked</div>" }}, true);
+    try std.testing.expectEqual(1, Prompt.boxes);
+    try clipboard.expectClipboard(pane.hwnd, "asked", null);
+    try pane.setClipboard(.standard, &.{.{ .mime = clipboard.text_mime, .data = "plain" }}, false);
+
+    // Nothing this runtime can hold leaves the clipboard as it was, and so
+    // does a write to the selection clipboard, which Windows has not.
+    try pane.setClipboard(.standard, &.{.{ .mime = "image/png", .data = "png" }}, false);
+    try pane.setClipboard(.selection, &.{.{ .mime = "text/html", .data = "<div>x</div>" }}, false);
+    try clipboard.expectClipboard(pane.hwnd, "plain", null);
+}
+
 test "win32: copy_title_to_clipboard copies the terminal's title, if it has one" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
@@ -9694,10 +9774,10 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
     const readClipboardText = @import("clipboard.zig").readClipboardText;
     const saved = try readClipboardText(alloc, pane.hwnd);
     defer if (saved) |text| {
-        writeClipboardText(pane.hwnd, text) catch {};
+        writeClipboard(pane.hwnd, .{ .text = text }) catch {};
         alloc.free(text);
     };
-    try writeClipboardText(pane.hwnd, "before");
+    try writeClipboard(pane.hwnd, .{ .text = "before" });
 
     // None yet, then an empty one: no effect.
     try std.testing.expect(!try app.performAction(target, .copy_title_to_clipboard, {}));
@@ -12996,7 +13076,7 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
     const readClipboardText = @import("clipboard.zig").readClipboardText;
     const saved = try readClipboardText(alloc, a.hwnd);
     defer if (saved) |text| {
-        writeClipboardText(a.hwnd, text) catch {};
+        writeClipboard(a.hwnd, .{ .text = text }) catch {};
         alloc.free(text);
     };
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 4);
@@ -13006,7 +13086,7 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
         defer alloc.free(text);
         try std.testing.expectEqualStrings("eed", text);
     }
-    try writeClipboardText(a.hwnd, "pasted");
+    try writeClipboard(a.hwnd, .{ .text = "pasted" });
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 6, 6);
     try fieldKey(edit, 'V', .{ .ctrl = true, .shift = true }, null);
     try std.testing.expectEqualStrings("needlepasted", try fieldText(a, &buf));

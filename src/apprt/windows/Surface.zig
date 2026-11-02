@@ -41,7 +41,8 @@ const shiftlessCodepoint = @import("key.zig").shiftlessCodepoint;
 const inputLanguage = @import("key.zig").inputLanguage;
 const text_mime = @import("clipboard.zig").text_mime;
 const readClipboardText = @import("clipboard.zig").readClipboardText;
-const writeClipboardText = @import("clipboard.zig").writeClipboardText;
+const writeClipboard = @import("clipboard.zig").writeClipboard;
+const ClipboardContents = @import("clipboard.zig").Contents;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const clipboardReadPrompt = @import("clipboard.zig").clipboardReadPrompt;
 const confirm = @import("dialog.zig").confirm;
@@ -1398,7 +1399,14 @@ pub const Surface = struct {
             log.warn("unable to paste a file drop err={}", .{err});
     }
 
-    /// Write text to the clipboard.
+    /// Write the text and the HTML of `contents` to the clipboard, the first
+    /// of each, as `writeClipboard` (clipboard.zig) puts them: a copy gives
+    /// the HTML with `copy_to_clipboard:html`, and with `:mixed`, the
+    /// default, the text too. A write that asks first (`confirm_write`)
+    /// writes the text alone, as GTK and macOS do after their prompts. They
+    /// otherwise write every type they are given; other types are left out
+    /// here, as only a Kitty clipboard write would carry them, and this
+    /// runtime does not accept those (`clipboardRequest`).
     ///
     /// `confirm` means the configuration asked for the write to be approved by
     /// the user. This runtime has no in-window prompt, so it uses a modal
@@ -1412,16 +1420,21 @@ pub const Surface = struct {
     ) !void {
         if (!self.supportsClipboard(clipboard_type)) return;
 
-        const text: []const u8 = text: {
-            for (contents) |c| {
-                if (terminal.clipboard.isTextMime(c.mime)) break :text c.data;
+        var found: ClipboardContents = .{};
+        for (contents) |c| {
+            if (found.text == null and terminal.clipboard.isTextMime(c.mime)) {
+                found.text = c.data;
+            } else if (found.html == null and std.mem.eql(u8, c.mime, "text/html")) {
+                found.html = c.data;
             }
-
-            // Nothing text-like to write. Silently doing nothing is correct:
-            // Windows has no way to hold the other representations here.
-            log.debug("clipboard write had no text representation", .{});
+        }
+        // After a prompt, the text alone, as GTK and macOS write it.
+        if (confirm_write) found.html = null;
+        if (found.text == null and found.html == null) {
+            // Nothing this runtime can write; doing nothing is correct.
+            log.debug("clipboard write had no text or HTML", .{});
             return;
-        };
+        }
 
         if (confirm_write and !confirm(
             self.app,
@@ -1430,9 +1443,9 @@ pub const Surface = struct {
             .cancel,
         )) return;
 
-        // An error, not a bare `return`, on every failure: the core must not
-        // believe a copy landed when it did not.
-        try writeClipboardText(self.hwnd, text);
+        // An error when nothing could be written: the core must not believe
+        // a copy landed when it did not.
+        try writeClipboard(self.hwnd, found);
     }
 
     /// The environment the child process starts from. The caller takes
