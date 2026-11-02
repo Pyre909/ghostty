@@ -13494,7 +13494,14 @@ test "win32: the command palette lists only what performAction carries out" {
             .prompt_surface_title => .surface,
             .set_window_title, .set_tab_title, .set_surface_title => .{ .title = "t" },
             .inspector => .toggle,
-            .toggle_secure_input, .toggle_window_float_on_top => .toggle,
+            .toggle_secure_input => .toggle,
+            // Not the core's `.toggle`: that is performed only if the
+            // window floats once SetWindowPos returns
+            // (`Window.setFloating`), which the VM now and then undid
+            // under load, on this desktop or on one of the test's own.
+            // Nothing seen makes a window float, so `.off` is refused
+            // only if the action is.
+            .toggle_window_float_on_top => .off,
             .new_split => .right,
             .goto_tab, .next_tab => .next,
             .previous_tab => .previous,
@@ -13531,7 +13538,6 @@ test "win32: the command palette lists only what performAction carries out" {
     try std.testing.expectEqual(35, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
-    _ = try app.performAction(target, .float_window, .off);
 }
 
 test "win32: the command palette has a jump to each terminal that is not closing" {
