@@ -616,6 +616,31 @@ pub extern "user32" fn SetWindowsHookExW(
 ) callconv(.winapi) ?HHOOK;
 pub extern "user32" fn UnhookWindowsHookEx(hook: HHOOK) callconv(.winapi) BOOL;
 pub extern "user32" fn CallNextHookEx(hook: ?HHOOK, code: c_int, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT;
+
+// A desktop of its own for a test of a window's place in the z-order
+// (App.testOnOwnDesktop): a desktop's windows, z-order and hooks are its
+// own. https://learn.microsoft.com/en-us/windows/win32/winstation/desktops
+pub const HDESK = *opaque {};
+/// Every access right to a desktop.
+/// https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights
+pub const GENERIC_ALL: DWORD = 0x10000000;
+/// Opens the process's window station's desktop of that name instead, if
+/// there is one.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createdesktopw
+pub extern "user32" fn CreateDesktopW(
+    name: LPCWSTR,
+    device: ?LPCWSTR,
+    mode: ?*const anyopaque,
+    flags: DWORD,
+    access: DWORD,
+    attributes: ?*const anyopaque,
+) callconv(.winapi) ?HDESK;
+/// Fails for a thread that has a window or a hook.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setthreaddesktop
+pub extern "user32" fn SetThreadDesktop(desktop: HDESK) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-closedesktop
+pub extern "user32" fn CloseDesktop(desktop: HDESK) callconv(.winapi) BOOL;
+
 /// A pending batch of window positions (BeginDeferWindowPos).
 pub const HDWP = *opaque {};
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-begindeferwindowpos

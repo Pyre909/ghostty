@@ -4099,6 +4099,49 @@ pub fn testCleanup(app: *App) void {
     _ = win32.DestroyWindow(app.msg_hwnd);
 }
 
+/// For tests: run `func` with `args` on a thread of its own on a desktop of
+/// its own, made for it and closed after, and return what it returns. A
+/// test that reads a window's place in the z-order runs there: each
+/// desktop has a z-order of its own, and window messages and hooks do not
+/// cross desktops
+/// (https://learn.microsoft.com/en-us/windows/win32/winstation/desktops),
+/// so other programs at work on the user's desktop at the time, someone
+/// signing in to a browser or another test run in the same VM, do not
+/// restack its windows. SetThreadDesktop refuses a thread that has a
+/// window or a hook, hence a new thread, which makes all of the test's.
+/// CreateDesktopW opens a desktop of the same name instead of making one,
+/// so the name has the calling thread's id, which no other thread has
+/// while it runs.
+fn testOnOwnDesktop(comptime func: anytype, args: anytype) anyerror!void {
+    var buf: [32]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, "ghostty-test-{d}", .{std.os.windows.GetCurrentThreadId()});
+    var wide: [buf.len:0]u16 = undefined;
+    const len = try std.unicode.utf8ToUtf16Le(&wide, name);
+    wide[len] = 0;
+    const desktop = win32.CreateDesktopW(wide[0..len :0], null, null, 0, win32.GENERIC_ALL, null) orelse
+        return error.TestUnexpectedResult;
+    defer _ = win32.CloseDesktop(desktop);
+
+    const Run = struct {
+        fn run(on: win32.HDESK, a: @TypeOf(args), result: *anyerror!void) void {
+            if (!win32.SetThreadDesktop(on).toBool()) {
+                result.* = error.TestUnexpectedResult;
+                return;
+            }
+            @call(.auto, func, a) catch |err| {
+                // The trace is this thread's, so it is shown here, as the
+                // test runner shows a test's.
+                if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+                result.* = err;
+            };
+        }
+    };
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Run.run, .{ desktop, args, &result });
+    thread.join();
+    return result;
+}
+
 fn clientRect(hwnd: win32.HWND) !win32.RECT {
     var rect: win32.RECT = undefined;
     if (!win32.GetClientRect(hwnd, &rect).toBool()) return error.TestUnexpectedResult;
@@ -11618,6 +11661,13 @@ test "win32: a bell border whose window cannot be made, or was destroyed, or sha
 }
 
 test "win32: float_window keeps a window on top, or puts it back" {
+    // On a desktop of its own (testOnOwnDesktop): what it reads is the
+    // window's place among every window on its desktop.
+    try testOnOwnDesktop(testFloatWindow, .{});
+}
+
+/// The float_window test, run by its test on a desktop of its own.
+fn testFloatWindow() !void {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
