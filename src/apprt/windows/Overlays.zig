@@ -2,11 +2,11 @@
 //! over it, as GTK stacks overlays over its surface
 //! (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge (ReadOnly.zig),
 //! the bell border (BellBorder.zig), the child-exited banner
-//! (ChildExited.zig), the link preview (LinkPreview.zig) and the key-state
-//! indicator (KeyState.zig). This file
-//! does for each what they all need: their window class and procedure,
-//! their place in the Z order, their font, colours and frame, and their
-//! teardown; each overlay's own file says what it shows and where
+//! (ChildExited.zig), the resize overlay (ResizeOverlay.zig), the link
+//! preview (LinkPreview.zig) and the key-state indicator (KeyState.zig).
+//! This file does for each what they all need: their window class and
+//! procedure, their place in the Z order, their font, colours and frame,
+//! and their teardown; each overlay's own file says what it shows and where
 //! (`placeIn`, `textIn`), and in what colours if not the search bar's
 //! (`look`), or draws itself (`draw`).
 //!
@@ -44,6 +44,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const BellBorder = @import("BellBorder.zig");
 const ChildExited = @import("ChildExited.zig");
+const ResizeOverlay = @import("ResizeOverlay.zig");
 const KeyState = @import("KeyState.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
@@ -62,6 +63,10 @@ bell_border: BellBorder.Border = .{},
 /// The child-exited banner, made when the core asks for it
 /// (`ChildExited.show`).
 child_exited: ChildExited.Banner = .{},
+
+/// The resize overlay, made the first time the terminal's size changes
+/// after its first delay (`ResizeOverlay.resized`).
+resize_overlay: ResizeOverlay.Overlay = .{},
 
 /// The link preview, made, hidden, with its terminal (`create`).
 link_preview: LinkPreview.Preview = .{},
@@ -84,11 +89,11 @@ font_dpi: u32 = 0,
 /// its text to measure), `shape` (its window's region), `handle`
 /// (messages of its own) and `hidden` (what it does as its window is
 /// hidden).
-pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "link_preview", "key_state" };
+pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "resize_overlay", "link_preview", "key_state" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, LinkPreview.class_name, KeyState.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, KeyState.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -249,9 +254,10 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// again, so the terminal shows no more previews; the key-state
 /// indicator is made again at its next change that leaves something to
 /// show (`KeyState.update`), the read-only badge the next time the
-/// terminal is made read-only (`ReadOnly.set`), and the bell border the
-/// next time it shows (`BellBorder.set`); the child-exited banner, asked
-/// for once, is not.
+/// terminal is made read-only (`ReadOnly.set`), the bell border the next
+/// time it shows (`BellBorder.set`), and the resize overlay at its
+/// terminal's next change of size (`ResizeOverlay.resized`); the
+/// child-exited banner, asked for once, is not.
 ///
 /// The terminals tile their area, and the search bars and the command
 /// palette are placed above all of them (`SearchBar.place`,

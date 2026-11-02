@@ -7,6 +7,7 @@ const configpkg = @import("../../config.zig");
 const global = @import("../../global.zig");
 const input = @import("../../input.zig");
 const internal_os = @import("../../os/main.zig");
+const renderer = @import("../../renderer.zig");
 const terminal = @import("../../terminal/main.zig");
 const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
@@ -24,6 +25,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
 const KeyState = @import("KeyState.zig");
+const ResizeOverlay = @import("ResizeOverlay.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
@@ -4196,6 +4198,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     // As `Surface.create` makes it.
     ScrollBar.made(surface);
     Overlays.create(surface);
+    ResizeOverlay.start(surface);
     app.surfaces.appendAssumeCapacity(surface);
     return surface;
 }
@@ -15488,6 +15491,433 @@ test "win32: a key state whose window cannot be made returns false, frees its te
     try expectKeyStateAt(window, a);
     try std.testing.expectEqualStrings("nav > resize \u{203A} Ctrl+K \u{2026}", try keyStateText(a, &buf));
     try std.testing.expectEqual(2, NoWindow.asked);
+}
+
+/// For tests: the cores test terminals give their sizes to
+/// (`Surface.test_core`), one for each, with cells 10 by 20 pixels and no
+/// padding, and no size until they are given one.
+const CoreResize = struct {
+    const Seen = struct { surface: ?*const Surface, core: Surface.TestCore };
+    var seen: [4]Seen = undefined;
+
+    fn reset() void {
+        seen = @splat(.{ .surface = null, .core = .{ .size = .{
+            .screen = .{ .width = 0, .height = 0 },
+            .cell = .{ .width = 10, .height = 20 },
+            .padding = .{},
+        } } });
+    }
+
+    fn core(surface: *Surface) *Surface.TestCore {
+        for (&seen) |*s| if (s.surface == surface) return &s.core;
+        for (&seen) |*s| {
+            if (s.surface == null) {
+                s.surface = surface;
+                return &s.core;
+            }
+        }
+        @panic("more terminals than CoreResize keeps");
+    }
+
+    /// How many sizes the cores were given.
+    fn calls() usize {
+        var n: usize = 0;
+        for (seen) |s| n += s.core.callbacks;
+        return n;
+    }
+
+    /// What the resize overlay shows for a terminal `width` by `height`, in
+    /// `buf`, worked out here.
+    fn textOf(width: i32, height: i32, buf: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{d} x {d}", .{ @divTrunc(width, 10), @divTrunc(height, 20) });
+    }
+
+    /// What the resize overlay shows for `surface`'s client area now, in
+    /// `buf`.
+    fn text(window: *const Window, surface: *const Surface, buf: []u8) ![]const u8 {
+        const pane = try paneClient(window, surface);
+        return textOf(pane.right - pane.left, pane.bottom - pane.top, buf);
+    }
+};
+
+/// For tests: `surface`'s WM_SIZE at `width` by `height`, as Windows sends
+/// it once its window is sized, with no window sized, so that nothing but
+/// what it does is drawn again.
+fn sendSize(surface: *const Surface, width: i32, height: i32) void {
+    const size: u32 = @as(u32, @as(u16, @intCast(height))) << 16 | @as(u16, @intCast(width));
+    // SIZE_RESTORED.
+    _ = win32.SendMessageW(surface.hwnd, win32.WM_SIZE, 0, @intCast(size));
+}
+
+/// For tests: `surface`'s resize overlay shows `text` in `window` where
+/// `position` puts it over its terminal, with no margin, as big as its text
+/// with GTK's padding, just above the terminal, or above the overlays under
+/// it that show; `text` is also its window's text.
+fn expectResizeAt(window: *const Window, surface: *const Surface, position: Config.ResizeOverlayPosition, text: []const u8) !void {
+    const o = &surface.overlays.resize_overlay;
+    const hwnd = o.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(o.text_size.width > 0 and o.text_size.height > 0);
+    const pane = try paneClient(window, surface);
+    const m = ResizeOverlay.Metrics.init(Window.dpiOf(window.app, window.hwnd));
+    const width = o.text_size.width + 2 * m.pad_x;
+    const height = o.text_size.height + 2 * m.pad_y;
+    const left = switch (position) {
+        .@"top-left", .@"bottom-left" => pane.left,
+        .center, .@"top-center", .@"bottom-center" => pane.left + @divTrunc(pane.right - pane.left - width, 2),
+        .@"top-right", .@"bottom-right" => pane.right - width,
+    };
+    const top = switch (position) {
+        .@"top-left", .@"top-center", .@"top-right" => pane.top,
+        .center => pane.top + @divTrunc(pane.bottom - pane.top - height, 2),
+        .@"bottom-left", .@"bottom-center", .@"bottom-right" => pane.bottom - height,
+    };
+    try std.testing.expectEqual(
+        win32.RECT{ .left = left, .top = top, .right = left + width, .bottom = top + height },
+        try childRect(window, hwnd),
+    );
+    try std.testing.expect(win32.GetWindow(overlayUnder(surface, "resize_overlay"), win32.GW_HWNDPREV) == hwnd);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(text, try windowText(hwnd, &buf));
+}
+
+/// For tests: whether `surface`'s resize overlay's timer fires within two
+/// seconds, its WM_TIMER taken from the queue undispatched.
+fn resizeTimerFires(surface: *const Surface) bool {
+    var waited: u32 = 0;
+    while (waited < 2000) : (waited += 10) {
+        var msg: win32.MSG = undefined;
+        while (win32.PeekMessageW(&msg, surface.hwnd, win32.WM_TIMER, win32.WM_TIMER, win32.PM_REMOVE).toBool()) {
+            if (msg.wParam == ResizeOverlay.timer_id) return true;
+        }
+        win32.Sleep(10);
+    }
+    return false;
+}
+
+/// For tests: `surface`'s resize overlay's timer, as `run` would dispatch
+/// it.
+fn resizeTimer(surface: *const Surface) void {
+    _ = win32.SendMessageW(surface.hwnd, win32.WM_TIMER, ResizeOverlay.timer_id, 0);
+}
+
+test "win32: a terminal's new size shows its grid over its centre until resize-overlay-duration passes with no other change" {
+    // GTK's resize overlay: "{columns} x {rows}" of the grid the core
+    // makes of the terminal's new size, centred over it by default, just
+    // above it, not for the sizes it takes in its first 250 ms, and hidden
+    // `resize-overlay-duration` after the last change, each change
+    // starting that again. The time is the test's
+    // (`ResizeOverlay.test_now`), the timer real.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    CoreResize.reset();
+    Surface.test_core = &CoreResize.core;
+    defer Surface.test_core = null;
+    ResizeOverlay.test_now = 1000;
+    defer ResizeOverlay.test_now = null;
+    app.config.@"resize-overlay-duration" = .{ .duration = 100 * std.time.ns_per_ms };
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    // In its first delay: the core has its sizes, and nothing shows.
+    ResizeOverlay.test_now = 1249;
+    testResize(window, 800, 500);
+    try std.testing.expect(CoreResize.calls() >= 2);
+    try std.testing.expect(a.overlays.resize_overlay.hwnd == null);
+
+    // After it: the grid, centred, until its duration has passed. A timer
+    // that comes early waits out the rest.
+    ResizeOverlay.test_now = 1250;
+    testResize(window, 700, 400);
+    var buf: [64]u8 = undefined;
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    const hwnd = a.overlays.resize_overlay.hwnd.?;
+    try std.testing.expect(resizeTimerFires(a));
+    ResizeOverlay.test_now = 1349;
+    resizeTimer(a);
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    ResizeOverlay.test_now = 1350;
+    resizeTimer(a);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(a.overlays.resize_overlay.text == null);
+    try std.testing.expectEqualStrings("", try windowText(hwnd, &buf));
+    // Not shown again by a layout, nor by a WM_SIZE at the size the core
+    // has, which it ignores, and its timer stopped.
+    window.relayout();
+    try std.testing.expect(!shown(hwnd));
+    const pane = try paneClient(window, a);
+    const callbacks = CoreResize.calls();
+    sendSize(a, pane.right - pane.left, pane.bottom - pane.top);
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expectEqual(callbacks, CoreResize.calls());
+    win32.Sleep(200);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(!win32.PeekMessageW(&msg, a.hwnd, win32.WM_TIMER, win32.WM_TIMER, win32.PM_REMOVE).toBool());
+
+    // A change inside the duration starts it again, with the new grid.
+    ResizeOverlay.test_now = 2000;
+    testResize(window, 800, 450);
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    ResizeOverlay.test_now = 2080;
+    testResize(window, 840, 480);
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    ResizeOverlay.test_now = 2150;
+    resizeTimer(a);
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    ResizeOverlay.test_now = 2180;
+    resizeTimer(a);
+    try std.testing.expect(!shown(hwnd));
+}
+
+test "win32: resize-overlay-position puts the resize overlay at its terminal's edges or centres, above the child-exited banner and under the link preview" {
+    // GTK's overlay-halign and overlay-valign, as its surface sets them
+    // from the option, with no margin. GTK stacks the overlay above its
+    // child-exited banner and under its URL labels.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    CoreResize.reset();
+    Surface.test_core = &CoreResize.core;
+    defer Surface.test_core = null;
+    ResizeOverlay.test_now = 1000;
+    defer ResizeOverlay.test_now = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    ResizeOverlay.test_now = 2000;
+
+    var buf: [64]u8 = undefined;
+    var width: c_int = 700;
+    for (std.enums.values(Config.ResizeOverlayPosition)) |position| {
+        app.config.@"resize-overlay-position" = position;
+        width += 20;
+        testResize(window, width, 400);
+        try expectResizeAt(window, a, position, try CoreResize.text(window, a, &buf));
+    }
+
+    // A long URL over the bottom-left corner: the preview above the
+    // overlay, which stays under it as it shows again.
+    app.config.@"resize-overlay-position" = .@"bottom-left";
+    try std.testing.expect(try testLink(&app, a, "https://example.com/a/path/long/enough/to/cover/the/overlay/at/the/bottom/left"));
+    try expectPreviewAt(window, a, .left);
+    testResize(window, 900, 420);
+    try expectResizeAt(window, a, .@"bottom-left", try CoreResize.text(window, a, &buf));
+    try expectPreviewAt(window, a, .left);
+    try std.testing.expect(above(window.hwnd, a.overlays.link_preview.hwnd.?, a.overlays.resize_overlay.hwnd.?));
+
+    // Its shell exited: the overlay above the banner across the bottom.
+    try std.testing.expect(try testChildExited(&app, a, 1));
+    testResize(window, 920, 420);
+    try expectResizeAt(window, a, .@"bottom-left", try CoreResize.text(window, a, &buf));
+    try std.testing.expect(above(window.hwnd, a.overlays.resize_overlay.hwnd.?, a.overlays.child_exited.hwnd.?));
+
+    // At the top-left a new grid as wide leaves the overlay where it was,
+    // and it is drawn again all the same. Only the terminal's WM_SIZE, so
+    // that no window sized draws it.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    app.config.@"resize-overlay-position" = .@"top-left";
+    const o = &a.overlays.resize_overlay;
+    const pane = try paneClient(window, a);
+    const w = pane.right - pane.left;
+    const h = pane.bottom - pane.top;
+    sendSize(a, w, h - 20);
+    try expectResizeAt(window, a, .@"top-left", try CoreResize.textOf(w, h - 20, &buf));
+    const at = try childRect(window, o.hwnd.?);
+    _ = win32.UpdateWindow(o.hwnd.?);
+    try std.testing.expect(!win32.GetUpdateRect(o.hwnd.?, null, .FALSE).toBool());
+    sendSize(a, w, h - 40);
+    try expectResizeAt(window, a, .@"top-left", try CoreResize.textOf(w, h - 40, &buf));
+    try std.testing.expectEqual(at, try childRect(window, o.hwnd.?));
+    try std.testing.expect(win32.GetUpdateRect(o.hwnd.?, null, .FALSE).toBool());
+
+    // Its window destroyed as it shows: made again at the next change,
+    // and named, though the grid it shows is the same.
+    try std.testing.expect(win32.DestroyWindow(o.hwnd.?).toBool());
+    try std.testing.expect(o.hwnd == null);
+    const same = if (@mod(w, 10) == 9) w - 1 else w + 1;
+    sendSize(a, same, h - 40);
+    try std.testing.expect(o.hwnd != null);
+    try expectResizeAt(window, a, .@"top-left", try CoreResize.textOf(w, h - 40, &buf));
+}
+
+test "win32: resize-overlay never shows no resize overlay, and always waits out a terminal's first delay as after-first does" {
+    // GTK shows none with `never`, and with `always` waits out its first
+    // delay as with `after-first`, as macOS waits until it is ready.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    CoreResize.reset();
+    Surface.test_core = &CoreResize.core;
+    defer Surface.test_core = null;
+    ResizeOverlay.test_now = 1000;
+    defer ResizeOverlay.test_now = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    // Never, long after its first delay: the core has the size, and
+    // nothing shows.
+    app.config.@"resize-overlay" = .never;
+    ResizeOverlay.test_now = 5000;
+    const before = CoreResize.calls();
+    testResize(window, 800, 500);
+    try std.testing.expect(CoreResize.calls() > before);
+    try std.testing.expect(a.overlays.resize_overlay.hwnd == null);
+
+    // Always: a new terminal's first sizes show nothing; later ones do.
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    app.config.@"resize-overlay" = .always;
+    const b = try testTab(&app, window);
+    window.selectTab(1);
+    ResizeOverlay.test_now = 5249;
+    testResize(window, 700, 400);
+    try std.testing.expect(b.overlays.resize_overlay.hwnd == null);
+    ResizeOverlay.test_now = 5250;
+    testResize(window, 720, 420);
+    var buf: [64]u8 = undefined;
+    try expectResizeAt(window, b, .center, try CoreResize.text(window, b, &buf));
+}
+
+test "win32: a resize overlay whose window cannot be made shows nothing, and is made at the next change" {
+    // CreateWindowExW fails when the process has used up its window
+    // handles: nothing shows, and the window is made at the terminal's
+    // next change of size, showing its grid then.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    CoreResize.reset();
+    Surface.test_core = &CoreResize.core;
+    defer Surface.test_core = null;
+    ResizeOverlay.test_now = 1000;
+    defer ResizeOverlay.test_now = null;
+    // Short enough that a timer started for it fires in the wait below.
+    app.config.@"resize-overlay-duration" = .{ .duration = 20 * std.time.ns_per_ms };
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    ResizeOverlay.test_now = 2000;
+
+    const NoWindow = struct {
+        var asked: usize = 0;
+        var class: []const u8 = "";
+        fn make(c: []const u8) ?win32.HWND {
+            asked += 1;
+            class = c;
+            return null;
+        }
+    };
+    NoWindow.asked = 0;
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+
+    testResize(window, 800, 500);
+    try std.testing.expect(a.overlays.resize_overlay.hwnd == null);
+    try std.testing.expect(a.overlays.resize_overlay.text == null);
+    try std.testing.expect(NoWindow.asked >= 1);
+    try std.testing.expectEqualStrings(ResizeOverlay.class_name, NoWindow.class);
+    // Nor a timer to hide nothing.
+    var msg: win32.MSG = undefined;
+    win32.Sleep(150);
+    try std.testing.expect(!win32.PeekMessageW(&msg, a.hwnd, win32.WM_TIMER, win32.WM_TIMER, win32.PM_REMOVE).toBool());
+
+    Overlays.test_make = null;
+    testResize(window, 820, 500);
+    var buf: [64]u8 = undefined;
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+}
+
+test "win32: a resize overlay whose timer cannot be started hides, as it would not be hidden after" {
+    // SetTimer fails when the process has used up its timers: a change
+    // that cannot start the timer hides the overlay rather than leave it
+    // shown, and so does an early WM_TIMER that cannot start it again.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    CoreResize.reset();
+    Surface.test_core = &CoreResize.core;
+    defer Surface.test_core = null;
+    ResizeOverlay.test_now = 1000;
+    defer ResizeOverlay.test_now = null;
+    defer ResizeOverlay.test_timer_fails = false;
+    app.config.@"resize-overlay-duration" = .{ .duration = 100 * std.time.ns_per_ms };
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    ResizeOverlay.test_now = 2000;
+    const o = &a.overlays.resize_overlay;
+    var buf: [64]u8 = undefined;
+
+    // Shown, then a change whose timer cannot be started.
+    testResize(window, 800, 500);
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    ResizeOverlay.test_timer_fails = true;
+    testResize(window, 820, 500);
+    try std.testing.expect(!shown(o.hwnd.?));
+    try std.testing.expect(o.text == null);
+    try std.testing.expectEqualStrings("", try windowText(o.hwnd.?, &buf));
+
+    // Shown again, then a WM_TIMER before its time that cannot start the
+    // timer again.
+    ResizeOverlay.test_timer_fails = false;
+    testResize(window, 840, 500);
+    try expectResizeAt(window, a, .center, try CoreResize.text(window, a, &buf));
+    ResizeOverlay.test_now = 2050;
+    ResizeOverlay.test_timer_fails = true;
+    resizeTimer(a);
+    try std.testing.expect(!shown(o.hwnd.?));
+    try std.testing.expect(o.text == null);
 }
 
 /// For tests: the core's `readonly` on `surface`, as its `toggle_readonly`

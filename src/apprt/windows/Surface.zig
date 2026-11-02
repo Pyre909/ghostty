@@ -23,6 +23,7 @@ const DesktopNotifications = @import("desktop_notifications.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
+const ResizeOverlay = @import("ResizeOverlay.zig");
 const BellBorder = @import("BellBorder.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
@@ -794,6 +795,10 @@ pub const Surface = struct {
             self.core_surface.setFontSize(size) catch |err|
                 log.warn("unable to apply the inherited font size err={}", .{err});
         }
+
+        // The sizes its window takes as it is laid out and shown show no
+        // resize overlay.
+        ResizeOverlay.start(self);
 
         return self;
     }
@@ -1651,6 +1656,50 @@ pub const Surface = struct {
             log.warn("content scale callback failed err={}", .{err});
     }
 
+    /// For tests: the core `coreResize` gives a terminal's sizes to, in
+    /// place of a live one, which a test's terminal does not have.
+    pub var test_core: if (builtin.is_test) ?*const fn (*Surface) *TestCore else void =
+        if (builtin.is_test) null else {};
+
+    /// For tests: what stands in for a terminal's core in `coreResize`:
+    /// its size, which `sizeCallback` sets as the core's does.
+    pub const TestCore = struct {
+        size: renderer.Size,
+        /// How many sizes it was given.
+        callbacks: usize = 0,
+
+        pub fn sizeCallback(self: *TestCore, size: apprt.SurfaceSize) !void {
+            self.callbacks += 1;
+            self.size.screen = .{ .width = size.width, .height = size.height };
+        }
+    };
+
+    /// The terminal's WM_SIZE, at `size`: the core takes it, and the resize
+    /// overlay shows the grid it makes if it is new to the core
+    /// (`ResizeOverlay.resized`), as GTK's surface schedules its overlay
+    /// for each size that changed.
+    fn resize(self: *Surface, size: apprt.SurfaceSize) void {
+        const grid = self.coreResize(size) orelse return;
+        ResizeOverlay.resized(self, grid);
+    }
+
+    /// `size` given to the core (`sizeCore`), or null with no live core.
+    fn coreResize(self: *Surface, size: apprt.SurfaceSize) ?renderer.GridSize {
+        if (builtin.is_test) if (test_core) |stand_in| return sizeCore(stand_in(self), size);
+        return sizeCore(self.liveCore() orelse return null, size);
+    }
+
+    /// `size` given to `to`, the core (`CoreSurface.sizeCallback`) or its
+    /// stand-in in tests: the grid it makes of it, or null for a size it
+    /// has already, which it ignores. A failed callback is logged, and the
+    /// grid is the core's still, as GTK shows it either way.
+    fn sizeCore(to: anytype, size: apprt.SurfaceSize) ?renderer.GridSize {
+        if (to.size.screen.equals(.{ .width = size.width, .height = size.height })) return null;
+        to.sizeCallback(size) catch |err|
+            log.warn("size callback failed err={}", .{err});
+        return to.size.grid();
+    }
+
     /// WM_PAINT. The render thread draws and presents on its own; all the
     /// main thread does is clear the update region and ask the core for a
     /// frame.
@@ -1729,14 +1778,11 @@ pub const Surface = struct {
 
             win32.WM_SIZE => {
                 self.ime.form = null;
-                const core_surface = self.liveCore() orelse return 0;
-
                 // Visibility is the frame's to report (`occlusionChanged`):
                 // this window is never minimized itself.
                 switch (SizeChange.init(lparam)) {
                     .empty => {},
-                    .resize => |size| core_surface.sizeCallback(size) catch |err|
-                        log.warn("size callback failed err={}", .{err}),
+                    .resize => |size| self.resize(size),
                 }
                 return 0;
             },
@@ -1748,6 +1794,10 @@ pub const Surface = struct {
                 },
                 DesktopNotifications.timer_id => {
                     self.notifications.expire(self.app.notifier, self.hwnd, win32.GetTickCount64());
+                    return 0;
+                },
+                ResizeOverlay.timer_id => {
+                    ResizeOverlay.timer(self);
                     return 0;
                 },
                 else => {},
