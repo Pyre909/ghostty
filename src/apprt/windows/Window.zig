@@ -2955,6 +2955,14 @@ pub fn isFloating(self: *const Window) bool {
 /// float, focused or not, as macOS floats it, or put it back among them.
 /// Only its place in the z-order changes, so no terminal is laid out
 /// again. False, logged, if it did not change.
+///
+/// SetWindowPos succeeding does not mean that it did: a window procedure
+/// may take the change of z-order out of WM_WINDOWPOSCHANGING, and another
+/// program may restack the window, or a window it owns, at any time (when
+/// a topmost window is made non-topmost, so are its owners, SetWindowPos
+/// documents). So the answer is whether the window floats as asked once
+/// SetWindowPos returns, read as `isFloating` reads it. It is not tried
+/// again.
 pub fn setFloating(self: *Window, on: bool) bool {
     if (!win32.SetWindowPos(
         self.hwnd,
@@ -2966,6 +2974,10 @@ pub fn setFloating(self: *Window, on: bool) bool {
         win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE,
     ).toBool()) {
         log.warn("cannot change whether the window floats err={}", .{win32.GetLastError()});
+        return false;
+    }
+    if (self.isFloating() != on) {
+        log.warn("the window does not float as asked although SetWindowPos succeeded on={}", .{on});
         return false;
     }
     return true;

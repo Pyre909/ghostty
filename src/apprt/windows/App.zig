@@ -11731,6 +11731,35 @@ fn testFloatWindow() !void {
     try std.testing.expect(window.isFloating());
     window.toggleFullscreen();
     try std.testing.expect(window.isFloating());
+
+    // A window that does not float as asked although SetWindowPos succeeds
+    // is not floated: a procedure that takes the change of z-order out of
+    // WM_WINDOWPOSCHANGING stands here for whatever leaves it where it was.
+    // Where it was asked to be, it is.
+    try std.testing.expect(try app.performAction(target, .float_window, .off));
+    const Refuse = struct {
+        var proc: ?win32.WNDPROC = null;
+        fn wndProc(
+            hwnd: win32.HWND,
+            msg: win32.UINT,
+            wparam: win32.WPARAM,
+            lparam: win32.LPARAM,
+        ) callconv(.winapi) win32.LRESULT {
+            if (msg == win32.WM_WINDOWPOSCHANGING) {
+                const pos: *win32.WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                pos.flags |= win32.SWP_NOZORDER;
+            }
+            return win32.CallWindowProcW(proc.?, hwnd, msg, wparam, lparam);
+        }
+    };
+    const old = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&Refuse.wndProc)));
+    Refuse.proc = @ptrFromInt(@as(usize, @bitCast(old)));
+    defer _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_WNDPROC, old);
+    for ([_]apprt.action.FloatWindow{ .on, .toggle }) |value| {
+        try std.testing.expect(!try app.performAction(target, .float_window, value));
+        try std.testing.expect(!window.isFloating());
+    }
+    try std.testing.expect(try app.performAction(target, .float_window, .off));
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
