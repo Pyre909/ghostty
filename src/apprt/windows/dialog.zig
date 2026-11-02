@@ -5,6 +5,8 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const App = @import("App.zig").App;
 
+const log = std.log.scoped(.win32);
+
 /// The button of a `confirm` prompt that Enter and Space press.
 ///
 /// Prompts that grant access default to Cancel, as GTK's clipboard
@@ -58,7 +60,18 @@ pub var test_message_box: if (builtin.is_test) ?*const fn (?win32.HWND, win32.LP
 /// ticks and no surface teardown until it returns (`App.canReenterCore`).
 /// Output from every surface pauses while a prompt is open, so the prompt
 /// is modal to every window, not only to `hwnd` (`App.beginPrompt`).
+///
+/// Once the windows are going for good (`App.terminating`) it is answered
+/// Cancel without a box: a tick in a teardown's wait can ask, as a
+/// program's clipboard read does, and no WM_QUIT would end the box's loop,
+/// as `run` has taken the quit's and the wait holds the session's end's
+/// until it returns (`App.waitForThread`). The box would hold up the quit,
+/// or the end inside WM_ENDSESSION, until someone answered it.
 fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
+    if (app.terminating) {
+        log.warn("a prompt while the windows close is answered Cancel", .{});
+        return win32.IDCANCEL;
+    }
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();

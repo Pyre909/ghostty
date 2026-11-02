@@ -267,9 +267,22 @@ pub const App = struct {
     /// button comes up.
     terminal_loops: u32,
 
-    /// Set for the whole of `terminate`. Teardown is driven from there
-    /// synchronously, so posted closes and destroys are ignored meanwhile.
+    /// Set once every window is being destroyed for good, by `terminate`
+    /// or by the session's end (`endSession`), and never cleared. Teardown
+    /// is driven from there synchronously, so posted closes and destroys
+    /// are ignored from then on, and nothing more is shown: no prompt
+    /// (`dialog.messageBox`), no toast (`notifierFor`).
     terminating: bool,
+
+    /// The runtime's window procedures and `dispatch` calls on this
+    /// thread's stack. A message another thread or process sends is
+    /// handled wherever this thread waits for one it sent, or for a COM
+    /// call: EmptyClipboard's WM_DESTROYCLIPBOARD to the clipboard's
+    /// owner, a toast's removal. So WM_ENDSESSION can come inside a
+    /// handler that holds a terminal, a window or a core frame; then this
+    /// is more than its own frame's one, and the end tears nothing down
+    /// (`endSession`). Per thread, as a stack is.
+    pub threadlocal var handler_depth: u32 = 0;
 
     pub const Error = error{
         Win32ClassRegistrationFailed,
@@ -634,8 +647,124 @@ pub const App = struct {
         // Every remaining window is destroyed with its terminals, as a
         // window close does it (Window.destroy), so that CoreApp.deinit,
         // which `main` runs after this, finds an empty surface list and its
-        // `font_grid_set.count() == 0` assert holds.
-        //
+        // `font_grid_set.count() == 0` assert holds. None is left when the
+        // session's end took them (`endSession`).
+        self.destroyWindows();
+        self.windows.deinit(self.core_app.alloc);
+
+        // Every terminal is a child window of a frame, so none is left.
+        self.surfaces.deinit(self.core_app.alloc);
+
+        // Windows asked for and never created: the process is quitting.
+        self.freeRequests();
+
+        self.stopQuitTimer();
+
+        _ = win32.DestroyWindow(self.msg_hwnd);
+        unregisterClasses(self.hinstance);
+        self.config.deinit();
+
+        if (self.taskbar_list) |list| list.release();
+        // Each terminal's toasts went with it (`surfaceDestroyed`). Not
+        // every toast of the app ID: another Ghostty process shows its own
+        // under it.
+        if (self.toasts) |t| {
+            t.deinit();
+            self.core_app.alloc.destroy(t);
+        }
+        // A COM object, released before COM is uninitialized.
+        self.bell_audio.deinit(self.core_app.alloc);
+        if (self.com_initialized) win32.CoUninitialize();
+    }
+
+    /// WM_ENDSESSION on a frame, for a session that ends (`lparam`, its
+    /// reason, is logged): shutdown, restart, sign-out, or the Restart
+    /// Manager closing Ghostty for an installer (ENDSESSION_CLOSEAPP).
+    /// Nothing is asked, as on macOS (see WM_QUERYENDSESSION in
+    /// `Window.handleMessage`). Every window goes here with its terminals,
+    /// as `terminate` takes them: their programs end as at a quit, and
+    /// their toasts leave the notification center, as macOS removes its
+    /// own (`applicationWillTerminate`), from a thread of their own
+    /// (`removeToastsOnThread`). It cannot wait for `run`: the process may
+    /// be ended any time after the message returns. The loop quits too, as
+    /// ENDSESSION_CLOSEAPP requires, and `terminate` then finds no window
+    /// left.
+    ///
+    /// Only the quit is posted where no teardown may run: inside another
+    /// of the runtime's handlers (`handler_depth`), which the end came
+    /// into while it waited, and whose terminal, window or core frame the
+    /// teardown would free under it; and inside a tick, a prompt, another
+    /// teardown's wait, or a terminal's menu or scroll bar loop
+    /// (`canTearDown`). The windows and their toasts are then left to
+    /// `terminate`, once `run` has left its loop, if the process still
+    /// runs by then. MessageBoxW's loop ends on WM_QUIT and posts it
+    /// again; whether a menu's or a scroll bar's loop does is not known.
+    pub fn endSession(self: *App, lparam: win32.LPARAM) void {
+        // `terminate`, or an end before this one, is tearing the windows
+        // down, and its wait for a terminal's threads pumped this message.
+        if (self.terminating) return;
+        log.info("the session is ending, quitting lparam=0x{x}", .{@as(usize, @bitCast(lparam))});
+        self.quit = true;
+        win32.PostQuitMessage(0);
+        // One: the procedure of the frame this came to.
+        if (handler_depth > 1 or !self.canTearDown()) {
+            log.warn("the session ends inside a handler, a tick, a prompt, a teardown or a terminal's loop, so the windows close after it, with their toasts", .{});
+            return;
+        }
+        const alloc = self.core_app.alloc;
+        const groups = self.shownToastGroups();
+        // Freed once the removal is joined: its thread reads them.
+        defer alloc.free(groups);
+        const removal = self.removeToastsOnThread(groups);
+        self.destroyWindows();
+        // Only now, so that the programs end while the notification center
+        // removes the toasts, and one that stalls holds up no more than
+        // this return.
+        removal.join();
+    }
+
+    /// The groups of the terminals' toasts that may still be shown
+    /// (`DesktopNotifications.shown`), the caller's to free; none, logged,
+    /// if there is no memory for them, and those toasts then stay, as this
+    /// thread cannot remove them inside WM_ENDSESSION
+    /// (`removeToastsOnThread`).
+    fn shownToastGroups(self: *App) []const u64 {
+        var n: usize = 0;
+        for (self.surfaces.items) |surface| {
+            if (surface.notifications.shown) n += 1;
+        }
+        const groups = self.core_app.alloc.alloc(u64, n) catch |err| {
+            log.warn("toasts not removed at the session's end err={}", .{err});
+            return &.{};
+        };
+        var i: usize = 0;
+        for (self.surfaces.items) |surface| {
+            if (!surface.notifications.shown) continue;
+            groups[i] = surface.notifications.id;
+            i += 1;
+        }
+        return groups;
+    }
+
+    /// Start removing the toasts of `groups` from a thread of their own,
+    /// and mark every terminal's removed, so the teardown that follows
+    /// asks nothing more of the notifier. WM_ENDSESSION is sent by another
+    /// process, and COM refuses an out-of-process call from the thread
+    /// handling it (RPC_E_CANTCALLOUT_ININPUTSYNCCALL): the notification
+    /// center's RemoveGroupWithId failed there with that error, leaving
+    /// the toasts shown after Ghostty had gone. The caller joins the
+    /// removal, and keeps `groups` until then.
+    fn removeToastsOnThread(self: *App, groups: []const u64) toast.Removal {
+        const notifier = self.notifier orelse return .{};
+        const removal: toast.Removal = if (groups.len > 0) notifier.removeGroupsOnThread(groups) else .{};
+        for (self.surfaces.items) |surface| surface.notifications.clear(null, surface.hwnd);
+        return removal;
+    }
+
+    /// Destroy every window with its terminals, for good: none is torn
+    /// down any other way after it (`terminating`), and none is made, as
+    /// `quit` is set by then and `createRequested` checks it.
+    fn destroyWindows(self: *App) void {
         // `terminating` makes destroyPosted and close ignore anything still
         // queued: stopCore pumps messages, and a WM_GHOSTTY_DESTROY or
         // WM_CLOSE dispatched there must not start a second teardown (or a
@@ -665,31 +794,6 @@ pub const App = struct {
                 self.windowDestroyed(window);
             }
         }
-        self.windows.deinit(self.core_app.alloc);
-
-        // Every terminal is a child window of a frame, so none is left.
-        self.surfaces.deinit(self.core_app.alloc);
-
-        // Windows asked for and never created: the process is quitting.
-        self.freeRequests();
-
-        self.stopQuitTimer();
-
-        _ = win32.DestroyWindow(self.msg_hwnd);
-        unregisterClasses(self.hinstance);
-        self.config.deinit();
-
-        if (self.taskbar_list) |list| list.release();
-        // Each terminal's toasts went with it (`surfaceDestroyed`). Not
-        // every toast of the app ID: another Ghostty process shows its own
-        // under it.
-        if (self.toasts) |t| {
-            t.deinit();
-            self.core_app.alloc.destroy(t);
-        }
-        // A COM object, released before COM is uninitialized.
-        self.bell_audio.deinit(self.core_app.alloc);
-        if (self.com_initialized) win32.CoUninitialize();
     }
 
     /// The taskbar buttons' progress bars, made the first time a button
@@ -818,6 +922,11 @@ pub const App = struct {
     /// Dispatch a message `run` or `waitForThread` took from the queue,
     /// first offering it to an open title prompt (`dialogMessage`).
     fn dispatch(self: *App, msg: *win32.MSG) void {
+        // Counted as a handler too: IsDialogMessageW and DispatchMessageW
+        // run the system's procedures for the title prompt's controls,
+        // which are no window procedure of ours.
+        handler_depth += 1;
+        defer handler_depth -= 1;
         if (self.dialogMessage(msg)) return;
         _ = win32.TranslateMessage(msg);
         _ = win32.DispatchMessageW(msg);
@@ -2403,8 +2512,13 @@ pub const App = struct {
 
     /// The system's notifications, made the first time one is shown, with
     /// Ghostty's app ID registered for them (`toast.register`); null,
-    /// logged once, if they cannot be.
+    /// logged once, if they cannot be. Null too once the windows are going
+    /// for good (`terminating`): a toast shown from a tick in a teardown's
+    /// wait would outlive its terminal if that one's teardown has passed,
+    /// and inside WM_ENDSESSION its own could not remove it from this
+    /// thread (`removeToastsOnThread`).
     pub fn notifierFor(self: *App) ?toast.Notifier {
+        if (self.terminating) return null;
         if (self.notifier) |notifier| return notifier;
         if (self.toasts_failed) return null;
         const t = self.makeToasts() catch |err| {
@@ -3121,6 +3235,8 @@ pub const App = struct {
         wparam: win32.WPARAM,
         lparam: win32.LPARAM,
     ) callconv(.winapi) win32.LRESULT {
+        handler_depth += 1;
+        defer handler_depth -= 1;
         const self: *App = ptr: {
             const v = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
             if (v == 0) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -10450,6 +10566,422 @@ test "win32: quitting with title prompts open leaves nothing behind" {
     app.terminate();
     try std.testing.expect(!win32.IsWindow(tab_prompt).toBool());
     try std.testing.expect(!win32.IsWindow(own_prompt).toBool());
+}
+
+/// For tests: dispatch every message waiting on this thread, as
+/// `testPump` does, and say whether a WM_QUIT was among them, taken out
+/// so that it ends no later wait. Not a peek for WM_QUIT alone: it comes
+/// out only once no other posted message is waiting.
+fn testTakeQuit() bool {
+    var quit = false;
+    var msg: win32.MSG = undefined;
+    while (win32.PeekMessageW(&msg, null, 0, 0, win32.PM_REMOVE).toBool()) {
+        if (msg.message == win32.WM_QUIT) {
+            quit = true;
+            continue;
+        }
+        _ = win32.TranslateMessage(&msg);
+        _ = win32.DispatchMessageW(&msg);
+    }
+    return quit;
+}
+
+test "win32: a session's end is never refused, and closes every window with its toasts" {
+    // As macOS, which asks nothing at shutdown, restart or sign-out: the
+    // query is answered yes, and the end takes every window from inside
+    // the handler, as `terminate` would, with the toasts of its terminals.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    var fake: toast.TestNotifier = .{};
+    app.notifier = fake.notifier();
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    const b = try testPane(&app, f);
+    f.tab().tree = try testRow(alloc, &.{ a, b });
+    f.tab().focused = a;
+    const g = try testFrame(&app);
+    const c = try testPane(&app, g);
+    g.tab().tree = try .init(alloc, c);
+    g.tab().focused = c;
+    for ([_]*Surface{ b, c }) |pane| try std.testing.expect(try app.performAction(
+        .{ .surface = &pane.core_surface },
+        .desktop_notification,
+        .{ .title = "build", .body = "done" },
+    ));
+    const b_id = b.notifications.id;
+    const c_id = c.notifications.id;
+
+    // Yes, for a shutdown and for the Restart Manager (ENDSESSION_CLOSEAPP),
+    // with nothing closed yet; nor when another program refused it after
+    // all (wParam 0).
+    try std.testing.expectEqual(1, Window.wndProc(f.hwnd, win32.WM_QUERYENDSESSION, 0, 0));
+    try std.testing.expectEqual(1, Window.wndProc(g.hwnd, win32.WM_QUERYENDSESSION, 0, 0x1));
+    try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 0, 0x1));
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expect(!app.quit);
+    try std.testing.expect(!testTakeQuit());
+    try std.testing.expectEqual(0, fake.removed_groups_len);
+    try std.testing.expectEqual(0, fake.removed_on_thread_len);
+
+    // The toasts go from a thread of their own, as COM refuses the call
+    // from this one while it handles another process's message; the
+    // teardown then has none left to remove here. That thread is joined
+    // only once the windows are gone, so that their programs end
+    // meanwhile.
+    const Joined = struct {
+        var app_joined: *App = undefined;
+        var windows: ?usize = null;
+        fn join() void {
+            windows = app_joined.windows.items.len;
+        }
+    };
+    Joined.app_joined = &app;
+    fake.on_join = &Joined.join;
+    try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1));
+    try std.testing.expectEqual(@as(?usize, 0), Joined.windows);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindow(g.hwnd).toBool());
+    try std.testing.expectEqual(0, fake.removed_groups_len);
+    try std.testing.expectEqual(2, fake.removed_on_thread_len);
+    const removed = fake.removed_on_thread[0..2];
+    try std.testing.expect(std.mem.indexOfScalar(u64, removed, b_id) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u64, removed, c_id) != null);
+    try std.testing.expect(app.quit);
+    try std.testing.expect(testTakeQuit());
+
+    // Once: an end after that teardown does nothing, as one inside its
+    // waits for a terminal's threads would (they pump messages; these
+    // terminals have no core to wait for).
+    app.endSession(0x1);
+    try std.testing.expect(!testTakeQuit());
+
+    // Nothing more is shown: a prompt, as a terminal's clipboard read asks
+    // from a tick in those waits, is answered Cancel without a box, and a
+    // toast is refused.
+    const NoBox = struct {
+        var boxes: usize = 0;
+        fn box(owner: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
+            _ = owner;
+            _ = text;
+            _ = buttons;
+            boxes += 1;
+            return win32.IDOK;
+        }
+    };
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &NoBox.box;
+    defer message_box.* = null;
+    try std.testing.expect(!confirm(&app, null, L("Paste?"), .cancel));
+    try std.testing.expectEqual(0, NoBox.boxes);
+    try std.testing.expect(!try app.performAction(.app, .desktop_notification, .{ .title = "late", .body = "" }));
+    try std.testing.expectEqual(2, fake.shown_len);
+
+    // `main` still runs `terminate`, which finds no window left.
+    terminated = true;
+    app.terminate();
+}
+
+test "win32: a session's end inside a prompt only quits, and the windows close after it" {
+    // No teardown under a prompt (`canTearDown`): its message loop ends
+    // on the quit, and `terminate` takes the windows once it has returned.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    // The end comes while the close confirmation is open, as MessageBoxW's
+    // loop would dispatch it to the box's owner, the frame.
+    const EndInPrompt = struct {
+        var ended: *App = undefined;
+        var result: win32.LRESULT = -1;
+        var windows: usize = 0;
+        var quit = false;
+        fn box(owner: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
+            _ = text;
+            _ = buttons;
+            result = Window.wndProc(owner.?, win32.WM_ENDSESSION, 1, 0x1);
+            windows = ended.windows.items.len;
+            quit = ended.quit;
+            return win32.IDCANCEL;
+        }
+    };
+    EndInPrompt.ended = &app;
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &EndInPrompt.box;
+    defer message_box.* = null;
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, a);
+    f.tab().focused = a;
+
+    // A process is running, so the close asks.
+    a.close(true);
+    try std.testing.expectEqual(0, EndInPrompt.result);
+    try std.testing.expectEqual(1, EndInPrompt.windows);
+    try std.testing.expect(EndInPrompt.quit);
+    try std.testing.expectEqual(0, app.prompt_depth);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expect(!app.terminating);
+    try std.testing.expect(testTakeQuit());
+
+    terminated = true;
+    app.terminate();
+    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+}
+
+test "win32: a session's end inside another handler only quits, and the windows close after it" {
+    // A handler that waits on another process lets this thread handle the
+    // end meanwhile: here a terminal gaining the focus removes its toasts,
+    // a COM call. Its teardown would free the terminal under that handler
+    // (`handler_depth`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    var fake: toast.TestNotifier = .{};
+    app.notifier = fake.notifier();
+    const EndInRemoval = struct {
+        var ended: *App = undefined;
+        var frame: win32.HWND = undefined;
+        var result: win32.LRESULT = -1;
+        var windows: usize = 0;
+        fn remove() void {
+            result = Window.wndProc(frame, win32.WM_ENDSESSION, 1, 0x1);
+            windows = ended.windows.items.len;
+        }
+    };
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, a);
+    f.tab().focused = a;
+    try std.testing.expect(try app.performAction(
+        .{ .surface = &a.core_surface },
+        .desktop_notification,
+        .{ .title = "build", .body = "done" },
+    ));
+    EndInRemoval.ended = &app;
+    EndInRemoval.frame = f.hwnd;
+    fake.on_remove = &EndInRemoval.remove;
+    defer fake.on_remove = null;
+
+    _ = Surface.wndProc(a.hwnd, win32.WM_SETFOCUS, 0, 0);
+    fake.on_remove = null;
+    try std.testing.expectEqual(1, fake.removed_groups_len);
+    try std.testing.expectEqual(0, EndInRemoval.result);
+    try std.testing.expectEqual(1, EndInRemoval.windows);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(win32.IsWindow(a.hwnd).toBool());
+    try std.testing.expect(app.quit);
+    try std.testing.expect(!app.terminating);
+    try std.testing.expect(testTakeQuit());
+
+    terminated = true;
+    app.terminate();
+    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+}
+
+test "win32: a session's end inside a system control's procedure only quits" {
+    // `dispatch` counts as a handler: the title prompt's controls are the
+    // system's, and one that waits on another process, as an EDIT's paste
+    // waits on the clipboard's owner, lets the end in. The teardown would
+    // destroy that control under its own procedure. A control of no
+    // procedure of ours stands in for it, dispatched by a teardown's wait
+    // (`waitForThread`), as `run` would.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    const InControl = struct {
+        var ended: *App = undefined;
+        var frame: win32.HWND = undefined;
+        var result: win32.LRESULT = -1;
+        var windows: usize = 0;
+        fn proc(hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+            if (msg != win32.WM_APP) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            result = Window.wndProc(frame, win32.WM_ENDSESSION, 1, 0x1);
+            windows = ended.windows.items.len;
+            return 0;
+        }
+        // No core here to tick.
+        fn tick(_: *App) void {}
+        fn sleep() void {
+            win32.Sleep(300);
+        }
+    };
+    App.test_tick = &InControl.tick;
+    defer App.test_tick = null;
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, a);
+    f.tab().focused = a;
+    InControl.ended = &app;
+    InControl.frame = f.hwnd;
+    const control = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(control);
+    _ = win32.SetWindowLongPtrW(control, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&InControl.proc)));
+    try std.testing.expect(win32.PostMessageW(control, win32.WM_APP, 0, 0).toBool());
+
+    const thread = try std.Thread.spawn(.{}, InControl.sleep, .{});
+    app.waitForThread(thread.getHandle());
+    thread.join();
+    try std.testing.expectEqual(0, InControl.result);
+    try std.testing.expectEqual(1, InControl.windows);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(app.quit);
+    try std.testing.expect(!app.terminating);
+    try std.testing.expect(testTakeQuit());
+
+    terminated = true;
+    app.terminate();
+    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+}
+
+test "win32: a session's end inside a terminal's loop only quits, and leaves the toasts to the quit" {
+    // A terminal's menu or scroll bar loop defers every teardown, the
+    // end's too (`terminal_loops`), and the toasts then go with the
+    // windows in `terminate`, if the process lives that long.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    var fake: toast.TestNotifier = .{};
+    app.notifier = fake.notifier();
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, a);
+    f.tab().focused = a;
+    try std.testing.expect(try app.performAction(
+        .{ .surface = &a.core_surface },
+        .desktop_notification,
+        .{ .title = "build", .body = "done" },
+    ));
+
+    app.beginTerminalLoop();
+    try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1));
+    app.endTerminalLoop();
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(win32.IsWindow(a.hwnd).toBool());
+    try std.testing.expect(a.notifications.shown);
+    try std.testing.expectEqual(0, fake.removed_on_thread_len);
+    try std.testing.expect(app.quit);
+    try std.testing.expect(testTakeQuit());
+
+    terminated = true;
+    app.terminate();
+    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expectEqual(1, fake.removed_groups_len);
+}
+
+test "win32: a session's end with no memory for the toasts' groups still closes every window" {
+    // The toasts then stay: this thread cannot remove them inside
+    // WM_ENDSESSION, so the teardown does not try (`shownToastGroups`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    var fake: toast.TestNotifier = .{};
+    app.notifier = fake.notifier();
+
+    const f = try testFrame(&app);
+    const a = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, a);
+    f.tab().focused = a;
+    try std.testing.expect(try app.performAction(
+        .{ .surface = &a.core_surface },
+        .desktop_notification,
+        .{ .title = "build", .body = "done" },
+    ));
+
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    core_app.alloc = failing.allocator();
+    const result = Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1);
+    core_app.alloc = alloc;
+    try std.testing.expectEqual(0, result);
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expectEqual(0, fake.removed_on_thread_len);
+    try std.testing.expectEqual(0, fake.removed_groups_len);
+    try std.testing.expect(testTakeQuit());
+
+    terminated = true;
+    app.terminate();
 }
 
 test "win32: a title prompt takes its keys while a teardown waits for a thread" {

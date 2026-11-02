@@ -1242,6 +1242,8 @@ pub fn wndProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     if (msg == win32.WM_NCCREATE) {
         const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
         if (cs.lpCreateParams) |param| {
@@ -1337,6 +1339,8 @@ fn editProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     const proc = edit_proc.?;
     const window = windowOfChild(hwnd) orelse return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
 
@@ -1398,6 +1402,8 @@ fn listProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     const proc = list_proc.?;
     const window = windowOfChild(hwnd) orelse return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
     const p = &window.palette;

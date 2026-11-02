@@ -17,6 +17,7 @@
 
 const std = @import("std");
 
+const App = @import("App.zig").App;
 const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 
@@ -425,6 +426,8 @@ pub fn wndProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     if (msg == win32.WM_NCCREATE) {
         const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
         if (cs.lpCreateParams) |param| {

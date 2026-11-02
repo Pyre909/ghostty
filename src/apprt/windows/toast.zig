@@ -484,6 +484,12 @@ pub const Notifier = struct {
         remove: *const fn (*anyopaque, group: u64, tag: u64) void,
         /// Remove every toast of a group.
         removeGroup: *const fn (*anyopaque, group: u64) void,
+        /// Start removing every toast of each group, from a thread of its
+        /// own, which reads `groups` until it is joined: for a caller
+        /// handling a message that another process sent (WM_ENDSESSION),
+        /// from whose thread COM refuses an out-of-process call
+        /// (RPC_E_CANTCALLOUT_ININPUTSYNCCALL).
+        removeGroupsOnThread: *const fn (*anyopaque, groups: []const u64) Removal,
     };
 
     pub fn show(self: Notifier, toast: Toast) bool {
@@ -496,6 +502,24 @@ pub const Notifier = struct {
 
     pub fn removeGroup(self: Notifier, group: u64) void {
         self.vtable.removeGroup(self.ptr, group);
+    }
+
+    pub fn removeGroupsOnThread(self: Notifier, groups: []const u64) Removal {
+        return self.vtable.removeGroupsOnThread(self.ptr, groups);
+    }
+};
+
+/// A removal `Notifier.removeGroupsOnThread` started; `join` waits for it
+/// to end. None if its thread could not be started.
+pub const Removal = struct {
+    thread: ?std.Thread = null,
+    /// For tests: called by `join` (`TestNotifier.on_join`).
+    test_on_join: if (builtin.is_test) ?*const fn () void else void =
+        if (builtin.is_test) null else {},
+
+    pub fn join(self: Removal) void {
+        if (self.thread) |thread| thread.join();
+        if (builtin.is_test) if (self.test_on_join) |f| f();
     }
 };
 
@@ -515,6 +539,14 @@ pub const TestNotifier = struct {
     removed_len: usize = 0,
     removed_groups: [8]u64 = undefined,
     removed_groups_len: usize = 0,
+    removed_on_thread: [8]u64 = undefined,
+    removed_on_thread_len: usize = 0,
+    /// Called by `remove` and `removeGroup` once they are recorded: the
+    /// system's are COM calls, inside which a message that another process
+    /// sends this thread is handled.
+    on_remove: ?*const fn () void = null,
+    /// Called when the removal `removeGroupsOnThread` started is joined.
+    on_join: ?*const fn () void = null,
 
     pub fn notifier(self: *TestNotifier) Notifier {
         return .{ .ptr = self, .vtable = &vtable };
@@ -524,6 +556,7 @@ pub const TestNotifier = struct {
         .show = show,
         .remove = remove,
         .removeGroup = removeGroup,
+        .removeGroupsOnThread = removeGroupsOnThread,
     };
 
     fn show(ptr: *anyopaque, t: Toast) bool {
@@ -547,12 +580,23 @@ pub const TestNotifier = struct {
         const self: *TestNotifier = @ptrCast(@alignCast(ptr));
         self.removed[self.removed_len] = .{ group, tag };
         self.removed_len += 1;
+        if (self.on_remove) |f| f();
     }
 
     fn removeGroup(ptr: *anyopaque, group: u64) void {
         const self: *TestNotifier = @ptrCast(@alignCast(ptr));
         self.removed_groups[self.removed_groups_len] = group;
         self.removed_groups_len += 1;
+        if (self.on_remove) |f| f();
+    }
+
+    fn removeGroupsOnThread(ptr: *anyopaque, groups: []const u64) Removal {
+        const self: *TestNotifier = @ptrCast(@alignCast(ptr));
+        for (groups) |group| {
+            self.removed_on_thread[self.removed_on_thread_len] = group;
+            self.removed_on_thread_len += 1;
+        }
+        return .{ .test_on_join = self.on_join };
     }
 };
 
@@ -614,6 +658,7 @@ pub const Toasts = struct {
         .show = showOpaque,
         .remove = removeOpaque,
         .removeGroup = removeGroupOpaque,
+        .removeGroupsOnThread = removeGroupsOnThreadOpaque,
     };
 
     fn showOpaque(ptr: *anyopaque, toast: Toast) bool {
@@ -685,6 +730,40 @@ pub const Toasts = struct {
         const g = String.decimal(group) catch return;
         defer g.deinit();
         check(self.history.vtable.RemoveGroupWithId(self.history, g.handle, self.app_id.handle), "RemoveGroupWithId") catch {};
+    }
+
+    fn removeGroupsOnThreadOpaque(ptr: *anyopaque, groups: []const u64) Removal {
+        const self: *Toasts = @ptrCast(@alignCast(ptr));
+        // The thread reads `app_id`, which lives until `deinit`, and
+        // `groups`, which the caller keeps until the join.
+        const thread = std.Thread.spawn(.{}, removeGroupsWith, .{ self.app_id.handle, groups }) catch |err| {
+            log.warn("toast: no thread to remove toasts from err={}", .{err});
+            return .{};
+        };
+        return .{ .thread = thread };
+    }
+
+    /// The thread of `removeGroupsOnThread`, in the multithreaded
+    /// apartment, with a history of its own: `history` was made in the UI
+    /// thread's apartment, and is not known to be callable from another.
+    fn removeGroupsWith(id: HSTRING, groups: []const u64) void {
+        const hr = win32.CoInitializeEx(null, win32.COINIT_MULTITHREADED);
+        if (hr < 0) {
+            log.warn("toast: CoInitializeEx failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return;
+        }
+        defer win32.CoUninitialize();
+        const statics = factoryOf(IToastNotificationManagerStatics2, "Windows.UI.Notifications.ToastNotificationManager") catch return;
+        defer release(statics);
+        var out: ?*IToastNotificationHistory = null;
+        check(statics.vtable.get_History(statics, &out), "get_History") catch return;
+        const history = out orelse return;
+        defer release(history);
+        for (groups) |group| {
+            const g = String.decimal(group) catch continue;
+            defer g.deinit();
+            check(history.vtable.RemoveGroupWithId(history, g.handle, id), "RemoveGroupWithId") catch {};
+        }
     }
 };
 

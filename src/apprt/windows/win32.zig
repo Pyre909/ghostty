@@ -175,8 +175,15 @@ pub const WM_ACTIVATE: UINT = 0x0006;
 pub const WM_SETFOCUS: UINT = 0x0007;
 pub const WM_KILLFOCUS: UINT = 0x0008;
 pub const WM_CLOSE: UINT = 0x0010;
+/// Sent to top-level windows, never to message-only ones; nonzero lets
+/// the session end.
+pub const WM_QUERYENDSESSION: UINT = 0x0011;
 pub const WM_QUIT: UINT = 0x0012;
 pub const WM_ERASEBKGND: UINT = 0x0014;
+/// Sent to top-level windows, never to message-only ones; wParam is
+/// nonzero when the session ends, which it may any time after the last
+/// window has returned.
+pub const WM_ENDSESSION: UINT = 0x0016;
 /// Sent to top-level windows, never to message-only ones.
 pub const WM_SETTINGCHANGE: UINT = 0x001A;
 pub const WM_SETCURSOR: UINT = 0x0020;
@@ -732,6 +739,7 @@ pub extern "shell32" fn DragQueryFileW(
     len: UINT,
 ) callconv(.winapi) UINT;
 pub extern "shell32" fn DragFinish(drop: HDROP) callconv(.winapi) void;
+pub const COINIT_MULTITHREADED: DWORD = 0x0;
 pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
 pub const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
 pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;

@@ -947,6 +947,8 @@ pub fn wndProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     // As in Surface.wndProc: WM_NCCREATE carries the CREATESTRUCTW, and
     // messages before it find no pointer and fall through.
     if (msg == win32.WM_NCCREATE) {
@@ -994,6 +996,20 @@ fn handleMessage(
         WM_GHOSTTY_DESTROY => {
             // Frees `self` unless deferred; nothing may follow it.
             self.destroyPosted();
+            return 0;
+        },
+
+        // Shutdown, restart, sign-out, or the Restart Manager closing
+        // Ghostty for an installer. Never refused, even with a command
+        // running: macOS asks nothing at shutdown, restart or logout
+        // (`AppDelegate.applicationShouldTerminate`), and GTK takes no
+        // part in ending a session. The windows close at WM_ENDSESSION,
+        // as WM_QUERYENDSESSION's documentation asks.
+        win32.WM_QUERYENDSESSION => return 1,
+
+        win32.WM_ENDSESSION => {
+            // Frees `self` when it tears down; nothing may follow it.
+            if (wparam != 0) self.app.endSession(lparam);
             return 0;
         },
 

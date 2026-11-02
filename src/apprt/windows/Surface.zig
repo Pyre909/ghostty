@@ -1150,8 +1150,9 @@ pub const Surface = struct {
 
         if (process_alive and !confirm(self.app, self.hwnd, self.closePrompt(), .ok)) {
             // `self` is still valid: `confirm` raises `prompt_depth`, so no
-            // teardown can run inside its modal loop (destroyPosted defers),
-            // and nothing but destroyPosted destroys a surface window.
+            // teardown can run inside its modal loop: destroyPosted defers,
+            // and so does the session's end (`App.endSession`), the only
+            // other that destroys a surface window.
             self.closing = false;
             return;
         }
@@ -3112,6 +3113,8 @@ pub const Surface = struct {
         wparam: win32.WPARAM,
         lparam: win32.LPARAM,
     ) callconv(.winapi) win32.LRESULT {
+        App.handler_depth += 1;
+        defer App.handler_depth -= 1;
         // WM_NCCREATE is the first message that carries the CREATESTRUCTW, so
         // it is the earliest point at which the Surface pointer can be
         // attached. Messages that arrive before it (WM_GETMINMAXINFO does)

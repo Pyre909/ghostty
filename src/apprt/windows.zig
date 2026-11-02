@@ -242,6 +242,26 @@
 //! a lower integrity level unless the window lets it through
 //! (ChangeWindowMessageFilterEx), which this one does not (not tried).
 //!
+//! ## Session end
+//!
+//! Shutdown, restart, sign-out, and the Restart Manager closing Ghostty
+//! for an installer are never refused, even with a command running
+//! (WM_QUERYENDSESSION returns TRUE): macOS asks nothing then
+//! (`AppDelegate.applicationShouldTerminate`), and GTK takes no part in
+//! ending a session. At WM_ENDSESSION every window closes with its
+//! terminals, as a quit closes them (`App.endSession`): their programs
+//! end, their toasts leave the notification center, as macOS removes its
+//! own, and the message loop quits, as ENDSESSION_CLOSEAPP asks. This
+//! cannot wait for the loop, as the process may be ended once the message
+//! returns. Where no teardown may run, the windows and their toasts are
+//! left until the loop has quit, which the session may not wait for:
+//! when the end comes inside another handler of Ghostty's, which it can
+//! reach while that one waits on another process, or inside a tick, a
+//! prompt, another teardown, or a terminal's menu or scroll bar. Once the
+//! windows are closing for good nothing more is shown: a prompt is
+//! answered Cancel, and a toast is refused. Ghostty does not ask to be
+//! started again after an update (RegisterApplicationRestart).
+//!
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another

@@ -37,6 +37,7 @@ const builtin = @import("builtin");
 
 const input = @import("../../input.zig");
 const CoreSurface = @import("../../Surface.zig");
+const App = @import("App.zig").App;
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
@@ -649,6 +650,8 @@ pub fn wndProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     if (msg == win32.WM_NCCREATE) {
         const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
         if (cs.lpCreateParams) |param| {
@@ -812,6 +815,8 @@ fn editProc(
     wparam: win32.WPARAM,
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
+    App.handler_depth += 1;
+    defer App.handler_depth -= 1;
     const proc = edit_proc.?;
     const parent = win32.GetAncestor(hwnd, win32.GA_PARENT);
     const surface = (if (parent) |p| surfaceOf(p) else null) orelse {
