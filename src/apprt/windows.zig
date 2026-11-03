@@ -54,9 +54,10 @@
 //! the focus once the core's key callback has returned
 //! (`Tab.pending_focus`), or after such a request when it follows one,
 //! and ends a zoom or moves it (`Window.focusFromGoto`).
-//! The process quits when its last window closes, whatever
-//! `quit-after-last-window-closed` says: with no window left there is
-//! nothing to open another from (`App.setQuitTimer`).
+//! The process quits when its last window closes unless
+//! `quit-after-last-window-closed` is false and a registered global
+//! keybind opens a window, the only way to open one with none left
+//! (`App.setQuitTimer`).
 //!
 //! ## Search
 //!

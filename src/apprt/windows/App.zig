@@ -2097,6 +2097,16 @@ pub const App = struct {
         self.hotkeys.refresh(self.core_app.alloc, self.msg_hwnd, &self.config) catch |err| {
             log.warn("cannot register the global keybinds err={}", .{err});
         };
+        // With no window open (a global reload_config, or the soft reload
+        // after a change of color scheme), decide again whether the app
+        // stays open: a reload that registers a hotkey that opens a window
+        // cancels the quit, and one that takes the last away arms it. With
+        // one open, the core starts the timer when the last closes.
+        if (self.surfaces.items.len == 0) {
+            const stays = self.staysOpen();
+            if (stays and self.quit_timer != .off) self.stopQuitTimer();
+            if (!stays and self.quit_timer == .off) _ = self.setQuitTimer(.start);
+        }
         for (self.windows.items) |window| {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
@@ -2131,28 +2141,27 @@ pub const App = struct {
             .stop => return true,
 
             .start => {
-                // The apprt owns the quit-after-last-window policy, and this
-                // foundation deliberately overrides the configuration.
+                // The apprt owns the quit-after-last-window policy, and
+                // overrides the configuration unless a window can be opened
+                // with none open.
                 //
                 // `quit-after-last-window-closed` is `builtin.target.os.tag == .linux`
                 // (`Config.@"quit-after-last-window-closed"`), i.e. false on
-                // Windows. But once its last window has closed, this runtime
-                // has nothing left to open another from: `.new_window` is
-                // asked for from a window, and there is no tray icon and no
-                // IPC to a running instance (`performIpc`). A global
-                // keybind's hotkey (`Hotkeys`) could open one, but this
-                // does not look for one yet. Honoring `false` would leave
-                // an invisible process with a message-only window and a
-                // GetMessageW that blocks forever, endable only from Task
-                // Manager.
-                //
-                // Delete this override -- not the config read -- as soon as
-                // a window can be opened with none open.
+                // Windows. Once its last window has closed, this runtime can
+                // open another only from a global keybind's hotkey
+                // (`staysOpen`): `.new_window` is otherwise asked for from a
+                // window, and there is no tray icon and no IPC to a running
+                // instance (`performIpc`). Without such a hotkey, honoring
+                // `false` would leave an invisible process with a
+                // message-only window and a GetMessageW that blocks forever,
+                // endable only from Task Manager. A reload with no window
+                // open decides again (`configChange`).
                 //
                 // The override is reported by logQuitOverride where the quit is
                 // carried out, not here: `.start` also arrives at launch, from
                 // startQuitTimer, for a quit that newWindow cancels, so
                 // logging here would report quits that never happen.
+                if (self.staysOpen()) return true;
 
                 const delay_ms: u64 = if (self.config.@"quit-after-last-window-closed-delay") |v|
                     v.asMilliseconds()
@@ -2181,6 +2190,14 @@ pub const App = struct {
                 return true;
             },
         }
+    }
+
+    /// Whether the app stays open with no window: the configuration says
+    /// not to quit after the last one, and a global keybind's hotkey can
+    /// open another (`Hotkeys.opensWindow`).
+    fn staysOpen(self: *const App) bool {
+        return !self.config.@"quit-after-last-window-closed" and
+            self.hotkeys.opensWindow(&self.config.keybind.set);
     }
 
     fn stopQuitTimer(self: *App) void {
@@ -2215,7 +2232,7 @@ pub const App = struct {
         if (self.config.@"quit-after-last-window-closed") return;
         log.info(
             "quitting despite quit-after-last-window-closed=false: " ++
-                "this runtime cannot open a window once none is left",
+                "no registered global keybind opens a window",
             .{},
         );
     }
@@ -3278,16 +3295,7 @@ pub const App = struct {
             log.debug("a global keybind pressed while the core is busy is dropped", .{});
             return;
         }
-        const entry = self.config.keybind.set.get(trigger) orelse return;
-        const leaf: input.Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
-            // The configuration refuses a global sequence.
-            .leader => return,
-            inline .leaf, .leaf_chained => |leaf| leaf.generic(),
-        };
-        // Only after a reload that ran out of memory (`configChange`),
-        // which leaves the hotkeys as they were: the keys may be bound
-        // otherwise now.
-        if (!leaf.flags.global) return;
+        const leaf = Hotkeys.globalLeaf(&self.config.keybind.set, trigger) orelse return;
         const actions = leaf.actionsSlice();
         if (builtin.is_test) if (test_perform_all) |seen| return seen(self, actions);
         self.core_app.performAllChainedAction(self, actions);
@@ -19818,4 +19826,85 @@ test "win32: a global keybind's key-up reaches no terminal's core" {
     TestHotkeys.press(&app, a_id, ctrl_a);
     try std.testing.expect(!app.hotkeyRelease(win32.WM_KEYDOWN, 'A'));
     try std.testing.expect(!app.hotkeyRelease(win32.WM_KEYUP, 'A'));
+}
+
+test "win32: the app stays open with no window while a global keybind can open one" {
+    // `quit-after-last-window-closed` is false by default here. `.start`
+    // comes at launch and at the last window's close; with no delay set,
+    // the timer expires at once, and `run` then quits.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    // No global keybind opens a window: the reload with no window arms
+    // the timer, and so does `.start`.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+b=new_tab"});
+    try std.testing.expectEqual(.expired, app.quit_timer);
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.expired, app.quit_timer);
+
+    // A reload that registers one cancels the quit, and `.start` quits
+    // nothing; as with a chain.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    try std.testing.expectEqual(.off, app.quit_timer);
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.off, app.quit_timer);
+    try TestHotkeys.apply(&app, &.{ "global:ctrl+b=new_tab", "chain=new_window" });
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.off, app.quit_timer);
+
+    // One that takes the last away arms it.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+b=new_tab"});
+    try std.testing.expectEqual(.expired, app.quit_timer);
+
+    // A hotkey another program holds cannot be pressed, until it is let
+    // go.
+    TestHotkeys.held = TestHotkeys.ctrl_a;
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.expired, app.quit_timer);
+    TestHotkeys.held = null;
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    try std.testing.expectEqual(.off, app.quit_timer);
+
+    // A binding that is not global registers nothing.
+    try TestHotkeys.apply(&app, &.{"ctrl+a=new_window"});
+    try std.testing.expectEqual(.expired, app.quit_timer);
+
+    // The configuration says to quit.
+    {
+        var config: Config = try .default(alloc);
+        defer config.deinit();
+        try config.keybind.parseCLI(config._arena.?.allocator(), "global:ctrl+a=new_window");
+        config.@"quit-after-last-window-closed" = true;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
+    }
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.expired, app.quit_timer);
+
+    // With a window open, a reload leaves the timer to the core, which
+    // starts it when the last window closes.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    try std.testing.expectEqual(.off, app.quit_timer);
+    const f = try testFrame(&app);
+    const pane = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, pane);
+    f.tab().focused = pane;
+    try TestHotkeys.apply(&app, &.{});
+    try std.testing.expectEqual(.off, app.quit_timer);
+
+    // `terminate` unregisters the hotkeys first, and the last terminal's
+    // teardown after it starts the timer (`CoreApp.deleteSurface`): no
+    // hotkey is left to keep the app open.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    app.hotkeys.deinit(alloc, app.msg_hwnd);
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.expired, app.quit_timer);
 }

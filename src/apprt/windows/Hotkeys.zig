@@ -159,11 +159,15 @@ pub var test_unregister: if (builtin.is_test) ?*const fn (win32.HWND, c_int) voi
 pub var test_layout: if (builtin.is_test) ?*const Layout else void =
     if (builtin.is_test) null else {};
 
-/// Unregister every hotkey and free it all.
+/// Unregister every hotkey and free it all, leaving none, not undefined:
+/// `App.terminate` calls this before the windows' teardown, whose last
+/// terminal starts the quit timer, which asks whether a hotkey opens a
+/// window (`App.staysOpen`).
 pub fn deinit(self: *Hotkeys, alloc: Allocator, hwnd: win32.HWND) void {
     for (self.entries.items) |entry| if (entry.id) |id| unregister(hwnd, id);
     self.entries.deinit(alloc);
     self.logged.deinit(alloc);
+    self.* = .{};
 }
 
 /// Make the hotkeys on `hwnd` what `config` binds globally, from what an
@@ -273,6 +277,33 @@ pub fn pressed(self: *const Hotkeys, wparam: win32.WPARAM, lparam: win32.LPARAM)
         return entry.trigger;
     }
     return null;
+}
+
+/// The binding of `trigger`, a hotkey's, in `set`, or null if it is not a
+/// global one: a reload that ran out of memory leaves the hotkeys as they
+/// were (`App.configChange`), and the keys may be bound otherwise now.
+pub fn globalLeaf(set: *const Binding.Set, trigger: Binding.Trigger) ?Binding.Set.GenericLeaf {
+    const entry = set.get(trigger) orelse return null;
+    const leaf: Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
+        // The configuration refuses a global sequence.
+        .leader => return null,
+        inline .leaf, .leaf_chained => |leaf| leaf.generic(),
+    };
+    return if (leaf.flags.global) leaf else null;
+}
+
+/// Whether a hotkey registered now performs, among its binding's actions
+/// in `set`, new_window, which opens a window with none open. One refused,
+/// or held by another program, cannot be pressed.
+pub fn opensWindow(self: *const Hotkeys, set: *const Binding.Set) bool {
+    for (self.entries.items) |entry| {
+        if (entry.id == null) continue;
+        const leaf = globalLeaf(set, entry.trigger) orelse continue;
+        for (leaf.actionsSlice()) |action| {
+            if (action == .new_window) return true;
+        }
+    }
+    return false;
 }
 
 /// The combination RegisterHotKey takes for `trigger` on `layout`.
