@@ -12816,23 +12816,21 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
     try std.testing.expectEqualStrings("search:;", SearchSeen.take());
 
     // Enter: the search still to be made, then the next match; again,
-    // only the next match. Shift+Enter: the previous one.
+    // only the next match. Shift+Enter: the previous one. A Shift the
+    // session holds changes none of them (`holdRightShift`).
     _ = win32.SetWindowTextW(edit, L("gamma"));
-    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
-    try std.testing.expectEqualStrings("search:gamma;navigate_search:next;", SearchSeen.take());
-    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
-    try std.testing.expectEqualStrings("navigate_search:next;", SearchSeen.take());
-    searchTimer(hwnd);
-    try std.testing.expectEqualStrings("", SearchSeen.take());
-    var keys: [256]u8 = undefined;
-    try std.testing.expect(win32.GetKeyboardState(&keys).toBool());
-    const shift = keys[@intCast(win32.VK_SHIFT)];
-    keys[@intCast(win32.VK_SHIFT)] = 0x80;
-    try std.testing.expect(win32.SetKeyboardState(&keys).toBool());
-    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
-    keys[@intCast(win32.VK_SHIFT)] = shift;
-    _ = win32.SetKeyboardState(&keys);
-    try std.testing.expectEqualStrings("navigate_search:previous;", SearchSeen.take());
+    {
+        const keyboard = try holdRightShift();
+        defer _ = win32.SetKeyboardState(&keyboard);
+        try fieldKey(edit, win32.VK_RETURN, .{}, null);
+        try std.testing.expectEqualStrings("search:gamma;navigate_search:next;", SearchSeen.take());
+        try fieldKey(edit, win32.VK_RETURN, .{}, null);
+        try std.testing.expectEqualStrings("navigate_search:next;", SearchSeen.take());
+        searchTimer(hwnd);
+        try std.testing.expectEqualStrings("", SearchSeen.take());
+        try fieldKey(edit, win32.VK_RETURN, .{ .shift = true }, null);
+        try std.testing.expectEqualStrings("navigate_search:previous;", SearchSeen.take());
+    }
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("gamma", try fieldText(a, &buf));
 
@@ -12931,11 +12929,21 @@ test "win32: typing in a search field searches its terminal, and Enter walks the
 /// dispatched after it. `scan` is the key's scan code in lParam, with 0xE0
 /// in the high byte for an extended key; with none, the layout's mapping
 /// of `vk` stands for it (`scanCode`), which for the arrows is the keypad's.
+///
+/// Only `mods` are down while it is handled; every other modifier key is
+/// up, whatever the thread's state held. That state follows the session's
+/// real keyboard while a test's window is in front, and a Shift held in
+/// the shared VM once turned Enter into Shift+Enter (`holdRightShift`).
 fn fieldKey(edit: win32.HWND, vk: u8, mods: struct { ctrl: bool = false, shift: bool = false, alt: bool = false, scan: u16 = 0 }, char: ?u16) !void {
     var keys: [256]u8 = undefined;
     if (!win32.GetKeyboardState(&keys).toBool()) return error.TestUnexpectedResult;
     const saved = keys;
     defer _ = win32.SetKeyboardState(&saved);
+    // Shift, Ctrl and Alt, each with its left and right keys, and both
+    // Windows keys: what `key.currentMods` and the field's Shift+Enter read.
+    for ([_]usize{ 0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C }) |vk_mod| {
+        keys[vk_mod] = 0;
+    }
     if (mods.ctrl) for ([_]usize{ 0x11, 0xA2 }) |vk_mod| {
         keys[vk_mod] = 0x80;
     };
@@ -12954,6 +12962,19 @@ fn fieldKey(edit: win32.HWND, vk: u8, mods: struct { ctrl: bool = false, shift: 
     for ([_][2]win32.UINT{ .{ win32.WM_CHAR, win32.WM_DEADCHAR }, .{ win32.WM_SYSCHAR, win32.WM_SYSDEADCHAR } }) |r| {
         while (win32.PeekMessageW(&m, edit, r[0], r[1], win32.PM_REMOVE).toBool()) _ = win32.DispatchMessageW(&m);
     }
+}
+
+/// For tests: the right Shift held in the thread's keyboard state, as a
+/// Shift down in the session leaves it, until the returned state is set
+/// back. Keys sent through `fieldKey` must not see it.
+fn holdRightShift() ![256]u8 {
+    var keys: [256]u8 = undefined;
+    if (!win32.GetKeyboardState(&keys).toBool()) return error.TestUnexpectedResult;
+    const saved = keys;
+    keys[0x10] = 0x80;
+    keys[0xA1] = 0x80;
+    if (!win32.SetKeyboardState(&keys).toBool()) return error.TestUnexpectedResult;
+    return saved;
 }
 
 /// For tests: the key messages a terminal's window receives, counted by a
@@ -13048,6 +13069,10 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
     app.applyPendingFocus();
     const edit = a.search_bar.edit.?;
     var buf: [64]u8 = undefined;
+    // A Shift the session holds changes none of the keys below
+    // (`holdRightShift`).
+    const keyboard = try holdRightShift();
+    defer _ = win32.SetKeyboardState(&keyboard);
 
     // The default new-tab and next-tab keys, and Alt+F4: performed, and
     // the control character Ctrl+Shift+T queued is not the field's.
