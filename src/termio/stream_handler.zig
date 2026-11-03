@@ -1974,7 +1974,7 @@ pub const StreamHandler = struct {
 /// `internal_os.hostname.isLocal`), and local hostnames are often not
 /// valid RFC 1123 hostnames: macOS allows names like "Foo's MacBook Pro",
 /// some systems use underscores, and some report a MAC address.
-fn osc7Host(
+pub fn osc7Host(
     uri: std.Uri,
     buffer: *[std.Io.net.HostName.max_len]u8,
 ) error{ UriMissingHost, NameTooLong }![]const u8 {

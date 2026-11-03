@@ -42,17 +42,22 @@
 //! if it is not a directory (`inheritWorkingDirectory` in
 //! src/apprt/windows/Surface.zig). OSC 9;9 has no host, so a remote shell
 //! can choose where a new terminal starts, as it can in ConEmu and
-//! Windows Terminal. `std.Io.net.HostName` refuses an OSC 7 host with an
-//! `_`, so a machine named so is reached through OSC 9;9 only.
+//! Windows Terminal. An OSC 7 host is compared with this machine's names
+//! as it is sent, percent-decoded, and not checked as an RFC 1123 host
+//! name, as on other platforms (`osc7Host` in stream_handler.zig): a
+//! NetBIOS name, which `isLocal` takes, can hold an `_` that an RFC 1123
+//! host name cannot.
 //!
 //! Pure, so that its tests also run off Windows.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const uri = @import("../os/uri.zig");
+const osc7Host = @import("stream_handler.zig").osc7Host;
 
 /// Why a reported value gives no working directory.
 pub const Refusal = enum {
-    /// Neither a Windows path nor a URL.
+    /// Neither a Windows path nor a URL, or a URL whose host is longer
+    /// than a host name can be (`std.Io.net.HostName.max_len`).
     invalid_url,
 
     /// A URL whose scheme is neither `file` nor `kitty-shell-cwd`.
@@ -60,9 +65,6 @@ pub const Refusal = enum {
 
     /// A URL without a host, which OSC 7 requires, as on other platforms.
     missing_host,
-
-    /// A URL whose host is not a valid host name.
-    invalid_host,
 
     /// A URL's host or a share's server other than this machine: another
     /// machine's directory.
@@ -118,13 +120,16 @@ pub fn parse(alloc: Allocator, value: []const u8, isLocal: IsLocal) Allocator.Er
         !std.mem.eql(u8, "kitty-shell-cwd", url.scheme))
         return .{ .refused = .scheme };
 
+    // `uri.parse` has refused a host longer than a host name (the MAC
+    // address it takes in place of one is 17 bytes), and decoding only
+    // shortens one, so `NameTooLong` is that refusal.
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = std.Io.net.HostName.fromUri(url, &host_buffer) catch |err|
+    const host = osc7Host(url, &host_buffer) catch |err|
         return .{ .refused = switch (err) {
             error.UriMissingHost => .missing_host,
-            error.NameTooLong, error.InvalidHostName => .invalid_host,
+            error.NameTooLong => .invalid_url,
         } };
-    if (!isLocal(host.bytes)) return .{ .refused = .remote_host };
+    if (!isLocal(host)) return .{ .refused = .remote_host };
 
     // Decoded for `file` (`%20` is a space); `kitty-shell-cwd`'s is raw.
     const raw = try alloc.print("{f}", .{std.fmt.alt(url.path, .formatRaw)});
@@ -279,8 +284,13 @@ fn windowsPath(alloc: Allocator, path: []const u8) Allocator.Error![]u8 {
 
 const testing = std.testing;
 
+/// This machine's names in tests: `ME`, `localhost`, and `MY_PC`, a
+/// NetBIOS name with an `_`, which an RFC 1123 host name cannot hold.
 fn localIsMe(host: []const u8) bool {
-    return std.mem.eql(u8, host, "ME") or std.mem.eql(u8, host, "localhost");
+    for ([_][]const u8{ "ME", "localhost", "MY_PC" }) |name| {
+        if (std.mem.eql(u8, host, name)) return true;
+    }
+    return false;
 }
 
 fn expectPath(expected: []const u8, value: []const u8) !void {
@@ -405,7 +415,19 @@ test "windows pwd: another machine's directory is refused" {
     // RFC 8089's share form puts the server in the host.
     try expectRefused(.remote_host, "file://server/share/dir");
     try expectRefused(.missing_host, "file:///C:/Windows");
-    try expectRefused(.invalid_host, "file://bad_host/C:/Windows");
+}
+
+test "windows pwd: an OSC 7 host need not be an RFC 1123 host name" {
+    // Compared with this machine's names as it is sent, percent-decoded,
+    // as on other platforms.
+    try expectPath("C:\\Windows", "file://MY_PC/C:/Windows");
+    try expectPath("C:\\Windows", "file://MY%5FPC/C:/Windows");
+    try expectPath("C:\\Windows", "kitty-shell-cwd://MY_PC/C:/Windows");
+    try expectRefused(.remote_host, "file://OTHER_PC/C:/Windows");
+    try expectRefused(.remote_host, "kitty-shell-cwd://Foo's PC/C:/Windows");
+    // Up to a host name's length, and no longer.
+    try expectRefused(.remote_host, "file://" ++ &@as([254]u8, @splat('A')) ++ "/C:/Windows");
+    try expectRefused(.invalid_url, "file://" ++ &@as([255]u8, @splat('A')) ++ "/C:/Windows");
 }
 
 test "windows pwd: paths that do not say where to start are refused" {
