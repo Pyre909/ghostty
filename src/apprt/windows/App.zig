@@ -2908,7 +2908,16 @@ pub const App = struct {
         var i: usize = 0;
         while (i < self.requests.items.len) : (i += 1) {
             switch (self.requests.items[i]) {
-                .window => |parent| _ = self.newWindow(parent) catch |err| {
+                // Brought to the front, as every new_window brings Ghostty
+                // forward on macOS: a global keybind's (`hotkeyPressed`) is
+                // pressed in another program, which keeps the foreground
+                // through `Window.show`, as ShowWindow activates a window
+                // only for the process in front. The hotkey lets this one
+                // take it with SetForegroundWindow. Not the initial window
+                // (`run`): a launcher may ask for it minimized.
+                .window => |parent| if (self.newWindow(parent)) |window| {
+                    _ = window.present();
+                } else |err| {
                     log.err("failed to create a window err={}", .{err});
                     notice(
                         self,
