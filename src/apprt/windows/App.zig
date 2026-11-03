@@ -24,6 +24,7 @@ const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
+const Hotkeys = @import("Hotkeys.zig");
 const KeyState = @import("KeyState.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const ReadOnly = @import("ReadOnly.zig");
@@ -275,6 +276,10 @@ pub const App = struct {
     /// are ignored from then on, and nothing more is shown: no prompt
     /// (`dialog.messageBox`), no toast (`notifierFor`).
     terminating: bool,
+
+    /// The global keybinds, as hotkeys on `msg_hwnd` (`Hotkeys`): made what
+    /// the configuration binds by `init` and by each `.config_change`.
+    hotkeys: Hotkeys,
 
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
@@ -631,6 +636,7 @@ pub const App = struct {
             .teardown_depth = 0,
             .terminal_loops = 0,
             .terminating = false,
+            .hotkeys = .{},
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -643,9 +649,19 @@ pub const App = struct {
             win32.GWLP_USERDATA,
             @bitCast(@intFromPtr(self)),
         );
+
+        // A keybind that cannot be had is logged and left out, as GTK
+        // leaves out the global shortcuts its portal refuses.
+        self.hotkeys.refresh(alloc, msg_hwnd, &self.config) catch |err| {
+            log.warn("cannot register the global keybinds err={}", .{err});
+        };
     }
 
     pub fn terminate(self: *App) void {
+        // First, so that the other programs have the keys back before the
+        // teardown's waits for the terminals' threads.
+        self.hotkeys.deinit(self.core_app.alloc, self.msg_hwnd);
+
         // Every remaining window is destroyed with its terminals, as a
         // window close does it (Window.destroy), so that CoreApp.deinit,
         // which `main` runs after this, finds an empty surface list and its
@@ -2068,6 +2084,9 @@ pub const App = struct {
         const config = try value.config.clone(self.core_app.alloc);
         self.config.deinit();
         self.config = config;
+        self.hotkeys.refresh(self.core_app.alloc, self.msg_hwnd, &self.config) catch |err| {
+            log.warn("cannot register the global keybinds err={}", .{err});
+        };
         for (self.windows.items) |window| {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
@@ -2109,12 +2128,13 @@ pub const App = struct {
                 // (`Config.@"quit-after-last-window-closed"`), i.e. false on
                 // Windows. But once its last window has closed, this runtime
                 // has nothing left to open another from: `.new_window` is
-                // asked for from a window, and there is no tray icon, no
-                // global hotkey and no IPC to a running instance
-                // (`performIpc`). Honoring `false` would leave an invisible
-                // process with a message-only window that receives nothing
-                // and a GetMessageW that blocks forever, endable only from
-                // Task Manager.
+                // asked for from a window, and there is no tray icon and no
+                // IPC to a running instance (`performIpc`). A global
+                // keybind's hotkey (`Hotkeys`) could open one, but this
+                // does not look for one yet. Honoring `false` would leave
+                // an invisible process with a message-only window and a
+                // GetMessageW that blocks forever, endable only from Task
+                // Manager.
                 //
                 // Delete this override -- not the config read -- as soon as
                 // a window can be opened with none open.
@@ -3230,6 +3250,40 @@ pub const App = struct {
         self.core_app.alloc.destroy(window);
     }
 
+    /// WM_HOTKEY: the keys of a global keybind (`Hotkeys`), pressed in
+    /// whichever program is in front. Its actions are performed as the
+    /// core performs a global binding's (`CoreApp.keyEvent`): an
+    /// app-scoped one once, any other on every terminal. Not inside a
+    /// prompt or a tick (`canReenterCore`), where the core would be
+    /// reentered, nor once the windows close for good (`terminating`):
+    /// the press is dropped, as a key reaching a terminal while a prompt is
+    /// open is.
+    fn hotkeyPressed(self: *App, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+        if (self.terminating or !self.canReenterCore()) {
+            log.debug("a global keybind pressed while the core is busy is dropped", .{});
+            return;
+        }
+        const trigger = self.hotkeys.pressed(wparam, lparam) orelse return;
+        const entry = self.config.keybind.set.get(trigger) orelse return;
+        const leaf: input.Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
+            // The configuration refuses a global sequence.
+            .leader => return,
+            inline .leaf, .leaf_chained => |leaf| leaf.generic(),
+        };
+        // Only after a reload that ran out of memory (`configChange`),
+        // which leaves the hotkeys as they were: the keys may be bound
+        // otherwise now.
+        if (!leaf.flags.global) return;
+        const actions = leaf.actionsSlice();
+        if (builtin.is_test) if (test_perform_all) |seen| return seen(self, actions);
+        self.core_app.performAllChainedAction(self, actions);
+    }
+
+    /// For tests: told the actions of each global keybind pressed, in
+    /// place of the core's `performAllChainedAction`.
+    pub var test_perform_all: if (builtin.is_test) ?*const fn (*App, []const input.Binding.Action) void else void =
+        if (builtin.is_test) null else {};
+
     /// The message-only window's procedure.
     fn wndProc(
         hwnd: win32.HWND,
@@ -3271,6 +3325,11 @@ pub const App = struct {
             // its loop.
             win32.WM_TIMER => if (wparam == quit_timer_id) {
                 self.quitTimerFired();
+                return 0;
+            },
+
+            win32.WM_HOTKEY => {
+                self.hotkeyPressed(wparam, lparam);
                 return 0;
             },
 
@@ -4090,6 +4149,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.search_focus = null;
     app.search_hide = null;
     app.quit = false;
+    app.hotkeys = .{};
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -4214,6 +4274,7 @@ pub fn testCleanup(app: *App) void {
     app.windows.deinit(alloc);
     app.freeRequests();
     app.bell_audio.deinit(alloc);
+    app.hotkeys.deinit(alloc, app.msg_hwnd);
     app.config.deinit();
     _ = win32.DestroyWindow(app.msg_hwnd);
 }
@@ -19046,4 +19107,594 @@ test "win32: a terminal's scroll bar takes its frame's dark or light theme" {
         }
         try std.testing.expectEqual(widths, try testWidths(window, a));
     }
+}
+
+/// For tests: what `Hotkeys` asked of the system, in place of
+/// RegisterHotKey and UnregisterHotKey; a combination another program
+/// holds; the actions a hotkey performed; and a keyboard layout of the
+/// test's own.
+const TestHotkeys = struct {
+    const Call = union(enum) {
+        register: struct { id: c_int, combo: Hotkeys.Combo },
+        unregister: c_int,
+    };
+    const Tag = std.meta.Tag(input.Binding.Action);
+
+    var calls: [32]Call = undefined;
+    var calls_len: usize = 0;
+    /// Answered 1409, ERROR_HOTKEY_ALREADY_REGISTERED, as when another
+    /// program holds it.
+    var held: ?Hotkeys.Combo = null;
+    var performed: [8]Tag = undefined;
+    var performed_len: usize = 0;
+
+    const ctrl_a: Hotkeys.Combo = .{ .mods = win32.MOD_CONTROL | win32.MOD_NOREPEAT, .vk = 'A' };
+    const ctrl_b: Hotkeys.Combo = .{ .mods = win32.MOD_CONTROL | win32.MOD_NOREPEAT, .vk = 'B' };
+    const ctrl_c: Hotkeys.Combo = .{ .mods = win32.MOD_CONTROL | win32.MOD_NOREPEAT, .vk = 'C' };
+
+    /// Stand in for the system, and give `app`'s message-only window the
+    /// App, as `init` does, for `App.wndProc`.
+    fn install(app: *App) void {
+        calls_len = 0;
+        held = null;
+        performed_len = 0;
+        Hotkeys.test_register = &register;
+        Hotkeys.test_unregister = &unregister;
+        Hotkeys.test_layout = &layout;
+        App.test_perform_all = &perform;
+        _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
+    }
+
+    /// Unregister `app`'s hotkeys through the stand-ins, before
+    /// `testCleanup` would through the system, and stop standing in.
+    fn remove(app: *App) void {
+        app.hotkeys.deinit(app.core_app.alloc, app.msg_hwnd);
+        app.hotkeys = .{};
+        uninstall();
+    }
+
+    /// Stop standing in, once `App.terminate` has unregistered the hotkeys
+    /// through the stand-ins.
+    fn uninstall() void {
+        Hotkeys.test_register = null;
+        Hotkeys.test_unregister = null;
+        Hotkeys.test_layout = null;
+        App.test_perform_all = null;
+    }
+
+    fn register(hwnd: win32.HWND, id: c_int, combo: Hotkeys.Combo) win32.Win32Error {
+        _ = hwnd;
+        if (calls_len < calls.len) calls[calls_len] = .{ .register = .{ .id = id, .combo = combo } };
+        calls_len += 1;
+        if (held) |h| if (std.meta.eql(h, combo)) return .HOTKEY_ALREADY_REGISTERED;
+        return .SUCCESS;
+    }
+
+    fn unregister(hwnd: win32.HWND, id: c_int) void {
+        _ = hwnd;
+        if (calls_len < calls.len) calls[calls_len] = .{ .unregister = id };
+        calls_len += 1;
+    }
+
+    fn perform(app: *App, actions: []const input.Binding.Action) void {
+        _ = app;
+        for (actions) |action| {
+            if (performed_len < performed.len) performed[performed_len] = std.meta.activeTag(action);
+            performed_len += 1;
+        }
+    }
+
+    /// The calls since the last `take`.
+    fn take() []const Call {
+        defer calls_len = 0;
+        return calls[0..@min(calls_len, calls.len)];
+    }
+
+    /// The actions performed since the last `takePerformed`.
+    fn takePerformed() []const Tag {
+        defer performed_len = 0;
+        return performed[0..@min(performed_len, performed.len)];
+    }
+
+    /// The id `combo` was last registered under in `list`.
+    fn idOf(list: []const Call, combo: Hotkeys.Combo) ?c_int {
+        var id: ?c_int = null;
+        for (list) |call| switch (call) {
+            .register => |r| if (std.meta.eql(r.combo, combo)) {
+                id = r.id;
+            },
+            .unregister => {},
+        };
+        return id;
+    }
+
+    /// A reload to the defaults and `binds`.
+    fn apply(app: *App, binds: []const []const u8) !void {
+        var config: Config = try .default(app.core_app.alloc);
+        defer config.deinit();
+        const arena = config._arena.?.allocator();
+        for (binds) |bind| try config.keybind.parseCLI(arena, bind);
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
+    }
+
+    /// A WM_HOTKEY for `id`, with the keys of `combo` held.
+    fn press(app: *App, id: c_int, combo: Hotkeys.Combo) void {
+        const mods = combo.mods & ~win32.MOD_NOREPEAT;
+        const lparam: win32.LPARAM = @bitCast((@as(usize, combo.vk) << 16) | mods);
+        _ = App.wndProc(app.msg_hwnd, win32.WM_HOTKEY, @intCast(id), lparam);
+    }
+
+    /// The failures `app` logged that are `err`.
+    fn refused(app: *const App, err: Hotkeys.Refusal) usize {
+        var n: usize = 0;
+        for (app.hotkeys.logged.items) |l| switch (l.failure) {
+            .refused => |e| if (e == err) {
+                n += 1;
+            },
+            .system => {},
+        };
+        return n;
+    }
+
+    /// A layout of the test's. The key at Q's place types 'a' and the one
+    /// at A's place 'q', as on AZERTY; F9 and F12 are where they are on
+    /// every layout; '-' and '1' need no modifier and '@' needs Shift, as
+    /// on a US layout, and '3' needs Shift, as on AZERTY; 'ä' needs none,
+    /// 'Ä' Shift and '€' AltGr, as on a German layout; and Ctrl+Alt+Q
+    /// types a character, as AltGr+Q types '@' there. No other character
+    /// or key is on it.
+    const layout: Hotkeys.Layout = .{
+        .key_scan = &keyScan,
+        .scan_to_vk = &scanToVk,
+        .alt_gr = &altGr,
+    };
+
+    fn keyScan(c: win32.WCHAR) i16 {
+        return switch (c) {
+            '@' => 0x0132,
+            '-' => 0x00BD,
+            '1' => 0x0031,
+            '3' => 0x0133,
+            'ä' => 0x00DE,
+            'Ä' => 0x01DE,
+            '€' => 0x0645,
+            else => -1,
+        };
+    }
+
+    fn scanToVk(scan: u32) win32.UINT {
+        return switch (scan) {
+            0x10 => 'A',
+            0x1E => 'Q',
+            0x43 => 0x78,
+            0x58 => win32.VK_F12,
+            else => 0,
+        };
+    }
+
+    fn altGr(vk: win32.UINT, shift: bool) bool {
+        return vk == 'Q' and !shift;
+    }
+};
+
+test "win32: a global keybind registers its modifiers and key" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    try TestHotkeys.apply(&app, &.{
+        "global:ctrl+a=new_window",
+        "global:super+shift+f9=new_tab",
+        // The key at Q's place, which types 'a' on the test's layout.
+        "global:alt+key_q=new_tab",
+        "global:ctrl+numpad_1=new_tab",
+        "global:ctrl+pause=new_tab",
+        "global:alt+pause=new_tab",
+        "global:ctrl+-=new_tab",
+        "global:ctrl+numpad_0=new_tab",
+        "global:ctrl+numpad_9=new_tab",
+        "global:ctrl+numpad_decimal=new_tab",
+        // By its W3C name: `num_lock` alone is a modifier (`key.Mods`),
+        // which leaves the trigger no key.
+        "global:ctrl+NumLock=new_tab",
+        "global:ctrl+Z=new_tab",
+        // Through the layout, as other characters are.
+        "global:ctrl+1=new_tab",
+        // Typed with Shift, which the trigger holds.
+        "global:shift+3=new_tab",
+        "global:alt+shift+@=new_tab",
+        // 'ä' folded, which needs no Shift.
+        "global:ctrl+Ä=new_tab",
+        // Not global, or global only in a key table.
+        "ctrl+t=new_tab",
+        "foo/global:ctrl+y=new_tab",
+    });
+    const calls = TestHotkeys.take();
+    const nr = win32.MOD_NOREPEAT;
+    const want = [_]Hotkeys.Combo{
+        TestHotkeys.ctrl_a,
+        .{ .mods = win32.MOD_WIN | win32.MOD_SHIFT | nr, .vk = 0x78 },
+        .{ .mods = win32.MOD_ALT | nr, .vk = 'A' },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = win32.VK_NUMPAD0 + 1 },
+        // Ctrl+Pause is Break.
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = win32.VK_CANCEL },
+        .{ .mods = win32.MOD_ALT | nr, .vk = win32.VK_PAUSE },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = 0xBD },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = win32.VK_NUMPAD0 },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = win32.VK_NUMPAD9 },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = win32.VK_DECIMAL },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = @intCast(win32.VK_NUMLOCK) },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = 'Z' },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = '1' },
+        .{ .mods = win32.MOD_SHIFT | nr, .vk = '3' },
+        .{ .mods = win32.MOD_ALT | win32.MOD_SHIFT | nr, .vk = '2' },
+        .{ .mods = win32.MOD_CONTROL | nr, .vk = 0xDE },
+    };
+    try std.testing.expectEqual(want.len, calls.len);
+    for (want) |combo| try std.testing.expect(TestHotkeys.idOf(calls, combo) != null);
+}
+
+test "win32: a reload registers and unregisters only the global keybinds it changed" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    const binds = [_][]const u8{ "global:ctrl+a=new_window", "global:ctrl+b=new_tab" };
+    try TestHotkeys.apply(&app, &binds);
+    const first = TestHotkeys.take();
+    try std.testing.expectEqual(2, first.len);
+    const b_id = TestHotkeys.idOf(first, TestHotkeys.ctrl_b).?;
+
+    // The same again, as the soft reload after each change of color
+    // scheme: nothing.
+    try TestHotkeys.apply(&app, &binds);
+    try std.testing.expectEqual(0, TestHotkeys.take().len);
+
+    // An action changed alone: nothing, as the press looks it up.
+    try TestHotkeys.apply(&app, &.{ "global:ctrl+a=new_tab", "global:ctrl+b=new_tab" });
+    try std.testing.expectEqual(0, TestHotkeys.take().len);
+
+    // A trigger changed: its old keys go and its new ones come; the
+    // other's stay.
+    try TestHotkeys.apply(&app, &.{ "global:ctrl+a=new_window", "global:ctrl+c=new_tab" });
+    const changed = TestHotkeys.take();
+    try std.testing.expectEqual(2, changed.len);
+    try std.testing.expect(std.meta.eql(TestHotkeys.Call{ .unregister = b_id }, changed[0]));
+    try std.testing.expect(TestHotkeys.idOf(changed, TestHotkeys.ctrl_c) != null);
+
+    // None left: each is unregistered.
+    try TestHotkeys.apply(&app, &.{});
+    const none = TestHotkeys.take();
+    try std.testing.expectEqual(2, none.len);
+    for (none) |call| try std.testing.expect(call == .unregister);
+}
+
+test "win32: a global keybind another program holds is tried again at each reload" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    TestHotkeys.held = TestHotkeys.ctrl_b;
+    const binds = [_][]const u8{ "global:ctrl+a=new_window", "global:ctrl+b=new_tab" };
+    try TestHotkeys.apply(&app, &binds);
+    const first = TestHotkeys.take();
+    try std.testing.expectEqual(2, first.len);
+    const tried = TestHotkeys.idOf(first, TestHotkeys.ctrl_b).?;
+
+    // Its keys under the id it was tried with do nothing.
+    TestHotkeys.press(&app, tried, TestHotkeys.ctrl_b);
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+
+    // The next reload tries it alone, and logs the same failure once.
+    try TestHotkeys.apply(&app, &binds);
+    const again = TestHotkeys.take();
+    try std.testing.expectEqual(1, again.len);
+    try std.testing.expect(TestHotkeys.idOf(again, TestHotkeys.ctrl_b) != null);
+    try std.testing.expectEqual(1, app.hotkeys.logged.items.len);
+
+    // Once the program lets go of it, it registers and works.
+    TestHotkeys.held = null;
+    try TestHotkeys.apply(&app, &binds);
+    const id = TestHotkeys.idOf(TestHotkeys.take(), TestHotkeys.ctrl_b).?;
+    TestHotkeys.press(&app, id, TestHotkeys.ctrl_b);
+    try std.testing.expectEqualSlices(TestHotkeys.Tag, &.{.new_tab}, TestHotkeys.takePerformed());
+}
+
+test "win32: a global keybind that cannot be a hotkey registers nothing, logged" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    try TestHotkeys.apply(&app, &.{
+        "global:catch_all=new_window",
+        "global:ctrl+shift_left=new_window",
+        "global:ctrl+shift_right=new_window",
+        "global:ctrl+control_left=new_window",
+        "global:ctrl+control_right=new_window",
+        "global:ctrl+alt_left=new_window",
+        "global:ctrl+alt_right=new_window",
+        "global:ctrl+meta_left=new_window",
+        "global:ctrl+meta_right=new_window",
+        "global:ctrl+numpad_enter=new_window",
+        "global:ctrl+f12=new_window",
+        // Shift+2 and Shift+3 on the test's layout, without Shift, and
+        // with Ctrl, which makes Shift+2 type nothing.
+        "global:ctrl+@=new_window",
+        "global:ctrl+3=new_window",
+        "global:ctrl+shift+@=new_window",
+        // AltGr+Q types a character, and '€' needs AltGr.
+        "global:ctrl+alt+q=new_window",
+        "global:ctrl+€=new_window",
+        "global:ctrl+\u{1F600}=new_window",
+        // On no key of the test's layout.
+        "global:ctrl+%=new_window",
+        // No scan code: NumLock makes it of numpad_7.
+        "global:ctrl+numpad_home=new_window",
+        // Not performed by this runtime yet.
+        "global:ctrl+b=toggle_quick_terminal",
+        "global:ctrl+c=toggle_visibility",
+    });
+    try std.testing.expectEqual(0, TestHotkeys.take().len);
+    try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.CatchAll));
+    try std.testing.expectEqual(8, TestHotkeys.refused(&app, error.ModifierKey));
+    try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.SharedKey));
+    try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.Reserved));
+    try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NeedsShift));
+    try std.testing.expectEqual(2, TestHotkeys.refused(&app, error.AltGr));
+    try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NoKey));
+    try std.testing.expectEqual(2, TestHotkeys.refused(&app, error.Unsupported));
+
+    // Ctrl+Alt+Q with Shift types nothing on that layout, and registers,
+    // as does a toggle chained to an action this runtime performs.
+    try TestHotkeys.apply(&app, &.{
+        "global:ctrl+alt+shift+q=new_window",
+        "global:ctrl+b=toggle_quick_terminal",
+        "chain=new_window",
+    });
+    try std.testing.expectEqual(2, TestHotkeys.take().len);
+}
+
+test "win32: two global keybinds on the same keys register once, for the physical key" {
+    // `Set.getEvent` tries a key event's physical key before its
+    // character. On the test's layout the key at A's place types 'q'.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    for ([_][2][]const u8{
+        .{ "global:ctrl+q=new_window", "global:ctrl+key_a=new_tab" },
+        .{ "global:ctrl+key_a=new_tab", "global:ctrl+q=new_window" },
+    }) |binds| {
+        try TestHotkeys.apply(&app, &binds);
+        const calls = TestHotkeys.take();
+        try std.testing.expectEqual(1, calls.len);
+        TestHotkeys.press(&app, calls[0].register.id, calls[0].register.combo);
+        const performed = TestHotkeys.takePerformed();
+        try std.testing.expectEqualSlices(TestHotkeys.Tag, &.{.new_tab}, performed);
+        // What the core performs for the same keys in a window.
+        const entry = app.config.keybind.set.getEvent(.{
+            .key = .key_a,
+            .mods = .{ .ctrl = true },
+            .unshifted_codepoint = 'q',
+        }) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(performed[0], std.meta.activeTag(entry.value_ptr.leaf.action));
+        try TestHotkeys.apply(&app, &.{});
+        _ = TestHotkeys.take();
+    }
+}
+
+test "win32: a hotkey performs its global keybind's actions, and only its own keys do" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    const a = TestHotkeys.ctrl_a;
+    const b = TestHotkeys.ctrl_b;
+    try TestHotkeys.apply(&app, &.{ "global:ctrl+a=new_window", "global:ctrl+b=new_tab", "chain=new_window" });
+    const calls = TestHotkeys.take();
+    const a_id = TestHotkeys.idOf(calls, a).?;
+    const b_id = TestHotkeys.idOf(calls, b).?;
+
+    TestHotkeys.press(&app, a_id, a);
+    try std.testing.expectEqualSlices(TestHotkeys.Tag, &.{.new_window}, TestHotkeys.takePerformed());
+    // A chain, in order.
+    TestHotkeys.press(&app, b_id, b);
+    try std.testing.expectEqualSlices(TestHotkeys.Tag, &.{ .new_tab, .new_window }, TestHotkeys.takePerformed());
+
+    // Under its id, another key, or other modifiers; an id of none.
+    TestHotkeys.press(&app, a_id, b);
+    TestHotkeys.press(&app, a_id, .{ .mods = win32.MOD_ALT, .vk = 'A' });
+    TestHotkeys.press(&app, 0x7777, a);
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+}
+
+test "win32: a global keybind does nothing in a prompt or a tick, or once the windows close" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.quit_timer = .off;
+    try registerClasses(app.hinstance);
+    var terminated = false;
+    defer if (!terminated) {
+        testCleanup(&app);
+        unregisterClasses(app.hinstance);
+    };
+    defer _ = testTakeQuit();
+    TestHotkeys.install(&app);
+    defer if (terminated) TestHotkeys.uninstall() else TestHotkeys.remove(&app);
+
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    const Inside = struct {
+        var app_: *App = undefined;
+        var id: c_int = 0;
+        fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+            TestHotkeys.press(app_, id, TestHotkeys.ctrl_a);
+            return win32.IDOK;
+        }
+        fn tick(_: *App) void {
+            TestHotkeys.press(app_, id, TestHotkeys.ctrl_a);
+        }
+    };
+    Inside.app_ = &app;
+    Inside.id = TestHotkeys.idOf(TestHotkeys.take(), TestHotkeys.ctrl_a).?;
+
+    // A prompt's loop dispatches it, and it is dropped, as keys are. A
+    // prompt with no window is given the core's focused terminal's.
+    core_app.focused_surface = null;
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &Inside.box;
+    defer message_box.* = null;
+    notice(&app, null, L("Notice"));
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+
+    // A tick's prompt, or a wait in it, dispatches it.
+    App.test_tick = &Inside.tick;
+    defer App.test_tick = null;
+    try app.tick();
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+    App.test_tick = null;
+
+    // Outside both, it performs.
+    TestHotkeys.press(&app, Inside.id, TestHotkeys.ctrl_a);
+    try std.testing.expectEqualSlices(TestHotkeys.Tag, &.{.new_window}, TestHotkeys.takePerformed());
+
+    // The session's end takes the windows for good, and the hotkeys stay
+    // registered until `terminate`.
+    const f = try testFrame(&app);
+    const pane = try testPane(&app, f);
+    f.tab().tree = try .init(alloc, pane);
+    f.tab().focused = pane;
+    try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1));
+    try std.testing.expect(testTakeQuit());
+    TestHotkeys.press(&app, Inside.id, TestHotkeys.ctrl_a);
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+    try std.testing.expectEqual(0, TestHotkeys.take().len);
+
+    terminated = true;
+    app.terminate();
+    const unregistered = TestHotkeys.take();
+    try std.testing.expectEqual(1, unregistered.len);
+    try std.testing.expect(std.meta.eql(TestHotkeys.Call{ .unregister = Inside.id }, unregistered[0]));
+}
+
+test "win32: a reload that gives a global keybind's keys to another trigger keeps the hotkey for it" {
+    // On the test's layout the key at A's place types 'q': both triggers
+    // are Ctrl and that key.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    try TestHotkeys.apply(&app, &.{"global:ctrl+q=new_window"});
+    const calls = TestHotkeys.take();
+    try std.testing.expectEqual(1, calls.len);
+    const registered = calls[0].register;
+
+    try TestHotkeys.apply(&app, &.{"global:ctrl+key_a=new_tab"});
+    try std.testing.expectEqual(0, TestHotkeys.take().len);
+    TestHotkeys.press(&app, registered.id, registered.combo);
+    try std.testing.expectEqualSlices(TestHotkeys.Tag, &.{.new_tab}, TestHotkeys.takePerformed());
+}
+
+test "win32: a global keybind left registered by a reload out of memory does nothing once bound otherwise" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    // The reload's copy of the configuration keeps the allocator it was
+    // made with until `testCleanup` frees it.
+    var failing: std.testing.FailingAllocator = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    const id = TestHotkeys.idOf(TestHotkeys.take(), TestHotkeys.ctrl_a).?;
+
+    // Ctrl+A bound for the terminal alone, and a new global keybind, so
+    // that the hotkeys need memory. As many allocations succeed as the
+    // copy of the configuration takes, and none after.
+    var next: Config = try .default(alloc);
+    defer next.deinit();
+    const arena = next._arena.?.allocator();
+    try next.keybind.parseCLI(arena, "ctrl+a=new_tab");
+    try next.keybind.parseCLI(arena, "global:ctrl+b=new_tab");
+    // No growth in place, which could take a new allocation in one and
+    // not the other.
+    var counting: std.testing.FailingAllocator = .init(alloc, .{ .resize_fail_index = 0 });
+    var copy = try next.clone(counting.allocator());
+    copy.deinit();
+    failing = .init(alloc, .{ .fail_index = counting.alloc_index, .resize_fail_index = 0 });
+    core_app.alloc = failing.allocator();
+    const changed = app.performAction(.app, .config_change, .{ .config = &next });
+    core_app.alloc = alloc;
+    try std.testing.expect(try changed);
+    try std.testing.expectEqual(0, TestHotkeys.take().len);
+
+    TestHotkeys.press(&app, id, TestHotkeys.ctrl_a);
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+}
+
+test "win32: a global keybind's new_window asks the core, which asks this runtime for a window" {
+    // No stand-in for the core: `performAllChainedAction` performs the
+    // app-scoped new_window, which the core asks back for as `.new_window`.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+    App.test_perform_all = null;
+
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=new_window"});
+    const id = TestHotkeys.idOf(TestHotkeys.take(), TestHotkeys.ctrl_a).?;
+    TestHotkeys.press(&app, id, TestHotkeys.ctrl_a);
+    var windows: usize = 0;
+    for (app.requests.items) |request| switch (request) {
+        .window => |parent| {
+            try std.testing.expect(parent == null);
+            windows += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(1, windows);
 }

@@ -261,7 +261,7 @@ pub fn shiftlessCodepoint(vk: win32.UINT, scan: u32, state: *const [256]win32.BY
 /// TOUNICODE_NO_STATE_CHANGE keeps this query from consuming a pending dead
 /// key; on Windows before 10 1607, which ignores the flag, a dead key
 /// followed by another key can lose its accent.
-fn layoutCodepoint(vk: win32.UINT, scan: u32, state: *const [256]win32.BYTE) u21 {
+pub fn layoutCodepoint(vk: win32.UINT, scan: u32, state: *const [256]win32.BYTE) u21 {
     var buf: [4]win32.WCHAR = undefined;
     const n = win32.ToUnicodeEx(
         vk,

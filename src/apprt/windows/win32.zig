@@ -304,6 +304,10 @@ pub const VK_SPACE: WPARAM = 0x20;
 pub const VK_PROCESSKEY: WPARAM = 0xE5;
 pub const VK_PACKET: WPARAM = 0xE7;
 pub const VK_CONTROL: WPARAM = 0x11;
+/// What the layout makes of Pause with Ctrl held: Break.
+pub const VK_CANCEL: UINT = 0x03;
+pub const VK_PAUSE: UINT = 0x13;
+pub const VK_F12: UINT = 0x7B;
 pub const VK_MENU: WPARAM = 0x12;
 pub const VK_NUMPAD0: UINT = 0x60;
 pub const VK_NUMPAD9: UINT = 0x69;
@@ -323,6 +327,10 @@ pub const VK_RMENU: c_int = 0xA5;
 /// MapVirtualKeyW mode: VK -> scan code, with the 0xE0/0xE1 prefix
 /// in the high byte for extended keys.
 pub const MAPVK_VK_TO_VSC_EX: UINT = 4;
+
+/// MapVirtualKeyExW mode: scan code, with the 0xE0/0xE1 prefix in the
+/// high byte for extended keys, -> VK, telling left and right apart.
+pub const MAPVK_VSC_TO_VK_EX: UINT = 3;
 
 /// ToUnicodeEx flag: do not change the keyboard state, in particular
 /// the pending dead key. Honored from Windows 10 1607.
@@ -962,6 +970,26 @@ pub extern "user32" fn SetKeyboardState(key_state: *const [256]BYTE) callconv(.w
 pub extern "kernel32" fn Sleep(ms: DWORD) callconv(.winapi) void;
 pub extern "user32" fn MapVirtualKeyW(code: UINT, map_type: UINT) callconv(.winapi) UINT;
 pub extern "user32" fn GetKeyboardLayout(thread_id: DWORD) callconv(.winapi) ?HKL;
+/// MapVirtualKeyW on `layout`.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mapvirtualkeyexw
+pub extern "user32" fn MapVirtualKeyExW(code: UINT, map_type: UINT, layout: ?HKL) callconv(.winapi) UINT;
+/// The key that types `ch` on `layout`: its virtual key in the low byte
+/// and the shift state it needs in the high one, or -1.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-vkkeyscanexw
+pub extern "user32" fn VkKeyScanExW(ch: WCHAR, layout: ?HKL) callconv(.winapi) SHORT;
+
+/// Hotkeys: a WM_HOTKEY to the window's thread when the keys are pressed,
+/// in whichever program is in front.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey
+pub extern "user32" fn RegisterHotKey(hwnd: ?HWND, id: c_int, mods: UINT, vk: UINT) callconv(.winapi) BOOL;
+pub extern "user32" fn UnregisterHotKey(hwnd: ?HWND, id: c_int) callconv(.winapi) BOOL;
+pub const WM_HOTKEY: UINT = 0x0312;
+pub const MOD_ALT: UINT = 0x0001;
+pub const MOD_CONTROL: UINT = 0x0002;
+pub const MOD_SHIFT: UINT = 0x0004;
+pub const MOD_WIN: UINT = 0x0008;
+/// A held key fires the hotkey once, not at each repeat.
+pub const MOD_NOREPEAT: UINT = 0x4000;
 pub extern "user32" fn ToUnicodeEx(
     vk: UINT,
     scan_code: UINT,
