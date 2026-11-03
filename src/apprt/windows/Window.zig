@@ -42,6 +42,7 @@ const CommandPalette = @import("CommandPalette.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
+const WM_GHOSTTY_QUICK_HIDE = @import("App.zig").WM_GHOSTTY_QUICK_HIDE;
 const postTeardown = @import("App.zig").postTeardown;
 const confirm = @import("dialog.zig").confirm;
 
@@ -133,6 +134,13 @@ decoration: ?configpkg.WindowDecoration,
 /// it is, as GTK refuses a quick terminal's resizes. Set when it is made,
 /// never changed.
 quick: bool,
+
+/// For the quick terminal: the window that was in the foreground as it
+/// last showed, unless that was one of Ghostty's (`ofApp`), to give the
+/// foreground back to as a toggle hides it (`hideQuick`), as macOS gives
+/// it back to the app it came from. Forgotten once another of Ghostty's
+/// windows takes the activation from it (`quickDeactivated`).
+quick_return: ?win32.HWND,
 
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
@@ -842,6 +850,7 @@ pub fn createBare(app: *App, kind: Kind) !*Window {
         .fullscreen = null,
         .decoration = null,
         .quick = kind == .quick,
+        .quick_return = null,
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
@@ -990,9 +999,14 @@ pub fn show(self: *Window) void {
 /// with the keyboard, as GTK and macOS show theirs. Its shown tab's
 /// terminals are told they show (`relayout`): a hidden frame's children
 /// are told nothing (`hideQuick`). Shown where it was if its monitor
-/// cannot be read.
+/// cannot be read. The window in the foreground first is remembered
+/// (`quick_return`).
 pub fn showQuick(self: *Window) void {
     assert(self.quick);
+    self.quick_return = if (App.foregroundWindow()) |front|
+        (if (ofApp(self.app, front)) null else front)
+    else
+        null;
     const flags = win32.SWP_SHOWWINDOW | win32.SWP_NOACTIVATE;
     if (quickWork(self.app, .pointer)) |work| {
         if (!self.placeQuick(work, win32.HWND_TOPMOST, flags)) return;
@@ -1016,22 +1030,83 @@ pub fn showQuick(self: *Window) void {
     if (!self.present()) log.info("the quick terminal shows without the keyboard: SetForegroundWindow refused", .{});
 }
 
-/// `toggle_quick_terminal` with the quick terminal shown: hide it, with
-/// its tabs, splits and programs kept for the next show, as on GTK and
-/// macOS. Its command palette and title prompt close first: "Hiding an
-/// owner window has no effect on the visibility state of the owned
-/// windows" (Window Features, Microsoft Learn), and the palette's tooltip
-/// and the prompt are owned. The shown tab's terminals are told they no
-/// longer show, as a minimized frame's are (WM_SIZE); the other tabs'
-/// were told when they were hidden (`hideTab`).
+/// `toggle_quick_terminal` with the quick terminal shown, or autohide
+/// (`quickAutohide`): hide it, with its tabs, splits and programs kept for
+/// the next show, as on GTK and macOS. Its command palette and title
+/// prompt close first: "Hiding an owner window has no effect on the
+/// visibility state of the owned windows" (Window Features, Microsoft
+/// Learn), and the palette's tooltip and the prompt are owned. While it or
+/// a window it owns is in the foreground, as when a toggle hides it, the
+/// foreground goes back to the window it came from (`quick_return`)
+/// before it hides, as macOS gives it back, if that window still shows
+/// and is not minimized. Autohide hides it only once the activation has
+/// gone elsewhere, so gives nothing back: the user chose where it went.
+/// The shown tab's terminals are told they no longer show, as a minimized
+/// frame's are (WM_SIZE); the other tabs' were told when they were hidden
+/// (`hideTab`).
 pub fn hideQuick(self: *Window) void {
     assert(self.quick);
+    // Asked before its prompt closes and the activation moves.
+    const front = App.inForeground(self);
     CommandPalette.close(self);
     TitleDialog.close(self);
+    if (front) if (self.quick_return) |hwnd| giveBack(hwnd);
     // The BOOL is the previous visibility, not success.
     _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
     var it = self.tab().tree.iterator();
     while (it.next()) |entry| entry.view.occlusionChanged(false);
+}
+
+/// Give the foreground to `hwnd`, the window the quick terminal came from
+/// (`hideQuick`), unless it has closed (IsWindowVisible is FALSE for a
+/// window that no longer exists), is hidden or is minimized. Allowed:
+/// Ghostty is the foreground process, which SetForegroundWindow's
+/// documentation lists as a process that can set it.
+fn giveBack(hwnd: win32.HWND) void {
+    if (!win32.IsWindowVisible(hwnd).toBool() or win32.IsIconic(hwnd).toBool()) return;
+    if (!bringForward(hwnd, hwnd)) log.info("the foreground stays with Ghostty: SetForegroundWindow refused", .{});
+}
+
+/// The quick terminal lost the activation (WM_ACTIVATE) to `to`, which
+/// Windows does not always name. To a window it owns, a prompt or its
+/// title dialog, nothing changes, as macOS keeps its quick terminal while
+/// a sheet is up. To another of Ghostty's windows, it forgets the window
+/// to give the foreground back to, as macOS forgets the app it came from
+/// once its own app keeps the activation. With `quick-terminal-autohide`
+/// it then hides, as GTK and macOS hide theirs, by a message to itself
+/// (`quickAutohide`) once this activation change is over: the activation
+/// can come straight back, and its command palette is not destroyed
+/// inside the change (`CommandPalette.deactivated`). Hidden, it has
+/// nothing to hide, and posts nothing.
+fn quickDeactivated(self: *Window, to: ?win32.HWND) void {
+    assert(self.quick);
+    if (to) |hwnd| {
+        if (win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) == self.hwnd) return;
+        if (ofApp(self.app, hwnd)) self.quick_return = null;
+    }
+    if (!self.app.config.@"quick-terminal-autohide") return;
+    if (!win32.IsWindowVisible(self.hwnd).toBool()) return;
+    if (!win32.PostMessageW(self.hwnd, WM_GHOSTTY_QUICK_HIDE, 0, 0).toBool()) {
+        log.warn("unable to hide the quick terminal as it loses the activation err={}", .{win32.GetLastError()});
+    }
+}
+
+/// `quick-terminal-autohide`, once the activation the quick terminal lost
+/// has settled (`quickDeactivated`): it hides unless the activation has
+/// come back to it or to a window it owns, as GTK checks that its quick
+/// terminal is still inactive.
+fn quickAutohide(self: *Window) void {
+    assert(self.quick);
+    if (App.inForeground(self)) return;
+    self.hideQuick();
+}
+
+/// Whether `hwnd` is one of `app`'s frames or a window one of them owns,
+/// such as a prompt or a title dialog: its root owner is a frame.
+fn ofApp(app: *const App, hwnd: win32.HWND) bool {
+    const root = win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) orelse return false;
+    for (app.windows.items) |window| if (window.hwnd == root) return true;
+    return false;
 }
 
 /// For `quick-terminal-screen = mouse`, whose monitor the quick terminal
@@ -1273,6 +1348,11 @@ fn handleMessage(
             return 0;
         },
 
+        WM_GHOSTTY_QUICK_HIDE => {
+            if (self.quick) self.quickAutohide();
+            return 0;
+        },
+
         // Shutdown, restart, sign-out, or the Restart Manager closing
         // Ghostty for an installer. Never refused, even with a command
         // running: macOS asks nothing at shutdown, restart or logout
@@ -1385,10 +1465,12 @@ fn handleMessage(
         win32.WM_DISPLAYCHANGE => if (self.quick) self.placeQuickAgain(),
 
         // Deactivated: an open command palette closes, as GTK's dialog
-        // does, once the deactivation is over (`CommandPalette.deactivated`).
-        // DefWindowProcW below as well.
+        // does, once the deactivation is over (`CommandPalette.deactivated`),
+        // and the quick terminal may hide (`quickDeactivated`); lParam is
+        // the window being activated. DefWindowProcW below as well.
         win32.WM_ACTIVATE => if (@as(u16, @truncate(wparam)) == win32.WA_INACTIVE) {
             CommandPalette.deactivated(self);
+            if (self.quick) self.quickDeactivated(@ptrFromInt(@as(usize, @bitCast(lparam))));
         },
 
         // Keyboard focus belongs to a terminal: the frame gets it on

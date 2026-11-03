@@ -2874,7 +2874,8 @@ keybind: Keybinds = .{},
 /// shortcuts on Linux require system configuration and are considerably less
 /// accessible than on macOS, meaning that it is more preferable to keep the
 /// quick terminal open until the user has completed their task.
-/// This default may change in the future.
+/// This default may change in the future. On Windows, it defaults to false,
+/// as on Linux.
 @"quick-terminal-autohide": bool = switch (builtin.target.os.tag) {
     .linux => false,
     .macos => true,

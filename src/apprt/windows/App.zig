@@ -69,6 +69,12 @@ pub const WM_GHOSTTY_LINK_REFUSED: win32.UINT = win32.WM_APP + 3;
 /// terminal the toast is for (`notificationClicked`).
 pub const WM_GHOSTTY_NOTIFICATION: win32.UINT = win32.WM_APP + 4;
 
+/// Posted to the quick terminal's frame by itself as it loses the
+/// activation with `quick-terminal-autohide` set
+/// (`Window.quickDeactivated`); its handler hides it unless it, or a
+/// window it owns, is in the foreground again (`Window.quickAutohide`).
+pub const WM_GHOSTTY_QUICK_HIDE: win32.UINT = win32.WM_APP + 5;
+
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
 const quit_timer_id: win32.UINT_PTR = 1;
@@ -2708,12 +2714,13 @@ pub const App = struct {
     pub var test_flash: if (builtin.is_test) ?win32.FLASHWINFO else void =
         if (builtin.is_test) null else {};
 
-    /// For tests: answers in place of GetForegroundWindow (`bell`), as
+    /// For tests: answers in place of GetForegroundWindow (`bell`, the
+    /// quick terminal's `Window.showQuick` and `Window.hideQuick`), as
     /// `Window.test_get_focus` stands for GetFocus.
     pub var test_get_foreground: if (builtin.is_test) ?*const fn () ?win32.HWND else void =
         if (builtin.is_test) null else {};
 
-    fn foregroundWindow() ?win32.HWND {
+    pub fn foregroundWindow() ?win32.HWND {
         if (builtin.is_test) if (test_get_foreground) |get| return get();
         return win32.GetForegroundWindow();
     }
@@ -2721,7 +2728,7 @@ pub const App = struct {
     /// Whether `window` is in the foreground, or a window it owns is: one
     /// of its prompts (dialog.zig) or the tab title's dialog
     /// (TitleDialog.zig), over a window that GTK would keep active.
-    fn inForeground(window: *const Window) bool {
+    pub fn inForeground(window: *const Window) bool {
         const front = foregroundWindow() orelse return false;
         return win32.GetAncestor(front, win32.GA_ROOTOWNER) == window.hwnd;
     }
@@ -4329,6 +4336,7 @@ fn testFrame(app: *App) !*Window {
         .fullscreen = null,
         .decoration = null,
         .quick = false,
+        .quick_return = null,
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
@@ -12609,21 +12617,34 @@ const TestQuick = struct {
     var front: ?win32.HWND = null;
     var told: ?*Surface = null;
     var shows: bool = false;
+    /// What GetForegroundWindow answers (`App.test_get_foreground`).
+    var in_front: ?win32.HWND = null;
+    /// Whether `watch` showed when a window was last given the foreground.
+    var watch: ?win32.HWND = null;
+    var watch_shown: bool = false;
 
     fn start() void {
         fail = false;
         area = null;
         front = null;
         told = null;
+        in_front = null;
+        watch = null;
         Window.test_create_pane = &create;
         Window.test_foreground = &foreground;
         Surface.test_occlusion = &occlusion;
+        App.test_get_foreground = &foregroundNow;
     }
 
     fn stop() void {
         Window.test_create_pane = null;
         Window.test_foreground = null;
         Surface.test_occlusion = null;
+        App.test_get_foreground = null;
+    }
+
+    fn foregroundNow() ?win32.HWND {
+        return in_front;
     }
 
     fn create(w: *Window) anyerror!*Surface {
@@ -12637,6 +12658,47 @@ const TestQuick = struct {
 
     fn foreground(hwnd: win32.HWND) void {
         front = hwnd;
+        if (watch) |w| watch_shown = win32.IsWindowVisible(w).toBool();
+    }
+
+    /// Another program's window, as the quick terminal sees one: shown,
+    /// and neither one of the app's nor owned by one.
+    fn foreign() !win32.HWND {
+        const hwnd = win32.CreateWindowExW(0, L("STATIC"), null, win32.WS_POPUP, 0, 0, 10, 10, null, null, null, null) orelse
+            return error.TestUnexpectedResult;
+        _ = win32.ShowWindow(hwnd, win32.SW_SHOWNOACTIVATE);
+        return hwnd;
+    }
+
+    /// A hidden window `window` owns, as it owns its prompts.
+    fn owned(window: *const Window) !win32.HWND {
+        return win32.CreateWindowExW(0, L("STATIC"), null, win32.WS_POPUP, 0, 0, 10, 10, window.hwnd, null, null, null) orelse
+            error.TestUnexpectedResult;
+    }
+
+    /// `quick` loses the activation to `to`, or to a window Windows does
+    /// not name (WM_ACTIVATE).
+    fn deactivate(quick: *const Window, to: ?win32.HWND) void {
+        const lparam: win32.LPARAM = if (to) |hwnd| @bitCast(@intFromPtr(hwnd)) else 0;
+        _ = win32.SendMessageW(quick.hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, lparam);
+    }
+
+    /// Whether `quick` posted itself the message that hides it as it lost
+    /// the activation; carried out if it did.
+    fn autohide(quick: *const Window) bool {
+        var msg: win32.MSG = undefined;
+        if (!win32.PeekMessageW(&msg, quick.hwnd, WM_GHOSTTY_QUICK_HIDE, WM_GHOSTTY_QUICK_HIDE, win32.PM_REMOVE).toBool()) return false;
+        _ = win32.DispatchMessageW(&msg);
+        return true;
+    }
+
+    /// Hide the shown `quick` by a toggle while it is in front, with no
+    /// window given the foreground yet.
+    fn hideInFront(app: *App, quick: *const Window) !void {
+        in_front = quick.hwnd;
+        front = null;
+        try toggle(app);
+        try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
     }
 
     fn occlusion(surface: *Surface, visible: bool) void {
@@ -13247,6 +13309,189 @@ fn testQuickReload() !void {
     try std.testing.expectEqual(RECT{ .left = 0, .top = 430, .right = 1600, .bottom = 860 }, try windowRect(quick.hwnd));
     try TestQuick.toggle(&app);
     try std.testing.expectEqual(RECT{ .left = 1600, .top = -170, .right = 2560, .bottom = 880 }, try windowRect(quick.hwnd));
+}
+
+test "win32: a toggle gives the foreground back to the window the quick terminal came from" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickReturn, .{});
+}
+
+/// The test of the quick terminal's focus return, run by its test on a
+/// desktop of its own.
+fn testQuickReturn() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+    const a = try testFrame(&app);
+
+    // Shown over another program's window, and hidden while it is in
+    // front: the foreground goes back to that window, while it still
+    // shows, so while Ghostty may still give it.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    TestQuick.watch = quick.hwnd;
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+    try std.testing.expect(TestQuick.watch_shown);
+
+    // Over one of Ghostty's own windows, here a shown one the other frame
+    // owns, as a prompt: nothing to give back, as macOS gives it back only
+    // to another app.
+    const ours = try TestQuick.owned(a);
+    defer _ = win32.DestroyWindow(ours);
+    _ = win32.ShowWindow(ours, win32.SW_SHOWNOACTIVATE);
+    TestQuick.in_front = ours;
+    try TestQuick.toggle(&app);
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expect(TestQuick.front == null);
+
+    // Hidden while another window is in front, the user having gone
+    // there: the foreground stays where it is.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    TestQuick.front = null;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(TestQuick.front == null);
+
+    // With a window it owns in front, its title prompt: given back.
+    try TestQuick.toggle(&app);
+    const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    const dialog = try testPrompt(&app, pane, .surface);
+    TestQuick.in_front = dialog;
+    TestQuick.front = null;
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+
+    // A window that has closed since, or is minimized, is left as it is.
+    const gone = try TestQuick.foreign();
+    TestQuick.in_front = gone;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(win32.DestroyWindow(gone).toBool());
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expect(TestQuick.front == null);
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    _ = win32.ShowWindow(other, win32.SW_SHOWMINNOACTIVE);
+    try std.testing.expect(win32.IsIconic(other).toBool());
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expect(TestQuick.front == null);
+    _ = win32.ShowWindow(other, win32.SW_SHOWNOACTIVATE);
+
+    // The activation lost to a window it owns, to another program's or to
+    // one Windows does not name keeps the window to give back; lost to
+    // another of Ghostty's, it is forgotten, as macOS forgets the app it
+    // came from once its own app keeps the activation.
+    const owned = try TestQuick.owned(quick);
+    defer _ = win32.DestroyWindow(owned);
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    TestQuick.deactivate(quick, owned);
+    TestQuick.deactivate(quick, other);
+    TestQuick.deactivate(quick, null);
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    TestQuick.deactivate(quick, a.hwnd);
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expect(TestQuick.front == null);
+}
+
+test "win32: with autohide the quick terminal hides as it loses the activation" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickAutohide, .{});
+}
+
+/// The quick terminal's autohide test, run by its test on a desktop of its
+/// own.
+fn testQuickAutohide() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+    const a = try testFrame(&app);
+
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    const owned = try TestQuick.owned(quick);
+    defer _ = win32.DestroyWindow(owned);
+
+    // Off, as it is on Windows unless set: it stays.
+    TestQuick.deactivate(quick, other);
+    try std.testing.expect(!TestQuick.autohide(quick));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // On from a reloaded configuration, read as it loses the activation:
+    // hidden once that change is over, its terminal told, and with no
+    // foreground given back, the user having chosen where it went.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"quick-terminal-autohide" = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    app.createRequested();
+    TestQuick.front = null;
+    TestQuick.deactivate(quick, other);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(TestQuick.autohide(quick));
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(!TestQuick.shows);
+    try std.testing.expect(TestQuick.front == null);
+
+    // Hidden, it has no activation to lose: nothing is posted.
+    TestQuick.deactivate(quick, other);
+    try std.testing.expect(!TestQuick.autohide(quick));
+
+    // Lost to a window Windows does not name, or to another of Ghostty's,
+    // as GTK hides its own for any window: hidden.
+    try TestQuick.toggle(&app);
+    TestQuick.deactivate(quick, null);
+    try std.testing.expect(TestQuick.autohide(quick));
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try TestQuick.toggle(&app);
+    TestQuick.in_front = a.hwnd;
+    TestQuick.deactivate(quick, a.hwnd);
+    try std.testing.expect(TestQuick.autohide(quick));
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Lost to a window it owns, as a prompt: it stays, as macOS keeps its
+    // quick terminal while a sheet is up.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    TestQuick.in_front = owned;
+    TestQuick.deactivate(quick, owned);
+    try std.testing.expect(!TestQuick.autohide(quick));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Back with it, or with a window it owns, before the message comes:
+    // it stays.
+    TestQuick.deactivate(quick, other);
+    TestQuick.in_front = quick.hwnd;
+    try std.testing.expect(TestQuick.autohide(quick));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    TestQuick.deactivate(quick, other);
+    TestQuick.in_front = owned;
+    try std.testing.expect(TestQuick.autohide(quick));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
