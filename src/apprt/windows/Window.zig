@@ -2970,7 +2970,8 @@ pub fn isFloating(self: *const Window) bool {
 /// `float_window`: keep the window above every window that does not
 /// float, focused or not, as macOS floats it, or put it back among them.
 /// Only its place in the z-order changes, so no terminal is laid out
-/// again. False, logged, if it did not change.
+/// again. False, logged, if SetWindowPos fails or the window does not
+/// float as asked afterwards.
 ///
 /// SetWindowPos succeeding does not mean that it did: a window procedure
 /// may take the change of z-order out of WM_WINDOWPOSCHANGING, and another

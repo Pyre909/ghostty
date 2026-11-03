@@ -624,9 +624,9 @@ pub extern "user32" fn SetWindowsHookExW(
 pub extern "user32" fn UnhookWindowsHookEx(hook: HHOOK) callconv(.winapi) BOOL;
 pub extern "user32" fn CallNextHookEx(hook: ?HHOOK, code: c_int, wparam: WPARAM, lparam: LPARAM) callconv(.winapi) LRESULT;
 
-// A desktop of its own for a test of a window's place in the z-order
-// (App.testOnOwnDesktop): a desktop's windows, z-order and hooks are its
-// own. https://learn.microsoft.com/en-us/windows/win32/winstation/desktops
+// A desktop of its own for a test that reads whether a window is topmost
+// (App.testOnOwnDesktop): window messages and hooks do not cross desktops.
+// https://learn.microsoft.com/en-us/windows/win32/winstation/desktops
 pub const HDESK = *opaque {};
 /// Every access right to a desktop.
 /// https://learn.microsoft.com/en-us/windows/win32/winstation/desktop-security-and-access-rights
