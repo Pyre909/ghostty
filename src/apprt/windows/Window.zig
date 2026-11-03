@@ -126,7 +126,7 @@ decoration: ?configpkg.WindowDecoration,
 
 /// The quick terminal (`App.quick`), which `toggle_quick_terminal` shows
 /// and hides (`showQuick`, `hideQuick`): a pop-up on a monitor's edge
-/// (`quickRect`), in neither the taskbar nor Alt+Tab (WS_EX_TOOLWINDOW),
+/// (`quickPlace`), in neither the taskbar nor Alt+Tab (WS_EX_TOOLWINDOW),
 /// above every window that is not topmost while it shows. It keeps the
 /// place and size it is given: maximizing, fullscreen, decorations,
 /// floating and the sizes from the configuration or a program leave it as
@@ -793,7 +793,7 @@ pub fn setWindowTitle(self: *Window, title: [:0]const u8) bool {
 /// Create a window of `kind` holding a new terminal, still hidden: `show`
 /// shows it once the app owns both (`App.newWindow`), or `showQuick` the
 /// quick terminal. The frame is created at CW_USEDEFAULT size, or the
-/// quick terminal's at its place (`quickRect`), so that the terminal,
+/// quick terminal's at its place (`quickPlace`), so that the terminal,
 /// which fills it, starts with a non-zero size (`CoreSurface.init` reads
 /// it).
 pub fn create(app: *App, opts: Surface.Options, kind: Kind) !*Window {
@@ -867,10 +867,20 @@ pub fn createBare(app: *App, kind: Kind) !*Window {
             win32.CW_USEDEFAULT,
         ),
         // CW_USEDEFAULT is for an overlapped window only: a pop-up's is
-        // made at 0, 0 and empty (CreateWindowExW).
+        // made at 0, 0 and empty (CreateWindowExW). Made at its place at
+        // 96 DPI, on the monitor it goes on, whose DPI it then has, and
+        // placed at that before its terminal is made at its size, and
+        // before its bar.
         .quick => {
-            const rect = quickRect(app) orelse return App.Error.Win32CallFailed;
+            const work = quickWork(app, .pointer) orelse return App.Error.Win32CallFailed;
+            const rect = quickPlace(
+                app.config.@"quick-terminal-position",
+                app.config.@"quick-terminal-size",
+                work,
+                win32.USER_DEFAULT_SCREEN_DPI,
+            );
             _ = try self.createFrame(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+            _ = self.placeQuick(work, null, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
         },
     }
     errdefer comptime unreachable;
@@ -975,26 +985,25 @@ pub fn show(self: *Window) void {
 }
 
 /// `toggle_quick_terminal` with the quick terminal hidden, or just made
-/// (`App.toggleQuick`): place it again (`quickRect`), above every window
-/// that is not, and bring it forward with the keyboard, as GTK and macOS
-/// show theirs. Its shown tab's terminals are told they show (`relayout`):
-/// a hidden frame's children are told nothing (`hideQuick`). Shown where
-/// it was if its place cannot be read.
+/// (`App.toggleQuick`): place it again, on the monitor it goes on now
+/// (`quickWork`), above every window that is not, and bring it forward
+/// with the keyboard, as GTK and macOS show theirs. Its shown tab's
+/// terminals are told they show (`relayout`): a hidden frame's children
+/// are told nothing (`hideQuick`). Shown where it was if its monitor
+/// cannot be read.
 pub fn showQuick(self: *Window) void {
     assert(self.quick);
-    var flags: win32.UINT = win32.SWP_SHOWWINDOW | win32.SWP_NOACTIVATE;
-    const rect = quickRect(self.app) orelse rect: {
-        flags |= win32.SWP_NOMOVE | win32.SWP_NOSIZE;
-        break :rect std.mem.zeroes(win32.RECT);
-    };
-    if (!win32.SetWindowPos(
+    const flags = win32.SWP_SHOWWINDOW | win32.SWP_NOACTIVATE;
+    if (quickWork(self.app, .pointer)) |work| {
+        if (!self.placeQuick(work, win32.HWND_TOPMOST, flags)) return;
+    } else if (!win32.SetWindowPos(
         self.hwnd,
         win32.HWND_TOPMOST,
-        rect.left,
-        rect.top,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        flags,
+        0,
+        0,
+        0,
+        0,
+        flags | win32.SWP_NOMOVE | win32.SWP_NOSIZE,
     ).toBool()) {
         log.warn("unable to show the quick terminal err={}", .{win32.GetLastError()});
         return;
@@ -1025,38 +1034,143 @@ pub fn hideQuick(self: *Window) void {
     while (it.next()) |entry| entry.view.occlusionChanged(false);
 }
 
-/// Where the quick terminal goes now: on the primary monitor's work area
-/// (`quickPlace`), the part of it the taskbar leaves; null, logged, if
-/// the monitor cannot be read.
-fn quickRect(app: *const App) ?win32.RECT {
-    const primary = win32.MonitorFromPoint(.{ .x = 0, .y = 0 }, win32.MONITOR_DEFAULTTOPRIMARY);
-    const info = monitorInfo(primary) orelse return null;
-    return quickPlace(
-        app.config.@"quick-terminal-position",
-        app.config.@"quick-terminal-size",
-        info.rcWork,
+/// For `quick-terminal-screen = mouse`, whose monitor the quick terminal
+/// goes on (`quickWork`): the pointer's, as it is made and as it shows;
+/// or, as it is placed again (`placeQuickAgain`, `quickDpiChanged`), the
+/// one the centre of `on`, its frame, is on: the monitor it is on,
+/// wherever the pointer has gone since.
+pub const Mouse = union(enum) { pointer, on: win32.HWND };
+
+/// For tests: answers in place of MonitorFromPoint and GetMonitorInfoW,
+/// with the point and flags `quickWork` gives the first, so that a test
+/// has monitors the VM does not.
+pub var test_monitor: if (builtin.is_test) ?*const fn (win32.POINT, win32.DWORD) ?win32.MONITORINFO else void =
+    if (builtin.is_test) null else {};
+
+/// The work area of the monitor the quick terminal goes on now, the part
+/// of it the taskbar leaves, by `quick-terminal-screen`: the primary
+/// monitor for `main`, as GTK takes it, and for `macos-menu-bar`, as the
+/// option says Linux does; for `mouse`, the monitor of the point `mouse`
+/// names, or the nearest, or the primary if Windows cannot say where the
+/// pointer is. Null, logged, if its place or the monitor cannot be read.
+fn quickWork(app: *const App, mouse: Mouse) ?win32.RECT {
+    const primary: struct { win32.POINT, win32.DWORD } = .{ .{ .x = 0, .y = 0 }, win32.MONITOR_DEFAULTTOPRIMARY };
+    const at: win32.POINT, const flags: win32.DWORD = switch (app.config.@"quick-terminal-screen") {
+        .main, .@"macos-menu-bar" => primary,
+        .mouse => switch (mouse) {
+            .pointer => if (Dividers.cursorPos()) |pos| .{ pos, win32.MONITOR_DEFAULTTONEAREST } else primary,
+            .on => |hwnd| centre: {
+                var frame: win32.RECT = undefined;
+                if (!win32.GetWindowRect(hwnd, &frame).toBool()) {
+                    log.warn("cannot read the quick terminal's place err={}", .{win32.GetLastError()});
+                    return null;
+                }
+                break :centre .{ .{
+                    .x = frame.left + @divTrunc(frame.right - frame.left, 2),
+                    .y = frame.top + @divTrunc(frame.bottom - frame.top, 2),
+                }, win32.MONITOR_DEFAULTTONEAREST };
+            },
+        },
+    };
+    if (builtin.is_test) if (test_monitor) |answer| {
+        const info = answer(at, flags) orelse return null;
+        return info.rcWork;
+    };
+    const info = monitorInfo(win32.MonitorFromPoint(at, flags)) orelse return null;
+    return info.rcWork;
+}
+
+/// Move the quick terminal to its place on `work` at its DPI, with
+/// SetWindowPos's `after` and `flags`; false, logged, if it cannot be.
+/// A move onto a monitor with another DPI changes the frame's (`dpiOf`),
+/// and its place is then that DPI's (`quickDpiChanged`). WM_DPICHANGED
+/// says so as the frame arrives, but whether a hidden frame, which
+/// `createBare` places and `showQuick` moves as it shows it, hears of the
+/// change, as `placeForDrop` takes it to, is unverified, and its terminals
+/// would keep the old scale: so the change is made here too, which a
+/// terminal told its scale twice ignores (the core's
+/// `Surface.contentScaleCallback`).
+fn placeQuick(self: *Window, work: win32.RECT, after: ?win32.HWND, flags: win32.UINT) bool {
+    const dpi = dpiOf(self.app, self.hwnd);
+    if (!self.moveQuick(work, dpi, after, flags)) return false;
+    const now = dpiOf(self.app, self.hwnd);
+    if (now != dpi) self.quickDpiChanged(std.math.lossyCast(u16, now));
+    return true;
+}
+
+/// SetWindowPos for the quick terminal to its place on `work` at `dpi`
+/// (`quickPlace`); false, logged, if it fails.
+fn moveQuick(self: *Window, work: win32.RECT, dpi: u32, after: ?win32.HWND, flags: win32.UINT) bool {
+    const rect = quickPlace(
+        self.app.config.@"quick-terminal-position",
+        self.app.config.@"quick-terminal-size",
+        work,
+        dpi,
     );
+    const w = rect.right - rect.left;
+    const h = rect.bottom - rect.top;
+    if (win32.SetWindowPos(self.hwnd, after, rect.left, rect.top, w, h, flags).toBool()) return true;
+    log.warn("unable to place the quick terminal err={}", .{win32.GetLastError()});
+    return false;
+}
+
+/// The quick terminal's DPI is now `dpi`, by WM_DPICHANGED or a move
+/// (`placeQuick`): its terminals take the new scale, then it takes its
+/// place at it (`quickWork`, on the monitor it is on for `mouse`), not
+/// the rect Windows suggests, which is its old one scaled, as a frame
+/// covering its monitor covers it again; then it is laid out if it shows
+/// (`relayout`), for the dividers' width is the DPI's too.
+fn quickDpiChanged(self: *Window, dpi: u16) void {
+    self.scaleTerminals(dpi);
+    if (quickWork(self.app, .{ .on = self.hwnd })) |work| {
+        _ = self.moveQuick(work, dpi, null, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    }
+    self.relayout();
+}
+
+/// The quick terminal, if it shows, placed again as its work area, the
+/// displays or the configuration change: on the primary monitor for
+/// `main`, which may be another by now, and on the monitor it is on for
+/// `mouse` (`Mouse`). A hidden one is placed as it shows (`showQuick`).
+pub fn placeQuickAgain(self: *Window) void {
+    assert(self.quick);
+    if (!win32.IsWindowVisible(self.hwnd).toBool()) return;
+    const work = quickWork(self.app, .{ .on = self.hwnd }) orelse return;
+    _ = self.placeQuick(work, null, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
 }
 
 /// The rect of a quick terminal at `position`, `size` from the
-/// configuration, on the work area `work`, in its pixels: as large as the
-/// core's `QuickTerminalSize.calculate` makes it over the work area, as
-/// macOS works it out over its screen's visible frame, but no larger than
-/// the work area, which `calculate` does not keep to, and at least a
-/// pixel; flush with the work area's edge at `position` and centred along
-/// it, or centred both ways for `center`, as macOS places it
-/// (QuickTerminalPosition.swift).
+/// configuration, on the work area `work`, in its pixels at `dpi`: as
+/// large as the core's `QuickTerminalSize.calculate` makes it over the
+/// work area in DIPs, as macOS works it out over its screen's visible
+/// frame in points, so that `300px`, and the 400 it is when no size is
+/// set, are as many pixels at 96 DPI and half as many again at 144;
+/// but no larger than the work area, which `calculate` does not keep to,
+/// and at least a pixel; flush with the work area's edge at `position`
+/// and centred along it, or centred both ways for `center`, as macOS
+/// places it (QuickTerminalPosition.swift).
+///
+/// The work area is made DIPs rounding up, and the size pixels again
+/// rounding down, so that all of the work area, `100%` or the whole edge
+/// it takes when no size is set, is all of it at any DPI: rounding down
+/// both ways would leave it a pixel or two short. A `dpi` of 0, which no
+/// window has, is taken as 96.
 pub fn quickPlace(
     position: configpkg.Config.QuickTerminalPosition,
     size: configpkg.Config.QuickTerminalSize,
     work: win32.RECT,
+    dpi: u32,
 ) win32.RECT {
+    const d: u64 = if (dpi == 0) win32.USER_DEFAULT_SCREEN_DPI else dpi;
     const work_w: u32 = @intCast(@max(0, work.right - work.left));
     const work_h: u32 = @intCast(@max(0, work.bottom - work.top));
-    const dims = boundedSize(size).calculate(position, .{ .width = work_w, .height = work_h });
+    const dims = boundedSize(size).calculate(position, .{
+        .width = toDips(work_w, d),
+        .height = toDips(work_h, d),
+    });
     // Both fit an i32: no larger than the work area's.
-    const w: i32 = @intCast(@max(1, @min(dims.width, work_w)));
-    const h: i32 = @intCast(@max(1, @min(dims.height, work_h)));
+    const w: i32 = @intCast(@max(1, @min(fromDips(dims.width, d), work_w)));
+    const h: i32 = @intCast(@max(1, @min(fromDips(dims.height, d), work_h)));
     const centred_x = work.left + @divTrunc(work.right - work.left - w, 2);
     const centred_y = work.top + @divTrunc(work.bottom - work.top - h, 2);
     const left: i32, const top: i32 = switch (position) {
@@ -1067,6 +1181,19 @@ pub fn quickPlace(
         .center => .{ centred_x, centred_y },
     };
     return .{ .left = left, .top = top, .right = left + w, .bottom = top + h };
+}
+
+/// `px` pixels at `dpi`, not 0, in DIPs, rounded up (`quickPlace`), or
+/// as many as a u32 holds.
+fn toDips(px: u32, dpi: u64) u32 {
+    const dips = std.math.divCeil(u64, @as(u64, px) * win32.USER_DEFAULT_SCREEN_DPI, dpi) catch unreachable;
+    return std.math.lossyCast(u32, dips);
+}
+
+/// `dips` at `dpi` in pixels, rounded down (`quickPlace`). No u32 times a
+/// u32 overflows a u64.
+fn fromDips(dips: u32, dpi: u64) u64 {
+    return @as(u64, dips) * dpi / win32.USER_DEFAULT_SCREEN_DPI;
 }
 
 /// `size` with each percentage at most 100 and a NaN one left unset, for
@@ -1183,15 +1310,16 @@ fn handleMessage(
         },
 
         win32.WM_DPICHANGED => {
+            // wParam carries the new DPI in both words; they are always
+            // equal for a window. The quick terminal takes its own place.
+            if (self.quick) {
+                self.quickDpiChanged(win32.hiword(wparam));
+                return 0;
+            }
             // The new scale first: the suggested rect below lays the
             // terminals out synchronously, and their cores must see the
-            // scale before the sizes computed for them. A child window gets
-            // no WM_DPICHANGED of its own. wParam carries the new DPI in
-            // both words; they are always equal for a window.
-            for (self.tabs.items) |t| {
-                var it = t.tree.iterator();
-                while (it.next()) |entry| entry.view.scaleChanged(win32.hiword(wparam));
-            }
+            // scale before the sizes computed for them.
+            self.scaleTerminals(win32.hiword(wparam));
             if (self.fullscreen == null) {
                 // Windows' rect as it suggests it: the frame's least is
                 // measured from the frame (`minTrackSize`), which may still
@@ -1249,7 +1377,12 @@ fn handleMessage(
                 // And the command palette's.
                 CommandPalette.fontChanged(self);
             }
+            // A work area changed, as when the taskbar moves.
+            if (wparam == win32.SPI_SETWORKAREA and self.quick) self.placeQuickAgain();
         },
+
+        // Sent to every top-level window; DefWindowProcW below as well.
+        win32.WM_DISPLAYCHANGE => if (self.quick) self.placeQuickAgain(),
 
         // Deactivated: an open command palette closes, as GTK's dialog
         // does, once the deactivation is over (`CommandPalette.deactivated`).
@@ -2175,6 +2308,15 @@ pub fn relayout(self: *Window) void {
     self.placeSearchBars();
     // Above them all, or closed if it no longer fits.
     _ = CommandPalette.place(self);
+}
+
+/// Tell every terminal of every tab its new DPI, `dpi`: a child window
+/// gets no WM_DPICHANGED of its own.
+fn scaleTerminals(self: *Window, dpi: u16) void {
+    for (self.tabs.items) |t| {
+        var it = t.tree.iterator();
+        while (it.next()) |entry| entry.view.scaleChanged(dpi);
+    }
 }
 
 /// Place each search bar of the shown tab's terminals where its terminal
@@ -3290,39 +3432,85 @@ test "win32: the quick terminal is placed on the work area at its position" {
 
     // By default all of its edge, 400 pixels deep, or 800x400 in the
     // middle (`QuickTerminalSize.calculate`), flush with the edge.
-    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 420 }, quickPlace(.top, .{}, work));
-    try testing.expectEqual(RECT{ .left = 10, .top = 660, .right = 1930, .bottom = 1060 }, quickPlace(.bottom, .{}, work));
-    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 410, .bottom = 1060 }, quickPlace(.left, .{}, work));
-    try testing.expectEqual(RECT{ .left = 1530, .top = 20, .right = 1930, .bottom = 1060 }, quickPlace(.right, .{}, work));
-    try testing.expectEqual(RECT{ .left = 570, .top = 340, .right = 1370, .bottom = 740 }, quickPlace(.center, .{}, work));
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 420 }, quickPlace(.top, .{}, work, 96));
+    try testing.expectEqual(RECT{ .left = 10, .top = 660, .right = 1930, .bottom = 1060 }, quickPlace(.bottom, .{}, work, 96));
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 410, .bottom = 1060 }, quickPlace(.left, .{}, work, 96));
+    try testing.expectEqual(RECT{ .left = 1530, .top = 20, .right = 1930, .bottom = 1060 }, quickPlace(.right, .{}, work, 96));
+    try testing.expectEqual(RECT{ .left = 570, .top = 340, .right = 1370, .bottom = 740 }, quickPlace(.center, .{}, work, 96));
 
     // Shorter than its edge: centred along it. The primary size is the
     // depth from the edge, the secondary the length along it.
     try testing.expectEqual(
         RECT{ .left = 490, .top = 20, .right = 1450, .bottom = 540 },
-        quickPlace(.top, .{ .primary = .{ .percentage = 50 }, .secondary = .{ .percentage = 50 } }, work),
+        quickPlace(.top, .{ .primary = .{ .percentage = 50 }, .secondary = .{ .percentage = 50 } }, work, 96),
     );
     try testing.expectEqual(
         RECT{ .left = 1630, .top = 270, .right = 1930, .bottom = 810 },
-        quickPlace(.right, .{ .primary = .{ .pixels = 300 }, .secondary = .{ .pixels = 540 } }, work),
+        quickPlace(.right, .{ .primary = .{ .pixels = 300 }, .secondary = .{ .pixels = 540 } }, work, 96),
     );
 
     // On a work area taller than it is wide, the middle's is 400x800.
     try testing.expectEqual(
         RECT{ .left = -500, .top = 100, .right = -100, .bottom = 900 },
-        quickPlace(.center, .{}, .{ .left = -600, .top = 0, .right = 0, .bottom = 1000 }),
+        quickPlace(.center, .{}, .{ .left = -600, .top = 0, .right = 0, .bottom = 1000 }, 96),
     );
 
     // No larger than the work area, including percentages `toPixels`
     // could not make into a u32, and at least a pixel. A NaN one is the
     // default.
-    try testing.expectEqual(work, quickPlace(.center, .{ .primary = .{ .pixels = 5000 }, .secondary = .{ .pixels = 5000 } }, work));
+    try testing.expectEqual(work, quickPlace(.center, .{ .primary = .{ .pixels = 5000 }, .secondary = .{ .pixels = 5000 } }, work, 96));
     try testing.expectEqual(work, quickPlace(.center, .{
         .primary = .{ .percentage = 1e30 },
         .secondary = .{ .percentage = std.math.inf(f32) },
-    }, work));
-    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 21 }, quickPlace(.top, .{ .primary = .{ .pixels = 0 } }, work));
-    try testing.expectEqual(quickPlace(.left, .{}, work), quickPlace(.left, .{ .primary = .{ .percentage = std.math.nan(f32) } }, work));
+    }, work, 96));
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 21 }, quickPlace(.top, .{ .primary = .{ .pixels = 0 } }, work, 96));
+    try testing.expectEqual(quickPlace(.left, .{}, work, 96), quickPlace(.left, .{ .primary = .{ .percentage = std.math.nan(f32) } }, work, 96));
+}
+
+test "win32: the quick terminal's size is in DIPs, and all of the work area is all of it" {
+    const testing = std.testing;
+    const RECT = win32.RECT;
+    const work: RECT = .{ .left = 10, .top = 20, .right = 1930, .bottom = 1060 };
+
+    // `px` and the 400 when no size is set are DIPs: half as many pixels
+    // again at 144 DPI, twice as many at 192. A percentage is the work
+    // area's at any DPI, to within the DIP that rounding the work area up
+    // may add.
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 620 }, quickPlace(.top, .{}, work, 144));
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 810, .bottom = 1060 }, quickPlace(.left, .{}, work, 192));
+    try testing.expectEqual(
+        RECT{ .left = 1555, .top = 202, .right = 1930, .bottom = 877 },
+        quickPlace(.right, .{ .primary = .{ .pixels = 300 }, .secondary = .{ .pixels = 540 } }, work, 120),
+    );
+    try testing.expectEqual(
+        RECT{ .left = 490, .top = 20, .right = 1450, .bottom = 540 },
+        quickPlace(.top, .{ .primary = .{ .percentage = 50 }, .secondary = .{ .percentage = 50 } }, work, 144),
+    );
+    // The middle's 800x400 too, from the work area in DIPs.
+    try testing.expectEqual(RECT{ .left = 370, .top = 240, .right = 1570, .bottom = 840 }, quickPlace(.center, .{}, work, 144));
+    // Still no larger than the work area.
+    try testing.expectEqual(work, quickPlace(.center, .{ .primary = .{ .pixels = 1500 }, .secondary = .{ .pixels = 1500 } }, work, 192));
+    // A DPI of 0 is 96's.
+    try testing.expectEqual(quickPlace(.right, .{}, work, 96), quickPlace(.right, .{}, work, 0));
+
+    // All of a work area whose sides no DPI divides evenly is all of it,
+    // at every DPI from 96 to five times as many: `100%`, and the whole
+    // edge when the length along it is not set.
+    const odd: RECT = .{ .left = -1919, .top = 7, .right = 0, .bottom = 1048 };
+    const all: configpkg.Config.QuickTerminalSize = .{
+        .primary = .{ .percentage = 100 },
+        .secondary = .{ .percentage = 100 },
+    };
+    var dpi: u32 = 96;
+    while (dpi <= 480) : (dpi += 1) {
+        try testing.expectEqual(odd, quickPlace(.center, all, odd, dpi));
+        const top = quickPlace(.top, .{}, odd, dpi);
+        try testing.expectEqual(odd.left, top.left);
+        try testing.expectEqual(odd.right, top.right);
+        const left = quickPlace(.left, .{}, odd, dpi);
+        try testing.expectEqual(odd.top, left.top);
+        try testing.expectEqual(odd.bottom, left.bottom);
+    }
 }
 
 test "win32: a tab dropped outside its window is placed with its label at the pointer" {

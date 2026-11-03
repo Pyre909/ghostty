@@ -199,6 +199,9 @@ pub const WM_GETMINMAXINFO: UINT = 0x0024;
 pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
 /// lParam is the WINDOWPOS that was applied.
 pub const WM_WINDOWPOSCHANGED: UINT = 0x0047;
+/// Sent to top-level windows "when the display resolution has changed"
+/// (Learn, WM_DISPLAYCHANGE).
+pub const WM_DISPLAYCHANGE: UINT = 0x007E;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_NCCREATE: UINT = 0x0081;
 pub const WM_NCDESTROY: UINT = 0x0082;
@@ -280,6 +283,9 @@ pub const WHEEL_PAGESCROLL: UINT = std.math.maxInt(UINT);
 /// once they change.
 pub const SPI_GETNONCLIENTMETRICS: UINT = 0x0029;
 pub const SPI_SETNONCLIENTMETRICS: UINT = 0x002A;
+/// WM_SETTINGCHANGE's wParam once a work area changes, as when the
+/// taskbar moves.
+pub const SPI_SETWORKAREA: UINT = 0x002F;
 pub const TME_LEAVE: DWORD = 0x00000002;
 /// TrackMouseEvent: fill the structure with what is tracked now.
 pub const TME_QUERY: DWORD = 0x40000000;

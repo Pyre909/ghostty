@@ -388,7 +388,10 @@ pub const App = struct {
         /// Give every window the decorations the configuration now asks
         /// for (`configChange`), and every terminal the scroll bar it asks
         /// for (`ScrollBar.restyle`), and lay each window out again, since
-        /// `window-show-tab-bar` may have changed.
+        /// `window-show-tab-bar` may have changed; and a shown quick
+        /// terminal the place its position, size and screen now give it
+        /// (`Window.placeQuickAgain`), which resizes its terminals, so not
+        /// inside the core frame a soft reload comes in.
         redecorate,
 
         /// Give the window of this surface the size a new one is made with
@@ -3031,6 +3034,7 @@ pub const App = struct {
                 .redecorate => for (self.windows.items) |window| {
                     window.applyDecorations();
                     window.applyScrollBars();
+                    if (window.quick) window.placeQuickAgain();
                     window.relayout();
                 },
                 // A window covering its monitor is left as it is: maximized,
@@ -12650,8 +12654,10 @@ const TestQuick = struct {
         try std.testing.expectEqual(0, app.requests.items.len);
     }
 
-    /// Where `Window.quickRect` puts the quick terminal now.
-    fn place(app: *const App) !win32.RECT {
+    /// Where the quick terminal, `quick`, goes now with no monitors
+    /// standing in (`TestMonitors`): on the primary monitor's work area,
+    /// at the frame's DPI.
+    fn place(app: *const App, quick: *const Window) !win32.RECT {
         const primary = win32.MonitorFromPoint(.{ .x = 0, .y = 0 }, win32.MONITOR_DEFAULTTOPRIMARY) orelse
             return error.TestUnexpectedResult;
         var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
@@ -12661,6 +12667,7 @@ const TestQuick = struct {
             app.config.@"quick-terminal-position",
             app.config.@"quick-terminal-size",
             info.rcWork,
+            Window.dpiOf(app, quick.hwnd),
         );
     }
 
@@ -12711,7 +12718,7 @@ fn testToggleQuick() !void {
     try std.testing.expect(!TestQuick.hasStyle(quick.hwnd, win32.GWL_STYLE, win32.WS_THICKFRAME));
     try std.testing.expect(TestQuick.hasStyle(quick.hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOOLWINDOW));
     try std.testing.expect(quick.isFloating());
-    const place = try TestQuick.place(&app);
+    const place = try TestQuick.place(&app, quick);
     try std.testing.expectEqual(place, try windowRect(quick.hwnd));
     try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
     try std.testing.expectEqual(pane, TestQuick.told.?);
@@ -12782,7 +12789,7 @@ fn testToggleQuick() !void {
     try std.testing.expectEqual(pane, quick.tab().focused.?);
     try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
     try std.testing.expect(quick.isFloating());
-    try std.testing.expectEqual(try TestQuick.place(&app), try windowRect(quick.hwnd));
+    try std.testing.expectEqual(try TestQuick.place(&app, quick), try windowRect(quick.hwnd));
     try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
     try std.testing.expect(TestQuick.shows);
 
@@ -12845,11 +12852,22 @@ fn testQuickFails() !void {
     try std.testing.expectEqual(0, app.surfaces.items.len);
     try std.testing.expectEqual(1, Prompt.boxes);
 
+    // Nor with no monitor to make it on: no frame is made.
     TestQuick.fail = false;
+    TestMonitors.start(&app);
+    defer TestMonitors.stop();
+    TestMonitors.none = true;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(app.quick == null);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(2, Prompt.boxes);
+
+    TestMonitors.none = false;
     try TestQuick.toggle(&app);
     const quick = app.quick orelse return error.TestUnexpectedResult;
     try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
-    try std.testing.expectEqual(1, Prompt.boxes);
+    try std.testing.expectEqual(2, Prompt.boxes);
 }
 
 test "win32: the quick terminal keeps its place, its size and its frame" {
@@ -12906,6 +12924,329 @@ fn testQuickKeepsPlace() !void {
     try std.testing.expectEqual(style, win32.GetWindowLongPtrW(quick.hwnd, win32.GWL_STYLE));
     try std.testing.expectEqual(ex_style, win32.GetWindowLongPtrW(quick.hwnd, win32.GWL_EXSTYLE));
     try std.testing.expectEqual(rect, try windowRect(quick.hwnd));
+}
+
+/// For tests: two monitors the VM does not have, which `Window.quickWork`
+/// asks of in place of Windows (`Window.test_monitor`): `a`, the primary,
+/// with the taskbar at its foot, and `b` right of it and higher, with its
+/// own at its top, at `b_dpi`. A window's DPI is that of the monitor its
+/// centre is on (`App.get_dpi_for_window`), as per-monitor DPI makes it.
+/// With the hook (`proc`) set, the quick terminal, `frame`, is sent the
+/// WM_DPICHANGED Windows sends once a move has taken it onto a monitor
+/// with another DPI than `frame_dpi`, with its rect scaled about its
+/// centre for the rect Windows suggests. What its terminals were last told
+/// of their DPI is `scale` (`Surface.test_scale_changed`). While `none`,
+/// no monitor can be read.
+const TestMonitors = struct {
+    var none = false;
+    var a: win32.MONITORINFO = undefined;
+    var b: win32.MONITORINFO = undefined;
+    var b_dpi: win32.UINT = 144;
+    var frame: ?win32.HWND = null;
+    var frame_dpi: win32.UINT = 96;
+    var dpi_changes: usize = 0;
+    var scale: ?u16 = null;
+
+    const on_a: win32.POINT = .{ .x = 800, .y = 450 };
+    const on_b: win32.POINT = .{ .x = 2500, .y = 300 };
+
+    /// With the pointer on `a`.
+    fn start(app: *App) void {
+        a = info(
+            .{ .left = 0, .top = 0, .right = 1600, .bottom = 900 },
+            .{ .left = 0, .top = 0, .right = 1600, .bottom = 860 },
+        );
+        b = info(
+            .{ .left = 1600, .top = -200, .right = 3520, .bottom = 880 },
+            .{ .left = 1600, .top = -170, .right = 3520, .bottom = 880 },
+        );
+        none = false;
+        b_dpi = 144;
+        frame = null;
+        frame_dpi = 96;
+        dpi_changes = 0;
+        scale = null;
+        Window.test_monitor = &answer;
+        Surface.test_scale_changed = &scaled;
+        Dividers.test_cursor_pos = on_a;
+        app.get_dpi_for_window = &dpiOf;
+    }
+
+    fn stop() void {
+        Window.test_monitor = null;
+        Surface.test_scale_changed = null;
+        Dividers.test_cursor_pos = null;
+    }
+
+    fn info(monitor: win32.RECT, work: win32.RECT) win32.MONITORINFO {
+        var v: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
+        v.cbSize = @sizeOf(win32.MONITORINFO);
+        v.rcMonitor = monitor;
+        v.rcWork = work;
+        return v;
+    }
+
+    fn within(r: win32.RECT, pt: win32.POINT) bool {
+        return pt.x >= r.left and pt.x < r.right and pt.y >= r.top and pt.y < r.bottom;
+    }
+
+    /// As MonitorFromPoint answers: the monitor the point is on, or, for
+    /// a point on neither, the primary for MONITOR_DEFAULTTOPRIMARY and
+    /// otherwise the nearer, taken to be the one on its side of their edge.
+    fn answer(at: win32.POINT, flags: win32.DWORD) ?win32.MONITORINFO {
+        if (none) return null;
+        if (within(a.rcMonitor, at)) return a;
+        if (within(b.rcMonitor, at)) return b;
+        return if (flags == win32.MONITOR_DEFAULTTOPRIMARY or at.x < b.rcMonitor.left) a else b;
+    }
+
+    fn dpiAt(hwnd: win32.HWND) win32.UINT {
+        var r: win32.RECT = undefined;
+        if (!win32.GetWindowRect(hwnd, &r).toBool()) return 96;
+        const centre: win32.POINT = .{
+            .x = r.left + @divTrunc(r.right - r.left, 2),
+            .y = r.top + @divTrunc(r.bottom - r.top, 2),
+        };
+        return if (within(b.rcMonitor, centre)) b_dpi else 96;
+    }
+
+    fn dpiOf(hwnd: win32.HWND) callconv(.winapi) win32.UINT {
+        return dpiAt(hwnd);
+    }
+
+    fn scaled(surface: *Surface, dpi: u16) void {
+        if (surface.window.quick) scale = dpi;
+    }
+
+    fn proc(code: c_int, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
+        if (code >= 0) {
+            const sent: *const win32.CWPRETSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            if (frame) |hwnd| if (sent.hwnd == hwnd and sent.message == win32.WM_WINDOWPOSCHANGED) {
+                const now = dpiAt(hwnd);
+                var r: win32.RECT = undefined;
+                if (now != frame_dpi and win32.GetWindowRect(hwnd, &r).toBool()) {
+                    const was: i32 = @intCast(frame_dpi);
+                    frame_dpi = now;
+                    dpi_changes += 1;
+                    const w = @divTrunc((r.right - r.left) * @as(i32, @intCast(now)), was);
+                    const h = @divTrunc((r.bottom - r.top) * @as(i32, @intCast(now)), was);
+                    const cx = r.left + @divTrunc(r.right - r.left, 2);
+                    const cy = r.top + @divTrunc(r.bottom - r.top, 2);
+                    var suggested: win32.RECT = .{
+                        .left = cx - @divTrunc(w, 2),
+                        .top = cy - @divTrunc(h, 2),
+                        .right = cx - @divTrunc(w, 2) + w,
+                        .bottom = cy - @divTrunc(h, 2) + h,
+                    };
+                    const dpi: win32.WPARAM = now;
+                    _ = win32.SendMessageW(hwnd, win32.WM_DPICHANGED, dpi << 16 | dpi, @bitCast(@intFromPtr(&suggested)));
+                }
+            };
+        }
+        return win32.CallNextHookEx(null, code, wparam, lparam);
+    }
+};
+
+test "win32: the quick terminal goes on the monitor its screen names, and stays on it while it shows" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickScreen, .{});
+}
+
+/// The test of the quick terminal's monitor, run by its test on a desktop
+/// of its own.
+fn testQuickScreen() !void {
+    const RECT = win32.RECT;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    TestMonitors.start(&app);
+    defer TestMonitors.stop();
+
+    // `main`, the default: the primary monitor's work area, at its DPI,
+    // wherever the pointer is.
+    Dividers.test_cursor_pos = TestMonitors.on_b;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+
+    // `mouse`: the work area of the pointer's monitor, below its taskbar,
+    // at the DPI the move there gave the frame, 144: its terminal is told
+    // so, and it is 600 deep, where 96 DPI's would be 400.
+    try TestQuick.toggle(&app);
+    app.config.@"quick-terminal-screen" = .mouse;
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -170, .right = 3520, .bottom = 430 }, try windowRect(quick.hwnd));
+    try std.testing.expectEqual(144, TestMonitors.scale.?);
+
+    // While it shows, a work area that changes, and displays that change,
+    // place it again on the monitor it is on, not the pointer's: here the
+    // taskbar going to the foot, then a monitor made wider.
+    Dividers.test_cursor_pos = TestMonitors.on_a;
+    TestMonitors.b.rcWork = .{ .left = 1600, .top = -200, .right = 3520, .bottom = 840 };
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETWORKAREA, 0);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -200, .right = 3520, .bottom = 400 }, try windowRect(quick.hwnd));
+    TestMonitors.b.rcMonitor = .{ .left = 1600, .top = -200, .right = 4160, .bottom = 1240 };
+    TestMonitors.b.rcWork = .{ .left = 1600, .top = -200, .right = 4160, .bottom = 1200 };
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_DISPLAYCHANGE, 32, 0);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -200, .right = 4160, .bottom = 400 }, try windowRect(quick.hwnd));
+
+    // Hidden, it is left where it is until it shows, then goes where the
+    // pointer is, at 96 DPI again.
+    try TestQuick.toggle(&app);
+    TestMonitors.b.rcWork = .{ .left = 1600, .top = 0, .right = 4160, .bottom = 1200 };
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETWORKAREA, 0);
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_DISPLAYCHANGE, 32, 0);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -200, .right = 4160, .bottom = 400 }, try windowRect(quick.hwnd));
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+    try std.testing.expectEqual(96, TestMonitors.scale.?);
+
+    // `macos-menu-bar`, which Windows has not: the primary's, as `main`.
+    try TestQuick.toggle(&app);
+    app.config.@"quick-terminal-screen" = .@"macos-menu-bar";
+    Dividers.test_cursor_pos = TestMonitors.on_b;
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+
+    // With no monitor to read, it shows where it was, above the rest.
+    try TestQuick.toggle(&app);
+    TestMonitors.none = true;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(quick.isFloating());
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+}
+
+test "win32: the quick terminal takes its place at its monitor's DPI, as that changes" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickDpi, .{});
+}
+
+/// The test of the quick terminal's DPI, run by its test on a desktop of
+/// its own.
+fn testQuickDpi() !void {
+    const RECT = win32.RECT;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    TestMonitors.start(&app);
+    defer TestMonitors.stop();
+    app.config.@"quick-terminal-screen" = .mouse;
+
+    // Made on the pointer's monitor, at its DPI from the first: its
+    // terminal is made at the size it has there.
+    Dividers.test_cursor_pos = TestMonitors.on_b;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1920, .bottom = 600 }, TestQuick.area.?);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -170, .right = 3520, .bottom = 430 }, try windowRect(quick.hwnd));
+
+    // With the WM_DPICHANGED Windows sends as the frame arrives on a
+    // monitor with another DPI, inside the move: once each way, the
+    // terminal told the new DPI, the frame at its place at it.
+    TestMonitors.frame = quick.hwnd;
+    TestMonitors.frame_dpi = 144;
+    const hook = win32.SetWindowsHookExW(
+        win32.WH_CALLWNDPROCRET,
+        TestMonitors.proc,
+        null,
+        std.os.windows.GetCurrentThreadId(),
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.UnhookWindowsHookEx(hook);
+    try TestQuick.toggle(&app);
+    Dividers.test_cursor_pos = TestMonitors.on_a;
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(1, TestMonitors.dpi_changes);
+    try std.testing.expectEqual(96, TestMonitors.scale.?);
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+    try TestQuick.toggle(&app);
+    Dividers.test_cursor_pos = TestMonitors.on_b;
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(2, TestMonitors.dpi_changes);
+    try std.testing.expectEqual(144, TestMonitors.scale.?);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -170, .right = 3520, .bottom = 430 }, try windowRect(quick.hwnd));
+
+    // Its monitor's scale changed while it shows, as Windows tells it,
+    // with a suggested rect that is not its place, on the other monitor
+    // here, as the pointer is: it takes its place at the new DPI on the
+    // monitor it is on, 800 deep, its terminal told first.
+    Dividers.test_cursor_pos = TestMonitors.on_a;
+    TestMonitors.b_dpi = 192;
+    TestMonitors.frame_dpi = 192;
+    var suggested: RECT = .{ .left = 10, .top = 10, .right = 110, .bottom = 110 };
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_DPICHANGED, 192 << 16 | 192, @bitCast(@intFromPtr(&suggested)));
+    try std.testing.expectEqual(192, TestMonitors.scale.?);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -170, .right = 3520, .bottom = 630 }, try windowRect(quick.hwnd));
+    try std.testing.expectEqual(2, TestMonitors.dpi_changes);
+}
+
+test "win32: a reloaded configuration places a shown quick terminal again, and a hidden one as it shows" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickReload, .{});
+}
+
+/// The test of the quick terminal's reloaded place, run by its test on a
+/// desktop of its own.
+fn testQuickReload() !void {
+    const RECT = win32.RECT;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    TestMonitors.start(&app);
+    defer TestMonitors.stop();
+
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+
+    // Its new position and size, from `run` (`redecorate`), not inside the
+    // core frame the reload comes in.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"quick-terminal-position" = .bottom;
+    changed.@"quick-terminal-size" = .{ .primary = .{ .percentage = 50 } };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 1600, .bottom = 400 }, try windowRect(quick.hwnd));
+    app.createRequested();
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 430, .right = 1600, .bottom = 860 }, try windowRect(quick.hwnd));
+
+    // `mouse` leaves it on the monitor it is on while it shows.
+    Dividers.test_cursor_pos = TestMonitors.on_b;
+    changed.@"quick-terminal-screen" = .mouse;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    app.createRequested();
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 430, .right = 1600, .bottom = 860 }, try windowRect(quick.hwnd));
+
+    // Hidden, it waits for its next show, then takes it on the pointer's
+    // monitor: half the width there at its DPI, and all its height.
+    try TestQuick.toggle(&app);
+    changed.@"quick-terminal-position" = .left;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    app.createRequested();
+    try std.testing.expectEqual(RECT{ .left = 0, .top = 430, .right = 1600, .bottom = 860 }, try windowRect(quick.hwnd));
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(RECT{ .left = 1600, .top = -170, .right = 2560, .bottom = 880 }, try windowRect(quick.hwnd));
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,

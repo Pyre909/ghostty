@@ -209,7 +209,7 @@ pub fn hitTest(
     return if (at(window, client) != null) win32.HTTRANSPARENT else hit;
 }
 
-/// For tests: answers in place of GetCursorPos (`setCursor`), as
+/// For tests: answers in place of GetCursorPos (`cursorPos`), as
 /// `Window.test_get_focus` stands for GetFocus, so that a test chooses
 /// the point without moving the pointer.
 pub var test_cursor_pos: if (builtin.is_test) ?win32.POINT else void =
@@ -235,8 +235,10 @@ pub fn setCursor(window: *const Window, wparam: win32.WPARAM, lparam: win32.LPAR
     return true;
 }
 
-/// Where the pointer is on the screen, or null if Windows cannot say.
-fn cursorPos() ?win32.POINT {
+/// Where the pointer is on the screen, or null if Windows cannot say: for
+/// `setCursor`, and for the quick terminal's `mouse` screen
+/// (`Window.quickWork`).
+pub fn cursorPos() ?win32.POINT {
     if (builtin.is_test) if (test_cursor_pos) |pos| return pos;
     var pos: win32.POINT = undefined;
     if (!win32.GetCursorPos(&pos).toBool()) return null;

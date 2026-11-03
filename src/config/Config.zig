@@ -2852,6 +2852,7 @@ keybind: Keybinds = .{},
 ///
 /// On macOS, `macos-menu-bar` uses the screen containing the menu bar.
 /// On Linux/Wayland, `macos-menu-bar` is treated as equivalent to `main`.
+/// On Windows, `main` and `macos-menu-bar` are both the primary monitor.
 ///
 /// Note: On Linux, there is no universal concept of a "primary" monitor.
 /// Ghostty uses the compositor-reported primary output when available and
