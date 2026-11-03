@@ -117,14 +117,19 @@ const StringAlloc = BitmapAllocator(string_chunk);
 const string_count_default = StringAlloc.bitmap_bit_size;
 pub const string_bytes_default = string_count_default * string_chunk;
 
-/// Default number of hyperlinks we support.
-///
-/// The cell multiplier is the number of cells per hyperlink entry that
-/// we support. A hyperlink can be longer than this multiplier; the multiplier
-/// just sets the total capacity to simplify adjustable size metrics.
+/// Default number of unique hyperlinks we support.
 const hyperlink_count_default = 4;
 const hyperlink_bytes_default = hyperlink_count_default * @sizeOf(hyperlink.Set.Item);
-const hyperlink_cell_multiplier = 16;
+
+/// The number of linked cells per unique hyperlink that the default
+/// capacity assumes. The hyperlink map is sized from
+/// `Capacity.hyperlink_cells` on its own, so this only derives the
+/// default below and converts the single hyperlink capacity hint in
+/// snapshots, which predates `hyperlink_cells`, to and from both fields.
+pub const hyperlink_cell_multiplier = 16;
+
+/// Default number of cells with a hyperlink we support.
+const hyperlink_cells_default = hyperlink_count_default * hyperlink_cell_multiplier;
 
 /// The alignment of the start of a page's cell array. Align it to a cache
 /// line so that row cells always start on a cache line. This avoids
@@ -351,6 +356,7 @@ pub const Page = struct {
         InvalidSpacerTailLocation,
         InvalidSpacerHeadLocation,
         UnwrappedSpacerHead,
+        BlankRowHasContent,
     };
 
     /// Temporarily pause integrity checks. This is useful when you are
@@ -433,6 +439,28 @@ pub const Page = struct {
         for (rows, 0..) |*row, y| {
             const graphemes_start = graphemes_seen;
             const cells = row.cells.ptr(self.memory)[0..self.size.cols];
+
+            // A row marked blank must contain only zero cells and must
+            // not use any managed memory. See Row.blank.
+            if (row.blank) {
+                if (row.managedMemory()) {
+                    log.warn(
+                        "page integrity violation y={} blank row has managed memory",
+                        .{y},
+                    );
+                    return IntegrityError.BlankRowHasContent;
+                }
+                for (cells, 0..) |*cell, x| {
+                    if (!cell.isZero()) {
+                        log.warn(
+                            "page integrity violation y={} x={} blank row has content",
+                            .{ y, x },
+                        );
+                        return IntegrityError.BlankRowHasContent;
+                    }
+                }
+            }
+
             for (cells, 0..) |*cell, x| {
                 if (cell.hasGrapheme()) {
                     // If a cell has grapheme data, it must be present in
@@ -782,42 +810,38 @@ pub const Page = struct {
             }
         }
 
-        // layout() requests `hyperlink_count * hyperlink_cell_multiplier`
-        // usable map entries. The map layout adds load-factor headroom and
-        // rounds the raw slot count to a power of two. We need enough
-        // hyperlink_bytes for that requested entry count to accommodate all
-        // hyperlink cells. This is unit tested.
-        const hyperlink_bytes = hyperlinkBytesForCounts(
-            id_set.count(),
-            hyperlink_cells,
-        );
+        const hyperlink_bytes = hyperlinkBytesForCount(id_set.count());
 
         // All the intCasts below are safe because we should have a
         // capacity strictly less than or equal to this page's capacity.
+        //
+        // The one exception is the linked cell count: the hyperlink map
+        // rounds `hyperlink_cells` up (load factor, then a power of
+        // two), so a page can hold more linked cells than its field
+        // says. This clamps to the field's range; the rounding gives
+        // the resulting map room for the count that was clamped away.
         return .{
             .cols = self.size.cols,
             .rows = @intCast(y_end - y_start),
             .styles = @intCast(styles_cap),
             .grapheme_bytes = @intCast(grapheme_bytes),
             .hyperlink_bytes = @intCast(hyperlink_bytes),
+            .hyperlink_cells = @intCast(@min(
+                hyperlink_cells,
+                std.math.maxInt(size.HyperlinkCountInt),
+            )),
             .string_bytes = @intCast(string_bytes),
         };
     }
 
-    /// Return the smallest `Capacity.hyperlink_bytes` that can store
-    /// `unique` distinct hyperlinks used by `cells` cells in total.
+    /// Return the smallest `Capacity.hyperlink_bytes` whose hyperlink
+    /// set can store `unique` distinct hyperlinks.
     ///
     /// For large counts the result can exceed the range of
     /// `size.HyperlinkCountInt`. Callers must clamp it or check that it
     /// fits before casting it.
-    pub fn hyperlinkBytesForCounts(unique: usize, cells: usize) usize {
-        const set_cap = hyperlink.Set.capacityForCount(unique);
-        const map_min = std.math.divCeil(
-            usize,
-            cells,
-            hyperlink_cell_multiplier,
-        ) catch unreachable;
-        return @max(set_cap, map_min) * @sizeOf(hyperlink.Set.Item);
+    pub fn hyperlinkBytesForCount(unique: usize) usize {
+        return hyperlink.Set.capacityForCount(unique) * @sizeOf(hyperlink.Set.Item);
     }
 
     /// Clone the contents of another page into this page. The capacities
@@ -907,6 +931,9 @@ pub const Page = struct {
                 copy.grapheme = dst_row.grapheme;
                 copy.hyperlink = dst_row.hyperlink;
                 copy.styled = dst_row.styled;
+
+                // Empty only if both the copied and kept parts were.
+                copy.blank = dst_row.blank and src_row.blank;
                 copy.dirty |= dst_row.dirty;
             }
 
@@ -1117,6 +1144,9 @@ pub const Page = struct {
         // Clear our destination now matter what
         self.clearCells(dst_row, dst_left, dst_left + len);
 
+        // The source cells may have content.
+        dst_row.blank = false;
+
         // If src has no managed memory, this is very fast.
         if (!src_row.managedMemory()) {
             fastmem.copy(Cell, dst_cells, src_cells);
@@ -1310,7 +1340,10 @@ pub const Page = struct {
     /// metadata such as the wrap state and semantic prompt remain.
     pub inline fn resetRow(self: *Page, row: *Row) void {
         self.clearCells(row, 0, self.size.cols);
-        row.reset();
+
+        // Same as row.reset() but also marks the now zeroed row blank.
+        assert(!row.managedMemory());
+        row.* = .{ .cells = row.cells, .blank = true, .dirty = true };
     }
 
     /// Returns the hyperlink ID for the given cell.
@@ -1490,6 +1523,38 @@ pub const Page = struct {
         gop.value_ptr.* = id;
         cell.hyperlink = true;
         row.hyperlink = true;
+    }
+
+    /// The number of cells that can still get a hyperlink before the
+    /// hyperlink map is full (see `setHyperlinkRun`).
+    pub inline fn hyperlinkCellsFree(self: *const Page) usize {
+        const map = self.hyperlink_map.map(self.memory);
+        return map.maxLoad() - map.count();
+    }
+
+    /// Link a run of freshly written cells in `row` to the hyperlink `id`:
+    /// one map entry per cell and one reference per cell, exactly what
+    /// `setHyperlink` and a `use` per cell would do, in bulk.
+    ///
+    /// The cells must already have their hyperlink flag set and must not
+    /// have had a hyperlink before they were written, so none of them has
+    /// a map entry (no old reference to release). The map must have room
+    /// for every cell (see `hyperlinkCellsFree`); it can't grow here.
+    pub fn setHyperlinkRun(
+        self: *Page,
+        row: *Row,
+        cells: []const Cell,
+        id: hyperlink.Id,
+    ) void {
+        defer self.assertIntegrity();
+        assert(cells.len <= self.hyperlinkCellsFree());
+
+        var map = self.hyperlink_map.map(self.memory);
+        for (cells) |*cell| {
+            map.putAssumeCapacityNoClobber(getOffset(Cell, self.memory, cell), id);
+        }
+        row.hyperlink = true;
+        self.hyperlink_set.useMultiple(self.memory, id, @intCast(cells.len));
     }
 
     /// Move the hyperlink from one cell to another. This can't fail
@@ -1756,15 +1821,6 @@ pub const Page = struct {
             used: usize,
             capacity: usize,
         };
-
-        /// Returns whichever hyperlink table is fuller relative to its
-        /// capacity. Both tables are sized from `Capacity.hyperlink_bytes`,
-        /// so this is the one that runs out of room first.
-        pub fn hyperlinks(self: Usage) Amount {
-            const set = self.hyperlink_set;
-            const map = self.hyperlink_map;
-            return if (set.used * map.capacity >= map.used * set.capacity) set else map;
-        }
     };
 
     /// Measures how much of its style, grapheme, string, and hyperlink
@@ -1934,20 +1990,17 @@ pub const Page = struct {
             const string_start = alignForward(usize, grapheme_map_end, StringAlloc.base_align.toByteUnits());
             const string_end = string_start + string_layout.total_size;
 
+            // The set and the map are sized independently: the set
+            // from the number of unique hyperlinks, the map from the
+            // number of cells that have one. The map layout adds its
+            // load-factor headroom and rounds up to a power of two, so
+            // it always holds at least `hyperlink_cells` entries.
             const hyperlink_count = @divFloor(cap.hyperlink_bytes, @sizeOf(hyperlink.Set.Item));
             const hyperlink_set_layout: hyperlink.Set.Layout = .init(@intCast(hyperlink_count));
             const hyperlink_set_start = alignForward(usize, string_end, hyperlink.Set.base_align.toByteUnits());
             const hyperlink_set_end = hyperlink_set_start + hyperlink_set_layout.total_size;
 
-            const hyperlink_map_count: u32 = count: {
-                if (hyperlink_count == 0) break :count 0;
-                const mult = std.math.cast(
-                    u32,
-                    hyperlink_count * hyperlink_cell_multiplier,
-                ) orelse break :count std.math.maxInt(u32);
-                break :count mult;
-            };
-            const hyperlink_map_layout = hyperlink.Map.layout(hyperlink_map_count);
+            const hyperlink_map_layout = hyperlink.Map.layout(cap.hyperlink_cells);
             const hyperlink_map_start = alignForward(usize, hyperlink_set_end, hyperlink.Map.base_align.toByteUnits());
             const hyperlink_map_end = hyperlink_map_start + hyperlink_map_layout.total_size;
 
@@ -2005,11 +2058,17 @@ pub const Capacity = struct {
     /// Number of unique styles that can be used on this page.
     styles: size.StyleCountInt = 16,
 
-    /// Number of bytes to allocate for hyperlink data. Note that the
-    /// amount of data used for hyperlinks in total is more than this because
-    /// hyperlinks use string data as well as a small amount of lookup metadata.
+    /// Number of bytes to allocate for the hyperlink set, which holds
+    /// the unique hyperlinks on the page. Note that the amount of data
+    /// used for hyperlinks in total is more than this because hyperlinks
+    /// use string data as well as a small amount of lookup metadata.
     /// This number is a rough approximation.
     hyperlink_bytes: size.HyperlinkCountInt = hyperlink_bytes_default,
+
+    /// Number of cells with a hyperlink that the hyperlink map can hold.
+    /// This is independent of `hyperlink_bytes`: a page can have a few
+    /// unique hyperlinks on many cells or many hyperlinks on a few.
+    hyperlink_cells: size.HyperlinkCountInt = hyperlink_cells_default,
 
     /// Number of bytes to allocate for grapheme data.
     grapheme_bytes: size.GraphemeBytesInt = grapheme_bytes_default,
@@ -2133,13 +2192,16 @@ pub const Capacity = struct {
     /// Computes the number of bytes available for the row headers and
     /// cells in the page: the page size minus the metadata block.
     fn availableBytesForGrid(self: Capacity) usize {
-        comptime {
-            assert(cells_align % Page.MetaLayout.alignment == 0);
-            assert(@sizeOf(Cell) % Page.MetaLayout.alignment == 0);
-        }
+        const total_size = Page.layout(self).total_size;
+        const meta_size = Page.MetaLayout.init(self).total_size;
 
-        const l = Page.layout(self);
-        return l.total_size - Page.MetaLayout.init(self).total_size;
+        // Find the latest aligned offset where the metadata fits.
+        // The grid can use all bytes before this offset.
+        return std.mem.alignBackward(
+            usize,
+            total_size - meta_size,
+            Page.MetaLayout.alignment,
+        );
     }
 };
 
@@ -2209,7 +2271,33 @@ pub const Row = packed struct(u64) {
     /// screen.
     dirty: bool = false,
 
-    _padding: u23 = 0,
+    /// True if every cell in the row is the zero cell (no text, style,
+    /// or background color) and the row has no managed memory.
+    ///
+    /// This may be false for an empty row, but must never be true for
+    /// a row with content. `Page.verifyIntegrity` checks this. It is set
+    /// only by code that zeroes the whole row (`Page.resetRow`, or
+    /// `Screen.clearCells` with a zero blank cell) or by copying a row
+    /// that has it set.
+    ///
+    /// Any code that writes cells must clear it, usually with
+    /// `markWritten`. Otherwise `Screen.clearRows` will skip the row
+    /// and leave the old content on screen.
+    ///
+    /// ```zig
+    /// cells[x] = new_cell;
+    /// row.markWritten(); // dirty = true, blank = false
+    /// ```
+    ///
+    /// `Screen.clearRows` skips rows with this set and does not mark them
+    /// dirty. Their cells don't change, and the metadata it resets (wrap
+    /// and semantic prompt state) doesn't change how the row looks.
+    /// `Screen.clearCells` (and so EL and ECH) also leaves their cells
+    /// alone, and the emptiness scans in `PageList.scrollClear` and
+    /// `PageList.trimTrailingBlankRows` don't read them.
+    blank: bool = false,
+
+    _padding: u22 = 0,
 
     /// The semantic prompt state of the row. See `semantic_prompt`.
     pub const SemanticPrompt = enum(u2) {
@@ -2240,6 +2328,18 @@ pub const Row = packed struct(u64) {
         return @bitCast(self);
     }
 
+    /// Mark the row dirty and not blank. Call this after writing cells.
+    ///
+    /// This is equivalent to `dirty = true` and `blank = false`, but does
+    /// a single load and store of the row instead of two. The difference
+    /// is measurable when printing text.
+    pub inline fn markWritten(self: *Row) void {
+        const set: Backing = comptime fieldMask(Row, &.{"dirty"});
+        const clear: Backing = comptime fieldMask(Row, &.{"blank"});
+        const v: Backing = @bitCast(self.*);
+        self.* = @bitCast((v | set) & ~clear);
+    }
+
     /// Returns true if this row has any managed memory outside of the
     /// row structure (graphemes, styles, etc.)
     pub inline fn managedMemory(self: Row) bool {
@@ -2250,6 +2350,10 @@ pub const Row = packed struct(u64) {
     /// Reset all row metadata to the default state, preserving only
     /// the cells offset, and mark the row dirty. This is a single
     /// 8-byte store.
+    ///
+    /// This also clears `blank`, which is always safe. Keeping it would
+    /// need a load of the old header, which is measurable on the scroll
+    /// region path that calls this for every scrolled line.
     ///
     /// This must be applied to any row whose storage is recycled as a
     /// blank row or retired into unused page capacity, in addition to
@@ -2504,13 +2608,73 @@ pub const Cell = packed struct(u64) {
         return self.content_tag == .codepoint_grapheme;
     }
 
+    /// The bit of `content_tag` that is set for the two background color
+    /// tags and clear for the two codepoint tags.
+    const bg_tag_bit: Backing = bg: {
+        assert(@backingInt(ContentTag.codepoint) & 2 == 0);
+        assert(@backingInt(ContentTag.codepoint_grapheme) & 2 == 0);
+        assert(@backingInt(ContentTag.bg_color_palette) & 2 != 0);
+        assert(@backingInt(ContentTag.bg_color_rgb) & 2 != 0);
+        break :bg @as(Backing, 2) << @bitOffsetOf(Cell, "content_tag");
+    };
+
+    /// The codepoint bits of `content`. For the background color tags
+    /// these bits hold color data instead.
+    const codepoint_bits: Backing = fieldMask(Cell, &.{"content.codepoint.data"});
+
+    /// A cell is not empty (see `isEmpty`) exactly when one of these
+    /// bits is set: a background color tag, a codepoint, or any wide
+    /// state other than narrow.
+    const non_empty_bits: Backing = bg_tag_bit | codepoint_bits |
+        fieldMask(Cell, &.{"wide"});
+
+    /// Cells checked at once by the group loops below.
+    const any_group_len = 8;
+    const AnyGroup = @Vector(any_group_len, Backing);
+
     /// Returns true if the set of cells has text in it.
-    pub inline fn hasTextAny(cells: []const Cell) bool {
-        for (cells) |cell| {
+    ///
+    /// This is the same as calling `hasText` on each cell, but checks
+    /// a group of cells at a time. The OR of a group's raw bits answers
+    /// most groups without looking at single cells: with no codepoint
+    /// bits set, no cell has text; with codepoint bits set and no
+    /// background color tag in the group, some codepoint cell has a
+    /// non-zero codepoint, which is text. Only a group mixing background
+    /// color cells with codepoint bits is checked cell by cell.
+    pub fn hasTextAny(cells: []const Cell) bool {
+        var i: usize = 0;
+        while (i + any_group_len <= cells.len) : (i += any_group_len) {
+            const group: AnyGroup = @bitCast(cells[i..][0..any_group_len].*);
+            const bits = @reduce(.Or, group);
+            if (bits & codepoint_bits == 0) continue;
+            if (bits & bg_tag_bit == 0) return true;
+            for (cells[i..][0..any_group_len]) |cell| {
+                if (cell.hasText()) return true;
+            }
+        }
+
+        for (cells[i..]) |cell| {
             if (cell.hasText()) return true;
         }
 
         return false;
+    }
+
+    /// Returns true if every cell in the set is empty (see `isEmpty`).
+    ///
+    /// This is the same as calling `isEmpty` on each cell, but is exact
+    /// on the OR of the cells' raw bits (see `non_empty_bits`), so it
+    /// needs no per-cell branch and checks a group of cells at a time.
+    pub fn isEmptyAll(cells: []const Cell) bool {
+        var i: usize = 0;
+        while (i + any_group_len <= cells.len) : (i += any_group_len) {
+            const group: AnyGroup = @bitCast(cells[i..][0..any_group_len].*);
+            if (@reduce(.Or, group) & non_empty_bits != 0) return false;
+        }
+
+        var bits: Backing = 0;
+        for (cells[i..]) |cell| bits |= @as(Backing, @bitCast(cell));
+        return bits & non_empty_bits == 0;
     }
 };
 
@@ -2922,6 +3086,46 @@ test "Cell is zero by default" {
     try std.testing.expectEqual(Cell.SemanticContent.output, cell.semantic_content);
 }
 
+test "Cell hasTextAny and isEmptyAll match the per-cell checks" {
+    // Each case the bulk checks must tell apart. Every pair is tried at
+    // every two positions of every row length up to past two groups, so
+    // pairs share a group, sit in different groups, or sit in the tail.
+    const cases = [_]Cell{
+        .{},
+        .{ .style_id = 7 }, // styled but empty
+        .init('A'),
+        .{ .content_tag = .codepoint, .content = .{ .codepoint = .{ .data = 'A' } }, .wide = .wide },
+        .{ .content_tag = .codepoint_grapheme, .content = .{ .codepoint = .{ .data = 'e' } } },
+        .{ .content_tag = .codepoint_grapheme }, // grapheme tag, no codepoint
+        .{ .wide = .spacer_tail }, // not empty, no text
+        .{ .wide = .spacer_head }, // not empty, no text
+        .{ .content_tag = .bg_color_palette }, // color bits all zero
+        .{ .content_tag = .bg_color_rgb, .content = .{ .color_rgb = .{ .r = 0xff, .g = 0xff, .b = 0xff } } },
+        .{ .protected = true, .hyperlink = true }, // flags only
+    };
+
+    try testing.expect(!Cell.hasTextAny(&.{}));
+    try testing.expect(Cell.isEmptyAll(&.{}));
+
+    var row: [19]Cell = undefined;
+    for (1..row.len + 1) |len| {
+        for (0..len) |i| for (0..len) |j| for (cases) |a| for (cases) |b| {
+            @memset(row[0..len], .{});
+            row[i] = a;
+            row[j] = b;
+
+            var text = false;
+            var empty = true;
+            for (row[0..len]) |cell| {
+                text = text or cell.hasText();
+                empty = empty and cell.isEmpty();
+            }
+            try testing.expectEqual(text, Cell.hasTextAny(row[0..len]));
+            try testing.expectEqual(empty, Cell.isEmptyAll(row[0..len]));
+        };
+    }
+}
+
 test "Page capacity adjust cols down" {
     const original = std_capacity;
     const original_size = Page.layout(original).total_size;
@@ -3104,15 +3308,12 @@ test "Page usage" {
     const linked = page.usage();
     try testing.expect(linked.string_bytes.used > 0);
     try testing.expectEqual(1, linked.hyperlink_set.used);
+    try testing.expectEqual(page.hyperlink_set.layout.cap, linked.hyperlink_set.capacity);
     try testing.expectEqual(1, linked.hyperlink_map.used);
+    try testing.expectEqual(page.hyperlinkCapacity(), linked.hyperlink_map.capacity);
 
-    // The set holds far fewer items than the map, so one link on one
-    // cell fills more of the set.
-    try testing.expectEqual(linked.hyperlink_set, linked.hyperlinks());
-
-    // The same link on half the map's capacity fills more of the map
-    // than the one link fills of the set.
-    try testing.expect(linked.hyperlink_set.capacity > 2);
+    // The same link on half the map's capacity fills the map and not
+    // the set: the two tables are measured independently.
     const half_map = page.hyperlinkCapacity() / 2;
     for (1..half_map) |i| {
         const rac = page.getRowAndCell(i % page.size.cols, i / page.size.cols);
@@ -3125,7 +3326,7 @@ test "Page usage" {
     }
     const spread = page.usage();
     try testing.expectEqual(half_map, spread.hyperlink_map.used);
-    try testing.expectEqual(spread.hyperlink_map, spread.hyperlinks());
+    try testing.expectEqual(1, spread.hyperlink_set.used);
 }
 
 test "Page init" {
@@ -4251,6 +4452,116 @@ test "Page verifyIntegrity zero cols" {
     );
 }
 
+test "Page verifyIntegrity blank row with content" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    // An empty row may be marked blank.
+    page.getRow(0).blank = true;
+    try page.verifyIntegrity(testing.allocator);
+
+    // A row with content may not.
+    const rac = page.getRowAndCell(3, 0);
+    rac.cell.* = .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = .{ .data = 'A' } },
+    };
+    try testing.expectError(
+        Page.IntegrityError.BlankRowHasContent,
+        page.verifyIntegrity(testing.allocator),
+    );
+}
+
+test "Page resetRow marks the row blank" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    const rac = page.getRowAndCell(3, 0);
+    rac.cell.* = .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = .{ .data = 'A' } },
+    };
+    rac.row.wrap = true;
+
+    page.resetRow(rac.row);
+    try testing.expect(rac.row.blank);
+    try testing.expect(rac.row.dirty);
+    try testing.expect(!rac.row.wrap);
+
+    // Row.reset is a single store and clears the flag, which is safe.
+    rac.row.reset();
+    try testing.expect(!rac.row.blank);
+}
+
+test "Page moveCells clears blank on the destination row" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    const src = page.getRowAndCell(0, 0);
+    src.cell.* = .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = .{ .data = 'A' } },
+    };
+    const dst = page.getRow(1);
+    dst.blank = true;
+
+    page.moveCells(src.row, 0, dst, 2, 3);
+    try testing.expect(!dst.blank);
+    try page.verifyIntegrity(testing.allocator);
+}
+
+test "Page cloneRowFrom partial keeps blank only if both parts are blank" {
+    var src = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer src.deinit();
+    var dst = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer dst.deinit();
+
+    // Both blank: the result is blank.
+    src.getRow(0).blank = true;
+    dst.getRow(0).blank = true;
+    try dst.clonePartialRowFrom(&src, dst.getRow(0), src.getRow(0), 2, 8);
+    try testing.expect(dst.getRow(0).blank);
+
+    // The copied part has content: the result is not blank.
+    const rac = src.getRowAndCell(4, 1);
+    rac.cell.* = .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = .{ .data = 'A' } },
+    };
+    dst.getRow(1).blank = true;
+    try dst.clonePartialRowFrom(&src, dst.getRow(1), src.getRow(1), 2, 8);
+    try testing.expect(!dst.getRow(1).blank);
+
+    // The kept part may have content: the result is not blank.
+    src.getRow(2).blank = true;
+    try dst.clonePartialRowFrom(&src, dst.getRow(2), src.getRow(2), 2, 8);
+    try testing.expect(!dst.getRow(2).blank);
+}
+
 test "Page exactRowCapacity empty rows" {
     var page = try Page.init(.{
         .cols = 10,
@@ -4412,11 +4723,11 @@ test "Page exactRowCapacity styles max single row" {
     for (cells, 0..) |*cell, i| {
         if (count >= max_count) break;
         const style_id = page.styles.add(page.memory, .{
-            .fg_color = .{ .rgb = .{
+            .fg_color = .rgb(.{
                 .r = @intCast(i & 0xFF),
                 .g = @intCast((i >> 8) & 0xFF),
                 .b = 0,
-            } },
+            }),
         }) catch break;
         cell.style_id = style_id;
         count += 1;
@@ -4733,15 +5044,14 @@ test "Page exactRowCapacity hyperlink map capacity for many cells" {
         try page.setHyperlink(rac.row, rac.cell, id);
     }
 
-    // exactRowCapacity must account for 50 hyperlink cells, not just 1 unique hyperlink
+    // exactRowCapacity must account for 50 hyperlink cells in the map
+    // and only 1 unique hyperlink in the set.
     const cap = page.exactRowCapacity(0, 1);
-
-    // The hyperlink_bytes must be large enough that layout() computes sufficient
-    // hyperlink_map capacity. With hyperlink_cell_multiplier=16, we need at least
-    // ceil(50/16) = 4 hyperlink entries worth of bytes for the map.
-    const min_for_map = std.math.divCeil(usize, cols, hyperlink_cell_multiplier) catch 0;
-    const min_hyperlink_bytes = min_for_map * @sizeOf(hyperlink.Set.Item);
-    try testing.expect(cap.hyperlink_bytes >= min_hyperlink_bytes);
+    try testing.expectEqual(cols, cap.hyperlink_cells);
+    try testing.expectEqual(
+        hyperlink.Set.capacityForCount(1) * @sizeOf(hyperlink.Set.Item),
+        cap.hyperlink_bytes,
+    );
 
     // Create a new page with exact capacity and clone - must not fail
     var cloned = try Page.init(cap);
@@ -4761,18 +5071,67 @@ test "Page exactRowCapacity hyperlink map capacity for many cells" {
 }
 
 test "Page layout avoids double rounding hyperlink map capacity" {
-    const hyperlink_count = 3;
     const layout = Page.layout(.{
         .cols = 1,
         .rows = 1,
-        .hyperlink_bytes = hyperlink_count * @sizeOf(hyperlink.Set.Item),
+        .hyperlink_cells = 48,
     });
 
-    // Three set entries request 48 usable map entries. Scaling that for the
-    // 80% load factor needs 60 raw slots, which rounds once to 64. Rounding
-    // the request before applying the load factor would allocate 128 slots.
+    // 48 usable map entries scaled for the 80% load factor need 60 raw
+    // slots, which rounds once to 64. Rounding the request before
+    // applying the load factor would allocate 128 slots.
     try std.testing.expectEqual(
         @as(u32, 64),
         layout.hyperlink_map_layout.capacity,
     );
+}
+
+test "Page layout sizes hyperlink map and set independently" {
+    // Many linked cells with few unique links: a large map, a small set.
+    {
+        var page = try Page.init(.{
+            .cols = 10,
+            .rows = 10,
+            .hyperlink_bytes = 2 * @sizeOf(hyperlink.Set.Item),
+            .hyperlink_cells = 4000,
+        });
+        defer page.deinit();
+        try testing.expect(page.hyperlinkCapacity() >= 4000);
+        try testing.expect(page.hyperlink_set.layout.cap <= 2);
+        const layout = Page.layout(page.capacity);
+        try testing.expect(
+            layout.hyperlink_set_layout.total_size <
+                layout.hyperlink_map_layout.total_size,
+        );
+    }
+
+    // Many unique links on few cells: a large set, a small map.
+    {
+        var page = try Page.init(.{
+            .cols = 10,
+            .rows = 10,
+            .hyperlink_bytes = 512 * @sizeOf(hyperlink.Set.Item),
+            .hyperlink_cells = 8,
+        });
+        defer page.deinit();
+        try testing.expect(page.hyperlink_set.layout.cap >= 400);
+        try testing.expect(page.hyperlinkCapacity() >= 8);
+        try testing.expect(page.hyperlinkCapacity() < 64);
+    }
+
+    // The default capacity holds the same map as before the split: 64
+    // entries request 80 raw slots, which round to 128.
+    {
+        const layout = Page.layout(.{ .cols = 1, .rows = 1 });
+        try testing.expectEqual(@as(u32, 128), layout.hyperlink_map_layout.capacity);
+    }
+
+    // A zero map with a non-zero set and the reverse both lay out.
+    {
+        const no_map = Page.layout(.{ .cols = 1, .rows = 1, .hyperlink_cells = 0 });
+        try testing.expectEqual(@as(u32, 0), no_map.hyperlink_map_layout.capacity);
+        try testing.expect(no_map.hyperlink_set_layout.total_size > 0);
+        const no_set = Page.layout(.{ .cols = 1, .rows = 1, .hyperlink_bytes = 0 });
+        try testing.expectEqual(@as(u32, 128), no_set.hyperlink_map_layout.capacity);
+    }
 }

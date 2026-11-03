@@ -53,6 +53,7 @@ anhthang
 anmitalidev
 anthonyzhoon
 aprilnea
+arc-source-coder
 aredmondd
 arneshbanerjee
 arvin7liu
@@ -88,6 +89,7 @@ cespare
 charliie-dev
 chernetskyi
 chronologos
+clavinjune
 clemg
 clinta
 cmwetherell
@@ -105,6 +107,7 @@ damyanbogoev
 danneu
 danulqua
 dariogriffo
+database64128
 dave92082
 davey-hughes
 davidhodge
@@ -245,6 +248,7 @@ mac0ne
 maddythewisp
 magnussp
 mahnokropotkinvich
+mangkoran
 marijagjorgjieva
 markdorison
 markhuot
@@ -413,6 +417,7 @@ yak3d
 yamshta
 ydah
 yeager
+yinxiangshi
 -zaviro
 zenangst
 zenyr
