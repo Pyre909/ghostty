@@ -1901,6 +1901,11 @@ pub const Surface = struct {
             win32.WM_KEYUP,
             win32.WM_SYSKEYUP,
             => {
+                // First, so that a terminal with no core clears it too.
+                if (self.app.hotkeyRelease(msg, wparam)) {
+                    return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
 

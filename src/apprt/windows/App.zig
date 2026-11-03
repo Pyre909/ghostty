@@ -281,6 +281,15 @@ pub const App = struct {
     /// the configuration binds by `init` and by each `.config_change`.
     hotkeys: Hotkeys,
 
+    /// The virtual keys whose press a hotkey took (`hotkeyPressed`).
+    /// Windows sends such a key's release to the window that has the
+    /// keyboard focus when the key comes up (checked in the VM,
+    /// 2026-11-02), which may be one the hotkey's action has just opened,
+    /// and no terminal's core saw the press. The key's next message in any
+    /// terminal clears it, and is withheld if it is the release
+    /// (`hotkeyRelease`); a key-down there is a press the core sees.
+    hotkey_up: std.bit_set.Static(256),
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -637,6 +646,7 @@ pub const App = struct {
             .terminal_loops = 0,
             .terminating = false,
             .hotkeys = .{},
+            .hotkey_up = .empty,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -3257,13 +3267,17 @@ pub const App = struct {
     /// prompt or a tick (`canReenterCore`), where the core would be
     /// reentered, nor once the windows close for good (`terminating`):
     /// the press is dropped, as a key reaching a terminal while a prompt is
-    /// open is.
+    /// open is. Either way no terminal's core saw the press, so the key's
+    /// release is withheld (`hotkey_up`).
     fn hotkeyPressed(self: *App, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+        const trigger = self.hotkeys.pressed(wparam, lparam) orelse return;
+        // `pressed` matched the high word against a registered virtual
+        // key, and a virtual key is one byte (Virtual-Key Codes).
+        self.hotkey_up.set(@as(u8, @truncate(@as(usize, @bitCast(lparam)) >> 16)));
         if (self.terminating or !self.canReenterCore()) {
             log.debug("a global keybind pressed while the core is busy is dropped", .{});
             return;
         }
-        const trigger = self.hotkeys.pressed(wparam, lparam) orelse return;
         const entry = self.config.keybind.set.get(trigger) orelse return;
         const leaf: input.Binding.Set.GenericLeaf = switch (entry.value_ptr.*) {
             // The configuration refuses a global sequence.
@@ -3283,6 +3297,17 @@ pub const App = struct {
     /// place of the core's `performAllChainedAction`.
     pub var test_perform_all: if (builtin.is_test) ?*const fn (*App, []const input.Binding.Action) void else void =
         if (builtin.is_test) null else {};
+
+    /// Whether a terminal's key message `msg` for virtual key `wparam` is
+    /// the release of a key whose press a hotkey took (`hotkey_up`), to be
+    /// withheld from the core. Any message of that key clears it: a
+    /// release once withheld, a press because the core sees it.
+    pub fn hotkeyRelease(self: *App, msg: win32.UINT, wparam: win32.WPARAM) bool {
+        const vk = std.math.cast(u8, wparam) orelse return false;
+        if (!self.hotkey_up.isSet(vk)) return false;
+        self.hotkey_up.unset(vk);
+        return msg == win32.WM_KEYUP or msg == win32.WM_SYSKEYUP;
+    }
 
     /// The message-only window's procedure.
     fn wndProc(
@@ -4150,6 +4175,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.search_hide = null;
     app.quit = false;
     app.hotkeys = .{};
+    app.hotkey_up = .empty;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -19697,4 +19723,99 @@ test "win32: a global keybind's new_window asks the core, which asks this runtim
         else => {},
     };
     try std.testing.expectEqual(1, windows);
+}
+
+test "win32: a global keybind's key-up reaches no terminal's core" {
+    // Windows takes the key's press for the hotkey and sends its release
+    // to the window that has the keyboard focus when the key comes up
+    // (checked in the VM, 2026-11-02): the terminal in front at the
+    // press, or one in a window the action has opened since. These panes
+    // have no core surface, so a release that reached the core would
+    // reach memory that is not one.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+
+    const ctrl_a = TestHotkeys.ctrl_a;
+    const alt_f9: Hotkeys.Combo = .{ .mods = win32.MOD_ALT | win32.MOD_NOREPEAT, .vk = 0x78 };
+    try TestHotkeys.apply(&app, &.{ "global:ctrl+a=new_window", "global:alt+f9=new_tab" });
+    const calls = TestHotkeys.take();
+    const a_id = TestHotkeys.idOf(calls, ctrl_a).?;
+    const f9_id = TestHotkeys.idOf(calls, alt_f9).?;
+
+    // Scan codes 0x1E (A) and 0x43 (F9). A release sets lParam bits 30
+    // and 31, and bit 29 with Alt held.
+    const a_up: win32.LPARAM = @bitCast(@as(usize, 0xC01E_0001));
+    const f9_up: win32.LPARAM = @bitCast(@as(usize, 0xE043_0001));
+    const b_up: win32.LPARAM = @bitCast(@as(usize, 0xC030_0001));
+
+    // The terminal in front at the press.
+    TestHotkeys.press(&app, a_id, ctrl_a);
+    try std.testing.expect(app.hotkey_up.isSet('A'));
+    a.core_state = .live;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYUP, 'A', a_up);
+    a.core_state = .none;
+    try std.testing.expect(!app.hotkey_up.isSet('A'));
+
+    // A terminal in a window opened since, given the release as
+    // WM_SYSKEYUP, with Alt held.
+    TestHotkeys.press(&app, f9_id, alt_f9);
+    const opened = try testFrame(&app);
+    const b = try testPane(&app, opened);
+    opened.tab().tree = try .init(alloc, b);
+    opened.tab().focused = b;
+    b.core_state = .live;
+    _ = win32.SendMessageW(b.hwnd, win32.WM_SYSKEYUP, 0x78, f9_up);
+    b.core_state = .none;
+    try std.testing.expect(!app.hotkey_up.isSet(0x78));
+
+    // Another key's release leaves it; a terminal with no core yet takes
+    // it as well.
+    TestHotkeys.press(&app, a_id, ctrl_a);
+    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYUP, 'B', b_up);
+    try std.testing.expect(app.hotkey_up.isSet('A'));
+    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYUP, 'A', a_up);
+    try std.testing.expect(!app.hotkey_up.isSet('A'));
+
+    // A press dropped in a prompt was not seen either.
+    const Inside = struct {
+        var app_: *App = undefined;
+        var id: c_int = 0;
+        fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+            TestHotkeys.press(app_, id, TestHotkeys.ctrl_a);
+            return win32.IDOK;
+        }
+    };
+    Inside.app_ = &app;
+    Inside.id = a_id;
+    core_app.focused_surface = null;
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &Inside.box;
+    defer message_box.* = null;
+    _ = TestHotkeys.takePerformed();
+    notice(&app, null, L("Notice"));
+    try std.testing.expectEqual(0, TestHotkeys.takePerformed().len);
+    try std.testing.expect(app.hotkey_up.isSet('A'));
+    a.core_state = .live;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYUP, 'A', a_up);
+    a.core_state = .none;
+    try std.testing.expect(!app.hotkey_up.isSet('A'));
+
+    // Once the release went to another program, the key's next press in
+    // a terminal reaches the core, and so does its release.
+    TestHotkeys.press(&app, a_id, ctrl_a);
+    try std.testing.expect(!app.hotkeyRelease(win32.WM_KEYDOWN, 'A'));
+    try std.testing.expect(!app.hotkeyRelease(win32.WM_KEYUP, 'A'));
 }
