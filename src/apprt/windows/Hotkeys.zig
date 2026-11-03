@@ -92,8 +92,8 @@ pub const Refusal = error{
     /// never matches.
     AltGr,
     /// Every action is one this runtime does not perform yet
-    /// (toggle_quick_terminal, toggle_visibility; `App.performAction`):
-    /// the hotkey would take its keys from every program and do nothing.
+    /// (toggle_visibility; `App.performAction`): the hotkey would take its
+    /// keys from every program and do nothing.
     Unsupported,
 };
 
@@ -293,15 +293,18 @@ pub fn globalLeaf(set: *const Binding.Set, trigger: Binding.Trigger) ?Binding.Se
 }
 
 /// Whether a hotkey registered now performs, among its binding's actions
-/// in `set`, new_window, which opens a window with none open. One refused,
-/// or held by another program, cannot be pressed.
+/// in `set`, one that opens a window with none open: new_window, or
+/// toggle_quick_terminal, which makes the quick terminal when there is
+/// none (`App.toggleQuick`). One refused, or held by another program,
+/// cannot be pressed.
 pub fn opensWindow(self: *const Hotkeys, set: *const Binding.Set) bool {
     for (self.entries.items) |entry| {
         if (entry.id == null) continue;
         const leaf = globalLeaf(set, entry.trigger) orelse continue;
-        for (leaf.actionsSlice()) |action| {
-            if (action == .new_window) return true;
-        }
+        for (leaf.actionsSlice()) |action| switch (action) {
+            .new_window, .toggle_quick_terminal => return true,
+            else => {},
+        };
     }
     return false;
 }
@@ -420,7 +423,7 @@ fn folded(cp: u21) u21 {
 /// Whether this runtime performs none of `actions` (`Refusal.Unsupported`).
 fn performsNone(actions: []const Binding.Action) bool {
     for (actions) |action| switch (action) {
-        .toggle_quick_terminal, .toggle_visibility => {},
+        .toggle_visibility => {},
         else => return false,
     };
     return true;

@@ -1449,10 +1449,14 @@ pub const Surface = struct {
     }
 
     /// The environment the child process starts from. The caller takes
-    /// ownership and then mutates it (`CoreSurface.init`).
+    /// ownership and then mutates it (`CoreSurface.init`). A terminal made
+    /// in the quick terminal has `GHOSTTY_QUICK_TERMINAL=1`, as on GTK and
+    /// macOS; `window` is set before the core starts (`create`).
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
-        _ = self;
-        return try global.environMap();
+        var env = try global.environMap();
+        errdefer env.deinit();
+        if (self.window.quick) try env.put("GHOSTTY_QUICK_TERMINAL", "1");
+        return env;
     }
 
     // ---------------------------------------------------------------------
@@ -1645,10 +1649,16 @@ pub const Surface = struct {
     /// at the same size, so it never sees either. The core ignores repeats
     /// (`Surface.occlusionCallback`).
     pub fn occlusionChanged(self: *Surface, visible: bool) void {
+        if (builtin.is_test) if (test_occlusion) |seen| seen(self, visible);
         const core_surface = self.liveCore() orelse return;
         core_surface.occlusionCallback(visible) catch |err|
             log.warn("occlusion callback failed err={}", .{err});
     }
+
+    /// Told what `occlusionChanged` reports for each terminal, in tests
+    /// only, where a terminal has no core to see it.
+    pub var test_occlusion: if (builtin.is_test) ?*const fn (*Surface, bool) void else void =
+        if (builtin.is_test) null else {};
 
     /// Told the DPI `scaleChanged` gives each terminal, in tests only,
     /// where a terminal has no core to see it.

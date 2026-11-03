@@ -103,6 +103,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .toggle_window_float_on_top,
         .reset_window_size,
         .toggle_command_palette,
+        .toggle_quick_terminal,
         .open_config,
         .reload_config,
         .quit,
@@ -114,12 +115,11 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no tab overview, inspector, quick terminal, updater, undo, secure
-        // input or on-screen keyboard here, and the background's opacity
-        // is not toggled.
+        // no tab overview, inspector, updater, undo, secure input or
+        // on-screen keyboard here, and the background's opacity is not
+        // toggled.
         .toggle_tab_overview,
         .close_all_windows,
-        .toggle_quick_terminal,
         .toggle_visibility,
         .check_for_updates,
         .undo,

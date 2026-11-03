@@ -163,6 +163,12 @@ pub const App = struct {
     /// (`windowDestroyed`).
     windows: std.ArrayList(*Window),
 
+    /// The quick terminal, shown or hidden, which is also in `windows`
+    /// (`Window.quick`): one for the app, as on GTK and macOS. Null until
+    /// the first `toggle_quick_terminal` makes it, and again once it is
+    /// destroyed (`windowDestroyed`), when the next makes another.
+    quick: ?*Window,
+
     /// Work the core asked for that `run` has not carried out yet, oldest
     /// first (`Request`): windows and splits, the changes to splits and
     /// the focus moves after them, and a full configuration reload.
@@ -325,6 +331,10 @@ pub const App = struct {
     pub const Request = union(enum) {
         /// A new window, from the surface that asked, if any.
         window: ?*CoreSurface,
+
+        /// Show the quick terminal, made if there is none, or hide it
+        /// (`toggleQuick`).
+        quick_terminal,
 
         /// A new split beside `parent`, in `direction`.
         split: struct {
@@ -634,6 +644,7 @@ pub const App = struct {
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
             .windows = .empty,
+            .quick = null,
             .requests = .empty,
             .search_focus = null,
             .search_hide = null,
@@ -863,7 +874,7 @@ pub const App = struct {
         // (`createRequested`), and the launch's quit timer would then
         // end the process with no reason given.
         if (self.config.@"initial-window") {
-            _ = self.newWindow(null) catch |err| {
+            _ = self.newWindow(null, .normal) catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
                 fatalNotice(err);
                 return err;
@@ -1064,14 +1075,34 @@ pub const App = struct {
         }
     }
 
+    /// The window a prompt with no window of its own belongs to
+    /// (`promptOwner`): the one the user was last in, else the first one,
+    /// but not the quick terminal while it is hidden, which would take the
+    /// activation back when the box closes, out of sight.
+    fn fallbackOwner(self: *const App) ?*Window {
+        const shows = struct {
+            fn f(window: *const Window) bool {
+                return !window.quick or win32.IsWindowVisible(window.hwnd).toBool();
+            }
+        }.f;
+        if (self.core_app.focusedSurface()) |s| {
+            if (shows(s.rt_surface.window)) return s.rt_surface.window;
+        }
+        for (self.windows.items) |window| {
+            if (shows(window)) return window;
+        }
+        return null;
+    }
+
     /// The window a prompt belongs to: the top-level window of `hwnd`
     /// (a terminal's is its frame), or for a caller that has none, the
-    /// window the user was last in, else the first one. With no owner, the
-    /// box would leave every window disabled (`beginPrompt`) and the
-    /// activation would go to another application when it closes;
-    /// MessageBoxW enables its owner again before it returns and hands the
-    /// activation back to it. It disables only that owner, so the owner
-    /// must be the top-level window, not a terminal inside it.
+    /// window the user was last in, else the first one (`fallbackOwner`).
+    /// With no owner, the box would leave every window disabled
+    /// (`beginPrompt`) and the activation would go to another application
+    /// when it closes; MessageBoxW enables its owner again before it
+    /// returns and hands the activation back to it. It disables only that
+    /// owner, so the owner must be the top-level window, not a terminal
+    /// inside it.
     ///
     /// A frame with a title prompt open is disabled by it, so the prompt
     /// is the owner instead: the activation then comes back to it, and the
@@ -1080,10 +1111,8 @@ pub const App = struct {
     pub fn promptOwner(self: *const App, hwnd: ?win32.HWND) ?win32.HWND {
         const frame: win32.HWND = if (hwnd) |h|
             win32.GetAncestor(h, win32.GA_ROOT) orelse h
-        else if (self.core_app.focusedSurface()) |s|
-            s.rt_surface.window.hwnd
-        else if (self.windows.items.len > 0)
-            self.windows.items[0].hwnd
+        else if (self.fallbackOwner()) |window|
+            window.hwnd
         else
             return null;
         for (self.windows.items) |window| {
@@ -1383,6 +1412,7 @@ pub const App = struct {
             },
 
             .new_window => self.requestWindow(target),
+            .toggle_quick_terminal => self.requestQuickTerminal(),
             .new_tab => self.requestTab(target),
             .goto_tab => self.gotoTab(target, value),
             .move_tab => self.moveTab(target, value),
@@ -2149,13 +2179,14 @@ pub const App = struct {
                 // (`Config.@"quit-after-last-window-closed"`), i.e. false on
                 // Windows. Once its last window has closed, this runtime can
                 // open another only from a global keybind's hotkey
-                // (`staysOpen`): `.new_window` is otherwise asked for from a
-                // window, and there is no tray icon and no IPC to a running
-                // instance (`performIpc`). Without such a hotkey, honoring
-                // `false` would leave an invisible process with a
-                // message-only window and a GetMessageW that blocks forever,
-                // endable only from Task Manager. A reload with no window
-                // open decides again (`configChange`).
+                // (`staysOpen`): `.new_window` and `.toggle_quick_terminal`
+                // are otherwise asked for from a window, and there is no
+                // tray icon and no IPC to a running instance (`performIpc`).
+                // Without such a hotkey, honoring `false` would leave an
+                // invisible process with a message-only window and a
+                // GetMessageW that blocks forever, endable only from Task
+                // Manager. A reload with no window open decides again
+                // (`configChange`).
                 //
                 // The override is reported by logQuitOverride where the quit is
                 // carried out, not here: `.start` also arrives at launch, from
@@ -2253,6 +2284,34 @@ pub const App = struct {
         return true;
     }
 
+    /// `.toggle_quick_terminal`, which the core performs for the app
+    /// wherever it is bound: recorded for `run`, as `requestWindow` records
+    /// a window, since showing it moves the focus and making it makes a
+    /// terminal. `true` once recorded.
+    fn requestQuickTerminal(self: *App) bool {
+        self.requests.append(self.core_app.alloc, .quick_terminal) catch |err| {
+            log.warn("cannot record toggling the quick terminal err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `toggle_quick_terminal`, carried out (`createRequested`): show the
+    /// quick terminal, or hide it if it shows, wherever the focus is, as
+    /// GTK and macOS toggle theirs. The first one makes it, with no parent,
+    /// as GTK makes its own, so with no other terminal's directory or font
+    /// size; so does the first after its last terminal closed.
+    fn toggleQuick(self: *App) void {
+        if (self.quick) |window| {
+            if (win32.IsWindowVisible(window.hwnd).toBool()) window.hideQuick() else window.showQuick();
+            return;
+        }
+        _ = self.newWindow(null, .quick) catch |err| {
+            log.warn("failed to create the quick terminal err={}", .{err});
+            notice(self, null, L("Ghostty could not open the quick terminal."));
+        };
+    }
+
     /// `.new_split`: record the request for `run`, as `requestWindow` does,
     /// for the same reason: a `new_split` binding performs it inside the
     /// core's key callback.
@@ -2346,7 +2405,7 @@ pub const App = struct {
             .title_prompt => |prompt| {
                 if (prompt.from == core_surface) request.* = .dropped;
             },
-            .reload, .redecorate, .dropped => {},
+            .quick_terminal, .reload, .redecorate, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -2497,6 +2556,8 @@ pub const App = struct {
             .app => return false,
             .surface => |v| v,
         };
+        // It keeps its place and size (`Window.quick`).
+        if (from.rt_surface.window.quick) return false;
         self.requests.append(self.core_app.alloc, .{ .maximize = from }) catch |err| {
             log.warn("cannot record toggling maximized err={}", .{err});
             return false;
@@ -2514,6 +2575,8 @@ pub const App = struct {
             .app => return false,
             .surface => |v| v,
         };
+        // It keeps its place and size (`Window.quick`).
+        if (from.rt_surface.window.quick) return false;
         self.requests.append(self.core_app.alloc, .{ .fullscreen = from }) catch |err| {
             log.warn("cannot record toggling fullscreen err={}", .{err});
             return false;
@@ -2529,6 +2592,8 @@ pub const App = struct {
             .app => return false,
             .surface => |v| v,
         };
+        // It keeps its place and size (`Window.quick`).
+        if (from.rt_surface.window.quick) return false;
         self.requests.append(self.core_app.alloc, .{ .decorations = from }) catch |err| {
             log.warn("cannot record toggling the window decorations err={}", .{err});
             return false;
@@ -2792,17 +2857,17 @@ pub const App = struct {
 
     /// `.goto_window`: activate the window beside the one asking, wrapping
     /// around, as GTK goes through its windows from the active one
-    /// (`Application.gotoWindow`, `windowBeside`); `false` with one window,
-    /// so that the key reaches the terminal. Recorded for `run`, as
-    /// `goto_split`'s move is held back: the activation moves the focus,
-    /// which would send the asking terminal's core its loss inside its key
-    /// callback.
+    /// (`Application.gotoWindow`, `windowBeside`); `false` with no other
+    /// window to go to, so that the key reaches the terminal. Recorded for
+    /// `run`, as `goto_split`'s move is held back: the activation moves the
+    /// focus, which would send the asking terminal's core its loss inside
+    /// its key callback.
     fn gotoWindow(self: *App, target: apprt.Target, to: apprt.action.GotoWindow) bool {
         const from = switch (target) {
             .app => return false,
             .surface => |v| v,
         };
-        if (self.windows.items.len < 2) return false;
+        if (self.windowBeside(from.rt_surface.window, to) == null) return false;
         self.requests.append(self.core_app.alloc, .{ .goto_window = .{
             .from = from,
             .to = to,
@@ -2828,20 +2893,26 @@ pub const App = struct {
     }
 
     /// The window `goto_window` goes to from `from`, wrapping around, or
-    /// null when it is the only one: for `.next` the one opened before it,
+    /// null when there is no other: for `.next` the one opened before it,
     /// and for `.previous` the one opened after it, in GTK's order, since
     /// GTK walks `gtk.Window.listToplevels`, which lists the newest window
-    /// first. `windows` is in opening order (`windowDestroyed`).
+    /// first. `windows` is in opening order (`windowDestroyed`). Never the
+    /// quick terminal, which its toggle shows and hides; from it, the
+    /// windows beside its place in that order.
     fn windowBeside(self: *const App, from: *Window, to: apprt.action.GotoWindow) ?*Window {
         const windows = self.windows.items;
-        if (windows.len < 2) return null;
         const i = std.mem.indexOfScalar(*Window, windows, from) orelse return null;
-        return windows[
-            switch (to) {
-                .next => (i + windows.len - 1) % windows.len,
-                .previous => (i + 1) % windows.len,
-            }
-        ];
+        var step: usize = 1;
+        while (step < windows.len) : (step += 1) {
+            const window = windows[
+                switch (to) {
+                    .next => (i + windows.len - step) % windows.len,
+                    .previous => (i + step) % windows.len,
+                }
+            ];
+            if (!window.quick) return window;
+        }
+        return null;
     }
 
     /// `.toggle_split_zoom`: recorded for `run`, as `resizeSplit` is, since
@@ -2915,7 +2986,7 @@ pub const App = struct {
                 // only for the process in front. The hotkey lets this one
                 // take it with SetForegroundWindow. Not the initial window
                 // (`run`): a launcher may ask for it minimized.
-                .window => |parent| if (self.newWindow(parent)) |window| {
+                .window => |parent| if (self.newWindow(parent, .normal)) |window| {
                     _ = window.present();
                 } else |err| {
                     log.err("failed to create a window err={}", .{err});
@@ -2925,6 +2996,7 @@ pub const App = struct {
                         L("Ghostty could not open a new window."),
                     );
                 },
+                .quick_terminal => self.toggleQuick(),
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
                     error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
@@ -3055,8 +3127,9 @@ pub const App = struct {
     }
 
     /// Create a terminal window: the initial one (`run`), or one the core
-    /// asked for (`createRequested`) from `parent`, a live surface.
-    fn newWindow(self: *App, parent: ?*CoreSurface) !*Window {
+    /// asked for (`createRequested`) from `parent`, a live surface; or the
+    /// quick terminal (`toggleQuick`), which then is `quick`.
+    fn newWindow(self: *App, parent: ?*CoreSurface, kind: Window.Kind) !*Window {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
         try self.windows.ensureUnusedCapacity(alloc, 1);
@@ -3067,13 +3140,19 @@ pub const App = struct {
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
         // itself, so there is no quit-timer handling here.
-        const window = try Window.create(self, opts);
+        const window = try Window.create(self, opts, kind);
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
         self.surfaces.appendAssumeCapacity(window.tab().focused.?);
 
         // Shown once both are owned, so that its first messages find them.
-        window.show();
+        switch (kind) {
+            .normal => window.show(),
+            .quick => {
+                self.quick = window;
+                window.showQuick();
+            },
+        }
         return window;
     }
 
@@ -3118,7 +3197,7 @@ pub const App = struct {
         }
 
         try self.windows.ensureUnusedCapacity(alloc, 1);
-        const window = try Window.createBare(self);
+        const window = try Window.createBare(self, .normal);
         errdefer window.discard();
         // Before the tab comes, so that its terminals take the scale of the
         // monitor the frame is on (`Window.adoptTab`).
@@ -3280,6 +3359,7 @@ pub const App = struct {
 
         // In order: `windowBeside` goes by opening order.
         _ = self.windows.orderedRemove(idx);
+        if (self.quick == window) self.quick = null;
         // Its tabs' trees are empty already unless `terminate` gave up on
         // the frame, which then had no WM_DESTROY.
         window.deinit(self.core_app.alloc);
@@ -4102,24 +4182,39 @@ test "win32: a prompt belongs to a top-level window" {
     const s = struct {
         var a: Surface = undefined;
         var b: Surface = undefined;
+        var q: Surface = undefined;
         var wa: Window = undefined;
         var wb: Window = undefined;
+        var wq: Window = undefined;
     };
     s.wa.hwnd = @ptrFromInt(0x10);
     s.wb.hwnd = @ptrFromInt(0x20);
+    s.wa.quick = false;
+    s.wb.quick = false;
     s.a.window = &s.wa;
     s.b.window = &s.wb;
     s.a.core_surface.rt_surface = &s.a;
     s.b.core_surface.rt_surface = &s.b;
+    // A hidden quick terminal: no window has this handle, so none shows.
+    s.wq.hwnd = @ptrFromInt(0x30);
+    s.wq.quick = true;
+    s.q.window = &s.wq;
+    s.q.core_surface.rt_surface = &s.q;
 
+    try std.testing.expect(app.promptOwner(null) == null);
+    try app.windows.append(alloc, &s.wq);
     try std.testing.expect(app.promptOwner(null) == null);
 
     try app.windows.appendSlice(alloc, &.{ &s.wa, &s.wb });
     try std.testing.expectEqual(s.wa.hwnd, app.promptOwner(null).?);
 
-    try core_app.surfaces.appendSlice(alloc, &.{ &s.a, &s.b });
+    try core_app.surfaces.appendSlice(alloc, &.{ &s.a, &s.b, &s.q });
     core_app.focused_surface = &s.b.core_surface;
     try std.testing.expectEqual(s.wb.hwnd, app.promptOwner(null).?);
+    // The last focused terminal is in the hidden quick terminal.
+    core_app.focused_surface = &s.q.core_surface;
+    try std.testing.expectEqual(s.wa.hwnd, app.promptOwner(null).?);
+    core_app.focused_surface = &s.b.core_surface;
 
     // The caller's own window always wins, and for a terminal that is its
     // frame. A hidden top-level window and a child of it stand in for them.
@@ -4187,6 +4282,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.terminal_loops = 0;
     app.surfaces = .empty;
     app.windows = .empty;
+    app.quick = null;
     app.requests = .empty;
     app.search_focus = null;
     app.search_hide = null;
@@ -4228,6 +4324,7 @@ fn testFrame(app: *App) !*Window {
         .dark_frame = false,
         .fullscreen = null,
         .decoration = null,
+        .quick = false,
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
@@ -4324,9 +4421,10 @@ pub fn testCleanup(app: *App) void {
 
 /// For tests: run `func` with `args` on a thread of its own on a desktop of
 /// its own, made for it and closed after, and return what it returns. The
-/// test fails, logged, when its desktop or its thread cannot be made, the
-/// thread cannot move to the desktop, or the desktop cannot be closed
-/// after. A test that reads whether a window is topmost runs there, away
+/// test fails, logged, when its desktop or its thread cannot be made, or
+/// the thread cannot move to the desktop. A desktop that cannot be closed
+/// after is logged and left open (below). A test that reads whether a
+/// window is topmost runs there, away
 /// from the programs on the user's desktop: window messages go only between
 /// processes on the same desktop, and a hook sees only its own desktop's
 /// windows
@@ -4371,11 +4469,16 @@ fn testOnOwnDesktop(comptime func: anytype, args: anytype) anyerror!void {
         result = err;
     }
     // CloseDesktop fails while a thread of this process still uses the
-    // desktop; by now the test's thread has ended.
-    const closed = win32.CloseDesktop(desktop).toBool();
-    if (!closed) log.warn("cannot close the test's desktop err={}", .{win32.GetLastError()});
+    // desktop. The test's thread has ended by now, and its windows with it,
+    // but Text Services Framework's threads (MSCTF.dll, msctfmonitor.dll)
+    // can still be there: they were after a title prompt's field had the
+    // keyboard on a quick terminal's desktop, in a run whose earlier tests
+    // had used text fields, and were not when those tests ran alone. The
+    // desktop is then left for the process's end to close, and the next
+    // test opens it by its name (above).
+    if (!win32.CloseDesktop(desktop).toBool())
+        log.warn("cannot close the test's desktop err={}", .{win32.GetLastError()});
     try result;
-    if (!closed) return error.TestUnexpectedResult;
 }
 
 fn clientRect(hwnd: win32.HWND) !win32.RECT {
@@ -8411,7 +8514,7 @@ test "win32: a tab dropped on a monitor of another DPI is placed again there" {
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
 
-    const window = try Window.createBare(&app);
+    const window = try Window.createBare(&app, .normal);
     defer window.discard();
 
     const Monitor = struct {
@@ -12489,6 +12592,322 @@ fn testFloatWindow() !void {
     try std.testing.expect(!try app.performAction(target, .float_window, .on));
 }
 
+/// For tests: the quick terminal's terminal, made as `Window.create`
+/// makes one (`Window.test_create_pane`), or an error while `fail`, with
+/// the area it would be made over (`area`); and what the quick terminal
+/// does with it: the window `Window.present` brings forward
+/// (`Window.test_foreground`), and what a quick terminal's terminal was
+/// last told of whether it shows (`Surface.test_occlusion`); not another
+/// window's, which a reloaded configuration lays out too.
+const TestQuick = struct {
+    var fail: bool = false;
+    var area: ?win32.RECT = null;
+    var front: ?win32.HWND = null;
+    var told: ?*Surface = null;
+    var shows: bool = false;
+
+    fn start() void {
+        fail = false;
+        area = null;
+        front = null;
+        told = null;
+        Window.test_create_pane = &create;
+        Window.test_foreground = &foreground;
+        Surface.test_occlusion = &occlusion;
+    }
+
+    fn stop() void {
+        Window.test_create_pane = null;
+        Window.test_foreground = null;
+        Surface.test_occlusion = null;
+    }
+
+    fn create(w: *Window) anyerror!*Surface {
+        if (fail) return error.TestQuickTerminal;
+        area = w.layoutArea();
+        const pane = try testPane(w.app, w);
+        // `App.newWindow` makes it the app's.
+        _ = w.app.surfaces.pop();
+        return pane;
+    }
+
+    fn foreground(hwnd: win32.HWND) void {
+        front = hwnd;
+    }
+
+    fn occlusion(surface: *Surface, visible: bool) void {
+        if (!surface.window.quick) return;
+        told = surface;
+        shows = visible;
+    }
+
+    /// `toggle_quick_terminal`, as a binding performs it, then as `run`
+    /// carries it out.
+    fn toggle(app: *App) !void {
+        try std.testing.expect(try app.performAction(.app, .toggle_quick_terminal, {}));
+        try std.testing.expectEqual(1, app.requests.items.len);
+        app.createRequested();
+        try std.testing.expectEqual(0, app.requests.items.len);
+    }
+
+    /// Where `Window.quickRect` puts the quick terminal now.
+    fn place(app: *const App) !win32.RECT {
+        const primary = win32.MonitorFromPoint(.{ .x = 0, .y = 0 }, win32.MONITOR_DEFAULTTOPRIMARY) orelse
+            return error.TestUnexpectedResult;
+        var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
+        info.cbSize = @sizeOf(win32.MONITORINFO);
+        if (!win32.GetMonitorInfoW(primary, &info).toBool()) return error.TestUnexpectedResult;
+        return Window.quickPlace(
+            app.config.@"quick-terminal-position",
+            app.config.@"quick-terminal-size",
+            info.rcWork,
+        );
+    }
+
+    fn hasStyle(hwnd: win32.HWND, which: c_int, bits: win32.DWORD) bool {
+        const want: isize = bits;
+        return win32.GetWindowLongPtrW(hwnd, which) & want == want;
+    }
+};
+
+test "win32: toggle_quick_terminal makes the quick terminal, then hides and shows it" {
+    // On a desktop of its own (testOnOwnDesktop): it reads whether the
+    // quick terminal is topmost, and keeps it off the user's desktop.
+    try testOnOwnDesktop(testToggleQuick, .{});
+}
+
+/// The toggle_quick_terminal test, run by its test on a desktop of its own.
+fn testToggleQuick() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+
+    // A window opened before it.
+    const a = try testFrame(&app);
+    const pa = try testPane(&app, a);
+    a.tab().tree = try .init(alloc, pa);
+
+    // Recorded, as the core performs it inside a key callback, and made by
+    // `run`: a pop-up with no frame and no taskbar button, at its place,
+    // above every window that is not, brought forward.
+    try std.testing.expect(try app.performAction(.app, .toggle_quick_terminal, {}));
+    try std.testing.expect(app.quick == null);
+    app.createRequested();
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expect(quick.quick);
+    try std.testing.expectEqualSlices(*Window, &.{ a, quick }, app.windows.items);
+    const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(*Surface, &.{ pa, pane }, app.surfaces.items);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(TestQuick.hasStyle(quick.hwnd, win32.GWL_STYLE, win32.WS_POPUP));
+    try std.testing.expect(!captioned(quick.hwnd));
+    try std.testing.expect(!TestQuick.hasStyle(quick.hwnd, win32.GWL_STYLE, win32.WS_THICKFRAME));
+    try std.testing.expect(TestQuick.hasStyle(quick.hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOOLWINDOW));
+    try std.testing.expect(quick.isFloating());
+    const place = try TestQuick.place(&app);
+    try std.testing.expectEqual(place, try windowRect(quick.hwnd));
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+    try std.testing.expectEqual(pane, TestQuick.told.?);
+    try std.testing.expect(TestQuick.shows);
+    // Its terminal is made at its size, which the core starts from: the
+    // frame is made at its place, not at CW_USEDEFAULT.
+    try std.testing.expectEqual(win32.RECT{
+        .left = 0,
+        .top = 0,
+        .right = place.right - place.left,
+        .bottom = place.bottom - place.top,
+    }, TestQuick.area.?);
+
+    // Only its terminals have the variable that says so, as on GTK.
+    {
+        var base = try global.environMap();
+        defer base.deinit();
+        var in_quick = try pane.defaultTermioEnv();
+        defer in_quick.deinit();
+        var in_a = try pa.defaultTermioEnv();
+        defer in_a.deinit();
+        try std.testing.expectEqualStrings("1", in_quick.get("GHOSTTY_QUICK_TERMINAL").?);
+        try std.testing.expectEqualDeep(base.get("GHOSTTY_QUICK_TERMINAL"), in_a.get("GHOSTTY_QUICK_TERMINAL"));
+    }
+
+    // goto_window leaves it out: from the other window there is nowhere
+    // to go, and with a third, it goes round past it.
+    try std.testing.expect(!try app.performAction(.{ .surface = &pa.core_surface }, .goto_window, .next));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    const b = try testFrame(&app);
+    try std.testing.expectEqual(b, app.windowBeside(a, .next).?);
+    try std.testing.expectEqual(b, app.windowBeside(a, .previous).?);
+    try std.testing.expectEqual(a, app.windowBeside(b, .next).?);
+    try std.testing.expectEqual(a, app.windowBeside(b, .previous).?);
+    // From it: the windows either side of its place.
+    try std.testing.expectEqual(a, app.windowBeside(quick, .next).?);
+    try std.testing.expectEqual(b, app.windowBeside(quick, .previous).?);
+
+    // Hidden, with its terminal kept, which is told it no longer shows;
+    // its command palette closes. Made as large as the palette's own test
+    // makes its window, for the palette to fit at any DPI.
+    testResize(quick, 1000, 700);
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_command_palette, {}));
+    app.createRequested();
+    try std.testing.expect(quick.palette.hwnd != null);
+    TestQuick.front = null;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(quick.palette.hwnd == null);
+    try std.testing.expectEqual(quick, app.quick.?);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(pane, TestQuick.told.?);
+    try std.testing.expect(!TestQuick.shows);
+    try std.testing.expect(TestQuick.front == null);
+    try std.testing.expectEqual(3, app.windows.items.len);
+
+    // Nothing laid out while it is hidden tells its terminal it shows: a
+    // reloaded configuration's frames (`redecorate`), or a move, which
+    // the frame hears of (WM_SIZE). Shown again where it goes now, above
+    // the rest, whatever moved it meanwhile.
+    try app.requests.append(alloc, .redecorate);
+    app.createRequested();
+    _ = win32.SetWindowPos(quick.hwnd, win32.HWND_NOTOPMOST, 30, 40, 50, 60, win32.SWP_NOACTIVATE);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(!quick.isFloating());
+    try std.testing.expect(!TestQuick.shows);
+    try TestQuick.toggle(&app);
+    try std.testing.expectEqual(quick, app.quick.?);
+    try std.testing.expectEqual(pane, quick.tab().focused.?);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(quick.isFloating());
+    try std.testing.expectEqual(try TestQuick.place(&app), try windowRect(quick.hwnd));
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+    try std.testing.expect(TestQuick.shows);
+
+    // Its title prompt closes as it hides: hiding a window leaves the
+    // windows it owns on screen.
+    const dialog = try testPrompt(&app, pane, .surface);
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindow(dialog).toBool());
+    try std.testing.expect(quick.title_prompt.hwnd == null);
+    try TestQuick.toggle(&app);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Closed, it is forgotten, and the next toggle makes another.
+    try std.testing.expect(win32.DestroyWindow(quick.hwnd).toBool());
+    try std.testing.expect(app.quick == null);
+    try std.testing.expectEqualSlices(*Window, &.{ a, b }, app.windows.items);
+    try TestQuick.toggle(&app);
+    const again = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expect(win32.IsWindowVisible(again.hwnd).toBool());
+    try std.testing.expectEqual(3, app.windows.items.len);
+}
+
+test "win32: a quick terminal that cannot be made is said so, and the next toggle makes it" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickFails, .{});
+}
+
+/// The failed quick terminal test, run by its test on a desktop of its own.
+fn testQuickFails() !void {
+    const alloc = std.testing.allocator;
+    // The failure's box has no window, so it asks the core for the last
+    // focused terminal (`fallbackOwner`): there is none.
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const Prompt = struct {
+        var boxes: usize = 0;
+        fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+            boxes += 1;
+            return win32.IDOK;
+        }
+    };
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &Prompt.box;
+    defer message_box.* = null;
+
+    // Its frame is destroyed again (`Window.discard`): nothing is left.
+    TestQuick.fail = true;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(app.quick == null);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(1, Prompt.boxes);
+
+    TestQuick.fail = false;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(1, Prompt.boxes);
+}
+
+test "win32: the quick terminal keeps its place, its size and its frame" {
+    // On a desktop of its own: it reads whether the quick terminal is
+    // topmost (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickKeepsPlace, .{});
+}
+
+/// The test of what leaves the quick terminal as it is, run by its test
+/// on a desktop of its own.
+fn testQuickKeepsPlace() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+    const rect = try windowRect(quick.hwnd);
+    const style = win32.GetWindowLongPtrW(quick.hwnd, win32.GWL_STYLE);
+    const ex_style = win32.GetWindowLongPtrW(quick.hwnd, win32.GWL_EXSTYLE);
+
+    // Refused, so that the key reaches the terminal, and nothing is
+    // recorded; reset_window_size although the core gave the terminal a
+    // size of its own, which is kept, as a tab can move to another window.
+    try std.testing.expect(try app.performAction(target, .initial_size, .{ .width = 300, .height = 200 }));
+    try std.testing.expect(!try app.performAction(target, .toggle_maximize, {}));
+    try std.testing.expect(!try app.performAction(target, .toggle_fullscreen, .native));
+    try std.testing.expect(!try app.performAction(target, .toggle_window_decorations, {}));
+    try std.testing.expect(!try app.performAction(target, .reset_window_size, {}));
+    try std.testing.expect(!try app.performAction(target, .resize_window, .{ .width = 300, .height = 200 }));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    // It floats while it shows, whatever float_window asks.
+    try std.testing.expect(!try app.performAction(target, .float_window, .off));
+    try std.testing.expect(quick.isFloating());
+
+    // Nor do the window's own, which run for every window: a reloaded
+    // configuration's frame (`redecorate`) among them.
+    quick.toggleFullscreen();
+    quick.toggleMaximize();
+    quick.toggleDecorations();
+    try app.requests.append(alloc, .redecorate);
+    app.createRequested();
+    try std.testing.expect(quick.fullscreen == null);
+    try std.testing.expect(quick.decoration == null);
+    try std.testing.expectEqual(style, win32.GetWindowLongPtrW(quick.hwnd, win32.GWL_STYLE));
+    try std.testing.expectEqual(ex_style, win32.GetWindowLongPtrW(quick.hwnd, win32.GWL_EXSTYLE));
+    try std.testing.expectEqual(rect, try windowRect(quick.hwnd));
+}
+
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
 /// which `current`, as `Window.test_get_focus`, answers for GetFocus; and
 /// whether the window `watch` showed when the focus last moved.
@@ -13656,7 +14075,6 @@ test "win32: the command palette lists only what performAction carries out" {
         // Left out.
         .{ .toggle_tab_overview, .toggle_tab_overview },
         .{ .close_all_windows, .close_all_windows },
-        .{ .toggle_quick_terminal, .toggle_quick_terminal },
         .{ .toggle_visibility, .toggle_visibility },
         .{ .check_for_updates, .check_for_updates },
         .{ .undo, .undo },
@@ -13703,6 +14121,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .toggle_command_palette, .toggle_command_palette },
         .{ .toggle_readonly, .readonly },
         // The app's.
+        .{ .toggle_quick_terminal, .toggle_quick_terminal },
         .{ .reload_config, .reload_config },
         .{ .quit, .quit },
     };
@@ -13739,7 +14158,7 @@ test "win32: the command palette lists only what performAction carries out" {
             else => if (apprt.Action.Value(case[1]) == void) {} else unreachable,
         };
         const to: apprt.Target = switch (case[0]) {
-            .reload_config, .quit => .app,
+            .toggle_quick_terminal, .reload_config, .quit => .app,
             else => target,
         };
         // Answered before it would ask the core whether to confirm, or
@@ -13755,7 +14174,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(35, listed);
+    try std.testing.expectEqual(36, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
 }
@@ -19494,7 +19913,6 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         // No scan code: NumLock makes it of numpad_7.
         "global:ctrl+numpad_home=new_window",
         // Not performed by this runtime yet.
-        "global:ctrl+b=toggle_quick_terminal",
         "global:ctrl+c=toggle_visibility",
     });
     try std.testing.expectEqual(0, TestHotkeys.take().len);
@@ -19505,16 +19923,18 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
     try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NeedsShift));
     try std.testing.expectEqual(2, TestHotkeys.refused(&app, error.AltGr));
     try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NoKey));
-    try std.testing.expectEqual(2, TestHotkeys.refused(&app, error.Unsupported));
+    try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.Unsupported));
 
     // Ctrl+Alt+Q with Shift types nothing on that layout, and registers,
-    // as does a toggle chained to an action this runtime performs.
+    // as does a toggle chained to an action this runtime performs, and
+    // the quick terminal's toggle.
     try TestHotkeys.apply(&app, &.{
         "global:ctrl+alt+shift+q=new_window",
-        "global:ctrl+b=toggle_quick_terminal",
+        "global:ctrl+c=toggle_visibility",
         "chain=new_window",
+        "global:ctrl+b=toggle_quick_terminal",
     });
-    try std.testing.expectEqual(2, TestHotkeys.take().len);
+    try std.testing.expectEqual(3, TestHotkeys.take().len);
 }
 
 test "win32: two global keybinds on the same keys register once, for the physical key" {
@@ -19866,6 +20286,14 @@ test "win32: the app stays open with no window while a global keybind can open o
     try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
     try std.testing.expectEqual(.off, app.quit_timer);
     try TestHotkeys.apply(&app, &.{ "global:ctrl+b=new_tab", "chain=new_window" });
+    try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
+    try std.testing.expectEqual(.off, app.quit_timer);
+
+    // The quick terminal's toggle makes one when there is none.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+b=new_tab"});
+    try std.testing.expectEqual(.expired, app.quit_timer);
+    try TestHotkeys.apply(&app, &.{"global:ctrl+b=toggle_quick_terminal"});
+    try std.testing.expectEqual(.off, app.quit_timer);
     try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
     try std.testing.expectEqual(.off, app.quit_timer);
 

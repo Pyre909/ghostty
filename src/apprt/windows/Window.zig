@@ -66,6 +66,10 @@ pub const Restore = struct {
     rect: win32.RECT,
 };
 
+/// What `create` makes: a terminal window, or the quick terminal
+/// (`quick`).
+pub const Kind = enum { normal, quick };
+
 app: *App,
 
 /// The frame. Written from WM_NCCREATE; a message before it
@@ -119,6 +123,16 @@ fullscreen: ?Restore,
 /// `toggle_window_decorations`, or null while it follows the
 /// configuration's, as GTK keeps one per window (`toggleDecorations`).
 decoration: ?configpkg.WindowDecoration,
+
+/// The quick terminal (`App.quick`), which `toggle_quick_terminal` shows
+/// and hides (`showQuick`, `hideQuick`): a pop-up on a monitor's edge
+/// (`quickRect`), in neither the taskbar nor Alt+Tab (WS_EX_TOOLWINDOW),
+/// above every window that is not topmost while it shows. It keeps the
+/// place and size it is given: maximizing, fullscreen, decorations,
+/// floating and the sizes from the configuration or a program leave it as
+/// it is, as GTK refuses a quick terminal's resizes. Set when it is made,
+/// never changed.
+quick: bool,
 
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
@@ -776,18 +790,23 @@ pub fn setWindowTitle(self: *Window, title: [:0]const u8) bool {
     return self.showTitle();
 }
 
-/// Create a window holding a new terminal, still hidden: `show` shows it
-/// once the app owns both (`App.newWindow`). The frame is created at
-/// CW_USEDEFAULT size so that the terminal, which fills it, starts with a
-/// non-zero size (`CoreSurface.init` reads it).
-pub fn create(app: *App, opts: Surface.Options) !*Window {
+/// Create a window of `kind` holding a new terminal, still hidden: `show`
+/// shows it once the app owns both (`App.newWindow`), or `showQuick` the
+/// quick terminal. The frame is created at CW_USEDEFAULT size, or the
+/// quick terminal's at its place (`quickRect`), so that the terminal,
+/// which fills it, starts with a non-zero size (`CoreSurface.init` reads
+/// it).
+pub fn create(app: *App, opts: Surface.Options, kind: Kind) !*Window {
     const alloc = app.core_app.alloc;
-    const self = try createBare(app);
+    const self = try createBare(app, kind);
     errdefer self.discard();
 
     // Under the bar, if `window-show-tab-bar = always` shows it already.
     const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
-    const surface = try Surface.create(app, self, area, opts);
+    const surface = surface: {
+        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self);
+        break :surface try Surface.create(app, self, area, opts);
+    };
     // Nothing owns the terminal until it is in the tree.
     self.tab().tree = Tree.init(alloc, surface) catch |err| {
         surface.discard();
@@ -802,12 +821,12 @@ pub fn create(app: *App, opts: Surface.Options) !*Window {
     return self;
 }
 
-/// A new window, still hidden and not yet the app's, with one empty tab:
-/// `create` puts a new terminal in it, `moveTabTo` a tab from another
-/// window in its place. Its frame is made at CW_USEDEFAULT, with its bar
-/// and its title bar's theme. Undone by `discard` until it is in
-/// `App.windows`.
-pub fn createBare(app: *App) !*Window {
+/// A new window of `kind`, still hidden and not yet the app's, with one
+/// empty tab: `create` puts a new terminal in it, `moveTabTo` a tab from
+/// another window in its place. Its frame is made at CW_USEDEFAULT, or the
+/// quick terminal's at its place, with its bar and its title bar's theme.
+/// Undone by `discard` until it is in `App.windows`.
+pub fn createBare(app: *App, kind: Kind) !*Window {
     const alloc = app.core_app.alloc;
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
@@ -822,6 +841,7 @@ pub fn createBare(app: *App) !*Window {
         .dark_frame = false,
         .fullscreen = null,
         .decoration = null,
+        .quick = kind == .quick,
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
@@ -839,12 +859,20 @@ pub fn createBare(app: *App) !*Window {
     errdefer self.deinitTabs(alloc);
     _ = try self.appendTab(alloc);
 
-    _ = try self.createFrame(
-        win32.CW_USEDEFAULT,
-        win32.CW_USEDEFAULT,
-        win32.CW_USEDEFAULT,
-        win32.CW_USEDEFAULT,
-    );
+    switch (kind) {
+        .normal => _ = try self.createFrame(
+            win32.CW_USEDEFAULT,
+            win32.CW_USEDEFAULT,
+            win32.CW_USEDEFAULT,
+            win32.CW_USEDEFAULT,
+        ),
+        // CW_USEDEFAULT is for an overlapped window only: a pop-up's is
+        // made at 0, 0 and empty (CreateWindowExW).
+        .quick => {
+            const rect = quickRect(app) orelse return App.Error.Win32CallFailed;
+            _ = try self.createFrame(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+        },
+    }
     errdefer comptime unreachable;
     self.bar.create(self);
 
@@ -876,13 +904,19 @@ pub fn discard(self: *Window) void {
 /// with the decorations it should have (`applyDecorations`), before
 /// anything measures its client area. CreateWindowExW gives every window
 /// that is neither a child nor a popup a caption, so the frame is made with
-/// one, and loses it after.
+/// one, and loses it after. The quick terminal's is a pop-up with no
+/// caption, sizing border or window menu, and no taskbar button
+/// (`quick`).
 pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_int) !win32.HWND {
+    const style: win32.DWORD = if (self.quick)
+        win32.WS_POPUP | win32.WS_CLIPCHILDREN
+    else
+        win32.WS_OVERLAPPEDWINDOW | win32.WS_CLIPCHILDREN;
     const hwnd = win32.CreateWindowExW(
-        0,
+        if (self.quick) win32.WS_EX_TOOLWINDOW else 0,
         L(class_name),
         L("Ghostty"),
-        win32.WS_OVERLAPPEDWINDOW | win32.WS_CLIPCHILDREN,
+        style,
         x,
         y,
         width,
@@ -938,6 +972,119 @@ pub fn show(self: *Window) void {
     // A title prompt opened before the window was on screen, which holds
     // it disabled, shows with it.
     TitleDialog.frameShown(self);
+}
+
+/// `toggle_quick_terminal` with the quick terminal hidden, or just made
+/// (`App.toggleQuick`): place it again (`quickRect`), above every window
+/// that is not, and bring it forward with the keyboard, as GTK and macOS
+/// show theirs. Its shown tab's terminals are told they show (`relayout`):
+/// a hidden frame's children are told nothing (`hideQuick`). Shown where
+/// it was if its place cannot be read.
+pub fn showQuick(self: *Window) void {
+    assert(self.quick);
+    var flags: win32.UINT = win32.SWP_SHOWWINDOW | win32.SWP_NOACTIVATE;
+    const rect = quickRect(self.app) orelse rect: {
+        flags |= win32.SWP_NOMOVE | win32.SWP_NOSIZE;
+        break :rect std.mem.zeroes(win32.RECT);
+    };
+    if (!win32.SetWindowPos(
+        self.hwnd,
+        win32.HWND_TOPMOST,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        flags,
+    ).toBool()) {
+        log.warn("unable to show the quick terminal err={}", .{win32.GetLastError()});
+        return;
+    }
+    // Laid out here too: WM_SIZE comes only if the size changed.
+    self.relayout();
+    _ = win32.UpdateWindow(self.hwnd);
+    // FALSE under Windows' foreground lock (`bringForward`): it shows,
+    // above the window in front, which keeps the keyboard.
+    if (!self.present()) log.info("the quick terminal shows without the keyboard: SetForegroundWindow refused", .{});
+}
+
+/// `toggle_quick_terminal` with the quick terminal shown: hide it, with
+/// its tabs, splits and programs kept for the next show, as on GTK and
+/// macOS. Its command palette and title prompt close first: "Hiding an
+/// owner window has no effect on the visibility state of the owned
+/// windows" (Window Features, Microsoft Learn), and the palette's tooltip
+/// and the prompt are owned. The shown tab's terminals are told they no
+/// longer show, as a minimized frame's are (WM_SIZE); the other tabs'
+/// were told when they were hidden (`hideTab`).
+pub fn hideQuick(self: *Window) void {
+    assert(self.quick);
+    CommandPalette.close(self);
+    TitleDialog.close(self);
+    // The BOOL is the previous visibility, not success.
+    _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
+    var it = self.tab().tree.iterator();
+    while (it.next()) |entry| entry.view.occlusionChanged(false);
+}
+
+/// Where the quick terminal goes now: on the primary monitor's work area
+/// (`quickPlace`), the part of it the taskbar leaves; null, logged, if
+/// the monitor cannot be read.
+fn quickRect(app: *const App) ?win32.RECT {
+    const primary = win32.MonitorFromPoint(.{ .x = 0, .y = 0 }, win32.MONITOR_DEFAULTTOPRIMARY);
+    const info = monitorInfo(primary) orelse return null;
+    return quickPlace(
+        app.config.@"quick-terminal-position",
+        app.config.@"quick-terminal-size",
+        info.rcWork,
+    );
+}
+
+/// The rect of a quick terminal at `position`, `size` from the
+/// configuration, on the work area `work`, in its pixels: as large as the
+/// core's `QuickTerminalSize.calculate` makes it over the work area, as
+/// macOS works it out over its screen's visible frame, but no larger than
+/// the work area, which `calculate` does not keep to, and at least a
+/// pixel; flush with the work area's edge at `position` and centred along
+/// it, or centred both ways for `center`, as macOS places it
+/// (QuickTerminalPosition.swift).
+pub fn quickPlace(
+    position: configpkg.Config.QuickTerminalPosition,
+    size: configpkg.Config.QuickTerminalSize,
+    work: win32.RECT,
+) win32.RECT {
+    const work_w: u32 = @intCast(@max(0, work.right - work.left));
+    const work_h: u32 = @intCast(@max(0, work.bottom - work.top));
+    const dims = boundedSize(size).calculate(position, .{ .width = work_w, .height = work_h });
+    // Both fit an i32: no larger than the work area's.
+    const w: i32 = @intCast(@max(1, @min(dims.width, work_w)));
+    const h: i32 = @intCast(@max(1, @min(dims.height, work_h)));
+    const centred_x = work.left + @divTrunc(work.right - work.left - w, 2);
+    const centred_y = work.top + @divTrunc(work.bottom - work.top - h, 2);
+    const left: i32, const top: i32 = switch (position) {
+        .top => .{ centred_x, work.top },
+        .bottom => .{ centred_x, work.bottom - h },
+        .left => .{ work.left, centred_y },
+        .right => .{ work.right - w, centred_y },
+        .center => .{ centred_x, centred_y },
+    };
+    return .{ .left = left, .top = top, .right = left + w, .bottom = top + h };
+}
+
+/// `size` with each percentage at most 100 and a NaN one left unset, for
+/// `calculate`: its `toPixels` makes a percentage of the work area into a
+/// u32, which one far above 100 or a NaN does not fit (`@intFromFloat`,
+/// a safety panic, or undefined behaviour in a release build), and the
+/// parser takes any float that is not negative. More than all of the work
+/// area is all of it anyway (`quickPlace`).
+fn boundedSize(size: configpkg.Config.QuickTerminalSize) configpkg.Config.QuickTerminalSize {
+    return .{ .primary = boundedPart(size.primary), .secondary = boundedPart(size.secondary) };
+}
+
+fn boundedPart(part: ?configpkg.Config.QuickTerminalSize.Size) ?configpkg.Config.QuickTerminalSize.Size {
+    const v = part orelse return null;
+    return switch (v) {
+        .pixels => v,
+        .percentage => |p| if (std.math.isNan(p)) null else .{ .percentage = @min(p, 100) },
+    };
 }
 
 /// The frame's window procedure.
@@ -1542,9 +1689,9 @@ pub fn split(
     return surface;
 }
 
-/// For tests: makes the terminal `split` opens, in place of
-/// `Surface.create`, which starts a core and its program; a test's
-/// terminals have no core.
+/// For tests: makes the terminal `split` opens, and the one `create` puts
+/// in a new window, in place of `Surface.create`, which starts a core and
+/// its program; a test's terminals have no core.
 pub var test_create_pane: if (builtin.is_test) ?*const fn (*Window) anyerror!*Surface else void =
     if (builtin.is_test) null else {};
 
@@ -2013,9 +2160,14 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
 
 /// Lay the terminals out over the client area (`layout`), then place their
 /// overlays and search bars over them. Not while the window is minimized
-/// and its client area is empty (see WM_SIZE).
+/// and its client area is empty (see WM_SIZE), nor while the quick
+/// terminal is hidden: its terminals would be told that they show
+/// (`Placer.pane`), as a reloaded configuration lays every window out
+/// (`App.Request.redecorate`); `showQuick` lays them out. Any other
+/// window is laid out hidden before it first shows.
 pub fn relayout(self: *Window) void {
     if (self.tab().tree.isEmpty() or win32.IsIconic(self.hwnd).toBool()) return;
+    if (self.quick and !win32.IsWindowVisible(self.hwnd).toBool()) return;
     self.placeBar();
     const client = self.layoutArea() orelse return;
     self.placeTerminals(client);
@@ -2606,9 +2758,10 @@ pub fn isRestored(self: *const Window) bool {
 /// Whether `resize_window` may resize the window for `surface`: as on GTK
 /// and macOS, only when it is the window's one terminal, since other
 /// terminals would change too, and the window is at a size of its own
-/// (`isRestored`), as `vt-window-resize-allowed` documents it.
+/// (`isRestored`), as `vt-window-resize-allowed` documents it; never the
+/// quick terminal (`quick`).
 pub fn terminalResizable(self: *const Window, surface: *const Surface) bool {
-    if (self.tabs.items.len != 1) return false;
+    if (self.quick or self.tabs.items.len != 1) return false;
     if (self.tab().tree.isSplit() or self.tab().tree.locate(surface) == null) return false;
     return self.isRestored();
 }
@@ -2624,9 +2777,10 @@ pub const DefaultSize = union(enum) {
 };
 
 /// The size `reset_window_size` would give the window now, or null when
-/// it has none or covers its monitor, which `reset_window_size` leaves.
+/// it has none, covers its monitor or is the quick terminal (`quick`),
+/// which `reset_window_size` leaves.
 pub fn defaultSize(self: *const Window) ?DefaultSize {
-    if (self.fullscreen != null) return null;
+    if (self.fullscreen != null or self.quick) return null;
     if (self.app.config.maximize) return .maximized;
     const surface = self.tab().focused orelse return null;
     return .{ .initial = surface.initial_size orelse return null };
@@ -2731,8 +2885,9 @@ pub fn bringForward(frame: win32.HWND, front: win32.HWND) bool {
 /// Raymond Chen describes it ("How do I switch a window between normal
 /// and fullscreen?", The Old New Thing). The terminals are laid out again,
 /// from the frame's WM_SIZE and then here for the bar, so this never runs
-/// inside a core frame (`App.requests`).
+/// inside a core frame (`App.requests`). Not the quick terminal (`quick`).
 pub fn toggleFullscreen(self: *Window) void {
+    if (self.quick) return;
     const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_STYLE);
     const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
     const reframe = win32.SWP_NOOWNERZORDER | win32.SWP_FRAMECHANGED;
@@ -2852,8 +3007,10 @@ fn frameStyle(decorated: bool) isize {
 /// the window's own setting is dropped if it has one, back to
 /// `window-decoration`, or else it takes the other one, `none` if that has
 /// decorations and `auto` if not. The frame changes (`applyDecorations`),
-/// so this never runs inside a core frame (`App.requests`).
+/// so this never runs inside a core frame (`App.requests`). Not the quick
+/// terminal, which has none (`quick`).
 pub fn toggleDecorations(self: *Window) void {
+    if (self.quick) return;
     self.decoration = if (self.decoration != null) null else switch (self.app.config.@"window-decoration") {
         .none => .auto,
         .auto, .client, .server => .none,
@@ -2864,11 +3021,12 @@ pub fn toggleDecorations(self: *Window) void {
 /// Give the frame the styles `isDecorated` asks for, keeping its rect, or a
 /// maximized one the work area (`refitMaximized`). A window that covers its
 /// monitor has none of them, and takes them when it leaves
-/// (`toggleFullscreen`). The client area grows or shrinks by the caption,
-/// and the terminals are laid out again from the frame's WM_SIZE, so this
-/// never runs inside a core frame (`App.requests`).
+/// (`toggleFullscreen`); the quick terminal never has them (`quick`). The
+/// client area grows or shrinks by the caption, and the terminals are laid
+/// out again from the frame's WM_SIZE, so this never runs inside a core
+/// frame (`App.requests`).
 pub fn applyDecorations(self: *Window) void {
-    if (self.fullscreen != null) return;
+    if (self.fullscreen != null or self.quick) return;
     const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_STYLE);
     const overlapped: isize = win32.WS_OVERLAPPEDWINDOW;
     const want = (style & ~overlapped) | frameStyle(self.isDecorated());
@@ -2979,8 +3137,10 @@ pub fn isFloating(self: *const Window) bool {
 /// a topmost window is made non-topmost, so are its owners, SetWindowPos
 /// documents). So the answer is whether the window floats as asked once
 /// SetWindowPos returns, read as `isFloating` reads it. It is not tried
-/// again.
+/// again. False for the quick terminal, which floats while it shows
+/// (`showQuick`).
 pub fn setFloating(self: *Window, on: bool) bool {
+    if (self.quick) return false;
     if (!win32.SetWindowPos(
         self.hwnd,
         if (on) win32.HWND_TOPMOST else win32.HWND_NOTOPMOST,
@@ -3003,8 +3163,10 @@ pub fn setFloating(self: *Window, on: bool) bool {
 /// `.toggle_maximize`: maximize the window, or restore it, by whether it
 /// is maximized now, as GTK decides (`surfaceToggleMaximize`): the user
 /// also maximizes and restores it with the caption buttons, a double click
-/// and Win+Up and Win+Down.
+/// and Win+Up and Win+Down. Not the quick terminal, which has neither
+/// (`quick`).
 pub fn toggleMaximize(self: *Window) void {
+    if (self.quick) return;
     // ShowWindow's BOOL is the window's *previous* visibility, not
     // whether the call succeeded, so it deliberately is not
     // propagated: a window that was hidden returns zero from a
@@ -3117,6 +3279,50 @@ test "win32: an initial size is kept inside the monitor work area" {
             .bottom = 824,
         }),
     );
+}
+
+test "win32: the quick terminal is placed on the work area at its position" {
+    const testing = std.testing;
+    const RECT = win32.RECT;
+
+    // 1920x1040, not at zero: taskbars on the left and at the top.
+    const work: RECT = .{ .left = 10, .top = 20, .right = 1930, .bottom = 1060 };
+
+    // By default all of its edge, 400 pixels deep, or 800x400 in the
+    // middle (`QuickTerminalSize.calculate`), flush with the edge.
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 420 }, quickPlace(.top, .{}, work));
+    try testing.expectEqual(RECT{ .left = 10, .top = 660, .right = 1930, .bottom = 1060 }, quickPlace(.bottom, .{}, work));
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 410, .bottom = 1060 }, quickPlace(.left, .{}, work));
+    try testing.expectEqual(RECT{ .left = 1530, .top = 20, .right = 1930, .bottom = 1060 }, quickPlace(.right, .{}, work));
+    try testing.expectEqual(RECT{ .left = 570, .top = 340, .right = 1370, .bottom = 740 }, quickPlace(.center, .{}, work));
+
+    // Shorter than its edge: centred along it. The primary size is the
+    // depth from the edge, the secondary the length along it.
+    try testing.expectEqual(
+        RECT{ .left = 490, .top = 20, .right = 1450, .bottom = 540 },
+        quickPlace(.top, .{ .primary = .{ .percentage = 50 }, .secondary = .{ .percentage = 50 } }, work),
+    );
+    try testing.expectEqual(
+        RECT{ .left = 1630, .top = 270, .right = 1930, .bottom = 810 },
+        quickPlace(.right, .{ .primary = .{ .pixels = 300 }, .secondary = .{ .pixels = 540 } }, work),
+    );
+
+    // On a work area taller than it is wide, the middle's is 400x800.
+    try testing.expectEqual(
+        RECT{ .left = -500, .top = 100, .right = -100, .bottom = 900 },
+        quickPlace(.center, .{}, .{ .left = -600, .top = 0, .right = 0, .bottom = 1000 }),
+    );
+
+    // No larger than the work area, including percentages `toPixels`
+    // could not make into a u32, and at least a pixel. A NaN one is the
+    // default.
+    try testing.expectEqual(work, quickPlace(.center, .{ .primary = .{ .pixels = 5000 }, .secondary = .{ .pixels = 5000 } }, work));
+    try testing.expectEqual(work, quickPlace(.center, .{
+        .primary = .{ .percentage = 1e30 },
+        .secondary = .{ .percentage = std.math.inf(f32) },
+    }, work));
+    try testing.expectEqual(RECT{ .left = 10, .top = 20, .right = 1930, .bottom = 21 }, quickPlace(.top, .{ .primary = .{ .pixels = 0 } }, work));
+    try testing.expectEqual(quickPlace(.left, .{}, work), quickPlace(.left, .{ .primary = .{ .percentage = std.math.nan(f32) } }, work));
 }
 
 test "win32: a tab dropped outside its window is placed with its label at the pointer" {

@@ -163,6 +163,9 @@ pub const WS_EX_TOPMOST: DWORD = 0x00000008;
 /// The window takes files dropped on it (WM_DROPFILES), as
 /// DragAcceptFiles sets.
 pub const WS_EX_ACCEPTFILES: DWORD = 0x00000010;
+/// Not in the taskbar or in the Alt+Tab switcher.
+/// https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles
+pub const WS_EX_TOOLWINDOW: DWORD = 0x00000080;
 /// SetWindowPos's place for a window above every window that is not on
 /// top, and back among them.
 pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
@@ -933,6 +936,7 @@ pub extern "user32" fn IsWindowEnabled(hwnd: HWND) callconv(.winapi) BOOL;
 
 pub const HMONITOR = *opaque {};
 pub const MONITOR_DEFAULTTONULL: DWORD = 0x00000000;
+pub const MONITOR_DEFAULTTOPRIMARY: DWORD = 0x00000001;
 pub const MONITOR_DEFAULTTONEAREST: DWORD = 0x00000002;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-monitorinfo
 pub const MONITORINFO = extern struct {

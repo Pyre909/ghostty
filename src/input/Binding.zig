@@ -853,8 +853,13 @@ pub const Action = union(enum) {
     ///     plugin in the plugin list. Ghostty would then need to be restarted
     ///     fully for this to take effect.
     ///
-    ///   - Quick terminal tabs are only supported on Linux and not on macOS.
-    ///     This is because tabs on macOS require a title bar.
+    ///   - Quick terminal tabs are only supported on Linux and Windows, and
+    ///     not on macOS. This is because tabs on macOS require a title bar.
+    ///
+    ///   - On Windows, the quick terminal stays above every window that is
+    ///     not always on top while it is shown, and has no taskbar button.
+    ///     It cannot be maximized, fullscreened, resized or given a title
+    ///     bar.
     ///
     ///   - On macOS, a fullscreened quick terminal will always be in non-native
     ///     fullscreen mode. This is a requirement due to how the quick terminal
