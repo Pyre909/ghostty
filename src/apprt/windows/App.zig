@@ -156,11 +156,11 @@ pub const App = struct {
     /// also registered with `CoreApp.addSurface`, which is what drives the
     /// quit timer; this list and the core's can differ only while a surface
     /// is being created or torn down.
-    surfaces: std.ArrayListUnmanaged(*Surface),
+    surfaces: std.ArrayList(*Surface),
 
     /// The windows the terminals are in, with the same ownership rule
     /// (`windowDestroyed`).
-    windows: std.ArrayListUnmanaged(*Window),
+    windows: std.ArrayList(*Window),
 
     /// Work the core asked for that `run` has not carried out yet, oldest
     /// first (`Request`): windows and splits, the changes to splits and
@@ -179,7 +179,7 @@ pub const App = struct {
     /// A surface named in a request is always live: a surface clears its
     /// own entries when its teardown starts (`forgetClosing`), before its
     /// address can be reused.
-    requests: std.ArrayListUnmanaged(Request),
+    requests: std.ArrayList(Request),
 
     /// The terminal whose search bar `start_search` opened or `end_search`
     /// closed last, to get the keyboard focus, or its search field, once

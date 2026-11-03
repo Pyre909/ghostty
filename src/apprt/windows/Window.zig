@@ -77,7 +77,7 @@ hwnd: win32.HWND,
 /// The window's tabs, in the order they show; never empty from `create`
 /// until the window is freed (`deinit`). Each is allocated, so that a
 /// pointer to one stays put.
-tabs: std.ArrayListUnmanaged(*Tab),
+tabs: std.ArrayList(*Tab),
 
 /// The index in `tabs` of the tab the window shows.
 selected: usize,

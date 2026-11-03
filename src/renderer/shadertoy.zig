@@ -521,7 +521,7 @@ test "shadertoy to hlsl" {
     defer buf.deinit();
     try spirvFromGlsl(&buf.writer, null, src);
 
-    var spvlist: std.ArrayListAligned(u8, .of(u32)) = .empty;
+    var spvlist: std.array_list.Aligned(u8, .of(u32)) = .empty;
     defer spvlist.deinit(alloc);
     try spvlist.appendSlice(alloc, buf.written());
 

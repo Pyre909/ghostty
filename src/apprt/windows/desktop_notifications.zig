@@ -33,7 +33,7 @@ shown: bool = false,
 
 /// The toasts shown while the terminal had the focus, in the order they
 /// lapse, which is the order they were shown in.
-expiring: std.ArrayListUnmanaged(Expiring) = .empty,
+expiring: std.ArrayList(Expiring) = .empty,
 
 const Expiring = struct {
     tag: u64,

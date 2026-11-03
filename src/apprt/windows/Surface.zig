@@ -237,7 +237,7 @@ pub const Surface = struct {
         /// Result text, as UTF-8, that arrived while the core could not be
         /// entered (`imeCore`). `flushIme` delivers it before any later
         /// input. Owned; freed in `stopCore` and `deinit`.
-        pending: std.ArrayListUnmanaged(u8) = .empty,
+        pending: std.ArrayList(u8) = .empty,
 
         /// Keys whose key-down the core never saw, by `scanSlot`: the IME
         /// claimed it (VK_PROCESSKEY), it was a digit of Alt+numpad entry

@@ -1126,7 +1126,7 @@ pub const DirectWrite = struct {
         const collection = try self.dwrite.systemFonts();
         defer api.release(collection);
 
-        var list: std.ArrayListUnmanaged(Candidate) = .empty;
+        var list: std.ArrayList(Candidate) = .empty;
         errdefer {
             for (list.items) |c| api.release(c.font);
             list.deinit(alloc);
@@ -1233,7 +1233,7 @@ pub const DirectWrite = struct {
     /// The fonts of the family with this name.
     fn collectFamily(
         alloc: Allocator,
-        list: *std.ArrayListUnmanaged(Candidate),
+        list: *std.ArrayList(Candidate),
         collection: *api.IDWriteFontCollection,
         family: [:0]const u8,
     ) !void {
@@ -1265,7 +1265,7 @@ pub const DirectWrite = struct {
     /// Every font of the collection.
     fn collectAll(
         alloc: Allocator,
-        list: *std.ArrayListUnmanaged(Candidate),
+        list: *std.ArrayList(Candidate),
         collection: *api.IDWriteFontCollection,
     ) !void {
         const count = collection.getFontFamilyCount();
@@ -1281,7 +1281,7 @@ pub const DirectWrite = struct {
     /// DirectWrite simulates are never among them.
     fn appendFonts(
         alloc: Allocator,
-        list: *std.ArrayListUnmanaged(Candidate),
+        list: *std.ArrayList(Candidate),
         fonts: *api.IDWriteFontList,
         named: ?[]const u8,
     ) !void {
