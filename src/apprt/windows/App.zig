@@ -1176,16 +1176,20 @@ pub const App = struct {
         if (self.config.@"initial-window") {
             _ = self.newWindow(null, .normal, null) catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
-                // Its clients hear at once that it quits (and a new
-                // window's starts Ghostty), rather than waiting through
-                // the notice to be told it is busy with a request it
-                // never carries out.
-                self.stopIpc();
-                fatalNotice(err);
+                self.failStart(err);
                 return err;
             };
         }
         self.showConfigErrors();
+    }
+
+    /// End a start that opened no window, for `err`: this instance's
+    /// clients hear at once that it quits (and a new window's starts
+    /// Ghostty), rather than waiting through the notice to be told it is
+    /// busy with a request it never carries out; then the notice says why.
+    fn failStart(self: *App, err: anyerror) void {
+        self.stopIpc();
+        fatalNotice(err);
     }
 
     /// The Win32 message loop.
@@ -22709,6 +22713,60 @@ fn testIpcInstance() !void {
         defer env.deinit();
         try std.testing.expectEqual(null, env.get(IpcClient.instance_env));
     }
+}
+
+test "win32: an instance whose start fails stops serving IPC before it says why" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+
+    var buf: [64]u8 = undefined;
+    const class = try testIpcBase(&buf);
+    app.config.class = class;
+    app.startIpc();
+    try std.testing.expect(app.ipc != null and app.ipc_instance != null);
+    const identity = try IpcServer.Identity.ofProcess();
+    const shared = (try App.ipcName(alloc, class, &identity)).name;
+    defer alloc.free(shared);
+
+    // Whether the shared pipe was still served as the notice showed, by a
+    // wait that finds a pipe of the name without opening it. The failure
+    // itself, the initial window's (`startUp`), is not made here: it logs
+    // an error, which fails a test run.
+    const Notice = struct {
+        var name: [:0]const u16 = undefined;
+        var boxes: usize = 0;
+        var served = true;
+        var said = false;
+
+        fn box(owner: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
+            boxes += 1;
+            served = win32.WaitNamedPipeW(name, 1).toBool() or win32.GetLastError() != .FILE_NOT_FOUND;
+            said = owner == null and buttons == win32.MB_OK and
+                std.mem.startsWith(u16, std.mem.span(text), std.mem.span(L("Ghostty could not start: Direct3D 11")));
+            return win32.IDOK;
+        }
+    };
+    Notice.name = shared;
+    Notice.boxes = 0;
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &Notice.box;
+    defer message_box.* = null;
+
+    app.failStart(error.D3D11DeviceFailed);
+    try std.testing.expectEqual(1, Notice.boxes);
+    try std.testing.expect(!Notice.served);
+    try std.testing.expect(Notice.said);
+    try std.testing.expect(app.ipc == null and app.ipc_instance == null);
 }
 
 test "win32: an instance's initial window names its own IPC pipe to its terminals" {

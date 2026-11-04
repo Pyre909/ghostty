@@ -46,8 +46,8 @@ pub fn notice(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) void {
     _ = messageBox(app, hwnd, text, win32.MB_OK);
 }
 
-/// For tests: answers in place of MessageBoxW in `messageBox`, given its
-/// owner, its text and its buttons, as `Overlays.test_make` stands for
+/// For tests: answers in place of MessageBoxW in `messageBox` and
+/// `fatalNotice`, given its owner, its text and its buttons, as `Overlays.test_make` stands for
 /// CreateWindowExW, so that a test sees what a prompt says and what each
 /// answer does without a modal loop.
 pub var test_message_box: if (builtin.is_test) ?*const fn (?win32.HWND, win32.LPCWSTR, win32.UINT) c_int else void =
@@ -102,5 +102,9 @@ pub fn fatalNotice(err: anyerror) void {
     var wide: [buf.len + 1]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&wide, text) catch unreachable;
     wide[n] = 0;
+    if (builtin.is_test) if (test_message_box) |answer| {
+        _ = answer(null, wide[0..n :0], win32.MB_OK);
+        return;
+    };
     _ = win32.MessageBoxW(null, wide[0..n :0], L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
 }
