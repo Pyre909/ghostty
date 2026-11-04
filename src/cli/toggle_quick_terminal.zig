@@ -30,12 +30,18 @@ pub const Options = struct {
 /// to be running, as D-Bus will handle launching a new instance if it is not
 /// already running.
 ///
-/// Only supported on GTK.
+/// On Windows, each instance serves a named pipe for the user's session,
+/// which the class names as it names the GTK application ID, and Ghostty
+/// must be running: none is started for this command. Run in a Ghostty
+/// terminal, it reaches the instance that terminal belongs to.
+///
+/// Only supported on GTK and Windows.
 ///
 /// Flags:
 ///
 ///   * `--class=<class>`: If set, connect to a custom instance of Ghostty.
-///     The class must be a valid GTK application ID.
+///     The class must be a valid GTK application ID; on Windows, any class
+///     without a backslash that fits a pipe's name.
 ///
 /// Available since: 1.4.0
 pub fn run(alloc: Allocator) !u8 {

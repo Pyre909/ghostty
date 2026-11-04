@@ -150,12 +150,20 @@ pub const Options = struct {
 /// of Ghostty if it is not already running. See the Ghostty website for
 /// information on properly configuring D-Bus activation.
 ///
-/// Only supported on GTK.
+/// On Windows, each instance serves a named pipe for the user's session,
+/// which the class names as it names the GTK application ID. When no
+/// instance answers, the command starts Ghostty with its arguments and
+/// the class, as D-Bus activation starts the default class. Run in a
+/// Ghostty terminal, it reaches the instance that terminal belongs to, as
+/// each launch is a process of its own.
+///
+/// Only supported on GTK and Windows.
 ///
 /// Flags:
 ///
 ///   * `--class=<class>`: If set, open up a new window in a custom instance of
-///     Ghostty. The class must be a valid GTK application ID.
+///     Ghostty. The class must be a valid GTK application ID; on Windows,
+///     any class without a backslash that fits a pipe's name.
 ///
 ///   * `--command`: The command to be executed in the first surface of the new window.
 ///
