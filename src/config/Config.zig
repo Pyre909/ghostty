@@ -1571,10 +1571,11 @@ title: ?[:0]const u8 = null,
 /// The default is `com.mitchellh.ghostty`.
 ///
 /// This only affects GTK and Windows builds. On Windows, it names the pipe
-/// that `ghostty +new-window`, `+new-tab` and `+toggle-quick-terminal`
-/// reach this instance by, as their `--class` does. There, any class
-/// without a backslash that fits a pipe's name works, one that does not
-/// is ignored, and a change takes effect at the next launch.
+/// that `ghostty +new-window` and `+new-tab` reach this instance by with
+/// the same `--class`, and that those commands and `+toggle-quick-terminal`
+/// reach it by from its own terminals. There, any class without a
+/// backslash that fits a pipe's name works, one that does not is ignored,
+/// and a change takes effect at the next launch.
 class: ?[:0]const u8 = null,
 
 /// This controls the instance name field of the `WM_CLASS` X11 property when

@@ -152,8 +152,10 @@ pub const Options = struct {
 ///
 /// On Windows, each instance serves a named pipe for the user's session,
 /// which the class names as it names the GTK application ID. When no
-/// instance answers, the command starts Ghostty with its arguments and
-/// the class, as D-Bus activation starts the default class. Run in a
+/// instance answers, the command starts Ghostty with the class and its
+/// arguments as that Ghostty's own command line, so that each option
+/// applies to the whole of it, as at any launch, where D-Bus activation
+/// starts the default class and then sends it the request. Run in a
 /// Ghostty terminal, it reaches the instance that terminal belongs to, as
 /// each launch is a process of its own.
 ///
