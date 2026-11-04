@@ -6,6 +6,9 @@
 //! (IpcServer.zig), checks that the user owns it, lets the instance bring
 //! its window forward, writes the request and reads the reply, all within
 //! `budget_ms`. What the instance did not do, and why, it says on stderr.
+//! Run in a Ghostty terminal, it reaches that terminal's instance, by the
+//! pipe that instance serves of its own (`instance_env`), as every plain
+//! launch is a process of its own.
 //! A new window or tab that no instance can take starts Ghostty instead
 //! (`startGhostty`), as D-Bus activation starts GTK's.
 
@@ -15,6 +18,7 @@ const Allocator = std.mem.Allocator;
 
 const apprt = @import("../../apprt.zig");
 const launcher_env = @import("../../os/main.zig").windows.launcher_env;
+const parsePid = @import("../../os/main.zig").windows.parsePid;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const ipc = @import("ipc.zig");
 const IpcServer = @import("IpcServer.zig");
@@ -43,13 +47,41 @@ pub var test_allow_foreground: if (builtin.is_test) ?*const fn (win32.DWORD) voi
 pub var test_spawn: if (builtin.is_test) ?*const fn ([:0]const u16) ?win32.Win32Error else void =
     if (builtin.is_test) null else {};
 
+/// The variable a terminal's environment names its instance by: the
+/// process ID of the instance, which serves a pipe of its own for the
+/// requests made in its terminals (`IpcServer.instancePipeName`), as
+/// GHOSTTY_SURFACE_ID names the terminal for `+new-tab`.
+pub const instance_env = "GHOSTTY_IPC_INSTANCE";
+const instance_env_w = std.unicode.utf8ToUtf16LeStringLiteral(instance_env);
+
+/// Name in `env` the instance of process `instance` as the one a
+/// terminal's requests reach (`instance_env`), or none, dropping a value
+/// inherited from the Ghostty this one was started in, which names that
+/// other instance.
+pub fn nameInstance(env: *std.process.Environ.Map, instance: ?u32) !void {
+    _ = env.orderedRemove(instance_env);
+    const pid = instance orelse return;
+    var buf: [10]u8 = undefined;
+    try env.put(instance_env, std.fmt.bufPrint(&buf, "{d}", .{pid}) catch unreachable);
+}
+
+/// The instance whose terminal this process runs in (`instance_env`), or
+/// null outside one, and for a value that is no process ID.
+fn instanceOfTerminal() ?u32 {
+    var buf: [16]u16 = undefined;
+    const len = win32.GetEnvironmentVariableW(instance_env_w, &buf, buf.len);
+    if (len == 0 or len >= buf.len) return null;
+    return parsePid(buf[0..len]);
+}
+
 /// What `perform` fails with, once it has said why on stderr, as the CLI
 /// expects (`apprt.ipc.Errors`).
 pub const Error = Allocator.Error || apprt.ipc.Errors;
 
 /// Send `action` with `value` to the running instance that `target` names,
-/// as this process's user, and say on `stderr` what came of it unless it
-/// was done (`performAs`).
+/// or the one whose terminal this process runs in, as this process's
+/// user, and say on `stderr` what came of it unless it was done
+/// (`performAs`).
 pub fn perform(
     alloc: Allocator,
     target: apprt.ipc.Target,
@@ -60,10 +92,11 @@ pub fn perform(
     const command = comptime commandName(action);
     const identity = IpcServer.Identity.ofProcess() catch |err|
         return fail(stderr, command, "this process's user cannot be told ({t})", .{err});
-    return performAs(alloc, &identity, target, action, value, stderr);
+    return performAs(alloc, &identity, instanceOfTerminal(), target, action, value, stderr);
 }
 
-/// `perform` as `identity`: true once the instance did it, or will
+/// `perform` as `identity`, run in a terminal of the instance of process
+/// `instance`, if not null: true once the instance did it, or will
 /// (`ipc.Status.pending`, which it says), or once Ghostty is started for it
 /// (`unanswered`), and error.IPCFailed once it has said what came of it
 /// otherwise. What it cannot say, as with no console
@@ -71,6 +104,7 @@ pub fn perform(
 pub fn performAs(
     alloc: Allocator,
     identity: *const IpcServer.Identity,
+    instance: ?u32,
     target: apprt.ipc.Target,
     comptime action: apprt.ipc.Action.Key,
     value: apprt.ipc.Action.Value(action),
@@ -112,7 +146,23 @@ pub fn performAs(
     defer alloc.free(request);
 
     var buf: [ipc.max_reply]u8 = undefined;
-    const reply = switch (exchange(name, &identity.user, request, &buf)) {
+    const exchanged = exchanged: {
+        // The instance whose terminal this runs in, unless it has gone, as
+        // a program its terminal started can outlive it; then the shared
+        // pipe's.
+        if (instance) |pid| own: {
+            const own = IpcServer.instancePipeName(alloc, name, pid) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // No instance serves one of this class.
+                error.NameTooLong => break :own,
+            };
+            defer alloc.free(own);
+            const result = exchange(own, &identity.user, request, &buf);
+            if (result != .none) break :exchanged result;
+        }
+        break :exchanged exchange(name, &identity.user, request, &buf);
+    };
+    const reply = switch (exchanged) {
         .reply => |reply| reply,
         .none => return unanswered(alloc, action, arguments, stderr, "no running Ghostty was found"),
         .foreign => return fail(stderr, command, "the pipe of its name is another account's, and was sent nothing", .{}),
@@ -561,11 +611,21 @@ const TestPipe = struct {
 
     /// `sddl` is its security, else the default, which lets the user in.
     fn init(alloc: Allocator, sddl: ?[]const u8) !TestPipe {
-        const identity = try IpcServer.Identity.ofProcess();
         var buf: [64]u8 = undefined;
-        const class = try alloc.dupeSentinel(u8, try IpcServer.testBase(&buf), 0);
+        return initOf(alloc, try IpcServer.testBase(&buf), null, sddl);
+    }
+
+    /// The pipe of `base`, or the one of the instance of process
+    /// `instance` beside it (`IpcServer.instancePipeName`).
+    fn initOf(alloc: Allocator, base: []const u8, instance: ?u32, sddl: ?[]const u8) !TestPipe {
+        const identity = try IpcServer.Identity.ofProcess();
+        const class = try alloc.dupeSentinel(u8, base, 0);
         errdefer alloc.free(class);
-        const name = try IpcServer.pipeName(alloc, class, &identity);
+        const shared = try IpcServer.pipeName(alloc, class, &identity);
+        const name = if (instance) |pid| own: {
+            defer alloc.free(shared);
+            break :own try IpcServer.instancePipeName(alloc, shared, pid);
+        } else shared;
         errdefer alloc.free(name);
 
         var descriptor: ?win32.PSECURITY_DESCRIPTOR = null;
@@ -689,7 +749,7 @@ test "win32: an IPC client with no instance to reach starts Ghostty for a window
     defer out.deinit();
     try std.testing.expectError(
         error.IPCFailed,
-        performAs(alloc, &identity, .{ .class = class }, .toggle_quick_terminal, {}, &out.writer),
+        performAs(alloc, &identity, null, .{ .class = class }, .toggle_quick_terminal, {}, &out.writer),
     );
     try std.testing.expectEqualStrings("+toggle-quick-terminal failed: no running Ghostty was found\n", out.written());
 
@@ -701,7 +761,7 @@ test "win32: an IPC client with no instance to reach starts Ghostty for a window
     defer _ = win32.SetEnvironmentVariableW(launcher_env, null);
     out.clearRetainingCapacity();
     var arguments = [_][:0]const u8{ "--working-directory=C:\\a b\\", "-e", "cmd.exe", "/k", "echo \"hi\"" };
-    try std.testing.expect(try performAs(alloc, &identity, .{ .class = class }, .new_tab, .{ .surface_id = 0x11, .arguments = &arguments }, &out.writer));
+    try std.testing.expect(try performAs(alloc, &identity, null, .{ .class = class }, .new_tab, .{ .surface_id = 0x11, .arguments = &arguments }, &out.writer));
     try std.testing.expectEqualStrings("", out.written());
     try TestSpawn.expectStarted(&arguments);
 
@@ -710,7 +770,7 @@ test "win32: an IPC client with no instance to reach starts Ghostty for a window
     out.clearRetainingCapacity();
     try std.testing.expectError(
         error.IPCFailed,
-        performAs(alloc, &identity, .{ .class = class }, .new_window, .{ .arguments = &arguments }, &out.writer),
+        performAs(alloc, &identity, null, .{ .class = class }, .new_window, .{ .arguments = &arguments }, &out.writer),
     );
     try std.testing.expectEqualStrings("+new-window failed: Ghostty cannot be started (error 2)\n", out.written());
 }
@@ -722,7 +782,7 @@ test "win32: an IPC client refuses a class that cannot name a pipe, and argument
     defer out.deinit();
     try std.testing.expectError(
         error.IPCFailed,
-        performAs(alloc, &identity, .{ .class = "a\\b" }, .new_window, .{ .arguments = null }, &out.writer),
+        performAs(alloc, &identity, null, .{ .class = "a\\b" }, .new_window, .{ .arguments = null }, &out.writer),
     );
     try std.testing.expectEqualStrings("+new-window failed: the class \"a\\b\" cannot name a pipe\n", out.written());
 
@@ -732,7 +792,7 @@ test "win32: an IPC client refuses a class that cannot name a pipe, and argument
     out.clearRetainingCapacity();
     try std.testing.expectError(
         error.IPCFailed,
-        performAs(alloc, &identity, .{ .class = "a\\\x1b[2J\xff\xe2\x80" }, .new_window, .{ .arguments = null }, &out.writer),
+        performAs(alloc, &identity, null, .{ .class = "a\\\x1b[2J\xff\xe2\x80" }, .new_window, .{ .arguments = null }, &out.writer),
     );
     try std.testing.expectEqualStrings("+new-window failed: the class \"a\\U+001B[2J\u{FFFD}\u{FFFD}\u{FFFD}\" cannot name a pipe\n", out.written());
 
@@ -753,7 +813,7 @@ test "win32: an IPC client refuses a class that cannot name a pipe, and argument
         out.clearRetainingCapacity();
         try std.testing.expectError(
             error.IPCFailed,
-            performAs(alloc, &identity, .{ .class = base }, .new_window, .{ .arguments = case.arguments }, &out.writer),
+            performAs(alloc, &identity, null, .{ .class = base }, .new_window, .{ .arguments = case.arguments }, &out.writer),
         );
         try std.testing.expectEqualStrings(case.said, out.written());
     }
@@ -942,6 +1002,8 @@ pub const TestCli = struct {
     action: ipc.Action,
     surface_id: u64 = 0,
     arguments: ?[][:0]const u8 = null,
+    /// The instance whose terminal it runs in, if any.
+    instance: ?u32 = null,
     buf: [512]u8 = undefined,
     out: std.Io.Writer = undefined,
     result: Error!bool = false,
@@ -956,9 +1018,9 @@ pub const TestCli = struct {
         const alloc = std.testing.allocator;
         const target: apprt.ipc.Target = .{ .class = self.class };
         self.result = switch (self.action) {
-            .new_window => performAs(alloc, &self.identity, target, .new_window, .{ .arguments = self.arguments }, &self.out),
-            .new_tab => performAs(alloc, &self.identity, target, .new_tab, .{ .surface_id = self.surface_id, .arguments = self.arguments }, &self.out),
-            .toggle_quick_terminal => performAs(alloc, &self.identity, target, .toggle_quick_terminal, {}, &self.out),
+            .new_window => performAs(alloc, &self.identity, self.instance, target, .new_window, .{ .arguments = self.arguments }, &self.out),
+            .new_tab => performAs(alloc, &self.identity, self.instance, target, .new_tab, .{ .surface_id = self.surface_id, .arguments = self.arguments }, &self.out),
+            .toggle_quick_terminal => performAs(alloc, &self.identity, self.instance, target, .toggle_quick_terminal, {}, &self.out),
         };
     }
 
@@ -1188,14 +1250,14 @@ test "win32: an elevated IPC client starts a Ghostty of its own, and sends nothi
     defer out.deinit();
 
     var arguments = [_][:0]const u8{"--title=a"};
-    try std.testing.expect(try performAs(alloc, &identity, .{ .class = t.class }, .new_tab, .{ .surface_id = 0, .arguments = &arguments }, &out.writer));
+    try std.testing.expect(try performAs(alloc, &identity, null, .{ .class = t.class }, .new_tab, .{ .surface_id = 0, .arguments = &arguments }, &out.writer));
     try std.testing.expectEqualStrings("", out.written());
     try TestSpawn.expectStarted(&arguments);
 
     out.clearRetainingCapacity();
     try std.testing.expectError(
         error.IPCFailed,
-        performAs(alloc, &identity, .{ .class = t.class }, .toggle_quick_terminal, {}, &out.writer),
+        performAs(alloc, &identity, null, .{ .class = t.class }, .toggle_quick_terminal, {}, &out.writer),
     );
     try std.testing.expectEqualStrings("+toggle-quick-terminal failed: an elevated process does not reach a running Ghostty\n", out.written());
 
@@ -1207,4 +1269,99 @@ test "win32: an elevated IPC client starts a Ghostty of its own, and sends nothi
     _ = win32.CancelIoEx(t.pipe, &ov);
     var n: win32.DWORD = 0;
     _ = win32.GetOverlappedResult(t.pipe, &ov, &n, .TRUE);
+}
+
+/// For tests: `cli`, which the pipe `t` takes, answered as failed with
+/// `text`; that it says so shows which pipe it reached.
+fn testAnsweredBy(cli: *TestCli, t: *TestPipe, text: []const u8) !void {
+    var request_buf: [ipc.max_request]u8 = undefined;
+    try cli.start();
+    {
+        errdefer _ = cli.finish() catch {};
+        try t.accept();
+        _ = try t.take(&request_buf);
+        try t.reply(.failed, text);
+    }
+    try std.testing.expectError(error.IPCFailed, cli.finish());
+    var said_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        try std.fmt.bufPrint(&said_buf, "+new-window failed: {s}\n", .{text}),
+        cli.said(),
+    );
+    try std.testing.expect(win32.DisconnectNamedPipe(t.pipe).toBool());
+}
+
+test "win32: an IPC client in a terminal reaches its instance's own pipe, else the shared one" {
+    const alloc = std.testing.allocator;
+    var shared: TestPipe = try .init(alloc, null);
+    defer shared.deinit(alloc);
+    const pid: u32 = 4242;
+    var own: TestPipe = try .initOf(alloc, shared.class, pid, null);
+    var own_open = true;
+    defer if (own_open) own.deinit(alloc);
+
+    // From its terminal: the instance's own, though another serves the
+    // shared one.
+    var cli: TestCli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = pid };
+    try testAnsweredBy(&cli, &own, "own");
+    // From no terminal, or one of an instance that serves none: the shared.
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window };
+    try testAnsweredBy(&cli, &shared, "shared");
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = pid + 1 };
+    try testAnsweredBy(&cli, &shared, "shared");
+    // From one whose instance has gone.
+    own.deinit(alloc);
+    own_open = false;
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = pid };
+    try testAnsweredBy(&cli, &shared, "shared");
+
+    // Of a class so long that no instance pipe can have it.
+    const fixed = shared.name.len - shared.class.len;
+    var long_buf: [IpcServer.max_name_len]u8 = undefined;
+    const long = long_buf[0 .. IpcServer.max_name_len - fixed];
+    @memcpy(long[0..shared.class.len], shared.class);
+    @memset(long[shared.class.len..], 'x');
+    var longest: TestPipe = try .initOf(alloc, long, null, null);
+    defer longest.deinit(alloc);
+    try std.testing.expectEqual(IpcServer.max_name_len, longest.name.len);
+    cli = .{ .identity = longest.identity, .class = longest.class, .action = .new_window, .instance = pid };
+    try testAnsweredBy(&cli, &longest, "shared");
+}
+
+test "win32: an IPC client finds its terminal's instance in its environment, and a terminal names only its own" {
+    const alloc = std.testing.allocator;
+
+    // A terminal's environment, from one inherited from another Ghostty.
+    var env = std.process.Environ.Map.init(alloc);
+    defer env.deinit();
+    try env.put(instance_env, "1");
+    try nameInstance(&env, null);
+    try std.testing.expectEqual(null, env.get(instance_env));
+    try env.put(instance_env, "1");
+    try nameInstance(&env, 4242);
+    try std.testing.expectEqualStrings("4242", env.get(instance_env) orelse return error.TestUnexpectedResult);
+
+    // This process's, put back after: a test run in a Ghostty terminal
+    // has one, of 10 digits at most.
+    var saved_buf: [16]u16 = undefined;
+    const saved_len = win32.GetEnvironmentVariableW(instance_env_w, &saved_buf, saved_buf.len);
+    const saved: ?[*:0]const u16 = if (saved_len == 0 or saved_len >= saved_buf.len) null else saved_buf[0..saved_len :0];
+    defer _ = win32.SetEnvironmentVariableW(instance_env_w, saved);
+    const Case = struct { value: ?[]const u8, instance: ?u32 };
+    for ([_]Case{
+        .{ .value = "4242", .instance = 4242 },
+        .{ .value = "42x", .instance = null },
+        .{ .value = "4294967296", .instance = null },
+        .{ .value = "123456789012345678", .instance = null },
+        .{ .value = null, .instance = null },
+    }) |case| {
+        var value_buf: [32]u16 = undefined;
+        const value: ?[*:0]const u16 = if (case.value) |v| value: {
+            const n = try std.unicode.utf8ToUtf16Le(&value_buf, v);
+            value_buf[n] = 0;
+            break :value value_buf[0..n :0];
+        } else null;
+        try std.testing.expect(win32.SetEnvironmentVariableW(instance_env_w, value).toBool());
+        try std.testing.expectEqual(case.instance, instanceOfTerminal());
+    }
 }

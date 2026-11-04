@@ -324,6 +324,13 @@ pub const App = struct {
     /// session serves it (`serveIpc`).
     ipc: ?*IpcServer,
 
+    /// The pipe only this instance serves (`IpcServer.instancePipeName`),
+    /// which the requests made in its terminals reach
+    /// (`Surface.defaultTermioEnv`), whether or not it serves `ipc`: every
+    /// plain launch is a process of its own, and a tab asked for in one of
+    /// its terminals goes beside that terminal. Null as `ipc` is.
+    ipc_instance: ?*IpcServer,
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -343,7 +350,8 @@ pub const App = struct {
     };
 
     /// Send the action to the running instance of the user's session that
-    /// `target` names, and say on stderr what came of it unless it was done
+    /// `target` names, or to the one whose terminal this process runs in,
+    /// and say on stderr what came of it unless it was done
     /// (`IpcClient.perform`): `ghostty +new-window`, `+new-tab` and
     /// `+toggle-quick-terminal`, each a process of its own, with no App.
     pub fn performIpc(
@@ -369,7 +377,8 @@ pub const App = struct {
     }
 
     /// Serve IPC requests on the pipe of `class` for `identity`
-    /// (`ipcName`).
+    /// (`ipcName`), unless another instance does, and on this instance's
+    /// own beside it.
     fn serveIpc(self: *App, identity: *const IpcServer.Identity, class: ?[]const u8) void {
         // An elevated instance would carry out what the user's programs
         // that are not elevated ask, with their arguments, as
@@ -384,12 +393,24 @@ pub const App = struct {
             return;
         };
         defer alloc.free(name);
-        self.ipc = IpcServer.start(alloc, name, identity, self.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+        self.ipc = IpcServer.start(alloc, name, identity, self.msg_hwnd, WM_GHOSTTY_IPC) catch |err| shared: {
             switch (err) {
-                error.NameTaken => log.info("serving no IPC, another instance of this session serves it", .{}),
-                else => log.warn("serving no IPC err={}", .{err}),
+                error.NameTaken => log.info("serving IPC only to this instance's terminals, another instance of this session serves the rest", .{}),
+                else => log.warn("serving no IPC but to this instance's terminals err={}", .{err}),
             }
+            break :shared null;
+        };
+
+        const own = IpcServer.instancePipeName(alloc, name, std.os.windows.GetCurrentProcessId()) catch |err| {
+            log.warn("serving no IPC to this instance's terminals, no pipe name err={}", .{err});
             return;
+        };
+        defer alloc.free(own);
+        // Taken only by a process that made it first, which the requests
+        // made in this instance's terminals then do not reach.
+        self.ipc_instance = IpcServer.start(alloc, own, identity, self.msg_hwnd, WM_GHOSTTY_IPC) catch |err| instance: {
+            log.warn("serving no IPC to this instance's terminals err={}", .{err});
+            break :instance null;
         };
     }
 
@@ -413,11 +434,24 @@ pub const App = struct {
         return IpcServer.pipeName(alloc, toast.app_id, identity);
     }
 
-    /// Stop serving IPC requests, if this instance serves them.
+    /// Stop serving IPC requests, on each pipe this instance serves.
     fn stopIpc(self: *App) void {
-        const server = self.ipc orelse return;
-        self.ipc = null;
-        server.stop();
+        for ([_]*?*IpcServer{ &self.ipc, &self.ipc_instance }) |field| {
+            const server = field.* orelse continue;
+            field.* = null;
+            server.stop();
+        }
+    }
+
+    /// Which of this instance's pipes a request came by, and is answered
+    /// on.
+    const IpcVia = enum { shared, instance };
+
+    fn ipcServer(self: *const App, via: IpcVia) ?*IpcServer {
+        return switch (via) {
+            .shared => self.ipc,
+            .instance => self.ipc_instance,
+        };
     }
 
     /// Record the requests the IPC thread has read (WM_GHOSTTY_IPC) for
@@ -427,26 +461,28 @@ pub const App = struct {
     /// memory runs out. Nothing here calls into the core, so it may run in
     /// any loop that dispatches messages, a prompt's or a core frame's.
     fn ipcRequests(self: *App) void {
-        const server = self.ipc orelse return;
-        var entries = server.take();
-        defer server.free(&entries);
-        for (entries.items) |entry| {
-            if (self.quit or self.terminating) {
-                _ = server.answer(entry.ticket, .quitting, "the running Ghostty is quitting");
-                continue;
+        for (std.enums.values(IpcVia)) |via| {
+            const server = self.ipcServer(via) orelse continue;
+            var entries = server.take();
+            defer server.free(&entries);
+            for (entries.items) |entry| {
+                if (self.quit or self.terminating) {
+                    _ = server.answer(entry.ticket, .quitting, "the running Ghostty is quitting");
+                    continue;
+                }
+                self.recordIpc(entry, via) catch |err| switch (err) {
+                    error.InvalidCommand => _ = server.answer(entry.ticket, .bad_arguments, "the command does not parse"),
+                    error.OutOfMemory => {
+                        log.warn("cannot record an IPC request err={}", .{err});
+                        _ = server.answer(entry.ticket, .failed, "out of memory");
+                    },
+                };
             }
-            self.recordIpc(entry) catch |err| switch (err) {
-                error.InvalidCommand => _ = server.answer(entry.ticket, .bad_arguments, "the command does not parse"),
-                error.OutOfMemory => {
-                    log.warn("cannot record an IPC request err={}", .{err});
-                    _ = server.answer(entry.ticket, .failed, "out of memory");
-                },
-            };
         }
     }
 
-    /// `ipcRequests` for one request.
-    fn recordIpc(self: *App, entry: IpcServer.Entry) Overrides.ParseError!void {
+    /// `ipcRequests` for one request, which came by `via`.
+    fn recordIpc(self: *App, entry: IpcServer.Entry, via: IpcVia) Overrides.ParseError!void {
         const alloc = self.core_app.alloc;
         const request = try alloc.create(IpcRequest);
         errdefer alloc.destroy(request);
@@ -455,6 +491,7 @@ pub const App = struct {
             .action = entry.request.action,
             .surface_id = entry.request.surface_id,
             .ticket = entry.ticket,
+            .via = via,
         };
         errdefer request.arena.deinit();
         if (entry.request.arguments) |arguments| {
@@ -472,8 +509,10 @@ pub const App = struct {
         /// focused one (`ipcTabParent`).
         surface_id: u64,
         overrides: Overrides = .{},
-        /// What its client is answered by (`IpcServer.answer`).
+        /// What its client is answered by (`IpcServer.answer`), on the
+        /// pipe it came by.
         ticket: u64,
+        via: IpcVia,
 
         fn destroy(self: *IpcRequest, alloc: Allocator) void {
             self.arena.deinit();
@@ -493,10 +532,10 @@ pub const App = struct {
                 .new_tab => "the running Ghostty could not open a tab",
                 .toggle_quick_terminal => "the running Ghostty could not open the quick terminal",
             };
-            if (self.ipc) |server| _ = server.answer(request.ticket, .failed, text);
+            if (self.ipcServer(request.via)) |server| _ = server.answer(request.ticket, .failed, text);
             return;
         };
-        if (self.ipc) |server| _ = server.answer(request.ticket, .ok, "");
+        if (self.ipcServer(request.via)) |server| _ = server.answer(request.ticket, .ok, "");
     }
 
     /// What `carryOutIpc` does: a window or tab opened and brought
@@ -878,6 +917,7 @@ pub const App = struct {
             .hotkeys = .{},
             .hotkey_up = .empty,
             .ipc = null,
+            .ipc_instance = null,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -4604,6 +4644,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.hotkeys = .{};
     app.hotkey_up = .empty;
     app.ipc = null;
+    app.ipc_instance = null;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -22037,12 +22078,16 @@ test "win32: an elevated app serves no IPC" {
     const base = try testIpcBase(&buf);
     const name = try IpcServer.pipeName(alloc, base, &identity);
     defer alloc.free(name);
+    const own = try IpcServer.instancePipeName(alloc, name, std.os.windows.GetCurrentProcessId());
+    defer alloc.free(own);
     identity.elevated = true;
     app.serveIpc(&identity, base);
     identity.elevated = false;
     try std.testing.expect(try testIpcNameFree(name, &identity, app.msg_hwnd));
+    try std.testing.expect(try testIpcNameFree(own, &identity, app.msg_hwnd));
     app.serveIpc(&identity, base);
     try std.testing.expect(!try testIpcNameFree(name, &identity, app.msg_hwnd));
+    try std.testing.expect(!try testIpcNameFree(own, &identity, app.msg_hwnd));
 }
 
 test "win32: quitting stops the app's IPC, and so does the session's end" {
@@ -22052,6 +22097,8 @@ test "win32: quitting stops the app's IPC, and so does the session's end" {
     const base = try testIpcBase(&buf);
     const name = try IpcServer.pipeName(alloc, base, &identity);
     defer alloc.free(name);
+    const own = try IpcServer.instancePipeName(alloc, name, std.os.windows.GetCurrentProcessId());
+    defer alloc.free(own);
     const hwnd = win32.CreateWindowExW(0, L("STATIC"), null, 0, 0, 0, 0, 0, win32.HWND_MESSAGE, null, null, null) orelse
         return error.TestUnexpectedResult;
     defer _ = win32.DestroyWindow(hwnd);
@@ -22072,6 +22119,7 @@ test "win32: quitting stops the app's IPC, and so does the session's end" {
 
         app.serveIpc(&identity, base);
         try std.testing.expect(!try testIpcNameFree(name, &identity, hwnd));
+        try std.testing.expect(!try testIpcNameFree(own, &identity, hwnd));
         if (session_end) {
             const f = try testFrame(&app);
             const a = try testPane(&app, f);
@@ -22079,10 +22127,12 @@ test "win32: quitting stops the app's IPC, and so does the session's end" {
             f.tab().focused = a;
             try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1));
             try std.testing.expect(try testIpcNameFree(name, &identity, hwnd));
+            try std.testing.expect(try testIpcNameFree(own, &identity, hwnd));
         }
         terminated = true;
         app.terminate();
         try std.testing.expect(try testIpcNameFree(name, &identity, hwnd));
+        try std.testing.expect(try testIpcNameFree(own, &identity, hwnd));
     }
 }
 
@@ -22511,4 +22561,91 @@ fn testIpcCli() !void {
         try std.testing.expectEqualStrings("+toggle-quick-terminal failed: the running Ghostty is quitting\n", cli.said());
     }
     try std.testing.expectEqual(1, app.windows.items.len);
+}
+
+test "win32: an instance serves IPC to its terminals by a pipe of its own, where another serves the shared one" {
+    // On a desktop of its own: its window shows (testOnOwnDesktop).
+    try testOnOwnDesktop(testIpcInstance, .{});
+}
+
+/// The test of an instance's own IPC pipe, run by its test on a desktop
+/// of its own.
+fn testIpcInstance() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    TestIpc.start();
+    defer TestQuick.stop();
+    app.config.@"window-inherit-working-directory" = false;
+    app.config.@"window-inherit-font-size" = false;
+
+    const identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const class = try testIpcBase(&buf);
+    const pid = std.os.windows.GetCurrentProcessId();
+
+    // The session's first instance, which serves the shared pipe.
+    const first_hwnd = win32.CreateWindowExW(0, L("STATIC"), null, 0, 0, 0, 0, 0, win32.HWND_MESSAGE, null, null, null) orelse
+        return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(first_hwnd);
+    const shared = try App.ipcName(alloc, class, &identity);
+    defer alloc.free(shared);
+    const first = try IpcServer.start(alloc, shared, &identity, first_hwnd, WM_GHOSTTY_IPC);
+    defer first.stop();
+
+    app.serveIpc(&identity, class);
+    try std.testing.expect(app.ipc == null);
+    try std.testing.expect(app.ipc_instance != null);
+
+    // Asked for in its terminal: a window of its own, answered on its pipe.
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .instance = pid };
+        try std.testing.expect(try testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("", cli.said());
+    }
+    try std.testing.expectEqual(1, app.windows.items.len);
+    const pa = app.windows.items[0].tab().focused orelse return error.TestUnexpectedResult;
+    var digits: [10]u8 = undefined;
+    const named = try std.fmt.bufPrint(&digits, "{d}", .{pid});
+    {
+        var env = try pa.defaultTermioEnv();
+        defer env.deinit();
+        try std.testing.expectEqualStrings(named, env.get(IpcClient.instance_env) orelse return error.TestUnexpectedResult);
+    }
+
+    // Asked for elsewhere: the first instance's.
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window };
+        try cli.start();
+        IpcServer.testAwaitPost(first_hwnd, WM_GHOSTTY_IPC) catch |err| {
+            _ = cli.finish() catch {};
+            return err;
+        };
+        var entries = first.take();
+        defer first.free(&entries);
+        try std.testing.expectEqual(1, entries.items.len);
+        try std.testing.expect(first.answer(entries.items[0].ticket, .ok, ""));
+        try std.testing.expect(try cli.finish());
+    }
+    try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(1, app.windows.items.len);
+
+    // Serving none, its terminals name none.
+    app.stopIpc();
+    try std.testing.expect(app.ipc_instance == null);
+    {
+        var env = try pa.defaultTermioEnv();
+        defer env.deinit();
+        try std.testing.expectEqual(null, env.get(IpcClient.instance_env));
+    }
 }

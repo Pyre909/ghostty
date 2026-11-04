@@ -28,6 +28,7 @@ const BellBorder = @import("BellBorder.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const IpcClient = @import("IpcClient.zig");
 const Overrides = @import("Overrides.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
@@ -1463,11 +1464,15 @@ pub const Surface = struct {
     /// The environment the child process starts from. The caller takes
     /// ownership and then mutates it (`CoreSurface.init`). A terminal made
     /// in the quick terminal has `GHOSTTY_QUICK_TERMINAL=1`, as on GTK and
-    /// macOS; `window` is set before the core starts (`create`).
+    /// macOS; `window` is set before the core starts (`create`). Each names
+    /// this instance while it serves IPC of its own, so that `ghostty
+    /// +new-tab` in it reaches this instance (`IpcClient.instance_env`).
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
         var env = try global.environMap();
         errdefer env.deinit();
         if (self.window.quick) try env.put("GHOSTTY_QUICK_TERMINAL", "1");
+        const instance: ?u32 = if (self.app.ipc_instance != null) std.os.windows.GetCurrentProcessId() else null;
+        try IpcClient.nameInstance(&env, instance);
         return env;
     }
 

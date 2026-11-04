@@ -237,6 +237,27 @@ pub fn pipeName(alloc: Allocator, base: []const u8, identity: *const Identity) N
     return wide;
 }
 
+/// The name of the pipe only the instance of process `pid` serves, beside
+/// `shared` (`pipeName`), which the session's first instance serves:
+/// `shared` with `.<pid>` after it, owned by the caller. Requests made in
+/// that instance's terminals reach it by this name
+/// (`IpcClient.instance_env`), as every plain launch is a process of its
+/// own; and only those of the class that names `shared`, as the
+/// instance's own pipe is reached by no other.
+pub fn instancePipeName(
+    alloc: Allocator,
+    shared: []const u16,
+    pid: u32,
+) error{ OutOfMemory, NameTooLong }![:0]u16 {
+    var buf: [16]u8 = undefined;
+    const suffix = std.fmt.bufPrint(&buf, ".{d}", .{pid}) catch unreachable;
+    if (shared.len + suffix.len > max_name_len) return error.NameTooLong;
+    const name = try alloc.allocSentinel(u16, shared.len + suffix.len, 0);
+    @memcpy(name[0..shared.len], shared);
+    for (name[shared.len..], suffix) |*unit, byte| unit.* = byte;
+    return name;
+}
+
 /// A request read, for the UI thread, with the ticket it answers it by.
 pub const Entry = struct {
     request: ipc.Request,
@@ -960,6 +981,29 @@ test "win32: the IPC pipe's name is the base's, the user's and the session's, an
     const longest = try pipeName(alloc, base[1..], &identity);
     defer alloc.free(longest);
     try std.testing.expectEqual(max_name_len, longest.len);
+}
+
+test "win32: an instance's own IPC pipe is the shared one's name and its process ID" {
+    const alloc = std.testing.allocator;
+    const identity = try Identity.ofProcess();
+    const shared = try pipeName(alloc, "com.example", &identity);
+    defer alloc.free(shared);
+    const own = try instancePipeName(alloc, shared, std.math.maxInt(u32));
+    defer alloc.free(own);
+    const shared_text = try std.unicode.utf16LeToUtf8Alloc(alloc, shared);
+    defer alloc.free(shared_text);
+    const expected = try std.fmt.allocPrint(alloc, "{s}.4294967295", .{shared_text});
+    defer alloc.free(expected);
+    const got = try std.unicode.utf16LeToUtf8Alloc(alloc, own);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(expected, got);
+
+    // Kept to the longest name, as the shared one is.
+    const long: [max_name_len - 2]u16 = @splat('a');
+    const longest = try instancePipeName(alloc, &long, 7);
+    defer alloc.free(longest);
+    try std.testing.expectEqual(max_name_len, longest.len);
+    try std.testing.expectError(error.NameTooLong, instancePipeName(alloc, &long, 10));
 }
 
 test "win32: the IPC pipe is the user's, who may only read, write and wait" {
