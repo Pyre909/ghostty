@@ -1134,10 +1134,13 @@ fn quickDeactivated(self: *Window, to: ?win32.HWND) void {
 /// `quick-terminal-autohide`, once the activation the quick terminal lost
 /// has settled (`quickDeactivated`): it hides unless the activation has
 /// come back to it or to a window it owns, as GTK checks that its quick
-/// terminal is still inactive.
+/// terminal is still inactive. With nothing to show it again once hidden
+/// (`App.quickAlone`), it stays: the activation going elsewhere does not
+/// ask to close it, as a toggle then does (`App.toggleQuick`).
 fn quickAutohide(self: *Window) void {
     assert(self.quick);
     if (App.inForeground(self)) return;
+    if (self.app.quickAlone()) return;
     self.hideQuick();
 }
 

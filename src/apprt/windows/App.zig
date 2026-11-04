@@ -175,6 +175,13 @@ pub const App = struct {
     /// destroyed (`windowDestroyed`), when the next makes another.
     quick: ?*Window,
 
+    /// Whether `run` is to check if the quick terminal, hidden or on its
+    /// way out, has been left with nothing to show it again
+    /// (`closeStrandedQuick`): set as another window closes, and at each
+    /// configuration change, which can take away the global keybind that
+    /// would show it.
+    quick_check: bool,
+
     /// Work the core asked for that `run` has not carried out yet, oldest
     /// first (`Request`): windows and splits, the changes to splits and
     /// the focus moves after them, and a full configuration reload.
@@ -654,6 +661,7 @@ pub const App = struct {
             .surfaces = .empty,
             .windows = .empty,
             .quick = null,
+            .quick_check = false,
             .requests = .empty,
             .search_focus = null,
             .search_hide = null,
@@ -964,6 +972,12 @@ pub const App = struct {
             // prompt may have held back, or of the configuration, which a
             // reload in `requests` may just have made.
             self.syncColorScheme();
+
+            // And the quick terminal, if a window's close or a reload has
+            // left it hidden with nothing to show it again: last, after the
+            // windows `requests` open, the click that may show it, and the
+            // reload a change of color scheme makes.
+            self.closeStrandedQuick();
         }
     }
 
@@ -2147,6 +2161,10 @@ pub const App = struct {
             if (stays and self.quit_timer != .off) self.stopQuitTimer();
             if (!stays and self.quit_timer == .off) _ = self.setQuitTimer(.start);
         }
+        // With only a hidden quick terminal open, as with none, a reload
+        // that takes the last hotkey that opens a window away leaves
+        // nothing to show it again (`closeStrandedQuick`).
+        self.quick_check = true;
         for (self.windows.items) |window| {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
@@ -2312,16 +2330,54 @@ pub const App = struct {
     /// toggle theirs; partway through its animation it turns back from
     /// where it is. The first one makes it, with no parent,
     /// as GTK makes its own, so with no other terminal's directory or font
-    /// size; so does the first after its last terminal closed.
+    /// size; so does the first after its last terminal closed. Shown with
+    /// nothing to show it again once hidden (`quickAlone`), it closes
+    /// instead, as `closeStrandedQuick` closes a hidden one.
     fn toggleQuick(self: *App) void {
         if (self.quick) |window| {
-            if (window.quickShown()) window.hideQuick() else _ = window.showQuick();
+            if (!window.quickShown()) {
+                _ = window.showQuick();
+            } else if (self.quickAlone()) {
+                window.requestClose();
+            } else window.hideQuick();
             return;
         }
         _ = self.newWindow(null, .quick) catch |err| {
             log.warn("failed to create the quick terminal err={}", .{err});
             notice(self, null, L("Ghostty could not open the quick terminal."));
         };
+    }
+
+    /// Whether nothing could show the quick terminal again once it is
+    /// hidden: it is the only window, and no global keybind's hotkey opens
+    /// one (`Hotkeys.opensWindow`). Its own keybinds act only in its
+    /// terminals, which take no keys while it is hidden, and, as with no
+    /// window at all (`setQuitTimer`), there is no tray icon and no IPC. A
+    /// toast's click shows it (`Window.present`), but only while the toast
+    /// lasts.
+    pub fn quickAlone(self: *const App) bool {
+        for (self.windows.items) |window| if (!window.quick) return false;
+        return !self.hotkeys.opensWindow(&self.config.keybind.set);
+    }
+
+    /// The quick terminal, hidden or on its way out, left with nothing to
+    /// show it again (`quickAlone`) by a window's close or a reload
+    /// (`quick_check`): closed, as the last window's close quits the app
+    /// rather than leave an invisible process (`setQuitTimer`), asking first
+    /// if a program still runs in it, which shows it
+    /// (`Window.requestClose`). Cancelled, it stays, shown. The core starts
+    /// no quit timer while it has terminals, so without this the process
+    /// would run on, endable only from Task Manager. Called by `run`, where
+    /// the question's message loop can run.
+    fn closeStrandedQuick(self: *App) void {
+        if (!self.quick_check) return;
+        // Once: a question cancelled where the quick terminal could not
+        // show is not asked again at every message.
+        self.quick_check = false;
+        if (self.quit) return;
+        const quick = self.quick orelse return;
+        if (quick.quickShown() or !self.quickAlone()) return;
+        quick.requestClose();
     }
 
     /// `.new_split`: record the request for `run`, as `requestWindow` does,
@@ -3374,6 +3430,8 @@ pub const App = struct {
         // In order: `windowBeside` goes by opening order.
         _ = self.windows.orderedRemove(idx);
         if (self.quick == window) self.quick = null;
+        // The quick terminal may be all that is left (`closeStrandedQuick`).
+        if (!window.quick) self.quick_check = true;
         // Its tabs' trees are empty already unless `terminate` gave up on
         // the frame, which then had no WM_DESTROY.
         window.deinit(self.core_app.alloc);
@@ -4297,6 +4355,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.surfaces = .empty;
     app.windows = .empty;
     app.quick = null;
+    app.quick_check = false;
     app.requests = .empty;
     app.search_focus = null;
     app.search_hide = null;
@@ -12768,6 +12827,25 @@ const TestQuick = struct {
         try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
     }
 
+    /// A normal window beside the quick terminal, as the app has one
+    /// unless a global keybind opens one: alone, with neither, a toggle
+    /// closes it rather than hide it (`App.quickAlone`).
+    fn beside(app: *App) !void {
+        _ = try testFrame(app);
+    }
+
+    /// `window`, a test's frame (`testFrame`), closed by its WM_CLOSE with
+    /// nothing to ask, and torn down. `run` would go on to
+    /// `closeStrandedQuick`, which the test calls.
+    fn closeFrame(app: *App, window: *Window) !void {
+        _ = win32.SendMessageW(window.hwnd, win32.WM_CLOSE, 0, 0);
+        var msg: win32.MSG = undefined;
+        while (win32.PeekMessageW(&msg, null, WM_GHOSTTY_DESTROY, WM_GHOSTTY_DESTROY, win32.PM_REMOVE).toBool()) {
+            _ = win32.DispatchMessageW(&msg);
+        }
+        try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, window) == null);
+    }
+
     fn occlusion(surface: *Surface, visible: bool) void {
         if (!surface.window.quick) return;
         told = surface;
@@ -13254,6 +13332,7 @@ fn testQuickScreen() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     TestMonitors.start(&app);
     defer TestMonitors.stop();
 
@@ -13331,6 +13410,7 @@ fn testQuickDpi() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     TestMonitors.start(&app);
     defer TestMonitors.stop();
     app.config.@"quick-terminal-screen" = .mouse;
@@ -13401,6 +13481,7 @@ fn testQuickReload() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     TestMonitors.start(&app);
     defer TestMonitors.stop();
 
@@ -13638,6 +13719,7 @@ fn testQuickUncover() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
 
     // Over the default 0.2 s, as macOS's.
     var changed: Config = try .default(alloc);
@@ -13709,6 +13791,7 @@ fn testQuickTurnBack() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     const e = TestQuick.eased;
 
     // Hidden halfway in: from what shows, over the whole time again, as
@@ -13764,6 +13847,7 @@ fn testQuickFade() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     var changed: Config = try .default(alloc);
     defer changed.deinit();
     changed.@"quick-terminal-position" = .center;
@@ -13814,6 +13898,7 @@ fn testQuickAtOnce() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     var changed: Config = try .default(alloc);
     defer changed.deinit();
 
@@ -13952,6 +14037,7 @@ fn testQuickPresent() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     const other = try TestQuick.foreign();
     defer _ = win32.DestroyWindow(other);
 
@@ -14021,6 +14107,7 @@ fn testQuickCloseAsks() !void {
     defer testCleanup(&app);
     TestQuick.start();
     defer TestQuick.stop();
+    try TestQuick.beside(&app);
     const message_box = &@import("dialog.zig").test_message_box;
     message_box.* = &TestQuick.ask;
     defer message_box.* = null;
@@ -14053,6 +14140,150 @@ fn testQuickCloseAsks() !void {
     try std.testing.expect(TestQuick.asked == null);
     try std.testing.expect(quick.closing);
     try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+}
+
+test "win32: a quick terminal nothing could show again closes rather than stay hidden" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickStranded, .{});
+}
+
+/// The test of a quick terminal left as the only window with no global
+/// keybind, run by its test on a desktop of its own.
+fn testQuickStranded() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestQuick.ask;
+    defer message_box.* = null;
+    defer Window.test_needs_confirm = false;
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+    const a = try testFrame(&app);
+    const b = try testFrame(&app);
+
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // A window closes with another left: it stays hidden.
+    try TestQuick.closeFrame(&app, b);
+    app.closeStrandedQuick();
+    try std.testing.expect(!quick.closing);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // The last closes, with a program running in it: as the app would
+    // have quit without it, it is asked to close, so it shows, and the
+    // question is its own; cancelled, it stays, shown.
+    try TestQuick.closeFrame(&app, a);
+    Window.test_needs_confirm = true;
+    TestQuick.asked = null;
+    TestQuick.answer = win32.IDCANCEL;
+    app.closeStrandedQuick();
+    try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
+    try std.testing.expect(TestQuick.asked_shown);
+    try std.testing.expect(!quick.closing);
+    TestQuick.settle(quick);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Shown, it is not asked, as at a reload.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"quick-terminal-autohide" = true;
+    try TestQuick.reconfigure(&app, &changed);
+    TestQuick.asked = null;
+    app.closeStrandedQuick();
+    try std.testing.expect(TestQuick.asked == null);
+
+    // Autohide leaves it: hidden, nothing could show it again, and the
+    // activation going elsewhere does not ask to close it.
+    TestQuick.deactivate(quick, other);
+    try std.testing.expect(TestQuick.autohide(quick));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(TestQuick.asked == null);
+
+    // A toggle asks to close it rather than hide it; cancelled, it stays,
+    // shown.
+    try TestQuick.begin(&app);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
+    try std.testing.expect(!quick.closing);
+    try std.testing.expect(quick.quickShown());
+
+    // With nothing running there is nothing to ask: the toggle closes it.
+    Window.test_needs_confirm = false;
+    TestQuick.asked = null;
+    try TestQuick.begin(&app);
+    try std.testing.expect(TestQuick.asked == null);
+    try std.testing.expect(quick.closing);
+}
+
+test "win32: a hidden quick terminal a global keybind can show stays until a reload takes the keybind away" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickStrandedHotkey, .{});
+}
+
+/// The test of a quick terminal left as the only window with a global
+/// keybind, run by its test on a desktop of its own.
+fn testQuickStrandedHotkey() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+    const a = try testFrame(&app);
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=toggle_quick_terminal"});
+    app.createRequested();
+
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try TestQuick.toggle(&app);
+
+    // The last other window closes: the keybind can show it again, so it
+    // stays, hidden.
+    try TestQuick.closeFrame(&app, a);
+    app.closeStrandedQuick();
+    try std.testing.expect(!quick.closing);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // The only window, it shows and hides by a toggle as ever.
+    try TestQuick.toggle(&app);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect(!quick.closing);
+
+    // A reload takes the keybind away while the app quits, as the core's
+    // `quit` can set it inside a tick of `run`: it goes with the rest, and
+    // is not closed on its own.
+    try TestHotkeys.apply(&app, &.{});
+    app.createRequested();
+    app.quit = true;
+    app.closeStrandedQuick();
+    app.quit = false;
+    try std.testing.expect(!quick.closing);
+
+    // And with the app not quitting: nothing could show it again, and,
+    // with nothing running to ask about, it closes.
+    try TestHotkeys.apply(&app, &.{});
+    app.createRequested();
+    app.closeStrandedQuick();
+    try std.testing.expect(quick.closing);
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
