@@ -22553,7 +22553,7 @@ fn testIpcCli() !void {
         var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .arguments = &arguments };
         try std.testing.expect(try testCliSend(&app, &cli));
         try std.testing.expectEqualStrings("", cli.said());
-        try IpcClient.TestSpawn.expectStarted(&arguments);
+        try IpcClient.TestSpawn.expectStarted(class, &arguments);
     }
     {
         var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .toggle_quick_terminal };

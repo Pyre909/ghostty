@@ -10,7 +10,8 @@
 //! pipe that instance serves of its own (`instance_env`), as every plain
 //! launch is a process of its own.
 //! A new window or tab that no instance can take starts Ghostty instead
-//! (`startGhostty`), as D-Bus activation starts GTK's.
+//! (`startGhostty`), for the class asked for, as D-Bus activation starts
+//! GTK's.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -122,7 +123,7 @@ pub fn performAs(
     // that is; and that instance's pipe is one any of the user's programs
     // could have made first. An elevated instance serves nothing for the
     // same reason (`App.serveIpc`), so one is started, elevated too.
-    if (identity.elevated) return unanswered(alloc, action, arguments, stderr, "an elevated process does not reach a running Ghostty");
+    if (identity.elevated) return unanswered(alloc, action, target, arguments, stderr, "an elevated process does not reach a running Ghostty");
 
     // As GTK names its bus (src/apprt/gtk/ipc/DBus.zig): by the class, else
     // by the build's own id.
@@ -164,7 +165,7 @@ pub fn performAs(
     };
     const reply = switch (exchanged) {
         .reply => |reply| reply,
-        .none => return unanswered(alloc, action, arguments, stderr, "no running Ghostty was found"),
+        .none => return unanswered(alloc, action, target, arguments, stderr, "no running Ghostty was found"),
         .foreign => return fail(stderr, command, "the pipe of its name is another account's, and was sent nothing", .{}),
         .timeout => return fail(stderr, command, "the running Ghostty did not answer in time", .{}),
         .closed => return fail(stderr, command, "the running Ghostty closed the pipe before it answered", .{}),
@@ -182,7 +183,7 @@ pub fn performAs(
         },
         // Its pipe goes with it, and so would a window or tab it opened.
         .quitting => switch (action) {
-            .new_window, .new_tab => return startGhostty(alloc, command, arguments, stderr),
+            .new_window, .new_tab => return startGhostty(alloc, command, target, arguments, stderr),
             .toggle_quick_terminal => return fail(stderr, command, "{f}", .{Safe{ .text = reply.text }}),
         },
         .unsupported, .bad_request, .bad_arguments, .failed => {
@@ -221,29 +222,48 @@ fn say(stderr: *std.Io.Writer, comptime format: []const u8, args: anytype) void 
 fn unanswered(
     alloc: Allocator,
     comptime action: apprt.ipc.Action.Key,
+    target: apprt.ipc.Target,
     arguments: ?[]const [:0]const u8,
     stderr: *std.Io.Writer,
     comptime reason: []const u8,
 ) Error!bool {
     const command = comptime commandName(action);
     return switch (action) {
-        .new_window, .new_tab => startGhostty(alloc, command, arguments, stderr),
+        .new_window, .new_tab => startGhostty(alloc, command, target, arguments, stderr),
         .toggle_quick_terminal => fail(stderr, command, reason, .{}),
     };
 }
 
 /// Start Ghostty, this process's own image, with `arguments` as its
 /// command line, and not wait for it: true once it is started, its own
-/// window saying what it makes of them.
+/// window saying what it makes of them. A class asked for comes first, as
+/// `--class`, before an `-e` that makes the rest the command's: the
+/// started Ghostty then serves the pipe that the next request for that
+/// class reaches, where one started without it would serve its config's,
+/// and each such request would start another. D-Bus activation starts
+/// only a name that a service file gives, the build's own, so GTK's
+/// request for any other class fails instead. Without one, the started
+/// Ghostty's config names its class.
 fn startGhostty(
     alloc: Allocator,
     comptime command: []const u8,
+    target: apprt.ipc.Target,
     arguments: ?[]const [:0]const u8,
     stderr: *std.Io.Writer,
 ) Error!bool {
     const image = try imagePath(alloc);
     defer alloc.free(image);
-    const line = commandLine(alloc, image, arguments orelse &.{}) catch |err| switch (err) {
+    const given = arguments orelse &.{};
+    const class_argument: ?[:0]u8 = switch (target) {
+        .class => |class| try alloc.printSentinel("--class={s}", .{class}, 0),
+        .detect => null,
+    };
+    defer if (class_argument) |argument| alloc.free(argument);
+    const words = try alloc.alloc([:0]const u8, @intFromBool(class_argument != null) + given.len);
+    defer alloc.free(words);
+    if (class_argument) |argument| words[0] = argument;
+    @memcpy(words[words.len - given.len ..], given);
+    const line = commandLine(alloc, image, words) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidUtf8 => return fail(stderr, command, "an argument is not valid Unicode", .{}),
     };
@@ -753,8 +773,9 @@ test "win32: an IPC client with no instance to reach starts Ghostty for a window
     );
     try std.testing.expectEqualStrings("+toggle-quick-terminal failed: no running Ghostty was found\n", out.written());
 
-    // Started with the arguments as given, and without the launcher's
-    // process ID, which this process has when ghostty.com runs it.
+    // Started for the class asked for, with the arguments as given, and
+    // without the launcher's process ID, which this process has when
+    // ghostty.com runs it.
     TestSpawn.start();
     defer TestSpawn.stop();
     try std.testing.expect(win32.SetEnvironmentVariableW(launcher_env, std.unicode.utf8ToUtf16LeStringLiteral("1")).toBool());
@@ -763,7 +784,7 @@ test "win32: an IPC client with no instance to reach starts Ghostty for a window
     var arguments = [_][:0]const u8{ "--working-directory=C:\\a b\\", "-e", "cmd.exe", "/k", "echo \"hi\"" };
     try std.testing.expect(try performAs(alloc, &identity, null, .{ .class = class }, .new_tab, .{ .surface_id = 0x11, .arguments = &arguments }, &out.writer));
     try std.testing.expectEqualStrings("", out.written());
-    try TestSpawn.expectStarted(&arguments);
+    try TestSpawn.expectStarted(class, &arguments);
 
     // One that cannot be started fails, saying so.
     TestSpawn.fails = .FILE_NOT_FOUND;
@@ -1084,7 +1105,7 @@ test "win32: an IPC client says what the instance did not do, its text made safe
         try std.testing.expectEqual(case.result, cli.finish());
         try std.testing.expectEqualStrings(case.said, cli.said());
         if (case.started) {
-            try TestSpawn.expectStarted(&arguments);
+            try TestSpawn.expectStarted(t.class, &arguments);
         } else {
             try std.testing.expectEqual(null, TestSpawn.len);
         }
@@ -1166,18 +1187,20 @@ pub const TestSpawn = struct {
         return fails;
     }
 
-    /// That Ghostty was started, from an image, with `arguments`, and no
-    /// launcher's process ID; and forget it.
-    pub fn expectStarted(arguments: []const [:0]const u8) !void {
+    /// That Ghostty was started, from an image, for `class` if not null,
+    /// then with `arguments`, and no launcher's process ID; and forget it.
+    pub fn expectStarted(class: ?[]const u8, arguments: []const [:0]const u8) !void {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const started = len orelse return error.TestUnexpectedResult;
         len = null;
         const got = try testSplit(arena.allocator(), line[0..started]);
         try std.testing.expect(launcher_gone);
-        try std.testing.expectEqual(arguments.len + 1, got.len);
+        const first: usize = if (class != null) 2 else 1;
+        try std.testing.expectEqual(arguments.len + first, got.len);
         try std.testing.expect(std.ascii.endsWithIgnoreCase(got[0], ".exe"));
-        for (arguments, got[1..]) |want, have| try std.testing.expectEqualStrings(want, have);
+        if (class) |c| try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena.allocator(), "--class={s}", .{c}), got[1]);
+        for (arguments, got[first..]) |want, have| try std.testing.expectEqualStrings(want, have);
     }
 };
 
@@ -1252,7 +1275,12 @@ test "win32: an elevated IPC client starts a Ghostty of its own, and sends nothi
     var arguments = [_][:0]const u8{"--title=a"};
     try std.testing.expect(try performAs(alloc, &identity, null, .{ .class = t.class }, .new_tab, .{ .surface_id = 0, .arguments = &arguments }, &out.writer));
     try std.testing.expectEqualStrings("", out.written());
-    try TestSpawn.expectStarted(&arguments);
+    try TestSpawn.expectStarted(t.class, &arguments);
+    // With no class asked for, none is given: the started Ghostty's
+    // config names it.
+    try std.testing.expect(try performAs(alloc, &identity, null, .detect, .new_window, .{ .arguments = &arguments }, &out.writer));
+    try std.testing.expectEqualStrings("", out.written());
+    try TestSpawn.expectStarted(null, &arguments);
 
     out.clearRetainingCapacity();
     try std.testing.expectError(
