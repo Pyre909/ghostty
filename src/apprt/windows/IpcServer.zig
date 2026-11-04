@@ -522,21 +522,10 @@ fn converse(self: *IpcServer) void {
         },
     };
 
-    self.last_ticket += 1;
-    const ticket = self.last_ticket;
-    const queued = queued: {
-        self.mutex.lockUncancelable(global.io());
-        defer self.mutex.unlock(global.io());
-        self.inbox.append(self.alloc, .{ .request = request, .ticket = ticket }) catch break :queued false;
-        self.waiting = ticket;
-        self.reply_len = 0;
-        _ = win32.ResetEvent(self.answered);
-        break :queued true;
-    };
-    if (!queued) {
+    const ticket = self.enqueue(request) orelse {
         request.deinit(self.alloc);
         return self.send(.failed, "out of memory");
-    }
+    };
 
     const posted = !(builtin.is_test and test_post_fails) and
         win32.PostMessageW(self.hwnd, self.message, 0, 0).toBool();
@@ -566,16 +555,32 @@ fn converse(self: *IpcServer) void {
     self.write(reply[0..len]);
 }
 
+/// Queue `request` for the UI thread as the one its client waits on the
+/// answer to: its ticket, or null when memory runs out, the request then
+/// left to the caller.
+fn enqueue(self: *IpcServer, request: ipc.Request) ?u64 {
+    self.last_ticket += 1;
+    const ticket = self.last_ticket;
+    self.mutex.lockUncancelable(global.io());
+    defer self.mutex.unlock(global.io());
+    self.inbox.append(self.alloc, .{ .request = request, .ticket = ticket }) catch return null;
+    self.waiting = ticket;
+    self.reply_len = 0;
+    _ = win32.ResetEvent(self.answered);
+    return ticket;
+}
+
 /// Take back the request of `ticket` if the UI thread has not taken it:
-/// whether it had not.
+/// whether it had not. One it took is still answered by it, as it
+/// answers every request it takes.
 fn withdraw(self: *IpcServer, ticket: u64) bool {
     self.mutex.lockUncancelable(global.io());
     defer self.mutex.unlock(global.io());
-    self.waiting = 0;
     for (self.inbox.items, 0..) |entry, i| {
         if (entry.ticket != ticket) continue;
         entry.request.deinit(self.alloc);
         _ = self.inbox.orderedRemove(i);
+        self.waiting = 0;
         return true;
     }
     return false;
@@ -1345,6 +1350,33 @@ test "win32: an IPC request the UI thread cannot be told of is answered failed, 
     var entries = t.server.take();
     defer t.server.free(&entries);
     try std.testing.expectEqual(0, entries.items.len);
+}
+
+test "win32: an IPC request the UI thread took before its post failed is still answered by it" {
+    const alloc = std.testing.allocator;
+    var t: TestServer = try .init(alloc, .{});
+    defer t.deinit(alloc);
+    const bytes = try testRequest(alloc, .new_window, 0, &.{"--title=a"});
+    defer alloc.free(bytes);
+
+    // Taken back before the UI thread takes it: no answer reaches its
+    // client, which was told it failed.
+    const first = t.server.enqueue(try ipc.decodeRequest(alloc, bytes)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(t.server.withdraw(first));
+    try std.testing.expect(!t.server.answer(first, .ok, ""));
+    var none = t.server.take();
+    defer t.server.free(&none);
+    try std.testing.expectEqual(0, none.items.len);
+
+    // Taken first, from an earlier request's post: its post failed, the
+    // server finds nothing to take back, and the UI thread's answer still
+    // reaches its client.
+    const second = t.server.enqueue(try ipc.decodeRequest(alloc, bytes)) orelse return error.TestUnexpectedResult;
+    var entries = t.server.take();
+    defer t.server.free(&entries);
+    try std.testing.expectEqual(1, entries.items.len);
+    try std.testing.expect(!t.server.withdraw(second));
+    try std.testing.expect(t.server.answer(second, .bad_arguments, "refused"));
 }
 
 test "win32: an IPC request memory runs out for is answered failed, and the next served" {
