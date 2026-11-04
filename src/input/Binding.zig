@@ -859,7 +859,12 @@ pub const Action = union(enum) {
     ///   - On Windows, the quick terminal stays above every window that is
     ///     not always on top while it is shown, and has no taskbar button.
     ///     It cannot be maximized, fullscreened, resized or given a title
-    ///     bar.
+    ///     bar. Its state is kept between appearances only while something
+    ///     could show it again: another window, or a global keybind. When
+    ///     it is the only window and no global keybind shows it, a toggle
+    ///     asks to close it rather than hide it, and a hidden one closes
+    ///     when the last other window closes or a reload takes the last
+    ///     such keybind away, asking first if a program still runs in it.
     ///
     ///   - On macOS, a fullscreened quick terminal will always be in non-native
     ///     fullscreen mode. This is a requirement due to how the quick terminal

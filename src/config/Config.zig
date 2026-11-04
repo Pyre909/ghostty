@@ -2882,7 +2882,8 @@ keybind: Keybinds = .{},
 /// accessible than on macOS, meaning that it is more preferable to keep the
 /// quick terminal open until the user has completed their task.
 /// This default may change in the future. On Windows, it defaults to false,
-/// as on Linux.
+/// as on Linux, and the quick terminal does not hide on its own while it is
+/// the only window and no global keybind can show it again.
 @"quick-terminal-autohide": bool = switch (builtin.target.os.tag) {
     .linux => false,
     .macos => true,

@@ -2695,10 +2695,11 @@ pub const App = struct {
     /// Whether nothing could show the quick terminal again once it is
     /// hidden: it is the only window, and no global keybind's hotkey opens
     /// one (`Hotkeys.opensWindow`). Its own keybinds act only in its
-    /// terminals, which take no keys while it is hidden, and, as with no
-    /// window at all (`setQuitTimer`), there is no tray icon and no IPC. A
-    /// toast's click shows it (`Window.present`), but only while the toast
-    /// lasts.
+    /// terminals, which take no keys while it is hidden, and there is no
+    /// tray icon. IPC could show it (`ghostty +toggle-quick-terminal`), but
+    /// is no reason to keep it, as it is none to keep running with no
+    /// window (`setQuitTimer`): nothing would show that it runs. A toast's
+    /// click shows it (`Window.present`), but only while the toast lasts.
     pub fn quickAlone(self: *const App) bool {
         for (self.windows.items) |window| if (!window.quick) return false;
         return !self.hotkeys.opensWindow(&self.config.keybind.set);
