@@ -1086,12 +1086,13 @@ pub const App = struct {
 
     /// The window a prompt with no window of its own belongs to
     /// (`promptOwner`): the one the user was last in, else the first one,
-    /// but not the quick terminal while it is hidden, which would take the
-    /// activation back when the box closes, out of sight.
+    /// but not the quick terminal while it is hidden or on its way out
+    /// (`Window.quickShown`), which would take the activation back when the
+    /// box closes, out of sight.
     fn fallbackOwner(self: *const App) ?*Window {
         const shows = struct {
             fn f(window: *const Window) bool {
-                return !window.quick or win32.IsWindowVisible(window.hwnd).toBool();
+                return !window.quick or window.quickShown();
             }
         }.f;
         if (self.core_app.focusedSurface()) |s| {
@@ -2306,13 +2307,15 @@ pub const App = struct {
     }
 
     /// `toggle_quick_terminal`, carried out (`createRequested`): show the
-    /// quick terminal, or hide it if it shows, wherever the focus is, as
-    /// GTK and macOS toggle theirs. The first one makes it, with no parent,
+    /// quick terminal, or hide it if it shows or is coming in
+    /// (`Window.quickShown`), wherever the focus is, as GTK and macOS
+    /// toggle theirs; partway through its animation it turns back from
+    /// where it is. The first one makes it, with no parent,
     /// as GTK makes its own, so with no other terminal's directory or font
     /// size; so does the first after its last terminal closed.
     fn toggleQuick(self: *App) void {
         if (self.quick) |window| {
-            if (win32.IsWindowVisible(window.hwnd).toBool()) window.hideQuick() else window.showQuick();
+            if (window.quickShown()) window.hideQuick() else window.showQuick();
             return;
         }
         _ = self.newWindow(null, .quick) catch |err| {
@@ -4337,6 +4340,7 @@ fn testFrame(app: *App) !*Window {
         .decoration = null,
         .quick = false,
         .quick_return = null,
+        .quick_animation = null,
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
@@ -12610,7 +12614,8 @@ fn testFloatWindow() !void {
 /// does with it: the window `Window.present` brings forward
 /// (`Window.test_foreground`), and what a quick terminal's terminal was
 /// last told of whether it shows (`Surface.test_occlusion`); not another
-/// window's, which a reloaded configuration lays out too.
+/// window's, which a reloaded configuration lays out too. Its animation's
+/// clock (`Window.test_quick_now`) stands still but for `tick`.
 const TestQuick = struct {
     var fail: bool = false;
     var area: ?win32.RECT = null;
@@ -12634,6 +12639,9 @@ const TestQuick = struct {
         Window.test_foreground = &foreground;
         Surface.test_occlusion = &occlusion;
         App.test_get_foreground = &foregroundNow;
+        Window.test_quick_now = 0;
+        Window.test_quick_timer_fails = false;
+        Window.test_quick_rgn = null;
     }
 
     fn stop() void {
@@ -12641,6 +12649,57 @@ const TestQuick = struct {
         Window.test_foreground = null;
         Surface.test_occlusion = null;
         App.test_get_foreground = null;
+        Window.test_quick_now = null;
+        Window.test_quick_timer_fails = false;
+        Window.test_quick_rgn = null;
+    }
+
+    /// The clock moved on by `ns` and the quick terminal's animation timer
+    /// fired (WM_TIMER).
+    fn tick(quick: *const Window, ns: u64) void {
+        Window.test_quick_now = Window.test_quick_now.? + ns;
+        _ = win32.SendMessageW(quick.hwnd, win32.WM_TIMER, Window.quick_timer_id, 0);
+    }
+
+    /// The quick terminal's animation, if one runs, carried to its end: an
+    /// hour on, longer than any test's.
+    fn settle(quick: *const Window) void {
+        tick(quick, std.time.ns_per_hour);
+    }
+
+    /// The part of `quick` its window region lets show, in its window's
+    /// coordinates, all zero if none; null with no region, all of it.
+    fn region(quick: *const Window) !?win32.RECT {
+        const rgn = win32.CreateRectRgn(0, 0, 0, 0) orelse return error.TestUnexpectedResult;
+        defer _ = win32.DeleteObject(rgn);
+        if (win32.GetWindowRgn(quick.hwnd, rgn) == win32.RGN_ERROR) return null;
+        var box: win32.RECT = undefined;
+        if (win32.GetRgnBox(rgn, &box) == win32.RGN_ERROR) return error.TestUnexpectedResult;
+        return box;
+    }
+
+    /// `quick`'s alpha as a layered window, null if it is not one.
+    fn alpha(quick: *const Window) !?u8 {
+        if (!hasStyle(quick.hwnd, win32.GWL_EXSTYLE, win32.WS_EX_LAYERED)) return null;
+        var value: u8 = 0;
+        var flags: win32.DWORD = 0;
+        if (!win32.GetLayeredWindowAttributes(quick.hwnd, null, &value, &flags).toBool()) return error.TestUnexpectedResult;
+        try std.testing.expectEqual(win32.LWA_ALPHA, flags);
+        return value;
+    }
+
+    /// `app`'s configuration reloaded as `changed`, as a reload performs
+    /// it, then as `run` carries it out.
+    fn reconfigure(app: *App, changed: *const Config) !void {
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = changed }));
+        app.createRequested();
+    }
+
+    /// In place of CreateRectRgn (`Window.test_quick_rgn`): no region, as
+    /// when GDI has run out of them.
+    fn noRgn(left: i32, top: i32, right: i32, bottom: i32) ?win32.HRGN {
+        _ = .{ left, top, right, bottom };
+        return null;
     }
 
     fn foregroundNow() ?win32.HWND {
@@ -12684,8 +12743,16 @@ const TestQuick = struct {
     }
 
     /// Whether `quick` posted itself the message that hides it as it lost
-    /// the activation; carried out if it did.
+    /// the activation; carried out if it did, and the animation it starts
+    /// carried to its end (`settle`).
     fn autohide(quick: *const Window) bool {
+        if (!posted(quick)) return false;
+        settle(quick);
+        return true;
+    }
+
+    /// `autohide`, with the animation left to run.
+    fn posted(quick: *const Window) bool {
         var msg: win32.MSG = undefined;
         if (!win32.PeekMessageW(&msg, quick.hwnd, WM_GHOSTTY_QUICK_HIDE, WM_GHOSTTY_QUICK_HIDE, win32.PM_REMOVE).toBool()) return false;
         _ = win32.DispatchMessageW(&msg);
@@ -12708,8 +12775,15 @@ const TestQuick = struct {
     }
 
     /// `toggle_quick_terminal`, as a binding performs it, then as `run`
-    /// carries it out.
+    /// carries it out, and the animation it starts carried to its end
+    /// (`settle`).
     fn toggle(app: *App) !void {
+        try begin(app);
+        if (app.quick) |quick| settle(quick);
+    }
+
+    /// `toggle`, with the animation left to run.
+    fn begin(app: *App) !void {
         try std.testing.expect(try app.performAction(.app, .toggle_quick_terminal, {}));
         try std.testing.expectEqual(1, app.requests.items.len);
         app.createRequested();
@@ -12736,6 +12810,44 @@ const TestQuick = struct {
     fn hasStyle(hwnd: win32.HWND, which: c_int, bits: win32.DWORD) bool {
         const want: isize = bits;
         return win32.GetWindowLongPtrW(hwnd, which) & want == want;
+    }
+
+    /// Half of the animation's default 0.2 s, and the share of the way it
+    /// has gone by then: CSS's ease-in, cubic-bezier(0.42, 0, 1, 1), at
+    /// 0.5, solved apart from `Window.easeIn`, by halving in Python to
+    /// double precision.
+    const half = std.time.ns_per_s / 10;
+    const eased = 0.31535681257253945;
+
+    /// What of a `width` x `height` quick terminal at `position` shows when
+    /// `share` of it does, in its window's coordinates: a band along that
+    /// edge, as deep as the share of it rounded up to a whole pixel.
+    fn band(position: Config.QuickTerminalPosition, width: i32, height: i32, share: f64) win32.RECT {
+        const deep = struct {
+            fn f(size: i32, s: f64) i32 {
+                return @intFromFloat(@ceil(@as(f64, @floatFromInt(size)) * s));
+            }
+        }.f;
+        return switch (position) {
+            .top => .{ .left = 0, .top = 0, .right = width, .bottom = deep(height, share) },
+            .bottom => .{ .left = 0, .top = height - deep(height, share), .right = width, .bottom = height },
+            .left => .{ .left = 0, .top = 0, .right = deep(width, share), .bottom = height },
+            .right => .{ .left = width - deep(width, share), .top = 0, .right = width, .bottom = height },
+            .center => unreachable,
+        };
+    }
+
+    /// The quick terminal shown whole by a toggle and hidden by the next,
+    /// each at once, with no step of an animation.
+    fn atOnce(app: *App) !void {
+        try begin(app);
+        const quick = app.quick orelse return error.TestUnexpectedResult;
+        try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expect((try region(quick)) == null);
+        try std.testing.expect((try alpha(quick)) == null);
+        try begin(app);
+        try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expect((try region(quick)) == null);
     }
 };
 
@@ -13492,6 +13604,320 @@ fn testQuickAutohide() !void {
     TestQuick.in_front = owned;
     try std.testing.expect(TestQuick.autohide(quick));
     try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+}
+
+test "win32: the quick terminal is uncovered from its edge as it shows, and covered back as it hides" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickUncover, .{});
+}
+
+/// The test of the quick terminal's animation at its edges, run by its
+/// test on a desktop of its own.
+fn testQuickUncover() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+
+    // Over the default 0.2 s, as macOS's.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    try std.testing.expectEqual(0.2, changed.@"quick-terminal-animation-duration");
+    for ([_]Config.QuickTerminalPosition{ .top, .bottom, .left, .right }) |position| {
+        changed.@"quick-terminal-position" = position;
+        try TestQuick.reconfigure(&app, &changed);
+
+        // Shown at its place at once, the first one as it is made, with
+        // none of it let through yet.
+        try TestQuick.begin(&app);
+        const quick = app.quick orelse return error.TestUnexpectedResult;
+        const place = try windowRect(quick.hwnd);
+        try std.testing.expectEqual(try TestQuick.place(&app, quick), place);
+        const width = place.right - place.left;
+        const height = place.bottom - place.top;
+        try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expectEqual(std.mem.zeroes(win32.RECT), (try TestQuick.region(quick)).?);
+
+        // Halfway through its time, eased: a band along its edge, with the
+        // window still at its place.
+        TestQuick.tick(quick, TestQuick.half);
+        try std.testing.expectEqual(TestQuick.band(position, width, height, TestQuick.eased), (try TestQuick.region(quick)).?);
+        try std.testing.expectEqual(place, try windowRect(quick.hwnd));
+        // At its end, whole: no region left, and not faded.
+        TestQuick.tick(quick, TestQuick.half);
+        try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expect((try TestQuick.region(quick)) == null);
+        try std.testing.expect((try TestQuick.alpha(quick)) == null);
+        // A step still in the queue after that changes nothing.
+        TestQuick.tick(quick, TestQuick.half);
+        try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expect((try TestQuick.region(quick)) == null);
+
+        // Covered back the same way as it hides, from all of it, and on
+        // screen, its terminal not told otherwise, until the end.
+        try TestQuick.begin(&app);
+        try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expectEqual(TestQuick.band(position, width, height, 1), (try TestQuick.region(quick)).?);
+        TestQuick.tick(quick, TestQuick.half);
+        try std.testing.expectEqual(TestQuick.band(position, width, height, 1 - TestQuick.eased), (try TestQuick.region(quick)).?);
+        try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expect(TestQuick.shows);
+        TestQuick.tick(quick, TestQuick.half);
+        try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+        try std.testing.expect(!TestQuick.shows);
+        try std.testing.expect((try TestQuick.region(quick)) == null);
+        TestQuick.tick(quick, TestQuick.half);
+        try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    }
+}
+
+test "win32: a toggle partway through the quick terminal's animation turns it back from where it is" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickTurnBack, .{});
+}
+
+/// The test of the quick terminal's animation turned back, run by its test
+/// on a desktop of its own.
+fn testQuickTurnBack() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const e = TestQuick.eased;
+
+    // Hidden halfway in: from what shows, over the whole time again, as
+    // macOS's animator turns back.
+    try TestQuick.begin(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    const place = try windowRect(quick.hwnd);
+    const width = place.right - place.left;
+    const height = place.bottom - place.top;
+    TestQuick.tick(quick, TestQuick.half);
+    try TestQuick.begin(&app);
+    try std.testing.expectEqual(TestQuick.band(.top, width, height, e), (try TestQuick.region(quick)).?);
+    TestQuick.tick(quick, TestQuick.half);
+    const back = e - e * e;
+    try std.testing.expectEqual(TestQuick.band(.top, width, height, back), (try TestQuick.region(quick)).?);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Shown again before it is gone: in from there, and whole at the end.
+    try TestQuick.begin(&app);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expectEqual(TestQuick.band(.top, width, height, back + (1 - back) * e), (try TestQuick.region(quick)).?);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+
+    // Out from whole and back in halfway, the same.
+    try TestQuick.begin(&app);
+    TestQuick.tick(quick, TestQuick.half);
+    try TestQuick.begin(&app);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expectEqual(TestQuick.band(.top, width, height, (1 - e) + e * e), (try TestQuick.region(quick)).?);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+    try std.testing.expect(TestQuick.shows);
+}
+
+test "win32: a centered quick terminal fades in and out" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickFade, .{});
+}
+
+/// The test of the centered quick terminal's fade, run by its test on a
+/// desktop of its own.
+fn testQuickFade() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"quick-terminal-position" = .center;
+    try TestQuick.reconfigure(&app, &changed);
+
+    // In by its alpha as a layered window, from none of it, with no
+    // region: it has no edge to come from.
+    try TestQuick.begin(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(0, (try TestQuick.alpha(quick)).?);
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+    // 255 of it eased halfway is 80.4.
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expectEqual(80, (try TestQuick.alpha(quick)).?);
+    // Opaque at the end: no longer layered.
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.alpha(quick)) == null);
+
+    // Out from all of it, 174.6 halfway; hidden at the end, and not
+    // layered for the next show.
+    try TestQuick.begin(&app);
+    try std.testing.expectEqual(255, (try TestQuick.alpha(quick)).?);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expectEqual(175, (try TestQuick.alpha(quick)).?);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.alpha(quick)) == null);
+}
+
+test "win32: with no duration, or no way to animate, the quick terminal shows and hides at once" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickAtOnce, .{});
+}
+
+/// The test of the quick terminal with no animation, run by its test on a
+/// desktop of its own.
+fn testQuickAtOnce() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+
+    // With 0, as the option says, or anything that is not a finite time
+    // above 0, which its parser lets through.
+    for ([_]f64{ 0, std.math.nan(f64), std.math.inf(f64), -1 }) |duration| {
+        changed.@"quick-terminal-animation-duration" = duration;
+        try TestQuick.reconfigure(&app, &changed);
+        try TestQuick.atOnce(&app);
+    }
+    changed.@"quick-terminal-animation-duration" = 0.2;
+    try TestQuick.reconfigure(&app, &changed);
+
+    // With no timer to step it, or no region to start it from.
+    Window.test_quick_timer_fails = true;
+    try TestQuick.atOnce(&app);
+    Window.test_quick_timer_fails = false;
+    Window.test_quick_rgn = &TestQuick.noRgn;
+    try TestQuick.atOnce(&app);
+
+    // With no region for a step partway: whole from there as it shows,
+    // and gone as it hides.
+    Window.test_quick_rgn = null;
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try TestQuick.begin(&app);
+    Window.test_quick_rgn = &TestQuick.noRgn;
+    TestQuick.tick(quick, TestQuick.half);
+    Window.test_quick_rgn = null;
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+    try TestQuick.begin(&app);
+    Window.test_quick_rgn = &TestQuick.noRgn;
+    TestQuick.tick(quick, TestQuick.half);
+    Window.test_quick_rgn = null;
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+}
+
+test "win32: the quick terminal on its way out is hidden no further, and owns no prompt" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickOnItsWayOut, .{});
+}
+
+/// The test of the quick terminal as it hides, run by its test on a
+/// desktop of its own.
+fn testQuickOnItsWayOut() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    core_app.focused_surface = null;
+    TestQuick.start();
+    defer TestQuick.stop();
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"quick-terminal-autohide" = true;
+    try TestQuick.reconfigure(&app, &changed);
+
+    // Made before another window, so the first of them.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    const a = try testFrame(&app);
+    try std.testing.expectEqualSlices(*Window, &.{ quick, a }, app.windows.items);
+
+    // A prompt with no window of its own is its while it shows, and the
+    // other window's once it is on its way out, which would take the
+    // activation back from the box out of sight.
+    try std.testing.expectEqual(quick.hwnd, app.promptOwner(null).?);
+    try TestQuick.begin(&app);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(a.hwnd, app.promptOwner(null).?);
+
+    // Its activation lost then, it has nothing more to hide: nothing is
+    // posted.
+    TestQuick.deactivate(quick, other);
+    try std.testing.expect(!TestQuick.posted(quick));
+    TestQuick.settle(quick);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // An autohide posted while it showed, that comes once a toggle has
+    // started to hide it, leaves that hide to end in its time.
+    try TestQuick.toggle(&app);
+    TestQuick.deactivate(quick, other);
+    try TestQuick.begin(&app);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(TestQuick.posted(quick));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+}
+
+test "win32: the quick terminal's animation eases in as macOS's does" {
+    // CSS's ease-in, cubic-bezier(0.42, 0, 1, 1), solved apart from it, by
+    // halving in Python to double precision.
+    try std.testing.expectEqual(0, Window.easeIn(0));
+    try std.testing.expectEqual(1, Window.easeIn(1));
+    try std.testing.expectApproxEqAbs(0.09346465071882484, Window.easeIn(0.25), 1e-12);
+    try std.testing.expectApproxEqAbs(0.31535681257253945, Window.easeIn(0.5), 1e-12);
+    try std.testing.expectApproxEqAbs(0.62186186917489, Window.easeIn(0.75), 1e-12);
+    // Rising all the way, and held at its ends outside them and for NaN.
+    var last: f64 = 0;
+    for (1..101) |i| {
+        const y = Window.easeIn(@as(f64, @floatFromInt(i)) / 100);
+        try std.testing.expect(y > last);
+        last = y;
+    }
+    try std.testing.expectEqual(0, Window.easeIn(-0.5));
+    try std.testing.expectEqual(0, Window.easeIn(std.math.nan(f64)));
+    try std.testing.expectEqual(1, Window.easeIn(2));
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,

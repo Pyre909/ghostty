@@ -142,6 +142,10 @@ quick: bool,
 /// windows takes the activation from it (`quickDeactivated`).
 quick_return: ?win32.HWND,
 
+/// For the quick terminal: its show or hide animation while one runs
+/// (`QuickAnimation`), else null.
+quick_animation: ?QuickAnimation,
+
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
 
@@ -851,6 +855,7 @@ pub fn createBare(app: *App, kind: Kind) !*Window {
         .decoration = null,
         .quick = kind == .quick,
         .quick_return = null,
+        .quick_animation = null,
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
@@ -1000,16 +1005,22 @@ pub fn show(self: *Window) void {
 /// terminals are told they show (`relayout`): a hidden frame's children
 /// are told nothing (`hideQuick`). Shown where it was if its monitor
 /// cannot be read. The window in the foreground first is remembered
-/// (`quick_return`).
+/// (`quick_return`). It comes in by its animation (`QuickAnimation`), from
+/// none of it, or from what a hide still running left of it.
 pub fn showQuick(self: *Window) void {
     assert(self.quick);
     self.quick_return = if (App.foregroundWindow()) |front|
         (if (ofApp(self.app, front)) null else front)
     else
         null;
+    // Before it shows, so that it does not show whole first.
+    if (!self.animateQuick(true)) self.stopQuickAnimation();
     const flags = win32.SWP_SHOWWINDOW | win32.SWP_NOACTIVATE;
     if (quickWork(self.app, .pointer)) |work| {
-        if (!self.placeQuick(work, win32.HWND_TOPMOST, flags)) return;
+        if (!self.placeQuick(work, win32.HWND_TOPMOST, flags)) {
+            self.stopQuickAnimation();
+            return;
+        }
     } else if (!win32.SetWindowPos(
         self.hwnd,
         win32.HWND_TOPMOST,
@@ -1020,6 +1031,7 @@ pub fn showQuick(self: *Window) void {
         flags | win32.SWP_NOMOVE | win32.SWP_NOSIZE,
     ).toBool()) {
         log.warn("unable to show the quick terminal err={}", .{win32.GetLastError()});
+        self.stopQuickAnimation();
         return;
     }
     // Laid out here too: WM_SIZE comes only if the size changed.
@@ -1041,20 +1053,43 @@ pub fn showQuick(self: *Window) void {
 /// before it hides, as macOS gives it back, if that window still shows
 /// and is not minimized. Autohide hides it only once the activation has
 /// gone elsewhere, so gives nothing back: the user chose where it went.
-/// The shown tab's terminals are told they no longer show, as a minimized
-/// frame's are (WM_SIZE); the other tabs' were told when they were hidden
-/// (`hideTab`).
+/// It goes by its animation (`QuickAnimation`), from all of it or from
+/// what a show still running has shown, as macOS gives the foreground
+/// back before its own; then it hides (`quickHidden`). Nothing if it is
+/// hidden or already hiding, as a posted autohide can find it once a
+/// toggle has started hiding it (`quickAutohide`).
 pub fn hideQuick(self: *Window) void {
     assert(self.quick);
+    if (!self.quickShown()) return;
     // Asked before its prompt closes and the activation moves.
     const front = App.inForeground(self);
     CommandPalette.close(self);
     TitleDialog.close(self);
     if (front) if (self.quick_return) |hwnd| giveBack(hwnd);
+    if (self.animateQuick(false)) return;
+    self.quickHidden();
+    self.stopQuickAnimation();
+}
+
+/// The quick terminal, at the end of a hide (`hideQuick`, `quickStep`):
+/// off screen, with its shown tab's terminals told they no longer show, as
+/// a minimized frame's are (WM_SIZE); the other tabs' were told when they
+/// were hidden (`hideTab`).
+fn quickHidden(self: *Window) void {
     // The BOOL is the previous visibility, not success.
     _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
     var it = self.tab().tree.iterator();
     while (it.next()) |entry| entry.view.occlusionChanged(false);
+}
+
+/// Whether the quick terminal shows, or is coming in: it is visible and
+/// not on its way out (`QuickAnimation`). What a toggle hides
+/// (`App.toggleQuick`).
+pub fn quickShown(self: *const Window) bool {
+    assert(self.quick);
+    if (!win32.IsWindowVisible(self.hwnd).toBool()) return false;
+    const animation = self.quick_animation orelse return true;
+    return animation.showing;
 }
 
 /// Give the foreground to `hwnd`, the window the quick terminal came from
@@ -1076,8 +1111,8 @@ fn giveBack(hwnd: win32.HWND) void {
 /// it then hides, as GTK and macOS hide theirs, by a message to itself
 /// (`quickAutohide`) once this activation change is over: the activation
 /// can come straight back, and its command palette is not destroyed
-/// inside the change (`CommandPalette.deactivated`). Hidden, it has
-/// nothing to hide, and posts nothing.
+/// inside the change (`CommandPalette.deactivated`). Hidden, or on its
+/// way out (`quickShown`), it has nothing to hide, and posts nothing.
 fn quickDeactivated(self: *Window, to: ?win32.HWND) void {
     assert(self.quick);
     if (to) |hwnd| {
@@ -1085,7 +1120,7 @@ fn quickDeactivated(self: *Window, to: ?win32.HWND) void {
         if (ofApp(self.app, hwnd)) self.quick_return = null;
     }
     if (!self.app.config.@"quick-terminal-autohide") return;
-    if (!win32.IsWindowVisible(self.hwnd).toBool()) return;
+    if (!self.quickShown()) return;
     if (!win32.PostMessageW(self.hwnd, WM_GHOSTTY_QUICK_HIDE, 0, 0).toBool()) {
         log.warn("unable to hide the quick terminal as it loses the activation err={}", .{win32.GetLastError()});
     }
@@ -1107,6 +1142,234 @@ fn ofApp(app: *const App, hwnd: win32.HWND) bool {
     const root = win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) orelse return false;
     for (app.windows.items) |window| if (window.hwnd == root) return true;
     return false;
+}
+
+/// The quick terminal's show or hide animation, as macOS animates its own
+/// (`quick-terminal-animation-duration`): over the duration, with macOS's
+/// easing (`easeIn`), from the share of it that shows as it starts to all
+/// of it or none, so that a toggle partway turns it back from where it
+/// is, as macOS's animator does. It is at its place from the first step:
+/// a window region grows from the edge it is on, or shrinks back to it,
+/// as Windows Terminal's quake window grows one, so that nothing is moved
+/// or resized, its terminals keep their size, and no part of it is ever
+/// on another monitor. `center`, which has no edge, fades, as macOS fades
+/// it, by a layered window's alpha. DWM clips the terminals' swap chains
+/// to the region and blends them by the alpha while they keep presenting,
+/// and animates neither the pop-up's show nor its hide itself (measured
+/// in the Windows 11 VM). Its timer steps it (`quickStep`); the share
+/// comes from the time since it started, so that a late step moves it
+/// further rather than drawing it out.
+const QuickAnimation = struct {
+    /// Coming in, or going out, which ends hidden.
+    showing: bool,
+    /// The share of it that showed as it started, from 0 to 1.
+    from: f64,
+    /// When it started, in `quickNow`'s nanoseconds.
+    start: u64,
+};
+
+/// The frame's timer that steps the quick terminal's animation
+/// (`QuickAnimation`), its only timer. Asked for at USER_TIMER_MINIMUM;
+/// it fires with the system tick, every 15.3 to 17.8 ms as measured in
+/// the Windows 11 VM.
+pub const quick_timer_id: win32.UINT_PTR = 1;
+
+/// For tests: the time the quick terminal's animation is driven with
+/// (`quickNow`), in nanoseconds, in place of the performance counter's.
+pub var test_quick_now: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
+/// For tests: SetTimer failing (`startQuickTimer`), as it does when the
+/// process has used up its timers.
+pub var test_quick_timer_fails: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+/// For tests: answers in place of CreateRectRgn (`quickReveal`), as
+/// BellBorder.test_create_rgn does for the bell's border.
+pub var test_quick_rgn: if (builtin.is_test) ?*const fn (i32, i32, i32, i32) ?win32.HRGN else void =
+    if (builtin.is_test) null else {};
+
+/// Nanoseconds by the performance counter, which the animation's share is
+/// measured in, not GetTickCount64, whose resolution "is limited to the
+/// resolution of the system timer, which is typically in the range of 10
+/// milliseconds to 16 milliseconds" (Learn, GetTickCount64): about as
+/// often as the timer fires.
+fn quickNow() u64 {
+    if (builtin.is_test) if (test_quick_now) |t| return t;
+    var count: i64 = 0;
+    var frequency: i64 = 0;
+    // Both "always succeed" since Windows XP (Learn); the frequency is
+    // kept above 0 all the same, for the division.
+    _ = win32.QueryPerformanceCounter(&count);
+    _ = win32.QueryPerformanceFrequency(&frequency);
+    const ticks: u128 = @intCast(@max(count, 0));
+    const per_second: u128 = @intCast(@max(frequency, 1));
+    return std.math.lossyCast(u64, ticks * std.time.ns_per_s / per_second);
+}
+
+/// `quick-terminal-animation-duration` in nanoseconds: 0, no animation,
+/// for 0, as the option says, and for anything that is not a finite
+/// number of seconds above 0, which its parser lets through
+/// (std.fmt.parseFloat reads "nan", "inf" and negative numbers).
+fn quickDuration(app: *const App) u64 {
+    const seconds = app.config.@"quick-terminal-animation-duration";
+    if (!(seconds > 0) or !std.math.isFinite(seconds)) return 0;
+    return std.math.lossyCast(u64, seconds * std.time.ns_per_s);
+}
+
+/// macOS's easeIn, which its quick terminal animates by
+/// (QuickTerminalController.swift, animateWindowIn and animateWindowOut):
+/// CAMediaTimingFunction(name: .easeIn), the cubic Bezier curve through
+/// (0, 0), (0.42, 0), (1, 1) and (1, 1), as its getControlPoint answers on
+/// macOS, and CSS's ease-in. The share of the way done after `x` of the
+/// time: the curve's y where its x is `x`, found by halving, for its x
+/// rises from 0 to 1.
+pub fn easeIn(x: f64) f64 {
+    if (!(x > 0)) return 0;
+    if (x >= 1) return 1;
+    var low: f64 = 0;
+    var high: f64 = 1;
+    // Each halves the interval: 2^-48 of t, well below a pixel.
+    for (0..48) |_| {
+        const t = (low + high) / 2;
+        if (bezier(t, 0.42, 1) < x) low = t else high = t;
+    }
+    return bezier((low + high) / 2, 0, 1);
+}
+
+/// One coordinate at `t` of a cubic Bezier curve from 0 to 1 whose inner
+/// control points have `p1` and `p2` for it.
+fn bezier(t: f64, p1: f64, p2: f64) f64 {
+    const u = 1 - t;
+    return 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t;
+}
+
+/// The share of the quick terminal that shows at `now` in `animation`,
+/// which runs for `duration`, and whether it is over.
+fn quickShare(animation: QuickAnimation, now: u64, duration: u64) struct { f64, bool } {
+    const to: f64 = if (animation.showing) 1 else 0;
+    const elapsed = now -| animation.start;
+    if (elapsed >= duration) return .{ to, true };
+    const x = @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(duration));
+    return .{ animation.from + (to - animation.from) * easeIn(x), false };
+}
+
+/// The part of a `width` x `height` quick terminal at `position` that
+/// shows when `share` of it does, in its window's coordinates, which
+/// SetWindowRgn takes: a band along its edge, as deep as the share of it
+/// rounded up, so that any share of it shows. All of it for `center`,
+/// which fades instead.
+fn quickBand(position: configpkg.Config.QuickTerminalPosition, width: i32, height: i32, share: f64) win32.RECT {
+    const depth = struct {
+        fn of(size: i32, s: f64) i32 {
+            return std.math.clamp(std.math.lossyCast(i32, @ceil(@as(f64, @floatFromInt(size)) * s)), 0, size);
+        }
+    }.of;
+    return switch (position) {
+        .top => .{ .left = 0, .top = 0, .right = width, .bottom = depth(height, share) },
+        .bottom => .{ .left = 0, .top = height - depth(height, share), .right = width, .bottom = height },
+        .left => .{ .left = 0, .top = 0, .right = depth(width, share), .bottom = height },
+        .right => .{ .left = width - depth(width, share), .top = 0, .right = width, .bottom = height },
+        .center => .{ .left = 0, .top = 0, .right = width, .bottom = height },
+    };
+}
+
+/// Start the quick terminal's show (`showing`) or hide animation from the
+/// share of it that shows now, taking over from one that runs, and show
+/// that share. False if there is none to run, its duration being 0, or if
+/// its timer or that share cannot be set, logged: the caller then shows
+/// it whole or hides it at once, and stops it (`stopQuickAnimation`).
+fn animateQuick(self: *Window, showing: bool) bool {
+    const duration = quickDuration(self.app);
+    const now = quickNow();
+    const from: f64 = if (self.quick_animation) |running|
+        quickShare(running, now, duration)[0]
+    else if (showing) 0 else 1;
+    if (duration == 0) return false;
+    self.quick_animation = .{ .showing = showing, .from = from, .start = now };
+    return self.quickReveal(from) and self.startQuickTimer();
+}
+
+/// The quick terminal's animation timer, started or started again; false,
+/// logged, if it cannot be.
+fn startQuickTimer(self: *Window) bool {
+    const fails = if (builtin.is_test) test_quick_timer_fails else false;
+    if (!fails and win32.SetTimer(self.hwnd, quick_timer_id, win32.USER_TIMER_MINIMUM, null) != 0) return true;
+    log.warn("unable to animate the quick terminal err={}", .{win32.GetLastError()});
+    return false;
+}
+
+/// No animation runs any more (`QuickAnimation`): its timer stopped, and
+/// the quick terminal shown whole (`quickRevealAll`), on screen or not.
+fn stopQuickAnimation(self: *Window) void {
+    self.quick_animation = null;
+    // FALSE if no timer ran.
+    _ = win32.KillTimer(self.hwnd, quick_timer_id);
+    self.quickRevealAll();
+}
+
+/// The quick terminal's animation timer fired (`quick_timer_id`): the
+/// share that shows now, or at the end, it shows whole or, at the end of a
+/// hide, hides first, so that it does not show whole as it goes. A step
+/// that cannot be shown ends it there, at once. Nothing if none runs: the
+/// timer's message can be in the queue after it stopped, as KillTimer
+/// "does not remove WM_TIMER messages already posted to the message queue"
+/// (Learn).
+fn quickStep(self: *Window) void {
+    const animation = self.quick_animation orelse return;
+    const share, const over = quickShare(animation, quickNow(), quickDuration(self.app));
+    if (!over and self.quickReveal(share)) return;
+    if (!animation.showing) self.quickHidden();
+    self.stopQuickAnimation();
+}
+
+/// Show `share` of the quick terminal (`QuickAnimation`): a band along its
+/// edge by a window region (`quickBand`), or for `center` its alpha, as a
+/// layered window. False, logged, if it cannot be shown so.
+fn quickReveal(self: *Window, share: f64) bool {
+    const position = self.app.config.@"quick-terminal-position";
+    if (position == .center) {
+        const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE);
+        const layered: isize = win32.WS_EX_LAYERED;
+        if (style & layered == 0) _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE, style | layered);
+        const alpha = std.math.lossyCast(u8, @round(share * 255));
+        if (win32.SetLayeredWindowAttributes(self.hwnd, 0, alpha, win32.LWA_ALPHA).toBool()) return true;
+        log.warn("unable to fade the quick terminal err={}", .{win32.GetLastError()});
+        return false;
+    }
+    var frame: win32.RECT = undefined;
+    if (!win32.GetWindowRect(self.hwnd, &frame).toBool()) {
+        log.warn("cannot read the quick terminal's size err={}", .{win32.GetLastError()});
+        return false;
+    }
+    const band = quickBand(position, frame.right - frame.left, frame.bottom - frame.top, share);
+    const rgn = quickRgn(band) orelse {
+        log.warn("unable to make the quick terminal's region err={}", .{win32.GetLastError()});
+        return false;
+    };
+    // Once set, "the system owns the region"; not set, it is still ours.
+    if (win32.SetWindowRgn(self.hwnd, rgn, .TRUE) != 0) return true;
+    log.warn("unable to set the quick terminal's region err={}", .{win32.GetLastError()});
+    _ = win32.DeleteObject(rgn);
+    return false;
+}
+
+fn quickRgn(band: win32.RECT) ?win32.HRGN {
+    if (builtin.is_test) if (test_quick_rgn) |make| return make(band.left, band.top, band.right, band.bottom);
+    return win32.CreateRectRgn(band.left, band.top, band.right, band.bottom);
+}
+
+/// The quick terminal whole again, as it was made: no region, and not
+/// layered. Asked to redraw once it is not layered, as "Using Layered
+/// Windows" (Learn) asks for a window to be opaque again.
+fn quickRevealAll(self: *Window) void {
+    if (win32.SetWindowRgn(self.hwnd, null, .TRUE) == 0) {
+        log.warn("unable to show all of the quick terminal err={}", .{win32.GetLastError()});
+    }
+    const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE);
+    const layered: isize = win32.WS_EX_LAYERED;
+    if (style & layered == 0) return;
+    _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE, style & ~layered);
+    const flags = win32.RDW_INVALIDATE | win32.RDW_ERASE | win32.RDW_FRAME | win32.RDW_ALLCHILDREN;
+    _ = win32.RedrawWindow(self.hwnd, null, null, flags);
 }
 
 /// For `quick-terminal-screen = mouse`, whose monitor the quick terminal
@@ -1463,6 +1726,12 @@ fn handleMessage(
 
         // Sent to every top-level window; DefWindowProcW below as well.
         win32.WM_DISPLAYCHANGE => if (self.quick) self.placeQuickAgain(),
+
+        // The quick terminal's animation steps (`quickStep`).
+        win32.WM_TIMER => if (wparam == quick_timer_id) {
+            if (self.quick) self.quickStep();
+            return 0;
+        },
 
         // Deactivated: an open command palette closes, as GTK's dialog
         // does, once the deactivation is over (`CommandPalette.deactivated`),

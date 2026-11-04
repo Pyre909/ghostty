@@ -166,6 +166,16 @@ pub const WS_EX_ACCEPTFILES: DWORD = 0x00000010;
 /// Not in the taskbar or in the Alt+Tab switcher.
 /// https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles
 pub const WS_EX_TOOLWINDOW: DWORD = 0x00000080;
+/// A layered window, which SetLayeredWindowAttributes can make
+/// translucent.
+/// https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles
+pub const WS_EX_LAYERED: DWORD = 0x00080000;
+/// SetLayeredWindowAttributes: the alpha applies.
+pub const LWA_ALPHA: DWORD = 0x00000002;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setlayeredwindowattributes
+pub extern "user32" fn SetLayeredWindowAttributes(hwnd: HWND, key: COLORREF, alpha: BYTE, flags: DWORD) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getlayeredwindowattributes
+pub extern "user32" fn GetLayeredWindowAttributes(hwnd: HWND, key: ?*COLORREF, alpha: ?*BYTE, flags: ?*DWORD) callconv(.winapi) BOOL;
 /// SetWindowPos's place for a window above every window that is not on
 /// top, and back among them.
 pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
@@ -441,6 +451,13 @@ pub const LOAD_LIBRARY_SEARCH_SYSTEM32 = internal_os.windows.LOAD_LIBRARY_SEARCH
 /// Milliseconds since the system started.
 /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+/// "On systems that run Windows XP or later, the function will always
+/// succeed and will thus never return zero."
+/// https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter
+pub extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.winapi) BOOL;
+/// Counts per second, fixed at boot.
+/// https://learn.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancefrequency
+pub extern "kernel32" fn QueryPerformanceFrequency(frequency: *i64) callconv(.winapi) BOOL;
 pub extern "kernel32" fn GlobalAlloc(flags: UINT, bytes: usize) callconv(.winapi) ?HGLOBAL;
 pub extern "kernel32" fn GlobalFree(mem: HGLOBAL) callconv(.winapi) ?HGLOBAL;
 pub extern "kernel32" fn GlobalLock(mem: HGLOBAL) callconv(.winapi) ?*anyopaque;
@@ -1098,6 +1115,19 @@ pub extern "gdi32" fn PtInRegion(rgn: HRGN, x: c_int, y: c_int) callconv(.winapi
 pub extern "user32" fn SetWindowRgn(hwnd: HWND, rgn: ?HRGN, redraw: BOOL) callconv(.winapi) c_int;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrgn
 pub extern "user32" fn GetWindowRgn(hwnd: HWND, rgn: HRGN) callconv(.winapi) c_int;
+/// GetWindowRgn's and GetRgnBox's answers for an empty region and for a
+/// rectangle.
+pub const NULLREGION: c_int = 1;
+pub const SIMPLEREGION: c_int = 2;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getrgnbox
+pub extern "gdi32" fn GetRgnBox(rgn: HRGN, rect: *RECT) callconv(.winapi) c_int;
+/// RedrawWindow: invalidate, erase, the frame too, and every child.
+pub const RDW_INVALIDATE: UINT = 0x0001;
+pub const RDW_ERASE: UINT = 0x0004;
+pub const RDW_ALLCHILDREN: UINT = 0x0080;
+pub const RDW_FRAME: UINT = 0x0400;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-redrawwindow
+pub extern "user32" fn RedrawWindow(hwnd: ?HWND, update: ?*const RECT, rgn: ?HRGN, flags: UINT) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-selectobject
 pub extern "gdi32" fn SelectObject(hdc: HDC, object: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createcompatibledc

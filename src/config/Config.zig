@@ -2864,7 +2864,9 @@ keybind: Keybinds = .{},
 /// Set it to 0 to disable animation completely. This can be changed at
 /// runtime.
 ///
-/// Only implemented on macOS.
+/// Only implemented on macOS and Windows. On Windows, the quick terminal
+/// does not slide: it is uncovered in place from its edge and covered back
+/// to it, and a centered one fades in and out.
 @"quick-terminal-animation-duration": f64 = 0.2,
 
 /// Automatically hide the quick terminal when focus shifts to another window.
