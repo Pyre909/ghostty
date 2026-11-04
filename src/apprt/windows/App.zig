@@ -13136,6 +13136,13 @@ const TestQuick = struct {
         return in_front;
     }
 
+    /// `foregroundNow`, but none once that window is hidden, as Windows
+    /// gives the foreground to another window as it hides the one in front.
+    fn foregroundShown() ?win32.HWND {
+        const hwnd = in_front orelse return null;
+        return if (win32.IsWindowVisible(hwnd).toBool()) hwnd else null;
+    }
+
     fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
         if (fail) return error.TestQuickTerminal;
         area = w.layoutArea();
@@ -13210,11 +13217,18 @@ const TestQuick = struct {
     /// `closeStrandedQuick`, which the test calls.
     fn closeFrame(app: *App, window: *Window) !void {
         _ = win32.SendMessageW(window.hwnd, win32.WM_CLOSE, 0, 0);
+        tearDown();
+        try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, window) == null);
+    }
+
+    /// The teardowns posted so far carried out, as `run` would dispatch
+    /// them: of terminals (`Surface.destroyPosted`) and of windows
+    /// (`Window.destroyPosted`).
+    fn tearDown() void {
         var msg: win32.MSG = undefined;
         while (win32.PeekMessageW(&msg, null, WM_GHOSTTY_DESTROY, WM_GHOSTTY_DESTROY, win32.PM_REMOVE).toBool()) {
             _ = win32.DispatchMessageW(&msg);
         }
-        try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, window) == null);
     }
 
     fn occlusion(surface: *Surface, visible: bool) void {
@@ -14702,6 +14716,73 @@ fn testQuickStranded() !void {
     TestQuick.answer = win32.IDOK;
     try TestQuick.begin(&app);
     try std.testing.expect(quick.closing);
+}
+
+test "win32: the quick terminal gives the foreground back as it closes in front" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickCloseGivesBack, .{});
+}
+
+/// The test of the foreground as the quick terminal closes, run by its
+/// test on a desktop of its own.
+fn testQuickCloseGivesBack() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    core_app.focused_surface = null;
+    TestQuick.start();
+    defer TestQuick.stop();
+    // A window loses the foreground as it hides, as the frame's own
+    // teardown hides it before it is destroyed (`Window.destroyPosted`).
+    App.test_get_foreground = &TestQuick.foregroundShown;
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestQuick.ask;
+    defer message_box.* = null;
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+
+    // Shown over another program, and in front as its last terminal ends,
+    // as when `exit` ends its shell: the foreground goes back to that
+    // program, as a toggle's hide gives it back.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    var quick = app.quick orelse return error.TestUnexpectedResult;
+    TestQuick.in_front = quick.hwnd;
+    TestQuick.front = null;
+    (quick.tab().focused orelse return error.TestUnexpectedResult).close(false);
+    TestQuick.tearDown();
+    try std.testing.expect(app.quick == null);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+
+    // The same when a toggle closes it, the only window, once the user
+    // says so (`Window.requestCloseAlone`), by the frame's own teardown.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    quick = app.quick orelse return error.TestUnexpectedResult;
+    TestQuick.in_front = quick.hwnd;
+    TestQuick.front = null;
+    TestQuick.answer = win32.IDOK;
+    try TestQuick.begin(&app);
+    try std.testing.expect(quick.closing);
+    TestQuick.tearDown();
+    try std.testing.expect(app.quick == null);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+
+    // Not in front as it closes, it gives nothing: the user chose where
+    // the foreground went.
+    TestQuick.in_front = other;
+    try TestQuick.toggle(&app);
+    quick = app.quick orelse return error.TestUnexpectedResult;
+    TestQuick.front = null;
+    (quick.tab().focused orelse return error.TestUnexpectedResult).close(false);
+    TestQuick.tearDown();
+    try std.testing.expect(app.quick == null);
+    try std.testing.expect(TestQuick.front == null);
 }
 
 test "win32: a hidden quick terminal a global keybind can show stays until a reload takes the keybind away" {

@@ -1129,6 +1129,23 @@ fn giveBack(hwnd: win32.HWND) void {
     if (!bringForward(hwnd, hwnd)) log.info("the foreground stays with Ghostty: SetForegroundWindow refused", .{});
 }
 
+/// The quick terminal, as it closes while it or a window it owns is in
+/// the foreground (`App.inForeground`), as when its last terminal exits:
+/// the foreground goes back to the window it came from (`quick_return`),
+/// as a toggle's hide gives it back (`hideQuick`) and as macOS gives its
+/// previous application back as an emptied quick terminal goes
+/// (QuickTerminalController.animateWindowOut), rather than to whichever
+/// window Windows picks next. Nothing while the app quits, as every
+/// window goes (`App.terminating`). Called by both ways a window leaves
+/// the screen as it closes: its teardown hides it (`destroyPosted`), or
+/// its last terminal's destroys it (`destroy`); once hidden, it is no
+/// longer in front.
+fn giveBackClosing(self: *Window) void {
+    if (!self.quick or self.app.terminating) return;
+    if (!App.inForeground(self)) return;
+    if (self.quick_return) |hwnd| giveBack(hwnd);
+}
+
 /// The quick terminal lost the activation (WM_ACTIVATE) to `to`, which
 /// Windows does not always name. To a window it owns, a prompt or its
 /// title dialog, nothing changes, as macOS keeps its quick terminal while
@@ -2157,6 +2174,7 @@ fn destroyPosted(self: *Window) void {
     // close_window, and hiding the active window there could activate
     // another Ghostty window and send its terminal a focus change inside
     // that call. A posted teardown runs from a message loop.
+    self.giveBackClosing();
     _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
     _ = self.destroy();
 
@@ -2175,6 +2193,9 @@ fn destroyPosted(self: *Window) void {
 /// searched afresh after each, until no terminal of this window has a
 /// live core left.
 pub fn destroy(self: *Window) bool {
+    // Asked before its title prompt closes and the activation moves, as
+    // `hideQuick` asks.
+    self.giveBackClosing();
     // The title prompt first, which would otherwise stay on screen until
     // its own terminal's turn, while the cores before it stop and their
     // threads are waited for, or after the frame was hidden
