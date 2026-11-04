@@ -14145,19 +14145,23 @@ fn testQuickUncover() !void {
         TestQuick.tick(quick, TestQuick.half);
         try std.testing.expectEqual(TestQuick.band(position, width, height, TestQuick.eased), (try TestQuick.region(quick)).?);
         try std.testing.expectEqual(place, try windowRect(quick.hwnd));
-        // At its end, whole: no region left, and not faded.
+        // At its end, whole: no region left, and not faded; and its timer
+        // stopped, as KillTimer finds none to kill.
         TestQuick.tick(quick, TestQuick.half);
         try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
         try std.testing.expect((try TestQuick.region(quick)) == null);
         try std.testing.expect((try TestQuick.alpha(quick)) == null);
+        try std.testing.expect(!win32.KillTimer(quick.hwnd, Window.quick_timer_id).toBool());
         // A step still in the queue after that changes nothing.
         TestQuick.tick(quick, TestQuick.half);
         try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
         try std.testing.expect((try TestQuick.region(quick)) == null);
 
         // Covered back the same way as it hides, from all of it, and on
-        // screen, its terminal not told otherwise, until the end.
+        // screen, its terminal not told otherwise, until the end. A timer
+        // steps it, which the test kills, as it steps it itself.
         try TestQuick.begin(&app);
+        try std.testing.expect(win32.KillTimer(quick.hwnd, Window.quick_timer_id).toBool());
         try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
         try std.testing.expectEqual(TestQuick.band(position, width, height, 1), (try TestQuick.region(quick)).?);
         TestQuick.tick(quick, TestQuick.half);
