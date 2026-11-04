@@ -3426,10 +3426,12 @@ pub fn constrainToWorkArea(
 }
 
 /// Bring the window to the front, restoring it first if it is
-/// minimized, as GTK's `gtk.Window.present` does; for `goto_window`,
-/// `present_terminal`, a toast's click and the command palette's jump to
-/// a terminal. With a title prompt open over it, the prompt comes forward
-/// with the keyboard focus in its field, not the frame it holds disabled
+/// minimized, as GTK's `gtk.Window.present` does; for `goto_window`, a
+/// toast's click (`App.notificationClicked`), the command palette's jump
+/// to a terminal, and `present_terminal`, which the core performs only
+/// for a `present_surface` message, which only GTK's runtime sends today.
+/// With a title prompt open over it, the prompt comes forward with the
+/// keyboard focus in its field, not the frame it holds disabled
 /// (`TitleDialog.front`). A quick terminal that is hidden, or on its way
 /// out (`quickShown`), shows first (`showQuick`), as macOS shows its own
 /// for one of its terminals (QuickTerminalController.focusSurface):

@@ -14423,7 +14423,7 @@ test "win32: the quick terminal's animation eases in as macOS's does" {
     try std.testing.expectEqual(1, Window.easeIn(2));
 }
 
-test "win32: present_terminal shows a hidden quick terminal, and turns back one on its way out" {
+test "win32: a toast's click and the palette's jump show a hidden quick terminal, and turn back one on its way out" {
     // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
     try testOnOwnDesktop(testQuickPresent, .{});
 }
@@ -14439,39 +14439,82 @@ fn testQuickPresent() !void {
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
+    core_app.focused_surface = null;
     TestQuick.start();
     defer TestQuick.stop();
-    try TestQuick.beside(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
     const other = try TestQuick.foreign();
     defer _ = win32.DestroyWindow(other);
+    // A normal window beside it, with a terminal whose command palette
+    // jumps to the quick terminal's.
+    const a = try testFrame(&app);
+    testResize(a, 1000, 700);
+    const b = try testPane(&app, a);
+    a.tab().tree = try .init(alloc, b);
+    a.tab().focused = b;
+    a.relayout();
+    // A toast's click, as Windows reports it (`App.notificationClicked`).
+    const click = struct {
+        fn f(on: *App, group: u64) void {
+            const m = toast.groupMessage(group);
+            _ = App.wndProc(on.msg_hwnd, WM_GHOSTTY_NOTIFICATION, m[0], m[1]);
+        }
+    }.f;
 
     try TestQuick.toggle(&app);
     const quick = app.quick orelse return error.TestUnexpectedResult;
     const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    pane.title = try alloc.dupeSentinel(u8, "quick", 0);
     try TestQuick.toggle(&app);
     try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
 
-    // Hidden, for one of its terminals, as a toast's click and the command
-    // palette's jump bring one forward too (`Window.present`): shown at
-    // its place by its animation, its terminal told, and brought forward,
-    // the window it came over remembered as a toggle remembers it.
+    // Hidden, a click on a toast of one of its terminals shows it
+    // (`Window.present`): at its place by its animation, its terminal told
+    // and given the focus, and brought forward, the window it came over
+    // remembered as a toggle remembers it.
     TestQuick.in_front = other;
     TestQuick.front = null;
-    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .present_terminal, {}));
+    click(&app, pane.notifications.id);
     try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
     try std.testing.expectEqual(std.mem.zeroes(win32.RECT), (try TestQuick.region(quick)).?);
     try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
     try std.testing.expect(TestQuick.shows);
+    try std.testing.expect(FocusSeen.last == pane.hwnd);
     TestQuick.settle(quick);
     try std.testing.expectEqual(try TestQuick.place(&app, quick), try windowRect(quick.hwnd));
     try std.testing.expect((try TestQuick.region(quick)) == null);
     try TestQuick.hideInFront(&app, quick);
     try std.testing.expectEqual(other, TestQuick.front.?);
 
+    // Hidden, the command palette's jump to one of its terminals, from
+    // another window's, shows it the same way.
+    TestQuick.in_front = other;
+    TestQuick.front = null;
+    FocusSeen.last = null;
+    try togglePalette(&app, b);
+    paletteQuery(a, L("focus: quick"));
+    try std.testing.expectEqual(1, paletteRows(a));
+    try std.testing.expect(paletteEntry(a, 0).run.jump == pane);
+    paletteKey(a, win32.VK_RETURN);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(std.mem.zeroes(win32.RECT), (try TestQuick.region(quick)).?);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+    try std.testing.expect(FocusSeen.last == pane.hwnd);
+    TestQuick.settle(quick);
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+
     // Shown, it is only brought forward.
+    TestQuick.in_front = other;
     try TestQuick.toggle(&app);
     TestQuick.front = null;
-    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .present_terminal, {}));
+    click(&app, pane.notifications.id);
     try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
     try std.testing.expect((try TestQuick.region(quick)) == null);
 
@@ -14479,7 +14522,7 @@ fn testQuickPresent() !void {
     try TestQuick.begin(&app);
     TestQuick.tick(quick, TestQuick.half);
     TestQuick.front = null;
-    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .present_terminal, {}));
+    click(&app, pane.notifications.id);
     try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
     TestQuick.tick(quick, TestQuick.half);
     const place = try windowRect(quick.hwnd);
