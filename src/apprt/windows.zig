@@ -381,6 +381,7 @@ test {
     _ = @import("windows/desktop_notifications.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/drop.zig");
+    _ = @import("windows/ipc.zig");
     _ = @import("windows/key.zig");
     _ = @import("windows/overlay_keys.zig");
     _ = @import("windows/taskbar.zig");
