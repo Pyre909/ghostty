@@ -26,6 +26,8 @@ const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
 const IpcServer = @import("IpcServer.zig");
+const Overrides = @import("Overrides.zig");
+const ipc = @import("ipc.zig");
 const KeyState = @import("KeyState.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const ReadOnly = @import("ReadOnly.zig");
@@ -339,9 +341,9 @@ pub const App = struct {
         Win32CallFailed,
     };
 
-    /// Always false: no request is sent to a running instance yet, and an
-    /// instance answers each as one it does not do (`ipcRequests`), so
-    /// every CLI action that would need one reports "not supported on this
+    /// Always false: no request is sent to a running instance yet, though
+    /// an instance carries out those it reads (`ipcRequests`), so every
+    /// CLI action that would need one reports "not supported on this
     /// platform".
     pub fn performIpc(
         _: Allocator,
@@ -394,9 +396,12 @@ pub const App = struct {
         server.stop();
     }
 
-    /// Answer the requests the IPC thread has read (WM_GHOSTTY_IPC): as
-    /// actions this instance does not do, or, once it is quitting, as
-    /// such.
+    /// Record the requests the IPC thread has read (WM_GHOSTTY_IPC) for
+    /// `run` to carry out (`carryOutIpc`), as `requestWindow` records a
+    /// window, or answer them now: once the instance is quitting, as such,
+    /// and as refused or failed when their arguments do not parse or
+    /// memory runs out. Nothing here calls into the core, so it may run in
+    /// any loop that dispatches messages, a prompt's or a core frame's.
     fn ipcRequests(self: *App) void {
         const server = self.ipc orelse return;
         var entries = server.take();
@@ -404,10 +409,106 @@ pub const App = struct {
         for (entries.items) |entry| {
             if (self.quit or self.terminating) {
                 _ = server.answer(entry.ticket, .quitting, "the running Ghostty is quitting");
-            } else {
-                _ = server.answer(entry.ticket, .unsupported, "the running Ghostty does not do this on Windows");
+                continue;
             }
+            self.recordIpc(entry) catch |err| switch (err) {
+                error.InvalidCommand => _ = server.answer(entry.ticket, .bad_arguments, "the command does not parse"),
+                error.OutOfMemory => {
+                    log.warn("cannot record an IPC request err={}", .{err});
+                    _ = server.answer(entry.ticket, .failed, "out of memory");
+                },
+            };
         }
+    }
+
+    /// `ipcRequests` for one request.
+    fn recordIpc(self: *App, entry: IpcServer.Entry) Overrides.ParseError!void {
+        const alloc = self.core_app.alloc;
+        const request = try alloc.create(IpcRequest);
+        errdefer alloc.destroy(request);
+        request.* = .{
+            .arena = .init(alloc),
+            .action = entry.request.action,
+            .surface_id = entry.request.surface_id,
+            .ticket = entry.ticket,
+        };
+        errdefer request.arena.deinit();
+        if (entry.request.arguments) |arguments| {
+            request.overrides = try Overrides.parse(request.arena.allocator(), arguments);
+        }
+        try self.requests.append(alloc, .{ .ipc = request });
+    }
+
+    /// An IPC request waiting in `requests`, with what its arguments ask.
+    const IpcRequest = struct {
+        /// Owns `overrides`.
+        arena: std.heap.ArenaAllocator,
+        action: ipc.Action,
+        /// For a new tab, the terminal it goes beside; zero for the
+        /// focused one (`ipcTabParent`).
+        surface_id: u64,
+        overrides: Overrides = .{},
+        /// What its client is answered by (`IpcServer.answer`).
+        ticket: u64,
+
+        fn destroy(self: *IpcRequest, alloc: Allocator) void {
+            self.arena.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    /// Carry out an IPC request (`createRequested`), then answer its
+    /// client, unless it was told the request is pending, and free it. A
+    /// failure is told the client rather than shown, as GTK only logs it.
+    fn carryOutIpc(self: *App, request: *IpcRequest) void {
+        defer request.destroy(self.core_app.alloc);
+        self.ipcAction(request) catch |err| {
+            log.warn("failed to carry out an IPC {s} err={}", .{ @tagName(request.action), err });
+            const text = switch (request.action) {
+                .new_window => "the running Ghostty could not open a window",
+                .new_tab => "the running Ghostty could not open a tab",
+                .toggle_quick_terminal => "the running Ghostty could not open the quick terminal",
+            };
+            if (self.ipc) |server| _ = server.answer(request.ticket, .failed, text);
+            return;
+        };
+        if (self.ipc) |server| _ = server.answer(request.ticket, .ok, "");
+    }
+
+    /// What `carryOutIpc` does: a window or tab opened and brought
+    /// forward, as a binding's is, with what the arguments ask, or the
+    /// quick terminal toggled.
+    fn ipcAction(self: *App, request: *IpcRequest) !void {
+        switch (request.action) {
+            .new_window => _ = (try self.newWindow(null, .normal, &request.overrides)).present(),
+            .new_tab => if (self.ipcTabParent(request.surface_id)) |parent| {
+                try self.newTab(parent, &request.overrides);
+                _ = parent.rt_surface.window.present();
+            } else {
+                _ = (try self.newWindow(null, .normal, &request.overrides)).present();
+            },
+            .toggle_quick_terminal => try self.toggleQuick(),
+        }
+    }
+
+    /// The terminal an IPC new tab goes beside, as GTK picks it: the one
+    /// of `id` (`CoreApp.findSurfaceByID`), else the focused one; null for
+    /// none, which opens a window for it. Not one closing, nor one of a
+    /// window closing.
+    fn ipcTabParent(self: *App, id: u64) ?*CoreSurface {
+        if (id != 0) {
+            if (self.core_app.findSurfaceByID(id)) |core| if (opensBeside(core)) return core;
+            log.info("no terminal of id 0x{x:0>16} for the IPC new tab, beside the focused one instead", .{id});
+        }
+        const focused = self.core_app.focusedSurface() orelse return null;
+        return if (opensBeside(focused)) focused else null;
+    }
+
+    /// Whether a new tab can go beside `core`: not if it is closing, or
+    /// its window is.
+    fn opensBeside(core: *CoreSurface) bool {
+        const surface = core.rt_surface;
+        return !surface.closing and !surface.window.closing;
     }
 
     /// Work the core asked for that `run` has not carried out yet
@@ -587,6 +688,12 @@ pub const App = struct {
         /// surface while the core could not be re-entered: it closes as its
         /// own WM_CLOSE closes it (`Surface.requestClose`, `ChildExited`).
         close_surface: *CoreSurface,
+
+        /// A request of `ghostty +new-window`, `+new-tab` or
+        /// `+toggle-quick-terminal`, read by the IPC thread
+        /// (`ipcRequests`). The request owns it, freed when it is carried
+        /// out (`carryOutIpc`) or dropped (`freeRequest`).
+        ipc: *IpcRequest,
 
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
@@ -950,6 +1057,9 @@ pub const App = struct {
     fn freeRequest(self: *App, request: *Request) void {
         switch (request.*) {
             .palette_run => |chosen| chosen.pending.destroy(self.core_app.alloc),
+            // Its client was told the instance is quitting as the server
+            // stopped, before this.
+            .ipc => |ipc_request| ipc_request.destroy(self.core_app.alloc),
             else => {},
         }
         request.* = .dropped;
@@ -969,7 +1079,7 @@ pub const App = struct {
         // (`createRequested`), and the launch's quit timer would then
         // end the process with no reason given.
         if (self.config.@"initial-window") {
-            _ = self.newWindow(null, .normal) catch |err| {
+            _ = self.newWindow(null, .normal, null) catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
                 fatalNotice(err);
                 return err;
@@ -1833,21 +1943,32 @@ pub const App = struct {
 
     /// Open a tab in `parent`'s window holding a new terminal, which
     /// inherits from `parent` as `tab-inherit-working-directory` asks, and
-    /// show it.
-    fn newTab(self: *App, parent: *CoreSurface) !void {
+    /// takes `overrides` (`Surface.Options.overrides`, `overrideTitle`),
+    /// and show it.
+    fn newTab(self: *App, parent: *CoreSurface, overrides: ?*const Overrides) !void {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
 
-        const opts = self.inheritedOptions(parent, .tab);
+        var opts = self.inheritedOptions(parent, .tab);
         defer if (opts.working_directory) |v| alloc.free(v);
+        opts.overrides = overrides;
 
         const window = parent.rt_surface.window;
         const index = try window.newTab(opts);
         errdefer comptime unreachable;
         self.surfaces.appendAssumeCapacity(window.tabs.items[index].focused.?);
+        overrideTitle(window.tabs.items[index].focused.?, overrides);
 
         // Shown once it is owned, as a new window is.
         window.selectTab(index);
+    }
+
+    /// Give `surface`, a new terminal not yet shown, the title `overrides`
+    /// ask for, as its title prompt sets one (`Surface.setTitleOverride`)
+    /// and GTK sets `title-override`.
+    fn overrideTitle(surface: *Surface, overrides: ?*const Overrides) void {
+        const title = (overrides orelse return).title orelse return;
+        if (!surface.setTitleOverride(title)) log.warn("cannot give a new terminal the title asked for", .{});
     }
 
     /// `.goto_tab`: whether there is a tab to go to in the terminal's window
@@ -2411,8 +2532,9 @@ pub const App = struct {
     /// as GTK makes its own, so with no other terminal's directory or font
     /// size; so does the first after its last terminal closed. Shown with
     /// nothing to show it again once hidden (`quickAlone`), it closes
-    /// instead, as `closeStrandedQuick` closes a hidden one.
-    fn toggleQuick(self: *App) void {
+    /// instead, as `closeStrandedQuick` closes a hidden one. An error only
+    /// if it could not be made.
+    fn toggleQuick(self: *App) !void {
         if (self.quick) |window| {
             if (!window.quickShown()) {
                 _ = window.showQuick();
@@ -2421,10 +2543,7 @@ pub const App = struct {
             } else window.hideQuick();
             return;
         }
-        _ = self.newWindow(null, .quick) catch |err| {
-            log.warn("failed to create the quick terminal err={}", .{err});
-            notice(self, null, L("Ghostty could not open the quick terminal."));
-        };
+        _ = try self.newWindow(null, .quick, null);
     }
 
     /// Whether nothing could show the quick terminal again once it is
@@ -2552,7 +2671,9 @@ pub const App = struct {
             .title_prompt => |prompt| {
                 if (prompt.from == core_surface) request.* = .dropped;
             },
-            .quick_terminal, .reload, .redecorate, .dropped => {},
+            // A new tab's terminal is found by its id once the request is
+            // carried out (`ipcTabParent`).
+            .quick_terminal, .reload, .redecorate, .ipc, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -3134,7 +3255,7 @@ pub const App = struct {
                 // only for the process in front. The hotkey lets this one
                 // take it with SetForegroundWindow. Not the initial window
                 // (`run`): a launcher may ask for it minimized.
-                .window => |parent| if (self.newWindow(parent, .normal)) |window| {
+                .window => |parent| if (self.newWindow(parent, .normal, null)) |window| {
                     _ = window.present();
                 } else |err| {
                     log.err("failed to create a window err={}", .{err});
@@ -3144,7 +3265,10 @@ pub const App = struct {
                         L("Ghostty could not open a new window."),
                     );
                 },
-                .quick_terminal => self.toggleQuick(),
+                .quick_terminal => self.toggleQuick() catch |err| {
+                    log.warn("failed to create the quick terminal err={}", .{err});
+                    notice(self, null, L("Ghostty could not open the quick terminal."));
+                },
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
                     error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
@@ -3192,7 +3316,7 @@ pub const App = struct {
                     const window = self.windowBeside(goto.from.rt_surface.window, goto.to) orelse continue;
                     _ = window.present();
                 },
-                .tab => |parent| self.newTab(parent) catch |err| {
+                .tab => |parent| self.newTab(parent, null) catch |err| {
                     log.err("failed to create a tab err={}", .{err});
                     notice(self, parent.rt_surface.hwnd, L("Ghostty could not open a new tab."));
                 },
@@ -3227,6 +3351,11 @@ pub const App = struct {
                 .search_key => |key| SearchBar.replay(key.from, key.key),
                 .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
                 .close_surface => |from| from.rt_surface.requestClose(),
+                // Dropped first, as `palette_run` is: freed there.
+                .ipc => |request| {
+                    self.requests.items[i] = .dropped;
+                    self.carryOutIpc(request);
+                },
                 .dropped => {},
             }
         }
@@ -3276,15 +3405,17 @@ pub const App = struct {
     }
 
     /// Create a terminal window: the initial one (`run`), or one the core
-    /// asked for (`createRequested`) from `parent`, a live surface; or the
-    /// quick terminal (`toggleQuick`), which then is `quick`.
-    fn newWindow(self: *App, parent: ?*CoreSurface, kind: Window.Kind) !*Window {
+    /// asked for (`createRequested`) from `parent`, a live surface, or an
+    /// IPC request with `overrides` (`carryOutIpc`); or the quick terminal
+    /// (`toggleQuick`), which then is `quick`.
+    fn newWindow(self: *App, parent: ?*CoreSurface, kind: Window.Kind, overrides: ?*const Overrides) !*Window {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
         try self.windows.ensureUnusedCapacity(alloc, 1);
 
-        const opts = self.inheritedOptions(parent, .window);
+        var opts = self.inheritedOptions(parent, .window);
         defer if (opts.working_directory) |v| alloc.free(v);
+        opts.overrides = overrides;
 
         // Surface.create registers the surface with the core, and
         // CoreApp.addSurface cancels the startup quit timer
@@ -3293,6 +3424,7 @@ pub const App = struct {
         errdefer comptime unreachable;
         self.windows.appendAssumeCapacity(window);
         self.surfaces.appendAssumeCapacity(window.tab().focused.?);
+        overrideTitle(window.tab().focused.?, overrides);
 
         // Shown once both are owned, so that its first messages find them.
         switch (kind) {
@@ -6239,7 +6371,7 @@ test "win32: a divider drag ends with a lost capture or a change of its tab" {
     // core (`Window.test_create_pane`), and shown, as `App.newSplit` shows
     // it. The split reads a's cell, which a core would have.
     const Panes = struct {
-        fn create(w: *Window) anyerror!*Surface {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
             return testPane(w.app, w);
         }
     };
@@ -12851,7 +12983,7 @@ const TestQuick = struct {
         return in_front;
     }
 
-    fn create(w: *Window) anyerror!*Surface {
+    fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
         if (fail) return error.TestQuickTerminal;
         area = w.layoutArea();
         const pane = try testPane(w.app, w);
@@ -20601,7 +20733,7 @@ test "win32: a terminal's least width counts its scroll bar beside the cell" {
     // a narrowed so that it holds two cells and the line, but not their
     // two bars: it does not split; widened, it does.
     const Panes = struct {
-        fn create(w: *Window) anyerror!*Surface {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
             return testPane(w.app, w);
         }
     };
@@ -21832,7 +21964,7 @@ fn testIpcNameFree(name: [:0]const u16, identity: *const IpcServer.Identity, hwn
     return true;
 }
 
-test "win32: the app answers an IPC request as one it does not do, and once it quits as quitting" {
+test "win32: the app answers an IPC request read once it quits as quitting" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -21849,27 +21981,21 @@ test "win32: the app answers an IPC request as one it does not do, and once it q
     app.serveIpc(&identity, base);
     const name = try IpcServer.pipeName(alloc, base, &identity);
     defer alloc.free(name);
-    const bytes = try @import("ipc.zig").encodeRequest(alloc, .new_window, 0, &.{"--title=a"});
+    const bytes = try ipc.encodeRequest(alloc, .new_window, 0, &.{"--title=a"});
     defer alloc.free(bytes);
 
-    // Before a quit, and after one that came while the request waited:
-    // the loop sees its WM_QUIT only once the messages posted before it
-    // are handled.
-    for ([_]bool{ false, true }) |quitting| {
-        var client: IpcServer.TestClient = .{ .name = name, .request = bytes };
-        try client.start();
-        IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
-            _ = client.finish() catch {};
-            return err;
-        };
-        if (quitting) try std.testing.expect(try app.performAction(.app, .quit, {}));
-        try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0));
-        const reply = try client.finish();
-        try std.testing.expectEqual(
-            if (quitting) @import("ipc.zig").Status.quitting else .unsupported,
-            reply.status,
-        );
-    }
+    // After a quit that came while the request waited: the loop sees its
+    // WM_QUIT only once the messages posted before it are handled.
+    var client: IpcServer.TestClient = .{ .name = name, .request = bytes };
+    try client.start();
+    IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+        _ = client.finish() catch {};
+        return err;
+    };
+    try std.testing.expect(try app.performAction(.app, .quit, {}));
+    try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0));
+    try std.testing.expectEqual(0, app.requests.items.len);
+    try std.testing.expectEqual(ipc.Status.quitting, (try client.finish()).status);
 }
 
 test "win32: an elevated app serves no IPC" {
@@ -21932,4 +22058,263 @@ test "win32: quitting stops the app's IPC, and so does the session's end" {
         app.terminate();
         try std.testing.expect(try testIpcNameFree(name, &identity, hwnd));
     }
+}
+
+/// For tests: the terminals IPC requests open, made as `TestQuick` makes
+/// them (`Window.test_create_pane`), and what the last was to start with.
+const TestIpc = struct {
+    var made: usize = 0;
+    var context: ?apprt.surface.NewSurfaceContext = null;
+    /// Its command's program, if one was asked for.
+    var command: ?[]const u8 = null;
+    var command_buf: [64]u8 = undefined;
+
+    fn start() void {
+        TestQuick.start();
+        Window.test_create_pane = &create;
+        made = 0;
+        context = null;
+        command = null;
+    }
+
+    fn create(w: *Window, opts: Surface.Options) anyerror!*Surface {
+        const pane = try TestQuick.create(w, opts);
+        made += 1;
+        context = opts.context;
+        command = null;
+        if (opts.overrides) |o| if (o.command) |c| {
+            const program: []const u8 = switch (c) {
+                .direct => |argv| argv[0],
+                .shell => |line| line,
+            };
+            @memcpy(command_buf[0..program.len], program);
+            command = command_buf[0..program.len];
+        };
+        return pane;
+    }
+
+    /// Send `app` a request as a client does, on the pipe of `name`, have
+    /// it read (WM_GHOSTTY_IPC) and carried out (`createRequested`), and
+    /// return what the client was answered. Reading it opens nothing: it
+    /// is recorded, or refused, and `run` carries it out, as it does a
+    /// binding's window.
+    fn send(
+        app: *App,
+        name: [:0]const u16,
+        action: ipc.Action,
+        surface_id: u64,
+        arguments: ?[]const [:0]const u8,
+    ) !ipc.Status {
+        const alloc = app.core_app.alloc;
+        const bytes = try ipc.encodeRequest(alloc, action, surface_id, arguments);
+        defer alloc.free(bytes);
+        var client: IpcServer.TestClient = .{ .name = name, .request = bytes };
+        try client.start();
+        IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+            _ = client.finish() catch {};
+            return err;
+        };
+        const windows = app.windows.items.len;
+        const handled = App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0);
+        const unopened = app.windows.items.len == windows;
+        app.createRequested();
+        const reply = try client.finish();
+        try std.testing.expectEqual(0, handled);
+        try std.testing.expect(unopened);
+        try std.testing.expectEqual(0, app.requests.items.len);
+        return reply.status;
+    }
+};
+
+test "win32: IPC requests open windows, tabs and the quick terminal as they ask, and their clients hear how it went" {
+    // On a desktop of its own: its windows show, and would come in front
+    // of the programs on the user's (testOnOwnDesktop).
+    try testOnOwnDesktop(testIpcOpens, .{});
+}
+
+/// The test of what IPC requests open, run by its test on a desktop of
+/// its own.
+fn testIpcOpens() !void {
+    const alloc = std.testing.allocator;
+    // A new tab goes beside a terminal the core knows (`ipcTabParent`).
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    TestIpc.start();
+    defer TestQuick.stop();
+    // A test's terminals have no core to inherit from (`inheritedOptions`).
+    app.config.@"window-inherit-working-directory" = false;
+    app.config.@"tab-inherit-working-directory" = false;
+    app.config.@"window-inherit-font-size" = false;
+    // Nothing an IPC request does shows a box: its client is told.
+    const Boxes = struct {
+        var count: usize = 0;
+        fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+            count += 1;
+            return win32.IDOK;
+        }
+    };
+    Boxes.count = 0;
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &Boxes.box;
+    defer message_box.* = null;
+
+    const identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const base = try testIpcBase(&buf);
+    app.serveIpc(&identity, base);
+    try std.testing.expect(app.ipc != null);
+    const name = try IpcServer.pipeName(alloc, base, &identity);
+    defer alloc.free(name);
+    var caption: [64]u16 = undefined;
+
+    // A window, its terminal started with the command asked for and titled
+    // as asked, shown and brought forward.
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_window, 0, &.{ "--title=hi", "-e", "cmd.exe", "/k" }));
+    try std.testing.expectEqual(1, app.windows.items.len);
+    const a = app.windows.items[0];
+    const pa = a.tab().focused orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(1, TestIpc.made);
+    try std.testing.expectEqual(.window, TestIpc.context.?);
+    try std.testing.expectEqualStrings("cmd.exe", TestIpc.command.?);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("hi"), testCaption(a, &caption));
+    try std.testing.expect(win32.IsWindowVisible(a.hwnd).toBool());
+    try std.testing.expectEqual(a.hwnd, TestQuick.front.?);
+
+    // A second window, focused, as the core has it.
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_window, 0, null));
+    try std.testing.expectEqual(2, app.windows.items.len);
+    const b = app.windows.items[1];
+    const pb = b.tab().focused orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(null, TestIpc.command);
+    pa.core_surface.id = 0x11;
+    pb.core_surface.id = 0x22;
+    try core_app.surfaces.appendSlice(alloc, &.{ pa, pb });
+    core_app.focused_surface = &pb.core_surface;
+
+    // A tab beside the terminal of the id given, in its window, made as a
+    // tab, started with the command asked for and titled as asked, shown,
+    // and its window brought forward.
+    TestQuick.front = null;
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_tab, 0x11, &.{ "--title=t", "-e", "pwsh.exe" }));
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expectEqual(2, a.tabs.items.len);
+    try std.testing.expectEqual(1, b.tabs.items.len);
+    const ta = a.tab().focused orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ta != pa);
+    try std.testing.expectEqual(.tab, TestIpc.context.?);
+    try std.testing.expectEqualStrings("pwsh.exe", TestIpc.command.?);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("t"), testCaption(a, &caption));
+    try std.testing.expectEqual(a.hwnd, TestQuick.front.?);
+
+    // With an id no terminal has, or none, beside the focused one.
+    for ([_]u64{ 0x99, 0 }) |id| {
+        try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_tab, id, null));
+        try std.testing.expectEqual(2, app.windows.items.len);
+        try std.testing.expectEqual(.tab, TestIpc.context.?);
+        try std.testing.expectEqual(b.hwnd, TestQuick.front.?);
+    }
+    try std.testing.expectEqual(3, b.tabs.items.len);
+
+    // In a new window when no terminal is focused, or the one asked for
+    // and the focused one are closing.
+    core_app.focused_surface = null;
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_tab, 0, null));
+    try std.testing.expectEqual(3, app.windows.items.len);
+    try std.testing.expectEqual(.window, TestIpc.context.?);
+    core_app.focused_surface = &pb.core_surface;
+    pa.closing = true;
+    b.closing = true;
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_tab, 0x11, null));
+    pa.closing = false;
+    b.closing = false;
+    try std.testing.expectEqual(4, app.windows.items.len);
+    try std.testing.expectEqual(2, a.tabs.items.len);
+    try std.testing.expectEqual(3, b.tabs.items.len);
+
+    // A command that does not parse is refused, and nothing opens.
+    const made = TestIpc.made;
+    for ([_]ipc.Action{ .new_window, .new_tab }) |action| {
+        try std.testing.expectEqual(.bad_arguments, try TestIpc.send(&app, name, action, 0, &.{"--command= "}));
+    }
+    try std.testing.expectEqual(made, TestIpc.made);
+    try std.testing.expectEqual(4, app.windows.items.len);
+
+    // A window or tab that cannot be made is told its client, and nothing
+    // is left of it.
+    TestQuick.fail = true;
+    try std.testing.expectEqual(.failed, try TestIpc.send(&app, name, .new_window, 0, null));
+    try std.testing.expectEqual(.failed, try TestIpc.send(&app, name, .new_tab, 0x22, null));
+    TestQuick.fail = false;
+    try std.testing.expectEqual(4, app.windows.items.len);
+    try std.testing.expectEqual(3, b.tabs.items.len);
+
+    // The quick terminal, made and shown, then hidden; one that cannot be
+    // made is told its client.
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .toggle_quick_terminal, 0, null));
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    TestQuick.settle(quick);
+    try std.testing.expect(quick.quickShown());
+    try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .toggle_quick_terminal, 0, null));
+    TestQuick.settle(quick);
+    try std.testing.expect(!quick.quickShown());
+    try std.testing.expect(win32.DestroyWindow(quick.hwnd).toBool());
+    try std.testing.expect(app.quick == null);
+    TestQuick.fail = true;
+    try std.testing.expectEqual(.failed, try TestIpc.send(&app, name, .toggle_quick_terminal, 0, null));
+    TestQuick.fail = false;
+    try std.testing.expect(app.quick == null);
+
+    try std.testing.expectEqual(0, Boxes.count);
+}
+
+test "win32: an IPC request waiting when the app quits is told so, and freed" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    defer _ = testTakeQuit();
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+
+    const identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const base = try testIpcBase(&buf);
+    app.serveIpc(&identity, base);
+    const name = try IpcServer.pipeName(alloc, base, &identity);
+    defer alloc.free(name);
+    const bytes = try ipc.encodeRequest(alloc, .new_window, 0, &.{"--title=a"});
+    defer alloc.free(bytes);
+
+    // Recorded, then the quit comes before `run` carries it out: nothing
+    // opens, and quitting stops the server (`stopIpc`), which tells the
+    // client. The testing allocator finds the request if it is not freed
+    // with the requests left (`freeRequests`).
+    var client: IpcServer.TestClient = .{ .name = name, .request = bytes };
+    try client.start();
+    IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+        _ = client.finish() catch {};
+        return err;
+    };
+    const handled = App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0);
+    const recorded = app.requests.items.len;
+    const quit = app.performAction(.app, .quit, {}) catch false;
+    app.createRequested();
+    app.stopIpc();
+    const reply = try client.finish();
+    try std.testing.expectEqual(0, handled);
+    try std.testing.expectEqual(1, recorded);
+    try std.testing.expect(quit);
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqual(ipc.Status.quitting, reply.status);
 }

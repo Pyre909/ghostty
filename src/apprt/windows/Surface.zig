@@ -28,6 +28,7 @@ const BellBorder = @import("BellBorder.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const Overrides = @import("Overrides.zig");
 const currentMods = @import("key.zig").currentMods;
 const isAltGrFakeCtrl = @import("key.zig").isAltGrFakeCtrl;
 const keyAction = @import("key.zig").keyAction;
@@ -673,6 +674,12 @@ pub const Surface = struct {
         /// `create`. Null keeps newConfig's, once checked.
         working_directory: ?[]const u8 = null,
 
+        /// What `ghostty +new-window` or `+new-tab` asked of the terminal
+        /// (`Overrides`): its command, shell integration and working
+        /// directory, in place of the configured ones and of what it
+        /// inherits. Borrowed for the duration of `create`.
+        overrides: ?*const Overrides = null,
+
         /// What the terminal is opened as, for `apprt.surface.newConfig`.
         context: apprt.surface.NewSurfaceContext = .window,
     };
@@ -767,7 +774,12 @@ pub const Surface = struct {
         // works on it.
         var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
-        inheritWorkingDirectory(&config, app.config.@"working-directory", opts.working_directory);
+        // Before the shell is read for drops, below, as GTK applies them
+        // before its terminal starts.
+        if (opts.overrides) |o| try o.apply(&config);
+        // A path asked for is checked as an inherited one is.
+        const wd = if (opts.overrides) |o| o.workingDirectory(opts.working_directory) else opts.working_directory;
+        inheritWorkingDirectory(&config, app.config.@"working-directory", wd);
         // Before init, which clears `first`. Without it a drop takes the
         // quoting for a shell Ghostty does not know, the most careful.
         self.shell = drop.shellOf(alloc, &config, app.core_app.first) catch |err| shell: {

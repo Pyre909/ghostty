@@ -295,7 +295,10 @@ fn tabFor(self: *Window, surface: *Surface) Allocator.Error!*Tab {
 /// shown (`selectTab`), once the app owns the terminal (`App.newTab`).
 pub fn newTab(self: *Window, opts: Surface.Options) !usize {
     const area = self.newTabArea() orelse return App.Error.Win32CallFailed;
-    const surface = try Surface.create(self.app, self, area, opts);
+    const surface = surface: {
+        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self, opts);
+        break :surface try Surface.create(self.app, self, area, opts);
+    };
     // Nothing owns the terminal until it is in a tab.
     errdefer surface.discard();
     return try self.insertTab(surface);
@@ -816,7 +819,7 @@ pub fn create(app: *App, opts: Surface.Options, kind: Kind) !*Window {
     // Under the bar, if `window-show-tab-bar = always` shows it already.
     const area = self.layoutArea() orelse return App.Error.Win32CallFailed;
     const surface = surface: {
-        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self);
+        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self, opts);
         break :surface try Surface.create(app, self, area, opts);
     };
     // Nothing owns the terminal until it is in the tree.
@@ -2181,7 +2184,7 @@ pub fn split(
     ) orelse return error.SplitTooSmall;
 
     const surface = surface: {
-        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self);
+        if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self, opts);
         break :surface try Surface.create(self.app, self, rect, opts);
     };
     // Nothing owns the terminal until it is in the tree.
@@ -2194,10 +2197,11 @@ pub fn split(
     return surface;
 }
 
-/// For tests: makes the terminal `split` opens, and the one `create` puts
-/// in a new window, in place of `Surface.create`, which starts a core and
-/// its program; a test's terminals have no core.
-pub var test_create_pane: if (builtin.is_test) ?*const fn (*Window) anyerror!*Surface else void =
+/// For tests: makes the terminal `split` opens, the one `create` puts in
+/// a new window and the one `newTab` puts in a new tab, from the options
+/// it was to be made with, in place of `Surface.create`, which starts a
+/// core and its program; a test's terminals have no core.
+pub var test_create_pane: if (builtin.is_test) ?*const fn (*Window, Surface.Options) anyerror!*Surface else void =
     if (builtin.is_test) null else {};
 
 /// Make `tree` `t`'s tree in place of the one it has, which is freed. A
