@@ -65,8 +65,8 @@ pub var test_post_fails: if (builtin.is_test) bool else void =
     if (builtin.is_test) false else {};
 
 /// What a client may do: read and write the pipe, read its security (the
-/// client checks its owner), and what CreateFileW asks for with any
-/// access, FILE_READ_ATTRIBUTES and SYNCHRONIZE (an open allowed the
+/// client checks its owner and label), and what CreateFileW asks for with
+/// any access, FILE_READ_ATTRIBUTES and SYNCHRONIZE (an open allowed the
 /// others alone is refused). Not FILE_WRITE_ATTRIBUTES, which
 /// SetNamedPipeHandleState needs, so a client reads the reply as bytes,
 /// by the length in its header (`ipc.replyTextLength`).
@@ -111,6 +111,17 @@ pub const Sid = struct {
         return @ptrCast(@constCast(&self.bytes));
     }
 
+    /// The integrity level a mandatory label's SID, `S-1-16-<level>`,
+    /// stands for, as `SECURITY_MANDATORY_MEDIUM_RID` is; null for any
+    /// other SID. Read from its binary form (MS-DTYP 2.4.2.2): the
+    /// revision, the count of sub-authorities, the authority as 6
+    /// big-endian bytes, then each sub-authority as a little-endian u32.
+    pub fn integrityLevel(self: *const Sid) ?u32 {
+        if (self.len != 12 or self.bytes[1] != 1) return null;
+        if (!std.mem.eql(u8, self.bytes[2..8], &.{ 0, 0, 0, 0, 0, 16 })) return null;
+        return std.mem.readInt(u32, self.bytes[8..12], .little);
+    }
+
     /// The SID as text (`S-1-5-21-...`), owned by the caller. The system
     /// writes it in ASCII.
     pub fn string(self: *const Sid, alloc: Allocator) error{ OutOfMemory, InvalidSid }![]u8 {
@@ -138,6 +149,11 @@ pub const Identity = struct {
     /// administrator is.
     elevated: bool,
 
+    /// The token's integrity level: `SECURITY_MANDATORY_MEDIUM_RID` for
+    /// the user's programs, lower for one run sandboxed, as a browser
+    /// runs some.
+    integrity: u32,
+
     pub const Error = error{ TokenUnavailable, InvalidSid };
 
     /// This process's.
@@ -152,20 +168,24 @@ pub const Identity = struct {
         const user = try tokenUser(token, &buf);
         const session = try tokenValue(win32.DWORD, token, .TokenSessionId);
         const elevation = try tokenValue(win32.TOKEN_ELEVATION, token, .TokenElevation);
+        const integrity = try tokenIntegrity(token, &buf);
         return .{
             .user = user,
             .session = session,
             .elevated = elevation.TokenIsElevated != 0,
+            .integrity = integrity,
         };
     }
 };
 
-/// Room for a TOKEN_USER with the longest SID.
+/// Room for a TOKEN_USER or a TOKEN_MANDATORY_LABEL with the longest
+/// SID.
 const TokenBuffer = struct {
     bytes: [128]u8 align(@alignOf(usize)) = undefined,
 
     comptime {
         std.debug.assert(@sizeOf(win32.TOKEN_USER) + win32.SECURITY_MAX_SID_SIZE <= 128);
+        std.debug.assert(@sizeOf(win32.TOKEN_MANDATORY_LABEL) + win32.SECURITY_MAX_SID_SIZE <= 128);
     }
 };
 
@@ -202,6 +222,12 @@ fn tokenValue(
 fn tokenUser(token: win32.HANDLE, buf: *TokenBuffer) Identity.Error!Sid {
     const user: *const win32.TOKEN_USER = @ptrCast(@alignCast(try tokenInformation(token, .TokenUser, buf)));
     return Sid.copy(user.User.Sid);
+}
+
+fn tokenIntegrity(token: win32.HANDLE, buf: *TokenBuffer) Identity.Error!u32 {
+    const label: *const win32.TOKEN_MANDATORY_LABEL = @ptrCast(@alignCast(try tokenInformation(token, .TokenIntegrityLevel, buf)));
+    const sid = try Sid.copy(label.Label.Sid);
+    return sid.integrityLevel() orelse error.InvalidSid;
 }
 
 pub const NameError = error{

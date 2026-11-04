@@ -3,8 +3,9 @@
 //! `App.performIpc` is), in a process of their own with no App.
 //!
 //! It opens the pipe the running instance of the user's session serves
-//! (IpcServer.zig), checks that the user owns it, lets the instance bring
-//! its window forward, writes the request and reads the reply, all within
+//! (IpcServer.zig), checks that the user owns it and that no less trusted
+//! program made it (`checkPipe`), lets the instance bring its window
+//! forward, writes the request and reads the reply, all within
 //! `budget_ms`. What the instance did not do, and why, it says on stderr.
 //! Run in a Ghostty terminal, it reaches that terminal's instance, by the
 //! pipe that instance serves of its own (`instance_env`), as every plain
@@ -222,16 +223,16 @@ pub fn performAs(
                 error.NameTooLong => break :own,
             };
             defer alloc.free(own);
-            const result = exchange(own, &identity.user, request, &buf, deadline);
+            const result = exchange(own, identity, request, &buf, deadline);
             if (result != .none) break :exchanged result;
         }
-        break :exchanged exchange(name, &identity.user, request, &buf, deadline);
+        break :exchanged exchange(name, identity, request, &buf, deadline);
     };
     const reply = switch (exchanged) {
         .reply => |reply| reply,
         .none => return unanswered(alloc, action, asked, arguments, stderr, "no running Ghostty was found"),
         .refused => return fail(stderr, command, "the pipe of its name refused this process, and was sent nothing", .{}),
-        .foreign => return fail(stderr, command, "the pipe of its name is another account's, and was sent nothing", .{}),
+        .foreign => return fail(stderr, command, "the pipe of its name is another account's, or a less trusted program's, and was sent nothing", .{}),
         .timeout => return fail(stderr, command, "the running Ghostty did not answer in time", .{}),
         .closed => return fail(stderr, command, "the running Ghostty closed the pipe before it answered", .{}),
         .malformed => |err| switch (err) {
@@ -472,7 +473,8 @@ pub const Outcome = union(enum) {
     refused,
 
     /// Another user owns the pipe, as when a process of theirs made the
-    /// name first. Nothing was written to it.
+    /// name first, or a less trusted program of the user's made it, as a
+    /// sandboxed one can (`checkPipe`). Nothing was written to it.
     foreign,
 
     /// The budget ran out.
@@ -498,11 +500,11 @@ pub const Outcome = union(enum) {
 };
 
 /// Send `request` on the pipe `name` (`IpcServer.pipeName`), once it is
-/// known to be `user`'s, and read its reply into `buf`, all by `deadline`
-/// (`deadlineFromNow`).
+/// known to be one `identity` can trust (`checkPipe`), and read its reply
+/// into `buf`, all by `deadline` (`deadlineFromNow`).
 pub fn exchange(
     name: [:0]const u16,
-    user: *const IpcServer.Sid,
+    identity: *const IpcServer.Identity,
     request: []const u8,
     buf: *[ipc.max_reply]u8,
     deadline: u64,
@@ -513,9 +515,9 @@ pub fn exchange(
     };
     defer _ = win32.CloseHandle(pipe);
 
-    // Before anything is written: another user's pipe would read the
-    // arguments, and answer as it liked.
-    if (checkOwner(pipe, user)) |outcome| return outcome;
+    // Before anything is written: another user's pipe, or a less trusted
+    // program's, would read the arguments, and answer as it liked.
+    if (checkPipe(pipe, identity)) |outcome| return outcome;
     allowForeground(pipe);
 
     const event = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse
@@ -595,26 +597,60 @@ fn open(name: [:0]const u16, deadline: u64) Opened {
     }
 }
 
-/// Null when `user` owns the pipe, else how the exchange ends. The
-/// server's own pipe is the user's (`IpcServer.start`); another is not,
-/// even with a DACL that lets the user in.
-fn checkOwner(pipe: win32.HANDLE, user: *const IpcServer.Sid) ?Outcome {
+/// Null when the pipe is one `identity` can trust, else how the exchange
+/// ends. Its user must own it, and its integrity label must be no lower
+/// than `identity`'s level or medium, whichever is lower
+/// (https://learn.microsoft.com/en-us/windows/win32/secauthz/mandatory-integrity-control).
+/// The server's own pipe is both (`IpcServer.start`): the user's, with no
+/// label, which is medium. Another user's pipe is not, even with a DACL
+/// that lets the user in; nor is one that a less trusted program of the
+/// user's made, as a sandboxed one can by making the name first: the
+/// pipe is the user's, but its label is never above the program's own
+/// level. A client below medium takes a pipe at its own level, as a
+/// Ghostty run at that level serves, since it could open no other.
+fn checkPipe(pipe: win32.HANDLE, identity: *const IpcServer.Identity) ?Outcome {
     var owner: ?win32.PSID = null;
+    var label: ?*win32.ACL = null;
     var descriptor: ?win32.PSECURITY_DESCRIPTOR = null;
     const err = win32.GetSecurityInfo(
         pipe,
         win32.SE_KERNEL_OBJECT,
-        win32.OWNER_SECURITY_INFORMATION,
+        win32.OWNER_SECURITY_INFORMATION | win32.LABEL_SECURITY_INFORMATION,
         &owner,
         null,
         null,
-        null,
+        &label,
         &descriptor,
     );
     if (err != 0) return .failure("GetSecurityInfo", @fromBackingInt(@intCast(err)));
     defer _ = win32.LocalFree(descriptor);
     const sid = IpcServer.Sid.copy(owner orelse return .foreign) catch return .foreign;
-    return if (sid.eql(user)) null else .foreign;
+    if (!sid.eql(&identity.user)) return .foreign;
+    const level = labelLevel(label) orelse return .foreign;
+    const least = @min(identity.integrity, win32.SECURITY_MANDATORY_MEDIUM_RID);
+    return if (level < least) .foreign else null;
+}
+
+/// The integrity level of the object whose label `sacl` is, as
+/// GetSecurityInfo reads it: the lowest of its label entries (the system
+/// keeps one), else medium, as an object with no label is taken to be;
+/// null when one cannot be read.
+fn labelLevel(sacl: ?*win32.ACL) ?u32 {
+    const acl = sacl orelse return win32.SECURITY_MANDATORY_MEDIUM_RID;
+    var size: win32.ACL_SIZE_INFORMATION = undefined;
+    if (!win32.GetAclInformation(acl, &size, @sizeOf(win32.ACL_SIZE_INFORMATION), win32.AclSizeInformation).toBool()) return null;
+    var lowest: ?u32 = null;
+    for (0..size.AceCount) |i| {
+        var entry: ?*anyopaque = null;
+        if (!win32.GetAce(acl, @intCast(i), &entry).toBool()) return null;
+        const header: *const win32.ACE_HEADER = @ptrCast(@alignCast(entry orelse return null));
+        if (header.AceType != win32.SYSTEM_MANDATORY_LABEL_ACE_TYPE) continue;
+        const ace: *const win32.SYSTEM_MANDATORY_LABEL_ACE = @ptrCast(@alignCast(header));
+        const sid = IpcServer.Sid.copy(@ptrCast(@constCast(&ace.SidStart))) catch return null;
+        const level = sid.integrityLevel() orelse return null;
+        lowest = @min(lowest orelse level, level);
+    }
+    return lowest orelse win32.SECURITY_MANDATORY_MEDIUM_RID;
 }
 
 /// Let the instance bring the window it opens forward. Windows lets a
@@ -800,7 +836,7 @@ const TestPipe = struct {
 /// A client's exchange on a thread of its own.
 const TestExchange = struct {
     name: [:0]const u16,
-    user: IpcServer.Sid,
+    identity: IpcServer.Identity,
     request: []const u8,
     buf: [ipc.max_reply]u8 = undefined,
     outcome: Outcome = .none,
@@ -811,7 +847,7 @@ const TestExchange = struct {
     }
 
     fn run(self: *TestExchange) void {
-        self.outcome = exchange(self.name, &self.user, self.request, &self.buf, deadlineFromNow());
+        self.outcome = exchange(self.name, &self.identity, self.request, &self.buf, deadlineFromNow());
     }
 
     fn finish(self: *TestExchange) Outcome {
@@ -928,7 +964,8 @@ test "win32: an IPC client sends nothing to a pipe that is not its user's" {
         var system: [win32.SECURITY_MAX_SID_SIZE]u8 align(4) = undefined;
         var system_len: win32.DWORD = system.len;
         try std.testing.expect(win32.CreateWellKnownSid(win32.WinLocalSystemSid, null, &system, &system_len).toBool());
-        const other = try IpcServer.Sid.copy(@ptrCast(&system));
+        var other = t.identity;
+        other.user = try IpcServer.Sid.copy(@ptrCast(&system));
         var buf: [ipc.max_reply]u8 = undefined;
         try std.testing.expectEqual(.foreign, exchange(t.name, &other, request, &buf, deadlineFromNow()));
         try t.accept();
@@ -941,7 +978,47 @@ test "win32: an IPC client sends nothing to a pipe that is not its user's" {
         var t: TestPipe = try .init(alloc, "D:P");
         defer t.deinit(alloc);
         var buf: [ipc.max_reply]u8 = undefined;
-        try std.testing.expectEqual(.refused, exchange(t.name, &t.identity.user, request, &buf, deadlineFromNow()));
+        try std.testing.expectEqual(.refused, exchange(t.name, &t.identity, request, &buf, deadlineFromNow()));
+    }
+}
+
+test "win32: an IPC client sends nothing to a pipe a less trusted program of its user made" {
+    const alloc = std.testing.allocator;
+    const request = try testRequest(alloc);
+    defer alloc.free(request);
+
+    // The user's, labelled low, as every pipe is that a program of the
+    // user's running at the low level makes, whatever it asks for.
+    const identity = try IpcServer.Identity.ofProcess();
+    const user = try identity.user.string(alloc);
+    defer alloc.free(user);
+    const sddl = try std.fmt.allocPrint(alloc, "D:(A;;GA;;;{s})S:(ML;;NW;;;LW)", .{user});
+    defer alloc.free(sddl);
+    {
+        var t: TestPipe = try .init(alloc, sddl);
+        defer t.deinit(alloc);
+        var buf: [ipc.max_reply]u8 = undefined;
+        try std.testing.expectEqual(.foreign, exchange(t.name, &t.identity, request, &buf, deadlineFromNow()));
+        try t.accept();
+        try std.testing.expect(t.sentNothing());
+    }
+
+    // A client as low takes it, as the one pipe it could open.
+    {
+        var t: TestPipe = try .init(alloc, sddl);
+        defer t.deinit(alloc);
+        var low = t.identity;
+        low.integrity = win32.SECURITY_MANDATORY_LOW_RID;
+        var client: TestExchange = .{ .name = t.name, .identity = low, .request = request };
+        try client.start();
+        {
+            errdefer _ = client.finish();
+            try t.accept();
+            var buf: [ipc.max_request]u8 = undefined;
+            try std.testing.expectEqualSlices(u8, request, try t.take(&buf));
+            try t.reply(.ok, "");
+        }
+        try std.testing.expectEqual(ipc.Status.ok, (try testReply(client.finish())).status);
     }
 }
 
@@ -962,7 +1039,7 @@ test "win32: an IPC client connects so that the server can identify it, not act 
     test_allow_foreground = &Foreground.allow;
     defer test_allow_foreground = null;
 
-    var client: TestExchange = .{ .name = t.name, .user = t.identity.user, .request = request };
+    var client: TestExchange = .{ .name = t.name, .identity = t.identity, .request = request };
     try client.start();
     const level = level: {
         errdefer _ = client.finish();
@@ -1008,19 +1085,19 @@ test "win32: an IPC client waits while another client has the pipe, until its bu
     test_budget_ms = 200;
     var buf: [ipc.max_reply]u8 = undefined;
     const started = win32.GetTickCount64();
-    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity.user, request, &buf, deadlineFromNow()));
+    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity, request, &buf, deadlineFromNow()));
     try std.testing.expect(win32.GetTickCount64() - started >= 150);
 
     // By a deadline already past, as the pipe a request tries second
     // gets only what the first left: it does not wait at all.
     test_budget_ms = 5000;
     const late = win32.GetTickCount64();
-    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity.user, request, &buf, late));
+    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity, request, &buf, late));
     try std.testing.expect(win32.GetTickCount64() - late < 2500);
 
     // Freed while it waits: it gets through.
     test_budget_ms = 5000;
-    var client: TestExchange = .{ .name = t.name, .user = t.identity.user, .request = request };
+    var client: TestExchange = .{ .name = t.name, .identity = t.identity, .request = request };
     try client.start();
     {
         errdefer _ = client.finish();
@@ -1048,7 +1125,7 @@ test "win32: an IPC client reads a reply that comes in pieces, and tells one cut
     {
         var t: TestPipe = try .init(alloc, null);
         defer t.deinit(alloc);
-        var client: TestExchange = .{ .name = t.name, .user = t.identity.user, .request = request };
+        var client: TestExchange = .{ .name = t.name, .identity = t.identity, .request = request };
         try client.start();
         {
             errdefer _ = client.finish();
@@ -1067,7 +1144,7 @@ test "win32: an IPC client reads a reply that comes in pieces, and tells one cut
     {
         var t: TestPipe = try .init(alloc, null);
         defer t.deinit(alloc);
-        var client: TestExchange = .{ .name = t.name, .user = t.identity.user, .request = request };
+        var client: TestExchange = .{ .name = t.name, .identity = t.identity, .request = request };
         try client.start();
         {
             errdefer _ = client.finish();
@@ -1085,7 +1162,7 @@ test "win32: an IPC client reads a reply that comes in pieces, and tells one cut
         defer t.deinit(alloc);
         test_budget_ms = 200;
         defer test_budget_ms = null;
-        var client: TestExchange = .{ .name = t.name, .user = t.identity.user, .request = request };
+        var client: TestExchange = .{ .name = t.name, .identity = t.identity, .request = request };
         try client.start();
         {
             errdefer _ = client.finish();

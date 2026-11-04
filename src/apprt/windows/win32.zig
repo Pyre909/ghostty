@@ -1618,6 +1618,7 @@ pub const TOKEN_INFORMATION_CLASS = enum(c_int) {
     TokenImpersonationLevel = 9,
     TokenSessionId = 12,
     TokenElevation = 20,
+    TokenIntegrityLevel = 25,
 };
 pub const SID_AND_ATTRIBUTES = extern struct {
     Sid: PSID,
@@ -1629,6 +1630,13 @@ pub const TOKEN_USER = extern struct {
 pub const TOKEN_ELEVATION = extern struct {
     TokenIsElevated: DWORD,
 };
+pub const TOKEN_MANDATORY_LABEL = extern struct {
+    Label: SID_AND_ATTRIBUTES,
+};
+/// Integrity levels, each the last sub-authority of a mandatory label's
+/// SID, `S-1-16-<level>` (winnt.h).
+pub const SECURITY_MANDATORY_LOW_RID: DWORD = 0x1000;
+pub const SECURITY_MANDATORY_MEDIUM_RID: DWORD = 0x2000;
 /// The longest SID, in bytes (winnt.h).
 pub const SECURITY_MAX_SID_SIZE = 68;
 pub const SDDL_REVISION_1: DWORD = 1;
@@ -1655,7 +1663,8 @@ pub extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
     descriptor: *?PSECURITY_DESCRIPTOR,
     size: ?*DWORD,
 ) callconv(.winapi) BOOL;
-/// For tests, which read a pipe's security back.
+/// A pipe's owner and integrity label (`IpcClient.checkPipe`), and in
+/// tests the rest of its security.
 /// https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo
 pub extern "advapi32" fn GetSecurityInfo(
     handle: HANDLE,
@@ -1671,6 +1680,10 @@ pub extern "advapi32" fn GetSecurityInfo(
 pub const SE_KERNEL_OBJECT: c_int = 6;
 pub const OWNER_SECURITY_INFORMATION: DWORD = 0x0000_0001;
 pub const DACL_SECURITY_INFORMATION: DWORD = 0x0000_0004;
+/// The object's mandatory label, which READ_CONTROL lets a process read
+/// though it is in the SACL
+/// (https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information).
+pub const LABEL_SECURITY_INFORMATION: DWORD = 0x0000_0010;
 pub const ACL = opaque {};
 pub const ACL_SIZE_INFORMATION = extern struct {
     AceCount: DWORD,
@@ -1697,6 +1710,12 @@ pub const ACCESS_ALLOWED_ACE = extern struct {
     SidStart: DWORD,
 };
 pub const ACCESS_ALLOWED_ACE_TYPE: BYTE = 0;
+pub const SYSTEM_MANDATORY_LABEL_ACE = extern struct {
+    Header: ACE_HEADER,
+    Mask: DWORD,
+    SidStart: DWORD,
+};
+pub const SYSTEM_MANDATORY_LABEL_ACE_TYPE: BYTE = 0x11;
 /// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getace
 pub extern "advapi32" fn GetAce(acl: *ACL, index: DWORD, ace: *?*anyopaque) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getsecuritydescriptorcontrol
