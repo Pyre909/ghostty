@@ -1430,17 +1430,27 @@ pub const App = struct {
     /// owner, so the owner must be the top-level window, not a terminal
     /// inside it.
     ///
+    /// The quick terminal owns none while it is hidden or on its way out
+    /// (`Window.quickShown`), as `fallbackOwner` never picks it then:
+    /// MessageBoxW would hand the activation back to it out of sight as
+    /// the box closes, and the keyboard with it. A question of its own, as
+    /// a clipboard question a program in it asks, goes to the window
+    /// `fallbackOwner` picks instead. Its close question shows it first,
+    /// and so is its own (`Window.requestClose`). No other question shows
+    /// it, since one can come inside a core frame, as a clipboard question
+    /// does, and a show lays its terminals out (`Window.showQuick`), which
+    /// this runtime never does there: WM_SIZE would call into the core.
+    ///
     /// A frame with a title prompt open is disabled by it, so the prompt
     /// is the owner instead: the activation then comes back to it, and the
     /// keyboard with it, rather than to a frame that cannot take it
     /// (`TitleDialog`).
     pub fn promptOwner(self: *const App, hwnd: ?win32.HWND) ?win32.HWND {
-        const frame: win32.HWND = if (hwnd) |h|
-            win32.GetAncestor(h, win32.GA_ROOT) orelse h
-        else if (self.fallbackOwner()) |window|
-            window.hwnd
-        else
-            return null;
+        var root: ?win32.HWND = if (hwnd) |h| win32.GetAncestor(h, win32.GA_ROOT) orelse h else null;
+        if (self.quick) |quick| if (root == quick.hwnd and !quick.quickShown()) {
+            root = null;
+        };
+        const frame = root orelse (self.fallbackOwner() orelse return null).hwnd;
         for (self.windows.items) |window| {
             if (window.hwnd == frame) return window.title_prompt.hwnd orelse frame;
         }
@@ -4602,6 +4612,7 @@ test "win32: a prompt belongs to a top-level window" {
     s.wq.quick = true;
     s.q.window = &s.wq;
     s.q.core_surface.rt_surface = &s.q;
+    app.quick = &s.wq;
 
     try std.testing.expect(app.promptOwner(null) == null);
     try app.windows.append(alloc, &s.wq);
@@ -14423,13 +14434,13 @@ fn testQuickPresent() !void {
     try std.testing.expect((try TestQuick.region(quick)) == null);
 }
 
-test "win32: a hidden quick terminal shows before it asks whether to close" {
+test "win32: a hidden quick terminal shows before it asks whether to close, and owns no other question" {
     // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
     try testOnOwnDesktop(testQuickCloseAsks, .{});
 }
 
-/// The test of a hidden quick terminal's close question, run by its test
-/// on a desktop of its own.
+/// The test of a hidden quick terminal's questions, run by its test on a
+/// desktop of its own.
 fn testQuickCloseAsks() !void {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
@@ -14439,9 +14450,10 @@ fn testQuickCloseAsks() !void {
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
+    core_app.focused_surface = null;
     TestQuick.start();
     defer TestQuick.stop();
-    try TestQuick.beside(&app);
+    const a = try testFrame(&app);
     const message_box = &@import("dialog.zig").test_message_box;
     message_box.* = &TestQuick.ask;
     defer message_box.* = null;
@@ -14449,6 +14461,32 @@ fn testQuickCloseAsks() !void {
 
     try TestQuick.toggle(&app);
     const quick = app.quick orelse return error.TestUnexpectedResult;
+    const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    try TestQuick.toggle(&app);
+
+    // A question a program in it asks while it is hidden, as the core
+    // asks one for a clipboard write with `clipboard-write = ask`: the
+    // other window's, as a question with no window of its own is, which
+    // the activation comes back to as it closes; it stays hidden. The
+    // same on its way out. Its own once it shows.
+    const write: []const apprt.ClipboardContent = &.{.{ .mime = "text/plain", .data = "x" }};
+    TestQuick.answer = win32.IDCANCEL;
+    TestQuick.asked = null;
+    try pane.setClipboard(.standard, write, true);
+    try std.testing.expectEqual(a.hwnd, TestQuick.asked.?);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try TestQuick.toggle(&app);
+    try TestQuick.begin(&app);
+    TestQuick.tick(quick, TestQuick.half);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    TestQuick.asked = null;
+    try pane.setClipboard(.standard, write, true);
+    try std.testing.expectEqual(a.hwnd, TestQuick.asked.?);
+    TestQuick.settle(quick);
+    try TestQuick.toggle(&app);
+    TestQuick.asked = null;
+    try pane.setClipboard(.standard, write, true);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
     try TestQuick.toggle(&app);
 
     // Asked to close while hidden (WM_CLOSE, as another program can send
