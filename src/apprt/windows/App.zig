@@ -1387,6 +1387,14 @@ pub const App = struct {
     /// disables its owner and enables it again with the activation as it
     /// returns; disabled here, it would be an owner MessageBoxW found
     /// disabled, and left so.
+    ///
+    /// The quick terminal, on screen, is above every window not always on
+    /// top (`Window.showQuick`), and so would cover a box another window
+    /// owns, or none does, as MessageBoxW makes it without MB_TOPMOST. It
+    /// is disabled, and global keybinds wait (`hotkeyPressed`), so nothing
+    /// would move it away: it leaves that band until `endPrompt`. A box of
+    /// its own, or of its title prompt's, is kept above it by MessageBoxW,
+    /// as an owned window is above its owner.
     pub fn beginPrompt(self: *App, owner: ?win32.HWND) void {
         self.prompt_depth += 1;
         if (self.prompt_depth > 1) return;
@@ -1398,6 +1406,10 @@ pub const App = struct {
             if (win32.EnableWindow(window.hwnd, .FALSE).toBool()) continue;
             window.prompt_disabled = true;
         }
+        const quick = self.quick orelse return;
+        if (!win32.IsWindowVisible(quick.hwnd).toBool()) return;
+        if (owner) |hwnd| if (win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) == quick.hwnd) return;
+        quick.prompt_lowered = quick.setTopmost(false);
     }
 
     /// The window a prompt with no window of its own belongs to
@@ -1471,9 +1483,18 @@ pub const App = struct {
     /// prompt and MessageBoxW enabled it on the way out, and the title
     /// prompt takes input again: enabled here if `beginPrompt` disabled
     /// it, or by MessageBoxW if it owned the prompt.
+    ///
+    /// It puts the quick terminal back above the windows not always on
+    /// top, if `beginPrompt` took it out of that band. Windows are neither
+    /// made nor torn down while a prompt is open (`beginPrompt`), so it is
+    /// the same quick terminal.
     pub fn endPrompt(self: *App) void {
         self.prompt_depth -= 1;
         if (self.prompt_depth > 0) return;
+        if (self.quick) |quick| if (quick.prompt_lowered) {
+            quick.prompt_lowered = false;
+            _ = quick.setTopmost(true);
+        };
         for (self.windows.items) |window| {
             if (window.title_prompt.hwnd) |dialog| {
                 window.prompt_disabled = false;
@@ -4522,6 +4543,7 @@ test "win32: a prompt disables the other windows until the outermost one ends an
 
     var app: App = undefined;
     app.prompt_depth = 0;
+    app.quick = null;
     app.windows = .empty;
     defer app.windows.deinit(std.testing.allocator);
     try app.windows.appendSlice(std.testing.allocator, &.{ &a, &b, &c });
@@ -4747,6 +4769,7 @@ fn testFrame(app: *App) !*Window {
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
+        .prompt_lowered = false,
         .title_prompt = .{},
         .palette = .{},
         .divider_drag = null,
@@ -13039,6 +13062,7 @@ const TestQuick = struct {
         told = null;
         in_front = null;
         watch = null;
+        watch_topmost = null;
         Window.test_create_pane = &create;
         Window.test_foreground = &foreground;
         Surface.test_occlusion = &occlusion;
@@ -13261,16 +13285,19 @@ const TestQuick = struct {
     }
 
     /// The owner of the last prompt `dialog.messageBox` would have shown
-    /// (`dialog.test_message_box`), and whether it showed then; answered
-    /// with `answer`.
+    /// (`dialog.test_message_box`), whether it showed then, and whether
+    /// `watch_topmost` was always on top then; answered with `answer`.
     var asked: ?win32.HWND = null;
     var asked_shown: bool = false;
+    var watch_topmost: ?win32.HWND = null;
+    var asked_topmost: bool = false;
     var answer: c_int = win32.IDCANCEL;
 
     fn ask(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
         _ = .{ prompt, buttons };
         asked = owner;
         asked_shown = if (owner) |hwnd| win32.IsWindowVisible(hwnd).toBool() else false;
+        if (watch_topmost) |hwnd| asked_topmost = hasStyle(hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOPMOST);
         return answer;
     }
 
@@ -14512,6 +14539,65 @@ fn testQuickCloseAsks() !void {
     try std.testing.expect(TestQuick.asked == null);
     try std.testing.expect(quick.closing);
     try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+}
+
+test "win32: the quick terminal does not cover a question another window asks" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickUnderPrompts, .{});
+}
+
+/// The test of the quick terminal's band while a prompt is open, run by
+/// its test on a desktop of its own.
+fn testQuickUnderPrompts() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    core_app.focused_surface = null;
+    TestQuick.start();
+    defer TestQuick.stop();
+    const a = try testFrame(&app);
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestQuick.ask;
+    defer message_box.* = null;
+    defer Window.test_needs_confirm = false;
+
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    TestQuick.watch_topmost = quick.hwnd;
+    try std.testing.expect(TestQuick.hasStyle(quick.hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOPMOST));
+
+    // Shown, as the other window asks whether to close with a program
+    // running in it: out of the band of windows always on top while it
+    // asks, so that the box, which is not in it, is not under the quick
+    // terminal; back in it once the question is answered.
+    Window.test_needs_confirm = true;
+    TestQuick.answer = win32.IDCANCEL;
+    TestQuick.asked = null;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expectEqual(a.hwnd, TestQuick.asked.?);
+    try std.testing.expect(!TestQuick.asked_topmost);
+    try std.testing.expect(TestQuick.hasStyle(quick.hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOPMOST));
+    try std.testing.expect(!a.closing);
+
+    // Its own question, which MessageBoxW keeps above it: it stays in it.
+    TestQuick.asked = null;
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
+    try std.testing.expect(TestQuick.asked_topmost);
+    try std.testing.expect(!quick.closing);
+
+    // Hidden, it covers nothing, and is left as it is.
+    try TestQuick.toggle(&app);
+    TestQuick.asked = null;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expectEqual(a.hwnd, TestQuick.asked.?);
+    try std.testing.expect(TestQuick.asked_topmost);
+    try std.testing.expect(!a.closing);
 }
 
 test "win32: a quick terminal nothing could show again closes rather than stay hidden" {

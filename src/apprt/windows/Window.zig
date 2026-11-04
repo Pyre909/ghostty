@@ -158,6 +158,11 @@ taskbar_button: bool,
 /// (`TitleDialog.close`), for `App.endPrompt` to enable again.
 prompt_disabled: bool,
 
+/// The quick terminal, taken out of the band of windows always on top by
+/// `App.beginPrompt` for a prompt it does not own, for `App.endPrompt` to
+/// put back.
+prompt_lowered: bool,
+
 /// The window's title prompt, open or not (`TitleDialog`), which holds the
 /// frame disabled while it is open.
 title_prompt: TitleDialog.Prompt,
@@ -862,6 +867,7 @@ pub fn createBare(app: *App, kind: Kind) !*Window {
         .modal_loops = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
+        .prompt_lowered = false,
         .title_prompt = .{},
         .palette = .{},
         .divider_drag = null,
@@ -1088,6 +1094,19 @@ fn quickHidden(self: *Window) void {
     _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
     var it = self.tab().tree.iterator();
     while (it.next()) |entry| entry.view.occlusionChanged(false);
+}
+
+/// Put the quick terminal in the band of windows always on top, where it
+/// is while it shows (`showQuick`), or take it out of it, for a prompt
+/// another window owns (`App.beginPrompt`); it neither moves nor takes
+/// the activation. False if it could not, logged.
+pub fn setTopmost(self: *Window, on: bool) bool {
+    assert(self.quick);
+    const after = if (on) win32.HWND_TOPMOST else win32.HWND_NOTOPMOST;
+    const flags = win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE;
+    if (win32.SetWindowPos(self.hwnd, after, 0, 0, 0, 0, flags).toBool()) return true;
+    log.warn("unable to move the quick terminal between bands topmost={} err={}", .{ on, win32.GetLastError() });
+    return false;
 }
 
 /// Whether the quick terminal shows, or is coming in: it is visible and
