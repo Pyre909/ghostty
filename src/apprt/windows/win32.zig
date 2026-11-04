@@ -448,6 +448,11 @@ pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
 pub const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
 pub const LoadLibraryExW = internal_os.windows.exp.kernel32.LoadLibraryExW;
 pub const LOAD_LIBRARY_SEARCH_SYSTEM32 = internal_os.windows.LOAD_LIBRARY_SEARCH_SYSTEM32;
+pub const CreateProcessW = internal_os.windows.exp.kernel32.CreateProcessW;
+pub const STARTUPINFOW = internal_os.windows.STARTUPINFOW;
+pub const PROCESS_INFORMATION = internal_os.windows.PROCESS_INFORMATION;
+pub const GetEnvironmentVariableW = internal_os.windows.exp.kernel32.GetEnvironmentVariableW;
+pub const SetEnvironmentVariableW = internal_os.windows.exp.kernel32.SetEnvironmentVariableW;
 /// Milliseconds since the system started.
 /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64
 pub extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;

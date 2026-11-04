@@ -22489,16 +22489,26 @@ fn testIpcCli() !void {
     }
     try std.testing.expectEqual(3, a.tabs.items.len);
 
-    // Quitting: it fails, saying so. The core's terminals held the one
-    // of the id for the tab; quitting asks each whether it needs a
-    // confirmation, and a test's has no core to ask.
+    // Quitting: a new window starts a Ghostty of its own, and the quick
+    // terminal fails, saying so. The core's terminals held the one of the
+    // id for the tab; quitting asks each whether it needs a confirmation,
+    // and a test's has no core to ask.
     core_app.surfaces.clearRetainingCapacity();
     core_app.focused_surface = null;
     try std.testing.expect(try app.performAction(.app, .quit, {}));
+    IpcClient.TestSpawn.start();
+    defer IpcClient.TestSpawn.stop();
     {
-        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window };
+        var arguments = [_][:0]const u8{"--title=b"};
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .arguments = &arguments };
+        try std.testing.expect(try testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("", cli.said());
+        try IpcClient.TestSpawn.expectStarted(&arguments);
+    }
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .toggle_quick_terminal };
         try std.testing.expectError(error.IPCFailed, testCliSend(&app, &cli));
-        try std.testing.expectEqualStrings("+new-window failed: the running Ghostty is quitting\n", cli.said());
+        try std.testing.expectEqualStrings("+toggle-quick-terminal failed: the running Ghostty is quitting\n", cli.said());
     }
     try std.testing.expectEqual(1, app.windows.items.len);
 }

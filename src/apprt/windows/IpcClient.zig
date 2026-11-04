@@ -6,12 +6,15 @@
 //! (IpcServer.zig), checks that the user owns it, lets the instance bring
 //! its window forward, writes the request and reads the reply, all within
 //! `budget_ms`. What the instance did not do, and why, it says on stderr.
+//! A new window or tab that no instance can take starts Ghostty instead
+//! (`startGhostty`), as D-Bus activation starts GTK's.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const apprt = @import("../../apprt.zig");
+const launcher_env = @import("../../os/main.zig").windows.launcher_env;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const ipc = @import("ipc.zig");
 const IpcServer = @import("IpcServer.zig");
@@ -31,6 +34,13 @@ pub var test_budget_ms: if (builtin.is_test) ?u32 else void =
 /// For tests: told the process an exchange would let bring its window
 /// forward, which it then does not call AllowSetForegroundWindow for.
 pub var test_allow_foreground: if (builtin.is_test) ?*const fn (win32.DWORD) void else void =
+    if (builtin.is_test) null else {};
+
+/// For tests: given the command line a client would start Ghostty with,
+/// which it then does not start, and what the start ends with in its
+/// place (`spawn`). A test build starts no process, as its image is the
+/// test runner.
+pub var test_spawn: if (builtin.is_test) ?*const fn ([:0]const u16) ?win32.Win32Error else void =
     if (builtin.is_test) null else {};
 
 /// What `perform` fails with, once it has said why on stderr, as the CLI
@@ -54,8 +64,9 @@ pub fn perform(
 }
 
 /// `perform` as `identity`: true once the instance did it, or will
-/// (`ipc.Status.pending`, which it says), and error.IPCFailed once it has
-/// said what came of it otherwise. What it cannot say, as with no console
+/// (`ipc.Status.pending`, which it says), or once Ghostty is started for it
+/// (`unanswered`), and error.IPCFailed once it has said what came of it
+/// otherwise. What it cannot say, as with no console
 /// to say it on, it drops.
 pub fn performAs(
     alloc: Allocator,
@@ -66,13 +77,18 @@ pub fn performAs(
     stderr: *std.Io.Writer,
 ) Error!bool {
     const command = comptime commandName(action);
+    const surface_id: u64, const arguments: ?[]const [:0]const u8 = switch (action) {
+        .new_window => .{ 0, value.arguments },
+        .new_tab => .{ value.surface_id, value.arguments },
+        .toggle_quick_terminal => .{ 0, null },
+    };
 
     // An elevated client would open its window in the user's instance,
     // which is not elevated, where an administrator's shell asked for one
     // that is; and that instance's pipe is one any of the user's programs
     // could have made first. An elevated instance serves nothing for the
-    // same reason (`App.serveIpc`).
-    if (identity.elevated) return fail(stderr, command, "an elevated process does not reach a running Ghostty", .{});
+    // same reason (`App.serveIpc`), so one is started, elevated too.
+    if (identity.elevated) return unanswered(alloc, action, arguments, stderr, "an elevated process does not reach a running Ghostty");
 
     // As GTK names its bus (src/apprt/gtk/ipc/DBus.zig): by the class, else
     // by the build's own id.
@@ -87,11 +103,6 @@ pub fn performAs(
     };
     defer alloc.free(name);
 
-    const surface_id: u64, const arguments: ?[]const [:0]const u8 = switch (action) {
-        .new_window => .{ 0, value.arguments },
-        .new_tab => .{ value.surface_id, value.arguments },
-        .toggle_quick_terminal => .{ 0, null },
-    };
     const request = ipc.encodeRequest(alloc, .fromCore(action), surface_id, arguments) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidArgument => return fail(stderr, command, "an argument is not valid Unicode", .{}),
@@ -103,7 +114,7 @@ pub fn performAs(
     var buf: [ipc.max_reply]u8 = undefined;
     const reply = switch (exchange(name, &identity.user, request, &buf)) {
         .reply => |reply| reply,
-        .none => return fail(stderr, command, "no running Ghostty was found", .{}),
+        .none => return unanswered(alloc, action, arguments, stderr, "no running Ghostty was found"),
         .foreign => return fail(stderr, command, "the pipe of its name is another account's, and was sent nothing", .{}),
         .timeout => return fail(stderr, command, "the running Ghostty did not answer in time", .{}),
         .closed => return fail(stderr, command, "the running Ghostty closed the pipe before it answered", .{}),
@@ -119,7 +130,12 @@ pub fn performAs(
             say(stderr, "{s}: {f}\n", .{ command, Safe{ .text = reply.text } });
             return true;
         },
-        .unsupported, .bad_request, .bad_arguments, .quitting, .failed => {
+        // Its pipe goes with it, and so would a window or tab it opened.
+        .quitting => switch (action) {
+            .new_window, .new_tab => return startGhostty(alloc, command, arguments, stderr),
+            .toggle_quick_terminal => return fail(stderr, command, "{f}", .{Safe{ .text = reply.text }}),
+        },
+        .unsupported, .bad_request, .bad_arguments, .failed => {
             return fail(stderr, command, "{f}", .{Safe{ .text = reply.text }});
         },
     }
@@ -146,6 +162,133 @@ fn fail(stderr: *std.Io.Writer, comptime command: []const u8, comptime format: [
 fn say(stderr: *std.Io.Writer, comptime format: []const u8, args: anytype) void {
     stderr.print(format, args) catch return;
     stderr.flush() catch {};
+}
+
+/// A request that no running instance can take, for `reason`. A new window
+/// or tab starts Ghostty instead (`startGhostty`), as D-Bus activation
+/// starts GTK's. The quick terminal fails: no option starts Ghostty with
+/// it shown, where D-Bus starts GTK's and then asks it to toggle.
+fn unanswered(
+    alloc: Allocator,
+    comptime action: apprt.ipc.Action.Key,
+    arguments: ?[]const [:0]const u8,
+    stderr: *std.Io.Writer,
+    comptime reason: []const u8,
+) Error!bool {
+    const command = comptime commandName(action);
+    return switch (action) {
+        .new_window, .new_tab => startGhostty(alloc, command, arguments, stderr),
+        .toggle_quick_terminal => fail(stderr, command, reason, .{}),
+    };
+}
+
+/// Start Ghostty, this process's own image, with `arguments` as its
+/// command line, and not wait for it: true once it is started, its own
+/// window saying what it makes of them.
+fn startGhostty(
+    alloc: Allocator,
+    comptime command: []const u8,
+    arguments: ?[]const [:0]const u8,
+    stderr: *std.Io.Writer,
+) Error!bool {
+    const image = try imagePath(alloc);
+    defer alloc.free(image);
+    const line = commandLine(alloc, image, arguments orelse &.{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidUtf8 => return fail(stderr, command, "an argument is not valid Unicode", .{}),
+    };
+    defer alloc.free(line);
+    if (spawn(image, line)) |err|
+        return fail(stderr, command, "Ghostty cannot be started (error {d})", .{@backingInt(err)});
+    return true;
+}
+
+/// This process's image, ghostty.exe, as Windows started it.
+fn imagePath(alloc: Allocator) Allocator.Error![:0]u16 {
+    const name = std.os.windows.peb().ProcessParameters.ImagePathName;
+    const buf = name.Buffer orelse return alloc.dupeSentinel(u16, &.{}, 0);
+    return alloc.dupeSentinel(u16, buf[0 .. name.Length / 2], 0);
+}
+
+/// `image`, quoted, then each of `arguments`, quoted where it needs to be,
+/// so that the started process splits the line back into them
+/// (std.process.Args.Iterator.Windows, which follows the C runtime). A
+/// path cannot hold a quote, so quotes alone keep its spaces.
+fn commandLine(
+    alloc: Allocator,
+    image: []const u16,
+    arguments: []const [:0]const u8,
+) (Allocator.Error || error{InvalidUtf8})![:0]u16 {
+    var line: std.ArrayList(u16) = .empty;
+    errdefer line.deinit(alloc);
+    try line.append(alloc, '"');
+    try line.appendSlice(alloc, image);
+    try line.append(alloc, '"');
+    for (arguments) |argument| {
+        try line.append(alloc, ' ');
+        try appendQuoted(alloc, &line, argument);
+    }
+    return line.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// `argument` as one word of a command line: as it is, unless it is empty
+/// or has a space, a tab, a newline or a quote. Then it is quoted, and
+/// inside the quotes a quote is escaped with a backslash and a run of
+/// backslashes doubled where a quote follows it, its own or the closing
+/// one, since there 2n backslashes stand for n
+/// (https://learn.microsoft.com/en-us/cpp/c-language/parsing-c-command-line-arguments).
+/// Anywhere else a backslash is itself.
+fn appendQuoted(
+    alloc: Allocator,
+    line: *std.ArrayList(u16),
+    argument: []const u8,
+) (Allocator.Error || error{InvalidUtf8})!void {
+    const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, argument);
+    defer alloc.free(wide);
+    const plain = wide.len != 0 and std.mem.indexOfAny(u16, wide, &.{ ' ', '\t', '\n', 0x0b, '"' }) == null;
+    if (plain) return line.appendSlice(alloc, wide);
+    try line.append(alloc, '"');
+    var backslashes: usize = 0;
+    for (wide) |unit| switch (unit) {
+        '\\' => backslashes += 1,
+        '"' => {
+            try line.appendNTimes(alloc, '\\', 2 * backslashes + 1);
+            try line.append(alloc, '"');
+            backslashes = 0;
+        },
+        else => {
+            try line.appendNTimes(alloc, '\\', backslashes);
+            try line.append(alloc, unit);
+            backslashes = 0;
+        },
+    };
+    try line.appendNTimes(alloc, '\\', 2 * backslashes);
+    try line.append(alloc, '"');
+}
+
+/// Start `line` from `image` with nothing of this process's inherited:
+/// neither its handles, among them those of the console it runs a CLI
+/// action on, which a pipe at the command line would wait for the started
+/// process to close, nor the launcher's process ID, by which the started
+/// process would take that console for its own
+/// (`internal_os.windows.attachLauncherConsole`). Null once started, else
+/// why not.
+fn spawn(image: [:0]u16, line: [:0]u16) ?win32.Win32Error {
+    // From this process's own environment, which the started one copies:
+    // this one ends once its action is done.
+    _ = win32.SetEnvironmentVariableW(launcher_env, null);
+    if (builtin.is_test) {
+        const record = test_spawn orelse @panic("a test would start a process");
+        return record(line);
+    }
+    var si = std.mem.zeroes(win32.STARTUPINFOW);
+    si.cb = @sizeOf(win32.STARTUPINFOW);
+    var pi: win32.PROCESS_INFORMATION = undefined;
+    if (!win32.CreateProcessW(image.ptr, line.ptr, null, null, .FALSE, 0, null, null, &si, &pi).toBool())
+        return win32.GetLastError();
+    _ = win32.CloseHandle(pi.hThread);
+    _ = win32.CloseHandle(pi.hProcess);
+    return null;
 }
 
 /// Text for the console, with a code point that could start a terminal's
@@ -535,7 +678,7 @@ fn testRequest(alloc: Allocator) ![]u8 {
     return ipc.encodeRequest(alloc, .new_window, 0, &.{"--title=a"});
 }
 
-test "win32: an IPC client with no instance to reach says so" {
+test "win32: an IPC client with no instance to reach starts Ghostty for a window or tab, and says so for the quick terminal" {
     const alloc = std.testing.allocator;
     const identity = try IpcServer.Identity.ofProcess();
     var buf: [64]u8 = undefined;
@@ -549,11 +692,32 @@ test "win32: an IPC client with no instance to reach says so" {
         performAs(alloc, &identity, .{ .class = class }, .toggle_quick_terminal, {}, &out.writer),
     );
     try std.testing.expectEqualStrings("+toggle-quick-terminal failed: no running Ghostty was found\n", out.written());
+
+    // Started with the arguments as given, and without the launcher's
+    // process ID, which this process has when ghostty.com runs it.
+    TestSpawn.start();
+    defer TestSpawn.stop();
+    try std.testing.expect(win32.SetEnvironmentVariableW(launcher_env, std.unicode.utf8ToUtf16LeStringLiteral("1")).toBool());
+    defer _ = win32.SetEnvironmentVariableW(launcher_env, null);
+    out.clearRetainingCapacity();
+    var arguments = [_][:0]const u8{ "--working-directory=C:\\a b\\", "-e", "cmd.exe", "/k", "echo \"hi\"" };
+    try std.testing.expect(try performAs(alloc, &identity, .{ .class = class }, .new_tab, .{ .surface_id = 0x11, .arguments = &arguments }, &out.writer));
+    try std.testing.expectEqualStrings("", out.written());
+    try TestSpawn.expectStarted(&arguments);
+
+    // One that cannot be started fails, saying so.
+    TestSpawn.fails = .FILE_NOT_FOUND;
+    out.clearRetainingCapacity();
+    try std.testing.expectError(
+        error.IPCFailed,
+        performAs(alloc, &identity, .{ .class = class }, .new_window, .{ .arguments = &arguments }, &out.writer),
+    );
+    try std.testing.expectEqualStrings("+new-window failed: Ghostty cannot be started (error 2)\n", out.written());
 }
 
-test "win32: an IPC client refuses a class that cannot name a pipe, and an elevated client sends nothing" {
+test "win32: an IPC client refuses a class that cannot name a pipe, and arguments a request cannot carry" {
     const alloc = std.testing.allocator;
-    var identity = try IpcServer.Identity.ofProcess();
+    const identity = try IpcServer.Identity.ofProcess();
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
     try std.testing.expectError(
@@ -593,27 +757,6 @@ test "win32: an IPC client refuses a class that cannot name a pipe, and an eleva
         );
         try std.testing.expectEqualStrings(case.said, out.written());
     }
-
-    // Elevated, with an instance to reach: it does not open the pipe. Were
-    // it to, it would wait for a reply nobody sends; not for long.
-    var t: TestPipe = try .init(alloc, null);
-    defer t.deinit(alloc);
-    test_budget_ms = 200;
-    defer test_budget_ms = null;
-    out.clearRetainingCapacity();
-    identity.elevated = true;
-    try std.testing.expectError(
-        error.IPCFailed,
-        performAs(alloc, &identity, .{ .class = t.class }, .new_tab, .{ .surface_id = 0, .arguments = null }, &out.writer),
-    );
-    try std.testing.expectEqualStrings("+new-tab failed: an elevated process does not reach a running Ghostty\n", out.written());
-    var ov = overlapped(win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.TestUnexpectedResult);
-    defer _ = win32.CloseHandle(ov.hEvent.?);
-    try std.testing.expect(!win32.ConnectNamedPipe(t.pipe, &ov).toBool());
-    try std.testing.expectEqual(win32.Win32Error.IO_PENDING, win32.GetLastError());
-    _ = win32.CancelIoEx(t.pipe, &ov);
-    var n: win32.DWORD = 0;
-    _ = win32.GetOverlappedResult(t.pipe, &ov, &n, .TRUE);
 }
 
 test "win32: an IPC client sends nothing to a pipe that is not its user's" {
@@ -843,6 +986,7 @@ test "win32: an IPC client says what the instance did not do, its text made safe
         text: []const u8,
         result: Error!bool,
         said: []const u8,
+        started: bool = false,
     };
     const cases = [_]Case{
         .{ .status = .ok, .text = "unsaid", .result = true, .said = "" },
@@ -854,9 +998,12 @@ test "win32: an IPC client says what the instance did not do, its text made safe
             .result = error.IPCFailed,
             .said = "+new-window failed: aU+001B[31mbU+202Ec\n",
         },
-        .{ .status = .quitting, .text = "it quits", .result = error.IPCFailed, .said = "+new-window failed: it quits\n" },
+        // Its window would go with it: one of its own is started instead.
+        .{ .status = .quitting, .text = "it quits", .result = true, .said = "", .started = true },
         .{ .status = .failed, .text = "it failed", .result = error.IPCFailed, .said = "+new-window failed: it failed\n" },
     };
+    TestSpawn.start();
+    defer TestSpawn.stop();
     for (cases) |case| {
         var arguments = [_][:0]const u8{"--title=a"};
         var cli: TestCli = .{ .identity = identity, .class = t.class, .action = .new_window, .arguments = &arguments };
@@ -874,6 +1021,11 @@ test "win32: an IPC client says what the instance did not do, its text made safe
         }
         try std.testing.expectEqual(case.result, cli.finish());
         try std.testing.expectEqualStrings(case.said, cli.said());
+        if (case.started) {
+            try TestSpawn.expectStarted(&arguments);
+        } else {
+            try std.testing.expectEqual(null, TestSpawn.len);
+        }
         try std.testing.expect(t.sentNothing());
         try std.testing.expect(win32.DisconnectNamedPipe(t.pipe).toBool());
     }
@@ -917,4 +1069,142 @@ test "win32: an IPC client names its command as the command line does" {
         try std.testing.expectEqual('+', name[0]);
         try std.testing.expect(std.meta.stringToEnum(CliAction, name[1..]) != null);
     }
+}
+
+/// For tests: records the command line a client would start Ghostty with
+/// (`test_spawn`), and whether the launcher's process ID was gone from the
+/// environment by then.
+pub const TestSpawn = struct {
+    var line: [2048]u16 = undefined;
+    var len: ?usize = null;
+    var launcher_gone: bool = false;
+    /// What the start ends with, null for started.
+    pub var fails: ?win32.Win32Error = null;
+
+    pub fn start() void {
+        len = null;
+        launcher_gone = false;
+        fails = null;
+        test_spawn = &record;
+    }
+
+    pub fn stop() void {
+        test_spawn = null;
+    }
+
+    fn record(started: [:0]const u16) ?win32.Win32Error {
+        // One too long to keep is kept as none, which fails the test.
+        if (started.len <= line.len) {
+            @memcpy(line[0..started.len], started);
+            len = started.len;
+        }
+        var value: [1]u16 = undefined;
+        launcher_gone = win32.GetEnvironmentVariableW(launcher_env, &value, value.len) == 0 and
+            win32.GetLastError() == .ENVVAR_NOT_FOUND;
+        return fails;
+    }
+
+    /// That Ghostty was started, from an image, with `arguments`, and no
+    /// launcher's process ID; and forget it.
+    pub fn expectStarted(arguments: []const [:0]const u8) !void {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const started = len orelse return error.TestUnexpectedResult;
+        len = null;
+        const got = try testSplit(arena.allocator(), line[0..started]);
+        try std.testing.expect(launcher_gone);
+        try std.testing.expectEqual(arguments.len + 1, got.len);
+        try std.testing.expect(std.ascii.endsWithIgnoreCase(got[0], ".exe"));
+        for (arguments, got[1..]) |want, have| try std.testing.expectEqualStrings(want, have);
+    }
+};
+
+/// The words of `line`, split as Zig splits ghostty.exe's own command line.
+fn testSplit(alloc: Allocator, line: []const u16) ![]const []const u8 {
+    var it = try std.process.Args.Iterator.Windows.init(alloc, line);
+    var words: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |word| try words.append(alloc, try alloc.dupe(u8, word));
+    return words.items;
+}
+
+fn expectSplitsBack(alloc: Allocator, arguments: []const [:0]const u8) !void {
+    const image = std.unicode.utf8ToUtf16LeStringLiteral("C:\\Program Files\\Ghostty\\ghostty.exe");
+    const line = try commandLine(alloc, image, arguments);
+    const got = try testSplit(alloc, line);
+    try std.testing.expectEqual(arguments.len + 1, got.len);
+    try std.testing.expectEqualStrings("C:\\Program Files\\Ghostty\\ghostty.exe", got[0]);
+    for (arguments, got[1..]) |want, have| try std.testing.expectEqualStrings(want, have);
+}
+
+test "win32: an IPC client starts Ghostty with its arguments as they were given" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try expectSplitsBack(alloc, &.{});
+    try expectSplitsBack(alloc, &.{ "--title=a b", "-e", "cmd.exe", "/k", "echo \"hi\"" });
+    // Backslashes: before a quote, at the end inside quotes, and bare.
+    try expectSplitsBack(alloc, &.{ "--working-directory=C:\\a b\\", "a\\\"b", "C:\\x\\", "\\\\srv\\s", "" });
+    try expectSplitsBack(alloc, &.{ "\u{e9}", "\u{1F47B} x", "a\tb", "a\nb" });
+    try std.testing.expectError(error.InvalidUtf8, commandLine(alloc, &.{}, &.{"a\xffb"}));
+
+    // Every argument of up to five of the characters that change the
+    // split, alone and between two others.
+    const alphabet = "a \t\"\\";
+    const most = 5;
+    var buf: [most + 1]u8 = undefined;
+    for (0..most + 1) |len| {
+        var digits: [most]usize = @splat(0);
+        while (true) {
+            for (buf[0..len], digits[0..len]) |*c, d| c.* = alphabet[d];
+            buf[len] = 0;
+            const argument: [:0]const u8 = buf[0..len :0];
+            try expectSplitsBack(alloc, &.{argument});
+            try expectSplitsBack(alloc, &.{ "x", argument, "\\" });
+            var i: usize = 0;
+            while (i < len) : (i += 1) {
+                digits[i] += 1;
+                if (digits[i] < alphabet.len) break;
+                digits[i] = 0;
+            }
+            if (i == len) break;
+        }
+    }
+}
+
+test "win32: an elevated IPC client starts a Ghostty of its own, and sends nothing" {
+    const alloc = std.testing.allocator;
+    var t: TestPipe = try .init(alloc, null);
+    defer t.deinit(alloc);
+    var identity = t.identity;
+    identity.elevated = true;
+    // Were it to open the pipe, it would wait for a reply nobody sends;
+    // not for long.
+    test_budget_ms = 200;
+    defer test_budget_ms = null;
+    TestSpawn.start();
+    defer TestSpawn.stop();
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    var arguments = [_][:0]const u8{"--title=a"};
+    try std.testing.expect(try performAs(alloc, &identity, .{ .class = t.class }, .new_tab, .{ .surface_id = 0, .arguments = &arguments }, &out.writer));
+    try std.testing.expectEqualStrings("", out.written());
+    try TestSpawn.expectStarted(&arguments);
+
+    out.clearRetainingCapacity();
+    try std.testing.expectError(
+        error.IPCFailed,
+        performAs(alloc, &identity, .{ .class = t.class }, .toggle_quick_terminal, {}, &out.writer),
+    );
+    try std.testing.expectEqualStrings("+toggle-quick-terminal failed: an elevated process does not reach a running Ghostty\n", out.written());
+
+    // Neither opened the pipe.
+    var ov = overlapped(win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.TestUnexpectedResult);
+    defer _ = win32.CloseHandle(ov.hEvent.?);
+    try std.testing.expect(!win32.ConnectNamedPipe(t.pipe, &ov).toBool());
+    try std.testing.expectEqual(win32.Win32Error.IO_PENDING, win32.GetLastError());
+    _ = win32.CancelIoEx(t.pipe, &ov);
+    var n: win32.DWORD = 0;
+    _ = win32.GetOverlappedResult(t.pipe, &ov, &n, .TRUE);
 }
