@@ -14853,6 +14853,8 @@ fn testQuickStrandedHotkey() !void {
     defer TestQuick.stop();
     TestHotkeys.install(&app);
     defer TestHotkeys.remove(&app);
+    // No core terminal would ask before the quit (`requestQuit`).
+    core_app.surfaces = .empty;
     const a = try testFrame(&app);
     try TestHotkeys.apply(&app, &.{"global:ctrl+a=toggle_quick_terminal"});
     app.createRequested();
@@ -14875,22 +14877,31 @@ fn testQuickStrandedHotkey() !void {
     try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
     try std.testing.expect(!quick.closing);
 
-    // A reload takes the keybind away while the app quits, as the core's
-    // `quit` can set it inside a tick of `run`: it goes with the rest, and
-    // is not closed on its own.
-    try TestHotkeys.apply(&app, &.{});
-    app.createRequested();
-    app.quit = true;
-    app.closeStrandedQuick();
-    app.quit = false;
-    try std.testing.expect(!quick.closing);
-
-    // And with the app not quitting: nothing could show it again, and,
+    // A reload takes the keybind away: nothing could show it again, and,
     // with nothing running to ask about, it closes.
     try TestHotkeys.apply(&app, &.{});
     app.createRequested();
     app.closeStrandedQuick();
     try std.testing.expect(quick.closing);
+    TestQuick.tearDown();
+    try std.testing.expect(app.quick == null);
+
+    // Made again with the keybind back, and hidden, a reload takes the
+    // keybind away while the app quits, as the core can perform both
+    // inside one tick of `run`, which then carries out no request: it goes
+    // with the rest at the quit, and is not closed on its own.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=toggle_quick_terminal"});
+    app.createRequested();
+    try TestQuick.toggle(&app);
+    const again = app.quick orelse return error.TestUnexpectedResult;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindowVisible(again.hwnd).toBool());
+    try TestHotkeys.apply(&app, &.{});
+    try std.testing.expect(try app.performAction(.app, .quit, {}));
+    app.createRequested();
+    app.closeStrandedQuick();
+    try std.testing.expect(!again.closing);
+    try std.testing.expect(testTakeQuit());
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
