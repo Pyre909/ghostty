@@ -999,15 +999,18 @@ pub fn show(self: *Window) void {
 }
 
 /// `toggle_quick_terminal` with the quick terminal hidden, or just made
-/// (`App.toggleQuick`): place it again, on the monitor it goes on now
-/// (`quickWork`), above every window that is not, and bring it forward
-/// with the keyboard, as GTK and macOS show theirs. Its shown tab's
-/// terminals are told they show (`relayout`): a hidden frame's children
-/// are told nothing (`hideQuick`). Shown where it was if its monitor
-/// cannot be read. The window in the foreground first is remembered
-/// (`quick_return`). It comes in by its animation (`QuickAnimation`), from
-/// none of it, or from what a hide still running left of it.
-pub fn showQuick(self: *Window) void {
+/// (`App.toggleQuick`), or a request to bring it forward (`present`) or to
+/// close it with a question to ask (`requestClose`): place it again, on
+/// the monitor it goes on now (`quickWork`), above every window that is
+/// not, and bring it forward with the keyboard, as GTK and macOS show
+/// theirs. Its shown tab's terminals are told they show (`relayout`): a
+/// hidden frame's children are told nothing (`hideQuick`). Shown where it
+/// was if its monitor cannot be read. The window in the foreground first
+/// is remembered (`quick_return`). It comes in by its animation
+/// (`QuickAnimation`), from none of it, or from what a hide still running
+/// left of it. False if it could not be shown, or was shown without the
+/// keyboard.
+pub fn showQuick(self: *Window) bool {
     assert(self.quick);
     self.quick_return = if (App.foregroundWindow()) |front|
         (if (ofApp(self.app, front)) null else front)
@@ -1019,7 +1022,7 @@ pub fn showQuick(self: *Window) void {
     if (quickWork(self.app, .pointer)) |work| {
         if (!self.placeQuick(work, win32.HWND_TOPMOST, flags)) {
             self.stopQuickAnimation();
-            return;
+            return false;
         }
     } else if (!win32.SetWindowPos(
         self.hwnd,
@@ -1032,14 +1035,16 @@ pub fn showQuick(self: *Window) void {
     ).toBool()) {
         log.warn("unable to show the quick terminal err={}", .{win32.GetLastError()});
         self.stopQuickAnimation();
-        return;
+        return false;
     }
     // Laid out here too: WM_SIZE comes only if the size changed.
     self.relayout();
     _ = win32.UpdateWindow(self.hwnd);
     // FALSE under Windows' foreground lock (`bringForward`): it shows,
     // above the window in front, which keeps the keyboard.
-    if (!self.present()) log.info("the quick terminal shows without the keyboard: SetForegroundWindow refused", .{});
+    if (self.bringToFront()) return true;
+    log.info("the quick terminal shows without the keyboard: SetForegroundWindow refused", .{});
+    return false;
 }
 
 /// `toggle_quick_terminal` with the quick terminal shown, or autohide
@@ -1880,14 +1885,22 @@ pub fn requestClose(self: *Window) void {
     const ask = for (self.tabs.items) |t| {
         if (needsConfirm(t)) break true;
     } else false;
-    if (ask and !confirm(
-        self.app,
-        self.hwnd,
-        L("A process is still running in this window. Close it anyway?"),
-        .ok,
-    )) {
-        self.closing = false;
-        return;
+    if (ask) {
+        // A quick terminal that is hidden, or on its way out, shows first,
+        // as macOS shows its own before it asks
+        // (QuickTerminalController.confirmCloseAsync): what the question
+        // closes is in view, and the question is its own
+        // (`App.promptOwner`). Cancelled, it stays shown.
+        if (self.quick and !self.quickShown()) _ = self.showQuick();
+        if (!confirm(
+            self.app,
+            self.hwnd,
+            L("A process is still running in this window. Close it anyway?"),
+            .ok,
+        )) {
+            self.closing = false;
+            return;
+        }
     }
 
     self.postDestroy();
@@ -2055,6 +2068,7 @@ pub fn closeTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMode) bool
 
 /// Whether a terminal of `t` asks before it closes.
 fn needsConfirm(t: *const Tab) bool {
+    if (builtin.is_test) if (test_needs_confirm) return true;
     var it = t.tree.iterator();
     while (it.next()) |entry| {
         const core_surface = entry.view.liveCore() orelse continue;
@@ -2062,6 +2076,10 @@ fn needsConfirm(t: *const Tab) bool {
     }
     return false;
 }
+
+/// For tests: a process still running in every terminal (`needsConfirm`),
+/// as a test's terminals, which have no core, cannot have one.
+pub var test_needs_confirm: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 
 /// Ask for the window to be torn down from a message loop.
 pub fn postDestroy(self: *Window) void {
@@ -3336,10 +3354,20 @@ pub fn constrainToWorkArea(
 
 /// Bring the window to the front, restoring it first if it is
 /// minimized, as GTK's `gtk.Window.present` does; for `goto_window`,
-/// `present_terminal` and a toast's click. With a title prompt open over
-/// it, the prompt comes forward with the keyboard focus in its field, not
-/// the frame it holds disabled (`TitleDialog.front`).
+/// `present_terminal`, a toast's click and the command palette's jump to
+/// a terminal. With a title prompt open over it, the prompt comes forward
+/// with the keyboard focus in its field, not the frame it holds disabled
+/// (`TitleDialog.front`). A quick terminal that is hidden, or on its way
+/// out (`quickShown`), shows first (`showQuick`), as macOS shows its own
+/// for one of its terminals (QuickTerminalController.focusSurface):
+/// SetForegroundWindow would give the keyboard to a window off screen.
 pub fn present(self: *Window) bool {
+    if (self.quick and !self.quickShown()) return self.showQuick();
+    return self.bringToFront();
+}
+
+/// `present` for a window that shows.
+fn bringToFront(self: *Window) bool {
     const ok = bringForward(self.hwnd, TitleDialog.front(self));
     TitleDialog.focusField(self);
     return ok;

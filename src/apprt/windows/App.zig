@@ -2315,7 +2315,7 @@ pub const App = struct {
     /// size; so does the first after its last terminal closed.
     fn toggleQuick(self: *App) void {
         if (self.quick) |window| {
-            if (window.quickShown()) window.hideQuick() else window.showQuick();
+            if (window.quickShown()) window.hideQuick() else _ = window.showQuick();
             return;
         }
         _ = self.newWindow(null, .quick) catch |err| {
@@ -3164,7 +3164,7 @@ pub const App = struct {
             .normal => window.show(),
             .quick => {
                 self.quick = window;
-                window.showQuick();
+                _ = window.showQuick();
             },
         }
         return window;
@@ -12837,6 +12837,20 @@ const TestQuick = struct {
         };
     }
 
+    /// The owner of the last prompt `dialog.messageBox` would have shown
+    /// (`dialog.test_message_box`), and whether it showed then; answered
+    /// with `answer`.
+    var asked: ?win32.HWND = null;
+    var asked_shown: bool = false;
+    var answer: c_int = win32.IDCANCEL;
+
+    fn ask(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
+        _ = .{ prompt, buttons };
+        asked = owner;
+        asked_shown = if (owner) |hwnd| win32.IsWindowVisible(hwnd).toBool() else false;
+        return answer;
+    }
+
     /// The quick terminal shown whole by a toggle and hidden by the next,
     /// each at once, with no step of an animation.
     fn atOnce(app: *App) !void {
@@ -13918,6 +13932,127 @@ test "win32: the quick terminal's animation eases in as macOS's does" {
     try std.testing.expectEqual(0, Window.easeIn(-0.5));
     try std.testing.expectEqual(0, Window.easeIn(std.math.nan(f64)));
     try std.testing.expectEqual(1, Window.easeIn(2));
+}
+
+test "win32: present_terminal shows a hidden quick terminal, and turns back one on its way out" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickPresent, .{});
+}
+
+/// The test of a quick terminal brought forward, run by its test on a
+/// desktop of its own.
+fn testQuickPresent() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Hidden, for one of its terminals, as a toast's click and the command
+    // palette's jump bring one forward too (`Window.present`): shown at
+    // its place by its animation, its terminal told, and brought forward,
+    // the window it came over remembered as a toggle remembers it.
+    TestQuick.in_front = other;
+    TestQuick.front = null;
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .present_terminal, {}));
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(std.mem.zeroes(win32.RECT), (try TestQuick.region(quick)).?);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+    try std.testing.expect(TestQuick.shows);
+    TestQuick.settle(quick);
+    try std.testing.expectEqual(try TestQuick.place(&app, quick), try windowRect(quick.hwnd));
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+    try TestQuick.hideInFront(&app, quick);
+    try std.testing.expectEqual(other, TestQuick.front.?);
+
+    // Shown, it is only brought forward.
+    try TestQuick.toggle(&app);
+    TestQuick.front = null;
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .present_terminal, {}));
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+
+    // On its way out, it turns back from where it is.
+    try TestQuick.begin(&app);
+    TestQuick.tick(quick, TestQuick.half);
+    TestQuick.front = null;
+    try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .present_terminal, {}));
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+    TestQuick.tick(quick, TestQuick.half);
+    const place = try windowRect(quick.hwnd);
+    const e = TestQuick.eased;
+    try std.testing.expectEqual(
+        TestQuick.band(.top, place.right - place.left, place.bottom - place.top, (1 - e) + e * e),
+        (try TestQuick.region(quick)).?,
+    );
+    TestQuick.settle(quick);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expect((try TestQuick.region(quick)) == null);
+}
+
+test "win32: a hidden quick terminal shows before it asks whether to close" {
+    // On a desktop of its own, as the toggle's test (testOnOwnDesktop).
+    try testOnOwnDesktop(testQuickCloseAsks, .{});
+}
+
+/// The test of a hidden quick terminal's close question, run by its test
+/// on a desktop of its own.
+fn testQuickCloseAsks() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestQuick.ask;
+    defer message_box.* = null;
+    defer Window.test_needs_confirm = false;
+
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try TestQuick.toggle(&app);
+
+    // Asked to close while hidden (WM_CLOSE, as another program can send
+    // it) with a process running: it shows first, by its animation, and
+    // the question is its own, asked while it shows; cancelled, it stays,
+    // shown.
+    Window.test_needs_confirm = true;
+    TestQuick.asked = null;
+    TestQuick.answer = win32.IDCANCEL;
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
+    try std.testing.expect(TestQuick.asked_shown);
+    try std.testing.expect(!quick.closing);
+    TestQuick.settle(quick);
+    try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // With nothing running there is nothing to ask: it closes as it is,
+    // hidden.
+    try TestQuick.toggle(&app);
+    Window.test_needs_confirm = false;
+    TestQuick.asked = null;
+    _ = win32.SendMessageW(quick.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expect(TestQuick.asked == null);
+    try std.testing.expect(quick.closing);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
