@@ -48,31 +48,82 @@ pub var test_allow_foreground: if (builtin.is_test) ?*const fn (win32.DWORD) voi
 pub var test_spawn: if (builtin.is_test) ?*const fn ([:0]const u16) ?win32.Win32Error else void =
     if (builtin.is_test) null else {};
 
-/// The variable a terminal's environment names its instance by: the
-/// process ID of the instance, which serves a pipe of its own for the
-/// requests made in its terminals (`IpcServer.instancePipeName`), as
-/// GHOSTTY_SURFACE_ID names the terminal for `+new-tab`.
+/// The variable a terminal's environment names its instance by
+/// (`Instance`): the instance's process ID, then a colon and its class
+/// when a class names its pipes, as GHOSTTY_SURFACE_ID names the terminal
+/// for `+new-tab`.
 pub const instance_env = "GHOSTTY_IPC_INSTANCE";
 const instance_env_w = std.unicode.utf8ToUtf16LeStringLiteral(instance_env);
 
-/// Name in `env` the instance of process `instance` as the one a
-/// terminal's requests reach (`instance_env`), or none, dropping a value
-/// inherited from the Ghostty this one was started in, which names that
-/// other instance.
-pub fn nameInstance(env: *std.process.Environ.Map, instance: ?u32) !void {
+/// The instance a terminal belongs to, as its environment names it
+/// (`instance_env`).
+pub const Instance = struct {
+    /// Its process ID, which names the pipe it serves of its own for the
+    /// requests made in its terminals (`IpcServer.instancePipeName`), as
+    /// every plain launch is a process of its own.
+    pid: u32,
+    /// The class that names its pipes (`App.serveIpc`), or null for the
+    /// build's own id. A request for no class made in its terminal is for
+    /// this one (`performAs`): only by its class does it reach the
+    /// instance.
+    class: ?[:0]const u8 = null,
+};
+
+/// Name in `env` `instance` as the one a terminal's requests reach
+/// (`instance_env`), or none, dropping a value inherited from the Ghostty
+/// this one was started in, which names that other instance.
+pub fn nameInstance(env: *std.process.Environ.Map, instance: ?Instance) Allocator.Error!void {
     _ = env.orderedRemove(instance_env);
-    const pid = instance orelse return;
-    var buf: [10]u8 = undefined;
-    try env.put(instance_env, std.fmt.bufPrint(&buf, "{d}", .{pid}) catch unreachable);
+    const named = instance orelse return;
+    const value = if (named.class) |class|
+        try std.fmt.allocPrint(env.allocator, "{d}:{s}", .{ named.pid, class })
+    else
+        try std.fmt.allocPrint(env.allocator, "{d}", .{named.pid});
+    defer env.allocator.free(value);
+    try env.put(instance_env, value);
 }
 
-/// The instance whose terminal this process runs in (`instance_env`), or
-/// null outside one, and for a value that is no process ID.
-fn instanceOfTerminal() ?u32 {
-    var buf: [16]u16 = undefined;
-    const len = win32.GetEnvironmentVariableW(instance_env_w, &buf, buf.len);
-    if (len == 0 or len >= buf.len) return null;
-    return parsePid(buf[0..len]);
+/// The longest `instance_env` an instance names, in UTF-16 code units: a
+/// process ID, a colon and a class no longer than a pipe's name.
+const instance_max_len = 10 + 1 + IpcServer.max_name_len;
+
+/// Where `instanceOfTerminal` keeps the class it reads, in UTF-8.
+pub const InstanceBuf = [3 * instance_max_len + 1]u8;
+
+/// The instance whose terminal this process runs in (`instance_env`), its
+/// class kept in `buf`, or null outside one (`parseInstance`).
+fn instanceOfTerminal(buf: *InstanceBuf) ?Instance {
+    var wide: [instance_max_len + 1]u16 = undefined;
+    const len = win32.GetEnvironmentVariableW(instance_env_w, &wide, wide.len);
+    if (len == 0 or len >= wide.len) return null;
+    return parseInstance(wide[0..len], buf);
+}
+
+/// For tests: the instance that `env`, a terminal's environment, names to
+/// a request made in that terminal (`instanceOfTerminal`).
+pub fn testInstanceOf(env: *const std.process.Environ.Map, buf: *InstanceBuf) !?Instance {
+    const value = env.get(instance_env) orelse return null;
+    var wide: [instance_max_len]u16 = undefined;
+    // UTF-16 takes no more code units than UTF-8 takes bytes.
+    if (value.len > wide.len) return null;
+    const len = try std.unicode.utf8ToUtf16Le(&wide, value);
+    return parseInstance(wide[0..len], buf);
+}
+
+/// The instance `value` of `instance_env` names, its class kept in `buf`,
+/// or null for one that names none: with no process ID before its colon,
+/// or after it a class that no pipe's name can hold, empty, longer than
+/// one, with a backslash or not UTF-16.
+fn parseInstance(value: []const u16, buf: *InstanceBuf) ?Instance {
+    const colon = std.mem.indexOfScalar(u16, value, ':');
+    const pid = parsePid(value[0 .. colon orelse value.len]) orelse return null;
+    const at = colon orelse return .{ .pid = pid };
+    const class = value[at + 1 ..];
+    if (class.len == 0 or class.len > IpcServer.max_name_len) return null;
+    if (std.mem.indexOfScalar(u16, class, '\\') != null) return null;
+    const len = std.unicode.utf16LeToUtf8(buf[0 .. buf.len - 1], class) catch return null;
+    buf[len] = 0;
+    return .{ .pid = pid, .class = buf[0..len :0] };
 }
 
 /// What `perform` fails with, once it has said why on stderr, as the CLI
@@ -93,11 +144,12 @@ pub fn perform(
     const command = comptime commandName(action);
     const identity = IpcServer.Identity.ofProcess() catch |err|
         return fail(stderr, command, "this process's user cannot be told ({t})", .{err});
-    return performAs(alloc, &identity, instanceOfTerminal(), target, action, value, stderr);
+    var instance_buf: InstanceBuf = undefined;
+    return performAs(alloc, &identity, instanceOfTerminal(&instance_buf), target, action, value, stderr);
 }
 
-/// `perform` as `identity`, run in a terminal of the instance of process
-/// `instance`, if not null: true once the instance did it, or will
+/// `perform` as `identity`, run in a terminal of `instance`, if not null:
+/// true once the instance did it, or will
 /// (`ipc.Status.pending`, which it says), or once Ghostty is started for it
 /// (`unanswered`), and error.IPCFailed once it has said what came of it
 /// otherwise. What it cannot say, as with no console
@@ -105,7 +157,7 @@ pub fn perform(
 pub fn performAs(
     alloc: Allocator,
     identity: *const IpcServer.Identity,
-    instance: ?u32,
+    instance: ?Instance,
     target: apprt.ipc.Target,
     comptime action: apprt.ipc.Action.Key,
     value: apprt.ipc.Action.Value(action),
@@ -118,16 +170,25 @@ pub fn performAs(
         .toggle_quick_terminal => .{ 0, null },
     };
 
+    // Made in a terminal, a request for no class is for the class of the
+    // terminal's instance, which names its pipes (`Instance.class`): by
+    // the build's own id it would miss an instance of a class, and start
+    // Ghostty each time no other instance takes it.
+    const asked: apprt.ipc.Target = switch (target) {
+        .class => target,
+        .detect => if (instance) |own| if (own.class) |class| .{ .class = class } else .detect else .detect,
+    };
+
     // An elevated client would open its window in the user's instance,
     // which is not elevated, where an administrator's shell asked for one
     // that is; and that instance's pipe is one any of the user's programs
     // could have made first. An elevated instance serves nothing for the
     // same reason (`App.serveIpc`), so one is started, elevated too.
-    if (identity.elevated) return unanswered(alloc, action, target, arguments, stderr, "an elevated process does not reach a running Ghostty");
+    if (identity.elevated) return unanswered(alloc, action, asked, arguments, stderr, "an elevated process does not reach a running Ghostty");
 
     // As GTK names its bus (src/apprt/gtk/ipc/DBus.zig): by the class, else
     // by the build's own id.
-    const base: []const u8 = switch (target) {
+    const base: []const u8 = switch (asked) {
         .class => |class| class,
         .detect => toast.app_id,
     };
@@ -151,8 +212,8 @@ pub fn performAs(
         // The instance whose terminal this runs in, unless it has gone, as
         // a program its terminal started can outlive it; then the shared
         // pipe's.
-        if (instance) |pid| own: {
-            const own = IpcServer.instancePipeName(alloc, name, pid) catch |err| switch (err) {
+        if (instance) |terminal| own: {
+            const own = IpcServer.instancePipeName(alloc, name, terminal.pid) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 // No instance serves one of this class.
                 error.NameTooLong => break :own,
@@ -165,7 +226,7 @@ pub fn performAs(
     };
     const reply = switch (exchanged) {
         .reply => |reply| reply,
-        .none => return unanswered(alloc, action, target, arguments, stderr, "no running Ghostty was found"),
+        .none => return unanswered(alloc, action, asked, arguments, stderr, "no running Ghostty was found"),
         .foreign => return fail(stderr, command, "the pipe of its name is another account's, and was sent nothing", .{}),
         .timeout => return fail(stderr, command, "the running Ghostty did not answer in time", .{}),
         .closed => return fail(stderr, command, "the running Ghostty closed the pipe before it answered", .{}),
@@ -183,7 +244,7 @@ pub fn performAs(
         },
         // Its pipe goes with it, and so would a window or tab it opened.
         .quitting => switch (action) {
-            .new_window, .new_tab => return startGhostty(alloc, command, target, arguments, stderr),
+            .new_window, .new_tab => return startGhostty(alloc, command, asked, arguments, stderr),
             .toggle_quick_terminal => return fail(stderr, command, "{f}", .{Safe{ .text = reply.text }}),
         },
         .unsupported, .bad_request, .bad_arguments, .failed => {
@@ -1024,7 +1085,10 @@ pub const TestCli = struct {
     surface_id: u64 = 0,
     arguments: ?[][:0]const u8 = null,
     /// The instance whose terminal it runs in, if any.
-    instance: ?u32 = null,
+    instance: ?Instance = null,
+    /// Whether it asks for `class`, or for no class, as a CLI run without
+    /// `--class` does.
+    target: enum { class, detect } = .class,
     buf: [512]u8 = undefined,
     out: std.Io.Writer = undefined,
     result: Error!bool = false,
@@ -1037,7 +1101,10 @@ pub const TestCli = struct {
 
     fn run(self: *TestCli) void {
         const alloc = std.testing.allocator;
-        const target: apprt.ipc.Target = .{ .class = self.class };
+        const target: apprt.ipc.Target = switch (self.target) {
+            .class => .{ .class = self.class },
+            .detect => .detect,
+        };
         self.result = switch (self.action) {
             .new_window => performAs(alloc, &self.identity, self.instance, target, .new_window, .{ .arguments = self.arguments }, &self.out),
             .new_tab => performAs(alloc, &self.identity, self.instance, target, .new_tab, .{ .surface_id = self.surface_id, .arguments = self.arguments }, &self.out),
@@ -1330,17 +1397,24 @@ test "win32: an IPC client in a terminal reaches its instance's own pipe, else t
 
     // From its terminal: the instance's own, though another serves the
     // shared one.
-    var cli: TestCli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = pid };
+    var cli: TestCli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = .{ .pid = pid } };
+    try testAnsweredBy(&cli, &own, "own");
+    // For no class, from a terminal of an instance of one: that class's,
+    // the instance's own.
+    const of_class: Instance = .{ .pid = pid, .class = shared.class };
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .target = .detect, .instance = of_class };
     try testAnsweredBy(&cli, &own, "own");
     // From no terminal, or one of an instance that serves none: the shared.
     cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window };
     try testAnsweredBy(&cli, &shared, "shared");
-    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = pid + 1 };
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = .{ .pid = pid + 1 } };
     try testAnsweredBy(&cli, &shared, "shared");
     // From one whose instance has gone.
     own.deinit(alloc);
     own_open = false;
-    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = pid };
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .instance = .{ .pid = pid } };
+    try testAnsweredBy(&cli, &shared, "shared");
+    cli = .{ .identity = shared.identity, .class = shared.class, .action = .new_window, .target = .detect, .instance = of_class };
     try testAnsweredBy(&cli, &shared, "shared");
 
     // Of a class so long that no instance pipe can have it.
@@ -1352,7 +1426,7 @@ test "win32: an IPC client in a terminal reaches its instance's own pipe, else t
     var longest: TestPipe = try .initOf(alloc, long, null, null);
     defer longest.deinit(alloc);
     try std.testing.expectEqual(IpcServer.max_name_len, longest.name.len);
-    cli = .{ .identity = longest.identity, .class = longest.class, .action = .new_window, .instance = pid };
+    cli = .{ .identity = longest.identity, .class = longest.class, .action = .new_window, .instance = .{ .pid = pid } };
     try testAnsweredBy(&cli, &longest, "shared");
 }
 
@@ -1366,30 +1440,58 @@ test "win32: an IPC client finds its terminal's instance in its environment, and
     try nameInstance(&env, null);
     try std.testing.expectEqual(null, env.get(instance_env));
     try env.put(instance_env, "1");
-    try nameInstance(&env, 4242);
+    try nameInstance(&env, .{ .pid = 4242 });
     try std.testing.expectEqualStrings("4242", env.get(instance_env) orelse return error.TestUnexpectedResult);
+    try nameInstance(&env, .{ .pid = 4242, .class = "work:a.b" });
+    try std.testing.expectEqualStrings("4242:work:a.b", env.get(instance_env) orelse return error.TestUnexpectedResult);
 
     // This process's, put back after: a test run in a Ghostty terminal
-    // has one, of 10 digits at most.
-    var saved_buf: [16]u16 = undefined;
+    // has one, no longer than an instance names.
+    var saved_buf: [instance_max_len + 1]u16 = undefined;
     const saved_len = win32.GetEnvironmentVariableW(instance_env_w, &saved_buf, saved_buf.len);
     const saved: ?[*:0]const u16 = if (saved_len == 0 or saved_len >= saved_buf.len) null else saved_buf[0..saved_len :0];
     defer _ = win32.SetEnvironmentVariableW(instance_env_w, saved);
-    const Case = struct { value: ?[]const u8, instance: ?u32 };
+    const Case = struct { value: ?[]const u16, pid: ?u32, class: ?[]const u8 = null };
+    const L16 = std.unicode.utf8ToUtf16LeStringLiteral;
+    // The longest class an instance names.
+    const xs: [IpcServer.max_name_len + 1]u16 = @splat('x');
+    const longest = L16("1:").* ++ xs[0..IpcServer.max_name_len].*;
+    const ones: [10]u16 = @splat('1');
     for ([_]Case{
-        .{ .value = "4242", .instance = 4242 },
-        .{ .value = "42x", .instance = null },
-        .{ .value = "4294967296", .instance = null },
-        .{ .value = "123456789012345678", .instance = null },
-        .{ .value = null, .instance = null },
+        .{ .value = L16("4242"), .pid = 4242 },
+        // A class, a colon of its own kept.
+        .{ .value = L16("4242:work:a.b"), .pid = 4242, .class = "work:a.b" },
+        .{ .value = L16("4242:\u{e9}t\u{e9}"), .pid = 4242, .class = "\u{e9}t\u{e9}" },
+        .{ .value = &longest, .pid = 1, .class = &@as([IpcServer.max_name_len]u8, @splat('x')) },
+        // No process ID, or no class that can name a pipe.
+        .{ .value = L16("42x"), .pid = null },
+        .{ .value = L16("42x:work"), .pid = null },
+        .{ .value = L16(":work"), .pid = null },
+        .{ .value = L16("4242:"), .pid = null },
+        .{ .value = L16("4242:a\\b"), .pid = null },
+        .{ .value = &[_]u16{ '1', ':', 0xd800 }, .pid = null },
+        .{ .value = L16("4294967296"), .pid = null },
+        .{ .value = L16("123456789012345678"), .pid = null },
+        // A class longer than a pipe's name, or a value longer than an
+        // instance names.
+        .{ .value = &(L16("1:").* ++ xs), .pid = null },
+        .{ .value = &(ones ++ L16(":").* ++ xs), .pid = null },
+        .{ .value = null, .pid = null },
     }) |case| {
-        var value_buf: [32]u16 = undefined;
+        var value_buf: [instance_max_len + 2]u16 = undefined;
         const value: ?[*:0]const u16 = if (case.value) |v| value: {
-            const n = try std.unicode.utf8ToUtf16Le(&value_buf, v);
-            value_buf[n] = 0;
-            break :value value_buf[0..n :0];
+            @memcpy(value_buf[0..v.len], v);
+            value_buf[v.len] = 0;
+            break :value value_buf[0..v.len :0];
         } else null;
         try std.testing.expect(win32.SetEnvironmentVariableW(instance_env_w, value).toBool());
-        try std.testing.expectEqual(case.instance, instanceOfTerminal());
+        var buf: InstanceBuf = undefined;
+        const found = instanceOfTerminal(&buf);
+        try std.testing.expectEqual(case.pid, if (found) |f| f.pid else null);
+        const class: ?[]const u8 = if (found) |f| f.class else null;
+        if (case.class) |expected|
+            try std.testing.expectEqualStrings(expected, class orelse return error.TestUnexpectedResult)
+        else
+            try std.testing.expectEqual(null, class);
     }
 }

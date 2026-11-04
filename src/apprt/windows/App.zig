@@ -331,6 +331,14 @@ pub const App = struct {
     /// its terminals goes beside that terminal. Null as `ipc` is.
     ipc_instance: ?*IpcServer,
 
+    /// The class that names this instance's pipes, which its terminals
+    /// name beside its process ID (`IpcClient.Instance`), so that a
+    /// request for no class made in one of them reaches this instance;
+    /// null for the build's own id, which names the pipes of a request for
+    /// no class anyway. A copy, as a reload frees the config's. Null where
+    /// `ipc_instance` is.
+    ipc_class: ?[:0]u8,
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -388,10 +396,11 @@ pub const App = struct {
             return;
         }
         const alloc = self.core_app.alloc;
-        const name = ipcName(alloc, class, identity) catch |err| {
+        const named = ipcName(alloc, class, identity) catch |err| {
             log.warn("serving no IPC, no pipe name err={}", .{err});
             return;
         };
+        const name = named.name;
         defer alloc.free(name);
         self.ipc = IpcServer.start(alloc, name, identity, self.msg_hwnd, WM_GHOSTTY_IPC) catch |err| shared: {
             switch (err) {
@@ -406,13 +415,27 @@ pub const App = struct {
             return;
         };
         defer alloc.free(own);
+        // Kept before the pipe is served: its terminals name the class
+        // with it, or requests made there for no class would miss it.
+        const own_class: ?[:0]u8 = if (named.class) |c| alloc.dupeSentinel(u8, c, 0) catch |err| {
+            log.warn("serving no IPC to this instance's terminals err={}", .{err});
+            return;
+        } else null;
         // Taken only by a process that made it first, which the requests
         // made in this instance's terminals then do not reach.
         self.ipc_instance = IpcServer.start(alloc, own, identity, self.msg_hwnd, WM_GHOSTTY_IPC) catch |err| instance: {
             log.warn("serving no IPC to this instance's terminals err={}", .{err});
             break :instance null;
         };
+        if (self.ipc_instance != null)
+            self.ipc_class = own_class
+        else if (own_class) |c|
+            alloc.free(c);
     }
+
+    /// The name of the pipe an instance serves (`ipcName`), owned by the
+    /// caller, and the class that names it: null for the build's own id.
+    const IpcName = struct { name: [:0]u16, class: ?[]const u8 };
 
     /// The name of the pipe an instance of `class` serves for `identity`
     /// (`IpcServer.pipeName`): the class names it, as it names GTK's bus
@@ -424,14 +447,14 @@ pub const App = struct {
         alloc: Allocator,
         class: ?[]const u8,
         identity: *const IpcServer.Identity,
-    ) IpcServer.NameError![:0]u16 {
+    ) IpcServer.NameError!IpcName {
         if (class) |c| {
-            if (IpcServer.pipeName(alloc, c, identity)) |name| return name else |err| switch (err) {
+            if (IpcServer.pipeName(alloc, c, identity)) |name| return .{ .name = name, .class = c } else |err| switch (err) {
                 error.InvalidName, error.NameTooLong => log.warn("ignored a class that cannot name the IPC pipe err={}", .{err}),
                 error.OutOfMemory, error.InvalidSid => return err,
             }
         }
-        return IpcServer.pipeName(alloc, toast.app_id, identity);
+        return .{ .name = try IpcServer.pipeName(alloc, toast.app_id, identity), .class = null };
     }
 
     /// Stop serving IPC requests, on each pipe this instance serves.
@@ -440,6 +463,10 @@ pub const App = struct {
             const server = field.* orelse continue;
             field.* = null;
             server.stop();
+        }
+        if (self.ipc_class) |class| {
+            self.ipc_class = null;
+            self.core_app.alloc.free(class);
         }
     }
 
@@ -918,6 +945,7 @@ pub const App = struct {
             .hotkey_up = .empty,
             .ipc = null,
             .ipc_instance = null,
+            .ipc_class = null,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -4660,6 +4688,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.hotkey_up = .empty;
     app.ipc = null;
     app.ipc_instance = null;
+    app.ipc_class = null;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -22418,9 +22447,9 @@ test "win32: the app's IPC pipe is named by its class, as GTK's bus is, else by 
     const own = try IpcServer.pipeName(alloc, "a.b", &identity);
     defer alloc.free(own);
     const long: [IpcServer.max_name_len]u8 = @splat('x');
-    const Case = struct { class: ?[]const u8, name: []const u16 };
+    const Case = struct { class: ?[]const u8, name: []const u16, named: ?[]const u8 = null };
     const cases = [_]Case{
-        .{ .class = "a.b", .name = own },
+        .{ .class = "a.b", .name = own, .named = "a.b" },
         .{ .class = null, .name = build },
         // A class that cannot name a pipe is ignored.
         .{ .class = "a\\b", .name = build },
@@ -22428,9 +22457,13 @@ test "win32: the app's IPC pipe is named by its class, as GTK's bus is, else by 
         .{ .class = &long, .name = build },
     };
     for (cases) |case| {
-        const name = try App.ipcName(alloc, case.class, &identity);
-        defer alloc.free(name);
-        try std.testing.expectEqualSlices(u16, case.name, name);
+        const named = try App.ipcName(alloc, case.class, &identity);
+        defer alloc.free(named.name);
+        try std.testing.expectEqualSlices(u16, case.name, named.name);
+        if (case.named) |class|
+            try std.testing.expectEqualStrings(class, named.class orelse return error.TestUnexpectedResult)
+        else
+            try std.testing.expectEqual(null, named.class);
     }
 }
 
@@ -22612,7 +22645,7 @@ fn testIpcInstance() !void {
     const first_hwnd = win32.CreateWindowExW(0, L("STATIC"), null, 0, 0, 0, 0, 0, win32.HWND_MESSAGE, null, null, null) orelse
         return error.TestUnexpectedResult;
     defer _ = win32.DestroyWindow(first_hwnd);
-    const shared = try App.ipcName(alloc, class, &identity);
+    const shared = (try App.ipcName(alloc, class, &identity)).name;
     defer alloc.free(shared);
     const first = try IpcServer.start(alloc, shared, &identity, first_hwnd, WM_GHOSTTY_IPC);
     defer first.stop();
@@ -22623,19 +22656,32 @@ fn testIpcInstance() !void {
 
     // Asked for in its terminal: a window of its own, answered on its pipe.
     {
-        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .instance = pid };
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .instance = .{ .pid = pid } };
         try std.testing.expect(try testCliSend(&app, &cli));
         try std.testing.expectEqualStrings("", cli.said());
     }
     try std.testing.expectEqual(1, app.windows.items.len);
     const pa = app.windows.items[0].tab().focused orelse return error.TestUnexpectedResult;
-    var digits: [10]u8 = undefined;
-    const named = try std.fmt.bufPrint(&digits, "{d}", .{pid});
-    {
+    // Its terminals name it by its process ID and its class.
+    var named_buf: [80]u8 = undefined;
+    const named = try std.fmt.bufPrint(&named_buf, "{d}:{s}", .{ pid, class });
+    var instance_buf: IpcClient.InstanceBuf = undefined;
+    const in_terminal = in_terminal: {
         var env = try pa.defaultTermioEnv();
         defer env.deinit();
         try std.testing.expectEqualStrings(named, env.get(IpcClient.instance_env) orelse return error.TestUnexpectedResult);
+        break :in_terminal try IpcClient.testInstanceOf(&env, &instance_buf);
+    };
+
+    // Asked for in its terminal for no class, as a CLI run there without
+    // `--class` asks: a window of its own, though its class is not the
+    // build's.
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .target = .detect, .instance = in_terminal };
+        try std.testing.expect(try testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("", cli.said());
     }
+    try std.testing.expectEqual(2, app.windows.items.len);
 
     // Asked for elsewhere: the first instance's.
     {
@@ -22653,7 +22699,7 @@ fn testIpcInstance() !void {
     }
     try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0));
     try std.testing.expectEqual(0, app.requests.items.len);
-    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(2, app.windows.items.len);
 
     // Serving none, its terminals name none.
     app.stopIpc();
@@ -22691,14 +22737,15 @@ fn testIpcInitialWindow() !void {
     // as the terminal starts (`CoreSurface.init`).
     const Made = struct {
         var count: usize = 0;
-        var named: ?u32 = null;
+        var buf: IpcClient.InstanceBuf = undefined;
+        var named: ?IpcClient.Instance = null;
 
         fn create(w: *Window, opts: Surface.Options) anyerror!*Surface {
             const pane = try TestQuick.create(w, opts);
             var env = try pane.defaultTermioEnv();
             defer env.deinit();
             count += 1;
-            named = if (env.get(IpcClient.instance_env)) |value| try std.fmt.parseUnsigned(u32, value, 10) else null;
+            named = try IpcClient.testInstanceOf(&env, &buf);
             return pane;
         }
     };
@@ -22707,10 +22754,13 @@ fn testIpcInitialWindow() !void {
     Window.test_create_pane = &Made.create;
 
     var buf: [64]u8 = undefined;
-    app.config.class = try testIpcBase(&buf);
+    const class = try testIpcBase(&buf);
+    app.config.class = class;
     try app.startUp();
     try std.testing.expect(app.ipc_instance != null);
     try std.testing.expectEqual(1, app.windows.items.len);
     try std.testing.expectEqual(1, Made.count);
-    try std.testing.expectEqual(@as(?u32, std.os.windows.GetCurrentProcessId()), Made.named);
+    const named = Made.named orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(std.os.windows.GetCurrentProcessId(), named.pid);
+    try std.testing.expectEqualStrings(class, named.class orelse return error.TestUnexpectedResult);
 }
