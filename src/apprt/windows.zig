@@ -382,6 +382,7 @@ test {
     _ = @import("windows/dialog.zig");
     _ = @import("windows/drop.zig");
     _ = @import("windows/ipc.zig");
+    _ = @import("windows/IpcServer.zig");
     _ = @import("windows/key.zig");
     _ = @import("windows/overlay_keys.zig");
     _ = @import("windows/taskbar.zig");

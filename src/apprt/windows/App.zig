@@ -25,6 +25,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
+const IpcServer = @import("IpcServer.zig");
 const KeyState = @import("KeyState.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const ReadOnly = @import("ReadOnly.zig");
@@ -74,6 +75,10 @@ pub const WM_GHOSTTY_NOTIFICATION: win32.UINT = win32.WM_APP + 4;
 /// (`Window.quickDeactivated`); its handler hides it unless it, or a
 /// window it owns, is in the foreground again (`Window.quickAutohide`).
 pub const WM_GHOSTTY_QUICK_HIDE: win32.UINT = win32.WM_APP + 5;
+
+/// Posted to the message-only window by the IPC thread (`IpcServer`) for
+/// each request it reads, which `ipcRequests` answers.
+pub const WM_GHOSTTY_IPC: win32.UINT = win32.WM_APP + 6;
 
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
@@ -309,6 +314,13 @@ pub const App = struct {
     /// (`hotkeyRelease`); a key-down there is a press the core sees.
     hotkey_up: std.bit_set.Static(256),
 
+    /// The pipe `ghostty +new-window` and the other IPC actions reach this
+    /// instance by (`IpcServer`), from `run` until `terminate` or the
+    /// session's end. Null where there is none: before and after, and when
+    /// it could not be had, as when another instance of the user's
+    /// session serves it (`serveIpc`).
+    ipc: ?*IpcServer,
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -327,9 +339,10 @@ pub const App = struct {
         Win32CallFailed,
     };
 
-    /// Always false: this runtime has no IPC channel to an already-running
-    /// instance, so every CLI action that would need one honestly reports
-    /// "not supported on this platform".
+    /// Always false: no request is sent to a running instance yet, and an
+    /// instance answers each as one it does not do (`ipcRequests`), so
+    /// every CLI action that would need one reports "not supported on this
+    /// platform".
     pub fn performIpc(
         _: Allocator,
         _: apprt.ipc.Target,
@@ -337,6 +350,64 @@ pub const App = struct {
         _: apprt.ipc.Action.Value(action),
     ) !bool {
         return false;
+    }
+
+    /// Serve IPC requests on this process's pipe, or log why not: no IPC is
+    /// no reason not to run.
+    fn startIpc(self: *App) void {
+        const identity = IpcServer.Identity.ofProcess() catch |err| {
+            log.warn("serving no IPC, this process's token cannot be read err={}", .{err});
+            return;
+        };
+        self.serveIpc(&identity, toast.app_id);
+    }
+
+    /// Serve IPC requests on the pipe of `base` for `identity`
+    /// (`IpcServer.pipeName`).
+    fn serveIpc(self: *App, identity: *const IpcServer.Identity, base: []const u8) void {
+        // An elevated instance would carry out what the user's programs
+        // that are not elevated ask, with their arguments, as
+        // administrator.
+        if (identity.elevated) {
+            log.info("serving no IPC, this instance is elevated", .{});
+            return;
+        }
+        const alloc = self.core_app.alloc;
+        const name = IpcServer.pipeName(alloc, base, identity) catch |err| {
+            log.warn("serving no IPC, no pipe name err={}", .{err});
+            return;
+        };
+        defer alloc.free(name);
+        self.ipc = IpcServer.start(alloc, name, identity, self.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+            switch (err) {
+                error.NameTaken => log.info("serving no IPC, another instance of this session serves it", .{}),
+                else => log.warn("serving no IPC err={}", .{err}),
+            }
+            return;
+        };
+    }
+
+    /// Stop serving IPC requests, if this instance serves them.
+    fn stopIpc(self: *App) void {
+        const server = self.ipc orelse return;
+        self.ipc = null;
+        server.stop();
+    }
+
+    /// Answer the requests the IPC thread has read (WM_GHOSTTY_IPC): as
+    /// actions this instance does not do, or, once it is quitting, as
+    /// such.
+    fn ipcRequests(self: *App) void {
+        const server = self.ipc orelse return;
+        var entries = server.take();
+        defer server.free(&entries);
+        for (entries.items) |entry| {
+            if (self.quit or self.terminating) {
+                _ = server.answer(entry.ticket, .quitting, "the running Ghostty is quitting");
+            } else {
+                _ = server.answer(entry.ticket, .unsupported, "the running Ghostty does not do this on Windows");
+            }
+        }
     }
 
     /// Work the core asked for that `run` has not carried out yet
@@ -675,6 +746,7 @@ pub const App = struct {
             .terminating = false,
             .hotkeys = .{},
             .hotkey_up = .empty,
+            .ipc = null,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -696,7 +768,11 @@ pub const App = struct {
     }
 
     pub fn terminate(self: *App) void {
-        // First, so that the other programs have the keys back before the
+        // First, so that no request is taken during the teardown, and a
+        // client waiting for its answer is told the instance is quitting.
+        self.stopIpc();
+
+        // Then, so that the other programs have the keys back before the
         // teardown's waits for the terminals' threads.
         self.hotkeys.deinit(self.core_app.alloc, self.msg_hwnd);
 
@@ -762,6 +838,8 @@ pub const App = struct {
         log.info("the session is ending, quitting lparam=0x{x}", .{@as(usize, @bitCast(lparam))});
         self.quit = true;
         win32.PostQuitMessage(0);
+        // Even inside a handler: it touches neither the core nor a window.
+        self.stopIpc();
         // One: the procedure of the frame this came to.
         if (handler_depth > 1 or !self.canTearDown()) {
             log.warn("the session ends inside a handler, a tick, a prompt, a teardown or a terminal's loop, so the windows close after it, with their toasts", .{});
@@ -898,6 +976,7 @@ pub const App = struct {
             };
         }
         self.showConfigErrors();
+        self.startIpc();
 
         var msg: win32.MSG = undefined;
         while (!self.quit) {
@@ -3515,6 +3594,11 @@ pub const App = struct {
                 return 0;
             },
 
+            WM_GHOSTTY_IPC => {
+                self.ipcRequests();
+                return 0;
+            },
+
             // `run` quits once the timer has expired, the next time round
             // its loop.
             win32.WM_TIMER => if (wparam == quit_timer_id) {
@@ -4362,6 +4446,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.quit = false;
     app.hotkeys = .{};
     app.hotkey_up = .empty;
+    app.ipc = null;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -4482,6 +4567,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
 /// frees it all, then release what `testApp` made.
 pub fn testCleanup(app: *App) void {
     const alloc = app.core_app.alloc;
+    app.stopIpc();
     while (app.windows.getLastOrNull()) |window| {
         if (!win32.DestroyWindow(window.hwnd).toBool()) break;
     }
@@ -21722,4 +21808,128 @@ test "win32: the app stays open with no window while a global keybind can open o
     app.hotkeys.deinit(alloc, app.msg_hwnd);
     try std.testing.expect(try app.performAction(.app, .quit_timer, .start));
     try std.testing.expectEqual(.expired, app.quit_timer);
+}
+
+/// For tests: a pipe base no other test's has, nor another test run's.
+fn testIpcBase(buf: []u8) ![]const u8 {
+    const Counter = struct {
+        var next: std.atomic.Value(u32) = .init(0);
+    };
+    return std.fmt.bufPrint(buf, "ghostty-app-test-{d}-{d}", .{
+        std.os.windows.GetCurrentProcessId(),
+        Counter.next.fetchAdd(1, .monotonic),
+    });
+}
+
+/// For tests: whether a pipe of `name` can be served, that is, whether
+/// no instance serves it.
+fn testIpcNameFree(name: [:0]const u16, identity: *const IpcServer.Identity, hwnd: win32.HWND) !bool {
+    const server = IpcServer.start(std.testing.allocator, name, identity, hwnd, WM_GHOSTTY_IPC) catch |err| switch (err) {
+        error.NameTaken => return false,
+        else => return err,
+    };
+    server.stop();
+    return true;
+}
+
+test "win32: the app answers an IPC request as one it does not do, and once it quits as quitting" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    defer _ = testTakeQuit();
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+
+    const identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const base = try testIpcBase(&buf);
+    app.serveIpc(&identity, base);
+    const name = try IpcServer.pipeName(alloc, base, &identity);
+    defer alloc.free(name);
+    const bytes = try @import("ipc.zig").encodeRequest(alloc, .new_window, 0, &.{"--title=a"});
+    defer alloc.free(bytes);
+
+    // Before a quit, and after one that came while the request waited:
+    // the loop sees its WM_QUIT only once the messages posted before it
+    // are handled.
+    for ([_]bool{ false, true }) |quitting| {
+        var client: IpcServer.TestClient = .{ .name = name, .request = bytes };
+        try client.start();
+        IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+            _ = client.finish() catch {};
+            return err;
+        };
+        if (quitting) try std.testing.expect(try app.performAction(.app, .quit, {}));
+        try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0));
+        const reply = try client.finish();
+        try std.testing.expectEqual(
+            if (quitting) @import("ipc.zig").Status.quitting else .unsupported,
+            reply.status,
+        );
+    }
+}
+
+test "win32: an elevated app serves no IPC" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+
+    var identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const base = try testIpcBase(&buf);
+    const name = try IpcServer.pipeName(alloc, base, &identity);
+    defer alloc.free(name);
+    identity.elevated = true;
+    app.serveIpc(&identity, base);
+    identity.elevated = false;
+    try std.testing.expect(try testIpcNameFree(name, &identity, app.msg_hwnd));
+    app.serveIpc(&identity, base);
+    try std.testing.expect(!try testIpcNameFree(name, &identity, app.msg_hwnd));
+}
+
+test "win32: quitting stops the app's IPC, and so does the session's end" {
+    const alloc = std.testing.allocator;
+    const identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const base = try testIpcBase(&buf);
+    const name = try IpcServer.pipeName(alloc, base, &identity);
+    defer alloc.free(name);
+    const hwnd = win32.CreateWindowExW(0, L("STATIC"), null, 0, 0, 0, 0, 0, win32.HWND_MESSAGE, null, null, null) orelse
+        return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    for ([_]bool{ false, true }) |session_end| {
+        var core_app: CoreApp = undefined;
+        core_app.alloc = alloc;
+        var app: App = undefined;
+        try testApp(&app, &core_app);
+        app.quit_timer = .off;
+        try registerClasses(app.hinstance);
+        var terminated = false;
+        defer if (!terminated) {
+            testCleanup(&app);
+            unregisterClasses(app.hinstance);
+        };
+        defer _ = testTakeQuit();
+
+        app.serveIpc(&identity, base);
+        try std.testing.expect(!try testIpcNameFree(name, &identity, hwnd));
+        if (session_end) {
+            const f = try testFrame(&app);
+            const a = try testPane(&app, f);
+            f.tab().tree = try .init(alloc, a);
+            f.tab().focused = a;
+            try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1));
+            try std.testing.expect(try testIpcNameFree(name, &identity, hwnd));
+        }
+        terminated = true;
+        app.terminate();
+        try std.testing.expect(try testIpcNameFree(name, &identity, hwnd));
+    }
 }

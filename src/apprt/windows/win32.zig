@@ -1497,6 +1497,177 @@ pub extern "user32" fn GetGuiResources(process: HANDLE, flags: DWORD) callconv(.
 /// GetCurrentProcess's pseudo handle, which needs no closing.
 pub const current_process: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
+// Named pipes, events and tokens, for IPC (IpcServer.zig).
+
+pub const CloseHandle = internal_os.windows.exp.kernel32.CloseHandle;
+pub const CreateFileW = internal_os.windows.exp.kernel32.CreateFileW;
+pub const CreateNamedPipeW = internal_os.windows.exp.kernel32.CreateNamedPipeW;
+pub const ReadFile = internal_os.windows.exp.kernel32.ReadFile;
+pub const WriteFile = internal_os.windows.exp.kernel32.WriteFile;
+pub const CancelIoEx = internal_os.windows.exp.kernel32.CancelIoEx;
+pub const WaitForSingleObject = internal_os.windows.exp.kernel32.WaitForSingleObject;
+pub const OVERLAPPED = internal_os.windows.OVERLAPPED;
+pub const SECURITY_ATTRIBUTES = internal_os.windows.SECURITY_ATTRIBUTES;
+pub const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;
+pub const FILE_FLAG_OVERLAPPED: DWORD = internal_os.windows.FILE_FLAG_OVERLAPPED;
+pub const FILE_FLAG_FIRST_PIPE_INSTANCE: DWORD = internal_os.windows.FILE_FLAG_FIRST_PIPE_INSTANCE;
+pub const OPEN_EXISTING: DWORD = internal_os.windows.OPEN_EXISTING;
+/// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
+pub const PIPE_ACCESS_DUPLEX: DWORD = 0x00000003;
+pub const PIPE_TYPE_BYTE: DWORD = 0x00000000;
+pub const PIPE_TYPE_MESSAGE: DWORD = 0x00000004;
+pub const PIPE_READMODE_MESSAGE: DWORD = 0x00000002;
+pub const PIPE_WAIT: DWORD = 0x00000000;
+pub const PIPE_REJECT_REMOTE_CLIENTS: DWORD = 0x00000008;
+pub const PIPE_UNLIMITED_INSTANCES: DWORD = 255;
+/// https://learn.microsoft.com/en-us/windows/win32/fileio/file-access-rights-constants
+pub const FILE_READ_DATA: DWORD = 0x0001;
+pub const FILE_WRITE_DATA: DWORD = 0x0002;
+pub const FILE_READ_ATTRIBUTES: DWORD = 0x0080;
+pub const FILE_WRITE_ATTRIBUTES: DWORD = 0x0100;
+/// https://learn.microsoft.com/en-us/windows/win32/secauthz/standard-access-rights
+pub const READ_CONTROL: DWORD = 0x00020000;
+pub const SYNCHRONIZE: DWORD = 0x00100000;
+pub const INFINITE: DWORD = 0xFFFF_FFFF;
+pub const WAIT_OBJECT_0: DWORD = 0x0000_0000;
+pub const WAIT_TIMEOUT: DWORD = 0x0000_0102;
+pub const WAIT_FAILED: DWORD = 0xFFFF_FFFF;
+/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventw
+pub extern "kernel32" fn CreateEventW(
+    attributes: ?*SECURITY_ATTRIBUTES,
+    manual_reset: BOOL,
+    initial_state: BOOL,
+    name: ?LPCWSTR,
+) callconv(.winapi) ?HANDLE;
+/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
+pub extern "kernel32" fn SetEvent(event: HANDLE) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-resetevent
+pub extern "kernel32" fn ResetEvent(event: HANDLE) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects
+pub extern "kernel32" fn WaitForMultipleObjects(
+    count: DWORD,
+    handles: [*]const HANDLE,
+    wait_all: BOOL,
+    milliseconds: DWORD,
+) callconv(.winapi) DWORD;
+/// https://learn.microsoft.com/en-us/windows/win32/api/ioapiset/nf-ioapiset-getoverlappedresult
+pub extern "kernel32" fn GetOverlappedResult(
+    file: HANDLE,
+    overlapped: *OVERLAPPED,
+    transferred: *DWORD,
+    wait: BOOL,
+) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-connectnamedpipe
+pub extern "kernel32" fn ConnectNamedPipe(pipe: HANDLE, overlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe
+pub extern "kernel32" fn DisconnectNamedPipe(pipe: HANDLE) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid
+pub extern "kernel32" fn GetNamedPipeClientProcessId(pipe: HANDLE, process_id: *DWORD) callconv(.winapi) BOOL;
+pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+/// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
+pub extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, process_id: DWORD) callconv(.winapi) ?HANDLE;
+/// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-processidtosessionid
+pub extern "kernel32" fn ProcessIdToSessionId(process_id: DWORD, session_id: *DWORD) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-localfree
+pub extern "kernel32" fn LocalFree(mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+
+pub const PSID = *anyopaque;
+pub const PSECURITY_DESCRIPTOR = *anyopaque;
+pub const TOKEN_QUERY: DWORD = 0x0008;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class
+pub const TOKEN_INFORMATION_CLASS = enum(c_int) {
+    TokenUser = 1,
+    TokenSessionId = 12,
+    TokenElevation = 20,
+};
+pub const SID_AND_ATTRIBUTES = extern struct {
+    Sid: PSID,
+    Attributes: DWORD,
+};
+pub const TOKEN_USER = extern struct {
+    User: SID_AND_ATTRIBUTES,
+};
+pub const TOKEN_ELEVATION = extern struct {
+    TokenIsElevated: DWORD,
+};
+/// The longest SID, in bytes (winnt.h).
+pub const SECURITY_MAX_SID_SIZE = 68;
+pub const SDDL_REVISION_1: DWORD = 1;
+/// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocesstoken
+pub extern "advapi32" fn OpenProcessToken(process: HANDLE, access: DWORD, token: *HANDLE) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation
+pub extern "advapi32" fn GetTokenInformation(
+    token: HANDLE,
+    class: TOKEN_INFORMATION_CLASS,
+    information: ?*anyopaque,
+    length: DWORD,
+    return_length: *DWORD,
+) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-isvalidsid
+pub extern "advapi32" fn IsValidSid(sid: PSID) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getlengthsid
+pub extern "advapi32" fn GetLengthSid(sid: PSID) callconv(.winapi) DWORD;
+/// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsidtostringsidw
+pub extern "advapi32" fn ConvertSidToStringSidW(sid: PSID, string: *?[*:0]u16) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertstringsecuritydescriptortosecuritydescriptorw
+pub extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    string: LPCWSTR,
+    revision: DWORD,
+    descriptor: *?PSECURITY_DESCRIPTOR,
+    size: ?*DWORD,
+) callconv(.winapi) BOOL;
+/// For tests, which read a pipe's security back.
+/// https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-getsecurityinfo
+pub extern "advapi32" fn GetSecurityInfo(
+    handle: HANDLE,
+    object_type: c_int,
+    information: DWORD,
+    owner: ?*?PSID,
+    group: ?*?PSID,
+    dacl: ?*?*ACL,
+    sacl: ?*?*ACL,
+    descriptor: ?*?PSECURITY_DESCRIPTOR,
+) callconv(.winapi) DWORD;
+/// SE_OBJECT_TYPE (accctrl.h).
+pub const SE_KERNEL_OBJECT: c_int = 6;
+pub const OWNER_SECURITY_INFORMATION: DWORD = 0x0000_0001;
+pub const DACL_SECURITY_INFORMATION: DWORD = 0x0000_0004;
+pub const ACL = opaque {};
+pub const ACL_SIZE_INFORMATION = extern struct {
+    AceCount: DWORD,
+    AclBytesInUse: DWORD,
+    AclBytesFree: DWORD,
+};
+/// ACL_INFORMATION_CLASS (winnt.h).
+pub const AclSizeInformation: c_int = 2;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getaclinformation
+pub extern "advapi32" fn GetAclInformation(
+    acl: *ACL,
+    information: *anyopaque,
+    length: DWORD,
+    class: c_int,
+) callconv(.winapi) BOOL;
+pub const ACE_HEADER = extern struct {
+    AceType: BYTE,
+    AceFlags: BYTE,
+    AceSize: u16,
+};
+pub const ACCESS_ALLOWED_ACE = extern struct {
+    Header: ACE_HEADER,
+    Mask: DWORD,
+    SidStart: DWORD,
+};
+pub const ACCESS_ALLOWED_ACE_TYPE: BYTE = 0;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getace
+pub extern "advapi32" fn GetAce(acl: *ACL, index: DWORD, ace: *?*anyopaque) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getsecuritydescriptorcontrol
+pub extern "advapi32" fn GetSecurityDescriptorControl(
+    descriptor: PSECURITY_DESCRIPTOR,
+    control: *u16,
+    revision: *DWORD,
+) callconv(.winapi) BOOL;
+pub const SE_DACL_PROTECTED: u16 = 0x1000;
+
 // The overlays (Overlays.zig): windows of our own that the pointer passes
 // through to the terminal under them, placed just above that one.
 
