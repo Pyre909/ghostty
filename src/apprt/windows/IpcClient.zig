@@ -230,6 +230,7 @@ pub fn performAs(
     const reply = switch (exchanged) {
         .reply => |reply| reply,
         .none => return unanswered(alloc, action, asked, arguments, stderr, "no running Ghostty was found"),
+        .refused => return fail(stderr, command, "the pipe of its name refused this process, and was sent nothing", .{}),
         .foreign => return fail(stderr, command, "the pipe of its name is another account's, and was sent nothing", .{}),
         .timeout => return fail(stderr, command, "the running Ghostty did not answer in time", .{}),
         .closed => return fail(stderr, command, "the running Ghostty closed the pipe before it answered", .{}),
@@ -465,9 +466,13 @@ pub const Outcome = union(enum) {
     /// No pipe of the name: no instance serves it.
     none,
 
-    /// The pipe is not the user's: its open was refused, or another user
-    /// owns it, as when a process of theirs made the name first. Nothing
-    /// was written to it.
+    /// Its open was refused: the pipe's security does not let this
+    /// process in, as another user's pipe need not. Nothing was written
+    /// to it.
+    refused,
+
+    /// Another user owns the pipe, as when a process of theirs made the
+    /// name first. Nothing was written to it.
     foreign,
 
     /// The budget ran out.
@@ -570,7 +575,7 @@ fn open(name: [:0]const u16, deadline: u64) Opened {
         if (pipe != win32.INVALID_HANDLE_VALUE) return .{ .pipe = pipe };
         switch (win32.GetLastError()) {
             .FILE_NOT_FOUND => return .{ .outcome = .none },
-            .ACCESS_DENIED => return .{ .outcome = .foreign },
+            .ACCESS_DENIED => return .{ .outcome = .refused },
             .PIPE_BUSY => {},
             else => |err| return .{ .outcome = .failure("CreateFileW", err) },
         }
@@ -936,7 +941,7 @@ test "win32: an IPC client sends nothing to a pipe that is not its user's" {
         var t: TestPipe = try .init(alloc, "D:P");
         defer t.deinit(alloc);
         var buf: [ipc.max_reply]u8 = undefined;
-        try std.testing.expectEqual(.foreign, exchange(t.name, &t.identity.user, request, &buf, deadlineFromNow()));
+        try std.testing.expectEqual(.refused, exchange(t.name, &t.identity.user, request, &buf, deadlineFromNow()));
     }
 }
 
