@@ -1129,11 +1129,14 @@ pub const App = struct {
         request.* = .dropped;
     }
 
-    /// The Win32 message loop.
-    pub fn run(self: *App) !void {
-        // The core learns the color scheme before the initial window, so
-        // that its terminal starts with it.
-        self.syncColorScheme();
+    /// What `run` does before its loop: serve IPC, then open the initial
+    /// window. IPC comes first because a terminal's environment is set as
+    /// it starts (`Surface.defaultTermioEnv`): only so do the initial
+    /// window's terminals name this instance's own pipe, as later ones do,
+    /// and a `ghostty +new-tab` run in one of them reaches this instance,
+    /// not the one that serves the shared pipe.
+    fn startUp(self: *App) !void {
+        self.startIpc();
 
         // Create the initial window directly, not through the core's
         // `.new_window` as GTK's `activate` does. If it cannot open, the
@@ -1145,12 +1148,24 @@ pub const App = struct {
         if (self.config.@"initial-window") {
             _ = self.newWindow(null, .normal, null) catch |err| {
                 log.err("failed to create the initial window err={}", .{err});
+                // Its clients hear at once that it quits (and a new
+                // window's starts Ghostty), rather than waiting through
+                // the notice to be told it is busy with a request it
+                // never carries out.
+                self.stopIpc();
                 fatalNotice(err);
                 return err;
             };
         }
         self.showConfigErrors();
-        self.startIpc();
+    }
+
+    /// The Win32 message loop.
+    pub fn run(self: *App) !void {
+        // The core learns the color scheme before the initial window, so
+        // that its terminal starts with it.
+        self.syncColorScheme();
+        try self.startUp();
 
         var msg: win32.MSG = undefined;
         while (!self.quit) {
@@ -22648,4 +22663,54 @@ fn testIpcInstance() !void {
         defer env.deinit();
         try std.testing.expectEqual(null, env.get(IpcClient.instance_env));
     }
+}
+
+test "win32: an instance's initial window names its own IPC pipe to its terminals" {
+    // On a desktop of its own: its window shows (testOnOwnDesktop).
+    try testOnOwnDesktop(testIpcInitialWindow, .{});
+}
+
+/// The test of the initial window's terminals and IPC, run by its test on
+/// a desktop of its own.
+fn testIpcInitialWindow() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    TestQuick.start();
+    defer TestQuick.stop();
+    // Each terminal's environment read as it is made, as the core reads it
+    // as the terminal starts (`CoreSurface.init`).
+    const Made = struct {
+        var count: usize = 0;
+        var named: ?u32 = null;
+
+        fn create(w: *Window, opts: Surface.Options) anyerror!*Surface {
+            const pane = try TestQuick.create(w, opts);
+            var env = try pane.defaultTermioEnv();
+            defer env.deinit();
+            count += 1;
+            named = if (env.get(IpcClient.instance_env)) |value| try std.fmt.parseUnsigned(u32, value, 10) else null;
+            return pane;
+        }
+    };
+    Made.count = 0;
+    Made.named = null;
+    Window.test_create_pane = &Made.create;
+
+    var buf: [64]u8 = undefined;
+    app.config.class = try testIpcBase(&buf);
+    try app.startUp();
+    try std.testing.expect(app.ipc_instance != null);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(1, Made.count);
+    try std.testing.expectEqual(@as(?u32, std.os.windows.GetCurrentProcessId()), Made.named);
 }
