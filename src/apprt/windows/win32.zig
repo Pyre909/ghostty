@@ -946,6 +946,8 @@ pub extern "imm32" fn ImmSetCompositionWindow(himc: HIMC, form: *COMPOSITIONFORM
 pub extern "imm32" fn ImmSetCandidateWindow(himc: HIMC, form: *CANDIDATEFORM) callconv(.winapi) BOOL;
 pub extern "imm32" fn ImmNotifyIME(himc: HIMC, action: DWORD, index: DWORD, value: DWORD) callconv(.winapi) BOOL;
 pub extern "user32" fn SetForegroundWindow(hwnd: HWND) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-allowsetforegroundwindow
+pub extern "user32" fn AllowSetForegroundWindow(process_id: DWORD) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-isiconic
 pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn IsZoomed(hwnd: HWND) callconv(.winapi) BOOL;
@@ -1496,6 +1498,7 @@ pub const GR_USEROBJECTS: DWORD = 1;
 pub extern "user32" fn GetGuiResources(process: HANDLE, flags: DWORD) callconv(.winapi) DWORD;
 /// GetCurrentProcess's pseudo handle, which needs no closing.
 pub const current_process: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+pub const current_thread: HANDLE = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
 
 // Named pipes, events and tokens, for IPC (IpcServer.zig).
 
@@ -1563,6 +1566,36 @@ pub extern "kernel32" fn ConnectNamedPipe(pipe: HANDLE, overlapped: ?*OVERLAPPED
 pub extern "kernel32" fn DisconnectNamedPipe(pipe: HANDLE) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeclientprocessid
 pub extern "kernel32" fn GetNamedPipeClientProcessId(pipe: HANDLE, process_id: *DWORD) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getnamedpipeserverprocessid
+pub extern "kernel32" fn GetNamedPipeServerProcessId(pipe: HANDLE, process_id: *DWORD) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-waitnamedpipew
+pub extern "kernel32" fn WaitNamedPipeW(name: LPCWSTR, timeout_ms: DWORD) callconv(.winapi) BOOL;
+/// CreateFileW's flags for a pipe client's security quality of service: the
+/// level at which the server may act as it, here SecurityIdentification
+/// shifted into place
+/// (https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+pub const SECURITY_SQOS_PRESENT: DWORD = 0x0010_0000;
+pub const SECURITY_IDENTIFICATION: DWORD = 0x0001_0000;
+/// For tests, which check that level.
+/// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-impersonatenamedpipeclient
+pub extern "advapi32" fn ImpersonateNamedPipeClient(pipe: HANDLE) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-reverttoself
+pub extern "advapi32" fn RevertToSelf() callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openthreadtoken
+pub extern "advapi32" fn OpenThreadToken(thread: HANDLE, access: DWORD, open_as_self: BOOL, token: *HANDLE) callconv(.winapi) BOOL;
+/// SECURITY_IMPERSONATION_LEVEL (winnt.h).
+pub const SECURITY_IMPERSONATION_LEVEL = enum(c_int) {
+    SecurityAnonymous = 0,
+    SecurityIdentification = 1,
+    SecurityImpersonation = 2,
+    SecurityDelegation = 3,
+    _,
+};
+/// For tests, which need a user other than their own.
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createwellknownsid
+pub extern "advapi32" fn CreateWellKnownSid(kind: c_int, domain: ?PSID, sid: ?*anyopaque, size: *DWORD) callconv(.winapi) BOOL;
+/// WELL_KNOWN_SID_TYPE (winnt.h).
+pub const WinLocalSystemSid: c_int = 22;
 pub const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
 /// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess
 pub extern "kernel32" fn OpenProcess(access: DWORD, inherit: BOOL, process_id: DWORD) callconv(.winapi) ?HANDLE;
@@ -1577,6 +1610,7 @@ pub const TOKEN_QUERY: DWORD = 0x0008;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class
 pub const TOKEN_INFORMATION_CLASS = enum(c_int) {
     TokenUser = 1,
+    TokenImpersonationLevel = 9,
     TokenSessionId = 12,
     TokenElevation = 20,
 };

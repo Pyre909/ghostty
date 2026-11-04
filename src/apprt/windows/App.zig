@@ -25,6 +25,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
+const IpcClient = @import("IpcClient.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
 const ipc = @import("ipc.zig");
@@ -341,32 +342,35 @@ pub const App = struct {
         Win32CallFailed,
     };
 
-    /// Always false: no request is sent to a running instance yet, though
-    /// an instance carries out those it reads (`ipcRequests`), so every
-    /// CLI action that would need one reports "not supported on this
-    /// platform".
+    /// Send the action to the running instance of the user's session that
+    /// `target` names, and say on stderr what came of it unless it was done
+    /// (`IpcClient.perform`): `ghostty +new-window`, `+new-tab` and
+    /// `+toggle-quick-terminal`, each a process of its own, with no App.
     pub fn performIpc(
-        _: Allocator,
-        _: apprt.ipc.Target,
+        alloc: Allocator,
+        target: apprt.ipc.Target,
         comptime action: apprt.ipc.Action.Key,
-        _: apprt.ipc.Action.Value(action),
+        value: apprt.ipc.Action.Value(action),
     ) !bool {
-        return false;
+        var buf: [1024]u8 = undefined;
+        var stderr = std.Io.File.stderr().writer(global.io(), &buf);
+        return IpcClient.perform(alloc, target, action, value, &stderr.interface);
     }
 
     /// Serve IPC requests on this process's pipe, or log why not: no IPC is
-    /// no reason not to run.
+    /// no reason not to run. The pipe is named once, here: a `class` that a
+    /// reload brings is the next launch's.
     fn startIpc(self: *App) void {
         const identity = IpcServer.Identity.ofProcess() catch |err| {
             log.warn("serving no IPC, this process's token cannot be read err={}", .{err});
             return;
         };
-        self.serveIpc(&identity, toast.app_id);
+        self.serveIpc(&identity, self.config.class);
     }
 
-    /// Serve IPC requests on the pipe of `base` for `identity`
-    /// (`IpcServer.pipeName`).
-    fn serveIpc(self: *App, identity: *const IpcServer.Identity, base: []const u8) void {
+    /// Serve IPC requests on the pipe of `class` for `identity`
+    /// (`ipcName`).
+    fn serveIpc(self: *App, identity: *const IpcServer.Identity, class: ?[]const u8) void {
         // An elevated instance would carry out what the user's programs
         // that are not elevated ask, with their arguments, as
         // administrator.
@@ -375,7 +379,7 @@ pub const App = struct {
             return;
         }
         const alloc = self.core_app.alloc;
-        const name = IpcServer.pipeName(alloc, base, identity) catch |err| {
+        const name = ipcName(alloc, class, identity) catch |err| {
             log.warn("serving no IPC, no pipe name err={}", .{err});
             return;
         };
@@ -387,6 +391,26 @@ pub const App = struct {
             }
             return;
         };
+    }
+
+    /// The name of the pipe an instance of `class` serves for `identity`
+    /// (`IpcServer.pipeName`): the class names it, as it names GTK's bus
+    /// (src/apprt/gtk/class/application.zig), else the build's own id, as
+    /// it names the pipe a client of no class reaches (`IpcClient`). A
+    /// class that cannot name a pipe is ignored, as GTK ignores one that
+    /// cannot name its bus.
+    fn ipcName(
+        alloc: Allocator,
+        class: ?[]const u8,
+        identity: *const IpcServer.Identity,
+    ) IpcServer.NameError![:0]u16 {
+        if (class) |c| {
+            if (IpcServer.pipeName(alloc, c, identity)) |name| return name else |err| switch (err) {
+                error.InvalidName, error.NameTooLong => log.warn("ignored a class that cannot name the IPC pipe err={}", .{err}),
+                error.OutOfMemory, error.InvalidSid => return err,
+            }
+        }
+        return IpcServer.pipeName(alloc, toast.app_id, identity);
     }
 
     /// Stop serving IPC requests, if this instance serves them.
@@ -2408,9 +2432,10 @@ pub const App = struct {
                 // Windows. Once its last window has closed, this runtime can
                 // open another only from a global keybind's hotkey
                 // (`staysOpen`): `.new_window` and `.toggle_quick_terminal`
-                // are otherwise asked for from a window, and there is no
-                // tray icon and no IPC to a running instance (`performIpc`).
-                // Without such a hotkey, honoring `false` would leave an
+                // are otherwise asked for from a window, or by IPC
+                // (`performIpc`), and there is no tray icon. IPC alone is no
+                // reason to stay, as nothing would show that the process
+                // runs. Without such a hotkey, honoring `false` would leave an
                 // invisible process with a message-only window and a
                 // GetMessageW that blocks forever, endable only from Task
                 // Manager. A reload with no window open decides again
@@ -21942,15 +21967,16 @@ test "win32: the app stays open with no window while a global keybind can open o
     try std.testing.expectEqual(.expired, app.quit_timer);
 }
 
-/// For tests: a pipe base no other test's has, nor another test run's.
-fn testIpcBase(buf: []u8) ![]const u8 {
+/// For tests: a pipe base, or class, no other test's has, nor another
+/// test run's.
+fn testIpcBase(buf: []u8) ![:0]const u8 {
     const Counter = struct {
         var next: std.atomic.Value(u32) = .init(0);
     };
-    return std.fmt.bufPrint(buf, "ghostty-app-test-{d}-{d}", .{
+    return std.fmt.bufPrintSentinel(buf, "ghostty-app-test-{d}-{d}", .{
         std.os.windows.GetCurrentProcessId(),
         Counter.next.fetchAdd(1, .monotonic),
-    });
+    }, 0);
 }
 
 /// For tests: whether a pipe of `name` can be served, that is, whether
@@ -22317,4 +22343,162 @@ test "win32: an IPC request waiting when the app quits is told so, and freed" {
     try std.testing.expect(quit);
     try std.testing.expectEqual(0, app.windows.items.len);
     try std.testing.expectEqual(ipc.Status.quitting, reply.status);
+}
+
+test "win32: the app's IPC pipe is named by its class, as GTK's bus is, else by the build's id" {
+    const alloc = std.testing.allocator;
+    const identity = try IpcServer.Identity.ofProcess();
+    const build = try IpcServer.pipeName(alloc, toast.app_id, &identity);
+    defer alloc.free(build);
+    const own = try IpcServer.pipeName(alloc, "a.b", &identity);
+    defer alloc.free(own);
+    const long: [IpcServer.max_name_len]u8 = @splat('x');
+    const Case = struct { class: ?[]const u8, name: []const u16 };
+    const cases = [_]Case{
+        .{ .class = "a.b", .name = own },
+        .{ .class = null, .name = build },
+        // A class that cannot name a pipe is ignored.
+        .{ .class = "a\\b", .name = build },
+        .{ .class = "", .name = build },
+        .{ .class = &long, .name = build },
+    };
+    for (cases) |case| {
+        const name = try App.ipcName(alloc, case.class, &identity);
+        defer alloc.free(name);
+        try std.testing.expectEqualSlices(u16, case.name, name);
+    }
+}
+
+/// For tests: run `cli` against `app` as a CLI process would, with the app
+/// reading its request (WM_GHOSTTY_IPC) and carrying it out
+/// (`createRequested`), and return what it returned.
+fn testCliSend(app: *App, cli: *IpcClient.TestCli) !bool {
+    try cli.start();
+    IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+        _ = cli.finish() catch {};
+        return err;
+    };
+    const handled = App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0);
+    app.createRequested();
+    const result = cli.finish();
+    try std.testing.expectEqual(0, handled);
+    return result;
+}
+
+test "win32: `ghostty +new-window` and the others reach the running instance by IPC, and end as it answers" {
+    // On a desktop of its own: its windows show, and would come in front
+    // of the programs on the user's (testOnOwnDesktop).
+    try testOnOwnDesktop(testIpcCli, .{});
+}
+
+/// The test of the CLI's IPC against the app, run by its test on a desktop
+/// of its own.
+fn testIpcCli() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer _ = testTakeQuit();
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    TestIpc.start();
+    defer TestQuick.stop();
+    // A test's terminals have no core to inherit from (`inheritedOptions`).
+    app.config.@"window-inherit-working-directory" = false;
+    app.config.@"tab-inherit-working-directory" = false;
+    app.config.@"window-inherit-font-size" = false;
+
+    const identity = try IpcServer.Identity.ofProcess();
+    var buf: [64]u8 = undefined;
+    const class = try testIpcBase(&buf);
+    // With a real instance's limits: a first window can take longer than
+    // the limit the pending request below is given.
+    app.serveIpc(&identity, class);
+    try std.testing.expect(app.ipc != null);
+
+    // Done: it succeeds, and says nothing.
+    {
+        var arguments = [_][:0]const u8{ "--title=a", "-e", "cmd.exe" };
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .arguments = &arguments };
+        try std.testing.expect(try testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("", cli.said());
+    }
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqualStrings("cmd.exe", TestIpc.command orelse return error.TestUnexpectedResult);
+    const a = app.windows.items[0];
+    const pa = a.tab().focused orelse return error.TestUnexpectedResult;
+    pa.core_surface.id = 0x11;
+    try core_app.surfaces.append(alloc, pa);
+
+    // A tab beside the terminal of the id given.
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_tab, .surface_id = 0x11 };
+        try std.testing.expect(try testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("", cli.said());
+    }
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(2, a.tabs.items.len);
+
+    // The quick terminal, shown, then hidden.
+    for ([_]bool{ true, false }) |visible| {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .toggle_quick_terminal };
+        try std.testing.expect(try testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("", cli.said());
+        const quick = app.quick orelse return error.TestUnexpectedResult;
+        TestQuick.settle(quick);
+        try std.testing.expectEqual(visible, quick.quickShown());
+    }
+    try std.testing.expect(win32.DestroyWindow(app.quick.?.hwnd).toBool());
+
+    // Refused: it fails, saying why.
+    {
+        var arguments = [_][:0]const u8{"--command= "};
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window, .arguments = &arguments };
+        try std.testing.expectError(error.IPCFailed, testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("+new-window failed: the command does not parse\n", cli.said());
+    }
+    try std.testing.expectEqual(1, app.windows.items.len);
+
+    // Not carried out in time: it succeeds, saying the instance is busy,
+    // and the tab opens once the app gets to it. Served again, so that
+    // a request not answered in 300 ms is pending.
+    app.stopIpc();
+    IpcServer.test_limits = .{ .answer_ms = 300 };
+    app.serveIpc(&identity, class);
+    IpcServer.test_limits = null;
+    try std.testing.expect(app.ipc != null);
+    core_app.focused_surface = &pa.core_surface;
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_tab };
+        try cli.start();
+        IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_IPC) catch |err| {
+            _ = cli.finish() catch {};
+            return err;
+        };
+        try std.testing.expect(try cli.finish());
+        try std.testing.expectEqualStrings("+new-tab: the running Ghostty is busy, and does it once it is free\n", cli.said());
+        try std.testing.expectEqual(2, a.tabs.items.len);
+        try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_IPC, 0, 0));
+        app.createRequested();
+    }
+    try std.testing.expectEqual(3, a.tabs.items.len);
+
+    // Quitting: it fails, saying so. The core's terminals held the one
+    // of the id for the tab; quitting asks each whether it needs a
+    // confirmation, and a test's has no core to ask.
+    core_app.surfaces.clearRetainingCapacity();
+    core_app.focused_surface = null;
+    try std.testing.expect(try app.performAction(.app, .quit, {}));
+    {
+        var cli: IpcClient.TestCli = .{ .identity = identity, .class = class, .action = .new_window };
+        try std.testing.expectError(error.IPCFailed, testCliSend(&app, &cli));
+        try std.testing.expectEqualStrings("+new-window failed: the running Ghostty is quitting\n", cli.said());
+    }
+    try std.testing.expectEqual(1, app.windows.items.len);
 }

@@ -625,7 +625,7 @@ fn readRequest(self: *IpcServer) Read {
     }
 }
 
-fn remaining(deadline: u64) u32 {
+pub fn remaining(deadline: u64) u32 {
     const now = win32.GetTickCount64();
     if (now >= deadline) return 0;
     return @intCast(@min(deadline - now, win32.INFINITE - 1));
@@ -723,8 +723,8 @@ const test_message: win32.UINT = win32.WM_APP + 0x40;
 
 var test_names: std.atomic.Value(u32) = .init(0);
 
-/// A base no other test's pipe has, nor another test run's.
-fn testBase(buf: []u8) ![]const u8 {
+/// For tests: a base no other test's pipe has, nor another test run's.
+pub fn testBase(buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "ghostty-test-{d}-{d}", .{
         std.os.windows.GetCurrentProcessId(),
         test_names.fetchAdd(1, .monotonic),
@@ -815,9 +815,9 @@ fn testExchange(name: [:0]const u16, request: []const u8, delay_ms: u32, reply: 
     return len;
 }
 
-/// Open the pipe as a client, waiting up to 5 s while another client has
-/// it.
-fn testOpen(name: [:0]const u16, access: win32.DWORD) !win32.HANDLE {
+/// For tests: open the pipe as a client, waiting up to 5 s while another
+/// client has it.
+pub fn testOpen(name: [:0]const u16, access: win32.DWORD) !win32.HANDLE {
     const deadline = win32.GetTickCount64() + 5000;
     while (true) {
         const pipe = win32.CreateFileW(name, access, 0, null, win32.OPEN_EXISTING, win32.FILE_FLAG_OVERLAPPED, null);
@@ -830,8 +830,8 @@ fn testOpen(name: [:0]const u16, access: win32.DWORD) !win32.HANDLE {
     }
 }
 
-/// Read or write all of `buf` on a client's handle within 5 s.
-fn testIo(pipe: win32.HANDLE, comptime kind: enum { read, write }, buf: []u8) !void {
+/// For tests: read or write all of `buf` on a pipe's handle within 5 s.
+pub fn testIo(pipe: win32.HANDLE, comptime kind: enum { read, write }, buf: []u8) !void {
     const event = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.TestUnexpectedResult;
     defer _ = win32.CloseHandle(event);
     var at: usize = 0;
