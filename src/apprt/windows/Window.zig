@@ -1931,6 +1931,32 @@ pub fn requestClose(self: *Window) void {
     self.postDestroy();
 }
 
+/// `toggle_quick_terminal` with the quick terminal shown and nothing that
+/// could show it again once hidden (`App.quickAlone`): closed rather than
+/// hidden, which would leave its programs running out of reach, but only
+/// once the user says so, even with no program running, since the key
+/// they pressed asked for a hide (`requestClose` asks only when one runs).
+/// The question says why it closes, and Cancel is its default button, as
+/// closing ends what runs in it. Cancelled, it stays, shown.
+pub fn requestCloseAlone(self: *Window) void {
+    assert(self.quick);
+    if (self.app.terminating or self.closing) return;
+    self.closing = true;
+    if (!confirm(self.app, self.hwnd, alone_prompt, .cancel)) {
+        self.closing = false;
+        return;
+    }
+    self.postDestroy();
+}
+
+/// The question `requestCloseAlone` asks. Its conversion at compile time
+/// takes more than the default branch quota.
+pub const alone_prompt = blk: {
+    @setEvalBranchQuota(10_000);
+    break :blk L("The quick terminal cannot hide, as nothing could show it again: " ++
+        "no other window is open, and no global keybind shows it. Close it instead?");
+};
+
 /// `close_tab`: the tabs `mode` names from the one at index `at`, as GTK
 /// closes them: that one itself, every other tab, or the tabs after it.
 /// Asks first, as `requestClose` does, if a process is still running in

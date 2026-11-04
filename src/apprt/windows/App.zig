@@ -2677,14 +2677,15 @@ pub const App = struct {
     /// as GTK makes its own, so with no other terminal's directory or font
     /// size; so does the first after its last terminal closed. Shown with
     /// nothing to show it again once hidden (`quickAlone`), it closes
-    /// instead, as `closeStrandedQuick` closes a hidden one. An error only
-    /// if it could not be made.
+    /// instead, as `closeStrandedQuick` closes a hidden one, but only once
+    /// the user says so (`Window.requestCloseAlone`). An error only if it
+    /// could not be made.
     fn toggleQuick(self: *App) !void {
         if (self.quick) |window| {
             if (!window.quickShown()) {
                 _ = window.showQuick();
             } else if (self.quickAlone()) {
-                window.requestClose();
+                window.requestCloseAlone();
             } else window.hideQuick();
             return;
         }
@@ -13063,6 +13064,7 @@ const TestQuick = struct {
         in_front = null;
         watch = null;
         watch_topmost = null;
+        answer = win32.IDCANCEL;
         Window.test_create_pane = &create;
         Window.test_foreground = &foreground;
         Surface.test_occlusion = &occlusion;
@@ -13285,20 +13287,31 @@ const TestQuick = struct {
     }
 
     /// The owner of the last prompt `dialog.messageBox` would have shown
-    /// (`dialog.test_message_box`), whether it showed then, and whether
-    /// `watch_topmost` was always on top then; answered with `answer`.
+    /// (`dialog.test_message_box`), its text and buttons, whether it
+    /// showed then, and whether `watch_topmost` was always on top then;
+    /// answered with `answer`, Cancel unless a test says otherwise.
     var asked: ?win32.HWND = null;
+    var asked_text: ?win32.LPCWSTR = null;
+    var asked_buttons: win32.UINT = 0;
     var asked_shown: bool = false;
     var watch_topmost: ?win32.HWND = null;
     var asked_topmost: bool = false;
     var answer: c_int = win32.IDCANCEL;
 
     fn ask(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
-        _ = .{ prompt, buttons };
         asked = owner;
+        asked_text = prompt;
+        asked_buttons = buttons;
         asked_shown = if (owner) |hwnd| win32.IsWindowVisible(hwnd).toBool() else false;
         if (watch_topmost) |hwnd| asked_topmost = hasStyle(hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOPMOST);
         return answer;
+    }
+
+    /// That the last prompt asked `text`, with `default` (MB_DEFBUTTON1
+    /// or MB_DEFBUTTON2) the button Enter presses.
+    fn expectAsked(text: win32.LPCWSTR, default: win32.UINT) !void {
+        try std.testing.expectEqualSlices(u16, std.mem.span(text), std.mem.span(asked_text.?));
+        try std.testing.expectEqual(default, asked_buttons & win32.MB_DEFMASK);
     }
 
     /// The quick terminal shown whole by a toggle and hidden by the next,
@@ -14669,18 +14682,25 @@ fn testQuickStranded() !void {
     try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
     try std.testing.expect(TestQuick.asked == null);
 
-    // A toggle asks to close it rather than hide it; cancelled, it stays,
-    // shown.
+    // A toggle asks to close it rather than hide it, saying why, with
+    // Cancel the default; cancelled, it stays, shown.
     try TestQuick.begin(&app);
     try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
+    try TestQuick.expectAsked(Window.alone_prompt, win32.MB_DEFBUTTON2);
     try std.testing.expect(!quick.closing);
     try std.testing.expect(quick.quickShown());
 
-    // With nothing running there is nothing to ask: the toggle closes it.
+    // With nothing running too, as the key meant a hide: asked the same,
+    // and closed once the answer is yes.
     Window.test_needs_confirm = false;
     TestQuick.asked = null;
     try TestQuick.begin(&app);
-    try std.testing.expect(TestQuick.asked == null);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.asked.?);
+    try TestQuick.expectAsked(Window.alone_prompt, win32.MB_DEFBUTTON2);
+    try std.testing.expect(!quick.closing);
+    try std.testing.expect(quick.quickShown());
+    TestQuick.answer = win32.IDOK;
+    try TestQuick.begin(&app);
     try std.testing.expect(quick.closing);
 }
 
