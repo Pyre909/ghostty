@@ -26,8 +26,8 @@ const IpcServer = @import("IpcServer.zig");
 const toast = @import("toast.zig");
 const win32 = @import("win32.zig");
 
-/// How long a client has for its whole exchange, from its first open, in
-/// milliseconds: more than a server takes for one client at most
+/// How long a request has for all its exchanges, with whichever pipes it
+/// tries, from its first open, in milliseconds: more than a server takes for one client at most
 /// (`IpcServer.Limits`), so that a server that keeps its limits is heard
 /// unless another client holds the pipe.
 pub const budget_ms: u32 = 10_000;
@@ -208,6 +208,9 @@ pub fn performAs(
     defer alloc.free(request);
 
     var buf: [ipc.max_reply]u8 = undefined;
+    // One budget for both pipes, so that the request ends within it
+    // however it goes: the shared pipe gets what the own one left.
+    const deadline = deadlineFromNow();
     const exchanged = exchanged: {
         // The instance whose terminal this runs in, unless it has gone, as
         // a program its terminal started can outlive it; then the shared
@@ -219,10 +222,10 @@ pub fn performAs(
                 error.NameTooLong => break :own,
             };
             defer alloc.free(own);
-            const result = exchange(own, &identity.user, request, &buf);
+            const result = exchange(own, &identity.user, request, &buf, deadline);
             if (result != .none) break :exchanged result;
         }
-        break :exchanged exchange(name, &identity.user, request, &buf);
+        break :exchanged exchange(name, &identity.user, request, &buf, deadline);
     };
     const reply = switch (exchanged) {
         .reply => |reply| reply,
@@ -490,15 +493,15 @@ pub const Outcome = union(enum) {
 };
 
 /// Send `request` on the pipe `name` (`IpcServer.pipeName`), once it is
-/// known to be `user`'s, and read its reply into `buf`, all within the
-/// budget.
+/// known to be `user`'s, and read its reply into `buf`, all by `deadline`
+/// (`deadlineFromNow`).
 pub fn exchange(
     name: [:0]const u16,
     user: *const IpcServer.Sid,
     request: []const u8,
     buf: *[ipc.max_reply]u8,
+    deadline: u64,
 ) Outcome {
-    const deadline = win32.GetTickCount64() + budget();
     const pipe = switch (open(name, deadline)) {
         .pipe => |pipe| pipe,
         .outcome => |outcome| return outcome,
@@ -531,6 +534,11 @@ pub fn exchange(
     const reply = ipc.decodeReply(buf[0 .. ipc.reply_header_len + len]) catch |err|
         return .{ .malformed = err };
     return .{ .reply = reply };
+}
+
+/// The tick (`GetTickCount64`) by which an exchange begun now ends.
+fn deadlineFromNow() u64 {
+    return win32.GetTickCount64() + budget();
 }
 
 fn budget() u32 {
@@ -798,7 +806,7 @@ const TestExchange = struct {
     }
 
     fn run(self: *TestExchange) void {
-        self.outcome = exchange(self.name, &self.user, self.request, &self.buf);
+        self.outcome = exchange(self.name, &self.user, self.request, &self.buf, deadlineFromNow());
     }
 
     fn finish(self: *TestExchange) Outcome {
@@ -917,7 +925,7 @@ test "win32: an IPC client sends nothing to a pipe that is not its user's" {
         try std.testing.expect(win32.CreateWellKnownSid(win32.WinLocalSystemSid, null, &system, &system_len).toBool());
         const other = try IpcServer.Sid.copy(@ptrCast(&system));
         var buf: [ipc.max_reply]u8 = undefined;
-        try std.testing.expectEqual(.foreign, exchange(t.name, &other, request, &buf));
+        try std.testing.expectEqual(.foreign, exchange(t.name, &other, request, &buf, deadlineFromNow()));
         try t.accept();
         try std.testing.expect(t.sentNothing());
     }
@@ -928,7 +936,7 @@ test "win32: an IPC client sends nothing to a pipe that is not its user's" {
         var t: TestPipe = try .init(alloc, "D:P");
         defer t.deinit(alloc);
         var buf: [ipc.max_reply]u8 = undefined;
-        try std.testing.expectEqual(.foreign, exchange(t.name, &t.identity.user, request, &buf));
+        try std.testing.expectEqual(.foreign, exchange(t.name, &t.identity.user, request, &buf, deadlineFromNow()));
     }
 }
 
@@ -995,8 +1003,15 @@ test "win32: an IPC client waits while another client has the pipe, until its bu
     test_budget_ms = 200;
     var buf: [ipc.max_reply]u8 = undefined;
     const started = win32.GetTickCount64();
-    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity.user, request, &buf));
+    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity.user, request, &buf, deadlineFromNow()));
     try std.testing.expect(win32.GetTickCount64() - started >= 150);
+
+    // By a deadline already past, as the pipe a request tries second
+    // gets only what the first left: it does not wait at all.
+    test_budget_ms = 5000;
+    const late = win32.GetTickCount64();
+    try std.testing.expectEqual(.timeout, exchange(t.name, &t.identity.user, request, &buf, late));
+    try std.testing.expect(win32.GetTickCount64() - late < 2500);
 
     // Freed while it waits: it gets through.
     test_budget_ms = 5000;
