@@ -2,8 +2,8 @@
 //! open, from the arguments they send (`ipc.Request`): parsed as GTK
 //! parses its own (src/apprt/gtk/class/Overrides.zig), and applied to the
 //! terminal's configuration as GTK applies them (`applyCommandOverrides`
-//! in src/apprt/gtk/class/surface.zig). Other arguments are ignored, as
-//! there.
+//! in src/apprt/gtk/class/surface.zig), but for the working directory
+//! (`workingDirectory`). Other arguments are ignored, as there.
 const Overrides = @This();
 
 const std = @import("std");
@@ -139,7 +139,12 @@ pub fn apply(self: *const Overrides, config: *configpkg.Config) Allocator.Error!
 
 /// The path a new terminal starts in, for one that would inherit
 /// `inherited`: the path asked for, or none for `inherit` (`apply`), or
-/// `inherited` when nothing was asked.
+/// `inherited` when nothing was asked. The CLI always asks, for the
+/// directory it runs in unless `--working-directory` names another
+/// (src/cli/new_tab.zig), so a tab opens where the command ran. GTK lets
+/// the inherited one win, the parent's pwd set after the overrides
+/// (src/apprt/gtk/class/surface.zig): there a tab opens where the terminal
+/// beside it is.
 pub fn workingDirectory(self: *const Overrides, inherited: ?[]const u8) ?[]const u8 {
     const wd = self.working_directory orelse return inherited;
     return wd.value();

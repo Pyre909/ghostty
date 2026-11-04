@@ -1149,8 +1149,10 @@ pub const App = struct {
     fn freeRequest(self: *App, request: *Request) void {
         switch (request.*) {
             .palette_run => |chosen| chosen.pending.destroy(self.core_app.alloc),
-            // Its client was told the instance is quitting as the server
-            // stopped, before this.
+            // Its client was told already: that the instance is quitting,
+            // as the server stopped before this, or, once the time for an
+            // answer ran out, that it was busy and would do it, which it
+            // now never does.
             .ipc => |ipc_request| ipc_request.destroy(self.core_app.alloc),
             else => {},
         }

@@ -12,7 +12,8 @@
 //! launch is a process of its own.
 //! A new window or tab that no instance can take starts Ghostty instead
 //! (`startGhostty`), for the class asked for, as D-Bus activation starts
-//! GTK's.
+//! GTK's, though with the request's arguments for its command line, where
+//! D-Bus sends GTK's the request once it is started.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -28,9 +29,9 @@ const toast = @import("toast.zig");
 const win32 = @import("win32.zig");
 
 /// How long a request has for all its exchanges, with whichever pipes it
-/// tries, from its first open, in milliseconds: more than a server takes for one client at most
-/// (`IpcServer.Limits`), so that a server that keeps its limits is heard
-/// unless another client holds the pipe.
+/// tries, from its first open, in milliseconds: more than a server takes
+/// for one client at most (`IpcServer.Limits`), so that a server that
+/// keeps its limits is heard unless another client holds the pipe.
 pub const budget_ms: u32 = 10_000;
 
 /// For tests: the budget in place of `budget_ms`.
@@ -281,10 +282,11 @@ fn say(stderr: *std.Io.Writer, comptime format: []const u8, args: anytype) void 
     stderr.flush() catch {};
 }
 
-/// A request that no running instance can take, for `reason`. A new window
-/// or tab starts Ghostty instead (`startGhostty`), as D-Bus activation
-/// starts GTK's. The quick terminal fails: no option starts Ghostty with
-/// it shown, where D-Bus starts GTK's and then asks it to toggle.
+/// A request that no running instance can take, for `reason`. A new
+/// window or tab starts Ghostty instead (`startGhostty`), as D-Bus
+/// activation starts GTK's, though with the request's arguments for its
+/// command line. The quick terminal fails: no option starts Ghostty
+/// with it shown, where D-Bus starts GTK's and then asks it to toggle.
 fn unanswered(
     alloc: Allocator,
     comptime action: apprt.ipc.Action.Key,
@@ -302,14 +304,17 @@ fn unanswered(
 
 /// Start Ghostty, this process's own image, with `arguments` as its
 /// command line, and not wait for it: true once it is started, its own
-/// window saying what it makes of them. A class asked for comes first, as
-/// `--class`, before an `-e` that makes the rest the command's: the
-/// started Ghostty then serves the pipe that the next request for that
-/// class reaches, where one started without it would serve its config's,
-/// and each such request would start another. D-Bus activation starts
-/// only a name that a service file gives, the build's own, so GTK's
-/// request for any other class fails instead. Without one, the started
-/// Ghostty's config names its class.
+/// window saying what it makes of them. There they mean more than in a
+/// request: each option of the config applies to the whole of the
+/// started Ghostty, an unknown one is a config error, and `--help` asks
+/// it for its help. A class asked for comes first, as `--class`, before
+/// an `-e` that makes the rest the command's: the started Ghostty then
+/// serves the pipe that the next request for that class reaches, where
+/// one started without it would serve its config's, and each such
+/// request would start another. D-Bus activation starts only a name
+/// that a service file gives, the build's own, so GTK's request for any
+/// other class fails instead. Without one, the started Ghostty's config
+/// names its class.
 fn startGhostty(
     alloc: Allocator,
     comptime command: []const u8,
@@ -405,10 +410,11 @@ fn appendQuoted(
 /// Start `line` from `image` with nothing of this process's inherited:
 /// neither its handles, among them those of the console it runs a CLI
 /// action on, which a pipe at the command line would wait for the started
-/// process to close, nor the launcher's process ID, by which the started
-/// process would take that console for its own
-/// (`internal_os.windows.attachLauncherConsole`). Null once started, else
-/// why not.
+/// process to close, nor the launcher's process ID: the launcher ends with
+/// this process, and the started one's terminals would pass its ID, which
+/// Windows can then give another process, to every program they run
+/// (`internal_os.windows.startedByLauncher`). Null once started, else why
+/// not.
 fn spawn(image: [:0]u16, line: [:0]u16) ?win32.Win32Error {
     // From this process's own environment, which the started one copies:
     // this one ends once its action is done.
