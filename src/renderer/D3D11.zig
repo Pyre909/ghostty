@@ -747,7 +747,10 @@ const Composition = struct {
 
     /// dcomp.dll is loaded like d3dcompiler_47.dll (see `loadCompiler`),
     /// but only for a composition chain, and every failure is the
-    /// fallback's error rather than surface creation's.
+    /// fallback's error rather than surface creation's. Loaded at every
+    /// bind, a new chain's or a recovered device's, as the compiler is at
+    /// every init: after the first, LoadLibraryExW finds the module loaded
+    /// and raises its reference count, which nothing lowers.
     fn bind(
         dxgi_device: *api.IDXGIDevice,
         hwnd: api.HWND,
@@ -763,7 +766,7 @@ const Composition = struct {
             return error.D3D11CompositionFailed;
         };
         const proc = internal_os.windows.exp.kernel32.GetProcAddress(module, "DCompositionCreateDevice") orelse {
-            log.warn("dcomp.dll has no DCompositionCreateDevice export", .{});
+            log.warn("dcomp.dll has no DCompositionCreateDevice export err={}", .{std.os.windows.GetLastError()});
             return error.D3D11CompositionFailed;
         };
         const create: api.DCompositionCreateDeviceFn = @ptrCast(@alignCast(proc));
@@ -832,7 +835,7 @@ fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
         return error.D3DCompilerMissing;
     };
     const proc = internal_os.windows.exp.kernel32.GetProcAddress(module, "D3DCompile") orelse {
-        log.err("d3dcompiler_47.dll has no D3DCompile export", .{});
+        log.err("d3dcompiler_47.dll has no D3DCompile export err={}", .{std.os.windows.GetLastError()});
         return error.D3DCompilerMissing;
     };
     return @ptrCast(@alignCast(proc));
