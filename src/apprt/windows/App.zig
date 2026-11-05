@@ -2496,13 +2496,22 @@ pub const App = struct {
         }
     }
 
-    /// `CoreApp.updateConfig` while the background is toggled opaque: each
-    /// live terminal, which during a reload are the core's
-    /// (`syncColorScheme`), given `config` with `background-opacity` 1
-    /// (`giveSurface`), and then the app the configuration at its
-    /// conditional state, as the core gives it. Not the core's followed by
-    /// a second change: the core gives each terminal `config` as it is, and
-    /// its renderer can draw a frame translucent before the second comes.
+    /// `CoreApp.updateConfig` while the background is toggled opaque, its
+    /// steps one for one (the test "updateOpaque mirrors
+    /// CoreApp.updateConfig" fails when the core's steps change):
+    ///
+    /// 1. Each terminal given `config`: the core sends each of its surfaces
+    ///    `change_config`, which is `CoreSurface.updateConfig`. Here each
+    ///    live one, which during a reload are the core's
+    ///    (`syncColorScheme`), with `background-opacity` 1 (`giveSurface`).
+    /// 2. `config` put at the core's conditional state, or as it is if
+    ///    that fails, logged.
+    /// 3. The app given that in a `config_change`, here `configChange`
+    ///    itself, which is what `performAction` calls for it.
+    ///
+    /// Not the core's followed by a second change: the core gives each
+    /// terminal `config` as it is, and its renderer can draw a frame
+    /// translucent before the second comes.
     fn updateOpaque(self: *App, config: *const Config) !void {
         for (self.surfaces.items) |surface| {
             const core = surface.liveCore() orelse continue;
@@ -18561,6 +18570,47 @@ test "win32: key_table and key_sequence show the active tables and pending keys 
 
     // Passive: Windows gives the pointer over it to the window under it.
     try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
+}
+
+test "win32: updateOpaque mirrors CoreApp.updateConfig" {
+    // `App.updateOpaque` carries out the core's reload itself while the
+    // background is toggled opaque, step for step. The core's steps, read
+    // from its source (src/App.zig) without comments or blank lines: a
+    // change to them fails this, for updateOpaque to be checked against
+    // them and this brought up to date.
+    const source = @embedFile("../../App.zig");
+    const head = "\npub fn updateConfig(self: *App, rt_app: *apprt.App, config: *const Config) !void {\n";
+    const at = std.mem.indexOf(u8, source, head) orelse return error.TestUnexpectedResult;
+    const start = at + head.len;
+    const end = std.mem.indexOfPos(u8, source, start, "\n}\n") orelse return error.TestUnexpectedResult;
+    var code: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer code.deinit();
+    var lines = std.mem.splitScalar(u8, source[start..end], '\n');
+    while (lines.next()) |line| {
+        const statement = std.mem.trim(u8, line, " \t\r");
+        if (statement.len == 0 or std.mem.startsWith(u8, statement, "//")) continue;
+        try code.writer.writeAll(statement);
+        try code.writer.writeByte('\n');
+    }
+    try std.testing.expectEqualStrings(
+        \\for (self.surfaces.items) |surface| {
+        \\try surface.core().handleMessage(.{ .change_config = config });
+        \\}
+        \\var applied_: ?configpkg.Config = config.changeConditionalState(
+        \\self.config_conditional_state,
+        \\) catch |err| err: {
+        \\log.warn("failed to apply conditional state to config err={}", .{err});
+        \\break :err null;
+        \\};
+        \\defer if (applied_) |*c| c.deinit();
+        \\const applied: *const configpkg.Config = if (applied_) |*c| c else config;
+        \\_ = try rt_app.performAction(
+        \\.app,
+        \\.config_change,
+        \\.{ .config = applied },
+        \\);
+        \\
+    , code.written());
 }
 
 /// For tests: the most key tables the core keeps active, read from its
