@@ -119,10 +119,11 @@ dark_frame: bool,
 
 /// Whether the frame lets the desktop through where its terminals'
 /// background is translucent (Transparency.zig): set as the frame is made
-/// (`makeTransparent`), never changed. Its terminals present with alpha
-/// (`Surface.presentsAlpha`), paint black under their chains, and its
-/// chrome is layered; a terminal only ever moves to a frame of the same
-/// kind (`App.moveTabAt`).
+/// (`makeTransparent`), never changed. Its terminals' renderers are asked
+/// to present with alpha (`Surface.presentsAlpha`), which each does unless
+/// it could not make a composition chain (`renderer.D3D11`), and the
+/// terminals paint black under their chains; its chrome is layered. A
+/// terminal only ever moves to a frame of the same kind (`App.moveTabAt`).
 transparent: bool,
 
 /// The system backdrop DWM was last given for the frame

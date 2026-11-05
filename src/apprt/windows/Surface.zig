@@ -1239,12 +1239,14 @@ pub const Surface = struct {
         return .{};
     }
 
-    /// Whether this terminal's renderer presents with alpha, through a
+    /// Whether this terminal's renderer is to present with alpha, through a
     /// swap chain DWM composes with what is behind the window, rather than
     /// opaque. Asked once, when the renderer is made: true in a transparent
     /// window, whose frame lets the desktop through (Transparency.zig). A
     /// terminal only ever moves to a frame of its window's kind
-    /// (`App.moveTabAt`), so the answer holds for its life.
+    /// (`App.moveTabAt`), so the answer holds for its life. A renderer that
+    /// cannot make the swap chain asked for presents opaque all the same
+    /// (`renderer.D3D11`), and says so itself.
     pub fn presentsAlpha(self: *const Surface) bool {
         return self.window.transparent;
     }

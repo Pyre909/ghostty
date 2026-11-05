@@ -39,7 +39,9 @@
 //! closes (`Window.transparent`): as `background-opacity` is then
 //! (`wanted`), or for a tab moved to a new window as its old window was
 //! (`App.moveTabAt`). So a terminal is always in a frame of the kind its
-//! renderer presents for, which the renderer asks once. A window made
+//! renderer was asked to present for, once, as it was made; a renderer
+//! that could not make a composition chain presents opaque in a
+//! transparent frame (`renderer.D3D11`). A window made
 //! opaque stays so when the opacity drops below 1 later, until it is
 //! opened again; macOS needs a restart for any change of it.
 

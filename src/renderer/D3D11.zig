@@ -365,8 +365,9 @@ pub fn init(
 
 /// `init` once the window and its chain are known. A composition chain
 /// that cannot be made or shown falls back to an HWND chain, with a
-/// warning: the window is then opaque, which `presentsAlpha` says from the
-/// start, rather than not drawn at all.
+/// warning: the terminal then presents opaque, which `presentsAlpha` says
+/// from the start, rather than not at all. Its window's frame stays
+/// transparent, as do the window's other terminals.
 fn initWindow(
     hwnd: api.HWND,
     compile: api.D3DCompileFn,
