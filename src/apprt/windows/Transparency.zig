@@ -262,9 +262,10 @@ pub fn paintTerminal(hwnd: win32.HWND) void {
         return;
     };
     defer _ = win32.EndPaint(hwnd, &paint);
-    const black = win32.CreateSolidBrush(win32.rgb(0, 0, 0)) orelse return;
-    defer _ = win32.DeleteObject(black);
-    _ = win32.FillRect(hdc, &paint.rcPaint, black);
+    // The stock brush, which the system made once, rather than a brush made
+    // and deleted at every paint.
+    const black = win32.GetStockObject(win32.BLACK_BRUSH) orelse return;
+    _ = win32.FillRect(hdc, &paint.rcPaint, @ptrCast(black));
 }
 
 /// Whether `fillOpaque` has said once that it could not buffer a paint.

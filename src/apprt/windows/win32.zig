@@ -1121,6 +1121,12 @@ pub extern "user32" fn FillRect(hdc: HDC, rect: *const RECT, brush: HBRUSH) call
 pub const COLORREF = w.COLORREF;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createsolidbrush
 pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUSH;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getstockobject
+/// The system's own object, made once: not to be deleted (Learn: deleting
+/// one is unnecessary, though not harmful).
+pub extern "gdi32" fn GetStockObject(index: c_int) callconv(.winapi) ?HGDIOBJ;
+/// wingdi.h's stock black brush, for GetStockObject.
+pub const BLACK_BRUSH = 4;
 /// A brush, font, bitmap or other GDI object.
 pub const HGDIOBJ = *anyopaque;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
