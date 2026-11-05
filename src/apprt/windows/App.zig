@@ -2041,8 +2041,8 @@ pub const App = struct {
     /// (`giveSurface`), which is a soft reload for it, so a key sequence and
     /// the key tables end as at any reload; and each transparent window the
     /// backdrop that goes with it (`Transparency.applyBlur`). The windows
-    /// stay transparent: C0 measured a composition chain at opacity 1
-    /// drawing what an opaque window draws (comp1). Nothing while
+    /// stay transparent: a composition chain at opacity 1 was measured
+    /// drawing what an opaque window draws. Nothing while
     /// `background-opacity` is 1 or more, as a reload since it was asked
     /// can have made it, as on macOS.
     fn toggleBackgroundOpacity(self: *App) void {

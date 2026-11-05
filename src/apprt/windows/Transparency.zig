@@ -1,9 +1,7 @@
 //! A transparent window: one whose terminals show what is behind it where
 //! their background is translucent (`background-opacity` below 1), as GTK
-//! and macOS show it. Probe C0 of the third parity plan measured on Windows
-//! 11 what that takes (~/ghostty-win/host/local/out/parity3-c0-report.md,
-//! the fork's notes), each part checked against the blend arithmetic over
-//! a known backing:
+//! and macOS show it. What that takes was measured on Windows 11, each part
+//! checked against the blend arithmetic over a known backing:
 //!
 //! - The terminal presents through a composition swap chain, whose alpha
 //!   DWM honours; it ignores an HWND chain's (`renderer.D3D11`, asked by
@@ -25,17 +23,16 @@
 //!
 //! `background-blur` blurs what is behind a transparent frame while its
 //! opacity is below 1, with DWM's acrylic system backdrop, from Windows 11
-//! 22H2 (`applyBlur`): C0
-//! measured it blurring under the blend, where Mica only tints it with the
-//! wallpaper. Its intensity is ignored, as on Linux.
+//! 22H2 (`applyBlur`), measured blurring under the blend, where Mica only
+//! tints it with the wallpaper. Its intensity is ignored, as on Linux.
 //!
 //! `toggle_background_opacity` leaves a window transparent: its terminals
-//! are given `background-opacity` 1 (`App.giveSurface`), which C0 measured
-//! a composition chain drawing as an opaque window does (comp1), and the
-//! frame the default backdrop.
+//! are given `background-opacity` 1 (`App.giveSurface`), at which a
+//! composition chain was measured drawing as an opaque window does, and
+//! the frame the default backdrop.
 //!
-//! C0 rejected a frame without a redirection bitmap
-//! (WS_EX_NOREDIRECTIONBITMAP): it loses the scroll bar and every pixel the
+//! A frame without a redirection bitmap (WS_EX_NOREDIRECTIONBITMAP) was
+//! measured and rejected: it loses the scroll bar and every pixel the
 //! frame paints, and can be chosen only as the frame is made.
 //!
 //! A window is transparent, or not, from when its frame is made until it
@@ -108,7 +105,8 @@ fn blurBehind(frame: win32.HWND, on: bool) bool {
         log.warn("a window is opaque: no region for its blur-behind err={}", .{win32.GetLastError()});
         return false;
     };
-    // DWM keeps none of it: the probe deleted it at once.
+    // DWM keeps none of it: blur-behind was measured working with the
+    // region deleted at once.
     defer _ = win32.DeleteObject(empty);
     const blur: win32.DWM_BLURBEHIND = .{
         .flags = win32.DWM_BB_ENABLE | win32.DWM_BB_BLURREGION,
@@ -125,7 +123,8 @@ fn blurBehind(frame: win32.HWND, on: bool) bool {
 /// The system backdrop DWM draws behind a transparent frame
 /// (DWMWA_SYSTEMBACKDROP_TYPE, dwmapi.h's DWM_SYSTEMBACKDROP_TYPE): the
 /// default, which a window has until it asks, or acrylic, which blurs what
-/// is behind the frame (C0: Mica, 2, only tints it with the wallpaper).
+/// is behind the frame (Mica, 2, was measured only tinting it with the
+/// wallpaper).
 pub const Backdrop = enum(win32.DWORD) {
     default = win32.DWMSBT_AUTO,
     acrylic = win32.DWMSBT_TRANSIENTWINDOW,
@@ -209,9 +208,9 @@ fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
 /// bar, a search bar, the command palette, an overlay), if the window is
 /// transparent (`layer`). Not their own children, the fields and the
 /// palette's list: a layered window's children are drawn into its
-/// surface, and come out opaque with it (c3s's probes, which left the
-/// search field and the palette's field and list unlayered: each the
-/// colour it is in an opaque window).
+/// surface, and come out opaque with it (measured with the search field
+/// and the palette's field and list left unlayered: each the colour it is
+/// in an opaque window).
 pub fn chrome(window: *const Window, hwnd: win32.HWND) void {
     if (window.transparent) _ = layer(hwnd);
 }
@@ -251,8 +250,8 @@ fn setAlpha(hwnd: win32.HWND) bool {
 
 /// A terminal's WM_PAINT in a transparent frame: its update region filled
 /// black, alpha 0 in the frame's surface, under the terminal's chain,
-/// which then blends with the desktop (C0: #203060 at 0.5 over GDI white,
-/// unpainted, showed #94a0c3). The region is validated either way, or
+/// which then blends with the desktop (measured: #203060 at 0.5 over GDI
+/// white, unpainted, showed #94a0c3). The region is validated either way, or
 /// Windows would post WM_PAINT again at once, forever.
 pub fn paintTerminal(hwnd: win32.HWND) void {
     var paint: win32.PAINTSTRUCT = undefined;
@@ -272,8 +271,8 @@ var buffer_failed_logged = false;
 /// Fill `rect` of `hdc`, a transparent frame's paint DC, with `brush`,
 /// opaque: in a buffer whose alpha is set to 255 before it is copied to
 /// the frame, as GDI alone writes alpha 0, which DWM shows added to what
-/// is behind the frame (C0: the divider #131d3a over magenta showed
-/// #ff1dff). Filled directly, said once, if no buffer can be had.
+/// is behind the frame (measured: the divider #131d3a over magenta
+/// showed #ff1dff). Filled directly, said once, if no buffer can be had.
 pub fn fillOpaque(hdc: win32.HDC, rect: *const win32.RECT, brush: win32.HBRUSH) void {
     if (rect.right <= rect.left or rect.bottom <= rect.top) return;
     var mem: ?win32.HDC = null;
@@ -328,8 +327,8 @@ test "win32: a window layered over a transparent frame is opaque, and one that c
     // stand-in, as a child's are in the test runner, which has no manifest
     // (error 87), keeps the style it had. A top-level one too: a child
     // there does not take WS_EX_LAYERED at all, so its style is as it was
-    // whether `layer` puts it back or not (c3u's mutant layer-keeps-style
-    // survived a child).
+    // whether `layer` puts it back or not (a mutation keeping the layered
+    // style survived a child).
     const testing = std.testing;
     const top = try testPopup();
     defer _ = win32.DestroyWindow(top);
