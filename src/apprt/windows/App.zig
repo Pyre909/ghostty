@@ -7766,6 +7766,20 @@ test "win32: a transparent window's backdrop follows the configuration, an opaqu
     try std.testing.expectEqual(.acrylic, clear.backdrop);
     try std.testing.expect(!solid.transparent);
     try std.testing.expectEqual(.default, solid.backdrop);
+
+    // Opacity 1 with blur still on: the terminals draw opaque, and the
+    // transparent window has no acrylic, as a window made then has none;
+    // below 1 again, acrylic again.
+    changed.@"background-opacity" = 1;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(5, TestClear.backdrop_count);
+    try std.testing.expectEqual(.default, TestClear.backdrops[4]);
+    try std.testing.expectEqual(.default, clear.backdrop);
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(6, TestClear.backdrop_count);
+    try std.testing.expectEqual(.acrylic, clear.backdrop);
+    try std.testing.expectEqual(.default, solid.backdrop);
 }
 
 /// For the `toggle_background_opacity` tests: the terminals `App.giveSurface`

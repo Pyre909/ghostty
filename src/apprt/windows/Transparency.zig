@@ -23,8 +23,9 @@
 //!   (`fillOpaque`). The themed scroll bar, the terminal's non-client
 //!   area, is opaque as it is.
 //!
-//! `background-blur` blurs what is behind a transparent frame with DWM's
-//! acrylic system backdrop, from Windows 11 22H2 (`applyBlur`): C0
+//! `background-blur` blurs what is behind a transparent frame while its
+//! opacity is below 1, with DWM's acrylic system backdrop, from Windows 11
+//! 22H2 (`applyBlur`): C0
 //! measured it blurring under the blend, where Mica only tints it with the
 //! wallpaper. Its intensity is ignored, as on Linux.
 //!
@@ -120,9 +121,13 @@ pub const Backdrop = enum(win32.DWORD) {
 
 /// The backdrop `config` asks a transparent window for: acrylic while
 /// `background-blur` blurs at all (`BackgroundBlur.enabled`, so macOS's
-/// glass too, as on Linux). DWM takes no radius: the intensity is ignored,
-/// as on Linux.
+/// glass too, as on Linux) and `background-opacity` is below 1, as the
+/// option says and macOS does (`ghostty_set_window_background_blur` in
+/// embedded.zig). At 1 the terminals draw opaque, and acrylic would show
+/// only in the title bar, which an opaque window's has not. DWM takes no
+/// radius: the intensity is ignored, as on Linux.
 pub fn backdrop(config: *const configpkg.Config) Backdrop {
+    if (config.@"background-opacity" >= 1) return .default;
     return if (config.@"background-blur".enabled()) .acrylic else .default;
 }
 
