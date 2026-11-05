@@ -663,17 +663,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     config.link.links.items,
                 );
 
-                // A backend whose surface is composed as opaque would show
-                // the premultiplied background, rgb * opacity, as a darker
-                // colour rather than a translucent one, so it gets none.
-                const background_opacity: f64 = if (@hasDecl(GraphicsAPI, "presents_alpha") and
-                    !GraphicsAPI.presents_alpha)
-                    1
-                else
-                    @max(0, @min(1, config.@"background-opacity"));
-
                 return .{
-                    .background_opacity = background_opacity,
+                    // The renderer may still draw it as 1, see
+                    // `opaqueUnlessPresentsAlpha`.
+                    .background_opacity = @max(0, @min(1, config.@"background-opacity")),
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
                     .font_thicken_strength = config.@"font-thicken-strength",
@@ -724,6 +717,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         };
 
+        /// A backend whose surface is composed as opaque would show the
+        /// premultiplied background, rgb * opacity, as a darker colour
+        /// rather than a translucent one, so it gets none. A backend says
+        /// so per instance with `presentsAlpha` (Direct3D 11: an HWND chain
+        /// or a composition chain, chosen per window at init); one without
+        /// it composes alpha. Every config the renderer adopts goes through
+        /// here: in `init` and `changeConfig`.
+        pub fn opaqueUnlessPresentsAlpha(api: *const GraphicsAPI, config: *DerivedConfig) void {
+            if (comptime !@hasDecl(GraphicsAPI, "presentsAlpha")) return;
+            if (!api.presentsAlpha()) config.background_opacity = 1;
+        }
+
         pub fn init(alloc: Allocator, options: renderer.Options) !Self {
             // Initialize our graphics API wrapper, this will prepare the
             // surface provided by the apprt and set up any API- and surface-
@@ -755,9 +760,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             };
 
+            var config = options.config;
+            opaqueUnlessPresentsAlpha(&api, &config);
+
             var result: Self = .{
                 .alloc = alloc,
-                .config = options.config,
+                .config = config,
                 .surface_mailbox = options.surface_mailbox,
                 .grid_metrics = font_critical.metrics,
                 .size = options.size,
@@ -790,7 +798,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Note that if we're on macOS with glass effects
                         // we'll disable background opacity but we handle
                         // that in updateFrame.
-                        @intFromFloat(@round(options.config.background_opacity * 255.0)),
+                        @intFromFloat(@round(config.background_opacity * 255.0)),
                     },
                     .bools = .{
                         .cursor_wide = false,
@@ -2323,6 +2331,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.config.deinit();
             self.config = config.*;
+            opaqueUnlessPresentsAlpha(&self.api, &self.config);
 
             // If our background image path changed, prepare the new bg image.
             if (bg_image_changed) try self.prepBackgroundImage();

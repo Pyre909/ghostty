@@ -4,7 +4,7 @@
 //! The COM interfaces are vtable structs in the order of the mingw headers
 //! Zig ships (lib/libc/include/any-windows-any: d3d11.h, dxgi.h, dxgi1_2.h,
 //! dxgi1_3.h, dxgi1_4.h, dxgi1_5.h, d3d11sdklayers.h, d3dcommon.h,
-//! d3dcompiler.h), the same headers the C compiler would read. Only the
+//! d3dcompiler.h, dcomp.h), the same headers the C compiler would read. Only the
 //! methods the backend calls are typed; every other slot is an untyped
 //! pointer, so a vtable keeps its size and each typed slot keeps its index.
 //! A derived interface embeds its parent's vtable as its first field, which
@@ -14,7 +14,8 @@
 //! against the header, so a dropped or shuffled slot fails on any host
 //! instead of calling the wrong function in a Windows run. No extern
 //! function lives here so that those tests link everywhere; D3D11.zig
-//! declares D3D11CreateDevice and loads D3DCompile at runtime.
+//! declares D3D11CreateDevice and loads D3DCompile and
+//! DCompositionCreateDevice at runtime.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -89,6 +90,7 @@ pub const IID_ID3D11DeviceContext: GUID = GUID.parse("{c0bfa96c-e089-44fb-8eaf-2
 pub const IID_ID3D11Resource: GUID = GUID.parse("{dc8e63f3-d12b-4952-b47b-5e45026a862d}");
 pub const IID_ID3D11Texture2D: GUID = GUID.parse("{6f15aaf2-d208-4e89-9ab4-489535d34f9c}");
 pub const IID_ID3D11InfoQueue: GUID = GUID.parse("{6543dbb6-1b48-42f5-ab82-e97ec74326f6}");
+pub const IID_IDCompositionDevice: GUID = GUID.parse("{c37ea93a-e7aa-450d-b16f-9746cb0407f3}");
 
 // ---------------------------------------------------------------------------
 // Enums and flags
@@ -131,6 +133,7 @@ pub const DXGI_SCALING = enum(c_int) {
 };
 
 pub const DXGI_ALPHA_MODE = enum(c_int) {
+    PREMULTIPLIED = 1,
     IGNORE = 3,
     _,
 };
@@ -671,7 +674,13 @@ pub const IDXGIFactory2 = extern struct {
         RegisterOcclusionStatusWindow: Slot,
         RegisterOcclusionStatusEvent: Slot,
         UnregisterOcclusionStatus: Slot,
-        CreateSwapChainForComposition: Slot,
+        CreateSwapChainForComposition: *const fn (
+            *IDXGIFactory2,
+            *IUnknown,
+            *const DXGI_SWAP_CHAIN_DESC1,
+            ?*IDXGIOutput,
+            *?*IDXGISwapChain1,
+        ) callconv(cc) HRESULT,
     };
 
     pub fn makeWindowAssociation(self: *IDXGIFactory2, hwnd: HWND, flags: UINT) HRESULT {
@@ -1179,6 +1188,92 @@ pub const D3DCompileFn = *const fn (
 ) callconv(cc) HRESULT;
 
 // ---------------------------------------------------------------------------
+// DirectComposition
+//
+// dcomp.h declares these for C++ only: there is no C vtable to compare
+// with, and its overloads (SetOffsetX, SetTransform, SetClip, ...) are
+// listed in one order for MSVC and the other for everyone else. The order
+// of two overloads does not move the slots after them, and none of them is
+// called here, so each pair is two untyped slots.
+
+pub const IDCompositionDevice = extern struct {
+    vtable: *const VTable,
+
+    pub const IID = IID_IDCompositionDevice;
+
+    pub const VTable = extern struct {
+        base: IUnknown.VTable,
+        Commit: *const fn (*IDCompositionDevice) callconv(cc) HRESULT,
+        WaitForCommitCompletion: Slot,
+        GetFrameStatistics: Slot,
+        CreateTargetForHwnd: *const fn (
+            *IDCompositionDevice,
+            HWND,
+            BOOL,
+            *?*IDCompositionTarget,
+        ) callconv(cc) HRESULT,
+        CreateVisual: *const fn (*IDCompositionDevice, *?*IDCompositionVisual) callconv(cc) HRESULT,
+        CreateSurface: Slot,
+        CreateVirtualSurface: Slot,
+        CreateSurfaceFromHandle: Slot,
+        CreateSurfaceFromHwnd: Slot,
+        CreateTranslateTransform: Slot,
+        CreateScaleTransform: Slot,
+        CreateRotateTransform: Slot,
+        CreateSkewTransform: Slot,
+        CreateMatrixTransform: Slot,
+        CreateTransformGroup: Slot,
+        CreateTranslateTransform3D: Slot,
+        CreateScaleTransform3D: Slot,
+        CreateRotateTransform3D: Slot,
+        CreateMatrixTransform3D: Slot,
+        CreateTransform3DGroup: Slot,
+        CreateEffectGroup: Slot,
+        CreateRectangleClip: Slot,
+        CreateAnimation: Slot,
+        CheckDeviceState: Slot,
+    };
+};
+
+pub const IDCompositionTarget = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        base: IUnknown.VTable,
+        SetRoot: *const fn (*IDCompositionTarget, ?*IDCompositionVisual) callconv(cc) HRESULT,
+    };
+};
+
+pub const IDCompositionVisual = extern struct {
+    vtable: *const VTable,
+
+    pub const VTable = extern struct {
+        base: IUnknown.VTable,
+        SetOffsetX: [2]Slot,
+        SetOffsetY: [2]Slot,
+        SetTransform: [2]Slot,
+        SetTransformParent: Slot,
+        SetEffect: Slot,
+        SetBitmapInterpolationMode: Slot,
+        SetBorderMode: Slot,
+        SetClip: [2]Slot,
+        SetContent: *const fn (*IDCompositionVisual, ?*IUnknown) callconv(cc) HRESULT,
+        AddVisual: Slot,
+        RemoveVisual: Slot,
+        RemoveAllVisuals: Slot,
+        SetCompositeMode: Slot,
+    };
+};
+
+/// DCompositionCreateDevice from dcomp.dll, resolved at runtime like
+/// D3DCompile: only a transparent window needs it.
+pub const DCompositionCreateDeviceFn = *const fn (
+    dxgi_device: ?*IDXGIDevice,
+    iid: REFIID,
+    dcomposition_device: *?*anyopaque,
+) callconv(cc) HRESULT;
+
+// ---------------------------------------------------------------------------
 // Layout tests
 //
 // Slot counts are the number of methods in each interface's C vtable in the
@@ -1220,6 +1315,9 @@ test "d3d11 api: vtable slot counts" {
     try testing.expectEqual(115 * p, @sizeOf(ID3D11DeviceContext.VTable));
     try testing.expectEqual(38 * p, @sizeOf(ID3D11InfoQueue.VTable));
     try testing.expectEqual(5 * p, @sizeOf(ID3DBlob.VTable));
+    try testing.expectEqual(27 * p, @sizeOf(IDCompositionDevice.VTable));
+    try testing.expectEqual(4 * p, @sizeOf(IDCompositionTarget.VTable));
+    try testing.expectEqual(20 * p, @sizeOf(IDCompositionVisual.VTable));
 }
 
 test "d3d11 api: typed slot indices" {
@@ -1244,6 +1342,12 @@ test "d3d11 api: typed slot indices" {
     try testing.expectEqual(13 * p, @offsetOf(IDXGISwapChain.VTable, "ResizeBuffers"));
     try testing.expectEqual(18 * p, @offsetOf(IDXGISwapChain1.VTable, "GetDesc1"));
     try testing.expectEqual(15 * p, @offsetOf(IDXGIFactory2.VTable, "CreateSwapChainForHwnd"));
+    try testing.expectEqual(24 * p, @offsetOf(IDXGIFactory2.VTable, "CreateSwapChainForComposition"));
+    try testing.expectEqual(3 * p, @offsetOf(IDCompositionDevice.VTable, "Commit"));
+    try testing.expectEqual(6 * p, @offsetOf(IDCompositionDevice.VTable, "CreateTargetForHwnd"));
+    try testing.expectEqual(7 * p, @offsetOf(IDCompositionDevice.VTable, "CreateVisual"));
+    try testing.expectEqual(3 * p, @offsetOf(IDCompositionTarget.VTable, "SetRoot"));
+    try testing.expectEqual(15 * p, @offsetOf(IDCompositionVisual.VTable, "SetContent"));
     try testing.expectEqual(12 * p, @offsetOf(IDXGIDevice1.VTable, "SetMaximumFrameLatency"));
 }
 
@@ -1278,6 +1382,8 @@ test "d3d11 api: iids and hresults" {
     try testing.expectEqual(0x46, IID_IUnknown.Data4[7]);
     try testing.expectEqual(0x77db970f, IID_IDXGIDevice1.Data1);
     try testing.expectEqual(0x2c, IID_IDXGIDevice1.Data4[7]);
+    try testing.expectEqual(0xc37ea93a, IID_IDCompositionDevice.Data1);
+    try testing.expectEqual(0xf3, IID_IDCompositionDevice.Data4[7]);
     try testing.expect(failed(DXGI_ERROR_DEVICE_REMOVED));
     try testing.expect(failed(E_FAIL));
     try testing.expect(succeeded(S_OK));

@@ -1199,6 +1199,17 @@ pub const Surface = struct {
         return .{};
     }
 
+    /// Whether this terminal's renderer presents with alpha, through a
+    /// swap chain DWM composes with what is behind the window, rather than
+    /// opaque. Asked once, when the renderer is made. False for every
+    /// terminal: such a chain needs its frame to let the desktop through
+    /// (blur-behind, and a terminal window that paints black), and no
+    /// frame does, so every terminal presents opaque.
+    pub fn presentsAlpha(self: *const Surface) bool {
+        _ = self;
+        return false;
+    }
+
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
         const scale: f32 = @as(f32, @floatFromInt(self.dpi())) /

@@ -12,6 +12,12 @@
 //! drawn from the apprt's or host's thread through `Surface.draw`
 //! (ghostty_surface_draw), which renderers must allow.
 //!
+//! The swap chain is one of two kinds, chosen once, at init (`Chain`): an
+//! HWND chain, which DWM composes as opaque, or, for a terminal whose frame
+//! is transparent, a composition chain with premultiplied alpha that
+//! DirectComposition shows on the window, so that what is behind the window
+//! shows through its translucent pixels.
+//!
 //! Frames render into an offscreen target texture and are copied to the
 //! back buffer and presented synchronously from `Frame.complete`, so one
 //! swap chain slot is enough and nothing is exported.
@@ -67,11 +73,24 @@ pub const custom_shader_target: shadertoy.Target = .hlsl;
 /// SV_Position is +Y = down, like Metal's fragment position.
 pub const custom_shader_y_is_down = true;
 
-/// The swap chain is an HWND chain, which DXGI only allows with
-/// DXGI_ALPHA_MODE_IGNORE, so DWM composes the window as opaque. The
-/// premultiplied background would show as its colour scaled toward
-/// black, so generic.zig draws it opaque instead; see `DerivedConfig`.
-pub const presents_alpha = false;
+/// Whether what this renderer presents is composed with its alpha. An
+/// HWND chain is not: DXGI only allows it DXGI_ALPHA_MODE_IGNORE, so DWM
+/// composes the window as opaque, and the premultiplied background would
+/// show as its colour scaled toward black; generic.zig draws it opaque
+/// instead (`opaqueUnlessPresentsAlpha`). The chain never changes after
+/// init, so neither does the answer.
+pub fn presentsAlpha(self: *const D3D11) bool {
+    return self.chain == .composition;
+}
+
+/// The two kinds of swap chain; see the top of this file.
+const Chain = enum {
+    /// CreateSwapChainForHwnd: FLIP_DISCARD, sized by the window, opaque.
+    hwnd,
+    /// CreateSwapChainForComposition with premultiplied alpha, shown on
+    /// the window through a DirectComposition visual (`Composition`).
+    composition,
+};
 
 /// One slot: presentation is synchronous inside `Frame.complete`, so at
 /// most one frame is ever in flight (generic.zig allows a count of 1).
@@ -94,6 +113,24 @@ const log = std.log.scoped(.d3d11);
 const win32 = struct {
     const RECT = internal_os.windows.RECT;
     const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
+
+    // For the tests' windows only.
+    const WS_POPUP: u32 = 0x80000000;
+    extern "user32" fn CreateWindowExW(
+        ex_style: u32,
+        class_name: [*:0]const u16,
+        window_name: [*:0]const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        parent: ?api.HWND,
+        menu: ?*anyopaque,
+        instance: ?*anyopaque,
+        param: ?*anyopaque,
+    ) callconv(.winapi) ?api.HWND;
+    extern "user32" fn DestroyWindow(hwnd: api.HWND) callconv(.winapi) api.BOOL;
 
     extern "d3d11" fn D3D11CreateDevice(
         adapter: ?*api.IDXGIAdapter,
@@ -146,6 +183,14 @@ lost: bool = false,
 /// Whether `window-vsync` is on, kept so that `recoverDevice` creates the
 /// new swap chain with the same presentation choice.
 vsync: bool,
+
+/// The kind of swap chain this window presents through, chosen at init
+/// and kept for `recoverDevice`, which makes the same kind or fails.
+chain: Chain,
+
+/// The DirectComposition objects that show a composition chain; null for
+/// an HWND chain and while the GPU objects are released.
+composition: ?Composition = null,
 
 /// Set while the GPU objects are released: after `deinit`, and after a
 /// recovery attempt that could not create a replacement device. The
@@ -307,13 +352,34 @@ pub fn init(
         else => @compileError("unsupported apprt for Direct3D 11"),
     };
 
-    const compile = try loadCompiler();
+    // A host owns its window and Ghostty cannot know what its frame
+    // draws, so an embedded surface keeps the HWND chain.
+    const chain: Chain = switch (apprt.runtime) {
+        apprt.windows => if (opts.rt_surface.presentsAlpha()) .composition else .hwnd,
+        apprt.embedded => .hwnd,
+        else => unreachable,
+    };
 
+    return initWindow(hwnd, try loadCompiler(), opts.config.vsync, opts.config.blending, chain);
+}
+
+/// `init` once the window and its chain are known. A composition chain
+/// that cannot be made or shown falls back to an HWND chain, with a
+/// warning: the window is then opaque, which `presentsAlpha` says from the
+/// start, rather than not drawn at all.
+fn initWindow(
+    hwnd: api.HWND,
+    compile: api.D3DCompileFn,
+    vsync: bool,
+    blending: configpkg.Config.AlphaBlending,
+    chain: Chain,
+) !D3D11 {
     var self: D3D11 = .{
         .hwnd = hwnd,
         .compile = compile,
-        .vsync = opts.config.vsync,
-        .blending = opts.config.blending,
+        .vsync = vsync,
+        .chain = chain,
+        .blending = blending,
         // Set by adopt.
         .device = undefined,
         .context = undefined,
@@ -323,7 +389,15 @@ pub fn init(
         .sync_interval = undefined,
         .present_flags = undefined,
     };
-    self.adopt(try createGpu(hwnd, opts.config.vsync));
+    const gpu = createGpu(hwnd, vsync, chain) catch |err| switch (err) {
+        error.D3D11CompositionFailed => gpu: {
+            log.warn("no composition swap chain for hwnd={x}; presenting through an HWND chain, opaque", .{@intFromPtr(hwnd)});
+            self.chain = .hwnd;
+            break :gpu try createGpu(hwnd, vsync, .hwnd);
+        },
+        else => |e| return e,
+    };
+    self.adopt(gpu);
     return self;
 }
 
@@ -339,6 +413,7 @@ const Gpu = struct {
     present_flags: api.UINT,
     info_queue: ?*api.ID3D11InfoQueue,
     software_factory: ?*api.IDXGIFactory2,
+    composition: ?Composition,
 };
 
 fn adopt(self: *D3D11, gpu: Gpu) void {
@@ -351,12 +426,15 @@ fn adopt(self: *D3D11, gpu: Gpu) void {
     self.present_flags = gpu.present_flags;
     self.info_queue = gpu.info_queue;
     self.software_factory = gpu.software_factory;
+    self.composition = gpu.composition;
     self.released = false;
 }
 
-/// Create the device, its immediate context and a swap chain for the
-/// window, plus the sampler and debug queue that go with them.
-fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
+/// Create the device, its immediate context and a swap chain of the kind
+/// `chain` names for the window, plus the sampler and debug queue that go
+/// with them. Failing to make or show a composition chain is
+/// error.D3D11CompositionFailed, after everything made so far is released.
+fn createGpu(hwnd: api.HWND, vsync: bool, chain: Chain) !Gpu {
     // BGRA support is required for the B8G8R8A8 swap chain format. The
     // debug layer needs the Graphics Tools optional feature; without it
     // device creation reports the SDK component missing, and the device is
@@ -499,11 +577,14 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
     // `window-vsync = false` presents without waiting for a vblank. In
     // windowed flip model only tearing unlocks the rate, and DXGI must
     // be asked whether it can tear; without it interval 0 still presents
-    // as soon as the queue has room.
+    // as soon as the queue has room. A composition chain does not ask:
+    // tearing shows only when DWM hands a chain the display (independent
+    // flip), and a chain it blends with what is behind the window is
+    // never handed it.
     const sync_interval: api.UINT = if (vsync) 1 else 0;
     var swap_chain_flags: api.UINT = 0;
     var present_flags: api.UINT = 0;
-    if (!vsync) tearing: {
+    if (!vsync and chain == .hwnd) tearing: {
         const factory5 = api.queryInterface(factory, api.IDXGIFactory5) catch break :tearing;
         defer api.release(factory5);
         var allow: api.BOOL = 0;
@@ -518,42 +599,98 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
         present_flags |= api.DXGI_PRESENT_ALLOW_TEARING;
     }
 
-    // Width and height 0 size the chain to the client area. The format is
-    // the same either way: the target texture carries the sRGB view when
-    // blending is linear and its bytes are copied over as they are.
-    const desc: api.DXGI_SWAP_CHAIN_DESC1 = .{
-        .Width = 0,
-        .Height = 0,
-        .Format = .B8G8R8A8_UNORM,
-        .Stereo = 0,
-        .SampleDesc = .{ .Count = 1, .Quality = 0 },
-        .BufferUsage = api.DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        .BufferCount = 2,
-        .Scaling = .NONE,
-        .SwapEffect = .FLIP_DISCARD,
-        .AlphaMode = .IGNORE,
-        .Flags = swap_chain_flags,
-    };
     var swap_chain_ptr: ?*api.IDXGISwapChain1 = null;
-    hr = factory.vtable.CreateSwapChainForHwnd(
-        factory,
-        api.unknown(device),
-        hwnd,
-        &desc,
-        null,
-        null,
-        &swap_chain_ptr,
-    );
-    if (api.failed(hr)) {
-        log.err("CreateSwapChainForHwnd failed hwnd={x} hr=0x{x}", .{
-            @intFromPtr(hwnd),
-            @as(u32, @bitCast(hr)),
-        });
-        return error.D3D11SwapChainFailed;
+    switch (chain) {
+        .hwnd => {
+            // Width and height 0 size the chain to the client area. The
+            // format is the same either way: the target texture carries
+            // the sRGB view when blending is linear and its bytes are
+            // copied over as they are.
+            const desc: api.DXGI_SWAP_CHAIN_DESC1 = .{
+                .Width = 0,
+                .Height = 0,
+                .Format = .B8G8R8A8_UNORM,
+                .Stereo = 0,
+                .SampleDesc = .{ .Count = 1, .Quality = 0 },
+                .BufferUsage = api.DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                .BufferCount = 2,
+                .Scaling = .NONE,
+                .SwapEffect = .FLIP_DISCARD,
+                .AlphaMode = .IGNORE,
+                .Flags = swap_chain_flags,
+            };
+            hr = factory.vtable.CreateSwapChainForHwnd(
+                factory,
+                api.unknown(device),
+                hwnd,
+                &desc,
+                null,
+                null,
+                &swap_chain_ptr,
+            );
+            if (api.failed(hr)) {
+                log.err("CreateSwapChainForHwnd failed hwnd={x} hr=0x{x}", .{
+                    @intFromPtr(hwnd),
+                    @as(u32, @bitCast(hr)),
+                });
+                return error.D3D11SwapChainFailed;
+            }
+        },
+        .composition => {
+            // A composition chain has no window to take its size from:
+            // it starts at the client area's (at least 1x1, which DXGI
+            // requires) and `present` resizes it to each target, as it
+            // does an HWND chain. FLIP_SEQUENTIAL and STRETCH are what
+            // CreateSwapChainForComposition accepts on Windows 8. The
+            // target's colours are premultiplied, which is what DWM is
+            // told here.
+            var rc: win32.RECT = undefined;
+            const sized = win32.GetClientRect(hwnd, &rc).toBool();
+            const desc: api.DXGI_SWAP_CHAIN_DESC1 = .{
+                .Width = if (sized) @intCast(@max(1, rc.right - rc.left)) else 1,
+                .Height = if (sized) @intCast(@max(1, rc.bottom - rc.top)) else 1,
+                .Format = .B8G8R8A8_UNORM,
+                .Stereo = 0,
+                .SampleDesc = .{ .Count = 1, .Quality = 0 },
+                .BufferUsage = api.DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                .BufferCount = 2,
+                .Scaling = .STRETCH,
+                .SwapEffect = .FLIP_SEQUENTIAL,
+                .AlphaMode = .PREMULTIPLIED,
+                .Flags = swap_chain_flags,
+            };
+            hr = factory.vtable.CreateSwapChainForComposition(
+                factory,
+                api.unknown(device),
+                &desc,
+                null,
+                &swap_chain_ptr,
+            );
+            if (api.failed(hr)) {
+                log.warn("CreateSwapChainForComposition failed hwnd={x} {d}x{d} hr=0x{x}", .{
+                    @intFromPtr(hwnd),
+                    desc.Width,
+                    desc.Height,
+                    @as(u32, @bitCast(hr)),
+                });
+                return error.D3D11CompositionFailed;
+            }
+        },
     }
     const swap_chain = swap_chain_ptr orelse return error.D3D11SwapChainFailed;
-    // Nothing after this may fail: DXGI may already have taken the chain
-    // full-screen, and only `releaseGpu` releases one safely.
+
+    // A composition chain is shown by binding it to the window. It has no
+    // window of its own, so DXGI never takes it full-screen, and it can
+    // still be released here if the binding fails.
+    const composition: ?Composition = switch (chain) {
+        .hwnd => null,
+        .composition => Composition.bind(dxgi_device, hwnd, swap_chain) catch |err| {
+            api.release(swap_chain);
+            return err;
+        },
+    };
+    // Nothing after this may fail: DXGI may already have taken an HWND
+    // chain full-screen, and only `releaseGpu` releases one safely.
 
     // DXGI would otherwise watch the window for Alt+Enter and window
     // changes on the app's behalf; the apprt or the host handles those.
@@ -565,11 +702,17 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
         log.warn("MakeWindowAssociation failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
     }
 
-    log.info("D3D11 swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_discard sync_interval={d} tearing={}", .{
-        @intFromPtr(hwnd),
-        sync_interval,
-        present_flags & api.DXGI_PRESENT_ALLOW_TEARING != 0,
-    });
+    switch (chain) {
+        .hwnd => log.info("D3D11 swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_discard sync_interval={d} tearing={}", .{
+            @intFromPtr(hwnd),
+            sync_interval,
+            present_flags & api.DXGI_PRESENT_ALLOW_TEARING != 0,
+        }),
+        .composition => log.info("D3D11 composition swap chain created hwnd={x} format=B8G8R8A8_UNORM buffers=2 flip_sequential premultiplied sync_interval={d}", .{
+            @intFromPtr(hwnd),
+            sync_interval,
+        }),
+    }
 
     return .{
         .device = device,
@@ -581,8 +724,92 @@ fn createGpu(hwnd: api.HWND, vsync: bool) !Gpu {
         .present_flags = present_flags,
         .info_queue = info_queue,
         .software_factory = software_factory,
+        .composition = composition,
     };
 }
+
+/// The DirectComposition objects that show a composition chain on its
+/// window: a device on the D3D device's DXGI device, a target on the
+/// window, above its child windows, and one visual whose content is the
+/// chain. A window takes one target of each kind, so `releaseGpu` releases
+/// these before `recoverDevice` binds a new chain.
+const Composition = struct {
+    device: *api.IDCompositionDevice,
+    target: *api.IDCompositionTarget,
+    visual: *api.IDCompositionVisual,
+
+    fn release(self: Composition) void {
+        api.release(self.visual);
+        api.release(self.target);
+        api.release(self.device);
+    }
+
+    /// dcomp.dll is loaded like d3dcompiler_47.dll (see `loadCompiler`),
+    /// but only for a composition chain, and every failure is the
+    /// fallback's error rather than surface creation's.
+    fn bind(
+        dxgi_device: *api.IDXGIDevice,
+        hwnd: api.HWND,
+        swap_chain: *api.IDXGISwapChain1,
+    ) error{D3D11CompositionFailed}!Composition {
+        const name = std.unicode.utf8ToUtf16LeStringLiteral("dcomp.dll");
+        const module = internal_os.windows.exp.kernel32.LoadLibraryExW(
+            name,
+            null,
+            internal_os.windows.LOAD_LIBRARY_SEARCH_SYSTEM32,
+        ) orelse {
+            log.warn("dcomp.dll could not be loaded err={}", .{std.os.windows.GetLastError()});
+            return error.D3D11CompositionFailed;
+        };
+        const proc = internal_os.windows.exp.kernel32.GetProcAddress(module, "DCompositionCreateDevice") orelse {
+            log.warn("dcomp.dll has no DCompositionCreateDevice export", .{});
+            return error.D3D11CompositionFailed;
+        };
+        const create: api.DCompositionCreateDeviceFn = @ptrCast(@alignCast(proc));
+
+        var device_ptr: ?*anyopaque = null;
+        var hr = create(dxgi_device, &api.IDCompositionDevice.IID, &device_ptr);
+        if (api.failed(hr) or device_ptr == null) {
+            log.warn("DCompositionCreateDevice failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return error.D3D11CompositionFailed;
+        }
+        const device: *api.IDCompositionDevice = @ptrCast(@alignCast(device_ptr.?));
+        errdefer api.release(device);
+
+        var target_ptr: ?*api.IDCompositionTarget = null;
+        hr = device.vtable.CreateTargetForHwnd(device, hwnd, 1, &target_ptr);
+        const target = (if (api.succeeded(hr)) target_ptr else null) orelse {
+            log.warn("IDCompositionDevice::CreateTargetForHwnd failed hwnd={x} hr=0x{x}", .{ @intFromPtr(hwnd), @as(u32, @bitCast(hr)) });
+            return error.D3D11CompositionFailed;
+        };
+        errdefer api.release(target);
+
+        var visual_ptr: ?*api.IDCompositionVisual = null;
+        hr = device.vtable.CreateVisual(device, &visual_ptr);
+        const visual = (if (api.succeeded(hr)) visual_ptr else null) orelse {
+            log.warn("IDCompositionDevice::CreateVisual failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return error.D3D11CompositionFailed;
+        };
+        errdefer api.release(visual);
+
+        hr = visual.vtable.SetContent(visual, api.unknown(swap_chain));
+        if (api.failed(hr)) {
+            log.warn("IDCompositionVisual::SetContent failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return error.D3D11CompositionFailed;
+        }
+        hr = target.vtable.SetRoot(target, visual);
+        if (api.failed(hr)) {
+            log.warn("IDCompositionTarget::SetRoot failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return error.D3D11CompositionFailed;
+        }
+        hr = device.vtable.Commit(device);
+        if (api.failed(hr)) {
+            log.warn("IDCompositionDevice::Commit failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+            return error.D3D11CompositionFailed;
+        }
+        return .{ .device = device, .target = target, .visual = visual };
+    }
+};
 
 /// d3dcompiler_47.dll is loaded by hand rather than linked so that its
 /// absence is an error this function can report. It is searched for in
@@ -638,8 +865,9 @@ pub fn deinit(self: *D3D11) void {
     self.drawFrameUnlocked();
 }
 
-/// Release the device and everything created with it. The swap chain goes
-/// before the context and device; nothing else references the back buffer
+/// Release the device and everything created with it. The composition
+/// objects go first (the visual holds the chain), then the swap chain,
+/// then the context and device; nothing else references the back buffer
 /// at this point. A chain in full-screen is kept instead, see
 /// `fullscreen_chain`. Nothing to do when a failed recovery already
 /// released them.
@@ -649,6 +877,8 @@ fn releaseGpu(self: *D3D11) void {
     self.context.vtable.ClearState(self.context);
     self.context.vtable.Flush(self.context);
     self.default_sampler.deinit();
+    if (self.composition) |c| c.release();
+    self.composition = null;
     if (isFullscreen(self.swap_chain)) {
         assert(self.fullscreen_chain == null);
         self.fullscreen_chain = self.swap_chain;
@@ -724,17 +954,20 @@ pub fn recoveryDelayMs(self: *const D3D11) ?u64 {
 }
 
 /// Replace a lost device: release it with everything created on it, and
-/// create them again for the same window. Under the draw mutex, on the
-/// thread drawing the frame, after the generic renderer released its own
-/// resources. On failure the device stays lost, the caller draws nothing,
-/// and the first frame after `recovery_retry_ms` tries again.
+/// create them again for the same window, with the same kind of chain.
+/// Under the draw mutex, on the thread drawing the frame, after the
+/// generic renderer released its own resources. On failure the device
+/// stays lost, the caller draws nothing, and the first frame after
+/// `recovery_retry_ms` tries again. A composition chain that cannot be
+/// made is such a failure, not a fall back to an HWND chain: generic.zig
+/// adopted its configs by `presentsAlpha`, which must not change.
 pub fn recoverDevice(self: *D3D11) !void {
     assert(self.lost);
     self.releaseGpu();
     const now: std.Io.Timestamp = .now(global.io(), .awake);
     if (self.recovery.delayMs(now) > 0) return error.DeviceLost;
     if (self.fullscreen_chain != null) return error.DeviceLost;
-    const gpu = createGpu(self.hwnd, self.vsync) catch |err| {
+    const gpu = createGpu(self.hwnd, self.vsync, self.chain) catch |err| {
         self.recovery.failed(now);
         log.err("D3D11 device recovery failed err={}; retrying in {d}ms", .{ err, recovery_retry_ms });
         return err;
@@ -1095,19 +1328,123 @@ pub fn beginFrame(
     }, renderer, target);
 }
 
-test "d3d11: background-opacity draws an opaque background" {
+/// A hidden 64x48 popup window, whose client area is the whole window,
+/// for the tests that make a real device and chain.
+fn testWindow() !api.HWND {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    return win32.CreateWindowExW(0, L("STATIC"), L(""), win32.WS_POPUP, 0, 0, 64, 48, null, null, null, null) orelse
+        error.TestWindowFailed;
+}
+
+/// The chain's alpha mode and size, and that a frame reaches it.
+fn expectPresents(r: *D3D11, alpha: api.DXGI_ALPHA_MODE) !void {
+    const testing = std.testing;
+    var desc: api.DXGI_SWAP_CHAIN_DESC1 = undefined;
+    try testing.expect(api.succeeded(r.swap_chain.getDesc1(&desc)));
+    try testing.expectEqual(alpha, desc.AlphaMode);
+    try testing.expectEqual(@as(api.UINT, 64), desc.Width);
+    try testing.expectEqual(@as(api.UINT, 48), desc.Height);
+    var target = try r.initTarget(64, 48);
+    defer target.deinit();
+    try r.present(target);
+}
+
+test "d3d11: a transparent window presents through a composition chain, again after a lost device" {
+    const testing = std.testing;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+
+    // `window-vsync = false` is the case that would ask DXGI about
+    // tearing; a composition chain never asks.
+    for ([_]bool{ true, false }) |vsync| {
+        var r = try initWindow(hwnd, try loadCompiler(), vsync, .native, .composition);
+        defer r.deinit();
+        try testing.expect(r.presentsAlpha());
+        try testing.expect(r.composition != null);
+        try testing.expectEqual(@as(api.UINT, 0), r.present_flags & api.DXGI_PRESENT_ALLOW_TEARING);
+        try expectPresents(&r, .PREMULTIPLIED);
+
+        // The window takes one composition target, so this also needs the
+        // old one released before the new chain is bound.
+        r.lost = true;
+        try r.recoverDevice();
+        try testing.expect(!r.lost);
+        try testing.expect(r.presentsAlpha());
+        try testing.expect(r.composition != null);
+        try testing.expectEqual(@as(api.UINT, 0), r.present_flags & api.DXGI_PRESENT_ALLOW_TEARING);
+        try expectPresents(&r, .PREMULTIPLIED);
+    }
+}
+
+test "d3d11: an opaque window presents through an HWND chain, again after a lost device" {
+    const testing = std.testing;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+
+    var r = try initWindow(hwnd, try loadCompiler(), true, .native, .hwnd);
+    defer r.deinit();
+    try testing.expect(!r.presentsAlpha());
+    try testing.expect(r.composition == null);
+    try expectPresents(&r, .IGNORE);
+
+    r.lost = true;
+    try r.recoverDevice();
+    try testing.expect(!r.presentsAlpha());
+    try testing.expect(r.composition == null);
+    try expectPresents(&r, .IGNORE);
+}
+
+test "d3d11: a window whose composition target is taken gets an opaque HWND chain at init" {
+    const testing = std.testing;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+    const compile = try loadCompiler();
+
+    var first = try initWindow(hwnd, compile, true, .native, .composition);
+    defer first.deinit();
+
+    // The binding fails after the chain was made, and everything made
+    // for it is released (the debug layer, where installed, reports a
+    // leak at the device's release as an error, which fails the test).
+    try testing.expectError(error.D3D11CompositionFailed, createGpu(hwnd, true, .composition));
+
+    var second = try initWindow(hwnd, compile, true, .native, .composition);
+    defer second.deinit();
+    try testing.expect(!second.presentsAlpha());
+    try testing.expect(second.composition == null);
+    try testing.expectEqual(Chain.hwnd, second.chain);
+}
+
+test "d3d11: only a composition chain keeps the background's opacity" {
     const testing = std.testing;
     const alloc = testing.allocator;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+    const compile = try loadCompiler();
 
     var config = try configpkg.Config.default(alloc);
     defer config.deinit();
     config.@"background-opacity" = 0.5;
 
     // The bg_color uniform's alpha and the cell background multiply both
-    // read this, so 1 keeps #ffffff from presenting as #808080.
-    var derived = try Renderer.DerivedConfig.init(alloc, &config);
-    defer derived.deinit();
-    try testing.expectEqual(@as(f64, 1), derived.background_opacity);
+    // read this, so an HWND chain gets 1, which keeps #ffffff from
+    // presenting as #808080.
+    {
+        var derived = try Renderer.DerivedConfig.init(alloc, &config);
+        defer derived.deinit();
+        var r = try initWindow(hwnd, compile, true, .native, .hwnd);
+        defer r.deinit();
+        Renderer.opaqueUnlessPresentsAlpha(&r, &derived);
+        try testing.expectEqual(@as(f64, 1), derived.background_opacity);
+    }
+    {
+        var derived = try Renderer.DerivedConfig.init(alloc, &config);
+        defer derived.deinit();
+        var r = try initWindow(hwnd, compile, true, .native, .composition);
+        defer r.deinit();
+        Renderer.opaqueUnlessPresentsAlpha(&r, &derived);
+        try testing.expectEqual(@as(f64, 0.5), derived.background_opacity);
+    }
 }
 
 test "d3d11: zero-size client area does not count as stale" {
