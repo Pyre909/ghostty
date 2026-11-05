@@ -779,6 +779,13 @@ pub const Surface = struct {
         // Before the shell is read for drops, below, as GTK applies them
         // before its terminal starts.
         if (opts.overrides) |o| try o.apply(&config);
+        // While the background is toggled opaque (`App.giveSurface`). The
+        // app's configuration is at the core's conditional state, as
+        // `configChange` keeps what the core gives it, and `run` tells the
+        // core the color scheme before the first window: CoreSurface.init,
+        // which applies that state, keeps the opacity rather than replaying
+        // the configuration's steps.
+        if (app.background_opaque) config.@"background-opacity" = 1;
         // A path asked for is checked as an inherited one is.
         const wd = if (opts.overrides) |o| o.workingDirectory(opts.working_directory) else opts.working_directory;
         inheritWorkingDirectory(&config, app.config.@"working-directory", wd);

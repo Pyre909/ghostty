@@ -101,6 +101,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .toggle_fullscreen,
         .toggle_window_decorations,
         .toggle_window_float_on_top,
+        .toggle_background_opacity,
         .reset_window_size,
         .toggle_command_palette,
         .toggle_quick_terminal,
@@ -116,8 +117,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
         // no tab overview, inspector, updater, undo, secure input or
-        // on-screen keyboard here, and the background's opacity is not
-        // toggled.
+        // on-screen keyboard here.
         .toggle_tab_overview,
         .close_all_windows,
         .toggle_visibility,
@@ -128,7 +128,6 @@ pub fn supported(key: Binding.Action.Key) bool {
         .show_gtk_inspector,
         .show_on_screen_keyboard,
         .toggle_secure_input,
-        .toggle_background_opacity,
         => false,
     };
 }

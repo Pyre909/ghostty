@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const apprt = @import("../../apprt.zig");
+const cli_args = @import("../../cli.zig").args;
 const configpkg = @import("../../config.zig");
 const global = @import("../../global.zig");
 const input = @import("../../input.zig");
@@ -190,6 +191,14 @@ pub const App = struct {
     /// configuration change, which can take away the global keybind that
     /// would show it.
     quick_check: bool,
+
+    /// Whether `toggle_background_opacity` has made every terminal's
+    /// background opaque (`toggleBackgroundOpacity`), for the app, as macOS
+    /// toggles every window's at once. While it is set each terminal is
+    /// given the configuration with `background-opacity` 1, as it is made
+    /// and at each reload (`giveSurface`), and a transparent window has the
+    /// default backdrop (`Transparency.applyBlur`). False as the app starts.
+    background_opaque: bool,
 
     /// Work the core asked for that `run` has not carried out yet, oldest
     /// first (`Request`): windows and splits, the changes to splits and
@@ -645,6 +654,10 @@ pub const App = struct {
         /// (`reloadConfig`).
         reload,
 
+        /// Make every terminal's background opaque, or as configured again
+        /// (`toggleBackgroundOpacity`).
+        background_opacity,
+
         /// Make the window of this surface cover its monitor, or put it
         /// back (`requestFullscreen`).
         fullscreen: *CoreSurface,
@@ -931,6 +944,7 @@ pub const App = struct {
             .windows = .empty,
             .quick = null,
             .quick_check = false,
+            .background_opaque = false,
             .requests = .empty,
             .search_focus = null,
             .search_hide = null,
@@ -1793,6 +1807,7 @@ pub const App = struct {
             .search_selected => searchCount(target, .selected, value.selected),
             .prompt_title => self.requestTitlePrompt(target, value),
             .toggle_command_palette => self.requestPalette(target),
+            .toggle_background_opacity => self.requestBackgroundOpacity(),
             .mouse_over_link => linkPreview(target, value),
             .key_sequence => keySequence(target, value),
             .key_table => keyTable(target, value),
@@ -1997,6 +2012,49 @@ pub const App = struct {
             return false;
         };
         return true;
+    }
+
+    /// `.toggle_background_opacity`, from a terminal: recorded for `run`
+    /// (`toggleBackgroundOpacity`), which gives every terminal a new
+    /// configuration; inside the core's key callback that would free the
+    /// bindings a chain still reads (`reloadConfig`). Recorded once however
+    /// many terminals ask before `run` carries it out, as a `global:` or
+    /// `all:` binding performs it in each (`CoreApp.performAllAction`): the
+    /// toggle is the app's, which macOS flips once for each terminal there.
+    /// `false` while `background-opacity` is 1 or more, when it does
+    /// nothing (`input.Binding.Action.toggle_background_opacity`), so that a
+    /// `performable:` binding's key goes on to the program.
+    fn requestBackgroundOpacity(self: *App) bool {
+        if (self.config.@"background-opacity" >= 1) return false;
+        for (self.requests.items) |request| {
+            if (request == .background_opacity) return true;
+        }
+        self.requests.append(self.core_app.alloc, .background_opacity) catch |err| {
+            log.warn("cannot record toggling the background's opacity err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `toggle_background_opacity`, carried out: every live terminal given
+    /// the app's configuration with `background-opacity` 1, or as it is
+    /// (`giveSurface`), which is a soft reload for it, so a key sequence and
+    /// the key tables end as at any reload; and each transparent window the
+    /// backdrop that goes with it (`Transparency.applyBlur`). The windows
+    /// stay transparent: C0 measured a composition chain at opacity 1
+    /// drawing what an opaque window draws (comp1). Nothing while
+    /// `background-opacity` is 1 or more, as a reload since it was asked
+    /// can have made it, as on macOS.
+    fn toggleBackgroundOpacity(self: *App) void {
+        if (self.config.@"background-opacity" >= 1) return;
+        self.background_opaque = !self.background_opaque;
+        for (self.surfaces.items) |surface| {
+            const core = surface.liveCore() orelse continue;
+            self.giveSurface(core, &self.config) catch |err| {
+                log.warn("cannot give a terminal the background's opacity err={}", .{err});
+            };
+        }
+        for (self.windows.items) |window| Transparency.applyBlur(window);
     }
 
     fn closeWindow(self: *App, target: apprt.Target) bool {
@@ -2421,16 +2479,67 @@ pub const App = struct {
 
     /// Give `target` the configuration: the loaded one again when `soft`,
     /// otherwise one read from disk. A configuration that fails to load is
-    /// an error, and the loaded one stays.
+    /// an error, and the loaded one stays. While the background is toggled
+    /// opaque, each terminal is given it with `background-opacity` 1
+    /// (`giveSurface`).
     fn reloadNow(self: *App, target: apprt.Target, soft: bool) !void {
         var loaded: ?Config = if (soft) null else try Config.load(self.core_app.alloc);
         defer if (loaded) |*c| c.deinit();
         const config: *const Config = if (loaded) |*c| c else &self.config;
 
         switch (target) {
-            .app => try self.core_app.updateConfig(self, config),
-            .surface => |core| try core.updateConfig(config),
+            .app => if (self.background_opaque)
+                try self.updateOpaque(config)
+            else
+                try self.core_app.updateConfig(self, config),
+            .surface => |core| try self.giveSurface(core, config),
         }
+    }
+
+    /// `CoreApp.updateConfig` while the background is toggled opaque: each
+    /// live terminal, which during a reload are the core's
+    /// (`syncColorScheme`), given `config` with `background-opacity` 1
+    /// (`giveSurface`), and then the app the configuration at its
+    /// conditional state, as the core gives it. Not the core's followed by
+    /// a second change: the core gives each terminal `config` as it is, and
+    /// its renderer can draw a frame translucent before the second comes.
+    fn updateOpaque(self: *App, config: *const Config) !void {
+        for (self.surfaces.items) |surface| {
+            const core = surface.liveCore() orelse continue;
+            try self.giveSurface(core, config);
+        }
+        var applied_: ?Config = config.changeConditionalState(
+            self.core_app.config_conditional_state,
+        ) catch |err| err: {
+            log.warn("failed to apply conditional state to config err={}", .{err});
+            break :err null;
+        };
+        defer if (applied_) |*c| c.deinit();
+        _ = try self.configChange(.app, .{ .config = if (applied_) |*c| c else config });
+    }
+
+    /// For tests: takes the configuration `giveSurface` gives a terminal's
+    /// core, which the test runner does not make (`testPane`).
+    pub var test_give: if (builtin.is_test) ?*const fn (*CoreSurface, *const Config) anyerror!void else void =
+        if (builtin.is_test) null else {};
+
+    /// Give `core` `config` (`CoreSurface.updateConfig`), or, while the
+    /// background is toggled opaque, a copy with `background-opacity` 1 at
+    /// the terminal's conditional state: the core applies that state by
+    /// replaying the configuration's steps, which would undo the opacity,
+    /// and to one at it already does nothing (`Config.changeConditionalState`).
+    fn giveSurface(self: *App, core: *CoreSurface, config: *const Config) !void {
+        if (!self.background_opaque) return give(core, config);
+        var forced = (try config.changeConditionalState(core.config_conditional_state)) orelse
+            config.shallowClone(self.core_app.alloc);
+        defer forced.deinit();
+        forced.@"background-opacity" = 1;
+        try give(core, &forced);
+    }
+
+    fn give(core: *CoreSurface, config: *const Config) !void {
+        if (builtin.is_test) if (test_give) |take| return take(core, config);
+        try core.updateConfig(config);
     }
 
     /// The full reload `reloadConfig` recorded, and the errors in what it
@@ -2822,7 +2931,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .reload, .redecorate, .ipc, .dropped => {},
+            .quick_terminal, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -3441,6 +3550,7 @@ pub const App = struct {
                 .equalize => |from| from.rt_surface.window.equalize(from.rt_surface),
                 .relayout => |from| from.rt_surface.window.relayout(),
                 .reload => self.reloadQueued(),
+                .background_opacity => self.toggleBackgroundOpacity(),
                 .fullscreen => |from| from.rt_surface.window.toggleFullscreen(),
                 .decorations => |from| from.rt_surface.window.toggleDecorations(),
                 .reset_window_size => |from| from.rt_surface.window.resetSize(),
@@ -4731,6 +4841,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.windows = .empty;
     app.quick = null;
     app.quick_check = false;
+    app.background_opaque = false;
     app.requests = .empty;
     app.search_focus = null;
     app.search_hide = null;
@@ -7655,6 +7766,227 @@ test "win32: a transparent window's backdrop follows the configuration, an opaqu
     try std.testing.expectEqual(.acrylic, clear.backdrop);
     try std.testing.expect(!solid.transparent);
     try std.testing.expectEqual(.default, solid.backdrop);
+}
+
+/// For the `toggle_background_opacity` tests: the terminals `App.giveSurface`
+/// gave a configuration (`App.test_give`), in order, and the opacity each
+/// core adopts from it: CoreSurface.updateConfig applies the terminal's
+/// conditional state to it first, as here.
+const TestGiven = struct {
+    var cores: [8]*CoreSurface = undefined;
+    var opacities: [8]f64 = undefined;
+    var count: usize = 0;
+
+    fn start() void {
+        count = 0;
+        App.test_give = &take;
+    }
+
+    fn stop() void {
+        App.test_give = null;
+    }
+
+    fn take(core: *CoreSurface, config: *const Config) anyerror!void {
+        if (count == cores.len) @panic("TestGiven: more configurations given than it records");
+        var applied_ = try config.changeConditionalState(core.config_conditional_state);
+        defer if (applied_) |*c| c.deinit();
+        cores[count] = core;
+        opacities[count] = (if (applied_) |*c| c else config).@"background-opacity";
+        count += 1;
+    }
+};
+
+test "win32: toggle_background_opacity is recorded once for run, and refused at an opacity of 1" {
+    // From a binding, inside the core's key callback: recorded, as a full
+    // reload is (`requestBackgroundOpacity`). A `global:` or `all:`
+    // binding performs it in every terminal (`CoreApp.performAllAction`),
+    // and the toggle is the app's: recorded once. At the configuration's
+    // opacity of 1 it does nothing, and is refused, so that a
+    // `performable:` binding's key goes on to the program.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .toggle_background_opacity, {}));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    app.config.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_background_opacity, {}));
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .toggle_background_opacity, {}));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .background_opacity);
+    try std.testing.expect(!app.background_opaque);
+    // A reload to 1 before `run` carries it out: nothing.
+    app.config.@"background-opacity" = 1;
+    app.createRequested();
+    try std.testing.expect(!app.background_opaque);
+    try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: toggle_background_opacity gives each live terminal an opaque background, then the configured one" {
+    // `run` carries it out (`toggleBackgroundOpacity`): each live terminal
+    // is given the app's configuration with `background-opacity` 1 at its
+    // own conditional state, which the core keeps (`giveSurface`), and at
+    // the next toggle the configuration as it is. A theme for each mode:
+    // the core applies a mode by replaying the configuration's steps,
+    // which would bring 0.5 back to the dark terminal.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var args = cli_args.sliceIterator(&.{ "--theme=light:foo,dark:bar", "--background-opacity=0.5" });
+    try app.config.loadIter(alloc, &args);
+    try app.config.finalize();
+
+    const window = try testFrame(&app);
+    const dark = try testPane(&app, window);
+    const light = try testPane(&app, window);
+    const starting = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ dark, light, starting });
+    // Live, and called only through `App.test_give`; back to `.none`
+    // before the teardown, which would stop a live core. `starting` has
+    // no core yet, and is given nothing.
+    dark.core_state = .live;
+    defer dark.core_state = .none;
+    light.core_state = .live;
+    defer light.core_state = .none;
+    dark.core_surface.config_conditional_state = .{ .theme = .dark };
+    light.core_surface.config_conditional_state = .{ .theme = .light };
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    try std.testing.expect(try app.performAction(.{ .surface = &light.core_surface }, .toggle_background_opacity, {}));
+    try std.testing.expectEqual(0, TestGiven.count);
+    app.createRequested();
+    try std.testing.expect(app.background_opaque);
+    try std.testing.expectEqual(2, TestGiven.count);
+    try std.testing.expectEqual(&dark.core_surface, TestGiven.cores[0]);
+    try std.testing.expectEqual(&light.core_surface, TestGiven.cores[1]);
+    try std.testing.expectEqual(1, TestGiven.opacities[0]);
+    try std.testing.expectEqual(1, TestGiven.opacities[1]);
+    // The app's own stays as configured, for the toggle back.
+    try std.testing.expectEqual(0.5, app.config.@"background-opacity");
+
+    try std.testing.expect(try app.performAction(.{ .surface = &dark.core_surface }, .toggle_background_opacity, {}));
+    app.createRequested();
+    try std.testing.expect(!app.background_opaque);
+    try std.testing.expectEqual(4, TestGiven.count);
+    try std.testing.expectEqual(0.5, TestGiven.opacities[2]);
+    try std.testing.expectEqual(0.5, TestGiven.opacities[3]);
+}
+
+test "win32: a reload while the background is toggled opaque keeps it, and the app's opacity" {
+    // The app's soft reload, as a change of color scheme makes it, gives
+    // each terminal 1 (`updateOpaque`, in place of CoreApp.updateConfig),
+    // and the app its configuration as it is, title and all; so does a
+    // terminal's own (`reloadNow`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    app.config.@"background-opacity" = 0.5;
+    app.config.title = try app.config.arenaAlloc().dupeSentinel(u8, "kept", 0);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    a.core_state = .live;
+    defer a.core_state = .none;
+    a.core_surface.config_conditional_state = .{};
+    TestGiven.start();
+    defer TestGiven.stop();
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_background_opacity, {}));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestGiven.count);
+
+    try std.testing.expect(try app.performAction(.app, .reload_config, .{ .soft = true }));
+    try std.testing.expectEqual(2, TestGiven.count);
+    try std.testing.expectEqual(&a.core_surface, TestGiven.cores[1]);
+    try std.testing.expectEqual(1, TestGiven.opacities[1]);
+    try std.testing.expectEqual(0.5, app.config.@"background-opacity");
+    try std.testing.expectEqualStrings("kept", app.config.title.?);
+
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .reload_config, .{ .soft = true }));
+    try std.testing.expectEqual(3, TestGiven.count);
+    try std.testing.expectEqual(1, TestGiven.opacities[2]);
+    try std.testing.expect(app.background_opaque);
+    // What the app's reload recorded (`configChange`) is not carried out
+    // here.
+    app.requests.clearRetainingCapacity();
+}
+
+test "win32: a toggled opaque background takes the acrylic away, and the toggle back gives it" {
+    // Acrylic would show in the title bar over the opaque terminals
+    // (`Transparency.applyBlur`): each transparent window has the default
+    // backdrop while toggled, through a new configuration, and as one is
+    // made, and acrylic again at the toggle back.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer TestClear.stop();
+    const Panes = struct {
+        var last: *Surface = undefined;
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
+            const pane = try testPane(w.app, w);
+            _ = w.app.surfaces.pop();
+            last = pane;
+            return pane;
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+
+    TestClear.start(2);
+    app.config.@"background-blur" = .true;
+    app.config.@"background-opacity" = 0.5;
+    const clear = try app.newWindow(null, .normal, null);
+    try std.testing.expectEqual(.acrylic, clear.backdrop);
+    const from: apprt.Target = .{ .surface = &Panes.last.core_surface };
+
+    try std.testing.expect(try app.performAction(from, .toggle_background_opacity, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, TestClear.backdrop_count);
+    try std.testing.expectEqual(.default, TestClear.backdrops[1]);
+    try std.testing.expectEqual(.default, clear.backdrop);
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-opacity" = 0.5;
+    changed.@"background-blur" = .true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    const later = try app.newWindow(null, .normal, null);
+    try std.testing.expect(later.transparent);
+    try std.testing.expectEqual(2, TestClear.backdrop_count);
+    try std.testing.expectEqual(.default, later.backdrop);
+
+    try std.testing.expect(try app.performAction(from, .toggle_background_opacity, {}));
+    app.createRequested();
+    try std.testing.expectEqual(4, TestClear.backdrop_count);
+    try std.testing.expectEqual(.acrylic, clear.backdrop);
+    try std.testing.expectEqual(.acrylic, later.backdrop);
 }
 
 test "win32: a tab moved to a new window keeps its window's transparency, or stays" {
@@ -16477,7 +16809,6 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
         .{ .toggle_secure_input, .secure_input },
-        .{ .toggle_background_opacity, .toggle_background_opacity },
         // Listed.
         .{ .new_window, .new_window },
         .{ .new_tab, .new_tab },
@@ -16493,6 +16824,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .toggle_maximize, .toggle_maximize },
         .{ .toggle_window_decorations, .toggle_window_decorations },
         .{ .toggle_window_float_on_top, .float_window },
+        .{ .toggle_background_opacity, .toggle_background_opacity },
         // Behind the queued new tab and move.
         .{ .close_tab, .close_tab },
         .{ .close_window, .close_window },
@@ -16561,6 +16893,12 @@ test "win32: the command palette lists only what performAction carries out" {
         defer if (case[0] == .quit) {
             app.quit = false;
         };
+        // At the configuration's opacity, 1, it does nothing, and is
+        // refused (`requestBackgroundOpacity`).
+        if (case[0] == .toggle_background_opacity) app.config.@"background-opacity" = 0.5;
+        defer if (case[0] == .toggle_background_opacity) {
+            app.config.@"background-opacity" = 1;
+        };
         const performed = try app.performAction(to, case[1], value);
         if (CommandPalette.supported(case[0]) != performed) {
             std.debug.print("{t}: listed={} performed={}\n", .{ case[0], CommandPalette.supported(case[0]), performed });
@@ -16568,7 +16906,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(36, listed);
+    try std.testing.expectEqual(37, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
 }

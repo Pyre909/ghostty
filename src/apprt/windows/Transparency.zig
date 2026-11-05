@@ -28,6 +28,11 @@
 //! measured it blurring under the blend, where Mica only tints it with the
 //! wallpaper. Its intensity is ignored, as on Linux.
 //!
+//! `toggle_background_opacity` leaves a window transparent: its terminals
+//! are given `background-opacity` 1 (`App.giveSurface`), which C0 measured
+//! a composition chain drawing as an opaque window does (comp1), and the
+//! frame the default backdrop.
+//!
 //! C0 rejected a frame without a redirection bitmap
 //! (WS_EX_NOREDIRECTIONBITMAP): it loses the scroll bar and every pixel the
 //! frame paints, and can be chosen only as the frame is made.
@@ -154,13 +159,14 @@ fn build() u32 {
 var old_build_logged = false;
 
 /// Give `window`'s frame the backdrop the configuration asks for, if the
-/// window is transparent: an opaque one is left as it is, as is every
-/// frame on a build before `backdrop_build`. Called as the frame is made
-/// and for each new configuration; a failed call leaves `Window.backdrop`
-/// as it was, so the next one tries again.
+/// window is transparent, or the default while the background is toggled
+/// opaque (`App.background_opaque`): an opaque window is left as it is, as
+/// is every frame on a build before `backdrop_build`. Called as the frame
+/// is made, for each new configuration and at each toggle; a failed call
+/// leaves `Window.backdrop` as it was, so the next one tries again.
 pub fn applyBlur(window: *Window) void {
     if (!window.transparent) return;
-    const want = backdrop(&window.app.config);
+    const want: Backdrop = if (window.app.background_opaque) .default else backdrop(&window.app.config);
     if (want == window.backdrop) return;
     if (build() < backdrop_build) {
         if (!old_build_logged) {
