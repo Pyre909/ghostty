@@ -813,6 +813,13 @@ pub extern "dwmapi" fn DwmGetWindowAttribute(
 /// The frame's visible bounds, a RECT in screen coordinates, without the
 /// invisible resize borders GetWindowRect includes (dwmapi.h).
 pub const DWMWA_EXTENDED_FRAME_BOUNDS: DWORD = 9;
+/// dwmapi.h, from Windows 11 22H2 (build 22621): a DWORD, one of
+/// DWM_SYSTEMBACKDROP_TYPE's.
+pub const DWMWA_SYSTEMBACKDROP_TYPE: DWORD = 38;
+/// DWM_SYSTEMBACKDROP_TYPE: DWM decides, the default; and acrylic, a
+/// transient window's (Learn: "Desktop Acrylic").
+pub const DWMSBT_AUTO: DWORD = 0;
+pub const DWMSBT_TRANSIENTWINDOW: DWORD = 3;
 /// DWM_BLURBEHIND's `flags`: `enable` and `region` apply.
 pub const DWM_BB_ENABLE: DWORD = 0x1;
 pub const DWM_BB_BLURREGION: DWORD = 0x2;

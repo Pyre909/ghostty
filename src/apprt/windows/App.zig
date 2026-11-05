@@ -2513,6 +2513,7 @@ pub const App = struct {
         for (self.windows.items) |window| {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
+            Transparency.applyBlur(window);
         }
         for (self.surfaces.items) |surface| surface.overlays.invalidate();
         // `bell-features` may show a ringing bell otherwise now.
@@ -4780,6 +4781,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .bar = .{},
         .dark_frame = false,
         .transparent = false,
+        .backdrop = .default,
         .fullscreen = null,
         .decoration = null,
         .quick = false,
@@ -4817,19 +4819,41 @@ const TestClear = struct {
     var undone: usize = 0;
     var layered: [16]win32.HWND = undefined;
     var layered_count: usize = 0;
+    /// The backdrops asked of DWM (`Transparency.test_backdrop`), in
+    /// order, and the frames they were asked for; whether DWM refuses
+    /// them. Every build has the backdrop unless a test says otherwise
+    /// (`Transparency.test_build`).
+    var backdrops: [8]Transparency.Backdrop = undefined;
+    var backdrop_frames: [8]win32.HWND = undefined;
+    var backdrop_count: usize = 0;
+    var refuse_backdrop = false;
 
     fn start(dwm_takes: usize) void {
         takes = dwm_takes;
         asked = 0;
         undone = 0;
         layered_count = 0;
+        backdrop_count = 0;
+        refuse_backdrop = false;
         Transparency.test_blur_behind = &blur;
         Transparency.test_set_alpha = &alpha;
+        Transparency.test_backdrop = &backdrop;
+        Transparency.test_build = Transparency.backdrop_build;
     }
 
     fn stop() void {
         Transparency.test_blur_behind = null;
         Transparency.test_set_alpha = null;
+        Transparency.test_backdrop = null;
+        Transparency.test_build = null;
+    }
+
+    fn backdrop(hwnd: win32.HWND, to: Transparency.Backdrop) bool {
+        if (backdrop_count == backdrops.len) @panic("TestClear: more backdrops asked than it records");
+        backdrops[backdrop_count] = to;
+        backdrop_frames[backdrop_count] = hwnd;
+        backdrop_count += 1;
+        return !refuse_backdrop;
     }
 
     fn blur(_: win32.HWND, on: bool) bool {
@@ -7518,6 +7542,119 @@ test "win32: a new window is transparent while background-opacity is below 1, if
         try std.testing.expect(!TestClear.isLayered(pane.hwnd));
         try std.testing.expectEqual(@as(usize, if (case.transparent) 2 else 0), TestClear.layered_count);
     }
+}
+
+test "win32: a transparent window's backdrop is acrylic while background-blur is on, from build 22621" {
+    // Asked as its frame is made (`Window.createBare`): for any blur at
+    // all, at any radius, which DWM does not take, as GTK's compositors do
+    // not, and for macOS's glass (`BackgroundBlur.enabled`). Not for an
+    // opaque window, whose frame is left as it was, nor before build
+    // 22621, below which DWM does not document the attribute.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer TestClear.stop();
+    const Panes = struct {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
+            const pane = try testPane(w.app, w);
+            // `App.newWindow` makes it the app's.
+            _ = w.app.surfaces.pop();
+            return pane;
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+
+    const Case = struct { opacity: f64, blur: Config.BackgroundBlur, build: u32, acrylic: bool };
+    for ([_]Case{
+        .{ .opacity = 0.5, .blur = .true, .build = 22621, .acrylic = true },
+        .{ .opacity = 0.5, .blur = .{ .radius = 30 }, .build = 26100, .acrylic = true },
+        .{ .opacity = 0.5, .blur = .@"macos-glass-clear", .build = 22621, .acrylic = true },
+        .{ .opacity = 0.5, .blur = .{ .radius = 0 }, .build = 22621, .acrylic = false },
+        .{ .opacity = 0.5, .blur = .false, .build = 22621, .acrylic = false },
+        .{ .opacity = 1, .blur = .true, .build = 22621, .acrylic = false },
+        .{ .opacity = 0.5, .blur = .true, .build = 22620, .acrylic = false },
+    }) |case| {
+        app.config.@"background-opacity" = case.opacity;
+        app.config.@"background-blur" = case.blur;
+        TestClear.start(1);
+        Transparency.test_build = case.build;
+        const window = try app.newWindow(null, .normal, null);
+        try std.testing.expectEqual(case.opacity < 1, window.transparent);
+        try std.testing.expectEqual(case.acrylic, window.backdrop == .acrylic);
+        try std.testing.expectEqual(@intFromBool(case.acrylic), TestClear.backdrop_count);
+        if (case.acrylic) {
+            try std.testing.expectEqual(.acrylic, TestClear.backdrops[0]);
+            try std.testing.expectEqual(window.hwnd, TestClear.backdrop_frames[0]);
+        }
+    }
+}
+
+test "win32: a transparent window's backdrop follows the configuration, an opaque one's is left" {
+    // Each new configuration asks DWM again for every transparent window
+    // whose backdrop it changes (`App.configChange`), and for no other:
+    // not an opaque window, which stays opaque at a lower opacity
+    // (Transparency.zig). A refused change leaves the backdrop as it was,
+    // for the next configuration to ask again.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer TestClear.stop();
+    const Panes = struct {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
+            const pane = try testPane(w.app, w);
+            _ = w.app.surfaces.pop();
+            return pane;
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+
+    TestClear.start(1);
+    app.config.@"background-blur" = .true;
+    app.config.@"background-opacity" = 0.5;
+    const clear = try app.newWindow(null, .normal, null);
+    app.config.@"background-opacity" = 1;
+    const solid = try app.newWindow(null, .normal, null);
+    try std.testing.expect(clear.transparent and !solid.transparent);
+    try std.testing.expectEqual(1, TestClear.backdrop_count);
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-opacity" = 0.5;
+    changed.@"background-blur" = .false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(2, TestClear.backdrop_count);
+    try std.testing.expectEqual(.default, TestClear.backdrops[1]);
+    try std.testing.expectEqual(clear.hwnd, TestClear.backdrop_frames[1]);
+    try std.testing.expectEqual(.default, clear.backdrop);
+    // The same again changes nothing, and asks nothing.
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(2, TestClear.backdrop_count);
+
+    // Refused, it stays as it was; the next configuration asks again.
+    changed.@"background-blur" = .true;
+    TestClear.refuse_backdrop = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(3, TestClear.backdrop_count);
+    try std.testing.expectEqual(.default, clear.backdrop);
+    TestClear.refuse_backdrop = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(4, TestClear.backdrop_count);
+    try std.testing.expectEqual(.acrylic, TestClear.backdrops[3]);
+    try std.testing.expectEqual(.acrylic, clear.backdrop);
+    try std.testing.expect(!solid.transparent);
+    try std.testing.expectEqual(.default, solid.backdrop);
 }
 
 test "win32: a tab moved to a new window keeps its window's transparency, or stays" {

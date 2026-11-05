@@ -125,6 +125,11 @@ dark_frame: bool,
 /// kind (`App.moveTabAt`).
 transparent: bool,
 
+/// The system backdrop DWM was last given for the frame
+/// (`Transparency.applyBlur`): acrylic while `background-blur` is on in a
+/// transparent window. A new frame has the default.
+backdrop: Transparency.Backdrop,
+
 /// Where and how the window was before it covered its monitor, to put it
 /// back (`toggleFullscreen`); null while it does not.
 fullscreen: ?Restore,
@@ -870,6 +875,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .bar = .{},
         .dark_frame = false,
         .transparent = false,
+        .backdrop = .default,
         .fullscreen = null,
         .decoration = null,
         .quick = kind == .quick,
@@ -928,6 +934,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
     // never shows the wrong one.
     app.systemSchemeChanged();
     self.applyTheme();
+    Transparency.applyBlur(self);
     return self;
 }
 

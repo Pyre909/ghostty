@@ -23,6 +23,11 @@
 //!   (`fillOpaque`). The themed scroll bar, the terminal's non-client
 //!   area, is opaque as it is.
 //!
+//! `background-blur` blurs what is behind a transparent frame with DWM's
+//! acrylic system backdrop, from Windows 11 22H2 (`applyBlur`): C0
+//! measured it blurring under the blend, where Mica only tints it with the
+//! wallpaper. Its intensity is ignored, as on Linux.
+//!
 //! C0 rejected a frame without a redirection bitmap
 //! (WS_EX_NOREDIRECTIONBITMAP): it loses the scroll bar and every pixel the
 //! frame paints, and can be chosen only as the frame is made.
@@ -96,6 +101,84 @@ fn blurBehind(frame: win32.HWND, on: bool) bool {
     const hr = win32.DwmEnableBlurBehindWindow(frame, &blur);
     if (hr >= 0) return true;
     log.warn("DwmEnableBlurBehindWindow failed on={} hr=0x{x}", .{ on, @as(u32, @bitCast(hr)) });
+    return false;
+}
+
+/// The system backdrop DWM draws behind a transparent frame
+/// (DWMWA_SYSTEMBACKDROP_TYPE, dwmapi.h's DWM_SYSTEMBACKDROP_TYPE): the
+/// default, which a window has until it asks, or acrylic, which blurs what
+/// is behind the frame (C0: Mica, 2, only tints it with the wallpaper).
+pub const Backdrop = enum(win32.DWORD) {
+    default = win32.DWMSBT_AUTO,
+    acrylic = win32.DWMSBT_TRANSIENTWINDOW,
+};
+
+/// The backdrop `config` asks a transparent window for: acrylic while
+/// `background-blur` blurs at all (`BackgroundBlur.enabled`, so macOS's
+/// glass too, as on Linux). DWM takes no radius: the intensity is ignored,
+/// as on Linux.
+pub fn backdrop(config: *const configpkg.Config) Backdrop {
+    return if (config.@"background-blur".enabled()) .acrylic else .default;
+}
+
+/// The first build of Windows whose DWM has DWMWA_SYSTEMBACKDROP_TYPE
+/// (Windows 11 22H2, Learn); what it does below that is not documented, so
+/// it is not asked there.
+pub const backdrop_build = 22621;
+
+/// For tests: the build of Windows to take in place of RtlGetVersion's,
+/// and what answers in place of DwmSetWindowAttribute for the backdrop.
+pub var test_build: if (builtin.is_test) ?u32 else void = if (builtin.is_test) null else {};
+pub var test_backdrop: if (builtin.is_test) ?*const fn (win32.HWND, Backdrop) bool else void =
+    if (builtin.is_test) null else {};
+
+/// The running build of Windows, asked once: RtlGetVersion, which no
+/// manifest's compatibility section changes (unlike GetVersionEx).
+fn build() u32 {
+    if (builtin.is_test) if (test_build) |b| return b;
+    const Once = struct {
+        var value: ?u32 = null;
+    };
+    if (Once.value) |b| return b;
+    var info: std.os.windows.RTL_OSVERSIONINFOW = undefined;
+    info.dwOSVersionInfoSize = @sizeOf(std.os.windows.RTL_OSVERSIONINFOW);
+    const b: u32 = switch (std.os.windows.ntdll.RtlGetVersion(&info)) {
+        .SUCCESS => info.dwBuildNumber,
+        else => 0,
+    };
+    Once.value = b;
+    return b;
+}
+
+/// Whether `applyBlur` has said once that blur needs a later Windows.
+var old_build_logged = false;
+
+/// Give `window`'s frame the backdrop the configuration asks for, if the
+/// window is transparent: an opaque one is left as it is, as is every
+/// frame on a build before `backdrop_build`. Called as the frame is made
+/// and for each new configuration; a failed call leaves `Window.backdrop`
+/// as it was, so the next one tries again.
+pub fn applyBlur(window: *Window) void {
+    if (!window.transparent) return;
+    const want = backdrop(&window.app.config);
+    if (want == window.backdrop) return;
+    if (build() < backdrop_build) {
+        if (!old_build_logged) {
+            old_build_logged = true;
+            log.info("background-blur needs Windows 11 22H2 (build {}), this is build {}", .{ backdrop_build, build() });
+        }
+        return;
+    }
+    if (!setBackdrop(window.hwnd, want)) return;
+    window.backdrop = want;
+}
+
+fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
+    if (builtin.is_test) if (test_backdrop) |answer| return answer(frame, to);
+    const value: win32.DWORD = @backingInt(to);
+    const hr = win32.DwmSetWindowAttribute(frame, win32.DWMWA_SYSTEMBACKDROP_TYPE, &value, @sizeOf(win32.DWORD));
+    if (hr >= 0) return true;
+    log.warn("cannot set a window's backdrop to={t} hr=0x{x}", .{ to, @as(u32, @bitCast(hr)) });
     return false;
 }
 
