@@ -1,11 +1,11 @@
-//! Direct3D 11, DXGI and D3DCompiler declarations for the D3D11 renderer
-//! backend.
+//! Direct3D 11, DXGI, DirectComposition and D3DCompiler declarations for
+//! the D3D11 renderer backend.
 //!
 //! The COM interfaces are vtable structs in the order of the mingw headers
 //! Zig ships (lib/libc/include/any-windows-any: d3d11.h, dxgi.h, dxgi1_2.h,
 //! dxgi1_3.h, dxgi1_4.h, dxgi1_5.h, d3d11sdklayers.h, d3dcommon.h,
-//! d3dcompiler.h, dcomp.h), the same headers the C compiler would read. Only the
-//! methods the backend calls are typed; every other slot is an untyped
+//! d3dcompiler.h, dcomp.h), the same headers the C compiler would read. Only
+//! the methods the backend calls are typed; every other slot is an untyped
 //! pointer, so a vtable keeps its size and each typed slot keeps its index.
 //! A derived interface embeds its parent's vtable as its first field, which
 //! is how COM lays them out.
