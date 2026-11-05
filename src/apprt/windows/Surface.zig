@@ -774,18 +774,18 @@ pub const Surface = struct {
         // at least a cell across for a split (`Window.split`), so getSize
         // is non-zero (`CoreSurface.init` reads it), and getContentScale
         // works on it.
-        var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
+        var base = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
+        defer base.deinit();
+        // The overrides before the shell is read for drops, below, as GTK
+        // applies them before its terminal starts.
+        var config = try startConfig(
+            app.core_app.alloc,
+            &base,
+            app.core_app.config_conditional_state,
+            opts.overrides,
+            app.background_opaque,
+        );
         defer config.deinit();
-        // Before the shell is read for drops, below, as GTK applies them
-        // before its terminal starts.
-        if (opts.overrides) |o| try o.apply(&config);
-        // While the background is toggled opaque (`App.giveSurface`). The
-        // app's configuration is at the core's conditional state, as
-        // `configChange` keeps what the core gives it, and `run` tells the
-        // core the color scheme before the first window: CoreSurface.init,
-        // which applies that state, keeps the opacity rather than replaying
-        // the configuration's steps.
-        if (app.background_opaque) config.@"background-opacity" = 1;
         // A path asked for is checked as an inherited one is.
         const wd = if (opts.overrides) |o| o.workingDirectory(opts.working_directory) else opts.working_directory;
         inheritWorkingDirectory(&config, app.config.@"working-directory", wd);
@@ -823,6 +823,38 @@ pub const Surface = struct {
         ResizeOverlay.start(self);
 
         return self;
+    }
+
+    /// The configuration a terminal starts with, made from `base`, the
+    /// app's for it (`apprt.surface.newConfig`): at the core's conditional
+    /// state `state`, as CoreSurface.init would put it, keeping `base`'s
+    /// working directory as init does; then `overrides`, and an opacity of
+    /// 1 while the background is toggled opaque (`toggled`,
+    /// `App.giveSurface`). In that order: init applies the state by
+    /// replaying the configuration's steps, which would undo what is set
+    /// here directly, and to one at it already does nothing
+    /// (`Config.changeConditionalState`). The app's configuration can be
+    /// off the core's state, when applying it failed (`App.updateOpaque`,
+    /// CoreApp.updateConfig), so it is not relied on to be at it. A
+    /// failure here is logged and the state left to init, as init does.
+    /// `base` outlives the result, which can share its memory.
+    fn startConfig(
+        alloc: std.mem.Allocator,
+        base: *const configpkg.Config,
+        state: configpkg.ConditionalState,
+        overrides: ?*const Overrides,
+        toggled: bool,
+    ) std.mem.Allocator.Error!configpkg.Config {
+        const at_state: ?configpkg.Config = base.changeConditionalState(state) catch |err| err: {
+            log.warn("failed to apply conditional state to config err={}", .{err});
+            break :err null;
+        };
+        var config = at_state orelse base.shallowClone(alloc);
+        errdefer config.deinit();
+        config.@"working-directory" = base.@"working-directory";
+        if (overrides) |o| try o.apply(&config);
+        if (toggled) config.@"background-opacity" = 1;
+        return config;
     }
 
     /// Settle a new terminal's working directory in `config`, which
@@ -3412,6 +3444,39 @@ pub fn commandFinishedText(
         .title = if (code == 0) "Command Succeeded" else "Command Failed",
         .body = std.fmt.bufPrint(buf, "Command took {f} and exited with code {d}.", .{ took, code }) catch unreachable,
     };
+}
+
+test "win32: a terminal starts at the core's conditional state, keeping what is set on it" {
+    // CoreSurface.init applies the core's conditional state to the
+    // configuration it is given by replaying the steps, which drops what
+    // was set on it directly. `startConfig` applies it first, so init's
+    // step changes nothing: a toggled background's opacity of 1, the
+    // overrides and the inherited working directory stay, at the state
+    // the app's configuration is at (light, the default) and at another
+    // (dark). A theme for each mode, so that the dark state replays.
+    const cli_args = @import("../../cli.zig").args;
+    const alloc = std.testing.allocator;
+    var base: configpkg.Config = try .default(alloc);
+    defer base.deinit();
+    var args = cli_args.sliceIterator(&.{ "--theme=light:foo,dark:bar", "--background-opacity=0.5" });
+    try base.loadIter(alloc, &args);
+    try base.finalize();
+    base.@"working-directory" = .{ .path = "C:\\inherited" };
+    const overrides: Overrides = .{ .command = .{ .shell = "cmd.exe" } };
+
+    for ([_]configpkg.ConditionalState{ .{ .theme = .light }, .{ .theme = .dark } }) |state| {
+        for ([_]bool{ true, false }) |toggled| {
+            var started = try Surface.startConfig(alloc, &base, state, &overrides, toggled);
+            defer started.deinit();
+            // What CoreSurface.init then does.
+            var applied_ = try started.changeConditionalState(state);
+            defer if (applied_) |*c| c.deinit();
+            try std.testing.expect(applied_ == null);
+            try std.testing.expectEqual(@as(f64, if (toggled) 1 else 0.5), started.@"background-opacity");
+            try std.testing.expectEqualStrings("cmd.exe", started.command.?.shell);
+            try std.testing.expectEqualStrings("C:\\inherited", started.@"working-directory".?.path);
+        }
+    }
 }
 
 test "win32: mouse lParam coordinates are signed" {
