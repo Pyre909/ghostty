@@ -28,6 +28,7 @@ const BellBorder = @import("BellBorder.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const Transparency = @import("Transparency.zig");
 const IpcClient = @import("IpcClient.zig");
 const Overrides = @import("Overrides.zig");
 const currentMods = @import("key.zig").currentMods;
@@ -1201,13 +1202,12 @@ pub const Surface = struct {
 
     /// Whether this terminal's renderer presents with alpha, through a
     /// swap chain DWM composes with what is behind the window, rather than
-    /// opaque. Asked once, when the renderer is made. False for every
-    /// terminal: such a chain needs its frame to let the desktop through
-    /// (blur-behind, and a terminal window that paints black), and no
-    /// frame does, so every terminal presents opaque.
+    /// opaque. Asked once, when the renderer is made: true in a transparent
+    /// window, whose frame lets the desktop through (Transparency.zig). A
+    /// terminal only ever moves to a frame of its window's kind
+    /// (`App.moveTabAt`), so the answer holds for its life.
     pub fn presentsAlpha(self: *const Surface) bool {
-        _ = self;
-        return false;
+        return self.window.transparent;
     }
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
@@ -1762,8 +1762,13 @@ pub const Surface = struct {
         // ValidateRect, not BeginPaint/EndPaint: the update region still has
         // to be cleared -- otherwise Windows re-posts WM_PAINT forever and the
         // loop spins at 100% CPU -- and nothing here draws, so no DC is
-        // needed.
-        _ = win32.ValidateRect(self.hwnd, null);
+        // needed. In a transparent frame the region is painted black, under
+        // the chain, which validates it too.
+        if (self.window.transparent) {
+            Transparency.paintTerminal(self.hwnd);
+        } else {
+            _ = win32.ValidateRect(self.hwnd, null);
+        }
 
         // A paint can arrive from inside CreateWindowExW, before the core
         // surface exists; `Window.show` shows the window only after it does.

@@ -20,6 +20,7 @@ const std = @import("std");
 const App = @import("App.zig").App;
 const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
+const Transparency = @import("Transparency.zig");
 
 const RECT = win32.RECT;
 const L = win32.L;
@@ -66,10 +67,11 @@ pub const Bar = struct {
     font: ?win32.HGDIOBJ = null,
     font_dpi: u32 = 0,
 
-    /// Make the bar's window in `window`'s frame, hidden; nothing, logged,
-    /// if it cannot be made: the window then has no bar.
+    /// Make the bar's window in `window`'s frame, hidden, layered if the
+    /// window is transparent (`Transparency.chrome`); nothing, logged, if
+    /// it cannot be made: the window then has no bar.
     pub fn create(self: *Bar, window: *Window) void {
-        self.hwnd = win32.CreateWindowExW(
+        const hwnd = win32.CreateWindowExW(
             0,
             L(class_name),
             null,
@@ -86,6 +88,8 @@ pub const Bar = struct {
             log.warn("cannot make a tab bar err={}", .{win32.GetLastError()});
             return;
         };
+        self.hwnd = hwnd;
+        Transparency.chrome(window, hwnd);
     }
 
     /// Draw the bar again: a tab came, went, moved or was renamed, another

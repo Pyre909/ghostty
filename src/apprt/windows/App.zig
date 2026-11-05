@@ -36,6 +36,7 @@ const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -3625,8 +3626,16 @@ pub const App = struct {
         }
 
         try self.windows.ensureUnusedCapacity(alloc, 1);
-        const window = try Window.createBare(self, .normal);
+        // Of the old window's kind, so that its terminals, whose renderers
+        // present as that frame does, stay in one that shows it
+        // (`Surface.presentsAlpha`): if the new frame cannot be
+        // transparent too, the tab stays where it is.
+        const window = try Window.createBare(self, .normal, old.transparent);
         errdefer window.discard();
+        if (window.transparent != old.transparent) {
+            log.warn("the tab is not moved to a new window: the new window cannot be transparent as its old one is", .{});
+            return Error.Win32CallFailed;
+        }
         // Before the tab comes, so that its terminals take the scale of the
         // monitor the frame is on (`Window.adoptTab`).
         if (drop) |d| window.placeForDrop(d);
@@ -4751,6 +4760,13 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
 /// For tests: a hidden frame made as `newWindow` makes one
 /// (`Window.createFrame`), owned by `app`, with no terminal yet.
 fn testFrame(app: *App) !*Window {
+    return testFrameOf(app, false);
+}
+
+/// `testFrame`, made transparent first if `transparent` asks
+/// (`Window.makeTransparent`), as `Window.createBare` makes it: a test
+/// stands in for DWM (`TestClear`).
+fn testFrameOf(app: *App, transparent: bool) !*Window {
     const alloc = app.core_app.alloc;
     try app.windows.ensureUnusedCapacity(alloc, 1);
     const window = try alloc.create(Window);
@@ -4763,6 +4779,7 @@ fn testFrame(app: *App) !*Window {
         .title_override = null,
         .bar = .{},
         .dark_frame = false,
+        .transparent = false,
         .fullscreen = null,
         .decoration = null,
         .quick = false,
@@ -4783,10 +4800,62 @@ fn testFrame(app: *App) !*Window {
     _ = try window.appendTab(alloc);
     errdefer window.deinitTabs(alloc);
     _ = try window.createFrame(0, 0, 200, 100);
+    if (transparent) window.makeTransparent();
     window.bar.create(window);
     app.windows.appendAssumeCapacity(window);
     return window;
 }
+
+/// For tests: DWM and SetLayeredWindowAttributes as a test has them
+/// (`Transparency.test_blur_behind`, `Transparency.test_set_alpha`), and
+/// what was asked of them: DWM takes the first `takes` frames' blur-behind
+/// and refuses the rest; every window is layered, and kept.
+const TestClear = struct {
+    var takes: usize = 0;
+    /// The frames blur-behind was asked of, and turned off for.
+    var asked: usize = 0;
+    var undone: usize = 0;
+    var layered: [16]win32.HWND = undefined;
+    var layered_count: usize = 0;
+
+    fn start(dwm_takes: usize) void {
+        takes = dwm_takes;
+        asked = 0;
+        undone = 0;
+        layered_count = 0;
+        Transparency.test_blur_behind = &blur;
+        Transparency.test_set_alpha = &alpha;
+    }
+
+    fn stop() void {
+        Transparency.test_blur_behind = null;
+        Transparency.test_set_alpha = null;
+    }
+
+    fn blur(_: win32.HWND, on: bool) bool {
+        if (!on) {
+            undone += 1;
+            return true;
+        }
+        asked += 1;
+        if (takes == 0) return false;
+        takes -= 1;
+        return true;
+    }
+
+    fn alpha(hwnd: win32.HWND) bool {
+        if (layered_count == layered.len) @panic("TestClear: more windows layered than it records");
+        layered[layered_count] = hwnd;
+        layered_count += 1;
+        return true;
+    }
+
+    fn isLayered(hwnd: ?win32.HWND) bool {
+        const h = hwnd orelse return false;
+        for (layered[0..layered_count]) |l| if (l == h) return true;
+        return false;
+    }
+};
 
 /// For tests: a hidden terminal window of the real class in `window`,
 /// owned by `app`, with no core surface, and the scroll bar the
@@ -6836,7 +6905,8 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
 }
 
 /// For tests: a tab of its own in `window` for a new terminal, as
-/// `Window.newTab` makes one, not shown.
+/// `Window.newTab` makes one, not shown: by default just after the shown
+/// tab, so a second one made goes before the first (`Window.insertTab`).
 fn testTab(app: *App, window: *Window) !*Surface {
     const pane = try testPane(app, window);
     _ = try window.insertTab(pane);
@@ -7400,6 +7470,197 @@ test "win32: a tab that cannot move to a new window stays as it was" {
     try std.testing.expectEqual(2, app.windows.items.len);
     try std.testing.expect(b.window == app.windows.items[1]);
     try std.testing.expect(b2.window == app.windows.items[1]);
+}
+
+test "win32: a new window is transparent while background-opacity is below 1, if DWM lets it" {
+    // Asked as its frame is made (`Window.createBare`), before its bar,
+    // which is layered then, as the link preview made with its terminal
+    // is (`Transparency.chrome`); not the terminal, whose renderer
+    // presents with alpha instead (`Surface.presentsAlpha`). At opacity 1
+    // DWM is not asked; refused, the window is opaque, and nothing in it
+    // is layered.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer TestClear.stop();
+    const Panes = struct {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
+            const pane = try testPane(w.app, w);
+            // `App.newWindow` makes it the app's.
+            _ = w.app.surfaces.pop();
+            return pane;
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+
+    const Case = struct { opacity: f64, takes: usize, transparent: bool };
+    for ([_]Case{
+        .{ .opacity = 1, .takes = 1, .transparent = false },
+        .{ .opacity = 0.5, .takes = 1, .transparent = true },
+        .{ .opacity = 0.5, .takes = 0, .transparent = false },
+    }) |case| {
+        app.config.@"background-opacity" = case.opacity;
+        TestClear.start(case.takes);
+        const window = try app.newWindow(null, .normal, null);
+        const pane = window.tab().focused.?;
+        try std.testing.expectEqual(case.transparent, window.transparent);
+        try std.testing.expectEqual(case.transparent, pane.presentsAlpha());
+        try std.testing.expectEqual(@intFromBool(case.opacity < 1), TestClear.asked);
+        try std.testing.expectEqual(0, TestClear.undone);
+        try std.testing.expectEqual(case.transparent, TestClear.isLayered(window.bar.hwnd));
+        try std.testing.expectEqual(case.transparent, TestClear.isLayered(pane.overlays.link_preview.hwnd));
+        try std.testing.expect(!TestClear.isLayered(pane.hwnd));
+        try std.testing.expectEqual(@as(usize, if (case.transparent) 2 else 0), TestClear.layered_count);
+    }
+}
+
+test "win32: a tab moved to a new window keeps its window's transparency, or stays" {
+    // Its terminals' renderers present for the frame they were made in
+    // (`Surface.presentsAlpha`), so the new window is made as the old one
+    // was (`App.moveTabAt`): a transparent window's tab goes to a
+    // transparent window, with its bar layered; if DWM refuses that
+    // frame, the tab stays where it was and the new window is discarded
+    // (a leak of it fails the test through the testing allocator). An
+    // opaque window's tab goes to an opaque one, DWM not asked.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(1);
+    defer TestClear.stop();
+
+    const window = try testFrameOf(&app, true);
+    try std.testing.expect(window.transparent);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    // A tab goes after the shown one (`Window.insertTab`): a, the third,
+    // then b.
+    const b = try testTab(&app, window);
+    _ = try testTab(&app, window);
+    window.selectTab(window.find(b).?.index);
+
+    // Refused: the tab stays.
+    try std.testing.expectError(App.Error.Win32CallFailed, app.moveTabToNewWindow(&b.core_surface, null));
+    try std.testing.expectEqual(2, TestClear.asked);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(3, window.tabs.items.len);
+    try std.testing.expect(window.tab() == window.tabOf(b).?);
+    try std.testing.expect(b.window == window);
+    try std.testing.expect(win32.GetAncestor(b.hwnd, win32.GA_PARENT) == window.hwnd);
+    try std.testing.expect(shown(b.hwnd));
+    try std.testing.expect(b.presentsAlpha());
+
+    // Taken: it moves.
+    TestClear.takes = 1;
+    try std.testing.expect((try app.moveTabToNewWindow(&b.core_surface, null)).? == .whole);
+    try std.testing.expectEqual(3, TestClear.asked);
+    const to = app.windows.getLast();
+    try std.testing.expect(to != window);
+    try std.testing.expect(to.transparent);
+    try std.testing.expect(b.window == to);
+    try std.testing.expect(b.presentsAlpha());
+    try std.testing.expect(TestClear.isLayered(to.bar.hwnd));
+
+    // From an opaque window.
+    const plain = try testFrame(&app);
+    testResize(plain, 800, 300);
+    const d = try testPane(&app, plain);
+    plain.tab().tree = try .init(alloc, d);
+    plain.tab().focused = d;
+    _ = win32.ShowWindow(plain.hwnd, win32.SW_SHOWNOACTIVATE);
+    plain.relayout();
+    const e = try testTab(&app, plain);
+    const layered = TestClear.layered_count;
+    try std.testing.expect((try app.moveTabToNewWindow(&e.core_surface, null)).? == .whole);
+    const plain_to = app.windows.getLast();
+    try std.testing.expect(plain_to != plain);
+    try std.testing.expect(e.window == plain_to);
+    try std.testing.expect(!plain_to.transparent);
+    try std.testing.expect(!e.presentsAlpha());
+    try std.testing.expectEqual(3, TestClear.asked);
+    try std.testing.expectEqual(layered, TestClear.layered_count);
+}
+
+test "win32: what is drawn over a transparent window's terminals is layered as it is made" {
+    // GDI writes alpha 0, which DWM shows added to the desktop behind a
+    // transparent frame (Transparency.zig): its bar, each terminal's
+    // overlays, made with the terminal or later, a search bar and the
+    // command palette are each layered as it is made
+    // (`Transparency.chrome`). Not their fields and the palette's list,
+    // drawn into their surfaces, nor the terminals, whose renderers
+    // present with alpha, nor the palette's tip, a pop-up of its own. In
+    // an opaque window none is.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    TestClear.start(1);
+    defer TestClear.stop();
+
+    for ([_]bool{ true, false }) |transparent| {
+        const window = try testFrameOf(&app, transparent);
+        try std.testing.expectEqual(transparent, window.transparent);
+        // As large as the palette's own test makes its window, for the
+        // palette to fit at any DPI.
+        testResize(window, 1000, 700);
+        const a = try testPane(&app, window);
+        window.tab().tree = try .init(alloc, a);
+        window.tab().focused = a;
+        _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+        window.relayout();
+
+        try std.testing.expect(try testReadOnly(&app, a, .on));
+        try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "" }));
+        app.applyPendingFocus();
+        try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_command_palette, {}));
+        app.createRequested();
+        const p = &window.palette;
+        for ([_]?win32.HWND{
+            window.bar.hwnd,
+            a.overlays.link_preview.hwnd,
+            a.overlays.readonly.hwnd,
+            a.search_bar.hwnd,
+            p.hwnd,
+        }) |hwnd| {
+            try std.testing.expect(hwnd != null);
+            try std.testing.expectEqual(transparent, TestClear.isLayered(hwnd));
+        }
+        try std.testing.expect(a.search_bar.edit != null and p.edit != null and p.list != null);
+        for ([_]?win32.HWND{ a.search_bar.edit, p.edit, p.list, a.hwnd, p.tip }) |hwnd| {
+            try std.testing.expect(!TestClear.isLayered(hwnd));
+        }
+
+        try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_command_palette, {}));
+        app.createRequested();
+        try std.testing.expect(p.hwnd == null);
+        try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
+        app.applyPendingFocus();
+    }
+    try std.testing.expectEqual(1, TestClear.asked);
+    try std.testing.expectEqual(5, TestClear.layered_count);
 }
 
 test "win32: a tab whose terminal cannot change frames stays where it was" {
@@ -8959,7 +9220,7 @@ test "win32: a tab dropped on a monitor of another DPI is placed again there" {
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
 
-    const window = try Window.createBare(&app, .normal);
+    const window = try Window.createBare(&app, .normal, false);
     defer window.discard();
 
     const Monitor = struct {

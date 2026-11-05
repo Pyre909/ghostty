@@ -32,7 +32,7 @@ pub const HINSTANCE = w.HINSTANCE;
 pub const HMODULE = w.HMODULE;
 const HICON = w.HICON;
 pub const HCURSOR = w.HCURSOR;
-const HBRUSH = w.HBRUSH;
+pub const HBRUSH = w.HBRUSH;
 pub const HMENU = w.HMENU;
 const ATOM = w.ATOM;
 
@@ -813,6 +813,18 @@ pub extern "dwmapi" fn DwmGetWindowAttribute(
 /// The frame's visible bounds, a RECT in screen coordinates, without the
 /// invisible resize borders GetWindowRect includes (dwmapi.h).
 pub const DWMWA_EXTENDED_FRAME_BOUNDS: DWORD = 9;
+/// DWM_BLURBEHIND's `flags`: `enable` and `region` apply.
+pub const DWM_BB_ENABLE: DWORD = 0x1;
+pub const DWM_BB_BLURREGION: DWORD = 0x2;
+/// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ns-dwmapi-dwm_blurbehind
+pub const DWM_BLURBEHIND = extern struct {
+    flags: DWORD,
+    enable: BOOL,
+    region: ?HRGN,
+    transition_on_maximized: BOOL,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmenableblurbehindwindow
+pub extern "dwmapi" fn DwmEnableBlurBehindWindow(hwnd: HWND, blur: *const DWM_BLURBEHIND) callconv(.winapi) HRESULT;
 
 // Registry
 pub const HKEY = w.HKEY;
@@ -1421,6 +1433,30 @@ pub const MEASUREITEMSTRUCT = extern struct {
 /// (`CommandPalette.applyListTheme`).
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-setwindowtheme
 pub extern "uxtheme" fn SetWindowTheme(hwnd: HWND, sub_app_name: ?LPCWSTR, sub_id_list: ?LPCWSTR) callconv(.winapi) HRESULT;
+
+// Buffered painting: GDI drawn into a 32-bit buffer whose alpha can be
+// set before it is copied to the window, as GDI alone writes alpha 0
+// (`Transparency.fillOpaque`).
+/// A buffered paint context (uxtheme.h).
+pub const HPAINTBUFFER = *opaque {};
+/// BP_BUFFERFORMAT: a top-down 32-bit DIB, which has an alpha channel.
+pub const BPBF_TOPDOWNDIB: c_int = 2;
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-bufferedpaintinit
+pub extern "uxtheme" fn BufferedPaintInit() callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-bufferedpaintuninit
+pub extern "uxtheme" fn BufferedPaintUnInit() callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-beginbufferedpaint
+pub extern "uxtheme" fn BeginBufferedPaint(
+    target: HDC,
+    rect: *const RECT,
+    format: c_int,
+    params: ?*const anyopaque,
+    hdc: *?HDC,
+) callconv(.winapi) ?HPAINTBUFFER;
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-bufferedpaintsetalpha
+pub extern "uxtheme" fn BufferedPaintSetAlpha(buffer: HPAINTBUFFER, rect: ?*const RECT, alpha: BYTE) callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-endbufferedpaint
+pub extern "uxtheme" fn EndBufferedPaint(buffer: HPAINTBUFFER, update_target: BOOL) callconv(.winapi) HRESULT;
 
 // The palette's tooltip, a system tooltip control made by its class name,
 // which the manifest's Common Controls v6 registers: nothing is imported

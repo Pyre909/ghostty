@@ -505,6 +505,7 @@ const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const Transparency = @import("Transparency.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -709,6 +710,9 @@ pub fn open(surface: *Surface) bool {
     // counting those in hidden tabs.
     p.hwnd = hwnd;
     p.entries = entries;
+    // Layered in a transparent window, as made, and with it its field and
+    // list, drawn into its surface.
+    Transparency.chrome(window, hwnd);
     p.surface = window.tab().focused orelse surface;
     const edit = win32.CreateWindowExW(
         0,

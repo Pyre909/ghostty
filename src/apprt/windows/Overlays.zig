@@ -39,6 +39,7 @@ const win32 = @import("win32.zig");
 const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
+const Transparency = @import("Transparency.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const ReadOnly = @import("ReadOnly.zig");
@@ -224,11 +225,12 @@ pub var test_make: if (builtin.is_test) ?*const fn ([]const u8) ?win32.HWND else
     if (builtin.is_test) null else {};
 
 /// A hidden window of the overlay class `class` in `surface`'s frame,
-/// whose procedure finds `surface` from its WM_NCCREATE; null if it cannot
-/// be made.
+/// whose procedure finds `surface` from its WM_NCCREATE, layered if the
+/// window is transparent (`Transparency.chrome`); null if it cannot be
+/// made.
 pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
     if (builtin.is_test) if (test_make) |answer| return answer(class);
-    return win32.CreateWindowExW(
+    const hwnd = win32.CreateWindowExW(
         0,
         L(class),
         null,
@@ -241,7 +243,9 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
         null,
         surface.app.hinstance,
         surface,
-    );
+    ) orelse return null;
+    Transparency.chrome(surface.window, hwnd);
+    return hwnd;
 }
 
 /// Place `surface`'s overlays over its terminal, each where its own file

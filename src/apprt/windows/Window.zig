@@ -38,6 +38,7 @@ const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
+const Transparency = @import("Transparency.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -115,6 +116,14 @@ dpi_changing: bool,
 /// Whether the title bar was last made dark (`applyTheme`). A new frame
 /// has a light one.
 dark_frame: bool,
+
+/// Whether the frame lets the desktop through where its terminals'
+/// background is translucent (Transparency.zig): set as the frame is made
+/// (`makeTransparent`), never changed. Its terminals present with alpha
+/// (`Surface.presentsAlpha`), paint black under their chains, and its
+/// chrome is layered; a terminal only ever moves to a frame of the same
+/// kind (`App.moveTabAt`).
+transparent: bool,
 
 /// Where and how the window was before it covered its monitor, to put it
 /// back (`toggleFullscreen`); null while it does not.
@@ -818,7 +827,7 @@ pub fn setWindowTitle(self: *Window, title: [:0]const u8) bool {
 /// it).
 pub fn create(app: *App, opts: Surface.Options, kind: Kind) !*Window {
     const alloc = app.core_app.alloc;
-    const self = try createBare(app, kind);
+    const self = try createBare(app, kind, Transparency.wanted(&app.config));
     errdefer self.discard();
 
     // Under the bar, if `window-show-tab-bar = always` shows it already.
@@ -844,9 +853,10 @@ pub fn create(app: *App, opts: Surface.Options, kind: Kind) !*Window {
 /// A new window of `kind`, still hidden and not yet the app's, with one
 /// empty tab: `create` puts a new terminal in it, `moveTabTo` a tab from
 /// another window in its place. Its frame is made at CW_USEDEFAULT, or the
-/// quick terminal's at its place, with its bar and its title bar's theme.
-/// Undone by `discard` until it is in `App.windows`.
-pub fn createBare(app: *App, kind: Kind) !*Window {
+/// quick terminal's at its place, transparent if `transparent` asks and
+/// DWM lets it (`makeTransparent`), with its bar and its title bar's
+/// theme. Undone by `discard` until it is in `App.windows`.
+pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
     const alloc = app.core_app.alloc;
     const self = try alloc.create(Window);
     errdefer alloc.destroy(self);
@@ -859,6 +869,7 @@ pub fn createBare(app: *App, kind: Kind) !*Window {
         .title_override = null,
         .bar = .{},
         .dark_frame = false,
+        .transparent = false,
         .fullscreen = null,
         .decoration = null,
         .quick = kind == .quick,
@@ -907,6 +918,8 @@ pub fn createBare(app: *App, kind: Kind) !*Window {
         },
     }
     errdefer comptime unreachable;
+    // Before the bar, which is layered in a transparent frame.
+    if (transparent) self.makeTransparent();
     self.bar.create(self);
 
     // Windows announces a change of its app mode only to the top-level
@@ -969,6 +982,15 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
         _ = win32.ChangeWindowMessageFilterEx(hwnd, self.app.taskbar_created, win32.MSGFLT_ALLOW, null);
     }
     return hwnd;
+}
+
+/// Make the new, still hidden and empty frame let the desktop through
+/// (`Transparency.frameMade`), before anything is made in it: its chrome
+/// is layered as it is made, and its terminals present with alpha. Left
+/// opaque, logged, if DWM does not let it.
+pub fn makeTransparent(self: *Window) void {
+    assert(!self.transparent);
+    self.transparent = Transparency.frameMade(self.hwnd);
 }
 
 /// Size the still-hidden frame to `window-width`/`window-height`, maximize
@@ -1866,7 +1888,8 @@ fn handleMessage(
 
         // What the terminals leave of the client area: the dividers
         // between them. WS_CLIPCHILDREN keeps the paint out of the
-        // terminals, which their own swap chains draw.
+        // terminals, which their own swap chains draw. Opaque in a
+        // transparent frame too (`Transparency.fillOpaque`).
         win32.WM_PAINT => {
             var paint: win32.PAINTSTRUCT = undefined;
             const hdc = win32.BeginPaint(hwnd, &paint) orelse return 0;
@@ -1874,7 +1897,11 @@ fn handleMessage(
             const color = dividerColor(&self.app.config);
             const brush = win32.CreateSolidBrush(win32.rgb(color.r, color.g, color.b)) orelse return 0;
             defer _ = win32.DeleteObject(brush);
-            _ = win32.FillRect(hdc, &paint.rcPaint, brush);
+            if (self.transparent) {
+                Transparency.fillOpaque(hdc, &paint.rcPaint, brush);
+            } else {
+                _ = win32.FillRect(hdc, &paint.rcPaint, brush);
+            }
             return 0;
         },
 
@@ -1899,6 +1926,7 @@ fn handleMessage(
 
         // After the child windows: frees `self`, so nothing may follow.
         win32.WM_NCDESTROY => {
+            if (self.transparent) Transparency.frameDestroyed();
             self.app.windowDestroyed(self);
             return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },

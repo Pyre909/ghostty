@@ -42,6 +42,7 @@ const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const Overlays = @import("Overlays.zig");
+const Transparency = @import("Transparency.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -111,8 +112,9 @@ pub const Bar = struct {
     }
 
     /// Make the bar's window and its field, hidden, in the terminal's
-    /// frame, unless it has them already. False, logged, if they cannot be
-    /// made.
+    /// frame, unless it has them already, the bar layered if the window is
+    /// transparent (`Transparency.chrome`), and with it the field, drawn
+    /// into its surface. False, logged, if they cannot be made.
     fn create(self: *Bar, surface: *Surface) bool {
         if (self.hwnd != null) return true;
         const app = surface.app;
@@ -134,6 +136,7 @@ pub const Bar = struct {
             return false;
         };
         self.hwnd = hwnd;
+        Transparency.chrome(surface.window, hwnd);
         const edit = win32.CreateWindowExW(
             0,
             L("EDIT"),
