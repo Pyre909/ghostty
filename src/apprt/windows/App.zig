@@ -7613,7 +7613,9 @@ test "win32: a new window is transparent while background-opacity is below 1, if
     // is (`Transparency.chrome`); not the terminal, whose renderer
     // presents with alpha instead (`Surface.presentsAlpha`). At opacity 1
     // DWM is not asked; refused, the window is opaque, and nothing in it
-    // is layered.
+    // is layered. So too if buffered painting, which its dividers need,
+    // cannot start (`Transparency.frameMade`): then blur-behind, taken,
+    // is turned off again.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -7634,20 +7636,23 @@ test "win32: a new window is transparent while background-opacity is below 1, if
     Window.test_create_pane = &Panes.create;
     defer Window.test_create_pane = null;
 
-    const Case = struct { opacity: f64, takes: usize, transparent: bool };
+    const Case = struct { opacity: f64, takes: usize, paints: bool = true, transparent: bool };
     for ([_]Case{
         .{ .opacity = 1, .takes = 1, .transparent = false },
         .{ .opacity = 0.5, .takes = 1, .transparent = true },
         .{ .opacity = 0.5, .takes = 0, .transparent = false },
+        .{ .opacity = 0.5, .takes = 1, .paints = false, .transparent = false },
     }) |case| {
         app.config.@"background-opacity" = case.opacity;
         TestClear.start(case.takes);
+        Transparency.test_no_buffered_paint = !case.paints;
+        defer Transparency.test_no_buffered_paint = false;
         const window = try app.newWindow(null, .normal, null);
         const pane = window.tab().focused.?;
         try std.testing.expectEqual(case.transparent, window.transparent);
         try std.testing.expectEqual(case.transparent, pane.presentsAlpha());
         try std.testing.expectEqual(@intFromBool(case.opacity < 1), TestClear.asked);
-        try std.testing.expectEqual(0, TestClear.undone);
+        try std.testing.expectEqual(@intFromBool(!case.paints), TestClear.undone);
         try std.testing.expectEqual(case.transparent, TestClear.isLayered(window.bar.hwnd));
         try std.testing.expectEqual(case.transparent, TestClear.isLayered(pane.overlays.link_preview.hwnd));
         try std.testing.expect(!TestClear.isLayered(pane.hwnd));

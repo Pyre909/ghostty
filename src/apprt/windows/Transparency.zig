@@ -75,10 +75,22 @@ pub var test_blur_behind: if (builtin.is_test) ?*const fn (win32.HWND, bool) boo
 /// either step fails, logged, it is opaque, with no blur-behind.
 pub fn frameMade(frame: win32.HWND) bool {
     if (!blurBehind(frame, true)) return false;
+    if (bufferedPaintInit()) return true;
+    _ = blurBehind(frame, false);
+    return false;
+}
+
+/// For tests: BufferedPaintInit in `frameMade` and BeginBufferedPaint in
+/// `fillOpaque` fail, which the test runner cannot make them do.
+pub var test_no_buffered_paint: if (builtin.is_test) bool else void =
+    if (builtin.is_test) false else {};
+
+/// BufferedPaintInit; whether it succeeded, logged if not.
+fn bufferedPaintInit() bool {
+    if (builtin.is_test and test_no_buffered_paint) return false;
     const hr = win32.BufferedPaintInit();
     if (hr >= 0) return true;
     log.warn("a window is opaque: BufferedPaintInit failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
-    _ = blurBehind(frame, false);
     return false;
 }
 
@@ -265,7 +277,11 @@ var buffer_failed_logged = false;
 pub fn fillOpaque(hdc: win32.HDC, rect: *const win32.RECT, brush: win32.HBRUSH) void {
     if (rect.right <= rect.left or rect.bottom <= rect.top) return;
     var mem: ?win32.HDC = null;
-    const buffer = win32.BeginBufferedPaint(hdc, rect, win32.BPBF_TOPDOWNDIB, null, &mem) orelse {
+    const began = if (builtin.is_test and test_no_buffered_paint)
+        null
+    else
+        win32.BeginBufferedPaint(hdc, rect, win32.BPBF_TOPDOWNDIB, null, &mem);
+    const buffer = began orelse {
         if (!buffer_failed_logged) {
             buffer_failed_logged = true;
             log.warn("a transparent window's dividers show blended with what is behind it: BeginBufferedPaint failed err={}", .{win32.GetLastError()});
@@ -366,5 +382,18 @@ test "win32: a transparent frame's terminal paints black, its dividers their col
     defer _ = win32.DeleteObject(brush);
     fillOpaque(hdc, &paint.rcPaint, brush);
     _ = win32.EndPaint(hwnd, &paint);
+    try testing.expectEqual(win32.rgb(19, 29, 58), try testPixel(hwnd));
+
+    // With no buffer to be had, filled directly, and said once.
+    try testFill(hwnd, win32.rgb(255, 255, 255));
+    _ = win32.InvalidateRect(hwnd, null, .FALSE);
+    test_no_buffered_paint = true;
+    defer test_no_buffered_paint = false;
+    buffer_failed_logged = false;
+    defer buffer_failed_logged = false;
+    const direct = win32.BeginPaint(hwnd, &paint) orelse return error.TestUnexpectedResult;
+    fillOpaque(direct, &paint.rcPaint, brush);
+    _ = win32.EndPaint(hwnd, &paint);
+    try testing.expect(buffer_failed_logged);
     try testing.expectEqual(win32.rgb(19, 29, 58), try testPixel(hwnd));
 }
