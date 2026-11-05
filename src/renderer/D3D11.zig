@@ -1380,6 +1380,39 @@ test "d3d11: a transparent window presents through a composition chain, again af
     }
 }
 
+test "d3d11: a composition chain made on the window's thread is recovered on another" {
+    // As the renderer runs: `init` on the thread that owns the window, the
+    // apprt's, and `recoverDevice` on the render thread, which binds a new
+    // composition target to that window. DirectComposition objects are not
+    // thread bound, and a target asks only that the window be the calling
+    // process's (Learn: DirectComposition "Basic concepts" and
+    // CreateTargetForHwnd); this holds Windows to it.
+    const testing = std.testing;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+
+    var r = try initWindow(hwnd, try loadCompiler(), true, .native, .composition);
+    defer r.deinit();
+    const Render = struct {
+        fn run(renderer: *D3D11, result: *anyerror!void) void {
+            result.* = recover(renderer);
+        }
+
+        fn recover(renderer: *D3D11) !void {
+            renderer.lost = true;
+            try renderer.recoverDevice();
+            try expectPresents(renderer, .PREMULTIPLIED);
+        }
+    };
+    var result: anyerror!void = {};
+    const thread = try std.Thread.spawn(.{}, Render.run, .{ &r, &result });
+    thread.join();
+    try result;
+    try testing.expect(!r.lost);
+    try testing.expect(r.presentsAlpha());
+    try testing.expect(r.composition != null);
+}
+
 test "d3d11: an opaque window presents through an HWND chain, again after a lost device" {
     const testing = std.testing;
     const hwnd = try testWindow();
