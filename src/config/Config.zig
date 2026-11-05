@@ -1070,8 +1070,10 @@ palette: Palette = .{},
 ///
 /// On Windows, any positive integer or `true` gives a transparent window
 /// the system's acrylic backdrop, which tints what it blurs and is behind
-/// the title bar too; the blur intensity is ignored. Acrylic needs
-/// Windows 11 22H2 (build 22621) or later; below that there is no blur.
+/// the title bar too; the blur intensity is ignored. While the window is
+/// inactive, the system draws the backdrop as a flat color instead, and
+/// nothing behind the window shows through. Acrylic needs Windows 11 22H2
+/// (build 22621) or later; below that there is no blur.
 @"background-blur": BackgroundBlur = .false,
 
 /// The opacity level (opposite of transparency) of an unfocused split.

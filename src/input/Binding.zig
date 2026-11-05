@@ -890,6 +890,10 @@ pub const Action = union(enum) {
     /// When `background-opacity` is less than 1, this action will either make
     /// the window transparent or not depending on its current transparency state.
     ///
+    /// On Windows, every terminal is given its configuration again, as a
+    /// configuration reload does: a pending key sequence and any active key
+    /// tables end, and a configured `title` is set again.
+    ///
     /// Only implemented on macOS and Windows.
     toggle_background_opacity,
 
