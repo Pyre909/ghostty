@@ -1017,8 +1017,10 @@ palette: Palette = .{},
 ///
 /// On macOS, changing this configuration requires restarting Ghostty completely.
 ///
-/// This setting is currently not supported on Windows, where the background
-/// is always drawn opaque.
+/// On Windows, a window is transparent only if it is made while this is
+/// below 1, and it stays transparent until it closes, in fullscreen too: a
+/// reload that lowers it leaves the windows already open opaque, and a
+/// transparent window draws a value of 1 as an opaque one does.
 @"background-opacity": f64 = 1.0,
 
 /// Applies background opacity to cells with an explicit background color
@@ -1065,6 +1067,11 @@ palette: Palette = .{},
 ///
 /// On X11, blur can only be enabled when using the KWin compositor
 /// as a part of KDE Plasma.
+///
+/// On Windows, any positive integer or `true` gives a transparent window
+/// the system's acrylic backdrop, which tints what it blurs and is behind
+/// the title bar too; the blur intensity is ignored. Acrylic needs
+/// Windows 11 22H2 (build 22621) or later; below that there is no blur.
 @"background-blur": BackgroundBlur = .false,
 
 /// The opacity level (opposite of transparency) of an unfocused split.
