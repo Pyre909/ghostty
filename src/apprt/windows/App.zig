@@ -11096,7 +11096,7 @@ test "win32: reset_window_size waits for run and gives the window a new one's si
     try std.testing.expect(app.requests.items[0] == .dropped);
 }
 
-test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the text alone after a prompt, or nothing it cannot hold" {
+test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the text alone after a prompt, and fails for what it cannot hold" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -11113,7 +11113,7 @@ test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the
     const clipboard = @import("clipboard.zig");
     const saved = try clipboard.readClipboardText(alloc, pane.hwnd);
     defer if (saved) |text| {
-        writeClipboard(pane.hwnd, .{ .text = text }) catch {};
+        writeClipboard(alloc, pane.hwnd, .text(text)) catch {};
         alloc.free(text);
     };
 
@@ -11147,7 +11147,7 @@ test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the
     try clipboard.expectClipboard(pane.hwnd, "plain", null);
 
     // A write that asks first writes the text alone, and with no text,
-    // nothing, without asking.
+    // fails without asking.
     const Prompt = struct {
         var boxes: usize = 0;
         fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
@@ -11164,14 +11164,26 @@ test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the
     }, true);
     try std.testing.expectEqual(1, Prompt.boxes);
     try clipboard.expectClipboard(pane.hwnd, "asked", null);
-    try pane.setClipboard(.standard, &.{.{ .mime = "text/html", .data = "<div>asked</div>" }}, true);
+    try std.testing.expectError(
+        error.NothingWritable,
+        pane.setClipboard(.standard, &.{.{ .mime = "text/html", .data = "<div>asked</div>" }}, true),
+    );
     try std.testing.expectEqual(1, Prompt.boxes);
     try clipboard.expectClipboard(pane.hwnd, "asked", null);
     try pane.setClipboard(.standard, &.{.{ .mime = clipboard.text_mime, .data = "plain" }}, false);
 
-    // Nothing this runtime can hold leaves the clipboard as it was, and so
-    // does a write to the selection clipboard, which Windows has not.
-    try pane.setClipboard(.standard, &.{.{ .mime = "image/png", .data = "png" }}, false);
+    // Nothing this runtime can hold fails the write and leaves the
+    // clipboard as it was: a type with no format, and data that is not what
+    // its type says. A write to the selection clipboard, which Windows has
+    // not, leaves it too.
+    try std.testing.expectError(
+        error.NothingWritable,
+        pane.setClipboard(.standard, &.{.{ .mime = "application/x-unknown", .data = "x" }}, false),
+    );
+    try std.testing.expectError(
+        error.NothingWritable,
+        pane.setClipboard(.standard, &.{.{ .mime = "image/png", .data = "png" }}, false),
+    );
     try pane.setClipboard(.selection, &.{.{ .mime = "text/html", .data = "<div>x</div>" }}, false);
     try clipboard.expectClipboard(pane.hwnd, "plain", null);
 }
@@ -11197,10 +11209,10 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
     const readClipboardText = @import("clipboard.zig").readClipboardText;
     const saved = try readClipboardText(alloc, pane.hwnd);
     defer if (saved) |text| {
-        writeClipboard(pane.hwnd, .{ .text = text }) catch {};
+        writeClipboard(alloc, pane.hwnd, .text(text)) catch {};
         alloc.free(text);
     };
-    try writeClipboard(pane.hwnd, .{ .text = "before" });
+    try writeClipboard(alloc, pane.hwnd, .text("before"));
 
     // None yet, then an empty one: no effect.
     try std.testing.expect(!try app.performAction(target, .copy_title_to_clipboard, {}));
@@ -16386,7 +16398,7 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
     const readClipboardText = @import("clipboard.zig").readClipboardText;
     const saved = try readClipboardText(alloc, a.hwnd);
     defer if (saved) |text| {
-        writeClipboard(a.hwnd, .{ .text = text }) catch {};
+        writeClipboard(alloc, a.hwnd, .text(text)) catch {};
         alloc.free(text);
     };
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 4);
@@ -16396,7 +16408,7 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
         defer alloc.free(text);
         try std.testing.expectEqualStrings("eed", text);
     }
-    try writeClipboard(a.hwnd, .{ .text = "pasted" });
+    try writeClipboard(alloc, a.hwnd, .text("pasted"));
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 6, 6);
     try fieldKey(edit, 'V', .{ .ctrl = true, .shift = true }, null);
     try std.testing.expectEqualStrings("needlepasted", try fieldText(a, &buf));

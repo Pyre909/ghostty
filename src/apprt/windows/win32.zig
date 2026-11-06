@@ -20,6 +20,7 @@ const w = std.os.windows;
 pub const BOOL = w.BOOL;
 pub const BYTE = w.BYTE;
 pub const DWORD = w.DWORD;
+pub const WORD = w.WORD;
 pub const HRESULT = internal_os.windows.HRESULT;
 pub const UINT = w.UINT;
 pub const LONG = w.LONG;
@@ -391,7 +392,60 @@ pub const IDC_APPSTARTING: ResourceW = @ptrFromInt(32650);
 pub const IDC_HELP: ResourceW = @ptrFromInt(32651);
 
 pub const CF_UNICODETEXT: UINT = 13;
+/// https://learn.microsoft.com/en-us/windows/win32/dataxchg/standard-clipboard-formats
+pub const CF_DIB: UINT = 8;
+pub const CF_DIBV5: UINT = 17;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header
+pub const BITMAPV5HEADER = extern struct {
+    bV5Size: DWORD,
+    bV5Width: LONG,
+    bV5Height: LONG,
+    bV5Planes: WORD,
+    bV5BitCount: WORD,
+    bV5Compression: DWORD,
+    bV5SizeImage: DWORD,
+    bV5XPelsPerMeter: LONG,
+    bV5YPelsPerMeter: LONG,
+    bV5ClrUsed: DWORD,
+    bV5ClrImportant: DWORD,
+    bV5RedMask: DWORD,
+    bV5GreenMask: DWORD,
+    bV5BlueMask: DWORD,
+    bV5AlphaMask: DWORD,
+    bV5CSType: DWORD,
+    /// CIEXYZTRIPLE: three CIEXYZ of three FXPT2DOT30 each.
+    bV5Endpoints: [9]LONG,
+    bV5GammaRed: DWORD,
+    bV5GammaGreen: DWORD,
+    bV5GammaBlue: DWORD,
+    bV5Intent: DWORD,
+    bV5ProfileData: DWORD,
+    bV5ProfileSize: DWORD,
+    bV5Reserved: DWORD,
+};
+comptime {
+    // The SDK's size and the offsets of the fields after the endpoints,
+    // which a wrong CIEXYZTRIPLE would move.
+    std.debug.assert(@sizeOf(BITMAPV5HEADER) == 124);
+    std.debug.assert(@offsetOf(BITMAPV5HEADER, "bV5AlphaMask") == 52);
+    std.debug.assert(@offsetOf(BITMAPV5HEADER, "bV5GammaRed") == 96);
+    std.debug.assert(@offsetOf(BITMAPV5HEADER, "bV5Intent") == 108);
+}
+/// biCompression values (wingdi.h).
+pub const BI_RGB: DWORD = 0;
+pub const BI_RLE8: DWORD = 1;
+pub const BI_RLE4: DWORD = 2;
+pub const BI_BITFIELDS: DWORD = 3;
+/// bV5CSType: the sRGB color space, 'sRGB'.
+pub const LCS_sRGB: DWORD = 0x73524742;
+/// bV5CSType: a profile in the DIB, 'MBED', and one named by a path in it,
+/// 'LINK'. Either is found from bV5ProfileData, an offset from the header.
+pub const PROFILE_EMBEDDED: DWORD = 0x4D424544;
+pub const PROFILE_LINKED: DWORD = 0x4C494E4B;
+/// bV5Intent: keep contrast, for photographs and images.
+pub const LCS_GM_IMAGES: DWORD = 4;
 pub const CP_UTF8: UINT = internal_os.windows.CP_UTF8;
 
 pub const MB_OK: UINT = 0x00000000;
@@ -1099,6 +1153,8 @@ pub extern "user32" fn IsClipboardFormatAvailable(format: UINT) callconv(.winapi
 pub extern "user32" fn RegisterClipboardFormatW(name: LPCWSTR) callconv(.winapi) UINT;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumclipboardformats
 pub extern "user32" fn EnumClipboardFormats(format: UINT) callconv(.winapi) UINT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclipboardformatnamew
+pub extern "user32" fn GetClipboardFormatNameW(format: UINT, name: [*]u16, max: c_int) callconv(.winapi) c_int;
 
 pub extern "gdi32" fn GetDeviceCaps(hdc: HDC, index: c_int) callconv(.winapi) c_int;
 

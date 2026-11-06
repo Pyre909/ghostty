@@ -45,7 +45,7 @@ const inputLanguage = @import("key.zig").inputLanguage;
 const text_mime = @import("clipboard.zig").text_mime;
 const readClipboardText = @import("clipboard.zig").readClipboardText;
 const writeClipboard = @import("clipboard.zig").writeClipboard;
-const ClipboardContents = @import("clipboard.zig").Contents;
+const ClipboardReps = @import("clipboard.zig").Reps;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const clipboardReadPrompt = @import("clipboard.zig").clipboardReadPrompt;
 const confirm = @import("dialog.zig").confirm;
@@ -1464,14 +1464,16 @@ pub const Surface = struct {
             log.warn("unable to paste a file drop err={}", .{err});
     }
 
-    /// Write the text and the HTML of `contents` to the clipboard, the first
-    /// of each, as `writeClipboard` (clipboard.zig) puts them: a copy gives
-    /// the HTML with `copy_to_clipboard:html`, and with `:mixed`, the
-    /// default, the text too. A write that asks first (`confirm_write`)
-    /// writes the text alone, as GTK and macOS do after their prompts. They
-    /// otherwise write every type they are given; other types are left out
-    /// here, as only a Kitty clipboard write would carry them, and this
-    /// runtime does not accept those (`clipboardRequest`).
+    /// Write `contents` to the clipboard, the first of each type Windows has
+    /// a format for, as `writeClipboard` (clipboard.zig) puts them: a copy
+    /// gives the HTML with `copy_to_clipboard:html`, and with `:mixed`, the
+    /// default, the text too; a Kitty clipboard write gives whatever types
+    /// the program sends. A write that asks first (`confirm_write`) writes
+    /// the text alone, as GTK and macOS do after their prompts. A write with
+    /// no type to write fails without asking and leaves the clipboard as it
+    /// was, so a Kitty write is answered with EIO rather than DONE. GTK and
+    /// macOS write every type they are given; the types Windows has no format
+    /// for are logged and left out.
     ///
     /// `confirm` means the configuration asked for the write to be approved by
     /// the user. This runtime has no in-window prompt, so it uses a modal
@@ -1485,20 +1487,11 @@ pub const Surface = struct {
     ) !void {
         if (!self.supportsClipboard(clipboard_type)) return;
 
-        var found: ClipboardContents = .{};
-        for (contents) |c| {
-            if (found.text == null and terminal.clipboard.isTextMime(c.mime)) {
-                found.text = c.data;
-            } else if (found.html == null and std.mem.eql(u8, c.mime, "text/html")) {
-                found.html = c.data;
-            }
-        }
         // After a prompt, the text alone, as GTK and macOS write it.
-        if (confirm_write) found.html = null;
-        if (found.text == null and found.html == null) {
-            // Nothing this runtime can write; doing nothing is correct.
-            log.debug("clipboard write had no text or HTML", .{});
-            return;
+        const reps: ClipboardReps = .of(contents, confirm_write);
+        if (reps.len == 0) {
+            log.info("clipboard write had no type Windows has a format for", .{});
+            return error.NothingWritable;
         }
 
         if (confirm_write and !confirm(
@@ -1510,7 +1503,7 @@ pub const Surface = struct {
 
         // An error when nothing could be written: the core must not believe
         // a copy landed when it did not.
-        try writeClipboard(self.hwnd, found);
+        try writeClipboard(self.app.core_app.alloc, self.hwnd, reps);
     }
 
     /// The environment the child process starts from. The caller takes
