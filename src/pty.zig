@@ -384,6 +384,33 @@ const WindowsPty = struct {
             create_failed,
         };
 
+        /// The source whose host an open last logged above debug, as its
+        /// tag, or none yet: every terminal opens a pty, and each would
+        /// otherwise log the same host again.
+        var logged = std.atomic.Value(u8).init(std.math.maxInt(u8));
+
+        /// Whether to log the host of an open with `source` at debug
+        /// rather than its own level: after the first, while the source
+        /// stays the same.
+        fn quiet(source: Source) bool {
+            return logged.swap(@backingInt(source), .monotonic) == @backingInt(source);
+        }
+
+        /// Log the host an open uses, as `quiet` says.
+        fn note(
+            source: Source,
+            comptime level: std.log.Level,
+            comptime format: []const u8,
+            args: anytype,
+        ) void {
+            if (quiet(source)) return log.debug(format, args);
+            switch (level) {
+                .info => log.info(format, args),
+                .warn => log.warn(format, args),
+                else => comptime unreachable,
+            }
+        }
+
         /// The functions for a pty opened now, from the executable's
         /// folder. Each open looks again: after the first, LoadLibraryExW
         /// finds conpty.dll loaded and raises its reference count, which
@@ -392,7 +419,7 @@ const WindowsPty = struct {
         fn init() ConPty {
             const alloc = global.alloc();
             const dir = std.process.executableDirPathAlloc(global.io(), alloc) catch |err| {
-                log.warn("conpty: using the system's, the executable's folder is unknown err={}", .{err});
+                note(.no_dll, .warn, "conpty: using the system's, the executable's folder is unknown err={}", .{err});
                 return .{ .source = .no_dll };
             };
             defer alloc.free(dir);
@@ -404,7 +431,7 @@ const WindowsPty = struct {
         /// that loads but lacks a function is freed at once.
         fn load(alloc: std.mem.Allocator, dir: []const u8) ConPty {
             return loadPaths(alloc, dir) catch |err| {
-                log.warn("conpty: using the system's, a path in {s} could not be made err={}", .{ dir, err });
+                note(.no_dll, .warn, "conpty: using the system's, a path in {s} could not be made err={}", .{ dir, err });
                 return .{ .source = .no_dll };
             };
         }
@@ -414,14 +441,14 @@ const WindowsPty = struct {
             const dll = try std.fs.path.join(alloc, &.{ dir, "conpty.dll" });
             defer alloc.free(dll);
             std.Io.Dir.accessAbsolute(io, dll, .{}) catch |err| {
-                log.info("conpty: using the system's, no {s} err={}", .{ dll, err });
+                note(.no_dll, .info, "conpty: using the system's, no {s} err={}", .{ dll, err });
                 return .{ .source = .no_dll };
             };
 
             const open_console = try std.fs.path.join(alloc, &.{ dir, "OpenConsole.exe" });
             defer alloc.free(open_console);
             std.Io.Dir.accessAbsolute(io, open_console, .{}) catch |err| {
-                log.warn("conpty: using the system's, {s} without {s} err={}", .{ dll, open_console, err });
+                note(.no_open_console, .warn, "conpty: using the system's, {s} without {s} err={}", .{ dll, open_console, err });
                 return .{ .source = .no_open_console };
             };
 
@@ -432,7 +459,7 @@ const WindowsPty = struct {
                 null,
                 windows.LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | windows.LOAD_LIBRARY_SEARCH_SYSTEM32,
             ) orelse {
-                log.warn("conpty: using the system's, {s} did not load err={}", .{ dll, windows.GetLastError() });
+                note(.load_failed, .warn, "conpty: using the system's, {s} did not load err={}", .{ dll, windows.GetLastError() });
                 return .{ .source = .load_failed };
             };
 
@@ -443,13 +470,13 @@ const WindowsPty = struct {
                 .{ "close", "ConptyClosePseudoConsole" },
             }) |f| {
                 const proc = windows.exp.kernel32.GetProcAddress(module, f[1]) orelse {
-                    log.warn("conpty: using the system's, {s} has no {s} err={}", .{ dll, f[1], windows.GetLastError() });
+                    note(.no_export, .warn, "conpty: using the system's, {s} has no {s} err={}", .{ dll, f[1], windows.GetLastError() });
                     _ = windows.exp.kernel32.FreeLibrary(module);
                     return .{ .source = .no_export };
                 };
                 @field(conpty, f[0]) = @ptrCast(@alignCast(proc));
             }
-            log.info("conpty: using {s}", .{dll});
+            note(.package, .info, "conpty: using {s}", .{dll});
             return conpty;
         }
     };
@@ -584,7 +611,7 @@ const WindowsPty = struct {
         // Where the package's create fails, kernel32's may still work: the
         // files were there, but its OpenConsole.exe may not start.
         if (result != windows.S_OK and pty.conpty.source == .package) {
-            log.warn("conpty: using the system's, the package's pseudoconsole failed err=0x{x}", .{@as(u32, @bitCast(result))});
+            ConPty.note(.create_failed, .warn, "conpty: using the system's, the package's pseudoconsole failed err=0x{x}", .{@as(u32, @bitCast(result))});
             pty.conpty = .{ .source = .create_failed };
             result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, 0, &pty.pseudo_console);
         }
@@ -709,4 +736,20 @@ test "WindowsPty: ConPTY package only with conpty.dll and OpenConsole.exe" {
         .{},
     );
     try expectSystem(ConPty.load(alloc, dir), .no_export);
+}
+
+test "WindowsPty: the console host is logged once while it stays the same" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const ConPty = WindowsPty.ConPty;
+
+    ConPty.logged.store(std.math.maxInt(u8), .monotonic);
+    try testing.expect(!ConPty.quiet(.package));
+    try testing.expect(ConPty.quiet(.package));
+    try testing.expect(ConPty.quiet(.package));
+
+    // A change is logged, and so is the change back.
+    try testing.expect(!ConPty.quiet(.no_dll));
+    try testing.expect(ConPty.quiet(.no_dll));
+    try testing.expect(!ConPty.quiet(.package));
 }
