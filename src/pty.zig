@@ -344,10 +344,13 @@ const WindowsPty = struct {
     // Process-wide counter for pipe names
     var pipe_name_counter = std.atomic.Value(u32).init(1);
 
-    /// The pseudoconsole functions a pty is made with, which must also
-    /// resize and close it: those of Microsoft's ConPTY package
+    /// The pseudoconsole functions a pty is made with, which also resize
+    /// and close it: those of Microsoft's ConPTY package
     /// (Microsoft.Windows.Console.ConPTY) when its conpty.dll and
     /// OpenConsole.exe are beside the executable, else kernel32's.
+    /// kernel32's resize did resize a pseudoconsole the package made, and
+    /// its close did not fail on one, on the Windows 11 tried, but neither
+    /// is documented, so a pty keeps the functions that made it.
     ///
     /// kernel32's start the system's conhost.exe, which drops the Kitty
     /// graphics protocol and the replies to OSC 10, 52 and 5522, and
