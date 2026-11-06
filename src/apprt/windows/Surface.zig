@@ -44,6 +44,7 @@ const shiftlessCodepoint = @import("key.zig").shiftlessCodepoint;
 const inputLanguage = @import("key.zig").inputLanguage;
 const text_mime = @import("clipboard.zig").text_mime;
 const readClipboardText = @import("clipboard.zig").readClipboardText;
+const readClipboard = @import("clipboard.zig").readClipboard;
 const writeClipboard = @import("clipboard.zig").writeClipboard;
 const ClipboardReps = @import("clipboard.zig").Reps;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
@@ -1348,14 +1349,21 @@ pub const Surface = struct {
 
         const alloc = self.app.core_app.alloc;
 
+        // A paste event lists each type a program could read
+        // (`readClipboard`), as GTK and macOS list theirs.
         if (state == .list) {
-            if (!win32.IsClipboardFormatAvailable(win32.CF_UNICODETEXT).toBool()) {
-                return .unavailable;
-            }
-
-            try self.core_surface.completeClipboardRequest(state, .{
-                .available = &.{text_mime},
-            });
+            var arena: std.heap.ArenaAllocator = .init(alloc);
+            defer arena.deinit();
+            // Nothing to read is no paste event, so a performable paste
+            // binding passes its key on, as when there is no text to paste;
+            // so is a clipboard another program holds open (logged), as for
+            // a paste (`readClipboardText`).
+            const found = readClipboard(arena.allocator(), self.hwnd, &.{}, true) catch |err| switch (err) {
+                error.Win32CallFailed => return .unavailable,
+                else => |e| return e,
+            };
+            if (found.available().len == 0) return .unavailable;
+            try self.completeClipboard(state, .{ .available = found.available() });
             return .started;
         }
 
@@ -1364,6 +1372,20 @@ pub const Surface = struct {
 
         try self.completePaste(state, text, false);
         return .started;
+    }
+
+    /// For tests: what stands in for the core's `completeClipboardRequest`
+    /// in `completeClipboard`, where a test's terminal has no core.
+    pub var test_clipboard_core: if (builtin.is_test) ?*const fn (
+        *Surface,
+        apprt.ClipboardRequest,
+        CoreSurface.CompleteClipboard,
+    ) std.mem.Allocator.Error!void else void = if (builtin.is_test) null else {};
+
+    /// Complete `state` with `complete` in the core.
+    fn completeClipboard(self: *Surface, state: apprt.ClipboardRequest, complete: CoreSurface.CompleteClipboard) !void {
+        if (builtin.is_test) if (test_clipboard_core) |stand_in| return stand_in(self, state, complete);
+        return self.core_surface.completeClipboardRequest(state, complete);
     }
 
     /// Hand `text` to the core for `state`, a clipboard request or a drop

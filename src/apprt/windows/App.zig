@@ -11320,6 +11320,77 @@ test "win32: files dropped on a terminal paste their paths, quoted for its shell
     try std.testing.expectEqual(3, Dropped.count);
 }
 
+test "win32: a paste event lists the types the clipboard holds, and an empty or held clipboard is none" {
+    const alloc = std.testing.allocator;
+    const clipboard = @import("clipboard.zig");
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
+
+    // What each request completes with, where a test's terminal has no
+    // core to complete it.
+    const Listed = struct {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        var count: usize = 0;
+        var listing = false;
+        fn complete(_: *Surface, state: apprt.ClipboardRequest, done: CoreSurface.CompleteClipboard) std.mem.Allocator.Error!void {
+            count += 1;
+            listing = state == .list and done.contents.len == 0;
+            len = 0;
+            for (done.available) |mime| {
+                if (len + mime.len + 1 > buf.len) break;
+                @memcpy(buf[len..][0..mime.len], mime);
+                buf[len + mime.len] = ' ';
+                len += mime.len + 1;
+            }
+        }
+        fn text() []const u8 {
+            return buf[0..len];
+        }
+    };
+    Surface.test_clipboard_core = &Listed.complete;
+    defer Surface.test_clipboard_core = null;
+
+    // Each type a program could read, the text first, as GTK and macOS
+    // list theirs; and a file list, which has no text.
+    try clipboard.writeClipboard(alloc, pane.hwnd, .of(&.{
+        .{ .mime = "text/html", .data = "<b>h</b>" },
+        .{ .mime = "text/plain", .data = "t" },
+    }, false));
+    try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .list = .standard }));
+    try std.testing.expectEqual(1, Listed.count);
+    try std.testing.expect(Listed.listing);
+    try std.testing.expectEqualStrings("text/plain text/html ", Listed.text());
+    try clipboard.testPut(pane.hwnd, &.{}, &.{std.unicode.utf8ToUtf16LeStringLiteral("C:\\a")});
+    try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .list = .standard }));
+    try std.testing.expectEqual(2, Listed.count);
+    try std.testing.expectEqualStrings("text/uri-list ", Listed.text());
+
+    // An empty clipboard, and one another program holds open, are no paste
+    // event, so a performable paste binding passes its key on.
+    try clipboard.testPut(pane.hwnd, &.{}, &.{});
+    try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .list = .standard }));
+    try clipboard.writeClipboard(alloc, pane.hwnd, .text("t"));
+    {
+        const holder = try clipboard.TestHolder.start();
+        defer holder.release();
+        try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .list = .standard }));
+    }
+    try std.testing.expectEqual(2, Listed.count);
+}
+
 /// For tests: `pane`'s title prompt for `which`, opened as a binding opens
 /// it: the action, then `run`'s requests (`createRequested`).
 fn testPrompt(app: *App, pane: *Surface, which: apprt.action.PromptTitle) !win32.HWND {

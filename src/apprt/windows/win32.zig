@@ -395,6 +395,8 @@ pub const CF_UNICODETEXT: UINT = 13;
 /// https://learn.microsoft.com/en-us/windows/win32/dataxchg/standard-clipboard-formats
 pub const CF_DIB: UINT = 8;
 pub const CF_DIBV5: UINT = 17;
+/// A file list, as a drop's HDROP is (DragQueryFileW).
+pub const CF_HDROP: UINT = 15;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
 
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header

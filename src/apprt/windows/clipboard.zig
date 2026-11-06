@@ -10,6 +10,7 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const App = @import("App.zig").App;
 const ConfirmDefault = @import("dialog.zig").ConfirmDefault;
+const drop = @import("drop.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -518,20 +519,8 @@ fn dibBitsLen(size: PngSize) ?usize {
     return if (len < max_write_size) len else null;
 }
 
-/// The parts of a BMP file's DIB (`dibOfBmp`).
-const Dib = struct {
-    /// CF_DIB for a BITMAPINFOHEADER, CF_DIBV5 for a BITMAPV4HEADER or a
-    /// BITMAPV5HEADER, as each format's page names its header
-    /// (standard-clipboard-formats).
-    kind: Block.Kind,
-    /// The info header as the file has it.
-    header: []const u8,
-    /// The masks after a BITMAPINFOHEADER, then the color table.
-    table: []const u8,
-    bits: []const u8,
-};
-
-/// Why a BMP file is not taken: what this runtime does not write.
+/// Why a DIB, or the BMP file around one, is not taken: what this runtime
+/// does not read or write.
 const DibError = error{
     /// Too short for a BMP file's header, or without its "BM".
     NotBmp,
@@ -542,8 +531,8 @@ const DibError = error{
     NotBitmap,
     /// A compression or depth a DIB cannot hold.
     UnsupportedCompression,
-    /// A color profile, which the file keeps apart from the header, past
-    /// the bits.
+    /// A color profile, which a DIB keeps apart from its header, past the
+    /// bits.
     ColorProfile,
     /// More colors than the depth has.
     TooManyColors,
@@ -551,24 +540,27 @@ const DibError = error{
     NoBitsSize,
     /// A color table or bits longer than memory.
     TooLong,
-    /// Bits the file says start inside its header.
+    /// Bits a BMP file says start inside its header.
     BitsInHeader,
     BitsCutShort,
 };
 
-/// The DIB inside a BMP file
+/// Where the parts of a DIB are
 /// (https://learn.microsoft.com/en-us/windows/win32/gdi/bitmap-storage):
-/// the 14-byte BITMAPFILEHEADER, whose bfOffBits is the offset of the bits
-/// from the file's start, then the info header with its masks and color
-/// table. A clipboard DIB has the bits right after the table, so the gap
-/// the file may leave before them is not copied. Refused for what this
-/// runtime does not write (`DibError`).
-fn dibOfBmp(bmp: []const u8) DibError!Dib {
-    const file_header_len = 14;
-    if (bmp.len < file_header_len or !std.mem.startsWith(u8, bmp, "BM")) return error.NotBmp;
-    const off_bits = std.mem.readInt(u32, bmp[10..14], .little);
-    const info = bmp[file_header_len..];
+/// its info header, the masks and color table after it, then its bits.
+const DibLayout = struct {
+    /// CF_DIB for a BITMAPINFOHEADER, CF_DIBV5 for a BITMAPV4HEADER or a
+    /// BITMAPV5HEADER, as each format's page names its header
+    /// (standard-clipboard-formats).
+    kind: Block.Kind,
+    header_len: usize,
+    /// The masks after a BITMAPINFOHEADER, then the color table.
+    table_len: usize,
+    bits_len: usize,
+};
 
+/// The layout of the DIB that `info` starts with its info header.
+fn dibLayout(info: []const u8) DibError!DibLayout {
     // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapinfoheader,
     // whose fields start the later headers too.
     if (info.len < 40) return error.HeaderCutShort;
@@ -629,16 +621,44 @@ fn dibOfBmp(bmp: []const u8) DibError!Dib {
         const stride = (row_bits / 32 + @intFromBool(row_bits % 32 != 0)) * 4;
         break :len std.math.mul(usize, stride, @abs(height)) catch return error.TooLong;
     };
+    return .{ .kind = kind, .header_len = size, .table_len = table_len, .bits_len = bits_len };
+}
 
-    const table_end = std.math.add(usize, file_header_len + size, table_len) catch
+/// The parts of a BMP file's DIB (`dibOfBmp`).
+const Dib = struct {
+    kind: Block.Kind,
+    /// The info header as the file has it.
+    header: []const u8,
+    /// The masks after a BITMAPINFOHEADER, then the color table.
+    table: []const u8,
+    bits: []const u8,
+};
+
+/// The length of a BITMAPFILEHEADER
+/// (https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapfileheader),
+/// whose bfOffBits is the offset of the bits from the file's start.
+const bmp_header_len = 14;
+
+/// The DIB inside a BMP file
+/// (https://learn.microsoft.com/en-us/windows/win32/gdi/bitmap-storage):
+/// the BITMAPFILEHEADER, then the info header with its masks and color
+/// table. A clipboard DIB has the bits right after the table, so the gap
+/// the file may leave before them is not copied. Refused for a DIB this
+/// runtime does not write (`dibLayout`), or bits the file does not hold.
+fn dibOfBmp(bmp: []const u8) DibError!Dib {
+    if (bmp.len < bmp_header_len or !std.mem.startsWith(u8, bmp, "BM")) return error.NotBmp;
+    const off_bits = std.mem.readInt(u32, bmp[10..14], .little);
+    const info = bmp[bmp_header_len..];
+    const layout = try dibLayout(info);
+    const table_end = std.math.add(usize, bmp_header_len + layout.header_len, layout.table_len) catch
         return error.TooLong;
     if (table_end > off_bits) return error.BitsInHeader;
-    const bits_end = std.math.add(usize, off_bits, bits_len) catch return error.TooLong;
+    const bits_end = std.math.add(usize, off_bits, layout.bits_len) catch return error.TooLong;
     if (bits_end > bmp.len) return error.BitsCutShort;
     return .{
-        .kind = kind,
-        .header = info[0..size],
-        .table = bmp[file_header_len + size .. table_end],
+        .kind = layout.kind,
+        .header = info[0..layout.header_len],
+        .table = bmp[bmp_header_len + layout.header_len .. table_end],
         .bits = bmp[off_bits..bits_end],
     };
 }
@@ -754,9 +774,9 @@ pub fn readClipboardHtml(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     return try alloc.dupe(u8, block[0 .. std.mem.indexOfScalar(u8, block, 0) orelse block.len]);
 }
 
-/// For tests: the fragment of CF_HTML `data`, found as a reader finds it,
-/// from the StartFragment and EndFragment offsets; null if they are
-/// missing or out of the data.
+/// The fragment of CF_HTML `data`, found as a reader finds it, from the
+/// StartFragment and EndFragment offsets; null if they are missing or out
+/// of the data.
 pub fn cfHtmlFragment(data: []const u8) ?[]const u8 {
     const start = cfHtmlOffset(data, "StartFragment:") orelse return null;
     const end = cfHtmlOffset(data, "EndFragment:") orelse return null;
@@ -769,6 +789,399 @@ fn cfHtmlOffset(data: []const u8, key: []const u8) ?usize {
     const digits = data[at + key.len ..];
     const len = std.mem.indexOfNone(u8, digits, "0123456789") orelse digits.len;
     return std.fmt.parseInt(usize, digits[0..len], 10) catch null;
+}
+
+// Reads by MIME type, for the Kitty clipboard protocol. Whatever another
+// program placed is checked as a write checks what a program sends.
+
+/// For tests: the most of one type a read takes (`readCap`).
+pub var test_read_cap: if (builtin.is_test) usize else void = if (builtin.is_test) max_write_size else {};
+
+/// The most of one type a read takes: what a program may write in one
+/// transaction. The core base64-encodes everything a read serves into one
+/// reply, so without a bound an image of several hundred MB would cost
+/// about 2.4 times its size at once.
+fn readCap() usize {
+    return if (builtin.is_test) test_read_cap else max_write_size;
+}
+
+/// What a clipboard format holds, as a read takes it.
+const Held = enum {
+    /// CF_UNICODETEXT.
+    text,
+    /// CF_HTML ("HTML Format").
+    html,
+    /// "PNG".
+    png,
+    /// CF_DIB or CF_DIBV5, read as a BMP file.
+    dib,
+    /// "Rich Text Format".
+    rtf,
+    /// CF_HDROP, read as text/uri-list.
+    files,
+    /// A format registered under a MIME type's name, read as it is.
+    other,
+};
+
+/// A clipboard format a read can serve, and the MIME type it serves it as.
+const Offered = struct {
+    format: win32.UINT,
+    mime: []const u8,
+    held: Held,
+};
+
+/// What a read serves `format` as; null for a format it does not serve.
+/// `known` holds the ids of the registered formats this runtime writes.
+/// Any other registered format is known by its name, which is never
+/// registered here: registering the names a program sends would let it
+/// fill the session's atom table, whose "space exhaustion ... will result
+/// in serious issues; for example, all applications may fail to launch"
+/// (https://learn.microsoft.com/en-us/windows/win32/dataxchg/about-atom-tables).
+/// A registered name that is a MIME type is served as it is, unless it
+/// is one a format above is served as: text, HTML, PNG, BMP, RTF and file
+/// lists come only from the formats Windows and programs share for them.
+fn offered(
+    alloc: Allocator,
+    format: win32.UINT,
+    known: *const std.EnumArray(Registered, ?win32.UINT),
+) Allocator.Error!?Offered {
+    return switch (format) {
+        win32.CF_UNICODETEXT => .{ .format = format, .mime = "text/plain", .held = .text },
+        win32.CF_DIB, win32.CF_DIBV5 => .{ .format = format, .mime = "image/bmp", .held = .dib },
+        win32.CF_HDROP => .{ .format = format, .mime = "text/uri-list", .held = .files },
+        // Registered formats (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerclipboardformatw).
+        0xC000...0xFFFF => registered: {
+            const ours = [_]struct { Registered, []const u8, Held }{
+                .{ .html, "text/html", .html },
+                .{ .png, "image/png", .png },
+                .{ .rtf, "text/rtf", .rtf },
+            };
+            for (ours) |o| if (known.get(o[0])) |id| if (id == format)
+                break :registered .{ .format = format, .mime = o[1], .held = o[2] };
+
+            // A registered name is at most 255 characters (about-atom-tables).
+            var wide: [256]u16 = undefined;
+            const n = win32.GetClipboardFormatNameW(format, &wide, wide.len);
+            if (n <= 0 or !isMimeName(wide[0..@intCast(n)])) break :registered null;
+            const name = try alloc.alloc(u8, @intCast(n));
+            for (name, wide[0..@intCast(n)]) |*b, unit| b.* = @intCast(unit);
+            if (formatOf(name) != null or std.mem.eql(u8, name, "text/uri-list")) break :registered null;
+            break :registered .{ .format = format, .mime = name, .held = .other };
+        },
+        else => null,
+    };
+}
+
+/// Whether `name` is a MIME type, `type/subtype`, each a restricted-name
+/// (RFC 6838 section 4.2): ASCII, with no space to split the listing,
+/// which joins types with spaces.
+fn isMimeName(name: []const u16) bool {
+    const slash = std.mem.indexOfScalar(u16, name, '/') orelse return false;
+    return isRestrictedName(name[0..slash]) and isRestrictedName(name[slash + 1 ..]);
+}
+
+fn isRestrictedName(name: []const u16) bool {
+    if (name.len == 0 or name.len > 127) return false;
+    for (name, 0..) |unit, i| {
+        if (unit > 0x7F) return false;
+        const c: u8 = @intCast(unit);
+        if (std.ascii.isAlphanumeric(c)) continue;
+        if (i == 0 or std.mem.indexOfScalar(u8, "!#$&-^_.+", c) == null) return false;
+    }
+    return true;
+}
+
+/// Whether a read of `o` serves `mime`: by name, and any name the core
+/// treats as text for the text.
+fn serves(o: Offered, mime: []const u8) bool {
+    return std.mem.eql(u8, o.mime, mime) or (o.held == .text and terminal.clipboard.isTextMime(mime));
+}
+
+/// What `readClipboard` found.
+pub const Found = struct {
+    contents_buf: [max_read_mimes]terminal.clipboard.Content = undefined,
+    contents_len: usize = 0,
+    available_buf: [max_listing_mimes][]const u8 = undefined,
+    available_len: usize = 0,
+
+    /// Each type asked for that the clipboard holds, once for each
+    /// format, in the order asked, under the name it is served as. The
+    /// core serves each type asked for from these, a text to every name
+    /// it treats as text.
+    pub fn contents(self: *const Found) []const terminal.clipboard.Content {
+        return self.contents_buf[0..self.contents_len];
+    }
+
+    /// The listing, when asked for.
+    pub fn available(self: *const Found) []const []const u8 {
+        return self.available_buf[0..self.available_len];
+    }
+
+    fn addListed(self: *Found, mime: []const u8) void {
+        if (self.available_len == self.available_buf.len) return;
+        for (self.available()) |m| if (std.mem.eql(u8, m, mime)) return;
+        self.available_buf[self.available_len] = mime;
+        self.available_len += 1;
+    }
+};
+
+const max_read_mimes = terminal.kitty.clipboard.max_read_mimes;
+const max_listing_mimes = terminal.kitty.clipboard.max_listing_mimes;
+
+/// Read the clipboard's representations of `mimes`, the first
+/// `max_read_mimes` of them, and its listing if `list`, in one opening of
+/// the clipboard, which is closed before this returns: it is a lock for
+/// the whole session, and no prompt may hold it. What is read is copied
+/// into `alloc`, an arena the caller frees.
+///
+/// The listing names each type once, `text/plain` first as macOS lists
+/// it, then the rest in the order the clipboard enumerates them, which is
+/// the order they were placed, each synthesized format after its source
+/// (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumclipboardformats);
+/// at most `max_listing_mimes`, as GTK lists them. It reads no data.
+///
+/// A type the clipboard does not hold is left out, and so is one whose
+/// data is not what its type says or is larger than `readCap`, logged: a
+/// program learns a type is unavailable by its absence. Fails only when
+/// the clipboard cannot be opened, or memory runs out.
+pub fn readClipboard(
+    alloc: Allocator,
+    hwnd: win32.HWND,
+    mimes: []const []const u8,
+    list: bool,
+) (Allocator.Error || App.Error)!Found {
+    var found: Found = .{};
+    const asked = mimes[0..@min(mimes.len, max_read_mimes)];
+    var wanted: [max_read_mimes]?Offered = @splat(null);
+
+    // The formats this runtime writes are known by id. Their names are
+    // fixed, so registering them, as every program that writes them does,
+    // registers nothing new.
+    var known: std.EnumArray(Registered, ?win32.UINT) = .initUndefined();
+    for (std.enums.values(Registered)) |which| known.set(which, registeredFormat(which));
+
+    if (!win32.OpenClipboard(hwnd).toBool()) {
+        log.warn("OpenClipboard failed for a read err={}", .{win32.GetLastError()});
+        return App.Error.Win32CallFailed;
+    }
+    defer _ = win32.CloseClipboard();
+
+    if (list and win32.IsClipboardFormatAvailable(win32.CF_UNICODETEXT).toBool()) found.addListed("text/plain");
+    var format: win32.UINT = 0;
+    while (true) {
+        // GetClipboardFormatNameW fails for the predefined formats, so the
+        // error left from it is not EnumClipboardFormats'.
+        win32.SetLastError(.SUCCESS);
+        format = win32.EnumClipboardFormats(format);
+        if (format == 0) {
+            // Zero with ERROR_SUCCESS is the end of the formats.
+            const err = win32.GetLastError();
+            if (err != .SUCCESS) log.warn("EnumClipboardFormats failed err={}", .{err});
+            break;
+        }
+        const o = (try offered(alloc, format, &known)) orelse continue;
+        if (list) found.addListed(o.mime);
+        for (asked, wanted[0..asked.len]) |mime, *w| {
+            if (w.* == null and serves(o, mime)) w.* = o;
+        }
+    }
+
+    next: for (wanted[0..asked.len], 0..) |w, i| {
+        const o = w orelse continue;
+        for (wanted[0..i]) |before| if (before) |b| if (b.format == o.format) continue :next;
+        const data = readOffered(alloc, o) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => |e| {
+                log.info("clipboard type left out of a read mime={f} err={}", .{ std.zig.fmtString(o.mime), e });
+                continue;
+            },
+        };
+        found.contents_buf[found.contents_len] = .{ .mime = o.mime, .data = data };
+        found.contents_len += 1;
+    }
+    return found;
+}
+
+/// Why a type the clipboard holds is not read.
+const ReadOneError = Allocator.Error || DibError || error{
+    /// GetClipboardData or GlobalLock gave nothing: an owner that
+    /// renders on request can fail to.
+    NoData,
+    /// Larger than `readCap`.
+    TooLarge,
+    /// "PNG" that is not a PNG's chunks.
+    NotPng,
+    /// CF_HTML with neither its fragment's offsets nor its document's.
+    NotCfHtml,
+    /// A file list with no path a URI can name.
+    NoFiles,
+};
+
+/// The data of `o` as its MIME type has it, copied into `alloc`. The
+/// clipboard must be open.
+fn readOffered(alloc: Allocator, o: Offered) ReadOneError![]const u8 {
+    const handle = win32.GetClipboardData(o.format) orelse return error.NoData;
+    if (o.held == .files) return uriList(alloc, @ptrCast(handle));
+    const raw = win32.GlobalLock(handle) orelse return error.NoData;
+    defer _ = win32.GlobalUnlock(handle);
+
+    // Another process wrote this block, so only its size bounds it, and
+    // that can be more than was written: "The size of a memory block may
+    // be larger than the size requested"
+    // (https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-globalsize).
+    const size = win32.GlobalSize(handle);
+    if (o.held == .text) {
+        const units: [*]const u16 = @ptrCast(@alignCast(raw));
+        return textOf(alloc, units[0 .. size / @sizeOf(u16)]);
+    }
+    const bytes: [*]const u8 = @ptrCast(raw);
+    const block = bytes[0..size];
+    const data: []const u8 = switch (o.held) {
+        .text, .files => unreachable,
+        .html => try htmlOf(block),
+        .png => try pngOf(block),
+        .dib => return bmpOfDib(alloc, block),
+        // RTF is text, which ends at its NUL (writeClipboard puts one
+        // after it). An opaque type is as GlobalSize gives it.
+        .rtf => untilNul(block),
+        .other => block,
+    };
+    if (data.len > readCap()) return error.TooLarge;
+    return try alloc.dupe(u8, data);
+}
+
+fn untilNul(block: []const u8) []const u8 {
+    return block[0 .. std.mem.indexOfScalar(u8, block, 0) orelse block.len];
+}
+
+/// UTF-8 for a CF_UNICODETEXT block (`utf8FromClipboard`), at most
+/// `readCap` bytes of it.
+fn textOf(alloc: Allocator, block: []const u16) (Allocator.Error || error{TooLarge})![]const u8 {
+    const units = block[0 .. std.mem.indexOfScalar(u16, block, 0) orelse block.len];
+    // Each unit is at least a byte of UTF-8, so text of more units than
+    // the cap is refused before it is converted.
+    if (units.len > readCap()) return error.TooLarge;
+    const text = try utf8FromWide(alloc, units);
+    if (text.len > readCap()) return error.TooLarge;
+    return text;
+}
+
+/// The HTML in CF_HTML `block`: its fragment, as a Kitty write puts it
+/// there, else its document, StartHTML to EndHTML, when the fragment's
+/// offsets are missing or out of the data. The data is UTF-8 and ends at
+/// its NUL.
+fn htmlOf(block: []const u8) error{NotCfHtml}![]const u8 {
+    const data = untilNul(block);
+    if (cfHtmlFragment(data)) |fragment| return fragment;
+    const start = cfHtmlOffset(data, "StartHTML:") orelse return error.NotCfHtml;
+    const end = cfHtmlOffset(data, "EndHTML:") orelse return error.NotCfHtml;
+    if (start > end or end > data.len) return error.NotCfHtml;
+    return data[start..end];
+}
+
+/// The PNG `block` starts with, to the end of its IEND chunk: each chunk
+/// is a length, a type, that many bytes and a CRC
+/// (https://www.w3.org/TR/png-3/#5Chunk-layout).
+fn pngOf(block: []const u8) error{NotPng}![]const u8 {
+    const signature = "\x89PNG\r\n\x1a\n";
+    if (!std.mem.startsWith(u8, block, signature)) return error.NotPng;
+    var at: usize = signature.len;
+    while (block.len - at >= 12) {
+        const len = std.mem.readInt(u32, block[at..][0..4], .big);
+        const end = std.math.add(usize, at + 12, len) catch return error.NotPng;
+        if (end > block.len) return error.NotPng;
+        if (std.mem.eql(u8, block[at + 4 ..][0..4], "IEND")) return block[0..end];
+        at = end;
+    }
+    return error.NotPng;
+}
+
+/// A BMP file of the DIB that `block`, a CF_DIB or CF_DIBV5, holds: the
+/// BITMAPFILEHEADER, then the DIB as long as its header says it is,
+/// without what GlobalSize gives past it. A DIB has its bits right after
+/// its table, which is where bfOffBits points.
+fn bmpOfDib(alloc: Allocator, block: []const u8) (Allocator.Error || DibError || error{TooLarge})![]const u8 {
+    const layout = try dibLayout(block);
+    const bits_at = layout.header_len + layout.table_len;
+    const dib_len = std.math.add(usize, bits_at, layout.bits_len) catch return error.TooLong;
+    if (dib_len > block.len) return error.BitsCutShort;
+    const len = bmp_header_len + dib_len;
+    if (len > readCap()) return error.TooLarge;
+    const out = try alloc.alloc(u8, len);
+    @memcpy(out[0..2], "BM");
+    // The cap is far under 4 GiB, so both fit.
+    std.mem.writeInt(u32, out[2..6], @intCast(len), .little);
+    @memset(out[6..10], 0);
+    std.mem.writeInt(u32, out[10..14], @intCast(bmp_header_len + bits_at), .little);
+    @memcpy(out[bmp_header_len..], block[0..dib_len]);
+    return out;
+}
+
+/// The files of CF_HDROP `hdrop` as text/uri-list (RFC 2483): a `file:`
+/// URI for each path, each line ended by CRLF, as macOS serves copied
+/// files (`ghosttyData` in
+/// macos/Sources/Helpers/Extensions/NSPasteboard+Extension.swift). A
+/// path a URI cannot name is left out and logged.
+fn uriList(alloc: Allocator, hdrop: win32.HDROP) (Allocator.Error || error{ NoFiles, TooLarge })![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var paths: drop.Paths = .init(hdrop);
+    defer paths.deinit(alloc);
+    while (try paths.next(alloc)) |path| {
+        defer alloc.free(path);
+        appendFileUri(alloc, &out, path) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NotAbsolute => {
+                log.info("a file list's path left out of text/uri-list err={}", .{err});
+                continue;
+            },
+        };
+        try out.appendSlice(alloc, "\r\n");
+        if (out.items.len > readCap()) return error.TooLarge;
+    }
+    if (out.items.len == 0) return error.NoFiles;
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Append the `file:` URI of `path`, an absolute Windows path (RFC 8089
+/// appendix E.2 and E.3): `file:///C:/a%20b` for a drive's, and
+/// `file://host/share/a` for a UNC path's, either also with the `\\?\`
+/// prefix of a long path. Each byte but the unreserved ones (RFC 3986
+/// section 2.3), a separator and the drive's colon is percent-escaped.
+fn appendFileUri(alloc: Allocator, out: *std.ArrayList(u8), path: []const u8) (Allocator.Error || error{NotAbsolute})!void {
+    const long = "\\\\?\\";
+    const long_unc = long ++ "UNC\\";
+    var rest = path;
+    var unc = false;
+    if (std.mem.startsWith(u8, rest, long_unc)) {
+        rest = rest[long_unc.len..];
+        unc = true;
+    } else if (std.mem.startsWith(u8, rest, long)) {
+        rest = rest[long.len..];
+    } else if (std.mem.startsWith(u8, rest, "\\\\")) {
+        rest = rest[2..];
+        unc = true;
+    }
+
+    if (unc) {
+        if (rest.len == 0 or rest[0] == '\\') return error.NotAbsolute;
+        try out.appendSlice(alloc, "file://");
+        return appendEscaped(alloc, out, rest);
+    }
+    if (rest.len < 3 or !std.ascii.isAlphabetic(rest[0]) or rest[1] != ':' or rest[2] != '\\')
+        return error.NotAbsolute;
+    try out.appendSlice(alloc, "file:///");
+    try out.appendSlice(alloc, rest[0..2]);
+    try appendEscaped(alloc, out, rest[2..]);
+}
+
+fn appendEscaped(alloc: Allocator, out: *std.ArrayList(u8), part: []const u8) Allocator.Error!void {
+    const hex = "0123456789ABCDEF";
+    for (part) |b| switch (b) {
+        '\\' => try out.append(alloc, '/'),
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~', '/' => try out.append(alloc, b),
+        else => try out.appendSlice(alloc, &.{ '%', hex[b >> 4], hex[b & 0xF] }),
+    };
 }
 
 /// UTF-8 for a CF_UNICODETEXT block. The text ends at the first NUL, or at
@@ -830,6 +1243,104 @@ pub fn clipboardReadPrompt(state: apprt.ClipboardRequestType) win32.LPCWSTR {
         // Writes go to setClipboard and lists never need consent.
         .osc_52_write, .kitty_write, .list => unreachable,
     };
+}
+
+/// For tests: a representation `testPut` puts on the clipboard as it is.
+pub const TestPut = struct { format: win32.UINT, data: []const u8 };
+
+/// For tests: replace the clipboard's contents with `puts`, in order, each
+/// as it is, then the files `names` as CF_HDROP if there are any.
+pub fn testPut(hwnd: win32.HWND, puts: []const TestPut, names: []const []const u16) !void {
+    if (!win32.OpenClipboard(hwnd).toBool()) return error.TestUnexpectedResult;
+    defer _ = win32.CloseClipboard();
+    if (!win32.EmptyClipboard().toBool()) return error.TestUnexpectedResult;
+    for (puts) |p| {
+        const mem = win32.GlobalAlloc(win32.GMEM_MOVEABLE, @max(p.data.len, 1)) orelse
+            return error.TestUnexpectedResult;
+        errdefer _ = win32.GlobalFree(mem);
+        const dst: [*]u8 = @ptrCast(win32.GlobalLock(mem) orelse return error.TestUnexpectedResult);
+        @memcpy(dst[0..p.data.len], p.data);
+        _ = win32.GlobalUnlock(mem);
+        if (win32.SetClipboardData(p.format, mem) == null) return error.TestUnexpectedResult;
+    }
+    if (names.len != 0) {
+        const hdrop = try drop.testDrop(names);
+        errdefer _ = win32.GlobalFree(@ptrCast(hdrop));
+        if (win32.SetClipboardData(win32.CF_HDROP, @ptrCast(hdrop)) == null) return error.TestUnexpectedResult;
+    }
+}
+
+/// For tests: the id of the registered format `name`, registering it. A
+/// name stays registered until the session ends, so tests register only
+/// fixed names.
+fn testRegister(name: [:0]const u16) !win32.UINT {
+    const format = win32.RegisterClipboardFormatW(name);
+    return if (format == 0) error.TestUnexpectedResult else format;
+}
+
+/// For tests: whether `name` is registered, found without registering it:
+/// GetClipboardFormatNameW names every registered id, 0xC000 to 0xFFFF,
+/// whether the clipboard holds it or not.
+fn testRegistered(name: []const u8) bool {
+    var wide: [256]u16 = undefined;
+    for (0xC000..0x10000) |id| {
+        const n = win32.GetClipboardFormatNameW(@intCast(id), &wide, wide.len);
+        if (n <= 0 or @as(usize, @intCast(n)) != name.len) continue;
+        for (wide[0..@intCast(n)], name) |w, c| {
+            if (w != c) break;
+        } else return true;
+    }
+    return false;
+}
+
+/// For tests: another thread holding the clipboard open, as another
+/// program can. OpenClipboard "fails if another window has the clipboard
+/// open" (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard).
+pub const TestHolder = struct {
+    const State = enum(u8) { start, open, refused, release };
+    var state: std.atomic.Value(State) = .init(.start);
+    thread: std.Thread,
+
+    fn hold() void {
+        if (!win32.OpenClipboard(null).toBool()) return state.store(.refused, .release);
+        defer _ = win32.CloseClipboard();
+        state.store(.open, .release);
+        while (state.load(.acquire) != .release) win32.Sleep(1);
+    }
+
+    /// The clipboard, held open by another thread until `release`.
+    pub fn start() !TestHolder {
+        state.store(.start, .release);
+        const thread = try std.Thread.spawn(.{}, hold, .{});
+        while (state.load(.acquire) == .start) win32.Sleep(1);
+        if (state.load(.acquire) != .open) {
+            thread.join();
+            return error.TestUnexpectedResult;
+        }
+        return .{ .thread = thread };
+    }
+
+    pub fn release(self: TestHolder) void {
+        state.store(.release, .release);
+        self.thread.join();
+    }
+};
+
+/// For tests: `found` served `want`, in order.
+fn expectServed(found: *const Found, want: []const terminal.clipboard.Content) !void {
+    errdefer for (found.contents()) |c| std.debug.print("served mime={s} data={f}\n", .{ c.mime, std.zig.fmtString(c.data) });
+    try std.testing.expectEqual(want.len, found.contents().len);
+    for (want, found.contents()) |w, c| {
+        try std.testing.expectEqualStrings(w.mime, c.mime);
+        try std.testing.expectEqualSlices(u8, w.data, c.data);
+    }
+}
+
+/// For tests: `found` listed `want`, in order.
+fn expectListed(found: *const Found, want: []const []const u8) !void {
+    errdefer for (found.available()) |m| std.debug.print("listed {s}\n", .{m});
+    try std.testing.expectEqual(want.len, found.available().len);
+    for (want, found.available()) |w, m| try std.testing.expectEqualStrings(w, m);
 }
 
 test "win32: clipboard reads are not worded as pastes and default to Cancel" {
@@ -922,14 +1433,14 @@ pub fn expectClipboard(hwnd: win32.HWND, text: ?[]const u8, fragment: ?[]const u
 
 /// For tests: put back the text the clipboard held when `save` ran. Other
 /// formats are lost, which is acceptable for a test.
-const TestSaved = struct {
+pub const TestSaved = struct {
     text: ?[]u8,
 
-    fn save(hwnd: win32.HWND) !TestSaved {
+    pub fn save(hwnd: win32.HWND) !TestSaved {
         return .{ .text = try readClipboardText(std.testing.allocator, hwnd) };
     }
 
-    fn restore(self: TestSaved, hwnd: win32.HWND) void {
+    pub fn restore(self: TestSaved, hwnd: win32.HWND) void {
         const text = self.text orelse return;
         writeClipboard(std.testing.allocator, hwnd, .text(text)) catch {};
         std.testing.allocator.free(text);
@@ -1419,26 +1930,9 @@ test "win32: a clipboard another thread holds open fails the write, which frees 
     defer saved.restore(hwnd);
     try writeClipboard(alloc, hwnd, .text("kept"));
 
-    // OpenClipboard "fails if another window has the clipboard open"
-    // (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard).
-    const Holder = struct {
-        const State = enum(u8) { start, open, refused, release };
-        var state: std.atomic.Value(State) = .init(.start);
-        fn hold() void {
-            if (!win32.OpenClipboard(null).toBool()) return state.store(.refused, .release);
-            defer _ = win32.CloseClipboard();
-            state.store(.open, .release);
-            while (state.load(.acquire) != .release) win32.Sleep(1);
-        }
-    };
-    Holder.state.store(.start, .release);
-    const thread = try std.Thread.spawn(.{}, Holder.hold, .{});
     {
-        defer thread.join();
-        defer Holder.state.store(.release, .release);
-        while (Holder.state.load(.acquire) == .start) win32.Sleep(1);
-        try std.testing.expectEqual(.open, Holder.state.load(.acquire));
-
+        const holder = try TestHolder.start();
+        defer holder.release();
         try std.testing.expectError(
             App.Error.Win32CallFailed,
             writeClipboard(alloc, hwnd, .of(&.{
@@ -1624,6 +2118,39 @@ test "win32: a BMP is written as the DIB inside it, its bits after its table" {
         try writeClipboard(alloc, hwnd, .of(&.{.{ .mime = "image/bmp", .data = file }}, false));
         try std.testing.expect(try testHolds(hwnd, bmp.clipboardFormat(), dib));
         try std.testing.expectEqual(0, test_held);
+
+        // Read back, the DIB the clipboard holds after a file header whose
+        // offset finds the bits written: the very file written, when it
+        // left no gap and its header was not widened.
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const found = try readClipboard(arena.allocator(), hwnd, &.{"image/bmp"}, false);
+        try std.testing.expectEqual(1, found.contents().len);
+        const read = found.contents()[0].data;
+        try std.testing.expectEqualStrings("BM", read[0..2]);
+        try std.testing.expectEqual(read.len, std.mem.readInt(u32, read[2..6], .little));
+        try std.testing.expectEqualSlices(u8, dib, read[14..]);
+        try std.testing.expectEqualSlices(u8, (try dibOfBmp(file)).bits, (try dibOfBmp(read)).bits);
+        if (bmp.gap == 0 and bmp.header != 108) try std.testing.expectEqualSlices(u8, file, read);
+    }
+
+    // A DIB block longer than its DIB, as GlobalSize can give one, reads as
+    // the DIB alone.
+    {
+        const bmp: TestBmp = .{ .bpp = 8, .clr_used = 2 };
+        var bmp_buf: [2048]u8 = undefined;
+        var dib_buf: [2048]u8 = undefined;
+        const file = bmp.file(&bmp_buf);
+        const dib = bmp.dib(file, &dib_buf);
+        var long_buf: [2048]u8 = undefined;
+        const long = long_buf[0 .. dib.len + 5];
+        @memcpy(long[0..dib.len], dib);
+        @memcpy(long[dib.len..], "junk!");
+        try testPut(hwnd, &.{.{ .format = win32.CF_DIB, .data = long }}, &.{});
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const found = try readClipboard(arena.allocator(), hwnd, &.{"image/bmp"}, false);
+        try expectServed(&found, &.{.{ .mime = "image/bmp", .data = file }});
     }
 
     // Refused: each a well-formed file with one thing wrong, refused for
@@ -1742,5 +2269,308 @@ test "win32: utf-8 becomes wide text with invalid sequences replaced" {
         defer alloc.free(got);
         try std.testing.expectEqualSlices(u16, c.want, got);
         try std.testing.expectEqual(0, got[got.len]);
+    }
+}
+
+test "win32: a read serves each type the clipboard holds once, in the order asked, and lists each once, the text first" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+
+    try writeClipboard(alloc, hwnd, .of(&.{
+        .{ .mime = "text/html", .data = "<b>h</b>" },
+        .{ .mime = "image/png", .data = test_png },
+        .{ .mime = "text/rtf", .data = "{\\rtf1 r}" },
+        .{ .mime = "text/plain", .data = "t\u{e9}" },
+    }, false));
+
+    // Two names for the text, which is one format and read once, and a
+    // type the clipboard does not hold.
+    const first = try readClipboard(arena.allocator(), hwnd, &.{ "image/png", "UTF8_STRING", "image/gif", "text/plain" }, true);
+    try expectServed(&first, &.{
+        .{ .mime = "image/png", .data = test_png },
+        .{ .mime = "text/plain", .data = "t\u{e9}" },
+    });
+    // CF_DIBV5 and the CF_DIB Windows makes of it are one type.
+    try expectListed(&first, &.{ "text/plain", "text/html", "image/png", "image/bmp", "text/rtf" });
+
+    // The HTML's fragment, the RTF as far as its NUL, and the DIB as a BMP
+    // file; no listing unasked.
+    const second = try readClipboard(arena.allocator(), hwnd, &.{ "text/rtf", "image/bmp", "text/html" }, false);
+    try std.testing.expectEqual(0, second.available().len);
+    const dibv5 = (try testData(alloc, hwnd, win32.CF_DIBV5)).?;
+    defer alloc.free(dibv5);
+    const dib = dibv5[0 .. @sizeOf(win32.BITMAPV5HEADER) + 2 * 2 * 4];
+    var bmp_buf: [256]u8 = undefined;
+    const bmp = bmp_buf[0 .. 14 + dib.len];
+    @memcpy(bmp[0..2], "BM");
+    std.mem.writeInt(u32, bmp[2..6], @intCast(bmp.len), .little);
+    @memset(bmp[6..10], 0);
+    std.mem.writeInt(u32, bmp[10..14], 14 + @sizeOf(win32.BITMAPV5HEADER), .little);
+    @memcpy(bmp[14..], dib);
+    try expectServed(&second, &.{
+        .{ .mime = "text/rtf", .data = "{\\rtf1 r}" },
+        .{ .mime = "image/bmp", .data = bmp },
+        .{ .mime = "text/html", .data = "<b>h</b>" },
+    });
+}
+
+test "win32: a read lists only MIME types, none twice, the formats it maps from no other, at most sixteen" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    const u = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    var many: [20]TestPut = undefined;
+    inline for (&many, 0..) |*p, i| p.* = .{
+        .format = try testRegister(u(std.fmt.comptimePrint("application/x-kc-{d:0>2}", .{i}))),
+        .data = "x",
+    };
+    // Not MIME types: a space, a letter outside ASCII, no slash, and a
+    // first character a type cannot start with. Then names of types the
+    // read makes from other formats, registered by another program.
+    const others = [_]TestPut{
+        .{ .format = try testRegister(u("Ghostty Test Format")), .data = "x" },
+        .{ .format = try testRegister(u("application/x-kc\u{e7}")), .data = "x" },
+        .{ .format = try testRegister(u("x-kc")), .data = "x" },
+        .{ .format = try testRegister(u("-x/kc")), .data = "x" },
+        .{ .format = try testRegister(u("image/png")), .data = test_png },
+        .{ .format = try testRegister(u("text/plain")), .data = "x" },
+        .{ .format = try testRegister(u("text/uri-list")), .data = "x" },
+    };
+    const text: TestPut = .{ .format = win32.CF_UNICODETEXT, .data = std.mem.sliceAsBytes(u("t")) };
+
+    // The text first, though placed last, then the first fifteen others.
+    try testPut(hwnd, &(others ++ many ++ [_]TestPut{text}), &.{});
+    const capped = try readClipboard(arena.allocator(), hwnd, &.{}, true);
+    var want: [16][]const u8 = undefined;
+    want[0] = "text/plain";
+    inline for (want[1..], 0..) |*w, i| w.* = std.fmt.comptimePrint("application/x-kc-{d:0>2}", .{i});
+    try expectListed(&capped, &want);
+
+    // A registered MIME type is read as it is, as long as GlobalSize says;
+    // those the read makes from other formats are not read from these.
+    try testPut(hwnd, &(others ++ many[0..1].*), &.{});
+    const found = try readClipboard(arena.allocator(), hwnd, &.{ "image/png", "application/x-kc-00", "text/plain", "text/uri-list" }, true);
+    try expectListed(&found, &.{"application/x-kc-00"});
+    try std.testing.expectEqual(1, found.contents().len);
+    try std.testing.expectEqualStrings("application/x-kc-00", found.contents()[0].mime);
+    try std.testing.expect(std.mem.startsWith(u8, found.contents()[0].data, "x"));
+}
+
+test "win32: a read registers no name a program asks for" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+
+    // A name no run has asked for, so none can have registered it.
+    var counter: i64 = 0;
+    _ = win32.QueryPerformanceCounter(&counter);
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "application/x-kc-unregistered-{d}", .{counter});
+
+    // The check finds a name registered and not on the clipboard.
+    _ = try testRegister(std.unicode.utf8ToUtf16LeStringLiteral("application/x-kc-00"));
+    try writeClipboard(alloc, hwnd, .text("t"));
+    try std.testing.expect(testRegistered("application/x-kc-00"));
+
+    try std.testing.expect(!testRegistered(name));
+    const found = try readClipboard(arena.allocator(), hwnd, &.{ name, "text/plain" }, true);
+    try std.testing.expect(!testRegistered(name));
+    try expectServed(&found, &.{.{ .mime = "text/plain", .data = "t" }});
+}
+
+test "win32: a read of a clipboard another thread holds open fails" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    try writeClipboard(alloc, hwnd, .text("t"));
+
+    {
+        const holder = try TestHolder.start();
+        defer holder.release();
+        try std.testing.expectError(
+            App.Error.Win32CallFailed,
+            readClipboard(arena.allocator(), hwnd, &.{"text/plain"}, true),
+        );
+    }
+    const found = try readClipboard(arena.allocator(), hwnd, &.{"text/plain"}, true);
+    try expectServed(&found, &.{.{ .mime = "text/plain", .data = "t" }});
+}
+
+test "win32: a read leaves out a type larger than a program may write, and still lists it" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    defer test_read_cap = max_write_size;
+
+    const Case = struct { cap: usize, mime: [:0]const u8, data: [:0]const u8, kept: bool };
+    var bmp_buf: [2048]u8 = undefined;
+    const bmp = (TestBmp{}).file(&bmp_buf);
+    for ([_]Case{
+        // Text by its UTF-8: four bytes of four units, or of two.
+        .{ .cap = 4, .mime = "text/plain", .data = "abcd", .kept = true },
+        .{ .cap = 4, .mime = "text/plain", .data = "abcde", .kept = false },
+        .{ .cap = 4, .mime = "text/plain", .data = "\u{e9}\u{e9}", .kept = true },
+        .{ .cap = 4, .mime = "text/plain", .data = "\u{e9}\u{e9}\u{e9}", .kept = false },
+        .{ .cap = test_png.len, .mime = "image/png", .data = test_png, .kept = true },
+        .{ .cap = test_png.len - 1, .mime = "image/png", .data = test_png, .kept = false },
+        // A BMP by its file, header and all.
+        .{ .cap = bmp.len, .mime = "image/bmp", .data = bmp, .kept = true },
+        .{ .cap = bmp.len - 1, .mime = "image/bmp", .data = bmp, .kept = false },
+    }) |c| {
+        errdefer std.debug.print("case={any}\n", .{c});
+        test_read_cap = max_write_size;
+        try writeClipboard(alloc, hwnd, .of(&.{.{ .mime = c.mime, .data = c.data }}, false));
+        test_read_cap = c.cap;
+        const found = try readClipboard(arena.allocator(), hwnd, &.{c.mime}, true);
+        try std.testing.expectEqualStrings(c.mime, found.available()[0]);
+        if (c.kept) {
+            try expectServed(&found, &.{.{ .mime = c.mime, .data = c.data }});
+        } else try std.testing.expectEqual(0, found.contents().len);
+    }
+
+    // A file list by its URIs: one line of 14 bytes.
+    for ([_]struct { usize, bool }{ .{ 14, true }, .{ 13, false } }) |c| {
+        test_read_cap = max_write_size;
+        try testPut(hwnd, &.{}, &.{std.unicode.utf8ToUtf16LeStringLiteral("C:\\a")});
+        test_read_cap = c[0];
+        const found = try readClipboard(arena.allocator(), hwnd, &.{"text/uri-list"}, false);
+        if (c[1]) {
+            try expectServed(&found, &.{.{ .mime = "text/uri-list", .data = "file:///C:/a\r\n" }});
+        } else try std.testing.expectEqual(0, found.contents().len);
+    }
+}
+
+test "win32: a file list reads as file URIs, escaped, each line ended by CRLF" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    const u = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    // An unpaired surrogate, which NTFS allows in a name; paths that are
+    // not absolute, or name no host.
+    const bad = [_]u16{ 'C', ':', '\\', 0xD800 };
+    try testPut(hwnd, &.{}, &.{
+        u("C:\\a b\\\u{fc}#%~.txt"),
+        &bad,
+        u("\\\\srv\\share\\x y"),
+        u("relative\\x"),
+        u("\\\\?\\C:\\long"),
+        u("\\\\\\x"),
+        u("\\\\?\\UNC\\srv\\s\\z"),
+        u("C:x"),
+    });
+    const found = try readClipboard(arena.allocator(), hwnd, &.{"text/uri-list"}, true);
+    try expectListed(&found, &.{"text/uri-list"});
+    try expectServed(&found, &.{.{
+        .mime = "text/uri-list",
+        .data = "file:///C:/a%20b/%C3%BC%23%25~.txt\r\n" ++
+            "file://srv/share/x%20y\r\n" ++
+            "file:///C:/long\r\n" ++
+            "file://srv/s/z\r\n",
+    }});
+
+    // None it can name: listed, and not served.
+    try testPut(hwnd, &.{}, &.{ &bad, u("relative") });
+    const none = try readClipboard(arena.allocator(), hwnd, &.{"text/uri-list"}, true);
+    try expectListed(&none, &.{"text/uri-list"});
+    try std.testing.expectEqual(0, none.contents().len);
+}
+
+test "win32: a read of HTML takes its fragment, else its document, as far as its NUL" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    const html = registeredFormat(.html).?;
+
+    var written_buf: [256]u8 = undefined;
+    const written = written_buf[0 .. cfHtmlLen(8).? + 5];
+    cfHtml(written[0 .. written.len - 5], "<i>f</i>");
+    @memcpy(written[written.len - 5 ..], "\x00<x>y");
+
+    const head = "Version:0.9\r\nStartHTML:{d:0>10}\r\nEndHTML:{d:0>10}\r\n";
+    const head_len = std.fmt.comptimePrint(head, .{ 0, 0 }).len;
+    const doc = "<p>d</p>";
+    const no_fragment = std.fmt.comptimePrint(head, .{ head_len, head_len + doc.len }) ++ doc;
+    const frag_head = head ++ "StartFragment:{d:0>10}\r\nEndFragment:{d:0>10}\r\n";
+    const frag_len = std.fmt.comptimePrint(frag_head, .{ 0, 0, 0, 0 }).len;
+    const outside = std.fmt.comptimePrint(frag_head, .{ frag_len, frag_len + doc.len, frag_len, 999 }) ++ doc;
+    // A document whose end is past the NUL that ends the data.
+    const cut = std.fmt.comptimePrint(head, .{ head_len, head_len + doc.len }) ++ "<p>\x00d</p>";
+
+    for ([_]struct { []const u8, ?[]const u8 }{
+        .{ written, "<i>f</i>" },
+        .{ no_fragment, doc },
+        .{ outside, doc },
+        .{ cut, null },
+        .{ "Version:0.9\r\n<b>x</b>", null },
+    }) |c| {
+        errdefer std.debug.print("html={f}\n", .{std.zig.fmtString(c[0])});
+        try testPut(hwnd, &.{.{ .format = html, .data = c[0] }}, &.{});
+        const found = try readClipboard(arena.allocator(), hwnd, &.{"text/html"}, true);
+        try expectListed(&found, &.{"text/html"});
+        if (c[1]) |want| {
+            try expectServed(&found, &.{.{ .mime = "text/html", .data = want }});
+        } else try std.testing.expectEqual(0, found.contents().len);
+    }
+}
+
+test "win32: a read of PNG ends at its IEND chunk, and is left out if it is not a PNG's chunks" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    const png = registeredFormat(.png).?;
+
+    const iend = test_png.len - 12;
+    var huge: [test_png.len]u8 = test_png.*;
+    std.mem.writeInt(u32, huge[iend..][0..4], 0xFFFFFFFF, .big);
+    for ([_]struct { []const u8, bool }{
+        .{ test_png ++ "junk", true },
+        .{ test_png, true },
+        .{ "not a png", false },
+        .{ test_png[0 .. test_png.len - 1], false },
+        .{ test_png[0..iend], false },
+        .{ &huge, false },
+    }) |c| {
+        errdefer std.debug.print("png={f}\n", .{std.zig.fmtString(c[0])});
+        try testPut(hwnd, &.{.{ .format = png, .data = c[0] }}, &.{});
+        const found = try readClipboard(arena.allocator(), hwnd, &.{"image/png"}, true);
+        try expectListed(&found, &.{"image/png"});
+        if (c[1]) {
+            try expectServed(&found, &.{.{ .mime = "image/png", .data = test_png }});
+        } else try std.testing.expectEqual(0, found.contents().len);
     }
 }

@@ -87,37 +87,15 @@ pub fn asks(shell: ?Shell, pasted: []const u8) bool {
 
 /// The text a drop of the files in `hdrop` pastes for `shell`: each
 /// file's path quoted, in the drop's order, joined by spaces. Null when
-/// no path could be read. A name that is not valid UTF-16 (NTFS allows an
-/// unpaired surrogate) is left out and logged: as U+FFFD it would name
-/// another file, or none. The caller still owns `hdrop` and frees the
+/// no path could be read. The caller still owns `hdrop` and frees the
 /// result.
 pub fn text(alloc: Allocator, shell: ?Shell, hdrop: win32.HDROP) Allocator.Error!?[]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    var wide: std.ArrayList(u16) = .empty;
-    defer wide.deinit(alloc);
-
-    const count = win32.DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
-    for (0..count) |n| {
-        const i: win32.UINT = @intCast(n);
-        // The length without the NUL, which the buffer must also hold.
-        const len = win32.DragQueryFileW(hdrop, i, null, 0);
-        if (len == 0) continue;
-        try wide.resize(alloc, @as(usize, len) + 1);
-        if (win32.DragQueryFileW(hdrop, i, wide.items.ptr, len + 1) != len) {
-            log.warn("a dropped file's name could not be read index={d}", .{i});
-            continue;
-        }
-
-        const path = std.unicode.utf16LeToUtf8Alloc(alloc, wide.items[0..len]) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => |e| {
-                log.warn("a dropped file's name is not valid UTF-16, left out index={d} err={}", .{ i, e });
-                continue;
-            },
-        };
+    var paths: Paths = .init(hdrop);
+    defer paths.deinit(alloc);
+    while (try paths.next(alloc)) |path| {
         defer alloc.free(path);
-
         if (out.items.len != 0) try out.append(alloc, ' ');
         try appendQuoted(alloc, &out, shell, path);
     }
@@ -125,6 +103,49 @@ pub fn text(alloc: Allocator, shell: ?Shell, hdrop: win32.HDROP) Allocator.Error
     if (out.items.len == 0) return null;
     return try out.toOwnedSlice(alloc);
 }
+
+/// The paths of the files in `hdrop`, a drop's or the clipboard's
+/// CF_HDROP, as UTF-8, in its order. A name that is not valid UTF-16
+/// (NTFS allows an unpaired surrogate) is left out and logged: as U+FFFD
+/// it would name another file, or none. So is one that cannot be read.
+pub const Paths = struct {
+    hdrop: win32.HDROP,
+    count: win32.UINT,
+    index: win32.UINT = 0,
+    wide: std.ArrayList(u16) = .empty,
+
+    pub fn init(hdrop: win32.HDROP) Paths {
+        return .{ .hdrop = hdrop, .count = win32.DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0) };
+    }
+
+    pub fn deinit(self: *Paths, alloc: Allocator) void {
+        self.wide.deinit(alloc);
+    }
+
+    /// The next path, which the caller frees; null after the last.
+    pub fn next(self: *Paths, alloc: Allocator) Allocator.Error!?[]u8 {
+        while (self.index < self.count) {
+            const i = self.index;
+            self.index += 1;
+            // The length without the NUL, which the buffer must also hold.
+            const len = win32.DragQueryFileW(self.hdrop, i, null, 0);
+            if (len == 0) continue;
+            try self.wide.resize(alloc, @as(usize, len) + 1);
+            if (win32.DragQueryFileW(self.hdrop, i, self.wide.items.ptr, len + 1) != len) {
+                log.warn("a file list's name could not be read index={d}", .{i});
+                continue;
+            }
+            return std.unicode.utf16LeToUtf8Alloc(alloc, self.wide.items[0..len]) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => |e| {
+                    log.warn("a file list's name is not valid UTF-16, left out index={d} err={}", .{ i, e });
+                    continue;
+                },
+            };
+        }
+        return null;
+    }
+};
 
 /// Appends `path` to `out` written so that `shell` reads it back as one
 /// word that is `path` unchanged. A Win32 name cannot hold `"`, `*`, `?`,
