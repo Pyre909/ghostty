@@ -12044,6 +12044,34 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
     }
     try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
 
+    // A write of as many parts as the core commits, its types and then the
+    // aliases that name new ones, lists every one: the last, the one
+    // written as text, is there to pick. One more is denied unasked.
+    {
+        const max = terminal.kitty.clipboard.max_write_mimes + terminal.kitty.clipboard.max_write_aliases;
+        var names: [max + 1][24]u8 = undefined;
+        var parts: [max + 1]TestPart = undefined;
+        for (&parts, &names, 0..) |*part, *name, i| part.* = .{
+            .mime = std.fmt.bufPrint(name, "application/x-{d}", .{i}) catch unreachable,
+            .data = "x",
+        };
+        parts[max - 1] = .{ .mime = "text/plain", .data = "landed" };
+        P.pick = max - 1;
+        const req = try testKittyWriteOf(alloc, .standard, parts[0..max]);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+        try std.testing.expectEqual(max, P.first.count);
+        try P.picked.part.expect(W("text/plain (6 bytes)"));
+        try P.picked.preview.expect(W("landed"));
+        try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+
+        const boxes = P.boxes;
+        const denied = TestKittyCore.denied;
+        const more = try testKittyWriteOf(alloc, .standard, &parts);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = more }));
+        try std.testing.expectEqual(denied + 1, TestKittyCore.denied);
+        try std.testing.expectEqual(boxes, P.boxes);
+    }
+
     // An empty write, which clears the clipboard, shows the empty text it
     // writes.
     P.pick = null;

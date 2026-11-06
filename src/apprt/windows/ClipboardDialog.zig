@@ -88,8 +88,9 @@ pub var test_fail: if (builtin.is_test) bool else void = if (builtin.is_test) fa
 /// Ask whether the Kitty clipboard request `state` may go ahead, from the
 /// terminal `hwnd`, showing what it would read, `read`, or write. `dark`
 /// gives the title bar the frames' mode, as the title prompt's has
-/// (`TitleDialog.setDark`). Deny if the dialog cannot be made, which is
-/// logged: the program is told it was refused.
+/// (`TitleDialog.setDark`). Deny if the dialog cannot be made, or if a
+/// write has more parts than it holds (`writeParts`), each logged: the
+/// program is told it was refused.
 pub fn ask(
     app: *App,
     hwnd: ?win32.HWND,
@@ -102,7 +103,7 @@ pub fn ask(
         return .deny;
     }
 
-    var buf: [terminal.kitty.clipboard.max_write_mimes]Content = undefined;
+    var buf: [max_write_parts]Content = undefined;
     var self: Dialog = switch (state) {
         .kitty_read => |kitty| .{
             .alloc = app.core_app.alloc,
@@ -114,7 +115,10 @@ pub fn ask(
         .kitty_write => |kitty| .{
             .alloc = app.core_app.alloc,
             .request = .kitty_write,
-            .parts = writeParts(kitty.contents, &buf),
+            .parts = writeParts(kitty.contents, &buf) orelse {
+                log.warn("a Kitty clipboard write of {d} types, more than its prompt holds, is denied", .{kitty.contents.len});
+                return .deny;
+            },
             .can_remember = kitty.pw.len > 0,
             .dark = dark,
         },
@@ -148,18 +152,25 @@ pub fn ask(
     return self.answer;
 }
 
-/// What a write would write: what it carries, or for an empty write, which
-/// clears the clipboard, the empty text the core writes then
-/// (`Surface.completeClipboardRequest`). The core takes at most `buf.len`
-/// types in a write (`terminal.kitty.clipboard.max_write_mimes`).
-fn writeParts(contents: []const apprt.ClipboardContent, buf: []Content) []const Content {
+/// The most parts a write holds. The core commits each type a program
+/// sends, at most `max_write_mimes`, then each alias that names a new
+/// type, at most `max_write_aliases`, as a part of its own
+/// (src/terminal/kitty/clipboard_write.zig:25-26 and `WriteState.commit`).
+const max_write_parts = terminal.kitty.clipboard.max_write_mimes + terminal.kitty.clipboard.max_write_aliases;
+
+/// What a write would write: every part it carries, or for an empty write,
+/// which clears the clipboard, the empty text the core writes then
+/// (`Surface.completeClipboardRequest`). Null when there are more parts
+/// than `buf` holds, which the core never commits: a prompt that showed
+/// only some of them could hide the one that lands.
+fn writeParts(contents: []const apprt.ClipboardContent, buf: []Content) ?[]const Content {
     if (contents.len == 0) {
         buf[0] = .{ .mime = "text/plain", .data = "" };
         return buf[0..1];
     }
-    const n = @min(contents.len, buf.len);
-    for (contents[0..n], buf[0..n]) |c, *p| p.* = .{ .mime = c.mime, .data = c.data };
-    return buf[0..n];
+    if (contents.len > buf.len) return null;
+    for (contents, buf[0..contents.len]) |c, *p| p.* = .{ .mime = c.mime, .data = c.data };
+    return buf[0..contents.len];
 }
 
 /// Room for the largest template (`Dialog.spec`), in 16-bit units.
