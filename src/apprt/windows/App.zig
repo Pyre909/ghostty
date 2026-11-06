@@ -11445,6 +11445,27 @@ fn testKittyWrite(alloc: Allocator, location: apprt.Clipboard, text: []const u8)
     return req;
 }
 
+/// For tests: `pane`'s answer to the Kitty request `state`, freed here, as
+/// the core frees it, unless the runtime took it (`.started`). A request
+/// the runtime took when it should have left it is then a failed
+/// expectation, not a second free that crashes the test.
+fn testKittyLeft(pane: *Surface, location: apprt.Clipboard, state: apprt.ClipboardRequest) !apprt.ClipboardReadResult {
+    const left = struct {
+        fn free(s: apprt.ClipboardRequest) void {
+            switch (s) {
+                inline .kitty_read, .kitty_write => |req| req.destroy(),
+                else => unreachable,
+            }
+        }
+    }.free;
+    const result = pane.clipboardRequest(location, state) catch |err| {
+        left(state);
+        return err;
+    };
+    if (result != .started) left(state);
+    return result;
+}
+
 /// For tests: what stands in for the core in a Kitty clipboard request,
 /// where a test's terminal has none (`Surface.test_clipboard_core`,
 /// `Surface.test_clipboard_deny`). As the core does under an `ask` policy,
@@ -11677,26 +11698,22 @@ test "win32: a Kitty clipboard read serves what was read, asking first, and answ
     try clipboard.testPut(pane.hwnd, &.{}, &.{});
     for ([_]bool{ false, true }) |list| {
         const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, list);
-        defer req.destroy();
-        try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+        try std.testing.expectEqual(.unavailable, try testKittyLeft(pane, .standard, .{ .kitty_read = req }));
     }
     try writeClipboard(alloc, pane.hwnd, .text("t"));
     {
         const req = try testKittyRead(alloc, .standard, &.{"image/png"}, false);
-        defer req.destroy();
-        try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+        try std.testing.expectEqual(.unavailable, try testKittyLeft(pane, .standard, .{ .kitty_read = req }));
     }
     {
         const req = try testKittyRead(alloc, .primary, &.{"text/plain"}, true);
-        defer req.destroy();
-        try std.testing.expectEqual(.unsupported, try pane.clipboardRequest(.primary, .{ .kitty_read = req }));
+        try std.testing.expectEqual(.unsupported, try testKittyLeft(pane, .primary, .{ .kitty_read = req }));
     }
     {
         const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, true);
-        defer req.destroy();
         const holder = try clipboard.TestHolder.start();
         defer holder.release();
-        try std.testing.expectError(error.Win32CallFailed, pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+        try std.testing.expectError(error.Win32CallFailed, testKittyLeft(pane, .standard, .{ .kitty_read = req }));
     }
     try std.testing.expectEqual(boxes, TestKittyPrompt.boxes);
     try std.testing.expectEqual(6, TestKittyCore.completed);
@@ -11772,8 +11789,7 @@ test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
     try std.testing.expectEqual(3, TestKittyCore.completed);
     {
         const req = try testKittyWrite(alloc, .primary, "w");
-        defer req.destroy();
-        try std.testing.expectEqual(.unsupported, try pane.clipboardRequest(.primary, .{ .kitty_write = req }));
+        try std.testing.expectEqual(.unsupported, try testKittyLeft(pane, .primary, .{ .kitty_write = req }));
     }
     try std.testing.expectEqual(3, TestKittyCore.completed);
     try std.testing.expectEqual(2, TestKittyPrompt.boxes);
