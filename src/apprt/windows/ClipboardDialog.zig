@@ -85,6 +85,10 @@ pub var test_run: if (builtin.is_test) ?*const fn (win32.HWND) void else void =
 /// fails.
 pub var test_fail: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
 
+/// For tests: the allocator the dialog makes its text and pictures with,
+/// in place of the app's.
+pub var test_alloc: if (builtin.is_test) ?Allocator else void = if (builtin.is_test) null else {};
+
 /// Ask whether the Kitty clipboard request `state` may go ahead, from the
 /// terminal `hwnd`, showing what it would read, `read`, or write. `dark`
 /// gives the title bar the frames' mode, as the title prompt's has
@@ -104,16 +108,17 @@ pub fn ask(
     }
 
     var buf: [max_write_parts]Content = undefined;
+    const alloc = if (builtin.is_test) test_alloc orelse app.core_app.alloc else app.core_app.alloc;
     var self: Dialog = switch (state) {
         .kitty_read => |kitty| .{
-            .alloc = app.core_app.alloc,
+            .alloc = alloc,
             .request = .kitty_read,
             .parts = read,
             .can_remember = kitty.pw.len > 0,
             .dark = dark,
         },
         .kitty_write => |kitty| .{
-            .alloc = app.core_app.alloc,
+            .alloc = alloc,
             .request = .kitty_write,
             .parts = writeParts(kitty.contents, &buf) orelse {
                 log.warn("a Kitty clipboard write of {d} types, more than its prompt holds, is denied", .{kitty.contents.len});
@@ -359,21 +364,29 @@ const Dialog = struct {
         if (win32.GetWindow(hwnd, win32.GW_OWNER)) |owner| TitleDialog.placeOverOwner(hwnd, owner);
 
         if (self.parts.len > 1) {
+            // One entry per part, in order, even for a part that cannot be
+            // named: the entry picked is the part shown (`show`).
             const list = win32.GetDlgItem(hwnd, id_parts);
-            for (self.parts) |part| {
-                const name = self.partName(part) catch |err| {
+            for (self.parts, 0..) |part, i| {
+                var buf: [64]u16 = undefined;
+                const named = self.partName(part);
+                defer if (named) |n| self.alloc.free(n) else |_| {};
+                const name = named catch |err| unnamed: {
                     log.warn("a Kitty clipboard prompt cannot name a part err={}", .{err});
-                    continue;
+                    break :unnamed unnamedPart(&buf, i, part);
                 };
-                defer self.alloc.free(name);
                 if (list) |l| _ = win32.SendMessageW(l, win32.CB_ADDSTRING, 0, @bitCast(@intFromPtr(name.ptr)));
             }
             if (list) |l| _ = win32.SendMessageW(l, win32.CB_SETCURSEL, 0, 0);
         } else if (self.parts.len == 1) {
-            if (self.partName(self.parts[0])) |name| {
-                defer self.alloc.free(name);
-                _ = win32.SetDlgItemTextW(hwnd, id_parts, name.ptr);
-            } else |err| log.warn("a Kitty clipboard prompt cannot name a part err={}", .{err});
+            var buf: [64]u16 = undefined;
+            const named = self.partName(self.parts[0]);
+            defer if (named) |n| self.alloc.free(n) else |_| {};
+            const name = named catch |err| unnamed: {
+                log.warn("a Kitty clipboard prompt cannot name a part err={}", .{err});
+                break :unnamed unnamedPart(&buf, 0, self.parts[0]);
+            };
+            _ = win32.SetDlgItemTextW(hwnd, id_parts, name.ptr);
         } else {
             // A read of types the clipboard has none of, with its listing.
             _ = win32.SetDlgItemTextW(hwnd, id_parts, W("The clipboard holds none of the types asked for."));
@@ -383,7 +396,10 @@ const Dialog = struct {
             if (self.unwrittenText()) |text| {
                 defer self.alloc.free(text);
                 _ = win32.SetDlgItemTextW(hwnd, id_unwritten, text.ptr);
-            } else |err| log.warn("a Kitty clipboard prompt cannot name what is left out err={}", .{err});
+            } else |err| {
+                log.warn("a Kitty clipboard prompt cannot name what is left out err={}", .{err});
+                _ = win32.SetDlgItemTextW(hwnd, id_unwritten, W("Some types are not written: Windows has no clipboard format for them"));
+            }
         }
 
         self.show(hwnd, 0);
@@ -448,6 +464,17 @@ const Dialog = struct {
         var buf: [40]u8 = undefined;
         try appendAscii(self.alloc, &out, std.fmt.bufPrint(&buf, " ({f})", .{size(part.data.len)}) catch unreachable);
         return out.toOwnedSliceSentinel(self.alloc, 0);
+    }
+
+    /// A part's name when `partName` cannot make it: its place and size,
+    /// made in `buf`, which nothing the program sent can make unsafe.
+    fn unnamedPart(buf: *[64]u16, index: usize, part: Content) [:0]const u16 {
+        var utf8: [buf.len]u8 = undefined;
+        const text = std.fmt.bufPrint(&utf8, "Part {d} ({f})", .{ index + 1, size(part.data.len) }) catch unreachable;
+        // ASCII, so as many units as bytes, and one left for the NUL.
+        const n = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], text) catch unreachable;
+        buf[n] = 0;
+        return buf[0..n :0];
     }
 
     /// The types of a write Windows has no format for, escaped.

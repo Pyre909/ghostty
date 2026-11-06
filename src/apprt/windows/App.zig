@@ -12113,6 +12113,77 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
     try std.testing.expectEqual(boxes, P.boxes);
 }
 
+test "win32: a Kitty clipboard prompt that can allocate nothing lists each part in its place and still answers" {
+    const alloc = std.testing.allocator;
+    const clipboard = @import("clipboard.zig");
+    const ClipboardDialog = @import("ClipboardDialog.zig");
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
+
+    TestKittyCore.reset();
+    TestKittyCore.ask = true;
+    Surface.test_clipboard_core = &TestKittyCore.complete;
+    defer Surface.test_clipboard_core = null;
+    Surface.test_clipboard_deny = &TestKittyCore.deny;
+    defer Surface.test_clipboard_deny = null;
+    TestKittyPrompt.reset(pane.hwnd);
+    ClipboardDialog.test_run = &TestKittyPrompt.run;
+    defer ClipboardDialog.test_run = null;
+    const P = TestKittyPrompt;
+
+    // No name, escaped text or list of what a write leaves out can be made.
+    var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    ClipboardDialog.test_alloc = failing.allocator();
+    defer ClipboardDialog.test_alloc = null;
+
+    // Each part still has its entry, named by its place and size, and the
+    // one picked is the one shown, as its size. Allow still allows.
+    P.answer = win32.IDOK;
+    P.pick = 1;
+    {
+        const completed = TestKittyCore.completed;
+        const req = try testKittyWriteOf(alloc, .standard, &.{
+            .{ .mime = "text/plain", .data = "abc" },
+            .{ .mime = "application/x-a", .data = "abcdefgh" },
+        });
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+        try std.testing.expectEqual(completed + 1, TestKittyCore.completed);
+    }
+    try std.testing.expectEqual(2, P.first.count);
+    try P.first.part.expect(W("Part 1 (3 bytes)"));
+    try P.first.preview.expect(W("No preview available\r\n3 bytes"));
+    try P.picked.part.expect(W("Part 2 (8 bytes)"));
+    try P.picked.preview.expect(W("No preview available\r\n8 bytes"));
+    const unwritten = P.first.unwritten orelse return error.TestUnexpectedResult;
+    try unwritten.expect(W("Some types are not written: Windows has no clipboard format for them"));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+
+    // One part, named the same way.
+    P.pick = null;
+    {
+        const req = try testKittyWriteOf(alloc, .standard, &.{.{ .mime = "text/plain", .data = "abcd" }});
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try std.testing.expectEqual(0, P.first.count);
+    try P.first.part.expect(W("Part 1 (4 bytes)"));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(0, failing.allocations);
+}
+
 /// For tests: `pane`'s title prompt for `which`, opened as a binding opens
 /// it: the action, then `run`'s requests (`createRequested`).
 fn testPrompt(app: *App, pane: *Surface, which: apprt.action.PromptTitle) !win32.HWND {
