@@ -2298,6 +2298,10 @@ test "win32: a read serves each type the clipboard holds once, in the order aske
     // CF_DIBV5 and the CF_DIB Windows makes of it are one type.
     try expectListed(&first, &.{ "text/plain", "text/html", "image/png", "image/bmp", "text/rtf" });
 
+    // The text by another of its names alone, which serves it too.
+    const alias = try readClipboard(arena.allocator(), hwnd, &.{"UTF8_STRING"}, false);
+    try expectServed(&alias, &.{.{ .mime = "text/plain", .data = "t\u{e9}" }});
+
     // The HTML's fragment, the RTF as far as its NUL, and the DIB as a BMP
     // file; no listing unasked.
     const second = try readClipboard(arena.allocator(), hwnd, &.{ "text/rtf", "image/bmp", "text/html" }, false);
