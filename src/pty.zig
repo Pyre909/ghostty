@@ -365,6 +365,11 @@ const WindowsPty = struct {
             load_failed,
             /// conpty.dll lacks one of the three functions.
             no_export,
+            /// The package's create failed, so kernel32's made the
+            /// pseudoconsole: its DLL starts OpenConsole.exe itself, which
+            /// a copy of it that is not a program, or a policy that allows
+            /// only ghostty.exe, stops.
+            create_failed,
         };
 
         /// The functions for a pty opened now, from the executable's
@@ -549,14 +554,19 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe_pty);
 
         pty.conpty = .init();
-        const result = pty.conpty.create(
-            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-            pty.in_pipe_pty,
-            pty.out_pipe_pty,
-            0,
-            &pty.pseudo_console,
-        );
-        if (result != windows.S_OK) return error.Unexpected;
+        const coord: windows.COORD = .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) };
+        var result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, 0, &pty.pseudo_console);
+        // Where the package's create fails, kernel32's may still work: the
+        // files were there, but its OpenConsole.exe may not start.
+        if (result != windows.S_OK and pty.conpty.source == .package) {
+            log.warn("conpty: using the system's, the package's pseudoconsole failed err=0x{x}", .{@as(u32, @bitCast(result))});
+            pty.conpty = .{ .source = .create_failed };
+            result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, 0, &pty.pseudo_console);
+        }
+        if (result != windows.S_OK) {
+            log.err("conpty: no pseudoconsole err=0x{x}", .{@as(u32, @bitCast(result))});
+            return error.Unexpected;
+        }
 
         pty.size = size;
         return pty;
