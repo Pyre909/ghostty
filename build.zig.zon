@@ -114,6 +114,16 @@
             .lazy = true,
         },
 
+        // Windows
+        .conpty = .{
+            // Microsoft.Windows.Console.ConPTY 1.25.260930003 from
+            // nuget.org (MIT, microsoft/terminal), the same bytes under a
+            // .zip name, which Zig can unpack and .nupkg it can't.
+            .url = "https://github.com/Pyre909/ghostty/releases/download/conpty-1.25.260930003/microsoft.windows.console.conpty.1.25.260930003.zip",
+            .hash = "N-V-__8AAJ0BOADACTmMHO-NUReZ9f6jk97_sQz27yQqiNu_",
+            .lazy = true,
+        },
+
         // Fonts
         .jetbrains_mono = .{
             .url = "https://deps.files.ghostty.org/JetBrainsMono-2.304.tar.gz",

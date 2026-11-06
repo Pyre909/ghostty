@@ -19,6 +19,12 @@
   },
   {
     "type": "archive",
+    "url": "https://github.com/Pyre909/ghostty/releases/download/conpty-1.25.260930003/microsoft.windows.console.conpty.1.25.260930003.zip",
+    "dest": "vendor/p/N-V-__8AAJ0BOADACTmMHO-NUReZ9f6jk97_sQz27yQqiNu_",
+    "sha256": "02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee"
+  },
+  {
+    "type": "archive",
     "url": "https://deps.files.ghostty.org/N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ.tar.xz",
     "dest": "vendor/p/N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ",
     "sha256": "4f7b554a38cdf78c033f666c8871f3749e14a094f65a07f630c91ed0b43d35e3"

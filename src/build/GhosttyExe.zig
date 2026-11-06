@@ -70,6 +70,31 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             launcher_install_step = b.addInstallArtifact(launcher, .{
                 .dest_sub_path = "ghostty.com",
             });
+
+            // Microsoft's ConPTY package: src/pty.zig uses its conpty.dll
+            // when OpenConsole.exe is beside it, both beside ghostty.exe,
+            // and kernel32's pseudoconsole otherwise. The package carries
+            // no licence file, so its MIT notice (microsoft/terminal's
+            // LICENSE) goes with them.
+            if (b.lazyDependency("conpty", .{})) |dep| conpty: {
+                const arch = switch (cfg.target.result.cpu.arch) {
+                    .aarch64 => "arm64",
+                    .x86_64 => "x64",
+                    .x86 => "x86",
+                    else => break :conpty,
+                };
+                for ([_]struct { []const u8, []const u8 }{
+                    .{ b.fmt("runtimes/win-{s}/native/conpty.dll", .{arch}), "conpty.dll" },
+                    .{ b.fmt("build/native/runtimes/{s}/OpenConsole.exe", .{arch}), "OpenConsole.exe" },
+                }) |file| install_step.step.dependOn(&b.addInstallBinFile(
+                    dep.path(file[0]),
+                    file[1],
+                ).step);
+                install_step.step.dependOn(&b.addInstallBinFile(
+                    b.path("dist/windows/conpty-LICENSE.txt"),
+                    "conpty-LICENSE.txt",
+                ).step);
+            }
         },
 
         else => {},

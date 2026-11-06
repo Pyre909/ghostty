@@ -52,6 +52,10 @@
       url = "https://deps.files.ghostty.org/breakpad-b99f444ba5f6b98cac261cbb391d8766b34a5918.tar.gz";
       hash = "sha256-Pro7cOujfdYAc3REK6HDyi/tlyH+Sq5Yt/OjQ0lg4FE=";
     };
+    "N-V-__8AAJ0BOADACTmMHO-NUReZ9f6jk97_sQz27yQqiNu_" = fetchurl {
+      url = "https://github.com/Pyre909/ghostty/releases/download/conpty-1.25.260930003/microsoft.windows.console.conpty.1.25.260930003.zip";
+      hash = "sha256-ArB7NJr2bYARWb355EDUoc54u5UfN/yGCXMWZa/a5+4=";
+    };
     "N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ" = fetchzip {
       name = "fontconfig";
       url = "https://deps.files.ghostty.org/N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ.tar.xz";
