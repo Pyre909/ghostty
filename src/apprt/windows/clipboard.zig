@@ -23,7 +23,11 @@ const max_write_size = terminal.kitty.clipboard.max_write_size;
 pub const text_mime = "text/plain;charset=utf-8";
 
 /// How many times `open` tries a clipboard another program holds, and the
-/// wait between tries.
+/// wait asked for between tries. Sleep counts in timer ticks, so the wait
+/// is longer than asked: on Windows 11 at the default timer resolution,
+/// Sleep(5) took 13 to 19 ms, 16.6 ms in the middle of 40. A clipboard
+/// held throughout therefore holds up the thread for about 65 ms over the
+/// four waits.
 const open_tries = 5;
 const open_wait_ms = 5;
 
@@ -34,10 +38,17 @@ pub var test_busy: if (builtin.is_test) ?*const fn () void else void = if (built
 /// Windows' clipboard history service (cbdhsvc) and clipboard sync tools
 /// (rdpclip, Parallels' prl_cc) each open it for a moment after every
 /// change, so a read or write that soon after a change can find it held,
-/// and OpenClipboard fails with ERROR_ACCESS_DENIED. Chromium tries five
-/// times, 5 ms apart, for the same reason (ScopedClipboard::Acquire in
+/// and OpenClipboard fails with ERROR_ACCESS_DENIED. Chromium also tries
+/// five times, 5 ms apart (ScopedClipboard::Acquire in
 /// ui/base/clipboard/clipboard_win.cc). No wait follows the last try, so
 /// the error it leaves is OpenClipboard's.
+///
+/// One holder cannot be outwaited. A program that empties a clipboard this
+/// process owns sends WM_DESTROYCLIPBOARD to the owner, a window of this
+/// thread, and keeps the clipboard open until it is answered, which Sleep
+/// does not do. The tries then fail, and a later read or write finds the
+/// clipboard free; answering sent messages here instead would run window
+/// procedures in the middle of a read or write.
 fn open(hwnd: ?win32.HWND) bool {
     for (0..open_tries) |tried| {
         if (win32.OpenClipboard(hwnd).toBool()) return true;
@@ -2645,13 +2656,25 @@ test "win32: a read of a clipboard another thread holds open fails" {
     defer saved.restore(hwnd);
     try writeClipboard(alloc, hwnd, .text("t"));
 
+    // Five tries, so four waits between them: what a clipboard held
+    // throughout costs.
+    const waits = struct {
+        var n: usize = 0;
+        fn count() void {
+            n += 1;
+        }
+    };
     {
         const holder = try TestHolder.start();
         defer holder.release();
+        waits.n = 0;
+        test_busy = &waits.count;
+        defer test_busy = null;
         try std.testing.expectError(
             App.Error.Win32CallFailed,
             readClipboard(arena.allocator(), hwnd, &.{"text/plain"}, true),
         );
+        try std.testing.expectEqual(4, waits.n);
     }
     const found = try readClipboard(arena.allocator(), hwnd, &.{"text/plain"}, true);
     try expectServed(&found, &.{.{ .mime = "text/plain", .data = "t" }});
