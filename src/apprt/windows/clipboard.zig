@@ -912,8 +912,9 @@ fn cfHtml(out: []u8, fragment: []const u8) void {
     @memcpy(out[end_fragment..end_html], cf_html_suffix);
 }
 
-/// For tests: the CF_HTML on the clipboard, as written, or null if it
-/// holds none. The app never reads HTML.
+/// For tests: the CF_HTML on the clipboard, as written, header and all, or
+/// null if it holds none. The app reads HTML only for a Kitty read, and
+/// only its fragment or document (`readClipboard`, `htmlOf`).
 pub fn readClipboardHtml(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     const format = registeredFormat(.html) orelse return error.TestUnexpectedResult;
     if (!win32.IsClipboardFormatAvailable(format).toBool()) return null;
