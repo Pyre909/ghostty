@@ -192,7 +192,7 @@ pub fn writeClipboard(alloc: Allocator, hwnd: win32.HWND, reps: Reps) WriteError
             } else log.info("clipboard PNG left out: it does not start as a PNG does", .{}),
             .bmp => if (dibOfBmp(r.data)) |dib| {
                 if (!made.contains(dib.kind)) two[0] = dibBlock(dib);
-            },
+            } else |err| log.info("clipboard BMP left out err={}", .{err}),
             .rtf => if (std.mem.startsWith(u8, r.data, "{\\rtf")) {
                 // A NUL after the data, as for CF_HTML.
                 two[0] = bytesBlock(.rtf, r.data, true);
@@ -531,36 +531,54 @@ const Dib = struct {
     bits: []const u8,
 };
 
+/// Why a BMP file is not taken: what this runtime does not write.
+const DibError = error{
+    /// Too short for a BMP file's header, or without its "BM".
+    NotBmp,
+    /// An info header Windows has no clipboard format for.
+    UnknownHeader,
+    HeaderCutShort,
+    /// A width, height or number of planes no bitmap has.
+    NotBitmap,
+    /// A compression or depth a DIB cannot hold.
+    UnsupportedCompression,
+    /// A color profile, which the file keeps apart from the header, past
+    /// the bits.
+    ColorProfile,
+    /// More colors than the depth has.
+    TooManyColors,
+    /// RLE bits with no size.
+    NoBitsSize,
+    /// A color table or bits longer than memory.
+    TooLong,
+    /// Bits the file says start inside its header.
+    BitsInHeader,
+    BitsCutShort,
+};
+
 /// The DIB inside a BMP file
 /// (https://learn.microsoft.com/en-us/windows/win32/gdi/bitmap-storage):
 /// the 14-byte BITMAPFILEHEADER, whose bfOffBits is the offset of the bits
 /// from the file's start, then the info header with its masks and color
 /// table. A clipboard DIB has the bits right after the table, so the gap
-/// the file may leave before them is not copied. Null, logged, for what
-/// this runtime does not write: another header, a compression or depth a
-/// DIB cannot hold, a color profile (the file keeps it apart from the
-/// header, past the bits), or bits the file does not hold.
-fn dibOfBmp(bmp: []const u8) ?Dib {
-    const refuse = struct {
-        fn refuse(comptime why: []const u8) ?Dib {
-            log.info("clipboard BMP left out: " ++ why, .{});
-            return null;
-        }
-    }.refuse;
+/// the file may leave before them is not copied. Refused for what this
+/// runtime does not write (`DibError`).
+fn dibOfBmp(bmp: []const u8) DibError!Dib {
     const file_header_len = 14;
-    if (bmp.len < file_header_len + 40 or !std.mem.startsWith(u8, bmp, "BM")) return refuse("not a BMP file");
+    if (bmp.len < file_header_len or !std.mem.startsWith(u8, bmp, "BM")) return error.NotBmp;
     const off_bits = std.mem.readInt(u32, bmp[10..14], .little);
     const info = bmp[file_header_len..];
 
     // https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapinfoheader,
     // whose fields start the later headers too.
+    if (info.len < 40) return error.HeaderCutShort;
     const size = std.mem.readInt(u32, info[0..4], .little);
     const kind: Block.Kind = switch (size) {
         40 => .dib,
         108, 124 => .dibv5,
-        else => return refuse("an info header Windows has no clipboard format for"),
+        else => return error.UnknownHeader,
     };
-    if (info.len < size) return refuse("its header is cut short");
+    if (info.len < size) return error.HeaderCutShort;
     const width = std.mem.readInt(i32, info[4..8], .little);
     const height = std.mem.readInt(i32, info[8..12], .little);
     const planes = std.mem.readInt(u16, info[12..14], .little);
@@ -569,7 +587,7 @@ fn dibOfBmp(bmp: []const u8) ?Dib {
     const size_image = std.mem.readInt(u32, info[20..24], .little);
     const clr_used = std.mem.readInt(u32, info[32..36], .little);
     if (width <= 0 or height == 0 or height == std.math.minInt(i32) or planes != 1)
-        return refuse("its size or planes are not a bitmap's");
+        return error.NotBitmap;
     // RLE bitmaps must be bottom-up.
     const depth_ok = switch (compression) {
         win32.BI_RGB => switch (bpp) {
@@ -581,11 +599,11 @@ fn dibOfBmp(bmp: []const u8) ?Dib {
         win32.BI_RLE4 => bpp == 4 and height > 0,
         else => false,
     };
-    if (!depth_ok) return refuse("a compression or depth a DIB cannot hold");
+    if (!depth_ok) return error.UnsupportedCompression;
     if (size >= 108) {
         const cs_type = std.mem.readInt(u32, info[56..60], .little);
         if (cs_type == win32.PROFILE_EMBEDDED or cs_type == win32.PROFILE_LINKED)
-            return refuse("it has a color profile");
+            return error.ColorProfile;
     }
 
     // A BITMAPINFOHEADER's three masks follow it; the later headers hold
@@ -595,28 +613,28 @@ fn dibOfBmp(bmp: []const u8) ?Dib {
     const masks: usize = if (size == 40 and compression == win32.BI_BITFIELDS) 12 else 0;
     const colors: usize = if (bpp <= 8) colors: {
         const most = @as(usize, 1) << @intCast(bpp);
-        if (clr_used > most) return refuse("more colors than its depth has");
+        if (clr_used > most) return error.TooManyColors;
         break :colors if (clr_used == 0) most else clr_used;
     } else clr_used;
     const table_len = std.math.add(usize, masks, std.math.mul(usize, colors, 4) catch
-        return refuse("its color table is too long")) catch return refuse("its color table is too long");
+        return error.TooLong) catch return error.TooLong;
 
     // RLE bits are as long as biSizeImage says; others are rows of whole
     // DWORDs.
     const bits_len: usize = if (compression == win32.BI_RLE8 or compression == win32.BI_RLE4) len: {
-        if (size_image == 0) return refuse("its RLE bits have no size");
+        if (size_image == 0) return error.NoBitsSize;
         break :len size_image;
     } else len: {
-        const row_bits = std.math.mul(usize, @intCast(width), bpp) catch return refuse("its rows are too long");
+        const row_bits = std.math.mul(usize, @intCast(width), bpp) catch return error.TooLong;
         const stride = (row_bits / 32 + @intFromBool(row_bits % 32 != 0)) * 4;
-        break :len std.math.mul(usize, stride, @abs(height)) catch return refuse("its bits are too long");
+        break :len std.math.mul(usize, stride, @abs(height)) catch return error.TooLong;
     };
 
     const table_end = std.math.add(usize, file_header_len + size, table_len) catch
-        return refuse("its color table is too long");
-    if (table_end > off_bits) return refuse("its bits start inside its header");
-    const bits_end = std.math.add(usize, off_bits, bits_len) catch return refuse("its bits are too long");
-    if (bits_end > bmp.len) return refuse("its bits are cut short");
+        return error.TooLong;
+    if (table_end > off_bits) return error.BitsInHeader;
+    const bits_end = std.math.add(usize, off_bits, bits_len) catch return error.TooLong;
+    if (bits_end > bmp.len) return error.BitsCutShort;
     return .{
         .kind = kind,
         .header = info[0..size],
@@ -1583,6 +1601,8 @@ test "win32: a BMP is written as the DIB inside it, its bits after its table" {
         .{ .gap = 5 },
         .{ .height = -2 },
         .{ .bpp = 1 },
+        // As many colors as the depth has.
+        .{ .bpp = 1, .clr_used = 2 },
         .{ .bpp = 4, .clr_used = 3 },
         .{ .bpp = 8 },
         .{ .bpp = 8, .clr_used = 2 },
@@ -1606,46 +1626,52 @@ test "win32: a BMP is written as the DIB inside it, its bits after its table" {
         try std.testing.expectEqual(0, test_held);
     }
 
-    // Refused: each a well-formed file with one thing wrong.
+    // Refused: each a well-formed file with one thing wrong, refused for
+    // that and not for something it leads to.
     var buf: [2048]u8 = undefined;
-    const Wrong = struct { bmp: TestBmp = .{}, at: usize = 0, bytes: []const u8 = "", cut: usize = 0 };
+    const Wrong = struct { bmp: TestBmp = .{}, at: usize = 0, bytes: []const u8 = "", cut: usize = 0, err: DibError };
     for ([_]Wrong{
-        .{ .at = 0, .bytes = "MB" },
-        .{ .at = 14, .bytes = "\x0c\x00\x00\x00" },
-        .{ .at = 14, .bytes = "\x38\x00\x00\x00" },
-        .{ .at = 14, .bytes = "\x40\x00\x00\x00" },
+        .{ .at = 0, .bytes = "MB", .err = error.NotBmp },
+        .{ .at = 14, .bytes = "\x0c\x00\x00\x00", .err = error.UnknownHeader },
+        .{ .at = 14, .bytes = "\x38\x00\x00\x00", .err = error.UnknownHeader },
+        .{ .at = 14, .bytes = "\x40\x00\x00\x00", .err = error.UnknownHeader },
         // Width 0, height 0, height minInt, 2 planes.
-        .{ .at = 18, .bytes = "\x00\x00\x00\x00" },
-        .{ .at = 22, .bytes = "\x00\x00\x00\x00" },
-        .{ .at = 22, .bytes = "\x00\x00\x00\x80" },
-        .{ .at = 26, .bytes = "\x02\x00" },
+        .{ .at = 18, .bytes = "\x00\x00\x00\x00", .err = error.NotBitmap },
+        .{ .at = 22, .bytes = "\x00\x00\x00\x00", .err = error.NotBitmap },
+        .{ .at = 22, .bytes = "\x00\x00\x00\x80", .err = error.NotBitmap },
+        .{ .at = 26, .bytes = "\x02\x00", .err = error.NotBitmap },
         // Depths no compression takes, and JPEG.
-        .{ .at = 28, .bytes = "\x02\x00" },
-        .{ .bmp = .{ .compression = win32.BI_BITFIELDS, .bpp = 32 }, .at = 28, .bytes = "\x18\x00" },
-        .{ .at = 30, .bytes = "\x04\x00\x00\x00" },
+        .{ .at = 28, .bytes = "\x02\x00", .err = error.UnsupportedCompression },
+        .{ .bmp = .{ .compression = win32.BI_BITFIELDS, .bpp = 32 }, .at = 28, .bytes = "\x18\x00", .err = error.UnsupportedCompression },
+        .{ .at = 30, .bytes = "\x04\x00\x00\x00", .err = error.UnsupportedCompression },
         // A top-down RLE bitmap, and one with no size.
-        .{ .bmp = .{ .compression = win32.BI_RLE8, .bpp = 8 }, .at = 22, .bytes = "\xfe\xff\xff\xff" },
-        .{ .bmp = .{ .compression = win32.BI_RLE8, .bpp = 8 }, .at = 34, .bytes = "\x00\x00\x00\x00" },
-        // More colors than the depth has.
-        .{ .bmp = .{ .bpp = 1 }, .at = 46, .bytes = "\x03\x00\x00\x00" },
+        .{ .bmp = .{ .compression = win32.BI_RLE8, .bpp = 8 }, .at = 22, .bytes = "\xfe\xff\xff\xff", .err = error.UnsupportedCompression },
+        .{ .bmp = .{ .compression = win32.BI_RLE8, .bpp = 8 }, .at = 34, .bytes = "\x00\x00\x00\x00", .err = error.NoBitsSize },
+        // One color more than the depth has, its table and bits where
+        // they would be.
+        .{ .bmp = .{ .bpp = 1, .clr_used = 3 }, .err = error.TooManyColors },
         // Bits that start inside the header, and bits cut short.
-        .{ .at = 10, .bytes = "\x35\x00\x00\x00" },
-        .{ .cut = 1 },
+        .{ .at = 10, .bytes = "\x35\x00\x00\x00", .err = error.BitsInHeader },
+        .{ .cut = 1, .err = error.BitsCutShort },
         // A color profile.
-        .{ .bmp = .{ .header = 124, .compression = win32.BI_BITFIELDS, .bpp = 32, .cs_type = win32.PROFILE_EMBEDDED } },
-        .{ .bmp = .{ .header = 108, .compression = win32.BI_BITFIELDS, .bpp = 32, .cs_type = win32.PROFILE_LINKED } },
+        .{ .bmp = .{ .header = 124, .compression = win32.BI_BITFIELDS, .bpp = 32, .cs_type = win32.PROFILE_EMBEDDED }, .err = error.ColorProfile },
+        .{ .bmp = .{ .header = 108, .compression = win32.BI_BITFIELDS, .bpp = 32, .cs_type = win32.PROFILE_LINKED }, .err = error.ColorProfile },
         // A header longer than the file.
-        .{ .bmp = .{ .header = 124, .compression = win32.BI_BITFIELDS, .bpp = 32 }, .cut = 100 },
+        .{ .bmp = .{ .header = 124, .compression = win32.BI_BITFIELDS, .bpp = 32 }, .cut = 100, .err = error.HeaderCutShort },
     }) |w| {
         errdefer std.debug.print("wrong={any}\n", .{w});
         const file = w.bmp.file(&buf);
         @memcpy(file[w.at..][0..w.bytes.len], w.bytes);
-        try std.testing.expect(dibOfBmp(file[0 .. file.len - w.cut]) == null);
+        try std.testing.expectError(w.err, dibOfBmp(file[0 .. file.len - w.cut]));
     }
     // And files too short to have the headers.
     const short: [53]u8 = @splat(0);
-    for ([_][]const u8{ "", "BM", "BM" ++ short[2..] }) |file| {
-        try std.testing.expect(dibOfBmp(file) == null);
+    for ([_]struct { []const u8, DibError }{
+        .{ "", error.NotBmp },
+        .{ "BM", error.NotBmp },
+        .{ "BM" ++ short[2..], error.HeaderCutShort },
+    }) |c| {
+        try std.testing.expectError(c[1], dibOfBmp(c[0]));
     }
 }
 
