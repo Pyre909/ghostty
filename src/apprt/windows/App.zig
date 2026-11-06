@@ -11345,7 +11345,7 @@ test "win32: a paste event lists the types the clipboard holds, and an empty or 
         var len: usize = 0;
         var count: usize = 0;
         var listing = false;
-        fn complete(_: *Surface, state: apprt.ClipboardRequest, done: CoreSurface.CompleteClipboard) std.mem.Allocator.Error!void {
+        fn complete(_: *Surface, state: apprt.ClipboardRequest, done: CoreSurface.CompleteClipboard) Surface.TestClipboardError!void {
             count += 1;
             listing = state == .list and done.contents.len == 0;
             len = 0;
@@ -11389,6 +11389,394 @@ test "win32: a paste event lists the types the clipboard holds, and an empty or 
         try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .list = .standard }));
     }
     try std.testing.expectEqual(2, Listed.count);
+}
+
+/// For tests: a Kitty clipboard read as the stream handler makes one
+/// (`StreamHandler.kittyClipboardRead`), the request and all it names in
+/// one arena, which whoever consumes it frees (`KittyRead.destroy`).
+fn testKittyRead(
+    alloc: Allocator,
+    location: apprt.Clipboard,
+    mimes: []const []const u8,
+    list: bool,
+) !*apprt.ClipboardRequest.KittyRead {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const req = try a.create(apprt.ClipboardRequest.KittyRead);
+    const owned = try a.alloc([:0]const u8, mimes.len);
+    for (mimes, owned) |mime, *m| m.* = try a.dupeSentinel(u8, mime, 0);
+    const id = try a.dupe(u8, "kc");
+    // The arena goes in last, so that it holds every allocation above.
+    req.* = .{
+        .arena = arena,
+        .location = location,
+        .mimes = owned,
+        .list = list,
+        .id = id,
+        .pw = "",
+        .name = "",
+        .granted = false,
+        .terminator = .st,
+    };
+    return req;
+}
+
+/// For tests: a Kitty clipboard write of `text`, as `testKittyRead` makes
+/// a read (`StreamHandler.kittyClipboardWrite`).
+fn testKittyWrite(alloc: Allocator, location: apprt.Clipboard, text: []const u8) !*apprt.ClipboardRequest.KittyWrite {
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const req = try a.create(apprt.ClipboardRequest.KittyWrite);
+    const contents = try a.alloc(apprt.ClipboardContent, 1);
+    contents[0] = .{ .mime = "text/plain", .data = try a.dupeSentinel(u8, text, 0) };
+    const id = try a.dupe(u8, "kc");
+    req.* = .{
+        .arena = arena,
+        .location = location,
+        .contents = contents,
+        .id = id,
+        .pw = "",
+        .name = "",
+        .granted = false,
+        .terminator = .st,
+    };
+    return req;
+}
+
+/// For tests: what stands in for the core in a Kitty clipboard request,
+/// where a test's terminal has none (`Surface.test_clipboard_core`,
+/// `Surface.test_clipboard_deny`). As the core does under an `ask` policy,
+/// it answers `error.UnauthorizedPaste` to an unconfirmed request when
+/// `ask`, leaving the request alive; every other completion, and every
+/// denial, consumes the request, freeing it, then fails with `fail` if
+/// set. A request consumed twice, or never, fails the test's allocator.
+const TestKittyCore = struct {
+    var ask = false;
+    var fail: ?Surface.TestClipboardError = null;
+    var asked: usize = 0;
+    var completed: usize = 0;
+    var denied: usize = 0;
+    var confirmed = false;
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+
+    fn reset() void {
+        ask = false;
+        fail = null;
+        asked = 0;
+        completed = 0;
+        denied = 0;
+        confirmed = false;
+        len = 0;
+    }
+
+    fn complete(_: *Surface, state: apprt.ClipboardRequest, done: CoreSurface.CompleteClipboard) Surface.TestClipboardError!void {
+        if (ask and !done.confirmed) {
+            asked += 1;
+            return error.UnauthorizedPaste;
+        }
+        completed += 1;
+        confirmed = done.confirmed;
+        len = 0;
+        for (done.contents) |c| {
+            add(c.mime);
+            add("=");
+            add(c.data);
+            add(" ");
+        }
+        for (done.available) |mime| {
+            add(mime);
+            add(" ");
+        }
+        consume(state);
+        if (fail) |err| return err;
+    }
+
+    fn deny(_: *Surface, state: apprt.ClipboardRequest) void {
+        denied += 1;
+        consume(state);
+    }
+
+    fn consume(state: apprt.ClipboardRequest) void {
+        switch (state) {
+            .kitty_read => |kitty| kitty.destroy(),
+            .kitty_write => |kitty| kitty.destroy(),
+            else => unreachable,
+        }
+    }
+
+    fn add(s: []const u8) void {
+        const n = @min(s.len, buf.len - len);
+        @memcpy(buf[len..][0..n], s[0..n]);
+        len += n;
+    }
+
+    /// What the last completion served, "mime=data " for each type, then
+    /// each type listed.
+    fn served() []const u8 {
+        return buf[0..len];
+    }
+};
+
+/// For tests: a Kitty clipboard prompt (`dialog.test_message_box`),
+/// answered `answer`, recording its text and buttons. While it is up it
+/// finds whether another program could open the clipboard, then writes
+/// `changed` to it, as a program could.
+const TestKittyPrompt = struct {
+    var answer: c_int = win32.IDCANCEL;
+    var boxes: usize = 0;
+    var text: ?win32.LPCWSTR = null;
+    var buttons: win32.UINT = 0;
+    var hwnd: ?win32.HWND = null;
+    var open = false;
+    var changed = false;
+
+    fn reset(owner: win32.HWND) void {
+        answer = win32.IDCANCEL;
+        boxes = 0;
+        hwnd = owner;
+        forget();
+    }
+
+    fn forget() void {
+        text = null;
+        buttons = 0;
+        open = false;
+        changed = false;
+    }
+
+    fn box(_: ?win32.HWND, prompt: win32.LPCWSTR, b: win32.UINT) c_int {
+        boxes += 1;
+        text = prompt;
+        buttons = b;
+        const clipboard = @import("clipboard.zig");
+        open = if (clipboard.TestHolder.start()) |holder| open: {
+            holder.release();
+            break :open true;
+        } else |_| false;
+        changed = if (writeClipboard(std.testing.allocator, hwnd.?, .text("changed"))) |_| true else |_| false;
+        return answer;
+    }
+
+    /// That the last prompt asked `want`, Cancel the button Enter presses,
+    /// with the clipboard free for other programs to open and change.
+    fn expectAsked(want: win32.LPCWSTR) !void {
+        defer forget();
+        try std.testing.expectEqualSlices(u16, std.mem.span(want), std.mem.span(text.?));
+        try std.testing.expectEqual(win32.MB_DEFBUTTON2, buttons & win32.MB_DEFMASK);
+        try std.testing.expect(open);
+        try std.testing.expect(changed);
+    }
+};
+
+test "win32: a Kitty clipboard read serves what was read, asking first, and answers once" {
+    const alloc = std.testing.allocator;
+    const clipboard = @import("clipboard.zig");
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
+
+    TestKittyCore.reset();
+    Surface.test_clipboard_core = &TestKittyCore.complete;
+    defer Surface.test_clipboard_core = null;
+    Surface.test_clipboard_deny = &TestKittyCore.deny;
+    defer Surface.test_clipboard_deny = null;
+    TestKittyPrompt.reset(pane.hwnd);
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestKittyPrompt.box;
+    defer message_box.* = null;
+    const read_prompt = clipboard.clipboardPrompt(.kitty_read);
+
+    // Unasked, each type asked for under the name asked, and the listing.
+    try writeClipboard(alloc, pane.hwnd, .of(&.{
+        .{ .mime = "text/html", .data = "<b>h</b>" },
+        .{ .mime = "text/plain", .data = "before" },
+    }, false));
+    {
+        const req = try testKittyRead(alloc, .standard, &.{ "text/html", "text/plain" }, true);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try std.testing.expectEqual(1, TestKittyCore.completed);
+    try std.testing.expect(!TestKittyCore.confirmed);
+    try std.testing.expectEqualStrings(
+        "text/html=<b>h</b> text/plain=before text/plain text/html ",
+        TestKittyCore.served(),
+    );
+    try std.testing.expectEqual(0, TestKittyPrompt.boxes);
+
+    // The listing alone is served, with no type, or a type the clipboard
+    // does not hold.
+    for ([_][]const []const u8{ &.{}, &.{"image/png"} }) |mimes| {
+        const req = try testKittyRead(alloc, .standard, mimes, true);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+        try std.testing.expectEqualStrings("text/plain text/html ", TestKittyCore.served());
+    }
+    try std.testing.expectEqual(3, TestKittyCore.completed);
+
+    // Asked, and allowed: what was read before the prompt is served, though
+    // the clipboard changed while it was up, and the clipboard was closed
+    // before it, so another program could open it.
+    TestKittyCore.ask = true;
+    TestKittyPrompt.answer = win32.IDOK;
+    {
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, false);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try TestKittyPrompt.expectAsked(read_prompt);
+    try std.testing.expectEqual(1, TestKittyPrompt.boxes);
+    try std.testing.expectEqual(1, TestKittyCore.asked);
+    try std.testing.expectEqual(4, TestKittyCore.completed);
+    try std.testing.expect(TestKittyCore.confirmed);
+    try std.testing.expectEqualStrings("text/plain=before ", TestKittyCore.served());
+    try clipboard.expectClipboard(pane.hwnd, "changed", null);
+
+    // Asked, and denied: denied once, never completed.
+    TestKittyPrompt.answer = win32.IDCANCEL;
+    {
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, false);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try std.testing.expectEqual(2, TestKittyPrompt.boxes);
+    try std.testing.expectEqual(1, TestKittyCore.denied);
+    try std.testing.expectEqual(4, TestKittyCore.completed);
+
+    // A completion that fails after consuming the request, unasked and
+    // after Allow, is logged, not returned: the core would answer it again.
+    TestKittyCore.fail = error.OutOfMemory;
+    TestKittyPrompt.answer = win32.IDOK;
+    for ([_]bool{ false, true }) |ask| {
+        TestKittyCore.ask = ask;
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, false);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try std.testing.expectEqual(6, TestKittyCore.completed);
+    try std.testing.expectEqual(1, TestKittyCore.denied);
+    TestKittyCore.fail = null;
+
+    // Nothing read and nothing listed is left to the core, which answers it
+    // with nothing, asking nobody: a type the clipboard does not hold, and
+    // an empty clipboard, its listing too. So is a primary selection, which
+    // Windows has not (ENOSYS); and a clipboard another program holds open
+    // is an error (EIO). The core frees each of these. Under an `ask`
+    // policy, so a prompt would show one was asked.
+    TestKittyCore.ask = true;
+    const boxes = TestKittyPrompt.boxes;
+    try clipboard.testPut(pane.hwnd, &.{}, &.{});
+    for ([_]bool{ false, true }) |list| {
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, list);
+        defer req.destroy();
+        try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try writeClipboard(alloc, pane.hwnd, .text("t"));
+    {
+        const req = try testKittyRead(alloc, .standard, &.{"image/png"}, false);
+        defer req.destroy();
+        try std.testing.expectEqual(.unavailable, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    {
+        const req = try testKittyRead(alloc, .primary, &.{"text/plain"}, true);
+        defer req.destroy();
+        try std.testing.expectEqual(.unsupported, try pane.clipboardRequest(.primary, .{ .kitty_read = req }));
+    }
+    {
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, true);
+        defer req.destroy();
+        const holder = try clipboard.TestHolder.start();
+        defer holder.release();
+        try std.testing.expectError(error.Win32CallFailed, pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try std.testing.expectEqual(boxes, TestKittyPrompt.boxes);
+    try std.testing.expectEqual(6, TestKittyCore.completed);
+    try std.testing.expectEqual(1, TestKittyCore.denied);
+}
+
+test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
+    const alloc = std.testing.allocator;
+    const clipboard = @import("clipboard.zig");
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
+
+    TestKittyCore.reset();
+    Surface.test_clipboard_core = &TestKittyCore.complete;
+    defer Surface.test_clipboard_core = null;
+    Surface.test_clipboard_deny = &TestKittyCore.deny;
+    defer Surface.test_clipboard_deny = null;
+    TestKittyPrompt.reset(pane.hwnd);
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestKittyPrompt.box;
+    defer message_box.* = null;
+
+    // A write carries what it writes, which the core writes once allowed.
+    // Unasked, then asked and allowed, then asked and denied.
+    {
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try std.testing.expectEqual(1, TestKittyCore.completed);
+    try std.testing.expect(!TestKittyCore.confirmed);
+    try std.testing.expectEqualStrings("", TestKittyCore.served());
+    try std.testing.expectEqual(0, TestKittyPrompt.boxes);
+
+    TestKittyCore.ask = true;
+    TestKittyPrompt.answer = win32.IDOK;
+    {
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try TestKittyPrompt.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try std.testing.expectEqual(2, TestKittyCore.completed);
+    try std.testing.expect(TestKittyCore.confirmed);
+
+    TestKittyPrompt.answer = win32.IDCANCEL;
+    {
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try std.testing.expectEqual(2, TestKittyPrompt.boxes);
+    try std.testing.expectEqual(1, TestKittyCore.denied);
+    try std.testing.expectEqual(2, TestKittyCore.completed);
+
+    // A completion that fails after consuming the write is logged, not
+    // returned; a write to the primary selection is left to the core.
+    TestKittyCore.ask = false;
+    TestKittyCore.fail = error.OutOfMemory;
+    {
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try std.testing.expectEqual(3, TestKittyCore.completed);
+    {
+        const req = try testKittyWrite(alloc, .primary, "w");
+        defer req.destroy();
+        try std.testing.expectEqual(.unsupported, try pane.clipboardRequest(.primary, .{ .kitty_write = req }));
+    }
+    try std.testing.expectEqual(3, TestKittyCore.completed);
+    try std.testing.expectEqual(2, TestKittyPrompt.boxes);
 }
 
 /// For tests: `pane`'s title prompt for `which`, opened as a binding opens

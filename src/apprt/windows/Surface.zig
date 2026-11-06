@@ -48,7 +48,7 @@ const readClipboard = @import("clipboard.zig").readClipboard;
 const writeClipboard = @import("clipboard.zig").writeClipboard;
 const ClipboardReps = @import("clipboard.zig").Reps;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
-const clipboardReadPrompt = @import("clipboard.zig").clipboardReadPrompt;
+const clipboardPrompt = @import("clipboard.zig").clipboardPrompt;
 const confirm = @import("dialog.zig").confirm;
 const drop = @import("drop.zig");
 const Shell = @import("../../termio/shell_integration.zig").Shell;
@@ -1322,30 +1322,29 @@ pub const Surface = struct {
         clipboard_type: apprt.Clipboard,
         state: apprt.ClipboardRequest,
     ) !apprt.ClipboardReadResult {
-        // The Kitty protocol requests own an arena that holds the request
-        // struct itself (`KittyRead.destroy`, `KittyWrite.destroy` in
-        // apprt/structs.zig) -- but the apprt does
-        // NOT own that arena here, and destroying it would be a double free.
-        //
-        // The core destroys the request itself for every answer other than
-        // `.started`: `Surface.kittyClipboardRead` and
-        // `Surface.kittyClipboardWrite` both `defer req.destroy()`. Worse,
-        // the ENOSYS reply it builds reads `req.id` and `req.terminator`,
-        // which live *in* that arena, after we return. Ownership only
-        // transfers on `.started`, and then only to
-        // `Surface.completeClipboardRequest` or
-        // `Surface.denyClipboardRequest`, which destroy it themselves.
-        switch (state) {
-            .kitty_read, .kitty_write => return .unsupported,
+        // The core routes OSC 52 writes straight to setClipboard; they
+        // never reach this function (`Surface.startClipboardRequest`).
+        if (state == .osc_52_write) return .unsupported;
 
-            // The core routes OSC 52 writes straight to setClipboard; they
-            // never reach this function (`Surface.startClipboardRequest`).
-            .osc_52_write => return .unsupported,
+        // A clipboard Windows has not. The core answers a Kitty request
+        // for it with ENOSYS, as the protocol lists for a clipboard the
+        // terminal does not have, so this comes before one is handed over.
+        if (!self.supportsClipboard(clipboard_type)) return .unsupported;
+
+        switch (state) {
+            .kitty_read => |kitty| return self.kittyRead(state, kitty),
+
+            // A write carries what it writes, which the core gives to
+            // `setClipboard` once it is allowed, as GTK's
+            // `completeKittyWrite` does.
+            .kitty_write => {
+                self.completeKitty(state, .{});
+                return .started;
+            },
 
             .paste, .osc_52_read, .list => {},
+            .osc_52_write => unreachable, // Returned above.
         }
-
-        if (!self.supportsClipboard(clipboard_type)) return .unsupported;
 
         const alloc = self.app.core_app.alloc;
 
@@ -1374,18 +1373,89 @@ pub const Surface = struct {
         return .started;
     }
 
+    /// A Kitty clipboard read (OSC 5522): read the types it asks for, and
+    /// the listing if it asks, then complete it with them (`completeKitty`).
+    ///
+    /// Until this answers `.started` the core owns the request, and answers
+    /// and destroys it for any other answer: EIO for an error, which is
+    /// what a clipboard another program holds open gives (logged), and an
+    /// empty success, asked of nobody, for `.unavailable`, which is what
+    /// nothing read and nothing listed gives, since that discloses nothing
+    /// (`Surface.kittyClipboardRead`). The clipboard is closed before
+    /// `completeKitty` can ask (`readClipboard`); what was read is in an
+    /// arena on this frame, which the modal prompt keeps alive.
+    fn kittyRead(
+        self: *Surface,
+        state: apprt.ClipboardRequest,
+        kitty: *apprt.ClipboardRequest.KittyRead,
+    ) !apprt.ClipboardReadResult {
+        var arena: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const mimes = try alloc.alloc([]const u8, kitty.mimes.len);
+        for (kitty.mimes, mimes) |mime, *m| m.* = mime;
+        const found = try readClipboard(alloc, self.hwnd, mimes, kitty.list);
+        if (found.contents().len == 0 and found.available().len == 0) return .unavailable;
+        self.completeKitty(state, .{
+            .contents = found.contents(),
+            .available = found.available(),
+        });
+        return .started;
+    }
+
+    /// Complete a Kitty clipboard request handed over to this runtime
+    /// (`.started`), asking first when the core will not complete it
+    /// unasked, as GTK's `kittyReadFinish` and `completeKittyWrite` do.
+    ///
+    /// The core consumes the request, destroying it and the arena it lives
+    /// in, for every outcome but `error.UnauthorizedPaste`, its errors
+    /// included (`Surface.completeClipboardRequest`), and so does
+    /// `denyClipboardRequest`. So this answers the request exactly once and
+    /// returns no error: its caller answers `.started` whatever happens, and
+    /// an error would have the core destroy and answer it a second time.
+    ///
+    /// After Allow it sends `complete` as it was shown, not what the
+    /// clipboard holds by then, as macOS does.
+    fn completeKitty(self: *Surface, state: apprt.ClipboardRequest, complete: CoreSurface.CompleteClipboard) void {
+        self.completeClipboard(state, complete) catch |err| switch (err) {
+            error.UnauthorizedPaste => if (confirm(self.app, self.hwnd, clipboardPrompt(state), .cancel)) {
+                var allowed = complete;
+                allowed.confirmed = true;
+                self.completeClipboard(state, allowed) catch |e|
+                    log.warn("unable to complete an allowed Kitty clipboard request err={}", .{e});
+            } else self.denyClipboard(state),
+            else => log.warn("unable to complete a Kitty clipboard request err={}", .{err}),
+        };
+    }
+
+    /// For tests: the errors `test_clipboard_core` may return, which the
+    /// core's `completeClipboardRequest` can.
+    pub const TestClipboardError = std.mem.Allocator.Error || error{UnauthorizedPaste};
+
     /// For tests: what stands in for the core's `completeClipboardRequest`
     /// in `completeClipboard`, where a test's terminal has no core.
     pub var test_clipboard_core: if (builtin.is_test) ?*const fn (
         *Surface,
         apprt.ClipboardRequest,
         CoreSurface.CompleteClipboard,
-    ) std.mem.Allocator.Error!void else void = if (builtin.is_test) null else {};
+    ) TestClipboardError!void else void = if (builtin.is_test) null else {};
 
     /// Complete `state` with `complete` in the core.
     fn completeClipboard(self: *Surface, state: apprt.ClipboardRequest, complete: CoreSurface.CompleteClipboard) !void {
         if (builtin.is_test) if (test_clipboard_core) |stand_in| return stand_in(self, state, complete);
         return self.core_surface.completeClipboardRequest(state, complete);
+    }
+
+    /// For tests: what stands in for the core's `denyClipboardRequest` in
+    /// `denyClipboard`.
+    pub var test_clipboard_deny: if (builtin.is_test) ?*const fn (*Surface, apprt.ClipboardRequest) void else void =
+        if (builtin.is_test) null else {};
+
+    /// Deny `state` in the core, which answers and consumes it.
+    fn denyClipboard(self: *Surface, state: apprt.ClipboardRequest) void {
+        if (builtin.is_test) if (test_clipboard_deny) |stand_in| return stand_in(self, state);
+        self.core_surface.denyClipboardRequest(state);
     }
 
     /// Hand `text` to the core for `state`, a clipboard request or a drop
@@ -1429,7 +1499,7 @@ pub const Surface = struct {
         if (confirm(
             self.app,
             self.hwnd,
-            clipboardReadPrompt(state),
+            clipboardPrompt(state),
             .cancel,
         )) {
             try self.core_surface.completeClipboardRequest(state, .{
@@ -1519,7 +1589,7 @@ pub const Surface = struct {
         if (confirm_write and !confirm(
             self.app,
             self.hwnd,
-            L("An application wants to write to the clipboard. Allow it?"),
+            clipboardPrompt(.osc_52_write),
             .cancel,
         )) return;
 
