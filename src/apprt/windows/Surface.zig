@@ -1426,9 +1426,9 @@ pub const Surface = struct {
             error.UnauthorizedPaste => switch (ClipboardDialog.ask(
                 self.app,
                 self.hwnd,
+                self.window,
                 state,
                 complete.contents,
-                self.window.dark_frame,
             )) {
                 .deny => self.denyClipboard(state),
                 .allow, .allow_and_remember => |answer| {

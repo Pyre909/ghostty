@@ -182,6 +182,11 @@ prompt_lowered: bool,
 /// frame disabled while it is open.
 title_prompt: TitleDialog.Prompt,
 
+/// The Kitty clipboard prompt asked for from one of the window's
+/// terminals, while it is open (`ClipboardDialog.ask`), whose title bar
+/// `applyTheme` gives the frame's mode.
+clipboard_prompt: ?win32.HWND,
+
 /// The window's command palette, open or not (`CommandPalette`).
 palette: CommandPalette.Palette,
 
@@ -887,6 +892,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .prompt_disabled = false,
         .prompt_lowered = false,
         .title_prompt = .{},
+        .clipboard_prompt = null,
         .palette = .{},
         .divider_drag = null,
         .divider_wheel = false,
@@ -3161,8 +3167,10 @@ pub fn applyTheme(self: *Window) void {
         return;
     }
     self.dark_frame = dark;
-    // And its title prompt's title bar, if one is open.
+    // And its title prompt's and Kitty clipboard prompt's title bars, if
+    // they are open.
     TitleDialog.setDark(self, dark);
+    if (self.clipboard_prompt) |prompt| TitleDialog.darkTitleBar(prompt, dark);
     self.bar.invalidate();
     for (self.tabs.items) |t| {
         var it = t.tree.iterator();

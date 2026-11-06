@@ -4912,6 +4912,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .prompt_disabled = false,
         .prompt_lowered = false,
         .title_prompt = .{},
+        .clipboard_prompt = null,
         .palette = .{},
         .divider_drag = null,
         .divider_wheel = false,
@@ -11576,8 +11577,12 @@ const TestKittyPrompt = struct {
     var pick: ?usize = null;
     var boxes: usize = 0;
     var hwnd: ?win32.HWND = null;
+    /// Run while the prompt is up, after any pick, before it is answered.
+    var during: ?*const fn () void = null;
     var first: View = .{};
     var picked: View = .{};
+    /// What it shows after `during` ran.
+    var after: View = .{};
     var open = false;
     var changed = false;
 
@@ -11587,12 +11592,14 @@ const TestKittyPrompt = struct {
         pick = null;
         boxes = 0;
         hwnd = owner;
+        during = null;
         forget();
     }
 
     fn forget() void {
         first = .{};
         picked = .{};
+        after = .{};
         open = false;
         changed = false;
     }
@@ -11600,7 +11607,8 @@ const TestKittyPrompt = struct {
     /// What the dialog shows: the heading, the part's name, or the one
     /// picked, how many the list holds, the one preview shown and its text,
     /// what a write leaves out, whether the box is offered, which button
-    /// Enter presses, and an image's pixels where they are drawn.
+    /// Enter presses, the title bar's mode, and an image's pixels where
+    /// they are drawn.
     const View = struct {
         heading: Text = .{},
         part: Text = .{},
@@ -11612,6 +11620,8 @@ const TestKittyPrompt = struct {
         unwritten: ?Text = null,
         offered: bool = false,
         default: isize = 0,
+        /// The title bar's mode, as DWM reads it back; null if it cannot.
+        dark: ?bool = null,
         /// The image drawn: the pixel a quarter of the way into it, and
         /// one of the face around it.
         quarter: ?win32.COLORREF = null,
@@ -11629,6 +11639,10 @@ const TestKittyPrompt = struct {
                 .offered = win32.GetDlgItem(dialog, ClipboardDialog.id_remember) != null,
                 .default = win32.SendMessageW(dialog, win32.DM_GETDEFID, 0, 0),
             };
+            var dark: win32.BOOL = .FALSE;
+            if (win32.DwmGetWindowAttribute(dialog, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(win32.BOOL)) >= 0) {
+                v.dark = dark.toBool();
+            }
             for ([_]c_int{ ClipboardDialog.id_text, ClipboardDialog.id_image, ClipboardDialog.id_none }) |id| {
                 const control = win32.GetDlgItem(dialog, id) orelse continue;
                 if (!shown(control)) continue;
@@ -11713,6 +11727,10 @@ const TestKittyPrompt = struct {
             _ = win32.SendMessageW(dialog, win32.WM_COMMAND, notify, @bitCast(@intFromPtr(list)));
             picked = .of(dialog);
         };
+        if (during) |d| {
+            d();
+            after = .of(dialog);
+        }
         const clipboard = @import("clipboard.zig");
         open = if (clipboard.TestHolder.start()) |holder| open: {
             holder.release();
@@ -12122,6 +12140,69 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
         try std.testing.expectEqual(denied + 1, TestKittyCore.denied);
     }
     try std.testing.expectEqual(boxes, P.boxes);
+}
+
+test "win32: a Kitty clipboard prompt's title bar follows its window's" {
+    const alloc = std.testing.allocator;
+    const clipboard = @import("clipboard.zig");
+    const ClipboardDialog = @import("ClipboardDialog.zig");
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.config.@"window-theme" = .dark;
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    window.applyTheme();
+    try std.testing.expect(window.dark_frame);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
+
+    TestKittyCore.reset();
+    TestKittyCore.ask = true;
+    Surface.test_clipboard_core = &TestKittyCore.complete;
+    defer Surface.test_clipboard_core = null;
+    Surface.test_clipboard_deny = &TestKittyCore.deny;
+    defer Surface.test_clipboard_deny = null;
+    TestKittyPrompt.reset(pane.hwnd);
+    ClipboardDialog.test_run = &TestKittyPrompt.run;
+    defer ClipboardDialog.test_run = null;
+    const P = TestKittyPrompt;
+
+    // A new configuration while the prompt is up re-themes it with the
+    // frame.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .light;
+    const light = struct {
+        var app_: *App = undefined;
+        var config: *const Config = undefined;
+        var done = false;
+        fn change() void {
+            done = app_.performAction(.app, .config_change, .{ .config = config }) catch false;
+        }
+    };
+    light.app_ = &app;
+    light.config = &changed;
+    light.done = false;
+    P.during = &light.change;
+    {
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try std.testing.expect(light.done);
+    try std.testing.expect(!window.dark_frame);
+    try std.testing.expectEqual(@as(?bool, true), P.first.dark);
+    try std.testing.expectEqual(@as(?bool, false), P.after.dark);
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    // Closed, it is forgotten.
+    try std.testing.expect(window.clipboard_prompt == null);
 }
 
 test "win32: a Kitty clipboard prompt that can allocate nothing lists each part in its place and still answers" {

@@ -42,6 +42,7 @@ const win32 = @import("win32.zig");
 const App = @import("App.zig").App;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const TitleDialog = @import("TitleDialog.zig");
+const Window = @import("Window.zig");
 const clipboard = @import("clipboard.zig");
 
 const Content = terminal.clipboard.Content;
@@ -90,17 +91,18 @@ pub var test_fail: if (builtin.is_test) bool else void = if (builtin.is_test) fa
 pub var test_alloc: if (builtin.is_test) ?Allocator else void = if (builtin.is_test) null else {};
 
 /// Ask whether the Kitty clipboard request `state` may go ahead, from the
-/// terminal `hwnd`, showing what it would read, `read`, or write. `dark`
-/// gives the title bar the frames' mode, as the title prompt's has
+/// terminal `hwnd` in `window`, showing what it would read, `read`, or
+/// write. The title bar takes the window's mode and follows it while the
+/// dialog is open (`Window.clipboard_prompt`), as the title prompt's does
 /// (`TitleDialog.setDark`). Deny if the dialog cannot be made, or if a
 /// write has more parts than it holds (`writeParts`), each logged: the
 /// program is told it was refused.
 pub fn ask(
     app: *App,
     hwnd: ?win32.HWND,
+    window: *Window,
     state: apprt.ClipboardRequest,
     read: []const Content,
-    dark: bool,
 ) Answer {
     if (app.terminating) {
         log.warn("a Kitty clipboard prompt while the windows close is answered Deny", .{});
@@ -115,7 +117,7 @@ pub fn ask(
             .request = .kitty_read,
             .parts = read,
             .can_remember = kitty.pw.len > 0,
-            .dark = dark,
+            .window = window,
         },
         .kitty_write => |kitty| .{
             .alloc = alloc,
@@ -125,7 +127,7 @@ pub fn ask(
                 return .deny;
             },
             .can_remember = kitty.pw.len > 0,
-            .dark = dark,
+            .window = window,
         },
         else => unreachable,
     };
@@ -139,6 +141,10 @@ pub fn ask(
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();
+    // Once the dialog returns it is gone, and the window's prompt is again
+    // the one open before it, if any.
+    const outer = window.clipboard_prompt;
+    defer window.clipboard_prompt = outer;
     const result = if (builtin.is_test)
         self.testDialog(app.hinstance, owner, template)
     else
@@ -188,7 +194,9 @@ const Dialog = struct {
     request: apprt.ClipboardRequestType,
     parts: []const Content,
     can_remember: bool,
-    dark: bool,
+    /// The window of the terminal that asked, whose mode the title bar
+    /// takes.
+    window: *Window,
     /// The picture of the part shown, while it is one.
     picture: ?clipboard.Picture = null,
     answer: Answer = .deny,
@@ -360,7 +368,8 @@ const Dialog = struct {
     /// parts, what a write leaves out, and the first part shown, with the
     /// keyboard focus on Deny.
     fn init(self: *Dialog, hwnd: win32.HWND) void {
-        TitleDialog.darkTitleBar(hwnd, self.dark);
+        TitleDialog.darkTitleBar(hwnd, self.window.dark_frame);
+        self.window.clipboard_prompt = hwnd;
         if (win32.GetWindow(hwnd, win32.GW_OWNER)) |owner| TitleDialog.placeOverOwner(hwnd, owner);
 
         if (self.parts.len > 1) {
@@ -712,7 +721,8 @@ test "win32: the Kitty clipboard prompt's template fits, every control on a DWOR
             .request = request,
             .parts = &parts,
             .can_remember = true,
-            .dark = false,
+            // The template needs no window.
+            .window = undefined,
         };
         var items: [max_items]Item = undefined;
         const s = d.spec(&items);
