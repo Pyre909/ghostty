@@ -118,6 +118,9 @@ pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004;
 /// ends, whatever FreeLibrary calls follow.
 pub const GET_MODULE_HANDLE_EX_FLAG_PIN = 0x00000001;
 pub const HANDLE_FLAG_INHERIT = 0x00000001;
+/// LoadLibraryExW dwFlags: search the folder of the DLL being loaded, which
+/// must be named by its full path, for the DLLs it imports.
+pub const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100;
 /// LoadLibraryExW dwFlags: search only %windows%\system32 for the DLL and
 /// its dependencies, never the standard search path.
 pub const LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
@@ -362,6 +365,8 @@ pub const exp = struct {
             hModule: HMODULE,
             lpProcName: [*:0]const u8,
         ) callconv(.winapi) ?*const anyopaque;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary
+        pub extern "kernel32" fn FreeLibrary(hLibModule: HMODULE) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/console/attachconsole
         pub extern "kernel32" fn AttachConsole(
             dwProcessId: DWORD,

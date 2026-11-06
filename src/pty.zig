@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const windows = @import("os/main.zig").windows;
+const global = @import("global.zig");
 const posix = std.posix;
 const assert = @import("quirks.zig").inlineAssert;
 
@@ -331,11 +332,117 @@ const WindowsPty = struct {
     // Process-wide counter for pipe names
     var pipe_name_counter = std.atomic.Value(u32).init(1);
 
+    /// The pseudoconsole functions a pty is made with, which must also
+    /// resize and close it: those of Microsoft's ConPTY package
+    /// (Microsoft.Windows.Console.ConPTY) when its conpty.dll and
+    /// OpenConsole.exe are beside the executable, else kernel32's.
+    ///
+    /// kernel32's start the system's conhost.exe, which drops the Kitty
+    /// graphics protocol and the replies to OSC 10, 52 and 5522, and
+    /// measures some clusters (emoji with skin tone modifiers, ZWJ
+    /// sequences, decomposed accents) wider than we do, so the shell's
+    /// cursor drifts from ours after them. The package's OpenConsole.exe
+    /// passes those sequences on and measures as we do.
+    const ConPty = struct {
+        create: *const @TypeOf(windows.exp.kernel32.CreatePseudoConsole) = &windows.exp.kernel32.CreatePseudoConsole,
+        resize: *const @TypeOf(windows.exp.kernel32.ResizePseudoConsole) = &windows.exp.kernel32.ResizePseudoConsole,
+        close: *const @TypeOf(windows.exp.kernel32.ClosePseudoConsole) = &windows.exp.kernel32.ClosePseudoConsole,
+        source: Source,
+
+        /// Where the functions came from: the package, or kernel32 and
+        /// why.
+        const Source = enum {
+            /// The package's conpty.dll.
+            package,
+            /// No conpty.dll beside the executable, or the folder or a
+            /// path in it could not be had.
+            no_dll,
+            /// conpty.dll without OpenConsole.exe. The DLL would start the
+            /// system's conhost.exe instead and still succeed, so this is
+            /// the only place the gap can be seen.
+            no_open_console,
+            /// conpty.dll did not load.
+            load_failed,
+            /// conpty.dll lacks one of the three functions.
+            no_export,
+        };
+
+        /// The functions for a pty opened now, from the executable's
+        /// folder. Each open looks again: after the first, LoadLibraryExW
+        /// finds conpty.dll loaded and raises its reference count, which
+        /// nothing lowers, so the pseudoconsoles made with it can always
+        /// be closed through it.
+        fn init() ConPty {
+            const alloc = global.alloc();
+            const dir = std.process.executableDirPathAlloc(global.io(), alloc) catch |err| {
+                log.warn("conpty: using the system's, the executable's folder is unknown err={}", .{err});
+                return .{ .source = .no_dll };
+            };
+            defer alloc.free(dir);
+            return load(alloc, dir);
+        }
+
+        /// The package's functions if `dir`, an absolute path, holds
+        /// conpty.dll and OpenConsole.exe, else kernel32's. A conpty.dll
+        /// that loads but lacks a function is freed at once.
+        fn load(alloc: std.mem.Allocator, dir: []const u8) ConPty {
+            return loadPaths(alloc, dir) catch |err| {
+                log.warn("conpty: using the system's, a path in {s} could not be made err={}", .{ dir, err });
+                return .{ .source = .no_dll };
+            };
+        }
+
+        fn loadPaths(alloc: std.mem.Allocator, dir: []const u8) !ConPty {
+            const io = global.io();
+            const dll = try std.fs.path.join(alloc, &.{ dir, "conpty.dll" });
+            defer alloc.free(dll);
+            std.Io.Dir.accessAbsolute(io, dll, .{}) catch |err| {
+                log.info("conpty: using the system's, no {s} err={}", .{ dll, err });
+                return .{ .source = .no_dll };
+            };
+
+            const open_console = try std.fs.path.join(alloc, &.{ dir, "OpenConsole.exe" });
+            defer alloc.free(open_console);
+            std.Io.Dir.accessAbsolute(io, open_console, .{}) catch |err| {
+                log.warn("conpty: using the system's, {s} without {s} err={}", .{ dll, open_console, err });
+                return .{ .source = .no_open_console };
+            };
+
+            const dll_w = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, dll);
+            defer alloc.free(dll_w);
+            const module = windows.exp.kernel32.LoadLibraryExW(
+                dll_w,
+                null,
+                windows.LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | windows.LOAD_LIBRARY_SEARCH_SYSTEM32,
+            ) orelse {
+                log.warn("conpty: using the system's, {s} did not load err={}", .{ dll, windows.GetLastError() });
+                return .{ .source = .load_failed };
+            };
+
+            var conpty: ConPty = .{ .source = .package };
+            inline for (.{
+                .{ "create", "ConptyCreatePseudoConsole" },
+                .{ "resize", "ConptyResizePseudoConsole" },
+                .{ "close", "ConptyClosePseudoConsole" },
+            }) |f| {
+                const proc = windows.exp.kernel32.GetProcAddress(module, f[1]) orelse {
+                    log.warn("conpty: using the system's, {s} has no {s} err={}", .{ dll, f[1], windows.GetLastError() });
+                    _ = windows.exp.kernel32.FreeLibrary(module);
+                    return .{ .source = .no_export };
+                };
+                @field(conpty, f[0]) = @ptrCast(@alignCast(proc));
+            }
+            log.info("conpty: using {s}", .{dll});
+            return conpty;
+        }
+    };
+
     out_pipe: windows.HANDLE,
     in_pipe: windows.HANDLE,
     out_pipe_pty: windows.HANDLE,
     in_pipe_pty: windows.HANDLE,
     pseudo_console: windows.HPCON,
+    conpty: ConPty,
     size: winsize,
 
     pub const OpenError = error{Unexpected};
@@ -441,7 +548,8 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
 
-        const result = windows.exp.kernel32.CreatePseudoConsole(
+        pty.conpty = .init();
+        const result = pty.conpty.create(
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
             pty.in_pipe_pty,
             pty.out_pipe_pty,
@@ -459,7 +567,7 @@ const WindowsPty = struct {
         _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
         _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        _ = windows.exp.kernel32.ClosePseudoConsole(self.pseudo_console);
+        self.conpty.close(self.pseudo_console);
         self.* = undefined;
     }
 
@@ -474,7 +582,7 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = windows.exp.kernel32.ResizePseudoConsole(
+        const result = self.conpty.resize(
             self.pseudo_console,
             .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
         );
@@ -517,4 +625,53 @@ test {
         .macos => try testing.expect(std.mem.startsWith(u8, pty.getProcessInfo(.tty_name).?, "/dev/")),
         else => try testing.expect(pty.getProcessInfo(.tty_name) == null),
     }
+}
+
+test "WindowsPty: ConPTY package only with conpty.dll and OpenConsole.exe" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const ConPty = WindowsPty.ConPty;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    const expectSystem = struct {
+        fn f(conpty: ConPty, source: ConPty.Source) !void {
+            try testing.expectEqual(source, conpty.source);
+            try testing.expect(conpty.create == &windows.exp.kernel32.CreatePseudoConsole);
+            try testing.expect(conpty.resize == &windows.exp.kernel32.ResizePseudoConsole);
+            try testing.expect(conpty.close == &windows.exp.kernel32.ClosePseudoConsole);
+        }
+    }.f;
+
+    // Neither file.
+    try expectSystem(ConPty.load(alloc, dir), .no_dll);
+
+    // OpenConsole.exe alone.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "OpenConsole.exe", .data = "" });
+    try expectSystem(ConPty.load(alloc, dir), .no_dll);
+
+    // A conpty.dll that is no DLL, alone: refused before it is loaded,
+    // because the package's DLL without OpenConsole.exe would start the
+    // system's conhost.exe and report success.
+    try tmp.dir.deleteFile(testing.io, "OpenConsole.exe");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "conpty.dll", .data = "not a DLL" });
+    try expectSystem(ConPty.load(alloc, dir), .no_open_console);
+
+    // With OpenConsole.exe beside it, it is loaded, which fails.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "OpenConsole.exe", .data = "" });
+    try expectSystem(ConPty.load(alloc, dir), .load_failed);
+
+    // A DLL without the ConPTY functions.
+    try std.Io.Dir.cwd().copyFile(
+        "C:\\Windows\\System32\\version.dll",
+        tmp.dir,
+        "conpty.dll",
+        testing.io,
+        .{},
+    );
+    try expectSystem(ConPty.load(alloc, dir), .no_export);
 }
