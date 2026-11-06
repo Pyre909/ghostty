@@ -49,6 +49,7 @@ const writeClipboard = @import("clipboard.zig").writeClipboard;
 const ClipboardReps = @import("clipboard.zig").Reps;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const clipboardPrompt = @import("clipboard.zig").clipboardPrompt;
+const ClipboardDialog = @import("ClipboardDialog.zig");
 const confirm = @import("dialog.zig").confirm;
 const drop = @import("drop.zig");
 const Shell = @import("../../termio/shell_integration.zig").Shell;
@@ -1406,7 +1407,10 @@ pub const Surface = struct {
 
     /// Complete a Kitty clipboard request handed over to this runtime
     /// (`.started`), asking first when the core will not complete it
-    /// unasked, as GTK's `kittyReadFinish` and `completeKittyWrite` do.
+    /// unasked, as GTK's `kittyReadFinish` and `completeKittyWrite` do,
+    /// with a prompt that shows what it would read or write
+    /// (`ClipboardDialog`). Allow with its box checked keeps a session
+    /// grant for the request's password (`CompleteClipboard.remember`).
     ///
     /// The core consumes the request, destroying it and the arena it lives
     /// in, for every outcome but `error.UnauthorizedPaste`, its errors
@@ -1419,12 +1423,22 @@ pub const Surface = struct {
     /// clipboard holds by then, as macOS does.
     fn completeKitty(self: *Surface, state: apprt.ClipboardRequest, complete: CoreSurface.CompleteClipboard) void {
         self.completeClipboard(state, complete) catch |err| switch (err) {
-            error.UnauthorizedPaste => if (confirm(self.app, self.hwnd, clipboardPrompt(state), .cancel)) {
-                var allowed = complete;
-                allowed.confirmed = true;
-                self.completeClipboard(state, allowed) catch |e|
-                    log.warn("unable to complete an allowed Kitty clipboard request err={}", .{e});
-            } else self.denyClipboard(state),
+            error.UnauthorizedPaste => switch (ClipboardDialog.ask(
+                self.app,
+                self.hwnd,
+                state,
+                complete.contents,
+                self.window.dark_frame,
+            )) {
+                .deny => self.denyClipboard(state),
+                .allow, .allow_and_remember => |answer| {
+                    var allowed = complete;
+                    allowed.confirmed = true;
+                    allowed.remember = answer == .allow_and_remember;
+                    self.completeClipboard(state, allowed) catch |e|
+                        log.warn("unable to complete an allowed Kitty clipboard request err={}", .{e});
+                },
+            },
             else => log.warn("unable to complete a Kitty clipboard request err={}", .{err}),
         };
     }

@@ -1442,6 +1442,111 @@ pub const BS_DEFPUSHBUTTON: DWORD = 0x0001;
 /// A static control shows its text with no "&" mnemonic.
 pub const SS_NOPREFIX: DWORD = 0x0080;
 
+// The Kitty clipboard prompt (`ClipboardDialog`): a modal dialog box made
+// from a template in memory, its parts in a combo box, the one picked
+// shown as text in a read-only EDIT or as an image drawn into an
+// owner-drawn static control.
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-dialogboxindirectparamw
+/// The value given to EndDialog; -1 if the dialog could not be made, 0
+/// if `owner` is not a window.
+pub extern "user32" fn DialogBoxIndirectParamW(
+    instance: ?HINSTANCE,
+    template: *const anyopaque,
+    owner: ?HWND,
+    proc: DLGPROC,
+    param: LPARAM,
+) callconv(.winapi) isize;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enddialog
+pub extern "user32" fn EndDialog(dialog: HWND, result: isize) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setdlgitemtextw
+pub extern "user32" fn SetDlgItemTextW(dialog: HWND, id: c_int, text: LPCWSTR) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsyscolor
+pub extern "user32" fn GetSysColor(index: c_int) callconv(.winapi) COLORREF;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsyscolorbrush
+/// One the system owns, never deleted.
+pub extern "user32" fn GetSysColorBrush(index: c_int) callconv(.winapi) ?HBRUSH;
+/// The face of dialog boxes and their buttons.
+pub const COLOR_BTNFACE: c_int = 15;
+/// GetWindow: the window's owner.
+pub const GW_OWNER: UINT = 4;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setstretchbltmode
+pub extern "gdi32" fn SetStretchBltMode(hdc: HDC, mode: c_int) callconv(.winapi) c_int;
+/// Each pixel the average of the pixels it stands for.
+pub const HALFTONE: c_int = 4;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbrushorgex
+/// Called after SetStretchBltMode(HALFTONE), as that function's page asks.
+pub extern "gdi32" fn SetBrushOrgEx(hdc: HDC, x: c_int, y: c_int, old: ?*POINT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchdibits
+/// The scan lines copied; 0 on failure.
+pub extern "gdi32" fn StretchDIBits(
+    hdc: HDC,
+    x_dest: c_int,
+    y_dest: c_int,
+    width_dest: c_int,
+    height_dest: c_int,
+    x_src: c_int,
+    y_src: c_int,
+    width_src: c_int,
+    height_src: c_int,
+    bits: *const anyopaque,
+    info: *const anyopaque,
+    usage: UINT,
+    rop: DWORD,
+) callconv(.winapi) c_int;
+/// The color table holds RGBQUADs.
+pub const DIB_RGB_COLORS: UINT = 0;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapinfoheader
+pub const BITMAPINFOHEADER = extern struct {
+    biSize: DWORD,
+    biWidth: i32,
+    /// Negative for rows from the top down.
+    biHeight: i32,
+    biPlanes: u16,
+    biBitCount: u16,
+    biCompression: DWORD,
+    biSizeImage: DWORD,
+    biXPelsPerMeter: i32,
+    biYPelsPerMeter: i32,
+    biClrUsed: DWORD,
+    biClrImportant: DWORD,
+};
+comptime {
+    // biSize: the SDK's sizeof(BITMAPINFOHEADER).
+    std.debug.assert(@sizeOf(BITMAPINFOHEADER) == 40);
+}
+/// https://learn.microsoft.com/en-us/windows/win32/controls/combo-box-styles
+pub const CBS_DROPDOWNLIST: DWORD = 0x0003;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/bumper-combobox-control-reference-messages
+pub const CB_ADDSTRING: UINT = 0x0143;
+pub const CB_GETCOUNT: UINT = 0x0146;
+pub const CB_GETCURSEL: UINT = 0x0147;
+pub const CB_SETCURSEL: UINT = 0x014E;
+/// WM_COMMAND's notification: the combo box's selection changed.
+pub const CBN_SELCHANGE: u16 = 1;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/edit-control-styles
+pub const ES_MULTILINE: DWORD = 0x0004;
+pub const ES_AUTOVSCROLL: DWORD = 0x0040;
+pub const ES_READONLY: DWORD = 0x0800;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/static-control-styles
+pub const SS_CENTER: DWORD = 0x0001;
+pub const SS_LEFTNOWORDWRAP: DWORD = 0x000C;
+/// Its parent draws it, given WM_DRAWITEM.
+pub const SS_OWNERDRAW: DWORD = 0x000D;
+pub const SS_ENDELLIPSIS: DWORD = 0x4000;
+/// https://learn.microsoft.com/en-us/windows/win32/controls/button-styles
+pub const BS_AUTOCHECKBOX: DWORD = 0x0003;
+pub const BM_GETCHECK: UINT = 0x00F0;
+pub const BM_SETCHECK: UINT = 0x00F1;
+/// BM_GETCHECK's answer for a checked box, and BM_SETCHECK's to check it.
+pub const BST_CHECKED: LRESULT = 1;
+/// https://learn.microsoft.com/en-us/windows/win32/dlgbox/dm-getdefid
+/// The default push button's id in the low word, DC_HASDEFID in the high.
+pub const DM_GETDEFID: UINT = 0x0400;
+pub const DC_HASDEFID: u16 = 0x534B;
+/// Centred in the work area of its owner's monitor, or the primary's.
+pub const DS_CENTER: DWORD = 0x0800;
+
 // The command palette (CommandPalette.zig): a window of the frame's holding
 // an EDIT for the query above an owner-drawn LISTBOX.
 

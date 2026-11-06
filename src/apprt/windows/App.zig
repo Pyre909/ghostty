@@ -11425,12 +11425,28 @@ fn testKittyRead(
 /// For tests: a Kitty clipboard write of `text`, as `testKittyRead` makes
 /// a read (`StreamHandler.kittyClipboardWrite`).
 fn testKittyWrite(alloc: Allocator, location: apprt.Clipboard, text: []const u8) !*apprt.ClipboardRequest.KittyWrite {
+    return testKittyWriteOf(alloc, location, &.{.{ .mime = "text/plain", .data = text }});
+}
+
+/// For tests: a part of a Kitty clipboard write (`testKittyWriteOf`).
+const TestPart = struct { mime: []const u8, data: []const u8 };
+
+/// For tests: a Kitty clipboard write of `parts`, each copied into its
+/// arena.
+fn testKittyWriteOf(
+    alloc: Allocator,
+    location: apprt.Clipboard,
+    parts: []const TestPart,
+) !*apprt.ClipboardRequest.KittyWrite {
     var arena: std.heap.ArenaAllocator = .init(alloc);
     errdefer arena.deinit();
     const a = arena.allocator();
     const req = try a.create(apprt.ClipboardRequest.KittyWrite);
-    const contents = try a.alloc(apprt.ClipboardContent, 1);
-    contents[0] = .{ .mime = "text/plain", .data = try a.dupeSentinel(u8, text, 0) };
+    const contents = try a.alloc(apprt.ClipboardContent, parts.len);
+    for (parts, contents) |part, *c| c.* = .{
+        .mime = try a.dupeSentinel(u8, part.mime, 0),
+        .data = try a.dupeSentinel(u8, part.data, 0),
+    };
     const id = try a.dupe(u8, "kc");
     req.* = .{
         .arena = arena,
@@ -11480,6 +11496,7 @@ const TestKittyCore = struct {
     var completed: usize = 0;
     var denied: usize = 0;
     var confirmed = false;
+    var remembered = false;
     var buf: [256]u8 = undefined;
     var len: usize = 0;
 
@@ -11490,6 +11507,7 @@ const TestKittyCore = struct {
         completed = 0;
         denied = 0;
         confirmed = false;
+        remembered = false;
         len = 0;
     }
 
@@ -11500,6 +11518,7 @@ const TestKittyCore = struct {
         }
         completed += 1;
         confirmed = done.confirmed;
+        remembered = done.remember;
         len = 0;
         for (done.contents) |c| {
             add(c.mime);
@@ -11541,52 +11560,165 @@ const TestKittyCore = struct {
     }
 };
 
-/// For tests: a Kitty clipboard prompt (`dialog.test_message_box`),
-/// answered `answer`, recording its text and buttons. While it is up it
-/// finds whether another program could open the clipboard, then writes
-/// `changed` to it, as a program could.
+/// For tests: the Kitty clipboard prompt (`ClipboardDialog.test_run`). It
+/// records what the dialog shows (`first`), checks the box to remember if
+/// `check` and the box is there, picks the part at `pick` if set, as the
+/// list would, and records the dialog again (`picked`), then answers
+/// `answer` as the button's click would, or leaves it unanswered when
+/// null, as the close button would. While it is up it finds whether
+/// another program could open the clipboard, then writes `changed` to it,
+/// as a program could.
 const TestKittyPrompt = struct {
-    var answer: c_int = win32.IDCANCEL;
+    const ClipboardDialog = @import("ClipboardDialog.zig");
+
+    var answer: ?c_int = win32.IDCANCEL;
+    var check = false;
+    var pick: ?usize = null;
     var boxes: usize = 0;
-    var text: ?win32.LPCWSTR = null;
-    var buttons: win32.UINT = 0;
     var hwnd: ?win32.HWND = null;
+    var first: View = .{};
+    var picked: View = .{};
     var open = false;
     var changed = false;
 
     fn reset(owner: win32.HWND) void {
         answer = win32.IDCANCEL;
+        check = false;
+        pick = null;
         boxes = 0;
         hwnd = owner;
         forget();
     }
 
     fn forget() void {
-        text = null;
-        buttons = 0;
+        first = .{};
+        picked = .{};
         open = false;
         changed = false;
     }
 
-    fn box(_: ?win32.HWND, prompt: win32.LPCWSTR, b: win32.UINT) c_int {
+    /// What the dialog shows: the heading, the part's name, or the one
+    /// picked, how many the list holds, the one preview shown and its text,
+    /// what a write leaves out, whether the box is offered, which button
+    /// Enter presses, and an image's pixels where they are drawn.
+    const View = struct {
+        heading: Text = .{},
+        part: Text = .{},
+        count: isize = 0,
+        shown: ?c_int = null,
+        /// How many previews are shown, which is always one.
+        previews: usize = 0,
+        preview: Text = .{},
+        unwritten: ?Text = null,
+        offered: bool = false,
+        default: isize = 0,
+        /// The image drawn: the pixel a quarter of the way into it, and
+        /// one of the face around it.
+        quarter: ?win32.COLORREF = null,
+        face: ?win32.COLORREF = null,
+
+        fn of(dialog: win32.HWND) View {
+            const parts = win32.GetDlgItem(dialog, ClipboardDialog.id_parts);
+            var v: View = .{
+                .heading = .of(win32.GetDlgItem(dialog, ClipboardDialog.id_heading)),
+                .part = .of(parts),
+                .count = if (parts) |p| win32.SendMessageW(p, win32.CB_GETCOUNT, 0, 0) else 0,
+                .offered = win32.GetDlgItem(dialog, ClipboardDialog.id_remember) != null,
+                .default = win32.SendMessageW(dialog, win32.DM_GETDEFID, 0, 0),
+            };
+            for ([_]c_int{ ClipboardDialog.id_text, ClipboardDialog.id_image, ClipboardDialog.id_none }) |id| {
+                const control = win32.GetDlgItem(dialog, id) orelse continue;
+                if (!shown(control)) continue;
+                v.previews += 1;
+                v.shown = id;
+                v.preview = .of(control);
+            }
+            if (win32.GetDlgItem(dialog, ClipboardDialog.id_unwritten)) |c| v.unwritten = .of(c);
+            if (v.shown == ClipboardDialog.id_image) v.drawn(dialog);
+            return v;
+        }
+
+        /// Draw the image into a bitmap as the dialog draws it into its
+        /// control (WM_DRAWITEM), and read two of its pixels.
+        fn drawn(self: *View, dialog: win32.HWND) void {
+            const image = win32.GetDlgItem(dialog, ClipboardDialog.id_image) orelse return;
+            var rect: win32.RECT = undefined;
+            if (!win32.GetClientRect(image, &rect).toBool()) return;
+            const screen = win32.GetDC(null) orelse return;
+            defer _ = win32.ReleaseDC(null, screen);
+            const dc = win32.CreateCompatibleDC(screen) orelse return;
+            defer _ = win32.DeleteDC(dc);
+            const bitmap = win32.CreateCompatibleBitmap(screen, rect.right, rect.bottom) orelse return;
+            defer _ = win32.DeleteObject(bitmap);
+            const old = win32.SelectObject(dc, bitmap);
+            defer if (old) |o| {
+                _ = win32.SelectObject(dc, o);
+            };
+            var item: win32.DRAWITEMSTRUCT = .{
+                // ODT_STATIC, ODA_DRAWENTIRE.
+                .CtlType = 5,
+                .CtlID = ClipboardDialog.id_image,
+                .itemID = 0,
+                .itemAction = 1,
+                .itemState = 0,
+                .hwndItem = image,
+                .hDC = dc,
+                .rcItem = rect,
+                .itemData = 0,
+            };
+            _ = win32.SendMessageW(dialog, win32.WM_DRAWITEM, ClipboardDialog.id_image, @bitCast(@intFromPtr(&item)));
+            const at = ClipboardDialog.fit(rect, 2, 2);
+            self.quarter = win32.GetPixel(dc, at.left + @divTrunc(at.right - at.left, 4), at.top + @divTrunc(at.bottom - at.top, 4));
+            self.face = win32.GetPixel(dc, 0, 0);
+        }
+    };
+
+    /// A control's text, its first `buf.len` units.
+    const Text = struct {
+        buf: [512]u16 = undefined,
+        len: usize = 0,
+
+        fn of(control: ?win32.HWND) Text {
+            var t: Text = .{};
+            const c = control orelse return t;
+            t.len = @intCast(@max(0, win32.GetWindowTextW(c, &t.buf, t.buf.len)));
+            return t;
+        }
+
+        fn expect(self: *const Text, want: []const u16) !void {
+            try std.testing.expectEqualSlices(u16, want, self.buf[0..self.len]);
+        }
+    };
+
+    fn run(dialog: win32.HWND) void {
         boxes += 1;
-        text = prompt;
-        buttons = b;
+        first = .of(dialog);
+        if (check) if (win32.GetDlgItem(dialog, ClipboardDialog.id_remember)) |box| {
+            _ = win32.SendMessageW(box, win32.BM_SETCHECK, @intCast(win32.BST_CHECKED), 0);
+        };
+        if (pick) |i| if (win32.GetDlgItem(dialog, ClipboardDialog.id_parts)) |list| {
+            // CB_SETCURSEL sends no CBN_SELCHANGE; a click on the list does.
+            _ = win32.SendMessageW(list, win32.CB_SETCURSEL, i, 0);
+            const notify: win32.WPARAM = @as(win32.WPARAM, win32.CBN_SELCHANGE) << 16 | ClipboardDialog.id_parts;
+            _ = win32.SendMessageW(dialog, win32.WM_COMMAND, notify, @bitCast(@intFromPtr(list)));
+            picked = .of(dialog);
+        };
         const clipboard = @import("clipboard.zig");
         open = if (clipboard.TestHolder.start()) |holder| open: {
             holder.release();
             break :open true;
         } else |_| false;
         changed = if (writeClipboard(std.testing.allocator, hwnd.?, .text("changed"))) |_| true else |_| false;
-        return answer;
+        if (answer) |id| _ = win32.SendMessageW(dialog, win32.WM_COMMAND, @intCast(id), 0);
     }
 
-    /// That the last prompt asked `want`, Cancel the button Enter presses,
+    /// That the last prompt asked `want`, Deny the button Enter presses,
     /// with the clipboard free for other programs to open and change.
     fn expectAsked(want: win32.LPCWSTR) !void {
         defer forget();
-        try std.testing.expectEqualSlices(u16, std.mem.span(want), std.mem.span(text.?));
-        try std.testing.expectEqual(win32.MB_DEFBUTTON2, buttons & win32.MB_DEFMASK);
+        try first.heading.expect(std.mem.span(want));
+        try std.testing.expectEqual(@as(isize, win32.DC_HASDEFID) << 16 | win32.IDCANCEL, first.default);
+        try std.testing.expectEqual(1, first.previews);
         try std.testing.expect(open);
         try std.testing.expect(changed);
     }
@@ -11616,9 +11748,9 @@ test "win32: a Kitty clipboard read serves what was read, asking first, and answ
     Surface.test_clipboard_deny = &TestKittyCore.deny;
     defer Surface.test_clipboard_deny = null;
     TestKittyPrompt.reset(pane.hwnd);
-    const message_box = &@import("dialog.zig").test_message_box;
-    message_box.* = &TestKittyPrompt.box;
-    defer message_box.* = null;
+    const ClipboardDialog = @import("ClipboardDialog.zig");
+    ClipboardDialog.test_run = &TestKittyPrompt.run;
+    defer ClipboardDialog.test_run = null;
     const read_prompt = clipboard.clipboardPrompt(.kitty_read);
 
     // Unasked, each type asked for under the name asked, and the listing.
@@ -11656,6 +11788,7 @@ test "win32: a Kitty clipboard read serves what was read, asking first, and answ
         const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, false);
         try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
     }
+    try TestKittyPrompt.first.preview.expect(std.unicode.utf8ToUtf16LeStringLiteral("before"));
     try TestKittyPrompt.expectAsked(read_prompt);
     try std.testing.expectEqual(1, TestKittyPrompt.boxes);
     try std.testing.expectEqual(1, TestKittyCore.asked);
@@ -11744,9 +11877,9 @@ test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
     Surface.test_clipboard_deny = &TestKittyCore.deny;
     defer Surface.test_clipboard_deny = null;
     TestKittyPrompt.reset(pane.hwnd);
-    const message_box = &@import("dialog.zig").test_message_box;
-    message_box.* = &TestKittyPrompt.box;
-    defer message_box.* = null;
+    const ClipboardDialog = @import("ClipboardDialog.zig");
+    ClipboardDialog.test_run = &TestKittyPrompt.run;
+    defer ClipboardDialog.test_run = null;
 
     // A write carries what it writes, which the core writes once allowed.
     // Unasked, then asked and allowed, then asked and denied.
@@ -11793,6 +11926,163 @@ test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
     }
     try std.testing.expectEqual(3, TestKittyCore.completed);
     try std.testing.expectEqual(2, TestKittyPrompt.boxes);
+}
+
+test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers only an Allow with a password" {
+    const alloc = std.testing.allocator;
+    const clipboard = @import("clipboard.zig");
+    const ClipboardDialog = @import("ClipboardDialog.zig");
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
+
+    TestKittyCore.reset();
+    TestKittyCore.ask = true;
+    Surface.test_clipboard_core = &TestKittyCore.complete;
+    defer Surface.test_clipboard_core = null;
+    Surface.test_clipboard_deny = &TestKittyCore.deny;
+    defer Surface.test_clipboard_deny = null;
+    TestKittyPrompt.reset(pane.hwnd);
+    ClipboardDialog.test_run = &TestKittyPrompt.run;
+    defer ClipboardDialog.test_run = null;
+    const P = TestKittyPrompt;
+
+    // A read of two types: listed by name and size, the first shown, the
+    // text with its override escaped, then the other picked. With no
+    // password there is no box to remember, checked or not.
+    try writeClipboard(alloc, pane.hwnd, .of(&.{
+        .{ .mime = "text/html", .data = "<b>h</b>" },
+        .{ .mime = "text/plain", .data = "a\u{202E}b" },
+    }, false));
+    P.answer = win32.IDOK;
+    P.check = true;
+    P.pick = 1;
+    {
+        const req = try testKittyRead(alloc, .standard, &.{ "text/plain", "text/html" }, false);
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try std.testing.expectEqual(2, P.first.count);
+    try P.first.part.expect(W("text/plain (5 bytes)"));
+    try std.testing.expectEqual(@as(?c_int, ClipboardDialog.id_text), P.first.shown);
+    try P.first.preview.expect(W("a\\u{202E}b"));
+    try std.testing.expect(!P.first.offered);
+    try std.testing.expect(P.first.unwritten == null);
+    try P.picked.part.expect(W("text/html (8 bytes)"));
+    try std.testing.expectEqual(1, P.picked.previews);
+    try P.picked.preview.expect(W("<b>h</b>"));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_read));
+    try std.testing.expect(TestKittyCore.confirmed);
+    try std.testing.expect(!TestKittyCore.remembered);
+
+    // With a password the box is offered: Allow with it checked keeps a
+    // session grant, without it does not, and Deny never does.
+    P.pick = null;
+    for ([_]struct { bool, c_int }{ .{ true, win32.IDOK }, .{ false, win32.IDOK }, .{ true, win32.IDCANCEL } }) |c| {
+        P.check = c[0];
+        P.answer = c[1];
+        const completed = TestKittyCore.completed;
+        const denied = TestKittyCore.denied;
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, false);
+        req.pw = "pw";
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_read = req }));
+        try std.testing.expect(P.first.offered);
+        // One part, what the last prompt wrote: its name, no list.
+        try std.testing.expectEqual(0, P.first.count);
+        try P.first.part.expect(W("text/plain (7 bytes)"));
+        if (c[1] == win32.IDOK) {
+            try std.testing.expectEqual(completed + 1, TestKittyCore.completed);
+            try std.testing.expectEqual(c[0], TestKittyCore.remembered);
+        } else {
+            try std.testing.expectEqual(completed, TestKittyCore.completed);
+            try std.testing.expectEqual(denied + 1, TestKittyCore.denied);
+        }
+    }
+
+    // A write: a PNG drawn over the dialog's face, a type Windows has no
+    // format for named as left out, its name escaped, and a PNG too large
+    // to decode, picked, shown as its size.
+    var large = clipboard.test_png.*;
+    std.mem.writeInt(u32, large[16..20], 4096, .big);
+    std.mem.writeInt(u32, large[20..24], 4096, .big);
+    P.check = false;
+    P.answer = win32.IDOK;
+    P.pick = 2;
+    {
+        const req = try testKittyWriteOf(alloc, .standard, &.{
+            .{ .mime = "image/png", .data = clipboard.test_png },
+            .{ .mime = "application/x-\u{202E}a", .data = "x" },
+            .{ .mime = "image/png", .data = &large },
+        });
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try std.testing.expectEqual(3, P.first.count);
+    try std.testing.expectEqual(@as(?c_int, ClipboardDialog.id_image), P.first.shown);
+    // Opaque red, and the face around it.
+    try std.testing.expectEqual(@as(?win32.COLORREF, 0x0000FF), P.first.quarter);
+    try std.testing.expectEqual(@as(?win32.COLORREF, win32.GetSysColor(win32.COLOR_BTNFACE)), P.first.face);
+    const unwritten = P.first.unwritten orelse return error.TestUnexpectedResult;
+    try unwritten.expect(W("Not written, Windows has no clipboard format for: application/x-\\u{202E}a"));
+    try std.testing.expectEqual(@as(?c_int, ClipboardDialog.id_none), P.picked.shown);
+    {
+        var buf: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&buf, "No preview available\r\n{d} bytes", .{large.len});
+        var wide: [64]u16 = undefined;
+        const n = try std.unicode.utf8ToUtf16Le(&wide, want);
+        try P.picked.preview.expect(wide[0..n]);
+    }
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+
+    // An empty write, which clears the clipboard, shows the empty text it
+    // writes.
+    P.pick = null;
+    {
+        const req = try testKittyWriteOf(alloc, .standard, &.{});
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+    }
+    try P.first.part.expect(W("text/plain (0 bytes)"));
+    try std.testing.expectEqual(@as(?c_int, ClipboardDialog.id_text), P.first.shown);
+    try P.first.preview.expect(W(""));
+
+    // Unanswered is Deny; so is a prompt that cannot be shown, and one
+    // asked for while the windows close, which shows nothing.
+    P.answer = null;
+    {
+        const denied = TestKittyCore.denied;
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+        try std.testing.expectEqual(denied + 1, TestKittyCore.denied);
+    }
+    P.answer = win32.IDOK;
+    const boxes = P.boxes;
+    {
+        ClipboardDialog.test_fail = true;
+        defer ClipboardDialog.test_fail = false;
+        const denied = TestKittyCore.denied;
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+        try std.testing.expectEqual(denied + 1, TestKittyCore.denied);
+    }
+    {
+        app.terminating = true;
+        defer app.terminating = false;
+        const denied = TestKittyCore.denied;
+        const req = try testKittyWrite(alloc, .standard, "w");
+        try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
+        try std.testing.expectEqual(denied + 1, TestKittyCore.denied);
+    }
+    try std.testing.expectEqual(boxes, P.boxes);
 }
 
 /// For tests: `pane`'s title prompt for `which`, opened as a binding opens

@@ -26,7 +26,9 @@ pub const ConfirmDefault = enum {
     }
 };
 
-/// A modal yes/no prompt. This is the only confirmation UI this runtime has.
+/// A modal yes/no prompt, a message box. The Kitty clipboard prompt, which
+/// shows what a program would read or write, is a dialog of its own
+/// (`ClipboardDialog`), run as this one is.
 pub fn confirm(
     app: *App,
     hwnd: ?win32.HWND,

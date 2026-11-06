@@ -361,6 +361,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("windows/App.zig");
     _ = @import("windows/ChildExited.zig");
+    _ = @import("windows/ClipboardDialog.zig");
     _ = @import("windows/CommandPalette.zig");
     _ = @import("windows/ContextMenu.zig");
     _ = @import("windows/Dividers.zig");

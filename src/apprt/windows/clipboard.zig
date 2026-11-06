@@ -55,7 +55,7 @@ pub const Format = enum { text, html, png, bmp, rtf };
 /// types under their MIME names would register each name for the rest of
 /// the session, in an atom table every program shares
 /// (https://learn.microsoft.com/en-us/windows/win32/dataxchg/about-atom-tables).
-fn formatOf(mime: []const u8) ?Format {
+pub fn formatOf(mime: []const u8) ?Format {
     if (terminal.clipboard.isTextMime(mime)) return .text;
     const names = [_]struct { []const u8, Format }{
         .{ "text/html", .html },
@@ -696,6 +696,119 @@ fn dibBlock(dib: Dib) ?Block {
         .format = if (dib.kind == .dib) win32.CF_DIB else win32.CF_DIBV5,
         .mem = block.mem,
     };
+}
+
+/// An image as the Kitty clipboard prompt draws it (`ClipboardDialog`):
+/// a DIB as StretchDIBits takes it, its info apart from its bits.
+pub const Picture = struct {
+    /// A BITMAPINFO: the info header, then any masks and color table.
+    info: []align(4) u8,
+    bits: []u8,
+    width: i32,
+    /// How many rows, whichever way they go.
+    height: i32,
+
+    pub fn deinit(self: Picture, alloc: Allocator) void {
+        alloc.free(self.info);
+        alloc.free(self.bits);
+    }
+};
+
+/// `data` as a Picture if it is a PNG or a BMP file, the image formats this
+/// runtime writes (`formatOf`): a PNG decoded, its transparency over
+/// `background` as the prompt's face shows through it; a BMP file's DIB as
+/// it is, which GDI draws. Null if it is neither, does not decode, or has
+/// as many pixels as a whole write may hold bytes (`dibBitsLen`), which is
+/// checked before anything is decoded or copied.
+pub fn picture(alloc: Allocator, data: []const u8, background: win32.COLORREF) ?Picture {
+    if (pngSize(data)) |size| return pngPicture(alloc, data, size, background);
+    const dib = dibOfBmp(data) catch return null;
+    return bmpPicture(alloc, dib);
+}
+
+fn pngPicture(alloc: Allocator, png: []const u8, size: PngSize, background: win32.COLORREF) ?Picture {
+    const bits_len = dibBitsLen(size) orelse {
+        log.info("no picture of a PNG this large width={d} height={d}", .{ size.width, size.height });
+        return null;
+    };
+    const image = wuffs.png.decode(alloc, png) catch |err| {
+        log.info("PNG could not be decoded for its picture err={}", .{err});
+        return null;
+    };
+    if (image.width != size.width or image.height != size.height or image.data.len != bits_len) {
+        log.warn("PNG decoded to {d}x{d} where its header says {d}x{d}", .{
+            image.width, image.height, size.width, size.height,
+        });
+        alloc.free(image.data);
+        return null;
+    }
+    const info = alloc.alignedAlloc(u8, .of(win32.BITMAPINFOHEADER), @sizeOf(win32.BITMAPINFOHEADER)) catch {
+        alloc.free(image.data);
+        return null;
+    };
+    // Both fit: their product is under max_write_size.
+    const width: i32 = @intCast(size.width);
+    const height: i32 = @intCast(size.height);
+    const header: win32.BITMAPINFOHEADER = .{
+        .biSize = @sizeOf(win32.BITMAPINFOHEADER),
+        .biWidth = width,
+        // Negative: the rows go from the top down, as decoded.
+        .biHeight = -height,
+        .biPlanes = 1,
+        .biBitCount = 32,
+        .biCompression = win32.BI_RGB,
+        .biSizeImage = 0,
+        .biXPelsPerMeter = 0,
+        .biYPelsPerMeter = 0,
+        .biClrUsed = 0,
+        .biClrImportant = 0,
+    };
+    @memcpy(info, std.mem.asBytes(&header));
+    over(image.data, background);
+    return .{ .info = info, .bits = image.data, .width = width, .height = height };
+}
+
+/// RGBA pixels, not premultiplied, as the decoder gives them, made in place
+/// into what a 32-bit BI_RGB DIB holds, blue, green, red and a byte GDI
+/// ignores, each over `background` by its alpha, rounded.
+fn over(pixels: []u8, background: win32.COLORREF) void {
+    const bg_r: u32 = background & 0xFF;
+    const bg_g: u32 = (background >> 8) & 0xFF;
+    const bg_b: u32 = (background >> 16) & 0xFF;
+    var i: usize = 0;
+    while (i + 4 <= pixels.len) : (i += 4) {
+        const p = pixels[i..][0..4];
+        const a: u32 = p[3];
+        const r = blend(p[0], a, bg_r);
+        const g = blend(p[1], a, bg_g);
+        const b = blend(p[2], a, bg_b);
+        p.* = .{ b, g, r, 0 };
+    }
+}
+
+fn blend(c: u8, a: u32, bg: u32) u8 {
+    // At most (255 * 255 + 127) / 255, so it fits.
+    return @intCast((@as(u32, c) * a + bg * (255 - a) + 127) / 255);
+}
+
+fn bmpPicture(alloc: Allocator, dib: Dib) ?Picture {
+    const width = std.mem.readInt(i32, dib.header[4..8], .little);
+    const height = std.mem.readInt(i32, dib.header[8..12], .little);
+    // dibLayout took neither as zero or less, nor minInt(i32) rows. GDI
+    // makes the pixels of a compressed bitmap, whatever its bits' length.
+    const size: PngSize = .{ .width = @intCast(width), .height = @abs(height) };
+    if (dibBitsLen(size) == null) {
+        log.info("no picture of a BMP this large width={d} height={d}", .{ size.width, size.height });
+        return null;
+    }
+    const info = alloc.alignedAlloc(u8, .of(win32.BITMAPINFOHEADER), dib.header.len + dib.table.len) catch return null;
+    @memcpy(info[0..dib.header.len], dib.header);
+    @memcpy(info[dib.header.len..], dib.table);
+    const bits = alloc.dupe(u8, dib.bits) catch {
+        alloc.free(info);
+        return null;
+    };
+    return .{ .info = info, .bits = bits, .width = width, .height = @intCast(size.height) };
 }
 
 /// `bytes` of movable memory for a `kind` block, as SetClipboardData
@@ -1493,7 +1606,7 @@ fn testHolds(hwnd: win32.HWND, format: win32.UINT, want: []const u8) !bool {
 /// For tests: a 2x2 PNG, RGBA at 8 bits a channel. Its pixels, top row
 /// first: opaque red, green at an alpha of 128; blue at an alpha of 0,
 /// and (16, 32, 48) at 64.
-const test_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52" ++
+pub const test_png = "\x89\x50\x4e\x47\x0d\x0a\x1a\x0a\x00\x00\x00\x0d\x49\x48\x44\x52" ++
     "\x00\x00\x00\x02\x00\x00\x00\x02\x08\x06\x00\x00\x00\x72\xb6\x0d" ++
     "\x24\x00\x00\x00\x16\x49\x44\x41\x54\x78\xda\x63\xf8\xcf\xc0\xf0" ++
     "\x1f\x08\x1b\x18\x40\xb4\x80\x82\x81\x03\x00\x37\x21\x05\x1d\x77" ++
@@ -2064,6 +2177,90 @@ test "win32: a PNG goes as it is, with a DIB of its pixels unless it is too larg
     }) |data| {
         if (std.mem.eql(u8, data, test_png)) continue;
         try std.testing.expect(pngSize(data) == null);
+    }
+}
+
+test "win32: a PNG's picture is its pixels over the background, top down" {
+    const alloc = std.testing.allocator;
+    // RGB(10, 20, 30).
+    const p = picture(alloc, test_png, 0x001E140A) orelse return error.TestUnexpectedResult;
+    defer p.deinit(alloc);
+    try std.testing.expectEqual(2, p.width);
+    try std.testing.expectEqual(2, p.height);
+    try std.testing.expectEqual(@sizeOf(win32.BITMAPINFOHEADER), p.info.len);
+    const header = std.mem.bytesToValue(win32.BITMAPINFOHEADER, p.info[0..@sizeOf(win32.BITMAPINFOHEADER)]);
+    try std.testing.expectEqual(40, header.biSize);
+    try std.testing.expectEqual(2, header.biWidth);
+    try std.testing.expectEqual(-2, header.biHeight);
+    try std.testing.expectEqual(1, header.biPlanes);
+    try std.testing.expectEqual(32, header.biBitCount);
+    try std.testing.expectEqual(win32.BI_RGB, header.biCompression);
+    // Blue, green, red: opaque red as it is, green at 128 halfway over the
+    // background, transparent blue the background, and (16, 32, 48) at 64
+    // a quarter of the way.
+    try std.testing.expectEqualSlices(u8, &.{
+        0,  0,  255, 0, 15, 138, 5,  0,
+        30, 20, 10,  0, 35, 23,  12, 0,
+    }, p.bits);
+}
+
+test "win32: a picture is never made of what is too large, nor decoded to find out" {
+    // The header says 4096x4096, whose pixels take all a write may.
+    var large = test_png.*;
+    std.mem.writeInt(u32, large[16..20], 4096, .big);
+    std.mem.writeInt(u32, large[20..24], 4096, .big);
+    var counting: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    try std.testing.expect(picture(counting.allocator(), &large, 0) == null);
+    try std.testing.expectEqual(0, counting.allocations);
+
+    // An RLE bitmap's bits are short whatever its size, but GDI makes
+    // all its pixels to draw it.
+    var buf: [256]u8 = undefined;
+    const rle: TestBmp = .{ .bpp = 8, .compression = win32.BI_RLE8, .clr_used = 2 };
+    const bmp = rle.file(&buf);
+    std.mem.writeInt(i32, bmp[18..22], 5000, .little);
+    std.mem.writeInt(i32, bmp[22..26], 5000, .little);
+    try std.testing.expect(picture(counting.allocator(), bmp, 0) == null);
+    try std.testing.expectEqual(0, counting.allocations);
+    // The bound is a write's whole size, as for a PNG (`dibBitsLen`).
+    std.mem.writeInt(i32, bmp[22..26], 3356, .little);
+    try std.testing.expect(5000 * 3356 * 4 >= max_write_size);
+    try std.testing.expect(picture(counting.allocator(), bmp, 0) == null);
+    try std.testing.expectEqual(0, counting.allocations);
+    std.mem.writeInt(i32, bmp[22..26], 3355, .little);
+    try std.testing.expect(5000 * 3355 * 4 < max_write_size);
+    const p = picture(counting.allocator(), bmp, 0) orelse return error.TestUnexpectedResult;
+    p.deinit(counting.allocator());
+}
+
+test "win32: a BMP's picture is its header, table and bits, without the file's gap" {
+    const alloc = std.testing.allocator;
+    var buf: [1200]u8 = undefined;
+    for ([_]TestBmp{
+        .{},
+        .{ .bpp = 8, .gap = 3 },
+        .{ .header = 124, .bpp = 32, .compression = win32.BI_BITFIELDS, .height = -2 },
+        .{ .bpp = 4, .compression = win32.BI_RLE4, .clr_used = 3 },
+    }) |t| {
+        const bmp = t.file(&buf);
+        const p = picture(alloc, bmp, 0) orelse return error.TestUnexpectedResult;
+        defer p.deinit(alloc);
+        const table_end = 14 + t.header + t.tableLen();
+        try std.testing.expectEqualSlices(u8, bmp[14..table_end], p.info);
+        try std.testing.expectEqualSlices(u8, bmp[t.offBits()..][0..t.bitsLen()], p.bits);
+        try std.testing.expectEqual(TestBmp.width, p.width);
+        try std.testing.expectEqual(2, p.height);
+    }
+}
+
+test "win32: only a PNG or BMP that can be read is a picture" {
+    const alloc = std.testing.allocator;
+    var broken = test_png.*;
+    @memset(broken[41..60], 0xAA);
+    var buf: [256]u8 = undefined;
+    const profile = (TestBmp{ .header = 124, .cs_type = win32.PROFILE_EMBEDDED }).file(&buf);
+    for ([_][]const u8{ "", "text", "BM", &broken, test_png[0..30], profile }) |data| {
+        try std.testing.expect(picture(alloc, data, 0) == null);
     }
 }
 

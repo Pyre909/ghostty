@@ -341,10 +341,15 @@ fn fieldText(alloc: std.mem.Allocator, hwnd: win32.HWND) ![:0]u8 {
 }
 
 /// Give the prompt's title bar the frame's mode (`Window.applyTheme`): the
-/// dialog follows `window-theme` as the frames do. Its body stays light, as
-/// MessageBoxW's does; only undocumented APIs change that.
+/// dialog follows `window-theme` as the frames do.
 pub fn setDark(window: *Window, dark: bool) void {
     const hwnd = window.title_prompt.hwnd orelse return;
+    darkTitleBar(hwnd, dark);
+}
+
+/// Give a dialog's title bar the frames' mode, dark or not. Its body stays
+/// light, as MessageBoxW's does; only undocumented APIs change that.
+pub fn darkTitleBar(hwnd: win32.HWND, dark: bool) void {
     const value: win32.BOOL = if (dark) .TRUE else .FALSE;
     const hr = win32.DwmSetWindowAttribute(
         hwnd,
@@ -353,13 +358,13 @@ pub fn setDark(window: *Window, dark: bool) void {
         @sizeOf(win32.BOOL),
     );
     if (hr < 0) {
-        log.warn("cannot set the title prompt's mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
+        log.warn("cannot set a dialog's mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
     }
 }
 
 /// Centre the dialog over its frame, kept inside the work area of the
 /// frame's monitor, as GTK centres its alert over its window.
-fn placeOverOwner(hwnd: win32.HWND, owner: win32.HWND) void {
+pub fn placeOverOwner(hwnd: win32.HWND, owner: win32.HWND) void {
     var dialog: win32.RECT = undefined;
     var frame: win32.RECT = undefined;
     if (!win32.GetWindowRect(hwnd, &dialog).toBool()) return;
@@ -462,6 +467,7 @@ pub const Item = struct {
         button = 0x0080,
         edit = 0x0081,
         static = 0x0082,
+        combobox = 0x0085,
     };
 };
 
