@@ -64,6 +64,7 @@ pub fn route(key: Binding.Action.Key) Route {
         .new_window,
         .open_config,
         .reload_config,
+        .set_window_theme,
         .close_all_windows,
         .quit,
         .toggle_quick_terminal,

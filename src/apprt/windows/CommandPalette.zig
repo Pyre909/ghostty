@@ -128,6 +128,8 @@ pub fn supported(key: Binding.Action.Key) bool {
         .show_gtk_inspector,
         .show_on_screen_keyboard,
         .toggle_secure_input,
+        // Nor a window theme set for the session, over `window-theme`.
+        .set_window_theme,
         => false,
     };
 }

@@ -17805,6 +17805,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
         .{ .toggle_secure_input, .secure_input },
+        .{ .set_window_theme, .set_window_theme },
         // Listed.
         .{ .new_window, .new_window },
         .{ .new_tab, .new_tab },
@@ -17876,11 +17877,12 @@ test "win32: the command palette lists only what performAction carries out" {
             .start_search => .{ .needle = "" },
             .search_selection => .{ .needle = "t" },
             .reload_config => .{},
+            .set_window_theme => .dark,
             .toggle_readonly => .on,
             else => if (apprt.Action.Value(case[1]) == void) {} else unreachable,
         };
         const to: apprt.Target = switch (case[0]) {
-            .toggle_quick_terminal, .reload_config, .quit => .app,
+            .toggle_quick_terminal, .reload_config, .quit, .set_window_theme => .app,
             else => target,
         };
         // Answered before it would ask the core whether to confirm, or
