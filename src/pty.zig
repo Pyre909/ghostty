@@ -352,7 +352,7 @@ const WindowsPty = struct {
     /// kernel32's start the system's conhost.exe, which drops the Kitty
     /// graphics protocol and the replies to OSC 10, 52 and 5522, and
     /// measures some clusters (emoji with skin tone modifiers, ZWJ
-    /// sequences, decomposed accents) wider than we do, so the shell's
+    /// sequences, decomposed accents) wider than we do, so a program's
     /// cursor drifts from ours after them. The package's OpenConsole.exe
     /// passes those sequences on, and open tells it to measure as we do.
     const ConPty = struct {
@@ -369,9 +369,11 @@ const WindowsPty = struct {
             /// No conpty.dll beside the executable, or the folder or a
             /// path in it could not be had.
             no_dll,
-            /// conpty.dll without OpenConsole.exe. The DLL would start the
-            /// system's conhost.exe instead and still succeed, so this is
-            /// the only place the gap can be seen.
+            /// conpty.dll without OpenConsole.exe beside it. The DLL would
+            /// then start one from a folder named for the machine's
+            /// architecture, a layout we do not install and so refuse, or
+            /// else the system's conhost.exe, and succeed either way, so
+            /// this is the only place the gap can be seen.
             no_open_console,
             /// conpty.dll did not load.
             load_failed,
@@ -412,10 +414,12 @@ const WindowsPty = struct {
         }
 
         /// The functions for a pty opened now, from the executable's
-        /// folder. Each open looks again: after the first, LoadLibraryExW
-        /// finds conpty.dll loaded and raises its reference count, which
-        /// nothing lowers, so the pseudoconsoles made with it can always
-        /// be closed through it.
+        /// folder, not this module's: a program that embeds libghostty
+        /// gets the package only with both files beside its own
+        /// executable. Each open looks again: after the first,
+        /// LoadLibraryExW finds conpty.dll loaded and raises its reference
+        /// count, which nothing lowers, so the pseudoconsoles made with it
+        /// can always be closed through it.
         fn init() ConPty {
             const alloc = global.alloc();
             const dir = std.process.executableDirPathAlloc(global.io(), alloc) catch |err| {
