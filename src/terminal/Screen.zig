@@ -1104,8 +1104,11 @@ pub fn cursorDownScroll(self: *Screen) !void {
             self.cursor.page_cell = page_rac.cell;
         }
 
-        // Our new row is always dirty
-        self.cursorMarkDirty();
+        // Our new row is always dirty. It is also always in the zero
+        // state: from unused page capacity, a fresh page, or a recycled
+        // page that grow() zeroed. Marking it blank too, in the same
+        // write, lets printing into it skip checking its old cells.
+        self.cursor.page_row.markCleared();
 
         // Clear the new row so it gets our bg color. We only do this
         // if we have a bg color at all.
@@ -1361,8 +1364,9 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     const page: *Page = pin.node.pageAssumeResident();
     const rows = page.rows.ptr(page.memory.ptr)[pin.y - limit ..][0 .. limit + 1];
 
-    // Clear the erased (top) row.
-    {
+    // Clear the erased (top) row and build its reset header, which the
+    // rotation below writes into the row's new slot.
+    const reset_row: Row = reset: {
         const row: *Row = &rows[0];
 
         // Whether our blank cell is a plain zero cell. This is true
@@ -1385,15 +1389,22 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
 
         // The row becomes the new blank cursor row after the rotation
         // below and must not retain metadata (wrap state, semantic
-        // prompt) from the discarded content.
-        row.reset();
-    }
+        // prompt) from the discarded content. This is Row.reset.
+        assert(!row.managedMemory());
+        break :reset .{ .cells = row.cells, .dirty = true };
+    };
 
     // Rotate the region rows so the now-blank top row moves to the
     // bottom (the cursor row) and everything else shifts up by one.
     // Rotating the region changes which logical row its coordinates identify.
+    //
+    // The reset header goes straight to its new slot rather than through
+    // row.reset() and rotateOnce: x86-64 codegen narrows that reset to a
+    // 4-byte store, and the rotation's 8-byte load of the same header
+    // right after it can't be store-forwarded, which stalls every
+    // scrolled line (about 6% on vtebench's region scrolling).
     self.pages.invalidateNodeLayout(pin.node);
-    fastmem.rotateOnce(Row, rows);
+    _ = fastmem.rotateIn(Row, rows, reset_row);
 
     // Mark the whole page as dirty.
     //
@@ -2326,6 +2337,10 @@ pub inline fn resize(
     // state is correct.
     self.cursorReload();
 
+    // Erasing history marks a cursor pin in the erased rows as garbage, but
+    // the cursor stays live wherever the pin moved to.
+    self.cursor.page_pin.garbage = false;
+
     // If resize moved a cursor with pending wrap away from the right edge,
     // advance to the next cell instead of wrapping on the next print.
     if (self.cursor.pending_wrap and self.cursor.x != opts.cols - 1) {
@@ -2604,8 +2619,10 @@ pub fn manualStyleUpdate(self: *Screen) PageList.IncreaseCapacityError!void {
         page.memory,
         self.cursor.style,
     ) catch |err| id: {
-        // Our style map is full or needs to be rehashed, so we need to
-        // increase style capacity (or rehash).
+        // Our style map is full, so we need to increase style capacity.
+        // `NeedsRehash` only happens if the set's bookkeeping is wrong
+        // (safe builds panic instead), and a clone at the same capacity
+        // rebuilds it.
         const node = self.increaseCapacity(
             self.cursor.page_pin.node,
             switch (err) {
@@ -2637,10 +2654,10 @@ pub fn manualStyleUpdate(self: *Screen) PageList.IncreaseCapacityError!void {
                 return error.OutOfMemory;
             },
             error.NeedsRehash => {
-                // This should be impossible because we rehash above
-                // and rehashing should never result in a duplicate. But
-                // we don't want to simply hard crash so log it and
-                // clear our style.
+                // This should be impossible because the page was just
+                // rebuilt, so the set's bookkeeping is right. But we
+                // don't want to simply hard crash so log it and clear
+                // our style.
                 log.err("style rehash resulted in needs rehash", .{});
                 return;
             },
@@ -2856,7 +2873,8 @@ pub fn startHyperlink(
                 .hyperlink_bytes,
             ),
 
-            // hyperlink set is too full, rehash it
+            // hyperlink set bookkeeping is wrong (safe builds panic
+            // instead), rebuild it with a clone at the same capacity
             error.SetNeedsRehash => _ = try self.increaseCapacity(
                 self.cursor.page_pin.node,
                 null,
@@ -4056,6 +4074,24 @@ test "Screen reset cursor pin is not garbage" {
     // that copies it (e.g. Kitty image placements) would otherwise be
     // born garbage and reaped.
     s.reset();
+    try testing.expect(!s.cursor.page_pin.garbage);
+}
+
+test "Screen resize erasing the cursor row leaves its pin not garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try Screen.init(io, alloc, .{ .cols = 12, .rows = 6, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // Content on the bottom row stops the resize from trimming blank rows,
+    // so shrinking pushes the top rows and the cursor into erased history.
+    s.cursorAbsolute(0, 5);
+    try s.testWriteString("x");
+    s.cursorAbsolute(0, 0);
+
+    try s.resize(.{ .cols = 12, .rows = 3 });
     try testing.expect(!s.cursor.page_pin.garbage);
 }
 
