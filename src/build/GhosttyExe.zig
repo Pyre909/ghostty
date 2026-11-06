@@ -76,13 +76,21 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             // and kernel32's pseudoconsole otherwise. The package carries
             // no licence file, so its MIT notice (microsoft/terminal's
             // LICENSE) goes with them.
-            if (b.lazyDependency("conpty", .{})) |dep| conpty: {
+            //
+            // Only a build that installs the app asks for the package
+            // (build.zig installs the exe for an app runtime with
+            // emit-exe), so lib-vt and libghostty builds never fetch it.
+            // x86 gets none: the package's own layout gives a 32-bit
+            // build all three architectures' OpenConsole.exe, since it may
+            // run on 64-bit Windows, and that is not measured here.
+            conpty: {
+                if (cfg.app_runtime == .none or !cfg.emit_exe) break :conpty;
                 const arch = switch (cfg.target.result.cpu.arch) {
                     .aarch64 => "arm64",
                     .x86_64 => "x64",
-                    .x86 => "x86",
                     else => break :conpty,
                 };
+                const dep = b.lazyDependency("conpty", .{}) orelse break :conpty;
                 for ([_]struct { []const u8, []const u8 }{
                     .{ b.fmt("runtimes/win-{s}/native/conpty.dll", .{arch}), "conpty.dll" },
                     .{ b.fmt("build/native/runtimes/{s}/OpenConsole.exe", .{arch}), "OpenConsole.exe" },
