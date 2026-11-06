@@ -86,6 +86,10 @@ pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
     // of the repaint marks the next row a continuation of the prompt, so a
     // later clear can start above the prompt and blank rows that have
     // since moved into scrollback, which the host never repaints.
+    // OpenConsole.exe sends nothing after a resize, so a prompt we cleared
+    // would come back only if the shell redrew it, and a redraw that
+    // leaves the host's buffer as it was may send nothing either. That
+    // part is reasoning: no shell's prompt was measured there.
     if (comptime builtin.target.os.tag == .windows) {
         term.flags.resize_pull_scrollback = false;
         term.flags.resize_prompt_redraw = false;
@@ -2589,9 +2593,11 @@ test "initTerminal: growing pulls rows from scrollback except on ConPTY" {
     }
 
     // Growing back either pulls them into the active area again or leaves
-    // them in scrollback. ConPTY repaints its two rows at the top after the
-    // grow, so the terminal must leave rows 1 and 2 in scrollback to match
-    // it. A POSIX pty keeps no screen, so pulling them back is right there.
+    // them in scrollback. conhost.exe repaints its two rows at the top
+    // after the grow, and OpenConsole.exe, which doesn't repaint, keeps
+    // them at the top of its buffer with blank rows below, so the terminal
+    // must leave rows 1 and 2 in scrollback to match either. A POSIX pty
+    // keeps no screen, so pulling them back is right there.
     try term.resize(alloc, .{ .cols = 5, .rows = 4 });
     const conpty = builtin.target.os.tag == .windows;
     try testing.expectEqual(
@@ -2634,11 +2640,13 @@ test "initTerminal: widening pulls rows from scrollback except on ConPTY" {
         try testing.expectEqualStrings("3CCCC\nDD\n4E", str);
     }
 
-    // Widening unwraps the line, which frees a row. ConPTY reflows its own
-    // screen and repaints it from the top, so the terminal must keep its
-    // top row and leave the freed row blank at the bottom: "2BBBB" pulled
-    // back into view would be where ConPTY writes its first row, and lost.
-    // A POSIX pty keeps no screen, so pulling it back is right there.
+    // Widening unwraps the line, which frees a row. Both console hosts
+    // reflow their own screen and keep its top row, so the terminal must
+    // keep its top row too and leave the freed row blank at the bottom:
+    // "2BBBB" pulled back into view would be where conhost.exe repaints
+    // its first row, and lost, and a row OpenConsole.exe, which doesn't
+    // repaint, doesn't have. A POSIX pty keeps no screen, so pulling it
+    // back is right there.
     try term.resize(alloc, .{ .cols = 10, .rows = 3 });
     const conpty = builtin.target.os.tag == .windows;
     try testing.expectEqual(
@@ -2683,9 +2691,10 @@ test "initTerminal: a resize clears the prompt except on ConPTY" {
     try term.printString("ls");
 
     // On a POSIX pty the shell redraws its prompt after a resize (on
-    // SIGWINCH), so the terminal clears it. ConPTY repaints the prompt
-    // itself, so the terminal must not clear it: after a repaint, a clear
-    // can reach rows in scrollback (see initTerminal).
+    // SIGWINCH), so the terminal clears it. conhost.exe repaints the
+    // prompt itself, and after a repaint a clear can reach rows in
+    // scrollback; OpenConsole.exe keeps the prompt in its buffer and sends
+    // nothing (see initTerminal). So the terminal must not clear it.
     try term.resize(alloc, .{ .cols = 12, .rows = 3 });
     const conpty = builtin.target.os.tag == .windows;
     const str = try term.plainString(alloc);

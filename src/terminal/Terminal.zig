@@ -143,13 +143,15 @@ flags: packed struct {
     resize_pull_scrollback: bool = true,
 
     /// Whether a resize may clear the prompt for the shell to redraw, as
-    /// shell_redraws_prompt asks. This should be false if the pty repaints
-    /// its whole screen itself after a resize (e.g. Windows ConPTY): the
-    /// clear isn't needed there, and since the repaint carries no prompt
-    /// marks, a later clear can start at an earlier prompt and blank rows
-    /// the pty never repaints, such as rows in scrollback. This is
-    /// configuration rather than terminal state so it is preserved across
-    /// a full reset.
+    /// shell_redraws_prompt asks. This should be false if the pty keeps
+    /// its own screen buffer and doesn't clear the prompt in it (Windows
+    /// ConPTY's console hosts). One that repaints its screen after a
+    /// resize writes the prompt again itself without its marks, so a later
+    /// clear can start at an earlier prompt and blank rows the pty never
+    /// repaints, such as rows in scrollback; one that doesn't repaint
+    /// still has the prompt, so a clear could leave it blank on our side
+    /// alone. This is configuration rather than terminal state so it is
+    /// preserved across a full reset.
     resize_prompt_redraw: bool = true,
 
     /// True if the terminal is in a password entry mode. This is set
