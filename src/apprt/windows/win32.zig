@@ -1477,6 +1477,17 @@ pub const HALFTONE: c_int = 4;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setbrushorgex
 /// Called after SetStretchBltMode(HALFTONE), as that function's page asks.
 pub extern "gdi32" fn SetBrushOrgEx(hdc: HDC, x: c_int, y: c_int, old: ?*POINT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getbrushorgex
+pub extern "gdi32" fn GetBrushOrgEx(hdc: HDC, point: *POINT) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getstretchbltmode
+/// 0 on failure.
+pub extern "gdi32" fn GetStretchBltMode(hdc: HDC) callconv(.winapi) c_int;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-savedc
+/// The number of the state saved; 0 on failure.
+pub extern "gdi32" fn SaveDC(hdc: HDC) callconv(.winapi) c_int;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-restoredc
+/// Back to the state SaveDC numbered `saved`.
+pub extern "gdi32" fn RestoreDC(hdc: HDC, saved: c_int) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-stretchdibits
 /// The scan lines copied; 0 on failure.
 pub extern "gdi32" fn StretchDIBits(

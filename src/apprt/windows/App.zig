@@ -11616,6 +11616,9 @@ const TestKittyPrompt = struct {
         /// one of the face around it.
         quarter: ?win32.COLORREF = null,
         face: ?win32.COLORREF = null,
+        /// Whether drawing it left the DC's stretch mode and brush origin
+        /// as they were.
+        restored: ?bool = null,
 
         fn of(dialog: win32.HWND) View {
             const parts = win32.GetDlgItem(dialog, ClipboardDialog.id_parts);
@@ -11639,7 +11642,8 @@ const TestKittyPrompt = struct {
         }
 
         /// Draw the image into a bitmap as the dialog draws it into its
-        /// control (WM_DRAWITEM), and read two of its pixels.
+        /// control (WM_DRAWITEM), read two of its pixels, and see that the
+        /// DC was given back as it came.
         fn drawn(self: *View, dialog: win32.HWND) void {
             const image = win32.GetDlgItem(dialog, ClipboardDialog.id_image) orelse return;
             var rect: win32.RECT = undefined;
@@ -11666,7 +11670,13 @@ const TestKittyPrompt = struct {
                 .rcItem = rect,
                 .itemData = 0,
             };
+            // An origin of its own, which drawing must not leave at 0,0.
+            _ = win32.SetBrushOrgEx(dc, 3, 3, null);
+            const mode = win32.GetStretchBltMode(dc);
             _ = win32.SendMessageW(dialog, win32.WM_DRAWITEM, ClipboardDialog.id_image, @bitCast(@intFromPtr(&item)));
+            var origin: win32.POINT = undefined;
+            self.restored = mode != 0 and win32.GetStretchBltMode(dc) == mode and
+                win32.GetBrushOrgEx(dc, &origin).toBool() and origin.x == 3 and origin.y == 3;
             const at = ClipboardDialog.fit(rect, 2, 2);
             self.quarter = win32.GetPixel(dc, at.left + @divTrunc(at.right - at.left, 4), at.top + @divTrunc(at.bottom - at.top, 4));
             self.face = win32.GetPixel(dc, 0, 0);
@@ -12032,6 +12042,7 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
     // Opaque red, and the face around it.
     try std.testing.expectEqual(@as(?win32.COLORREF, 0x0000FF), P.first.quarter);
     try std.testing.expectEqual(@as(?win32.COLORREF, win32.GetSysColor(win32.COLOR_BTNFACE)), P.first.face);
+    try std.testing.expectEqual(@as(?bool, true), P.first.restored);
     const unwritten = P.first.unwritten orelse return error.TestUnexpectedResult;
     try unwritten.expect(W("Not written, Windows has no clipboard format for: application/x-\\u{202E}a"));
     try std.testing.expectEqual(@as(?c_int, ClipboardDialog.id_none), P.picked.shown);

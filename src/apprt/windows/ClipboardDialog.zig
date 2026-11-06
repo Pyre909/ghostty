@@ -494,10 +494,16 @@ const Dialog = struct {
 
     /// WM_DRAWITEM for the picture: drawn over the dialog's face, as large
     /// as its place allows, its shape kept (GTK's `content-fit: contain`).
+    /// The stretch mode and brush origin it sets are put back, as
+    /// WM_DRAWITEM asks that the control's DC be left in its default state.
     fn draw(self: *const Dialog, item: *const win32.DRAWITEMSTRUCT) void {
         if (win32.GetSysColorBrush(win32.COLOR_BTNFACE)) |face| _ = win32.FillRect(item.hDC, &item.rcItem, face);
         const p = self.picture orelse return;
         const at = fit(item.rcItem, p.width, p.height);
+        const saved = win32.SaveDC(item.hDC);
+        defer if (saved != 0) {
+            _ = win32.RestoreDC(item.hDC, saved);
+        };
         _ = win32.SetStretchBltMode(item.hDC, win32.HALFTONE);
         _ = win32.SetBrushOrgEx(item.hDC, 0, 0, null);
         const lines = win32.StretchDIBits(
