@@ -72,16 +72,20 @@ pub fn initTerminal(self: *Exec, term: *terminal.Terminal) void {
         log.warn("error setting initial pwd err={}", .{err});
     };
 
-    // Our Windows pty is ConPTY, which keeps its own screen buffer without
-    // scrollback, reflows it itself, and repaints it from the top row after
-    // every resize. Rows the terminal pulled back out of scrollback, on a
-    // grow or when a reflow frees rows, would be painted over and lost, so
-    // they must stay in scrollback. The repaint also rewrites the prompt,
-    // without its OSC 133 marks, so a resize must not clear the prompt for
-    // the shell either: each line feed of the repaint marks the next row a
-    // continuation of the prompt, so a later clear can start above the
-    // prompt and blank rows that have since moved into scrollback, which
-    // ConPTY never repaints.
+    // Our Windows pty is ConPTY, whose console host keeps its own screen
+    // buffer without scrollback and reflows it itself, so a resize must
+    // leave our screen as the host leaves its own. Rows the terminal pulled
+    // back out of scrollback, on a grow or when a reflow frees rows, are
+    // rows the host doesn't have: the system's conhost.exe repaints from
+    // its top row after every resize and paints over them, and the
+    // package's OpenConsole.exe (see pty.zig), which doesn't repaint, keeps
+    // other rows above the cursor than we would show. So they must stay in
+    // scrollback. Nor may a resize clear the prompt for the shell, which
+    // neither host clears in its own buffer. Under conhost.exe the repaint
+    // also rewrites the prompt without its OSC 133 marks: each line feed
+    // of the repaint marks the next row a continuation of the prompt, so a
+    // later clear can start above the prompt and blank rows that have
+    // since moved into scrollback, which the host never repaints.
     if (comptime builtin.target.os.tag == .windows) {
         term.flags.resize_pull_scrollback = false;
         term.flags.resize_prompt_redraw = false;
