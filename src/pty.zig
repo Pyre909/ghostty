@@ -727,15 +727,34 @@ test "WindowsPty: ConPTY package only with conpty.dll and OpenConsole.exe" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "OpenConsole.exe", .data = "" });
     try expectSystem(ConPty.load(alloc, dir), .load_failed);
 
-    // A DLL without the ConPTY functions.
-    try std.Io.Dir.cwd().copyFile(
-        "C:\\Windows\\System32\\version.dll",
-        tmp.dir,
-        "conpty.dll",
-        testing.io,
-        .{},
-    );
+    // A DLL without the ConPTY functions, which is freed: the loader no
+    // longer has it, and its file can be deleted.
+    var system_w: [windows.MAX_PATH]u16 = undefined;
+    const system_len = windows.exp.kernel32.GetSystemDirectoryW(&system_w, system_w.len);
+    try testing.expect(system_len > 0 and system_len < system_w.len);
+    const system = try std.unicode.wtf16LeToWtf8Alloc(alloc, system_w[0..system_len]);
+    defer alloc.free(system);
+    const version = try std.fs.path.join(alloc, &.{ system, "version.dll" });
+    defer alloc.free(version);
+    try std.Io.Dir.cwd().copyFile(version, tmp.dir, "conpty.dll", testing.io, .{});
+    const dll = try std.fs.path.join(alloc, &.{ dir, "conpty.dll" });
+    defer alloc.free(dll);
+    const dll_w = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, dll);
+    defer alloc.free(dll_w);
     try expectSystem(ConPty.load(alloc, dir), .no_export);
+    try testing.expect(windows.exp.kernel32.GetModuleHandleW(dll_w) == null);
+
+    // Failing to allocate a path also falls back to kernel32's, and frees
+    // the paths allocated before it.
+    try testing.checkAllAllocationFailures(alloc, struct {
+        fn f(a: std.mem.Allocator, d: []const u8) !void {
+            try testing.expectEqual(ConPty.Source.no_export, (try ConPty.loadPaths(a, d)).source);
+        }
+    }.f, .{dir});
+    var failing: testing.FailingAllocator = .init(alloc, .{ .fail_index = 0 });
+    try expectSystem(ConPty.load(failing.allocator(), dir), .no_dll);
+    try testing.expect(windows.exp.kernel32.GetModuleHandleW(dll_w) == null);
+    try tmp.dir.deleteFile(testing.io, "conpty.dll");
 }
 
 test "WindowsPty: the console host is logged once while it stays the same" {

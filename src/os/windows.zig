@@ -381,6 +381,13 @@ pub const exp = struct {
         pub extern "kernel32" fn GetStdHandle(
             nStdHandle: DWORD,
         ) callconv(.winapi) ?HANDLE;
+        /// The length written, without the terminating null, or 0 on
+        /// failure; more than uSize if the buffer is too small.
+        /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemdirectoryw
+        pub extern "kernel32" fn GetSystemDirectoryW(
+            lpBuffer: [*]u16,
+            uSize: UINT,
+        ) callconv(.winapi) UINT;
         /// https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler
         pub extern "kernel32" fn SetConsoleCtrlHandler(
             HandlerRoutine: ?*const fn (dwCtrlType: DWORD) callconv(.winapi) BOOL,
