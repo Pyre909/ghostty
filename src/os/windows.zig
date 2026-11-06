@@ -135,6 +135,12 @@ pub const PROC_THREAD_ATTRIBUTE_ADDITIVE = 0x00040000;
 pub const PROC_THREAD_ATTRIBUTE_INPUT = 0x00020000;
 pub const PROC_THREAD_ATTRIBUTE_NUMBER = 0x0000FFFF;
 pub const PROC_THREAD_ATTRIBUTE_THREAD = 0x00010000;
+/// CreatePseudoConsole dwFlags, as Microsoft's ConPTY package
+/// (Microsoft.Windows.Console.ConPTY) names them in its conpty.h: how the
+/// console host measures text, a grapheme cluster as one character or
+/// each codepoint by its wcwidth.
+pub const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES = 0x08;
+pub const PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH = 0x10;
 pub const S_OK = 0;
 /// GetStdHandle/SetStdHandle nStdHandle values ((DWORD)-12, -10, -11).
 pub const STD_ERROR_HANDLE: DWORD = 0xFFFFFFF4;

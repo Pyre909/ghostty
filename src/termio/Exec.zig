@@ -713,6 +713,7 @@ pub const Config = struct {
     shell_integration: configpkg.Config.ShellIntegration = .detect,
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
     cursor_blink: ?bool = null,
+    grapheme_width_method: configpkg.Config.GraphemeWidthMethod = .unicode,
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
@@ -730,6 +731,7 @@ const Subprocess = struct {
     args: []const [:0]const u8,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
+    pty_options: ptypkg.OpenOptions,
     pty: ?Pty = null,
     process: ?Process = null,
 
@@ -1019,6 +1021,13 @@ const Subprocess = struct {
             // Should be initialized with initTerminal call.
             .grid_size = .{},
             .screen_size = .{ .width = 1, .height = 1 },
+
+            .pty_options = .{
+                .grapheme_cluster = switch (cfg.grapheme_width_method) {
+                    .unicode => true,
+                    .legacy => false,
+                },
+            },
         };
     }
 
@@ -1051,7 +1060,7 @@ const Subprocess = struct {
             .ws_col = @intCast(self.grid_size.columns),
             .ws_xpixel = @intCast(self.screen_size.width),
             .ws_ypixel = @intCast(self.screen_size.height),
-        });
+        }, self.pty_options);
         self.pty = pty;
         errdefer if (!in_child) {
             if (comptime builtin.target.os.tag != .windows) {

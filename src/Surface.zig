@@ -694,6 +694,7 @@ pub fn init(
             .shell_integration = config.@"shell-integration",
             .shell_integration_features = config.@"shell-integration-features",
             .cursor_blink = config.@"cursor-style-blink",
+            .grapheme_width_method = config.@"grapheme-width-method",
             .working_directory = if (config.@"working-directory") |wd| wd.value() else null,
             .resources_dir = global.resourcesDir().host(),
             .term = config.term,

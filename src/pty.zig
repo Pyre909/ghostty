@@ -17,6 +17,15 @@ pub const winsize = extern struct {
     ws_ypixel: u16 = 600,
 };
 
+/// How a pty is opened, beyond its size.
+pub const OpenOptions = struct {
+    /// Whether the terminal measures a grapheme cluster as one character
+    /// (grapheme-width-method = unicode) rather than each codepoint on its
+    /// own (legacy). Only Windows uses it: there a console host keeps its
+    /// own screen buffer and cursor, so it must measure text as we do.
+    grapheme_cluster: bool = true,
+};
+
 pub const Pty = switch (builtin.target.os.tag) {
     .windows => WindowsPty,
     .ios => NullPty,
@@ -67,8 +76,9 @@ const NullPty = struct {
 
     pub const OpenError = error{};
 
-    pub fn open(size: winsize) OpenError!Pty {
+    pub fn open(size: winsize, opts: OpenOptions) OpenError!Pty {
         _ = size;
+        _ = opts;
         return .{ .master = 0, .slave = 0 };
     }
 
@@ -132,7 +142,9 @@ const PosixPty = struct {
     pub const OpenError = error{OpenptyFailed};
 
     /// Open a new PTY with the given initial size.
-    pub fn open(size: winsize) OpenError!Pty {
+    pub fn open(size: winsize, opts: OpenOptions) OpenError!Pty {
+        _ = opts;
+
         // Need to copy so that it becomes non-const.
         var sizeCopy = size;
 
@@ -342,7 +354,7 @@ const WindowsPty = struct {
     /// measures some clusters (emoji with skin tone modifiers, ZWJ
     /// sequences, decomposed accents) wider than we do, so the shell's
     /// cursor drifts from ours after them. The package's OpenConsole.exe
-    /// passes those sequences on and measures as we do.
+    /// passes those sequences on, and open tells it to measure as we do.
     const ConPty = struct {
         create: *const @TypeOf(windows.exp.kernel32.CreatePseudoConsole) = &windows.exp.kernel32.CreatePseudoConsole,
         resize: *const @TypeOf(windows.exp.kernel32.ResizePseudoConsole) = &windows.exp.kernel32.ResizePseudoConsole,
@@ -453,7 +465,7 @@ const WindowsPty = struct {
     pub const OpenError = error{Unexpected};
 
     /// Open a new PTY with the given initial size.
-    pub fn open(size: winsize) OpenError!Pty {
+    pub fn open(size: winsize, opts: OpenOptions) OpenError!Pty {
         var pty: Pty = undefined;
 
         var pipe_path_buf: [128]u8 = undefined;
@@ -555,7 +567,20 @@ const WindowsPty = struct {
 
         pty.conpty = .init();
         const coord: windows.COORD = .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) };
-        var result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, 0, &pty.pseudo_console);
+        // The package's host is told how the terminal measures text, so
+        // that its cursor stays with ours: as graphemes under
+        // grapheme-width-method = unicode, by each codepoint's wcwidth
+        // under legacy. Each agreed with us on every cluster tried, where
+        // the package's other settings did not. A program that switches
+        // mode 2027 changes our measurement but not the host's, which is
+        // fixed here. kernel32's get none: conhost.exe measured the same
+        // with and without the graphemes flag, and the others are not
+        // measured there.
+        const flags: windows.DWORD = if (pty.conpty.source != .package) 0 else if (opts.grapheme_cluster)
+            windows.PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES
+        else
+            windows.PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH;
+        var result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, flags, &pty.pseudo_console);
         // Where the package's create fails, kernel32's may still work: the
         // files were there, but its OpenConsole.exe may not start.
         if (result != windows.S_OK and pty.conpty.source == .package) {
@@ -618,7 +643,7 @@ test {
         .ws_ypixel = 1,
     };
 
-    var pty = try Pty.open(ws);
+    var pty = try Pty.open(ws, .{});
     defer pty.deinit();
 
     // Initialize size should match what we gave it
