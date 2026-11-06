@@ -22,6 +22,35 @@ const max_write_size = terminal.kitty.clipboard.max_write_size;
 /// `terminal.clipboard.isTextMime` accepts this spelling.
 pub const text_mime = "text/plain;charset=utf-8";
 
+/// How many times `open` tries a clipboard another program holds, and the
+/// wait between tries.
+const open_tries = 5;
+const open_wait_ms = 5;
+
+/// For tests: run in place of `open`'s wait between tries.
+pub var test_busy: if (builtin.is_test) ?*const fn () void else void = if (builtin.is_test) null else {};
+
+/// OpenClipboard, tried again while another program holds the clipboard.
+/// Windows' clipboard history service (cbdhsvc) and clipboard sync tools
+/// (rdpclip, Parallels' prl_cc) each open it for a moment after every
+/// change, so a read or write that soon after a change can find it held,
+/// and OpenClipboard fails with ERROR_ACCESS_DENIED. Chromium tries five
+/// times, 5 ms apart, for the same reason (ScopedClipboard::Acquire in
+/// ui/base/clipboard/clipboard_win.cc). No wait follows the last try, so
+/// the error it leaves is OpenClipboard's.
+fn open(hwnd: ?win32.HWND) bool {
+    for (0..open_tries) |tried| {
+        if (win32.OpenClipboard(hwnd).toBool()) return true;
+        if (tried + 1 == open_tries) break;
+        if (builtin.is_test) if (test_busy) |busy| {
+            busy();
+            continue;
+        };
+        win32.Sleep(open_wait_ms);
+    }
+    return false;
+}
+
 /// Read CF_UNICODETEXT as UTF-8. Returns null when the clipboard holds no
 /// text. The caller owns the result.
 pub fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
@@ -29,7 +58,7 @@ pub fn readClipboardText(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
 
     // OpenClipboard takes a process-wide lock; the defer guarantees no path
     // out of this function leaves it held.
-    if (!win32.OpenClipboard(hwnd).toBool()) {
+    if (!open(hwnd)) {
         log.warn("failed to open the clipboard for reading err={}", .{win32.GetLastError()});
         return null;
     }
@@ -208,7 +237,7 @@ pub fn writeClipboard(alloc: Allocator, hwnd: win32.HWND, reps: Reps) WriteError
     }
     if (text == null and len == 0) return error.NothingWritable;
 
-    if (!win32.OpenClipboard(hwnd).toBool()) {
+    if (!open(hwnd)) {
         log.warn("OpenClipboard failed err={}", .{win32.GetLastError()});
         return App.Error.Win32CallFailed;
     }
@@ -877,7 +906,7 @@ fn cfHtml(out: []u8, fragment: []const u8) void {
 pub fn readClipboardHtml(alloc: Allocator, hwnd: win32.HWND) !?[]u8 {
     const format = registeredFormat(.html) orelse return error.TestUnexpectedResult;
     if (!win32.IsClipboardFormatAvailable(format).toBool()) return null;
-    if (!win32.OpenClipboard(hwnd).toBool()) return error.TestUnexpectedResult;
+    if (!open(hwnd)) return error.TestUnexpectedResult;
     defer _ = win32.CloseClipboard();
     const mem = win32.GetClipboardData(format) orelse return error.TestUnexpectedResult;
     const raw = win32.GlobalLock(mem) orelse return error.TestUnexpectedResult;
@@ -1073,7 +1102,7 @@ pub fn readClipboard(
     var known: std.EnumArray(Registered, ?win32.UINT) = .initUndefined();
     for (std.enums.values(Registered)) |which| known.set(which, registeredFormat(which));
 
-    if (!win32.OpenClipboard(hwnd).toBool()) {
+    if (!open(hwnd)) {
         log.warn("OpenClipboard failed for a read err={}", .{win32.GetLastError()});
         return App.Error.Win32CallFailed;
     }
@@ -1365,7 +1394,7 @@ pub const TestPut = struct { format: win32.UINT, data: []const u8 };
 /// For tests: replace the clipboard's contents with `puts`, in order, each
 /// as it is, then the files `names` as CF_HDROP if there are any.
 pub fn testPut(hwnd: win32.HWND, puts: []const TestPut, names: []const []const u16) !void {
-    if (!win32.OpenClipboard(hwnd).toBool()) return error.TestUnexpectedResult;
+    if (!open(hwnd)) return error.TestUnexpectedResult;
     defer _ = win32.CloseClipboard();
     if (!win32.EmptyClipboard().toBool()) return error.TestUnexpectedResult;
     for (puts) |p| {
@@ -1411,15 +1440,23 @@ fn testRegistered(name: []const u8) bool {
 /// program can. OpenClipboard "fails if another window has the clipboard
 /// open" (https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-openclipboard).
 pub const TestHolder = struct {
-    const State = enum(u8) { start, open, refused, release };
+    const State = enum(u8) { start, open, refused, release, closed };
     var state: std.atomic.Value(State) = .init(.start);
     thread: std.Thread,
 
     fn hold() void {
-        if (!win32.OpenClipboard(null).toBool()) return state.store(.refused, .release);
-        defer _ = win32.CloseClipboard();
+        if (!open(null)) return state.store(.refused, .release);
         state.store(.open, .release);
         while (state.load(.acquire) != .release) win32.Sleep(1);
+        _ = win32.CloseClipboard();
+        state.store(.closed, .release);
+    }
+
+    /// Close the clipboard the holder holds, and wait until it has. As
+    /// `test_busy`, another program letting go between `open`'s tries.
+    pub fn letGo() void {
+        if (state.cmpxchgStrong(.open, .release, .acq_rel, .acquire) != null) return;
+        while (state.load(.acquire) != .closed) win32.Sleep(1);
     }
 
     /// The clipboard, held open by another thread until `release`.
@@ -1435,7 +1472,7 @@ pub const TestHolder = struct {
     }
 
     pub fn release(self: TestHolder) void {
-        state.store(.release, .release);
+        letGo();
         self.thread.join();
     }
 };
@@ -1568,7 +1605,7 @@ pub const TestSaved = struct {
 /// For tests: the formats on the clipboard, in the order
 /// EnumClipboardFormats gives them, synthesized ones included.
 fn testFormats(hwnd: win32.HWND, buf: []win32.UINT) ![]win32.UINT {
-    if (!win32.OpenClipboard(hwnd).toBool()) return error.TestUnexpectedResult;
+    if (!open(hwnd)) return error.TestUnexpectedResult;
     defer _ = win32.CloseClipboard();
     var len: usize = 0;
     var format: win32.UINT = 0;
@@ -1586,7 +1623,7 @@ fn testFormats(hwnd: win32.HWND, buf: []win32.UINT) ![]win32.UINT {
 /// it holds none. The block can be longer than what was written.
 fn testData(alloc: Allocator, hwnd: win32.HWND, format: win32.UINT) !?[]u8 {
     if (!win32.IsClipboardFormatAvailable(format).toBool()) return null;
-    if (!win32.OpenClipboard(hwnd).toBool()) return error.TestUnexpectedResult;
+    if (!open(hwnd)) return error.TestUnexpectedResult;
     defer _ = win32.CloseClipboard();
     const mem = win32.GetClipboardData(format) orelse return error.TestUnexpectedResult;
     const raw = win32.GlobalLock(mem) orelse return error.TestUnexpectedResult;
@@ -2618,6 +2655,45 @@ test "win32: a read of a clipboard another thread holds open fails" {
     }
     const found = try readClipboard(arena.allocator(), hwnd, &.{"text/plain"}, true);
     try expectServed(&found, &.{.{ .mime = "text/plain", .data = "t" }});
+}
+
+test "win32: a clipboard another program holds for a moment is read and written once it lets go" {
+    const alloc = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+    const saved = try TestSaved.save(hwnd);
+    defer saved.restore(hwnd);
+    try writeClipboard(alloc, hwnd, .text("t"));
+
+    // Each finds the clipboard held at its first try, and the holder lets
+    // go when it waits to try again.
+    {
+        const holder = try TestHolder.start();
+        defer holder.release();
+        test_busy = &TestHolder.letGo;
+        defer test_busy = null;
+        const found = try readClipboard(arena.allocator(), hwnd, &.{"text/plain"}, true);
+        try expectServed(&found, &.{.{ .mime = "text/plain", .data = "t" }});
+    }
+    {
+        const holder = try TestHolder.start();
+        defer holder.release();
+        test_busy = &TestHolder.letGo;
+        defer test_busy = null;
+        try writeClipboard(alloc, hwnd, .text("w"));
+        try std.testing.expectEqual(0, test_held);
+    }
+    {
+        const holder = try TestHolder.start();
+        defer holder.release();
+        test_busy = &TestHolder.letGo;
+        defer test_busy = null;
+        const text = (try readClipboardText(alloc, hwnd)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings("w", text);
+    }
 }
 
 test "win32: a read leaves out a type larger than a program may write, and still lists it" {
