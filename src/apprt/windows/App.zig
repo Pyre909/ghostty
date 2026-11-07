@@ -1613,16 +1613,17 @@ pub const App = struct {
 
     /// Tell the core the color scheme (`coreScheme`) if it changed: the
     /// app's conditional state, which new terminals start from, and each
-    /// live terminal's, which pick the light or dark half of `theme` and
-    /// answer a program's color scheme query. For each the core reloads the
-    /// configuration softly (`reloadConfig`). Called by `run`, where
-    /// `canReenterCore` holds: before the initial window, then after every
-    /// tick and the requests after it, which picks up a change of the
-    /// system's mode (`systemSchemeChanged`), of the session's theme
+    /// live terminal's, which pick the light or dark half of a light and
+    /// dark `theme`. The core answers a program's color scheme query from
+    /// that pair, so without one the answer is light whatever it is told
+    /// (`changeConditionalState` has nothing to apply then). For each the
+    /// core reloads the configuration softly (`reloadConfig`). Called by
+    /// `run`, where `canReenterCore` holds: before the initial window, then
+    /// after every tick and the requests after it, which picks up a change
+    /// of the system's mode (`systemSchemeChanged`), of the session's theme
     /// (`setWindowTheme`) or of `window-theme` and the background
-    /// (`configChange`, as a recorded reload makes it). The
-    /// list does not change during the loop: a reload creates and destroys
-    /// no surface.
+    /// (`configChange`, as a recorded reload makes it). The list does not
+    /// change during the loop: a reload creates and destroys no surface.
     fn syncColorScheme(self: *App) void {
         const scheme = coreScheme(&self.config, self.system_scheme, self.window_theme_override);
         if (self.reported_scheme == scheme) return;
@@ -4315,14 +4316,15 @@ fn systemColorScheme() apprt.ColorScheme {
 }
 
 /// The color scheme the core is told, which picks the light or dark half of
-/// `theme` and answers a program's color scheme query: the one the title
-/// bars show (`Window.frameDark`). Under `auto` without a light and a dark
-/// theme the core thus hears that a dark background is dark, whatever the
-/// system's mode, as macOS tells its core the appearance `auto` gives its
-/// windows; with them, and under `system`, it hears the system's mode.
-/// macOS gives `ghostty` the system's appearance; here it is `auto`. A
-/// theme set for the session (`override`) is heard too, as GTK's core
-/// hears the scheme its forced style manager reports.
+/// a light and dark `theme`, and with one the answer to a program's color
+/// scheme query (without one the core answers light, `syncColorScheme`):
+/// the one the title bars show (`Window.frameDark`). Under `auto` without a
+/// light and a dark theme the core thus hears that a dark background is
+/// dark, whatever the system's mode, as macOS tells its core the appearance
+/// `auto` gives its windows; with them, and under `system`, it hears the
+/// system's mode. macOS gives `ghostty` the system's appearance; here it is
+/// `auto`. A theme set for the session (`override`) is heard too, as GTK's
+/// core hears the scheme its forced style manager reports.
 fn coreScheme(
     config: *const Config,
     system: apprt.ColorScheme,
@@ -10570,8 +10572,10 @@ test "win32: a new configuration re-themes every title bar" {
 test "win32: set_window_theme themes every title bar for the session" {
     // Over `window-theme = light`, through a reload of the configuration
     // (the action's documentation: until another set_window_theme), and
-    // back to the configuration with `config`. Each step changes the
-    // frame, so that none passes by what the frame showed before.
+    // back to the configuration with `config`. Each action is checked on a
+    // frame that showed the other mode before it, so that none passes by
+    // what the frame showed already; the two reloads check that the frame
+    // keeps its mode.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -10604,18 +10608,23 @@ test "win32: set_window_theme themes every title bar for the session" {
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expectEqual(.dark, app.window_theme_override);
     try std.testing.expect(window.dark_frame);
-    // A frame made now has it too.
+    // A frame made now has it from the start, as `Window.createBare` makes
+    // every frame: a new window's, the quick terminal's, a moved tab's.
+    const made = try Window.createBare(&app, .normal, false);
+    defer made.discard();
+    try std.testing.expect(made.dark_frame);
+    // A second frame of the app's, which every step from here reaches.
     const later = try testFrame(&app);
-    later.applyTheme();
-    try std.testing.expect(later.dark_frame);
 
     // The system's mode (light), whatever `window-theme` says, dark too.
     app.system_scheme = .light;
     try std.testing.expect(try app.performAction(.app, .set_window_theme, .system));
     try std.testing.expect(!window.dark_frame);
-    app.config.@"window-theme" = .dark;
-    window.applyTheme();
-    try std.testing.expect(!window.dark_frame);
+    var dark: Config = try .default(alloc);
+    defer dark.deinit();
+    dark.@"window-theme" = .dark;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &dark }));
+    try std.testing.expect(!window.dark_frame and !later.dark_frame);
 
     // `config` is `window-theme` again (dark now), then light forced.
     try std.testing.expect(try app.performAction(.app, .set_window_theme, .config));
@@ -10637,7 +10646,6 @@ test "win32: set_window_theme tells the core its scheme" {
     defer testCleanup(&app);
     app.config.@"window-theme" = .light;
     app.syncColorScheme();
-    try std.testing.expectEqual(.light, core_app.config_conditional_state.theme);
 
     try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
     app.syncColorScheme();
