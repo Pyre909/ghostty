@@ -104,6 +104,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .toggle_window_decorations,
         .toggle_window_float_on_top,
         .toggle_background_opacity,
+        .set_window_theme,
         .reset_window_size,
         .toggle_command_palette,
         .toggle_quick_terminal,
@@ -130,8 +131,6 @@ pub fn supported(key: Binding.Action.Key) bool {
         .show_gtk_inspector,
         .show_on_screen_keyboard,
         .toggle_secure_input,
-        // Nor a window theme set for the session, over `window-theme`.
-        .set_window_theme,
         => false,
     };
 }

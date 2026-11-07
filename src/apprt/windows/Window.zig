@@ -3126,8 +3126,11 @@ pub fn dividerWidth(dpi: u32) i32 {
     return @intCast(@max(1, (dpi +| base / 2) / base));
 }
 
-/// Whether a frame's title bar is dark, by `window-theme`. `auto` follows
-/// the background, light above a perceived luminance of 0.5 as on GTK and
+/// Whether a frame's title bar is dark: by the theme `set_window_theme` set
+/// for the session (`override`, `App.window_theme_override`), whatever
+/// `window-theme` says, and by `window-theme` under `config`, as GTK picks
+/// its color scheme (`Application.colorScheme`). `auto` follows the
+/// background, light above a perceived luminance of 0.5 as on GTK and
 /// macOS, except with a light and a dark `theme`, when it follows the
 /// system: `Config.finalize` turns such an `auto` into `system`. `ghostty`,
 /// the GTK header bar in the terminal's colors, is taken as `auto`, as GTK
@@ -3135,15 +3138,24 @@ pub fn dividerWidth(dpi: u32) i32 {
 /// so the pair is checked here. Followed by the background, a pair would
 /// pick the scheme from the half it picked: stuck on one half, or, if the
 /// light half is dark, flipping between them for good.
-pub fn frameDark(config: *const configpkg.Config, system: apprt.ColorScheme) bool {
-    return switch (config.@"window-theme") {
+pub fn frameDark(
+    config: *const configpkg.Config,
+    system: apprt.ColorScheme,
+    override: apprt.action.WindowTheme,
+) bool {
+    return switch (override) {
+        .config => switch (config.@"window-theme") {
+            .light => false,
+            .dark => true,
+            .system => system == .dark,
+            .auto, .ghostty => if (config._conditional_set.contains(.theme))
+                system == .dark
+            else
+                config.background.toTerminalRGB().perceivedLuminance() <= 0.5,
+        },
+        .system => system == .dark,
         .light => false,
         .dark => true,
-        .system => system == .dark,
-        .auto, .ghostty => if (config._conditional_set.contains(.theme))
-            system == .dark
-        else
-            config.background.toTerminalRGB().perceivedLuminance() <= 0.5,
     };
 }
 
@@ -3152,7 +3164,7 @@ pub fn frameDark(config: *const configpkg.Config, system: apprt.ColorScheme) boo
 /// A failed call leaves `dark_frame` as it was, so the next one tries
 /// again.
 pub fn applyTheme(self: *Window) void {
-    const dark = frameDark(&self.app.config, self.app.system_scheme);
+    const dark = frameDark(&self.app.config, self.app.system_scheme, self.app.window_theme_override);
     if (dark == self.dark_frame) return;
 
     const value: win32.BOOL = if (dark) .TRUE else .FALSE;
@@ -4228,11 +4240,11 @@ test "win32: the title bar follows window-theme" {
     // Forced, whatever the system's mode.
     for ([_]apprt.ColorScheme{ .light, .dark }) |system| {
         config.@"window-theme" = .light;
-        try std.testing.expect(!frameDark(&config, system));
+        try std.testing.expect(!frameDark(&config, system, .config));
         config.@"window-theme" = .dark;
-        try std.testing.expect(frameDark(&config, system));
+        try std.testing.expect(frameDark(&config, system, .config));
         config.@"window-theme" = .system;
-        try std.testing.expectEqual(system == .dark, frameDark(&config, system));
+        try std.testing.expectEqual(system == .dark, frameDark(&config, system, .config));
     }
 
     // auto and ghostty: the background, whatever the system's mode. The
@@ -4240,9 +4252,9 @@ test "win32: the title bar follows window-theme" {
     for ([_]configpkg.Config.WindowTheme{ .auto, .ghostty }) |theme| {
         config.@"window-theme" = theme;
         config.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
-        try std.testing.expect(frameDark(&config, .light));
+        try std.testing.expect(frameDark(&config, .light, .config));
         config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
-        try std.testing.expect(!frameDark(&config, .dark));
+        try std.testing.expect(!frameDark(&config, .dark, .config));
     }
 
     // With a light and a dark theme, which Config.finalize marks in the
@@ -4253,10 +4265,43 @@ test "win32: the title bar follows window-theme" {
     for ([_]configpkg.Config.WindowTheme{ .auto, .ghostty }) |theme| {
         config.@"window-theme" = theme;
         config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
-        try std.testing.expect(frameDark(&config, .dark));
+        try std.testing.expect(frameDark(&config, .dark, .config));
         config.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
-        try std.testing.expect(!frameDark(&config, .light));
+        try std.testing.expect(!frameDark(&config, .light, .config));
     }
+}
+
+test "win32: a theme set for the session overrides window-theme" {
+    // `set_window_theme`'s system, light and dark, over every
+    // `window-theme`, background, system mode and pair of themes: the
+    // system's mode, light and dark, whatever the configuration says.
+    // `config` is the configuration's answer (the test above).
+    const alloc = std.testing.allocator;
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+
+    const themes = std.enums.values(configpkg.Config.WindowTheme);
+    var checked: usize = 0;
+    for ([_]bool{ false, true }) |pair| {
+        config._conditional_set = .{};
+        if (pair) config._conditional_set.insert(.theme);
+        for (themes) |theme| {
+            config.@"window-theme" = theme;
+            for ([_]bool{ false, true }) |light_background| {
+                config.background = if (light_background)
+                    .{ .r = 0xFF, .g = 0xFF, .b = 0xFF }
+                else
+                    .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
+                for ([_]apprt.ColorScheme{ .light, .dark }) |system| {
+                    try std.testing.expectEqual(system == .dark, frameDark(&config, system, .system));
+                    try std.testing.expect(!frameDark(&config, system, .light));
+                    try std.testing.expect(frameDark(&config, system, .dark));
+                    checked += 1;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(2 * themes.len * 2 * 2, checked);
 }
 
 test "win32: only the app mode setting is a color set change" {

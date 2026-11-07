@@ -93,7 +93,7 @@ pub const Refusal = error{
     /// never matches.
     AltGr,
     /// Every action is one this runtime does not perform yet, as
-    /// toggle_visibility or set_window_theme (`performsNone`): the hotkey
+    /// toggle_visibility or check_for_updates (`performsNone`): the hotkey
     /// would take its keys from every program and do nothing.
     Unsupported,
 };

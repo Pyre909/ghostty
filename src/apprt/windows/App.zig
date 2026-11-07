@@ -161,6 +161,13 @@ pub const App = struct {
     /// until it is first told.
     reported_scheme: ?apprt.ColorScheme,
 
+    /// The theme `set_window_theme` set for the session (`setWindowTheme`),
+    /// over `window-theme` until another sets `config` back. It is never
+    /// written to the configuration and outlives every reload of it, as
+    /// the action's documentation says and GTK keeps its own
+    /// (`Application.setWindowTheme`).
+    window_theme_override: apprt.action.WindowTheme,
+
     /// A message-only window. It is the target for `wakeup` and for the quit
     /// timer. Using a window rather than `PostThreadMessageW` is deliberate:
     /// thread messages are silently dropped by the nested modal loops that
@@ -939,6 +946,7 @@ pub const App = struct {
             .com_initialized = com_hr >= 0,
             .system_scheme = systemColorScheme(),
             .reported_scheme = null,
+            .window_theme_override = .config,
             .msg_hwnd = msg_hwnd,
             .surfaces = .empty,
             .windows = .empty,
@@ -1610,12 +1618,13 @@ pub const App = struct {
     /// configuration softly (`reloadConfig`). Called by `run`, where
     /// `canReenterCore` holds: before the initial window, then after every
     /// tick and the requests after it, which picks up a change of the
-    /// system's mode (`systemSchemeChanged`) or of `window-theme` and the
-    /// background (`configChange`, as a recorded reload makes it). The
+    /// system's mode (`systemSchemeChanged`), of the session's theme
+    /// (`setWindowTheme`) or of `window-theme` and the background
+    /// (`configChange`, as a recorded reload makes it). The
     /// list does not change during the loop: a reload creates and destroys
     /// no surface.
     fn syncColorScheme(self: *App) void {
-        const scheme = coreScheme(&self.config, self.system_scheme);
+        const scheme = coreScheme(&self.config, self.system_scheme, self.window_theme_override);
         if (self.reported_scheme == scheme) return;
         self.reported_scheme = scheme;
 
@@ -1643,6 +1652,22 @@ pub const App = struct {
         self.system_scheme = scheme;
         for (self.windows.items) |window| window.applyTheme();
         self.wakeup();
+    }
+
+    /// `.set_window_theme`, which the core gives the app: the theme every
+    /// title bar and the core follow for the rest of the session
+    /// (`window_theme_override`), as on GTK (`Application.setWindowTheme`);
+    /// `config` goes back to `window-theme`. Every frame follows at once,
+    /// and the core from `run` (`syncColorScheme`), which is woken for it,
+    /// as for a change of the system's mode: a keybind or the palette asks
+    /// from inside a core call, which cannot be re-entered. GTK reloads its
+    /// header bar's CSS too, for `window-theme = ghostty`; that is `auto`
+    /// here, with nothing to reload.
+    fn setWindowTheme(self: *App, theme: apprt.action.WindowTheme) bool {
+        self.window_theme_override = theme;
+        for (self.windows.items) |window| window.applyTheme();
+        self.wakeup();
+        return true;
     }
 
     /// Wait until the thread `handle` has exited, while keeping the main
@@ -1773,6 +1798,7 @@ pub const App = struct {
             .initial_size => initialSize(target, value),
             .reload_config => try self.reloadConfig(target, value),
             .config_change => try self.configChange(target, value),
+            .set_window_theme => self.setWindowTheme(value),
 
             // The core rings only a terminal's.
             .ring_bell => switch (target) {
@@ -4294,9 +4320,15 @@ fn systemColorScheme() apprt.ColorScheme {
 /// theme the core thus hears that a dark background is dark, whatever the
 /// system's mode, as macOS tells its core the appearance `auto` gives its
 /// windows; with them, and under `system`, it hears the system's mode.
-/// macOS gives `ghostty` the system's appearance; here it is `auto`.
-fn coreScheme(config: *const Config, system: apprt.ColorScheme) apprt.ColorScheme {
-    return if (Window.frameDark(config, system)) .dark else .light;
+/// macOS gives `ghostty` the system's appearance; here it is `auto`. A
+/// theme set for the session (`override`) is heard too, as GTK's core
+/// hears the scheme its forced style manager reports.
+fn coreScheme(
+    config: *const Config,
+    system: apprt.ColorScheme,
+    override: apprt.action.WindowTheme,
+) apprt.ColorScheme {
+    return if (Window.frameDark(config, system, override)) .dark else .light;
 }
 
 /// The allocator of the link `openLink` hands to its opener thread, which
@@ -4840,6 +4872,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.com_initialized = false;
     app.system_scheme = .light;
     app.reported_scheme = null;
+    app.window_theme_override = .config;
     app.modal_loop_depth = 0;
     app.terminating = false;
     app.ticking = false;
@@ -10399,11 +10432,11 @@ test "win32: the core is told the color scheme the title bars show" {
 
     for ([_]apprt.ColorScheme{ .light, .dark }) |system| {
         config.@"window-theme" = .system;
-        try std.testing.expectEqual(system, coreScheme(&config, system));
+        try std.testing.expectEqual(system, coreScheme(&config, system, .config));
         config.@"window-theme" = .light;
-        try std.testing.expectEqual(.light, coreScheme(&config, system));
+        try std.testing.expectEqual(.light, coreScheme(&config, system, .config));
         config.@"window-theme" = .dark;
-        try std.testing.expectEqual(.dark, coreScheme(&config, system));
+        try std.testing.expectEqual(.dark, coreScheme(&config, system, .config));
     }
 
     // auto and ghostty: the background's, against the system's mode, and
@@ -10412,12 +10445,21 @@ test "win32: the core is told the color scheme the title bars show" {
         config.@"window-theme" = theme;
         config._conditional_set = .{};
         config.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
-        try std.testing.expectEqual(.dark, coreScheme(&config, .light));
+        try std.testing.expectEqual(.dark, coreScheme(&config, .light, .config));
         config.background = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF };
-        try std.testing.expectEqual(.light, coreScheme(&config, .dark));
+        try std.testing.expectEqual(.light, coreScheme(&config, .dark, .config));
         config._conditional_set.insert(.theme);
-        try std.testing.expectEqual(.dark, coreScheme(&config, .dark));
+        try std.testing.expectEqual(.dark, coreScheme(&config, .dark, .config));
     }
+
+    // A theme set for the session, over the configuration: a light one
+    // whose title bars and core would be light, and with a dark system.
+    config.@"window-theme" = .light;
+    try std.testing.expectEqual(.dark, coreScheme(&config, .light, .dark));
+    try std.testing.expectEqual(.dark, coreScheme(&config, .dark, .system));
+    config.@"window-theme" = .dark;
+    try std.testing.expectEqual(.light, coreScheme(&config, .dark, .light));
+    try std.testing.expectEqual(.light, coreScheme(&config, .light, .system));
 }
 
 test "win32: the core is told the color scheme when it changes" {
@@ -10523,6 +10565,88 @@ test "win32: a new configuration re-themes every title bar" {
         try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
         try std.testing.expectEqual(theme == .dark, window.dark_frame);
     }
+}
+
+test "win32: set_window_theme themes every title bar for the session" {
+    // Over `window-theme = light`, through a reload of the configuration
+    // (the action's documentation: until another set_window_theme), and
+    // back to the configuration with `config`. Each step changes the
+    // frame, so that none passes by what the frame showed before.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    app.config.@"window-theme" = .light;
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const window = try testFrame(&app);
+    window.applyTheme();
+    try std.testing.expect(!window.dark_frame);
+
+    // At once, and `run` is woken to tell the core.
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
+    try std.testing.expect(window.dark_frame);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        app.msg_hwnd,
+        WM_GHOSTTY_WAKEUP,
+        WM_GHOSTTY_WAKEUP,
+        win32.PM_REMOVE,
+    ).toBool());
+
+    // A reload keeps it, even one whose `window-theme` is light.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .light;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(.dark, app.window_theme_override);
+    try std.testing.expect(window.dark_frame);
+    // A frame made now has it too.
+    const later = try testFrame(&app);
+    later.applyTheme();
+    try std.testing.expect(later.dark_frame);
+
+    // The system's mode (light), whatever `window-theme` says, dark too.
+    app.system_scheme = .light;
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .system));
+    try std.testing.expect(!window.dark_frame);
+    app.config.@"window-theme" = .dark;
+    window.applyTheme();
+    try std.testing.expect(!window.dark_frame);
+
+    // `config` is `window-theme` again (dark now), then light forced.
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .config));
+    try std.testing.expect(window.dark_frame and later.dark_frame);
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .light));
+    try std.testing.expect(!window.dark_frame and !later.dark_frame);
+}
+
+test "win32: set_window_theme tells the core its scheme" {
+    // A light `window-theme` set dark for the session: the core hears
+    // dark (which picks the dark half of a light and dark `theme`), then,
+    // set back to the configuration, light.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    try core_app.init(alloc);
+    defer core_app.deinit();
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    app.config.@"window-theme" = .light;
+    app.syncColorScheme();
+    try std.testing.expectEqual(.light, core_app.config_conditional_state.theme);
+
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
+    app.syncColorScheme();
+    try std.testing.expectEqual(.dark, core_app.config_conditional_state.theme);
+    try std.testing.expectEqual(.dark, app.reported_scheme.?);
+
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .config));
+    app.syncColorScheme();
+    try std.testing.expectEqual(.light, core_app.config_conditional_state.theme);
 }
 
 test "win32: toggle_fullscreen waits for run, covers the monitor and comes back" {
@@ -17805,7 +17929,6 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
         .{ .toggle_secure_input, .secure_input },
-        .{ .set_window_theme, .set_window_theme },
         // Listed.
         .{ .new_window, .new_window },
         .{ .new_tab, .new_tab },
@@ -17846,6 +17969,7 @@ test "win32: the command palette lists only what performAction carries out" {
         // The app's.
         .{ .toggle_quick_terminal, .toggle_quick_terminal },
         .{ .reload_config, .reload_config },
+        .{ .set_window_theme, .set_window_theme },
         .{ .quit, .quit },
     };
     var listed: usize = 0;
@@ -17904,7 +18028,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(37, listed);
+    try std.testing.expectEqual(38, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
 }
@@ -23686,7 +23810,7 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         // Not performed by this runtime yet: every action the command
         // palette leaves out, alone or chained.
         "global:ctrl+c=toggle_visibility",
-        "global:ctrl+d=set_window_theme:dark",
+        "global:ctrl+d=check_for_updates",
         "global:ctrl+e=close_all_windows",
         "global:ctrl+g=paste_from_selection",
         "global:ctrl+h=undo",
@@ -23704,16 +23828,18 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
 
     // Ctrl+Alt+Q with Shift types nothing on that layout, and registers,
     // as does a toggle chained to an action this runtime performs, the
-    // quick terminal's toggle, and `ignore`, which the palette leaves out
-    // but which asks for its keys to be taken.
+    // quick terminal's toggle, the session's window theme, and `ignore`,
+    // which the palette leaves out but which asks for its keys to be
+    // taken.
     try TestHotkeys.apply(&app, &.{
         "global:ctrl+alt+shift+q=new_window",
         "global:ctrl+c=toggle_visibility",
         "chain=new_window",
         "global:ctrl+b=toggle_quick_terminal",
+        "global:ctrl+d=set_window_theme:dark",
         "global:ctrl+a=ignore",
     });
-    try std.testing.expectEqual(4, TestHotkeys.take().len);
+    try std.testing.expectEqual(5, TestHotkeys.take().len);
 }
 
 test "win32: two global keybinds on the same keys register once, for the physical key" {
