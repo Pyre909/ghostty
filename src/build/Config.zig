@@ -497,10 +497,11 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
         .fast, .small => true,
     };
 
-    // A stripped build is miscompiled on aarch64-windows, so it is never
-    // stripped there. With -fstrip, Zig gives internal globals private
-    // linkage, and for a private `threadlocal` LLVM's COFF backend bakes
-    // the variable's raw section offset into the
+    // A stripped app is miscompiled on aarch64-windows, so `strip` (the
+    // app, its launcher and libghostty) is never set there. With -fstrip,
+    // Zig gives internal globals private linkage, and for a private
+    // `threadlocal` LLVM's COFF backend bakes the variable's raw section
+    // offset into the
     // IMAGE_REL_ARM64_SECREL_HIGH12A `add` where the offset >> 12 belongs,
     // so the low twelve bits of the offset are added a second time,
     // shifted up by twelve. Zeroing glad's threadlocal context (4352 bytes
@@ -508,12 +509,18 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
     // process heap, and the process dies at startup with a heap corruption.
     // A named symbol is relocated directly and is unaffected. The debug
     // info goes to the PDB, so the executable itself does not grow.
+    //
+    // libghostty-vt has its own `strip_lib_vt` below, which this leaves as
+    // asked. Measured with Zig 0.17, a stripped aarch64-windows
+    // libghostty-vt reaches every thread-local through a named symbol
+    // (ReleaseSafe with -Dstrip=true), or reaches none (ReleaseSmall).
     if (config.strip and
         config.target.result.os.tag == .windows and
         config.target.result.cpu.arch == .aarch64)
     {
         if (strip == true) std.log.warn(
-            "-Dstrip is ignored for aarch64-windows: a stripped build is miscompiled",
+            "-Dstrip is ignored for the aarch64-windows app and libghostty " ++
+                "(a stripped one is miscompiled); libghostty-vt is still stripped",
             .{},
         );
         config.strip = false;
