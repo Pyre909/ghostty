@@ -1,4 +1,4 @@
-//! Dear ImGui's DirectX 11 and Win32 backends, which draw the inspector.
+//! Dear ImGui's DirectX 11 and Win32 backends, for the terminal inspector.
 //!
 //! The DirectX 11 backend compiles its two shaders at runtime with
 //! D3DCompile. Linked as it is, that call would put d3dcompiler_47.dll in
@@ -9,15 +9,25 @@
 //! renderer's loader, the one that searches System32 only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cimgui = @import("dcimgui");
 
 const D3D11 = @import("../../renderer/D3D11.zig");
 const api = @import("../../renderer/d3d11/api.zig");
 const win32 = @import("win32.zig");
 
-/// D3DCompile for the DirectX 11 backend (see the file comment). When
-/// d3dcompiler_47.dll is missing, the backend's device objects fail and
-/// the inspector reports that; the process still starts.
+const LoadCompiler = @TypeOf(&D3D11.loadCompiler);
+
+/// For tests: a loader in place of the renderer's
+/// (`ghostty_imgui_D3DCompile`), to reach the shim's failure path.
+var test_load_compiler: if (builtin.is_test) ?LoadCompiler else void =
+    if (builtin.is_test) null else {};
+
+/// D3DCompile for the DirectX 11 backend (see the file comment). It
+/// returns E_FAIL when the compiler cannot be loaded. The backend's
+/// CreateDeviceObjects then returns false, and its NewFrame calls that
+/// again on every frame and asserts when it fails, so a caller creates
+/// the device objects itself and draws nothing when they fail.
 export fn ghostty_imgui_D3DCompile(
     data: *const anyopaque,
     data_size: api.SIZE_T,
@@ -31,7 +41,8 @@ export fn ghostty_imgui_D3DCompile(
     shader: *?*api.ID3DBlob,
     error_messages: ?*?*api.ID3DBlob,
 ) callconv(.winapi) api.HRESULT {
-    const compile = D3D11.loadCompiler() catch return api.E_FAIL;
+    const load = if (builtin.is_test) test_load_compiler orelse &D3D11.loadCompiler else &D3D11.loadCompiler;
+    const compile = load() catch return api.E_FAIL;
     return compile(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, error_messages);
 }
 
@@ -47,6 +58,26 @@ extern "d3d11" fn D3D11CreateDevice(
     feature_level: ?*api.D3D_FEATURE_LEVEL,
     context: ?*?*api.ID3D11DeviceContext,
 ) callconv(.winapi) api.HRESULT;
+
+/// A WARP device, which every supported Windows has, GPU driver or not.
+const TestDevice = struct {
+    device: *api.ID3D11Device,
+    context: *api.ID3D11DeviceContext,
+
+    fn init() !TestDevice {
+        const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
+        var device: ?*api.ID3D11Device = null;
+        var context: ?*api.ID3D11DeviceContext = null;
+        if (api.failed(D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device, null, &context)))
+            return error.TestDeviceFailed;
+        return .{ .device = device orelse return error.TestDeviceFailed, .context = context orelse return error.TestDeviceFailed };
+    }
+
+    fn deinit(self: TestDevice) void {
+        api.release(self.context);
+        api.release(self.device);
+    }
+};
 
 /// An ImGui context set up as the inspector's is (no ini or log file),
 /// current until `deinit`.
@@ -90,15 +121,10 @@ fn testTexture(device: *api.ID3D11Device, usage: api.D3D11_USAGE, bind: api.UINT
 test "win32: ImGui's DirectX 11 backend draws with the compiler loaded from System32" {
     const testing = std.testing;
 
-    // WARP, which every supported Windows has, GPU driver or not.
-    const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
-    var device_ptr: ?*api.ID3D11Device = null;
-    var context_ptr: ?*api.ID3D11DeviceContext = null;
-    try testing.expect(api.succeeded(D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device_ptr, null, &context_ptr)));
-    const device = device_ptr.?;
-    defer api.release(device);
-    const context = context_ptr.?;
-    defer api.release(context);
+    const d3d = try TestDevice.init();
+    defer d3d.deinit();
+    const device = d3d.device;
+    const context = d3d.context;
 
     const ig = try TestContext.init(64, 48);
     defer ig.deinit();
@@ -164,4 +190,23 @@ test "win32: ImGui's Win32 backend sizes the display from the window and never l
     // xinput1_4.dll.
     try testing.expect(win32.GetModuleHandleW(L("xinput1_4.dll")) == null);
     try testing.expect(win32.GetModuleHandleW(L("xinput9_1_0.dll")) == null);
+}
+
+test "win32: ImGui's DirectX 11 backend fails cleanly without a compiler" {
+    const testing = std.testing;
+    test_load_compiler = &noCompiler;
+    defer test_load_compiler = null;
+
+    const d3d = try TestDevice.init();
+    defer d3d.deinit();
+    const ig = try TestContext.init(64, 48);
+    defer ig.deinit();
+    try testing.expect(cimgui.ImGui_ImplDX11_Init(d3d.device, d3d.context));
+    // Shutdown and the context's destruction follow the failure.
+    defer cimgui.ImGui_ImplDX11_Shutdown();
+    try testing.expect(!cimgui.ImGui_ImplDX11_CreateDeviceObjects());
+}
+
+fn noCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
+    return error.D3DCompilerMissing;
 }
