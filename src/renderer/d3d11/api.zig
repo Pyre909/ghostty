@@ -1175,14 +1175,16 @@ pub const ID3DBlob = extern struct {
 
 /// D3DCompile from d3dcompiler_47.dll, which the backend resolves at
 /// runtime with GetProcAddress so that a missing DLL is an init error
-/// rather than a process-start failure.
+/// rather than a process-start failure. The entry point is optional:
+/// D3DCompile ignores it for an effect (fx_*) target, where Learn
+/// recommends null.
 pub const D3DCompileFn = *const fn (
     data: *const anyopaque,
     data_size: SIZE_T,
     filename: ?LPCSTR,
     defines: ?[*]const D3D_SHADER_MACRO,
     include: ?*ID3DInclude,
-    entrypoint: LPCSTR,
+    entrypoint: ?LPCSTR,
     target: LPCSTR,
     sflags: UINT,
     eflags: UINT,

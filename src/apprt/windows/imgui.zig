@@ -24,17 +24,18 @@ var test_load_compiler: if (builtin.is_test) ?LoadCompiler else void =
     if (builtin.is_test) null else {};
 
 /// D3DCompile for the DirectX 11 backend (see the file comment). It
-/// returns E_FAIL when the compiler cannot be loaded. The backend's
-/// CreateDeviceObjects then returns false, and its NewFrame calls that
-/// again on every frame and asserts when it fails, so a caller creates
-/// the device objects itself and draws nothing when they fail.
+/// returns E_FAIL, with both blobs null, when the compiler cannot be
+/// loaded. The backend's CreateDeviceObjects then returns false, and its
+/// NewFrame calls that again on every frame and asserts when it fails,
+/// so a caller creates the device objects itself and draws nothing when
+/// they fail.
 export fn ghostty_imgui_D3DCompile(
     data: *const anyopaque,
     data_size: api.SIZE_T,
     filename: ?api.LPCSTR,
     defines: ?[*]const api.D3D_SHADER_MACRO,
     include: ?*api.ID3DInclude,
-    entrypoint: api.LPCSTR,
+    entrypoint: ?api.LPCSTR,
     target: api.LPCSTR,
     sflags: api.UINT,
     eflags: api.UINT,
@@ -42,7 +43,11 @@ export fn ghostty_imgui_D3DCompile(
     error_messages: ?*?*api.ID3DBlob,
 ) callconv(.winapi) api.HRESULT {
     const load = if (builtin.is_test) test_load_compiler orelse &D3D11.loadCompiler else &D3D11.loadCompiler;
-    const compile = load() catch return api.E_FAIL;
+    const compile = load() catch {
+        shader.* = null;
+        if (error_messages) |messages| messages.* = null;
+        return api.E_FAIL;
+    };
     return compile(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, error_messages);
 }
 
@@ -205,6 +210,24 @@ test "win32: ImGui's DirectX 11 backend fails cleanly without a compiler" {
     // Shutdown and the context's destruction follow the failure.
     defer cimgui.ImGui_ImplDX11_Shutdown();
     try testing.expect(!cimgui.ImGui_ImplDX11_CreateDeviceObjects());
+}
+
+test "win32: the ImGui compiler shim fails with no blobs when the compiler cannot load" {
+    const testing = std.testing;
+    test_load_compiler = &noCompiler;
+    defer test_load_compiler = null;
+
+    // Addresses no blob has, which the shim must overwrite.
+    var shader: ?*api.ID3DBlob = @ptrFromInt(0x1000);
+    var messages: ?*api.ID3DBlob = @ptrFromInt(0x1000);
+    const source = "float4 main() : SV_Target { return 0; }";
+    try testing.expectEqual(api.E_FAIL, ghostty_imgui_D3DCompile(source.ptr, source.len, null, null, null, "main", "ps_4_0", 0, 0, &shader, &messages));
+    try testing.expect(shader == null);
+    try testing.expect(messages == null);
+    // The error blob is optional.
+    shader = @ptrFromInt(0x1000);
+    try testing.expectEqual(api.E_FAIL, ghostty_imgui_D3DCompile(source.ptr, source.len, null, null, null, null, "fx_5_0", 0, 0, &shader, null));
+    try testing.expect(shader == null);
 }
 
 fn noCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
