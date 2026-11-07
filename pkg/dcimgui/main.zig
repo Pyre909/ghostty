@@ -33,9 +33,9 @@ pub extern fn ImGui_ImplDX11_RenderDrawData(draw_data: *c.ImDrawData) callconv(.
 pub extern fn ImGui_ImplDX11_CreateDeviceObjects() callconv(.c) bool;
 pub extern fn ImGui_ImplDX11_InvalidateDeviceObjects() callconv(.c) void;
 
-// Win32 backend. The handles are an HWND and an HMONITOR; the message
-// handler takes a window procedure's arguments and returns nonzero when
-// ImGui consumed the message.
+// Win32 backend. The handle is an HWND; the message handler takes a
+// window procedure's arguments and returns nonzero when ImGui consumed the
+// message.
 pub extern fn ImGui_ImplWin32_Init(hwnd: *anyopaque) callconv(.c) bool;
 pub extern fn ImGui_ImplWin32_Shutdown() callconv(.c) void;
 pub extern fn ImGui_ImplWin32_NewFrame() callconv(.c) void;

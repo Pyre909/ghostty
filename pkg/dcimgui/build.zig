@@ -9,7 +9,7 @@ pub fn build(b: *std.Build) !void {
     const backend_opengl3 = b.option(bool, "backend-opengl3", "OpenGL3 backend") orelse false;
     const backend_metal = b.option(bool, "backend-metal", "Metal backend") orelse false;
     const backend_osx = b.option(bool, "backend-osx", "OSX backend") orelse false;
-    const backend_dx11 = b.option(bool, "backend-dx11", "DirectX 11 backend") orelse false;
+    const backend_dx11 = b.option(bool, "backend-dx11", "DirectX 11 backend (the program defines ghostty_imgui_D3DCompile)") orelse false;
     const backend_win32 = b.option(bool, "backend-win32", "Win32 backend") orelse false;
 
     // Build options
@@ -169,10 +169,10 @@ pub fn build(b: *std.Build) !void {
             // defines ghostty_imgui_D3DCompile (the D3DCompile signature),
             // loading the compiler however it trusts. d3dcompiler.h
             // declares the function in extern "C", so the renamed one has
-            // C linkage too. Under the MSVC ABI the backend's
-            // `#pragma comment(lib, "d3dcompiler")` still names the import
-            // library; nothing references it after the rename, so the
-            // linker takes no import from it.
+            // C linkage too. Under the MSVC ABI, which is not yet built,
+            // the backend's `#pragma comment(lib, "d3dcompiler")` still
+            // names the import library; nothing references it after the
+            // rename, so the linker should take no import from it.
             var flags: std.ArrayList([]const u8) = .empty;
             try flags.appendSlice(b.allocator, all_flags.items);
             try flags.append(b.allocator, "-DD3DCompile=ghostty_imgui_D3DCompile");
