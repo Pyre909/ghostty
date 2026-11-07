@@ -1,0 +1,167 @@
+//! Dear ImGui's DirectX 11 and Win32 backends, which draw the inspector.
+//!
+//! The DirectX 11 backend compiles its two shaders at runtime with
+//! D3DCompile. Linked as it is, that call would put d3dcompiler_47.dll in
+//! the exe's import table, and that DLL is not a KnownDLL: a static import
+//! of it is searched for in the application's directory first, so a copy
+//! planted beside the exe would load at startup. pkg/dcimgui renames the
+//! call to ghostty_imgui_D3DCompile, which this file defines over the
+//! renderer's loader, the one that searches System32 only.
+
+const std = @import("std");
+const cimgui = @import("dcimgui");
+
+const D3D11 = @import("../../renderer/D3D11.zig");
+const api = @import("../../renderer/d3d11/api.zig");
+const win32 = @import("win32.zig");
+
+/// D3DCompile for the DirectX 11 backend (see the file comment). When
+/// d3dcompiler_47.dll is missing, the backend's device objects fail and
+/// the inspector reports that; the process still starts.
+export fn ghostty_imgui_D3DCompile(
+    data: *const anyopaque,
+    data_size: api.SIZE_T,
+    filename: ?api.LPCSTR,
+    defines: ?[*]const api.D3D_SHADER_MACRO,
+    include: ?*api.ID3DInclude,
+    entrypoint: api.LPCSTR,
+    target: api.LPCSTR,
+    sflags: api.UINT,
+    eflags: api.UINT,
+    shader: *?*api.ID3DBlob,
+    error_messages: ?*?*api.ID3DBlob,
+) callconv(.winapi) api.HRESULT {
+    const compile = D3D11.loadCompiler() catch return api.E_FAIL;
+    return compile(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, error_messages);
+}
+
+extern "d3d11" fn D3D11CreateDevice(
+    adapter: ?*api.IDXGIAdapter,
+    driver_type: api.D3D_DRIVER_TYPE,
+    software: ?api.HMODULE,
+    flags: api.UINT,
+    feature_levels: ?[*]const api.D3D_FEATURE_LEVEL,
+    num_feature_levels: api.UINT,
+    sdk_version: api.UINT,
+    device: ?*?*api.ID3D11Device,
+    feature_level: ?*api.D3D_FEATURE_LEVEL,
+    context: ?*?*api.ID3D11DeviceContext,
+) callconv(.winapi) api.HRESULT;
+
+/// An ImGui context set up as the inspector's is (no ini or log file),
+/// current until `deinit`.
+const TestContext = struct {
+    ctx: *cimgui.c.ImGuiContext,
+
+    fn init(width: f32, height: f32) !TestContext {
+        const ctx = cimgui.c.ImGui_CreateContext(null) orelse return error.ImGuiContextFailed;
+        cimgui.c.ImGui_SetCurrentContext(ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        io.IniFilename = null;
+        io.LogFilename = null;
+        io.DisplaySize = .{ .x = width, .y = height };
+        return .{ .ctx = ctx };
+    }
+
+    fn deinit(self: TestContext) void {
+        cimgui.c.ImGui_DestroyContext(self.ctx);
+    }
+};
+
+/// A 64x48 RGBA texture, for a render target or a CPU-readable copy of one.
+fn testTexture(device: *api.ID3D11Device, usage: api.D3D11_USAGE, bind: api.UINT, cpu: api.UINT) !*api.ID3D11Texture2D {
+    const desc: api.D3D11_TEXTURE2D_DESC = .{
+        .Width = 64,
+        .Height = 48,
+        .MipLevels = 1,
+        .ArraySize = 1,
+        .Format = .R8G8B8A8_UNORM,
+        .SampleDesc = .{ .Count = 1, .Quality = 0 },
+        .Usage = usage,
+        .BindFlags = bind,
+        .CPUAccessFlags = cpu,
+        .MiscFlags = 0,
+    };
+    var texture: ?*api.ID3D11Texture2D = null;
+    if (api.failed(device.vtable.CreateTexture2D(device, &desc, null, &texture))) return error.TextureFailed;
+    return texture orelse error.TextureFailed;
+}
+
+test "win32: ImGui's DirectX 11 backend draws with the compiler loaded from System32" {
+    const testing = std.testing;
+
+    // WARP, which every supported Windows has, GPU driver or not.
+    const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
+    var device_ptr: ?*api.ID3D11Device = null;
+    var context_ptr: ?*api.ID3D11DeviceContext = null;
+    try testing.expect(api.succeeded(D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device_ptr, null, &context_ptr)));
+    const device = device_ptr.?;
+    defer api.release(device);
+    const context = context_ptr.?;
+    defer api.release(context);
+
+    const ig = try TestContext.init(64, 48);
+    defer ig.deinit();
+    try testing.expect(cimgui.ImGui_ImplDX11_Init(device, context));
+    defer cimgui.ImGui_ImplDX11_Shutdown();
+    // Both shaders compile here, through ghostty_imgui_D3DCompile.
+    try testing.expect(cimgui.ImGui_ImplDX11_CreateDeviceObjects());
+
+    const target = try testTexture(device, .DEFAULT, api.D3D11_BIND_RENDER_TARGET, 0);
+    defer api.release(target);
+    var rtv: ?*api.ID3D11RenderTargetView = null;
+    try testing.expect(api.succeeded(device.vtable.CreateRenderTargetView(device, target.resource(), null, &rtv)));
+    defer api.release(rtv.?);
+    context.vtable.OMSetRenderTargets(context, 1, &[_]?*api.ID3D11RenderTargetView{rtv}, null);
+    context.vtable.ClearRenderTargetView(context, rtv.?, &.{ 0, 0, 0, 1 });
+
+    // One opaque red rectangle, (16,16) to (48,32), over a black frame.
+    cimgui.ImGui_ImplDX11_NewFrame();
+    cimgui.c.ImGui_NewFrame();
+    cimgui.c.ImDrawList_AddRectFilled(
+        cimgui.c.ImGui_GetForegroundDrawList(),
+        .{ .x = 16, .y = 16 },
+        .{ .x = 48, .y = 32 },
+        0xff0000ff, // IM_COL32(255, 0, 0, 255)
+    );
+    cimgui.c.ImGui_Render();
+    cimgui.ImGui_ImplDX11_RenderDrawData(cimgui.c.ImGui_GetDrawData());
+
+    const copy = try testTexture(device, .STAGING, 0, api.D3D11_CPU_ACCESS_READ);
+    defer api.release(copy);
+    context.vtable.CopyResource(context, copy.resource(), target.resource());
+    var mapped: api.D3D11_MAPPED_SUBRESOURCE = undefined;
+    try testing.expect(api.succeeded(context.vtable.Map(context, copy.resource(), 0, .READ, 0, &mapped)));
+    defer context.vtable.Unmap(context, copy.resource(), 0);
+    const bytes: [*]const u8 = @ptrCast(mapped.pData.?);
+    const pixel = struct {
+        fn at(b: [*]const u8, pitch: usize, x: usize, y: usize) [4]u8 {
+            return b[y * pitch + x * 4 ..][0..4].*;
+        }
+    }.at;
+    try testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixel(bytes, mapped.RowPitch, 32, 24));
+    try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pixel(bytes, mapped.RowPitch, 4, 4));
+}
+
+test "win32: ImGui's Win32 backend sizes the display from the window and never loads XInput" {
+    const testing = std.testing;
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    const hwnd = win32.CreateWindowExW(0, L("STATIC"), L(""), win32.WS_POPUP, 0, 0, 64, 48, null, null, null, null) orelse
+        return error.TestWindowFailed;
+    defer _ = win32.DestroyWindow(hwnd);
+
+    const ig = try TestContext.init(0, 0);
+    defer ig.deinit();
+    try testing.expect(cimgui.ImGui_ImplWin32_Init(hwnd));
+    defer cimgui.ImGui_ImplWin32_Shutdown();
+    cimgui.ImGui_ImplWin32_NewFrame();
+
+    const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+    try testing.expectEqual(@as(f32, 64), io.DisplaySize.x);
+    try testing.expectEqual(@as(f32, 48), io.DisplaySize.y);
+    // The build leaves the backend's gamepad support out; with it, Init
+    // loads the first of these it finds, and Windows 10 and 11 ship
+    // xinput1_4.dll.
+    try testing.expect(win32.GetModuleHandleW(L("xinput1_4.dll")) == null);
+    try testing.expect(win32.GetModuleHandleW(L("xinput9_1_0.dll")) == null);
+}

@@ -175,6 +175,7 @@ pub const D3D11_USAGE = enum(c_int) {
     DEFAULT = 0,
     IMMUTABLE = 1,
     DYNAMIC = 2,
+    STAGING = 3,
     _,
 };
 
@@ -183,9 +184,11 @@ pub const D3D11_BIND_CONSTANT_BUFFER: UINT = 0x4;
 pub const D3D11_BIND_SHADER_RESOURCE: UINT = 0x8;
 pub const D3D11_BIND_RENDER_TARGET: UINT = 0x20;
 pub const D3D11_CPU_ACCESS_WRITE: UINT = 0x10000;
+pub const D3D11_CPU_ACCESS_READ: UINT = 0x20000;
 pub const D3D11_RESOURCE_MISC_BUFFER_STRUCTURED: UINT = 0x40;
 
 pub const D3D11_MAP = enum(c_int) {
+    READ = 1,
     WRITE_DISCARD = 4,
     WRITE_NO_OVERWRITE = 5,
     _,

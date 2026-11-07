@@ -823,8 +823,9 @@ const Composition = struct {
 /// already loaded is used as it is, wherever it came from; a WinUI 3 host
 /// loads one before the first surface (see ghostty_platform_windows_s in
 /// ghostty.h). The module is never freed: LoadLibrary counts references,
-/// and every surface in the process shares it.
-fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
+/// and every surface in the process shares it, as does the inspector's
+/// ImGui backend (apprt/windows/imgui.zig).
+pub fn loadCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
     const name = std.unicode.utf8ToUtf16LeStringLiteral("d3dcompiler_47.dll");
     const module = internal_os.windows.exp.kernel32.LoadLibraryExW(
         name,

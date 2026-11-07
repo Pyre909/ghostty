@@ -23,6 +23,25 @@ pub extern fn ImGui_ImplOSX_Init(*anyopaque) callconv(.c) bool;
 pub extern fn ImGui_ImplOSX_Shutdown() callconv(.c) void;
 pub extern fn ImGui_ImplOSX_NewFrame(*anyopaque) callconv(.c) void;
 
+// DirectX 11 backend. The device and context are an ID3D11Device and an
+// ID3D11DeviceContext. The backend's D3DCompile is renamed by the build;
+// the program linking it defines ghostty_imgui_D3DCompile (see build.zig).
+pub extern fn ImGui_ImplDX11_Init(device: *anyopaque, device_context: *anyopaque) callconv(.c) bool;
+pub extern fn ImGui_ImplDX11_Shutdown() callconv(.c) void;
+pub extern fn ImGui_ImplDX11_NewFrame() callconv(.c) void;
+pub extern fn ImGui_ImplDX11_RenderDrawData(draw_data: *c.ImDrawData) callconv(.c) void;
+pub extern fn ImGui_ImplDX11_CreateDeviceObjects() callconv(.c) bool;
+pub extern fn ImGui_ImplDX11_InvalidateDeviceObjects() callconv(.c) void;
+
+// Win32 backend. The handles are an HWND and an HMONITOR; the message
+// handler takes a window procedure's arguments and returns nonzero when
+// ImGui consumed the message.
+pub extern fn ImGui_ImplWin32_Init(hwnd: *anyopaque) callconv(.c) bool;
+pub extern fn ImGui_ImplWin32_Shutdown() callconv(.c) void;
+pub extern fn ImGui_ImplWin32_NewFrame() callconv(.c) void;
+pub extern fn ImGui_ImplWin32_WndProcHandler(hwnd: *anyopaque, msg: c_uint, wparam: usize, lparam: isize) callconv(.c) isize;
+pub extern fn ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd: *anyopaque) callconv(.c) f32;
+
 // Internal API types and functions from dcimgui_internal.h We declare these
 // manually because the internal header contains bitfields that translate-c has
 // trouble with.
