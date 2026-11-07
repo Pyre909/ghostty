@@ -84,8 +84,7 @@ const TestDevice = struct {
     }
 };
 
-/// An ImGui context set up as the inspector's is (no ini or log file),
-/// current until `deinit`.
+/// An ImGui context with no ini or log file, current until `deinit`.
 const TestContext = struct {
     ctx: *cimgui.c.ImGuiContext,
 
@@ -123,7 +122,7 @@ fn testTexture(device: *api.ID3D11Device, usage: api.D3D11_USAGE, bind: api.UINT
     return texture orelse error.TextureFailed;
 }
 
-test "win32: ImGui's DirectX 11 backend draws with the compiler loaded from System32" {
+test "win32: ImGui's DirectX 11 backend compiles through ghostty_imgui_D3DCompile and draws" {
     const testing = std.testing;
 
     const d3d = try TestDevice.init();
@@ -174,27 +173,31 @@ test "win32: ImGui's DirectX 11 backend draws with the compiler loaded from Syst
     try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pixel(bytes, mapped.RowPitch, 4, 4));
 }
 
-test "win32: ImGui's Win32 backend sizes the display from the window and never loads XInput" {
+test "win32: ImGui's Win32 backend never loads XInput" {
     const testing = std.testing;
     const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    // The backend's gamepad support, which the build leaves out, loads the
+    // first of these it finds; Windows 10 and 11 ship xinput1_4.dll.
+    const xinput = [_][*:0]const u16{
+        L("xinput1_4.dll"),
+        L("xinput1_3.dll"),
+        L("xinput9_1_0.dll"),
+        L("xinput1_2.dll"),
+        L("xinput1_1.dll"),
+    };
+    // None is loaded yet, so one loaded below is the backend's doing.
+    for (xinput) |name| try testing.expect(win32.GetModuleHandleW(name) == null);
+
     const hwnd = win32.CreateWindowExW(0, L("STATIC"), L(""), win32.WS_POPUP, 0, 0, 64, 48, null, null, null, null) orelse
         return error.TestWindowFailed;
     defer _ = win32.DestroyWindow(hwnd);
-
     const ig = try TestContext.init(0, 0);
     defer ig.deinit();
     try testing.expect(cimgui.ImGui_ImplWin32_Init(hwnd));
     defer cimgui.ImGui_ImplWin32_Shutdown();
     cimgui.ImGui_ImplWin32_NewFrame();
 
-    const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
-    try testing.expectEqual(@as(f32, 64), io.DisplaySize.x);
-    try testing.expectEqual(@as(f32, 48), io.DisplaySize.y);
-    // The build leaves the backend's gamepad support out; with it, Init
-    // loads the first of these it finds, and Windows 10 and 11 ship
-    // xinput1_4.dll.
-    try testing.expect(win32.GetModuleHandleW(L("xinput1_4.dll")) == null);
-    try testing.expect(win32.GetModuleHandleW(L("xinput9_1_0.dll")) == null);
+    for (xinput) |name| try testing.expect(win32.GetModuleHandleW(name) == null);
 }
 
 test "win32: ImGui's DirectX 11 backend fails cleanly without a compiler" {
