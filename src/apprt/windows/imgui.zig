@@ -12,8 +12,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const cimgui = @import("dcimgui");
 
-const D3D11 = @import("../../renderer/D3D11.zig");
-const api = @import("../../renderer/d3d11/api.zig");
+const D3D11 = @import("../../renderer.zig").D3D11;
+const api = D3D11.api;
 const win32 = @import("win32.zig");
 
 const LoadCompiler = @TypeOf(&D3D11.loadCompiler);

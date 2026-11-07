@@ -53,7 +53,9 @@ const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(D3D11);
 const shadertoy = @import("shadertoy.zig");
 
-const api = @import("d3d11/api.zig");
+/// The Direct3D 11, DXGI and compiler bindings, which the Windows apprt's
+/// ImGui backend draws with too.
+pub const api = @import("d3d11/api.zig");
 
 pub const GraphicsAPI = D3D11;
 pub const Device = @import("d3d11/Device.zig");
