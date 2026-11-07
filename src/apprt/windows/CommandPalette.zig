@@ -25,7 +25,9 @@ const uucode = @import("uucode");
 /// here. An action the core performs itself is supported; one the core
 /// hands to this runtime only if `App.performAction` handles what it
 /// becomes. GTK's palette leaves out the actions it cannot perform the
-/// same way (`isActionSupportedOnGtk`).
+/// same way (`isActionSupportedOnGtk`). A global keybind whose actions are
+/// all left out, `ignore` aside, is refused as well
+/// (`Hotkeys.performsNone`).
 pub fn supported(key: Binding.Action.Key) bool {
     return switch (key) {
         // The core's own: the terminal, its screen and its pty.

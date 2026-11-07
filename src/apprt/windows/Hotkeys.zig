@@ -27,6 +27,7 @@ const Config = @import("../../config.zig").Config;
 const win32 = @import("win32.zig");
 const L = win32.L;
 const key = @import("key.zig");
+const CommandPalette = @import("CommandPalette.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -91,9 +92,9 @@ pub const Refusal = error{
     /// without Ctrl and Alt (`Surface.isAltGr`), so the binding with them
     /// never matches.
     AltGr,
-    /// Every action is one this runtime does not perform yet
-    /// (toggle_visibility; `App.performAction`): the hotkey would take its
-    /// keys from every program and do nothing.
+    /// Every action is one this runtime does not perform yet, as
+    /// toggle_visibility or set_window_theme (`performsNone`): the hotkey
+    /// would take its keys from every program and do nothing.
     Unsupported,
 };
 
@@ -420,12 +421,18 @@ fn folded(cp: u21) u21 {
     return if (slice.len == 1) slice[0] else cp;
 }
 
-/// Whether this runtime performs none of `actions` (`Refusal.Unsupported`).
+/// Whether this runtime performs none of `actions` (`Refusal.Unsupported`):
+/// each is one the command palette leaves out (`CommandPalette.supported`,
+/// the one exhaustive list of what this runtime performs), so that a new
+/// action the palette cannot list is refused here too. All but `ignore`,
+/// which the palette leaves out as doing nothing: a global `ignore` takes
+/// its keys from every program, which is what it asks for, as on macOS,
+/// where the core reports every global binding handled
+/// (`CoreApp.keyEvent`) and the event tap then swallows the key.
 fn performsNone(actions: []const Binding.Action) bool {
-    for (actions) |action| switch (action) {
-        .toggle_visibility => {},
-        else => return false,
-    };
+    for (actions) |action| {
+        if (action == .ignore or CommandPalette.supported(action)) return false;
+    }
     return true;
 }
 

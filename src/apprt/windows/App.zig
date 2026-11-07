@@ -23683,8 +23683,14 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         "global:ctrl+%=new_window",
         // No scan code: NumLock makes it of numpad_7.
         "global:ctrl+numpad_home=new_window",
-        // Not performed by this runtime yet.
+        // Not performed by this runtime yet: every action the command
+        // palette leaves out, alone or chained.
         "global:ctrl+c=toggle_visibility",
+        "global:ctrl+d=set_window_theme:dark",
+        "global:ctrl+e=close_all_windows",
+        "global:ctrl+g=paste_from_selection",
+        "global:ctrl+h=undo",
+        "chain=redo",
     });
     try std.testing.expectEqual(0, TestHotkeys.take().len);
     try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.CatchAll));
@@ -23694,18 +23700,20 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
     try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NeedsShift));
     try std.testing.expectEqual(2, TestHotkeys.refused(&app, error.AltGr));
     try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NoKey));
-    try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.Unsupported));
+    try std.testing.expectEqual(5, TestHotkeys.refused(&app, error.Unsupported));
 
     // Ctrl+Alt+Q with Shift types nothing on that layout, and registers,
-    // as does a toggle chained to an action this runtime performs, and
-    // the quick terminal's toggle.
+    // as does a toggle chained to an action this runtime performs, the
+    // quick terminal's toggle, and `ignore`, which the palette leaves out
+    // but which asks for its keys to be taken.
     try TestHotkeys.apply(&app, &.{
         "global:ctrl+alt+shift+q=new_window",
         "global:ctrl+c=toggle_visibility",
         "chain=new_window",
         "global:ctrl+b=toggle_quick_terminal",
+        "global:ctrl+a=ignore",
     });
-    try std.testing.expectEqual(3, TestHotkeys.take().len);
+    try std.testing.expectEqual(4, TestHotkeys.take().len);
 }
 
 test "win32: two global keybinds on the same keys register once, for the physical key" {
