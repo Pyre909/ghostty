@@ -193,9 +193,6 @@ pub const View = struct {
         // WM_SETCURSOR for it.
         io.ConfigFlags |= cimgui.c.ImGuiConfigFlags_NoMouseCursorChange;
 
-        if (!cimgui.ImGui_ImplWin32_Init(hwnd)) return error.ImGuiWin32Failed;
-        errdefer shutdownWin32(hwnd);
-
         self.* = .{
             .hwnd = hwnd,
             .ctx = ctx,
@@ -222,7 +219,6 @@ pub const View = struct {
         _ = win32.KillTimer(self.hwnd, timer_id);
         cimgui.c.ImGui_SetCurrentContext(self.ctx);
         self.releaseGpu();
-        shutdownWin32(self.hwnd);
         cimgui.c.ImGui_DestroyContext(self.ctx);
         _ = win32.DestroyWindow(self.hwnd);
     }
@@ -288,8 +284,8 @@ pub const View = struct {
         return &self.gpu.?;
     }
 
-    /// A device, a swap chain for `hwnd` sized to its client area, and the
-    /// DirectX 11 backend initialized on them, in the current context.
+    /// A device, a swap chain for `hwnd` sized to its client area, and both
+    /// backends initialized for them, in the current context.
     fn makeGpu(hwnd: win32.HWND) !Gpu {
         const made = try D3D11.createDevice(api.D3D11_CREATE_DEVICE_BGRA_SUPPORT);
         errdefer api.release(made.device);
@@ -334,6 +330,12 @@ pub const View = struct {
         hr = factory.makeWindowAssociation(hwnd, api.DXGI_MWA_NO_ALT_ENTER | api.DXGI_MWA_NO_WINDOW_CHANGES);
         if (api.failed(hr)) log.warn("MakeWindowAssociation failed for an ImGui window hr=0x{x}", .{@as(u32, @bitCast(hr))});
 
+        // The backends start and end together (`releaseGpu`): the DirectX
+        // 11 backend's Shutdown destroys every viewport's platform data,
+        // the Win32 backend's for the main viewport among them, which
+        // that backend reads in every frame after.
+        if (!cimgui.ImGui_ImplWin32_Init(hwnd)) return error.ImGuiWin32Failed;
+        errdefer shutdownWin32(hwnd);
         if (!cimgui.ImGui_ImplDX11_Init(made.device, made.context)) return error.ImGuiD3D11Failed;
         // A warning: a compiler that cannot load (the usual cause) logs
         // its own error.
@@ -411,12 +413,13 @@ pub const View = struct {
         self.releaseGpu();
     }
 
-    /// Release the GPU objects, the backend's included; the context must
-    /// be current.
+    /// Release the GPU objects and end both backends (see `makeGpu`); the
+    /// context must be current.
     fn releaseGpu(self: *View) void {
         const gpu = self.gpu orelse return;
         self.gpu = null;
         cimgui.ImGui_ImplDX11_Shutdown();
+        shutdownWin32(self.hwnd);
         if (gpu.target) |target| api.release(target);
         // Unbound and flushed, released objects are destroyed now rather
         // than at a flush that never comes (as the renderer's releaseGpu).
@@ -775,9 +778,11 @@ test "win32: an ImGui view makes another device after it lost one" {
     try testing.expect(view.gpu != null);
 
     // Released as a lost one is (`loseDevice`, whose error log would fail
-    // the test). The next frame makes another, with the backend
-    // initialized on it again, its font texture made again too, and
-    // draws; twice, as the backend's Shutdown must allow.
+    // the test). The next frame makes another, with both backends
+    // initialized again and the font texture made again, and draws; the
+    // Win32 backend's frame reads the main viewport's data, which the
+    // DirectX 11 backend's Shutdown destroyed. Twice, as the backends'
+    // Shutdown and Init must allow.
     for (0..2) |i| {
         view.releaseGpu();
         try testing.expect(view.gpu == null);
