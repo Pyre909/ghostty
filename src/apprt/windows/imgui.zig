@@ -31,6 +31,11 @@ const LoadCompiler = @TypeOf(&D3D11.loadCompiler);
 var test_load_compiler: if (builtin.is_test) ?LoadCompiler else void =
     if (builtin.is_test) null else {};
 
+/// For tests: no device can be made (`View.makeGpu`), as when there is
+/// neither a GPU nor WARP.
+var test_no_device: if (builtin.is_test) bool else void =
+    if (builtin.is_test) false else {};
+
 /// D3DCompile for the DirectX 11 backend (see the file comment). It
 /// returns E_FAIL, with both blobs null, when the compiler cannot be
 /// loaded. The backend's CreateDeviceObjects then returns false, and its
@@ -287,15 +292,16 @@ pub const View = struct {
     }
 
     /// The GPU objects, made now if there are none and the last failure
-    /// was long enough ago (`recovery`). The context must be current: the
-    /// DirectX 11 backend is initialized in it.
+    /// was long enough ago (`recovery`). The context must be current: both
+    /// backends are initialized in it. A failure is a warning, as the
+    /// window stays open and tries again.
     fn gpuForFrame(self: *View) ?*Gpu {
         if (self.gpu) |*gpu| return gpu;
         const now: std.Io.Timestamp = .now(global.io(), .awake);
         if (self.recovery.delayMs(now) > 0) return null;
         self.gpu = makeGpu(self.hwnd) catch |err| {
             self.recovery.failed(now);
-            log.err("ImGui window D3D11 setup failed err={}; retrying in {d}ms", .{ err, D3D11.recovery_retry_ms });
+            log.warn("ImGui window D3D11 setup failed err={}; retrying in {d}ms", .{ err, D3D11.recovery_retry_ms });
             return null;
         };
         self.recovery.succeeded();
@@ -305,6 +311,7 @@ pub const View = struct {
     /// A device, a swap chain for `hwnd` sized to its client area, and both
     /// backends initialized for them, in the current context.
     fn makeGpu(hwnd: win32.HWND) !Gpu {
+        if (builtin.is_test) if (test_no_device) return error.D3D11DeviceFailed;
         const made = try D3D11.createDevice(api.D3D11_CREATE_DEVICE_BGRA_SUPPORT);
         errdefer api.release(made.device);
         errdefer api.release(made.context);
@@ -338,7 +345,7 @@ pub const View = struct {
         var swap_chain_ptr: ?*api.IDXGISwapChain1 = null;
         hr = factory.vtable.CreateSwapChainForHwnd(factory, api.unknown(made.device), hwnd, &desc, null, null, &swap_chain_ptr);
         if (api.failed(hr)) {
-            log.err("CreateSwapChainForHwnd failed for an ImGui window hwnd={x} hr=0x{x}", .{ @intFromPtr(hwnd), @as(u32, @bitCast(hr)) });
+            log.warn("CreateSwapChainForHwnd failed for an ImGui window hwnd={x} hr=0x{x}", .{ @intFromPtr(hwnd), @as(u32, @bitCast(hr)) });
             return error.D3D11SwapChainFailed;
         }
         const swap_chain = swap_chain_ptr orelse return error.D3D11SwapChainFailed;
@@ -420,10 +427,11 @@ pub const View = struct {
         self.loseDevice(what, hr);
     }
 
+    /// A warning: the next frame makes another device.
     fn loseDevice(self: *View, what: []const u8, hr: api.HRESULT) void {
         const gpu = self.gpu orelse return;
         const reason = gpu.device.vtable.GetDeviceRemovedReason(gpu.device);
-        log.err("ImGui window D3D11 device lost in {s} hr=0x{x} reason=0x{x}; making another", .{
+        log.warn("ImGui window D3D11 device lost in {s} hr=0x{x} reason=0x{x}; making another", .{
             what,
             @as(u32, @bitCast(hr)),
             @as(u32, @bitCast(reason)),
@@ -898,26 +906,63 @@ test "win32: an ImGui view makes another device after it lost one" {
     try testing.expectEqual(1, view.presents);
 
     // Only a removed or reset device is lost; any other failure keeps it.
-    try testing.expect(View.isDeviceLoss(api.DXGI_ERROR_DEVICE_REMOVED));
-    try testing.expect(View.isDeviceLoss(api.DXGI_ERROR_DEVICE_RESET));
-    try testing.expect(!View.isDeviceLoss(api.E_FAIL));
     view.failed("Present", api.E_FAIL);
     try testing.expect(view.gpu != null);
 
-    // Released as a lost one is (`loseDevice`, whose error log would fail
-    // the test). The next frame makes another, with both backends
-    // initialized again and the font texture made again, and draws; the
-    // Win32 backend's frame reads the main viewport's data, which the
-    // DirectX 11 backend's Shutdown destroyed. Twice, as the backends'
-    // Shutdown and Init must allow.
-    for (0..2) |i| {
-        view.releaseGpu();
+    // The next frame makes another, with both backends initialized again
+    // and the font texture made again, and draws; ImGui_NewFrame reads
+    // the main viewport's data from the Win32 backend
+    // (Platform_GetWindowDpiScale), and the DirectX 11 backend's Shutdown
+    // destroyed it. Twice, as the backends' Shutdown and Init must allow.
+    for ([_]api.HRESULT{ api.DXGI_ERROR_DEVICE_REMOVED, api.DXGI_ERROR_DEVICE_RESET }, 0..) |hr, i| {
+        view.failed("Present", hr);
         try testing.expect(view.gpu == null);
         testTick(&view);
         try testing.expect(view.gpu != null);
         try testing.expectEqual(2 * (i + 2), owner.draws);
         try testing.expectEqual(i + 2, view.presents);
     }
+}
+
+test "win32: an ImGui view without a device opens, and makes one after a pause" {
+    const testing = std.testing;
+    test_no_device = true;
+    defer test_no_device = false;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var depth: u32 = 0;
+    var owner: TestOwner = .{};
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    defer view.deinit();
+    try testing.expect(view.gpu == null);
+    testTick(&view);
+    try testing.expectEqual(0, owner.draws);
+
+    // One could be made now, but not before the pause after the failure.
+    test_no_device = false;
+    testTick(&view);
+    try testing.expect(view.gpu == null);
+    win32.Sleep(D3D11.recovery_retry_ms + 50);
+    testTick(&view);
+    try testing.expect(view.gpu != null);
+    try testing.expectEqual(2, owner.draws);
+    try testing.expectEqual(1, view.presents);
+}
+
+test "win32: an ImGui view that never had a device ends" {
+    // Neither backend was initialized, so neither is shut down: the Win32
+    // backend's Shutdown asserts that it was.
+    test_no_device = true;
+    defer test_no_device = false;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var depth: u32 = 0;
+    var owner: TestOwner = .{};
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try std.testing.expect(view.gpu == null);
+    view.deinit();
 }
 
 test "win32: an ImGui view without a compiler shows its background only" {
