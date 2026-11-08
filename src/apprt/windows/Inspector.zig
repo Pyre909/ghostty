@@ -15,7 +15,10 @@ const imgui = @import("imgui.zig");
 const win32 = @import("win32.zig");
 const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
+const TitleDialog = @import("TitleDialog.zig");
 const Window = @import("Window.zig");
+
+const log = std.log.scoped(.win32);
 
 surface: *Surface,
 view: imgui.View,
@@ -24,7 +27,7 @@ view: imgui.View,
 /// `App.endPrompt` enables it again.
 prompt_disabled: bool,
 
-/// GTK's title, and its default size, here at 96 DPI.
+/// GTK's title, and its default size, here the client area's at 96 DPI.
 const title = "Ghostty: Terminal Inspector";
 const width = 1000;
 const height = 600;
@@ -59,20 +62,49 @@ pub fn create(surface: *Surface) !*Inspector {
     try activate(core);
     errdefer deactivate(core);
 
-    // Scaled for the terminal's monitor, where the window opens.
-    const dpi: c_int = @intCast(Window.dpiOf(app, surface.hwnd));
+    // Made where the terminal's frame is, so on its monitor and at its
+    // DPI, then sized and centred there.
+    const frame = surface.window.hwnd;
+    var over: win32.RECT = .{ .left = 0, .top = 0, .right = width, .bottom = height };
+    _ = win32.GetWindowRect(frame, &over);
     try self.view.init(
         app.hinstance,
         L(title),
-        @divTrunc(width * dpi, 96),
-        @divTrunc(height * dpi, 96),
+        over,
         &app.modal_loop_depth,
         .{ .ptr = self, .ready = ready, .draw = draw, .close = close },
     );
+    place(self.view.hwnd, frame, Window.dpiOf(app, self.view.hwnd));
     // The view's context is current, for the inspector's fonts and flags.
     CoreInspector.setup();
     self.view.show();
     return self;
+}
+
+/// Size the window `hwnd` so that its client area is `width` by `height`
+/// at `dpi`, its own, centred over the terminal's frame and kept inside
+/// the work area of the frame's monitor (`TitleDialog.centred`). Its frame
+/// is measured from the window itself, as `Window.resizeClient` measures
+/// a terminal's: AdjustWindowRectExForDpi does not exist before Windows 10
+/// 1607. Left where it was made when the windows cannot be read.
+fn place(hwnd: win32.HWND, frame: win32.HWND, dpi: u32) void {
+    var window: win32.RECT = undefined;
+    var client: win32.RECT = undefined;
+    var over: win32.RECT = undefined;
+    if (!win32.GetWindowRect(hwnd, &window).toBool() or
+        !win32.GetClientRect(hwnd, &client).toBool() or
+        !win32.GetWindowRect(frame, &over).toBool())
+    {
+        log.warn("cannot read the inspector window's frame err={}", .{win32.GetLastError()});
+        return;
+    }
+    const monitor = Window.monitorInfo(win32.MonitorFromWindow(frame, win32.MONITOR_DEFAULTTONEAREST)) orelse return;
+    const scaled: c_int = @intCast(dpi);
+    const w = @divTrunc(width * scaled, 96) + (window.right - window.left) - (client.right - client.left);
+    const h = @divTrunc(height * scaled, 96) + (window.bottom - window.top) - (client.bottom - client.top);
+    const at = TitleDialog.centred(over, w, h, monitor.rcWork);
+    if (!win32.SetWindowPos(hwnd, null, at.left, at.top, at.right - at.left, at.bottom - at.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE).toBool())
+        log.warn("cannot place the inspector window err={}", .{win32.GetLastError()});
 }
 
 /// Close the window, and end the core's recording if the core is live.

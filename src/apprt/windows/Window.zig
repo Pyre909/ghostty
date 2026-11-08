@@ -3624,7 +3624,7 @@ fn monitorRect(monitor: ?win32.HMONITOR) ?win32.RECT {
 }
 
 /// The rects of `monitor`, or null, logged, if they cannot be read.
-fn monitorInfo(monitor: ?win32.HMONITOR) ?win32.MONITORINFO {
+pub fn monitorInfo(monitor: ?win32.HMONITOR) ?win32.MONITORINFO {
     var info: win32.MONITORINFO = std.mem.zeroes(win32.MONITORINFO);
     info.cbSize = @sizeOf(win32.MONITORINFO);
     if (!win32.GetMonitorInfoW(monitor orelse return null, &info).toBool()) {

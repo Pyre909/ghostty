@@ -18126,6 +18126,30 @@ test "win32: the inspector action opens, keeps and closes a live terminal's insp
     const hwnd = opened.view.hwnd;
     try std.testing.expect(core.active);
     try std.testing.expect(win32.IsWindowVisible(hwnd).toBool());
+    // Its client area is GTK's default size at its DPI, and it is centred
+    // over the terminal's frame as far as the frame's work area allows.
+    {
+        var frame: win32.RECT = undefined;
+        var rect: win32.RECT = undefined;
+        var client: win32.RECT = undefined;
+        try std.testing.expect(win32.GetWindowRect(window.hwnd, &frame).toBool());
+        try std.testing.expect(win32.GetWindowRect(hwnd, &rect).toBool());
+        try std.testing.expect(win32.GetClientRect(hwnd, &client).toBool());
+        const monitor = Window.monitorInfo(win32.MonitorFromWindow(window.hwnd, win32.MONITOR_DEFAULTTONEAREST)) orelse
+            return error.TestUnexpectedResult;
+        const work = monitor.rcWork;
+        try std.testing.expect(rect.left >= work.left and rect.right <= work.right);
+        try std.testing.expect(rect.top >= work.top and rect.bottom <= work.bottom);
+        const w = rect.right - rect.left;
+        const h = rect.bottom - rect.top;
+        const x = frame.left + @divTrunc(frame.right - frame.left - w, 2);
+        const y = frame.top + @divTrunc(frame.bottom - frame.top - h, 2);
+        try std.testing.expect(rect.left == x or rect.left == work.left or rect.right == work.right);
+        try std.testing.expect(rect.top == y or rect.top == work.top or rect.bottom == work.bottom);
+        const dpi: i32 = @intCast(Window.dpiOf(&app, hwnd));
+        if (w < work.right - work.left) try std.testing.expectEqual(@divTrunc(1000 * dpi, 96), client.right);
+        if (h < work.bottom - work.top) try std.testing.expectEqual(@divTrunc(600 * dpi, 96), client.bottom);
+    }
     // Open already: `show` keeps it.
     try std.testing.expect(try app.performAction(target, .inspector, .show));
     try std.testing.expectEqual(opened, a.inspector.?);

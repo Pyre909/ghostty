@@ -166,8 +166,8 @@ pub const View = struct {
         _ = win32.UnregisterClassW(L(class_name), hinstance);
     }
 
-    /// Make the window, hidden, `width` by `height` pixels with its frame,
-    /// with its context and its GPU objects, and leave the context current
+    /// Make the window, hidden, at `rect` (its frame included), with its
+    /// context and its GPU objects, and leave the context current
     /// for the owner's setup (fonts, flags); `show` then shows it. A device
     /// that cannot be made is not an error: the window opens and its frames
     /// try again (`recovery`). `modal_depth` is the app's count of system
@@ -178,8 +178,7 @@ pub const View = struct {
         self: *View,
         hinstance: win32.HINSTANCE,
         title: [*:0]const u16,
-        width: c_int,
-        height: c_int,
+        rect: win32.RECT,
         modal_depth: *u32,
         owner: Owner,
     ) !void {
@@ -188,10 +187,10 @@ pub const View = struct {
             L(class_name),
             title,
             win32.WS_OVERLAPPEDWINDOW,
-            win32.CW_USEDEFAULT,
-            win32.CW_USEDEFAULT,
-            width,
-            height,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
             null,
             null,
             hinstance,
@@ -759,6 +758,9 @@ const TestOwner = struct {
     }
 };
 
+/// For tests: where a test's view is made.
+const test_rect: win32.RECT = .{ .left = 0, .top = 0, .right = 320, .bottom = 200 };
+
 /// For tests: the exe's instance, with the view's class registered until
 /// `deinit`.
 const TestClass = struct {
@@ -789,7 +791,7 @@ test "win32: an ImGui view draws its owner twice per frame and presents" {
     var owner: TestOwner = .{};
     var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     defer view.deinit();
     try testing.expect(view.gpu.?.drawable);
 
@@ -836,7 +838,7 @@ test "win32: a shown ImGui view draws on its timer, but not while minimized" {
     var depth: u32 = 0;
     var owner: TestOwner = .{};
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     defer view.deinit();
 
     view.show();
@@ -870,7 +872,7 @@ test "win32: closing an ImGui view's window asks its owner" {
     var owner: TestOwner = .{};
     var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     defer view.deinit();
 
     _ = win32.SendMessageW(view.hwnd, win32.WM_CLOSE, 0, 0);
@@ -887,7 +889,7 @@ test "win32: an ImGui view counts its system modal loops" {
     var depth: u32 = 1;
     var owner: TestOwner = .{};
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
 
     _ = win32.SendMessageW(view.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
     try testing.expectEqual(2, depth);
@@ -912,7 +914,7 @@ test "win32: an ImGui view makes another device after it lost one" {
     var owner: TestOwner = .{};
     var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     defer view.deinit();
     testTick(&view);
     try testing.expectEqual(1, view.presents);
@@ -945,7 +947,7 @@ test "win32: an ImGui view without a device opens, and makes one after a pause" 
     var depth: u32 = 0;
     var owner: TestOwner = .{};
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     defer view.deinit();
     try testing.expect(view.gpu == null);
     testTick(&view);
@@ -972,7 +974,7 @@ test "win32: an ImGui view that never had a device ends" {
     var depth: u32 = 0;
     var owner: TestOwner = .{};
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     try std.testing.expect(view.gpu == null);
     view.deinit();
 }
@@ -986,7 +988,7 @@ test "win32: an ImGui view without a compiler shows its background only" {
     var owner: TestOwner = .{};
     var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
     defer view.deinit();
     try testing.expect(!view.gpu.?.drawable);
 
@@ -1006,10 +1008,10 @@ test "win32: ImGui views draw side by side and leave no USER objects" {
     var depth: u32 = 0;
     var first_owner: TestOwner = .{};
     var first: View = undefined;
-    try first.init(class.hinstance, L("first"), 320, 200, &depth, first_owner.owner());
+    try first.init(class.hinstance, L("first"), test_rect, &depth, first_owner.owner());
     var second_owner: TestOwner = .{};
     var second: View = undefined;
-    try second.init(class.hinstance, L("second"), 320, 200, &depth, second_owner.owner());
+    try second.init(class.hinstance, L("second"), test_rect, &depth, second_owner.owner());
     testTick(&first);
     testTick(&second);
     testTick(&first);
