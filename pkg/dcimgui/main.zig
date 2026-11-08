@@ -9,7 +9,8 @@ pub const c = @import("dcimgui_c");
 // takes its arguments as Zig passes them and hands them on to the
 // non-variadic ImGui_TextColoredV, whose ImVec4 both compilers pass alike.
 // A va_list there is a pointer to the arguments in 8-byte slots, as
-// MSVC's is.
+// MSVC's is. Removed with build.zig's rename, when Zig passes a struct to
+// a variadic function there as clang does.
 comptime {
     if (builtin.target.cpu.arch == .aarch64 and builtin.target.os.tag == .windows)
         @export(&textColored, .{ .name = "ImGui_TextColored" });

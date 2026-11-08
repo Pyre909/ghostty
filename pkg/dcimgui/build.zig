@@ -223,11 +223,22 @@ pub fn build(b: *std.Build) !void {
     if (b.lazyDependency("bindings", .{})) |upstream| {
         // On Windows ARM64 a variadic function takes every argument in
         // general registers, a struct packed into them as clang packs it
-        // (an ImVec4 in two), but Zig passes an ImVec4 to one as four
-        // separate floats, so the C wrapper would read its format from the
-        // colour. ImGui_TextColored, the one variadic function with such a
-        // parameter, is defined in Zig there (main.zig), and the wrapper's
-        // own is renamed out of its way.
+        // (an ImVec4 in two): "All composites are treated alike; no special
+        // treatment of HFAs or HVAs", in Microsoft's ARM64 ABI,
+        // https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions#addendum-variadic-functions
+        // But Zig passes an ImVec4 to one as four separate floats, as to a
+        // function that is not variadic, so the C wrapper would read its
+        // format from the colour. ImGui_TextColored, the one variadic
+        // function with such a parameter, is defined in Zig there
+        // (main.zig), and the wrapper's own is renamed out of its way.
+        // Remove both when Zig passes a struct to a variadic function on
+        // that target as clang does.
+        //
+        // So there the installed library does not define
+        // ImGui_TextColored, though the installed dcimgui.h declares it: a
+        // C program calling it would not link against the library alone.
+        // Only Zig code that imports this module has it, and no C program
+        // links the library.
         var bindings_flags: std.ArrayList([]const u8) = .empty;
         try bindings_flags.appendSlice(b.allocator, all_flags.items);
         if (target.result.cpu.arch == .aarch64 and target.result.os.tag == .windows) {
