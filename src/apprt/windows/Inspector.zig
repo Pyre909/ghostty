@@ -79,6 +79,9 @@ pub fn create(surface: *Surface) !*Inspector {
         .{ .ptr = self, .ready = ready, .draw = draw, .close = close },
     );
     place(self.view.hwnd, frame, Window.dpiOf(app, self.view.hwnd));
+    // Read again, as placed: a move to another DPI would have scaled the
+    // view already (WM_DPICHANGED), and this must not undo it.
+    self.view.setDpi(Window.dpiOf(app, self.view.hwnd));
     self.applyTheme();
     // The view's context is current, for the inspector's fonts and flags.
     CoreInspector.setup();

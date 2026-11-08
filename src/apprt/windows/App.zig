@@ -18115,6 +18115,11 @@ test "win32: the inspector action opens, keeps and closes a live terminal's insp
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
+    // 120 DPI, whatever the screen's: ImGui's sizes scaled differ from
+    // its defaults there, and the window still fits a work area at 96.
+    TestDpi.dpi = 120;
+    defer TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
 
     const window = try testFrame(&app);
     const a = try testPane(&app, window);
@@ -18175,6 +18180,11 @@ test "win32: the inspector action opens, keeps and closes a live terminal's insp
             try std.testing.expectEqual(frame.top + @divTrunc(frame.bottom - frame.top - h, 2), rect.top);
             try std.testing.expectEqual(@divTrunc(600 * dpi, 96), client.bottom);
         }
+        // ImGui's sizes are its DPI's: the window padding, 8 by default,
+        // scaled by dpi/96.
+        const cimgui = @import("dcimgui");
+        cimgui.c.ImGui_SetCurrentContext(opened.view.ctx);
+        try std.testing.expectEqual(@trunc(8 * @as(f32, @floatFromInt(dpi)) / 96), cimgui.c.ImGui_GetStyle().*.WindowPadding.x);
     }
     // Open already: `show` keeps it.
     try std.testing.expect(try app.performAction(target, .inspector, .show));

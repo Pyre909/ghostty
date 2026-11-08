@@ -75,7 +75,8 @@ export fn ghostty_imgui_D3DCompile(
 /// second, the most GTK's inspector redraws on its own, and from input
 /// (`inputFrame`). All of it runs on the UI thread. Its input goes to
 /// ImGui through the Win32 backend's message handler; ImGui leaves the
-/// pointer's shape alone, as GTK's does.
+/// pointer's shape alone, as GTK's does, and its sizes follow the
+/// window's DPI (`setDpi`).
 pub const View = struct {
     hwnd: win32.HWND,
     ctx: *cimgui.c.ImGuiContext,
@@ -496,6 +497,19 @@ pub const View = struct {
         api.release(gpu.device);
     }
 
+    /// Size ImGui's style for `dpi`, the window's: ImGui's defaults with
+    /// every size scaled by dpi/96, made afresh each time, as GTK's
+    /// inspector scales them by its scale factor. Fonts keep the size the
+    /// owner gave them, as GTK's do. The owner calls it once it has placed
+    /// the window, and WM_DPICHANGED after. Not inside a frame.
+    pub fn setDpi(self: *View, dpi: u32) void {
+        cimgui.c.ImGui_SetCurrentContext(self.ctx);
+        var style: cimgui.c.ImGuiStyle = undefined;
+        cimgui.ext.ImGuiStyle_ImGuiStyle(&style);
+        cimgui.c.ImGuiStyle_ScaleAllSizes(&style, @as(f32, @floatFromInt(dpi)) / 96);
+        cimgui.c.ImGui_GetStyle().* = style;
+    }
+
     /// Whether `msg` is input that the Win32 backend hands to ImGui: a key
     /// or a character, the mouse in the client area or leaving it, or the
     /// keyboard focus.
@@ -564,6 +578,15 @@ pub const View = struct {
             },
             win32.WM_EXITSIZEMOVE, win32.WM_EXITMENULOOP => {
                 self.modal_loops.exit(self.modal_depth);
+                return 0;
+            },
+
+            // The sizes for the new DPI (both words of wParam), then
+            // Windows' suggested rect, which keeps the window's size in
+            // DIPs; the frame it repaints is drawn at the new sizes.
+            win32.WM_DPICHANGED => {
+                self.setDpi(win32.hiword(wparam));
+                Window.applySuggestedRect(hwnd, lparam);
                 return 0;
             },
 
@@ -1240,4 +1263,30 @@ test "win32: an ImGui view that loses its device lets the mouse go" {
     testTick(&view);
     try testing.expect(view.gpu != null);
     try testing.expectEqual(0, owner.chars_len);
+}
+
+test "win32: an ImGui view's sizes follow its DPI" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var owner: TestOwner = .{};
+    var depth: u32 = 0;
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
+    defer view.deinit();
+
+    // ImGui's window padding is 8 by default.
+    view.setDpi(192);
+    try testing.expectEqual(16, cimgui.c.ImGui_GetStyle().*.WindowPadding.x);
+
+    // Moved to a monitor at 144 DPI: Windows' suggested rect, and the
+    // sizes made afresh, 8 by 1.5 each time rather than 16 by 1.5.
+    var rect: win32.RECT = .{ .left = 30, .top = 40, .right = 30 + 480, .bottom = 40 + 300 };
+    for (0..2) |_| {
+        _ = win32.SendMessageW(view.hwnd, win32.WM_DPICHANGED, 144 << 16 | 144, @bitCast(@intFromPtr(&rect)));
+        try testing.expectEqual(12, cimgui.c.ImGui_GetStyle().*.WindowPadding.x);
+    }
+    var now: win32.RECT = undefined;
+    try testing.expect(win32.GetWindowRect(view.hwnd, &now).toBool());
+    try testing.expectEqual(rect, now);
 }
