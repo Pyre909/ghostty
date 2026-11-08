@@ -117,9 +117,11 @@ pub fn route(key: Binding.Action.Key) Route {
         // GTK's window accelerators, so they act from its overlays' entries
         // too (`syncActionAccelerators` in
         // src/apprt/gtk/class/application.zig): they reset or clear the
-        // terminal behind the field, and take no input from it.
+        // terminal behind the field, or open its inspector, and take no
+        // input from it.
         .reset,
         .clear_screen,
+        .inspector,
         => .core,
 
         .copy_to_clipboard => .copy,
@@ -157,10 +159,6 @@ pub fn route(key: Binding.Action.Key) Route {
         .write_screen_file,
         .write_selection_file,
         .toggle_readonly,
-        // GTK's accelerators have it, but this runtime has no inspector to
-        // open (`App.performAction` does not handle the apprt's
-        // `inspector`), so the key stays the field's.
-        .inspector,
         .show_on_screen_keyboard,
         .toggle_secure_input,
         .toggle_mouse_reporting,
@@ -572,10 +570,10 @@ test "win32: the allow-list's choices" {
         try std.testing.expectEqual(Route.core, route(k));
     }
     // GTK's window accelerators act from its overlays, and so from the
-    // field, but the inspector, which this runtime does not have.
+    // field.
     try std.testing.expectEqual(Route.core, route(.reset));
     try std.testing.expectEqual(Route.core, route(.clear_screen));
-    try std.testing.expectEqual(Route.field, route(.inspector));
+    try std.testing.expectEqual(Route.core, route(.inspector));
     try std.testing.expectEqual(Route.copy, route(.copy_to_clipboard));
     try std.testing.expectEqual(Route.paste, route(.paste_from_clipboard));
     try std.testing.expectEqual(Route.select_all, route(.select_all));

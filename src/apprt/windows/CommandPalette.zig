@@ -111,6 +111,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .open_config,
         .reload_config,
         .quit,
+        .inspector,
         => true,
 
         // Nothing to do.
@@ -119,7 +120,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no tab overview, inspector, updater, undo, secure input or
+        // no tab overview, GTK inspector, updater, undo, secure input or
         // on-screen keyboard here.
         .toggle_tab_overview,
         .close_all_windows,
@@ -127,7 +128,6 @@ pub fn supported(key: Binding.Action.Key) bool {
         .check_for_updates,
         .undo,
         .redo,
-        .inspector,
         .show_gtk_inspector,
         .show_on_screen_keyboard,
         .toggle_secure_input,
@@ -1798,7 +1798,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     for (commands) |c| {
         if (supported(c.action)) commands_kept += 1;
     }
-    // Some are left out: the inspector, undo, the tab overview.
+    // Some are left out: the GTK inspector, undo, the tab overview.
     try testing.expect(commands_kept < commands.len);
     try testing.expectEqual(commands_kept + jumps.len, entries.items.len);
 
@@ -1808,6 +1808,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     }
     var saw_split = false;
     var saw_tab = false;
+    var saw_inspector = false;
     for (entries.items) |*e| switch (e.run) {
         .action => |action| {
             try testing.expect(supported(action));
@@ -1824,13 +1825,18 @@ test "win32: the palette's entries are the supported commands and a jump per ter
                 saw_tab = true;
                 try testing.expectEqualStrings("Ctrl+Shift+T", e.shortcut);
             }
-            try testing.expect(std.mem.indexOf(u8, e.action_key, "inspector") == null);
+            if (std.mem.eql(u8, e.action_key, "inspector:toggle")) {
+                saw_inspector = true;
+                try testing.expectEqualStrings("Toggle Inspector", e.title);
+                try testing.expectEqualStrings("Ctrl+Shift+I", e.shortcut);
+            }
+            try testing.expect(!std.mem.eql(u8, e.action_key, "show_gtk_inspector"));
             try testing.expect(!std.mem.eql(u8, e.action_key, "undo"));
             try testing.expect(!std.mem.eql(u8, e.action_key, "toggle_tab_overview"));
         },
         .jump => {},
     };
-    try testing.expect(saw_split and saw_tab);
+    try testing.expect(saw_split and saw_tab and saw_inspector);
 
     // The jumps: "Focus: <title>", "Untitled" for none, the directory as
     // the description unless the title shows it; two of the same title in

@@ -103,7 +103,7 @@ const max_texture_dimension: u32 = 16384;
 
 /// Time to let pass between recovery attempts after one failed, so a GPU
 /// that stays gone is not asked for a device on every frame.
-const recovery_retry_ms: i64 = 1000;
+pub const recovery_retry_ms: i64 = 1000;
 
 /// Stale frames dropped in a row before `present` warns that the window's
 /// size is not being reported. A drag drops a few at a time, each followed
@@ -304,25 +304,26 @@ const StaleFrames = struct {
 };
 
 /// When `recoverDevice` may next try to create a device. The deadline is
-/// on the `.awake` clock, so time spent asleep counts toward it.
-const Recovery = struct {
+/// on the `.awake` clock, so time spent asleep counts toward it. The
+/// inspector's window (apprt/windows/imgui.zig) paces its own the same way.
+pub const Recovery = struct {
     /// Null until an attempt failed: the first one runs at once.
     retry_at: ?std.Io.Timestamp = null,
 
     /// Milliseconds until the next attempt may run, rounded up so that a
     /// wake after this many finds the deadline passed.
-    fn delayMs(self: Recovery, now: std.Io.Timestamp) u64 {
+    pub fn delayMs(self: Recovery, now: std.Io.Timestamp) u64 {
         const at = self.retry_at orelse return 0;
         const ns = now.durationTo(at).nanoseconds;
         if (ns <= 0) return 0;
         return @intCast(@divFloor(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
     }
 
-    fn failed(self: *Recovery, now: std.Io.Timestamp) void {
+    pub fn failed(self: *Recovery, now: std.Io.Timestamp) void {
         self.retry_at = now.addDuration(.fromMilliseconds(recovery_retry_ms));
     }
 
-    fn succeeded(self: *Recovery) void {
+    pub fn succeeded(self: *Recovery) void {
         self.retry_at = null;
     }
 };

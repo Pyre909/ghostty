@@ -24,6 +24,7 @@ const TabBar = @import("TabBar.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
+const imgui = @import("imgui.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
 const IpcClient = @import("IpcClient.zig");
@@ -1843,6 +1844,12 @@ pub const App = struct {
             .scrollbar => scrollBar(target, value),
             .cell_size => self.cellSize(target),
             .size_limit => sizeLimit(target, value),
+
+            // A terminal's inspector window (`Inspector`).
+            .inspector => switch (target) {
+                .app => false,
+                .surface => |v| v.rt_surface.controlInspector(value),
+            },
 
             else => false,
         };
@@ -4232,6 +4239,10 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     try Overlays.registerClasses(hinstance, arrow);
     errdefer Overlays.unregisterClasses(hinstance);
 
+    // The inspector's windows (`imgui.View`), with the frame's icon.
+    try imgui.View.registerClass(hinstance, arrow, icon);
+    errdefer imgui.View.unregisterClass(hinstance);
+
     const app_class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
         .style = 0,
@@ -4253,6 +4264,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
 }
 
 fn unregisterClasses(hinstance: win32.HINSTANCE) void {
+    imgui.View.unregisterClass(hinstance);
     _ = win32.UnregisterClassW(L(app_class_name), hinstance);
     _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
     _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
@@ -5071,6 +5083,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.scroll_bar = .{};
     surface.preedit = .none;
     surface.shell = null;
+    surface.inspector = null;
     _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
@@ -17897,7 +17910,8 @@ test "win32: the command palette lists only what performAction carries out" {
     // below the tab moves are queued behind the new tab, and the closes
     // and tab moves behind the move to a new window, so that none of them
     // closes or moves anything here. Not `open_config`, which starts a
-    // program (the VM scenario runs it).
+    // program, nor `inspector`, which opens only for a live terminal (the
+    // VM scenarios run both).
     @setEvalBranchQuota(100_000);
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
@@ -17933,7 +17947,6 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .check_for_updates, .check_for_updates },
         .{ .undo, .undo },
         .{ .redo, .redo },
-        .{ .inspector, .inspector },
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
         .{ .toggle_secure_input, .secure_input },
@@ -17987,7 +18000,6 @@ test "win32: the command palette lists only what performAction carries out" {
             .prompt_tab_title => .tab,
             .prompt_surface_title => .surface,
             .set_window_title, .set_tab_title, .set_surface_title => .{ .title = "t" },
-            .inspector => .toggle,
             .toggle_secure_input => .toggle,
             // Not the core's `.toggle`: that is performed only if the
             // window floats once SetWindowPos returns
@@ -18039,6 +18051,33 @@ test "win32: the command palette lists only what performAction carries out" {
     try std.testing.expectEqual(38, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
+}
+
+test "win32: the inspector opens only for a live terminal" {
+    // A live terminal's inspector opens in the VM scenarios: a test's
+    // terminals have no core. For one with none, `show` and `toggle` are
+    // refused and nothing is made; `hide` has nothing to close.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+
+    try std.testing.expect(!try app.performAction(target, .inspector, .show));
+    try std.testing.expect(!try app.performAction(target, .inspector, .toggle));
+    try std.testing.expect(a.inspector == null);
+    try std.testing.expect(try app.performAction(target, .inspector, .hide));
+    try std.testing.expect(!try app.performAction(.app, .inspector, .toggle));
+    try std.testing.expect(CommandPalette.supported(.inspector));
 }
 
 test "win32: the command palette has a jump to each terminal that is not closing" {

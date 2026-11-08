@@ -28,6 +28,7 @@ const BellBorder = @import("BellBorder.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const Inspector = @import("Inspector.zig");
 const Transparency = @import("Transparency.zig");
 const IpcClient = @import("IpcClient.zig");
 const Overrides = @import("Overrides.zig");
@@ -201,6 +202,11 @@ pub const Surface = struct {
     /// Ghostty does not know. What a drop of files pastes is quoted for it
     /// (`dropFiles`).
     shell: ?Shell,
+
+    /// The terminal's inspector window while it is open
+    /// (`controlInspector`). Only while the core is live: `stopCore`
+    /// closes it first.
+    inspector: ?*Inspector,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -732,6 +738,7 @@ pub const Surface = struct {
             .overlays = .{},
             .scroll_bar = .{},
             .shell = null,
+            .inspector = null,
         };
 
         const hwnd = win32.CreateWindowExW(
@@ -1013,6 +1020,30 @@ pub const Surface = struct {
         self.ime.swallow_up.set(Ime.scanSlot(lparam));
     }
 
+    /// The `inspector` action: open the terminal's inspector window, close
+    /// it, or toggle it, as GTK does; `show` leaves an open one as it is.
+    /// False only when one would open and cannot, as for a terminal whose
+    /// core is not live.
+    pub fn controlInspector(self: *Surface, mode: apprt.action.Inspector) bool {
+        if (self.inspector != null) switch (mode) {
+            .show => {},
+            .toggle, .hide => self.closeInspector(),
+        } else switch (mode) {
+            .toggle, .show => self.inspector = Inspector.create(self) catch |err| {
+                log.warn("failed to open the inspector err={}", .{err});
+                return false;
+            },
+            .hide => {},
+        }
+        return true;
+    }
+
+    fn closeInspector(self: *Surface) void {
+        const inspector = self.inspector orelse return;
+        self.inspector = null;
+        inspector.destroy();
+    }
+
     /// The core surface, if message handlers may call into it.
     pub fn liveCore(self: *Surface) ?*CoreSurface {
         return switch (self.core_state) {
@@ -1065,6 +1096,11 @@ pub const Surface = struct {
     /// desired failure.
     pub fn stopCore(self: *Surface) void {
         if (self.core_state != .live) return;
+
+        // The inspector goes while the core can still take its end
+        // (`CoreSurface.deactivateInspector` reaches the core's threads).
+        self.closeInspector();
+
         self.core_state = .stopping;
 
         // Counted for the whole teardown, the waits included: they pump

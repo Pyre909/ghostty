@@ -366,6 +366,7 @@ test {
     _ = @import("windows/ContextMenu.zig");
     _ = @import("windows/Dividers.zig");
     _ = @import("windows/Hotkeys.zig");
+    _ = @import("windows/Inspector.zig");
     _ = @import("windows/KeyState.zig");
     _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/Overlays.zig");

@@ -31,7 +31,7 @@ pub const HWND = w.HWND;
 pub const HDC = w.HDC;
 pub const HINSTANCE = w.HINSTANCE;
 pub const HMODULE = w.HMODULE;
-const HICON = w.HICON;
+pub const HICON = w.HICON;
 pub const HCURSOR = w.HCURSOR;
 pub const HBRUSH = w.HBRUSH;
 pub const HMENU = w.HMENU;
@@ -114,6 +114,10 @@ pub const WNDCLASSEXW = extern struct {
 /// place of the second press of a quick second click, for every button:
 /// WM_LBUTTONDBLCLK, WM_MBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_XBUTTONDBLCLK.
 pub const CS_DBLCLKS: UINT = 0x0008;
+/// WNDCLASSEXW.style: a change of the window's width (CS_HREDRAW) or
+/// height (CS_VREDRAW) invalidates all of its client area.
+pub const CS_VREDRAW: UINT = 0x0001;
+pub const CS_HREDRAW: UINT = 0x0002;
 
 pub const CREATESTRUCTW = extern struct {
     lpCreateParams: ?*anyopaque,
@@ -1033,6 +1037,11 @@ pub extern "user32" fn IsIconic(hwnd: HWND) callconv(.winapi) BOOL;
 pub extern "user32" fn IsZoomed(hwnd: HWND) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow
 pub extern "user32" fn IsWindow(hwnd: HWND) callconv(.winapi) BOOL;
+/// The handle the property `name` held, or null if the window had none.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-removepropa
+pub extern "user32" fn RemovePropA(hwnd: HWND, name: [*:0]const u8) callconv(.winapi) ?HANDLE;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpropa
+pub extern "user32" fn GetPropA(hwnd: HWND, name: [*:0]const u8) callconv(.winapi) ?HANDLE;
 /// Returns whether the window was disabled *before* the call.
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablewindow
 pub extern "user32" fn EnableWindow(hwnd: HWND, enable: BOOL) callconv(.winapi) BOOL;
