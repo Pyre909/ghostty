@@ -42,6 +42,7 @@ pub fn create(surface: *Surface) !*Inspector {
         L(title),
         @divTrunc(width * dpi, 96),
         @divTrunc(height * dpi, 96),
+        &app.modal_loop_depth,
         .{ .ptr = self, .ready = ready, .draw = draw, .close = close },
     );
     // The view's context is current, for the inspector's fonts and flags.

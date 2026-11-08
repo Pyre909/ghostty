@@ -18,6 +18,7 @@ const global = @import("../../global.zig");
 const D3D11 = @import("../../renderer.zig").D3D11;
 const api = D3D11.api;
 const App = @import("App.zig").App;
+const Window = @import("Window.zig");
 const win32 = @import("win32.zig");
 const L = win32.L;
 
@@ -68,6 +69,13 @@ pub const View = struct {
     hwnd: win32.HWND,
     ctx: *cimgui.c.ImGuiContext,
     owner: Owner,
+
+    /// The app's count of system modal loops (`App.modal_loop_depth`), and
+    /// this window's share of it: a drag of the window, or its window
+    /// menu, runs one, and the app's wakeups tick the core only while that
+    /// count is above 0.
+    modal_depth: *u32,
+    modal_loops: Window.ModalLoops,
 
     /// Null after the device was lost or could not be made, until a frame
     /// makes another (`gpuForFrame`).
@@ -153,14 +161,17 @@ pub const View = struct {
     /// with its context and its GPU objects, and leave the context current
     /// for the owner's setup (fonts, flags); `show` then shows it. A device
     /// that cannot be made is not an error: the window opens and its frames
-    /// try again (`recovery`). `self` must not move, as the window
-    /// procedure finds it through GWLP_USERDATA.
+    /// try again (`recovery`). `modal_depth` is the app's count of system
+    /// modal loops (`App.modal_loop_depth`), which the window's own loops
+    /// add to. `self` must not move, as the window procedure finds it
+    /// through GWLP_USERDATA.
     pub fn init(
         self: *View,
         hinstance: win32.HINSTANCE,
         title: [*:0]const u16,
         width: c_int,
         height: c_int,
+        modal_depth: *u32,
         owner: Owner,
     ) !void {
         const hwnd = win32.CreateWindowExW(
@@ -197,6 +208,8 @@ pub const View = struct {
             .hwnd = hwnd,
             .ctx = ctx,
             .owner = owner,
+            .modal_depth = modal_depth,
+            .modal_loops = .{},
             .gpu = null,
             .recovery = .{},
             .presents = 0,
@@ -214,8 +227,12 @@ pub const View = struct {
 
     /// Destroy the window and everything made for it. Its procedure
     /// forgets the view first, so nothing the destruction sends reaches it.
+    /// Destroyed inside one of its modal loops (the terminal exited during
+    /// a drag), the window never hears that loop end, so its share of the
+    /// count is given back here.
     pub fn deinit(self: *View) void {
         _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWLP_USERDATA, 0);
+        self.modal_loops.release(self.modal_depth);
         _ = win32.KillTimer(self.hwnd, timer_id);
         cimgui.c.ImGui_SetCurrentContext(self.ctx);
         self.releaseGpu();
@@ -455,6 +472,16 @@ pub const View = struct {
 
             win32.WM_TIMER => if (wparam == timer_id) {
                 self.frame();
+                return 0;
+            },
+
+            // The system modal loops: see App.wndProc's WM_GHOSTTY_WAKEUP.
+            win32.WM_ENTERSIZEMOVE, win32.WM_ENTERMENULOOP => {
+                self.modal_loops.enter(self.modal_depth);
+                return 0;
+            },
+            win32.WM_EXITSIZEMOVE, win32.WM_EXITMENULOOP => {
+                self.modal_loops.exit(self.modal_depth);
                 return 0;
             },
 
@@ -739,8 +766,9 @@ test "win32: an ImGui view draws its owner twice per frame and presents" {
     const class = try TestClass.init();
     defer class.deinit();
     var owner: TestOwner = .{};
+    var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, owner.owner());
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
     defer view.deinit();
     try testing.expect(view.gpu.?.drawable);
 
@@ -785,8 +813,9 @@ test "win32: closing an ImGui view's window asks its owner" {
     const class = try TestClass.init();
     defer class.deinit();
     var owner: TestOwner = .{};
+    var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, owner.owner());
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
     defer view.deinit();
 
     _ = win32.SendMessageW(view.hwnd, win32.WM_CLOSE, 0, 0);
@@ -795,13 +824,40 @@ test "win32: closing an ImGui view's window asks its owner" {
     try testing.expect(win32.IsWindow(view.hwnd).toBool());
 }
 
+test "win32: an ImGui view counts its system modal loops" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    // Another window's loop is already counted.
+    var depth: u32 = 1;
+    var owner: TestOwner = .{};
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+
+    _ = win32.SendMessageW(view.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    try testing.expectEqual(2, depth);
+    _ = win32.SendMessageW(view.hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+    try testing.expectEqual(1, depth);
+    // An exit without a loop of its own takes nothing from the other's.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_EXITMENULOOP, 0, 0);
+    try testing.expectEqual(1, depth);
+
+    // Ended inside both of its loops, whose exits never come.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    _ = win32.SendMessageW(view.hwnd, win32.WM_ENTERMENULOOP, 0, 0);
+    try testing.expectEqual(3, depth);
+    view.deinit();
+    try testing.expectEqual(1, depth);
+}
+
 test "win32: an ImGui view makes another device after it lost one" {
     const testing = std.testing;
     const class = try TestClass.init();
     defer class.deinit();
     var owner: TestOwner = .{};
+    var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, owner.owner());
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
     defer view.deinit();
     testTick(&view);
     try testing.expectEqual(1, view.presents);
@@ -836,8 +892,9 @@ test "win32: an ImGui view without a compiler shows its background only" {
     const class = try TestClass.init();
     defer class.deinit();
     var owner: TestOwner = .{};
+    var depth: u32 = 0;
     var view: View = undefined;
-    try view.init(class.hinstance, L("test"), 320, 200, owner.owner());
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
     defer view.deinit();
     try testing.expect(!view.gpu.?.drawable);
 
@@ -854,12 +911,13 @@ test "win32: ImGui views draw side by side and leave no USER objects" {
     defer class.deinit();
     const before = win32.GetGuiResources(win32.current_process, win32.GR_USEROBJECTS);
 
+    var depth: u32 = 0;
     var first_owner: TestOwner = .{};
     var first: View = undefined;
-    try first.init(class.hinstance, L("first"), 320, 200, first_owner.owner());
+    try first.init(class.hinstance, L("first"), 320, 200, &depth, first_owner.owner());
     var second_owner: TestOwner = .{};
     var second: View = undefined;
-    try second.init(class.hinstance, L("second"), 320, 200, second_owner.owner());
+    try second.init(class.hinstance, L("second"), 320, 200, &depth, second_owner.owner());
     testTick(&first);
     testTick(&second);
     testTick(&first);
