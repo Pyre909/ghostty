@@ -188,7 +188,8 @@ pub const View = struct {
             hinstance,
             null,
         ) orelse {
-            log.err("CreateWindowExW failed for an ImGui window err={}", .{win32.GetLastError()});
+            // A warning: the owner goes on without the window, and says so.
+            log.warn("CreateWindowExW failed for an ImGui window err={}", .{win32.GetLastError()});
             return App.Error.Win32WindowCreationFailed;
         };
         errdefer _ = win32.DestroyWindow(hwnd);
@@ -806,6 +807,40 @@ test "win32: an ImGui view draws its owner twice per frame and presents" {
     try testing.expect(api.succeeded(view.gpu.?.swap_chain.getDesc1(&desc)));
     try testing.expectEqual(@as(api.UINT, @intCast(rc.right - rc.left)), desc.Width);
     try testing.expectEqual(@as(api.UINT, @intCast(rc.bottom - rc.top)), desc.Height);
+}
+
+test "win32: a shown ImGui view draws on its timer, but not while minimized" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var depth: u32 = 0;
+    var owner: TestOwner = .{};
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), 320, 200, &depth, owner.owner());
+    defer view.deinit();
+
+    view.show();
+    try testing.expect(win32.IsWindowVisible(view.hwnd).toBool());
+    // The timer's first tick, due in 33 ms, within a second.
+    var msg: win32.MSG = undefined;
+    const start = win32.GetTickCount64();
+    while (!win32.PeekMessageW(&msg, view.hwnd, win32.WM_TIMER, win32.WM_TIMER, win32.PM_REMOVE).toBool()) {
+        if (win32.GetTickCount64() - start > 1000) return error.TestNoTimer;
+        win32.Sleep(5);
+    }
+    try testing.expectEqual(View.timer_id, msg.wParam);
+    const drawn = owner.draws;
+    _ = win32.DispatchMessageW(&msg);
+    try testing.expectEqual(drawn + 2, owner.draws);
+
+    _ = win32.ShowWindow(view.hwnd, win32.SW_SHOWMINNOACTIVE);
+    const presents = view.presents;
+    testTick(&view);
+    try testing.expectEqual(drawn + 2, owner.draws);
+    try testing.expectEqual(presents, view.presents);
+    _ = win32.ShowWindow(view.hwnd, win32.SW_SHOWNOACTIVATE);
+    testTick(&view);
+    try testing.expectEqual(drawn + 4, owner.draws);
 }
 
 test "win32: closing an ImGui view's window asks its owner" {

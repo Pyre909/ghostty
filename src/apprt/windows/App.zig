@@ -25,6 +25,7 @@ const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const imgui = @import("imgui.zig");
+const Inspector = @import("Inspector.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
 const IpcClient = @import("IpcClient.zig");
@@ -18078,6 +18079,117 @@ test "win32: the inspector opens only for a live terminal" {
     try std.testing.expect(try app.performAction(target, .inspector, .hide));
     try std.testing.expect(!try app.performAction(.app, .inspector, .toggle));
     try std.testing.expect(CommandPalette.supported(.inspector));
+}
+
+test "win32: the inspector action opens, keeps and closes a live terminal's inspector" {
+    // GTK's: `show` opens the inspector if it is closed, `hide` closes it
+    // if it is open, and `toggle` does whichever applies. Its window draws
+    // the core's inspector, but not while the core cannot be used, and its
+    // close button closes it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+
+    var core: Inspector.TestCore = .{};
+    Inspector.test_core = &core;
+    defer Inspector.test_core = null;
+    // Back to `.none` before the teardown, which would stop a live core,
+    // and the inspector closed before that, while the core is live.
+    a.core_state = .live;
+    defer a.core_state = .none;
+    defer _ = a.controlInspector(.hide);
+
+    try std.testing.expect(try app.performAction(target, .inspector, .toggle));
+    const opened = a.inspector orelse return error.TestUnexpectedResult;
+    const hwnd = opened.view.hwnd;
+    try std.testing.expect(core.active);
+    try std.testing.expect(win32.IsWindowVisible(hwnd).toBool());
+    // Open already: `show` keeps it.
+    try std.testing.expect(try app.performAction(target, .inspector, .show));
+    try std.testing.expectEqual(opened, a.inspector.?);
+    try std.testing.expectEqual(1, core.activations);
+
+    // A repaint draws the core's inspector, twice per frame.
+    const renders = core.renders;
+    _ = win32.SendMessageW(hwnd, win32.WM_PAINT, 0, 0);
+    try std.testing.expectEqual(renders + 2, core.renders);
+
+    // Under a prompt, nothing draws, and its close leaves the window open.
+    app.beginPrompt(null);
+    _ = win32.SendMessageW(hwnd, win32.WM_PAINT, 0, 0);
+    try std.testing.expectEqual(renders + 2, core.renders);
+    _ = win32.SendMessageW(hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expectEqual(opened, a.inspector.?);
+    app.endPrompt();
+
+    // Its close button closes it, as `hide` does.
+    _ = win32.SendMessageW(hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expect(a.inspector == null);
+    try std.testing.expect(!core.active);
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+
+    try std.testing.expect(try app.performAction(target, .inspector, .toggle));
+    try std.testing.expect(a.inspector != null);
+    try std.testing.expect(try app.performAction(target, .inspector, .toggle));
+    try std.testing.expect(a.inspector == null);
+    try std.testing.expect(try app.performAction(target, .inspector, .show));
+    try std.testing.expect(a.inspector != null);
+    try std.testing.expect(try app.performAction(target, .inspector, .hide));
+    try std.testing.expect(a.inspector == null);
+    // Closed already: `hide` has nothing to close.
+    try std.testing.expect(try app.performAction(target, .inspector, .hide));
+    try std.testing.expectEqual(3, core.activations);
+    try std.testing.expectEqual(3, core.deactivations);
+}
+
+test "win32: an inspector that cannot open leaves nothing behind" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+
+    var core: Inspector.TestCore = .{ .refuse = true };
+    Inspector.test_core = &core;
+    defer Inspector.test_core = null;
+    a.core_state = .live;
+    defer a.core_state = .none;
+
+    // The core cannot make its inspector.
+    try std.testing.expect(!try app.performAction(target, .inspector, .toggle));
+    try std.testing.expect(a.inspector == null);
+    try std.testing.expectEqual(0, core.activations);
+
+    // The window cannot be made: the core's inspector is ended again.
+    core.refuse = false;
+    imgui.View.unregisterClass(app.hinstance);
+    try std.testing.expect(!try app.performAction(target, .inspector, .show));
+    try std.testing.expect(a.inspector == null);
+    try std.testing.expectEqual(1, core.activations);
+    try std.testing.expectEqual(1, core.deactivations);
+    try std.testing.expect(!core.active);
+    // For `unregisterClasses`.
+    try imgui.View.registerClass(app.hinstance, null, null);
 }
 
 test "win32: the command palette has a jump to each terminal that is not closing" {

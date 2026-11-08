@@ -7,8 +7,10 @@
 const Inspector = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const CoreInspector = @import("../../inspector/main.zig").Inspector;
+const CoreSurface = @import("../../Surface.zig");
 const imgui = @import("imgui.zig");
 const win32 = @import("win32.zig");
 const L = win32.L;
@@ -23,6 +25,23 @@ const title = "Ghostty: Terminal Inspector";
 const width = 1000;
 const height = 600;
 
+/// For tests: what stands in for the terminal's core, which a test's
+/// terminal does not have: one marked live has an unmade core.
+pub var test_core: if (builtin.is_test) ?*TestCore else void =
+    if (builtin.is_test) null else {};
+
+/// For tests: whether the core's inspector is active, and what was asked
+/// of the core.
+pub const TestCore = struct {
+    active: bool = false,
+    activations: u32 = 0,
+    deactivations: u32 = 0,
+    renders: u32 = 0,
+
+    /// Activation fails, as the core's can when out of memory.
+    refuse: bool = false,
+};
+
 /// Open the inspector of `surface`'s terminal, whose core must be live.
 pub fn create(surface: *Surface) !*Inspector {
     const core = surface.liveCore() orelse return error.SurfaceNotLive;
@@ -32,8 +51,8 @@ pub fn create(surface: *Surface) !*Inspector {
     errdefer alloc.destroy(self);
     self.surface = surface;
 
-    try core.activateInspector();
-    errdefer core.deactivateInspector();
+    try activate(core);
+    errdefer deactivate(core);
 
     // Scaled for the terminal's monitor, where the window opens.
     const dpi: c_int = @intCast(Window.dpiOf(app, surface.hwnd));
@@ -55,7 +74,7 @@ pub fn create(surface: *Surface) !*Inspector {
 pub fn destroy(self: *Inspector) void {
     const surface = self.surface;
     self.view.deinit();
-    if (surface.liveCore()) |core| core.deactivateInspector();
+    if (surface.liveCore()) |core| deactivate(core);
     surface.app.core_app.alloc.destroy(self);
 }
 
@@ -65,14 +84,13 @@ fn ready(ptr: *anyopaque) bool {
     const self: *Inspector = @ptrCast(@alignCast(ptr));
     if (!self.surface.app.canReenterCore()) return false;
     const core = self.surface.liveCore() orelse return false;
-    return core.inspector != null;
+    return isActive(core);
 }
 
 fn draw(ptr: *anyopaque) void {
     const self: *Inspector = @ptrCast(@alignCast(ptr));
     const core = self.surface.liveCore() orelse return;
-    const inspector = core.inspector orelse return;
-    inspector.render(core);
+    render(core);
 }
 
 /// Closed as the `inspector` action closes it, except under a core frame
@@ -82,4 +100,39 @@ fn close(ptr: *anyopaque) void {
     const self: *Inspector = @ptrCast(@alignCast(ptr));
     if (!self.surface.app.canReenterCore()) return;
     _ = self.surface.controlInspector(.hide);
+}
+
+// The core's inspector calls, which tests make on `test_core` instead.
+
+fn activate(core: *CoreSurface) !void {
+    if (builtin.is_test) if (test_core) |t| {
+        if (t.refuse) return error.OutOfMemory;
+        t.active = true;
+        t.activations += 1;
+        return;
+    };
+    try core.activateInspector();
+}
+
+fn deactivate(core: *CoreSurface) void {
+    if (builtin.is_test) if (test_core) |t| {
+        if (t.active) t.deactivations += 1;
+        t.active = false;
+        return;
+    };
+    core.deactivateInspector();
+}
+
+fn isActive(core: *CoreSurface) bool {
+    if (builtin.is_test) if (test_core) |t| return t.active;
+    return core.inspector != null;
+}
+
+fn render(core: *CoreSurface) void {
+    if (builtin.is_test) if (test_core) |t| {
+        t.renders += 1;
+        return;
+    };
+    const inspector = core.inspector orelse return;
+    inspector.render(core);
 }
