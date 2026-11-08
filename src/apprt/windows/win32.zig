@@ -1040,8 +1040,6 @@ pub extern "user32" fn IsWindow(hwnd: HWND) callconv(.winapi) BOOL;
 /// The handle the property `name` held, or null if the window had none.
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-removepropa
 pub extern "user32" fn RemovePropA(hwnd: HWND, name: [*:0]const u8) callconv(.winapi) ?HANDLE;
-/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getpropa
-pub extern "user32" fn GetPropA(hwnd: HWND, name: [*:0]const u8) callconv(.winapi) ?HANDLE;
 /// Returns whether the window was disabled *before* the call.
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enablewindow
 pub extern "user32" fn EnableWindow(hwnd: HWND, enable: BOOL) callconv(.winapi) BOOL;
