@@ -51,19 +51,6 @@ export fn ghostty_imgui_D3DCompile(
     return compile(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, error_messages);
 }
 
-extern "d3d11" fn D3D11CreateDevice(
-    adapter: ?*api.IDXGIAdapter,
-    driver_type: api.D3D_DRIVER_TYPE,
-    software: ?api.HMODULE,
-    flags: api.UINT,
-    feature_levels: ?[*]const api.D3D_FEATURE_LEVEL,
-    num_feature_levels: api.UINT,
-    sdk_version: api.UINT,
-    device: ?*?*api.ID3D11Device,
-    feature_level: ?*api.D3D_FEATURE_LEVEL,
-    context: ?*?*api.ID3D11DeviceContext,
-) callconv(.winapi) api.HRESULT;
-
 /// A WARP device, which every supported Windows has, GPU driver or not.
 const TestDevice = struct {
     device: *api.ID3D11Device,
@@ -73,7 +60,7 @@ const TestDevice = struct {
         const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
         var device: ?*api.ID3D11Device = null;
         var context: ?*api.ID3D11DeviceContext = null;
-        if (api.failed(D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device, null, &context)))
+        if (api.failed(D3D11.D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device, null, &context)))
             return error.TestDeviceFailed;
         return .{ .device = device orelse return error.TestDeviceFailed, .context = context orelse return error.TestDeviceFailed };
     }

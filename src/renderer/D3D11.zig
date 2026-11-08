@@ -134,7 +134,7 @@ const win32 = struct {
     ) callconv(.winapi) ?api.HWND;
     extern "user32" fn DestroyWindow(hwnd: api.HWND) callconv(.winapi) api.BOOL;
 
-    extern "d3d11" fn D3D11CreateDevice(
+    pub extern "d3d11" fn D3D11CreateDevice(
         adapter: ?*api.IDXGIAdapter,
         driver_type: api.D3D_DRIVER_TYPE,
         software: ?api.HMODULE,
@@ -147,6 +147,11 @@ const win32 = struct {
         context: ?*?*api.ID3D11DeviceContext,
     ) callconv(.winapi) api.HRESULT;
 };
+
+/// The one declaration of D3D11CreateDevice, for a caller that needs a
+/// particular driver type (the ImGui tests' WARP device); `createDevice`
+/// makes the device a window draws with.
+pub const D3D11CreateDevice = win32.D3D11CreateDevice;
 
 /// The window this renderer presents to. Borrowed from the apprt or the
 /// embedding host, which destroys it only after the renderer is gone.
@@ -433,17 +438,23 @@ fn adopt(self: *D3D11, gpu: Gpu) void {
     self.released = false;
 }
 
-/// Create the device, its immediate context and a swap chain of the kind
-/// `chain` names for the window, plus the sampler and debug queue that go
-/// with them. Failing to make or show a composition chain is
-/// error.D3D11CompositionFailed, after everything made so far is released.
-fn createGpu(hwnd: api.HWND, vsync: bool, chain: Chain) !Gpu {
-    // BGRA support is required for the B8G8R8A8 swap chain format. The
-    // debug layer needs the Graphics Tools optional feature; without it
-    // device creation reports the SDK component missing, and the device is
-    // created again without the layer.
-    var flags: api.UINT = api.D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-    if (comptime builtin.mode == .debug) flags |= api.D3D11_CREATE_DEVICE_DEBUG;
+/// A device and its immediate context, from `createDevice`.
+pub const CreatedDevice = struct {
+    device: *api.ID3D11Device,
+    context: *api.ID3D11DeviceContext,
+    level: api.D3D_FEATURE_LEVEL,
+    /// Made on WARP after the hardware adapter failed.
+    warp: bool,
+    /// The flags it was made with: those asked for, less the debug layer
+    /// when that is not installed.
+    flags: api.UINT,
+};
+
+/// A device at feature level 11_0 on the hardware adapter, or on WARP
+/// when that fails, with `flags`. The renderer's and the inspector's
+/// windows each make their own.
+pub fn createDevice(flags_in: api.UINT) error{D3D11DeviceFailed}!CreatedDevice {
+    var flags = flags_in;
 
     // Only 11_0: asking for 11_1 on an 11.0 runtime fails device creation
     // outright instead of falling back.
@@ -465,6 +476,9 @@ fn createGpu(hwnd: api.HWND, vsync: bool, chain: Chain) !Gpu {
         &level,
         &context_ptr,
     );
+    // The debug layer needs the Graphics Tools optional feature; without
+    // it device creation reports the SDK component missing, and the device
+    // is created again without the layer.
     if (hr == api.DXGI_ERROR_SDK_COMPONENT_MISSING and
         flags & api.D3D11_CREATE_DEVICE_DEBUG != 0)
     {
@@ -485,8 +499,9 @@ fn createGpu(hwnd: api.HWND, vsync: bool, chain: Chain) !Gpu {
     }
     // A driver that stops short of feature level 11_0, or no adapter at
     // all: WARP, the software rasterizer every supported Windows ships,
-    // does 11_0. Slow, but a terminal is drawn rather than no window, and
-    // the adapter line below then names the Microsoft Basic Render Driver.
+    // does 11_0. Slow, but a window is drawn rather than none, and the
+    // renderer's adapter line then names the Microsoft Basic Render
+    // Driver.
     if (api.failed(hr)) {
         log.warn("D3D11CreateDevice on the hardware adapter failed hr=0x{x}; trying WARP", .{@as(u32, @bitCast(hr))});
         warp = true;
@@ -510,7 +525,27 @@ fn createGpu(hwnd: api.HWND, vsync: bool, chain: Chain) !Gpu {
     const device = device_ptr orelse return error.D3D11DeviceFailed;
     errdefer api.release(device);
     const context = context_ptr orelse return error.D3D11DeviceFailed;
+    return .{ .device = device, .context = context, .level = level, .warp = warp, .flags = flags };
+}
+
+/// Create the device, its immediate context and a swap chain of the kind
+/// `chain` names for the window, plus the sampler and debug queue that go
+/// with them. Failing to make or show a composition chain is
+/// error.D3D11CompositionFailed, after everything made so far is released.
+fn createGpu(hwnd: api.HWND, vsync: bool, chain: Chain) !Gpu {
+    // BGRA support is required for the B8G8R8A8 swap chain format. Debug
+    // builds ask for the debug layer, which `createDevice` drops when it
+    // is not installed.
+    const made = try createDevice(api.D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+        if (builtin.mode == .debug) api.D3D11_CREATE_DEVICE_DEBUG else 0);
+    const device = made.device;
+    errdefer api.release(device);
+    const context = made.context;
     errdefer api.release(context);
+    const flags = made.flags;
+    const level = made.level;
+    const warp = made.warp;
+    var hr: api.HRESULT = undefined;
 
     // The debug layer queues its messages; drainDebugMessages logs them.
     const info_queue: ?*api.ID3D11InfoQueue = if (flags & api.D3D11_CREATE_DEVICE_DEBUG != 0)
