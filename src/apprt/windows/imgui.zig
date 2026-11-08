@@ -100,7 +100,7 @@ pub const View = struct {
         ptr: *anyopaque,
 
         /// Whether a frame may draw now; when not, the window keeps
-        /// showing the last one. Asked first, before anything else.
+        /// showing the last one. Asked before each frame draws.
         ready: *const fn (*anyopaque) bool,
 
         /// Build the UI, with the view's context current, between
@@ -363,7 +363,8 @@ pub const View = struct {
         // The backends start and end together (`releaseGpu`): the DirectX
         // 11 backend's Shutdown destroys every viewport's platform data,
         // the Win32 backend's for the main viewport among them, which
-        // that backend reads in every frame after.
+        // ImGui_NewFrame reads in every frame after, through that backend's
+        // Platform_GetWindowDpiScale.
         if (!cimgui.ImGui_ImplWin32_Init(hwnd)) return error.ImGuiWin32Failed;
         errdefer shutdownWin32(hwnd);
         if (!cimgui.ImGui_ImplDX11_Init(made.device, made.context)) return error.ImGuiD3D11Failed;
@@ -777,9 +778,11 @@ const TestClass = struct {
     }
 };
 
-/// For tests: the frame a timer tick draws. The view is never shown, so
-/// that no test window takes the focus; a hidden window draws as a shown
-/// one does.
+/// For tests: the frame a timer tick draws. Most tests never show the
+/// view, so that no test window takes the focus: hidden, it draws and
+/// presents as when shown, as a flip-model chain never reports its window
+/// occluded (DXGI_STATUS_OCCLUDED). The tests count draws and presents,
+/// not what reaches the screen.
 fn testTick(view: *View) void {
     _ = win32.SendMessageW(view.hwnd, win32.WM_TIMER, View.timer_id, 0);
 }
