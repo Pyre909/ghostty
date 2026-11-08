@@ -579,6 +579,42 @@ test "win32: ImGui's DirectX 11 backend compiles through ghostty_imgui_D3DCompil
     try testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pixel(bytes, mapped.RowPitch, 4, 4));
 }
 
+test "win32: ImGui_TextColored formats its arguments, in its colour" {
+    const testing = std.testing;
+
+    // The DirectX 11 backend makes the glyphs' texture as text needs it.
+    const d3d = try TestDevice.init();
+    defer d3d.deinit();
+    const ig = try TestContext.init(400, 300);
+    defer ig.deinit();
+    try testing.expect(cimgui.ImGui_ImplDX11_Init(d3d.device, d3d.context));
+    defer cimgui.ImGui_ImplDX11_Shutdown();
+
+    cimgui.ImGui_ImplDX11_NewFrame();
+    cimgui.c.ImGui_NewFrame();
+    cimgui.c.ImGui_SetNextWindowPos(.{ .x = 0, .y = 0 }, cimgui.c.ImGuiCond_Always);
+    _ = cimgui.c.ImGui_Begin("test", null, 0);
+    // The inspector's colour for an active screen. Passed as Zig passes a
+    // variadic function's ImVec4 on Windows ARM64, its third component
+    // was the address the C wrapper read its format from.
+    const col: cimgui.c.ImVec4 = .{ .x = 0.4, .y = 1.0, .z = 0.4, .w = 1.0 };
+    const list = cimgui.c.ImGui_GetWindowDrawList();
+    const before: usize = @intCast(list.*.VtxBuffer.Size);
+    cimgui.c.ImGui_TextColored(col, "%s %d", @as([*:0]const u8, "ab"), @as(c_int, 12));
+    const size = cimgui.c.ImGui_GetItemRectSize();
+    const after: usize = @intCast(list.*.VtxBuffer.Size);
+    const want = cimgui.c.ImGui_CalcTextSize("ab 12");
+    cimgui.c.ImGui_End();
+    cimgui.c.ImGui_Render();
+
+    try testing.expectEqual(want.x, size.x);
+    try testing.expectEqual(want.y, size.y);
+    // Every vertex of the text is in the colour.
+    try testing.expect(after > before);
+    const rgba = cimgui.c.ImGui_ColorConvertFloat4ToU32(col);
+    for (list.*.VtxBuffer.Data[before..after]) |vertex| try testing.expectEqual(rgba, vertex.col);
+}
+
 test "win32: ImGui's Win32 backend never loads XInput" {
     const testing = std.testing;
     // The backend's gamepad support, which the build leaves out, loads the

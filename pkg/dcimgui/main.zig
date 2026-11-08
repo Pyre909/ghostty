@@ -1,6 +1,25 @@
+const builtin = @import("builtin");
+
 pub const build_options = @import("build_options");
 
 pub const c = @import("dcimgui_c");
+
+// ImGui_TextColored on Windows ARM64, where the C wrapper's is renamed
+// (see build.zig): a call to c.ImGui_TextColored reaches this one, which
+// takes its arguments as Zig passes them and hands them on to the
+// non-variadic ImGui_TextColoredV, whose ImVec4 both compilers pass alike.
+// A va_list there is a pointer to the arguments in 8-byte slots, as
+// MSVC's is.
+comptime {
+    if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .windows)
+        @export(&textColored, .{ .name = "ImGui_TextColored" });
+}
+
+fn textColored(col: c.ImVec4, fmt: [*c]const u8, ...) callconv(.c) void {
+    var args = @cVaStart();
+    defer @cVaEnd(&args);
+    c.ImGui_TextColoredV(col, fmt, args);
+}
 
 // OpenGL3 backend
 pub extern fn ImGui_ImplOpenGL3_Init(glsl_version: ?[*:0]const u8) callconv(.c) bool;

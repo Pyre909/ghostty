@@ -221,6 +221,18 @@ pub fn build(b: *std.Build) !void {
 
     // Add the C bindings
     if (b.lazyDependency("bindings", .{})) |upstream| {
+        // On Windows ARM64 a variadic function takes every argument in
+        // general registers, a struct packed into them as clang packs it
+        // (an ImVec4 in two), but Zig passes an ImVec4 to one as four
+        // separate floats, so the C wrapper would read its format from the
+        // colour. ImGui_TextColored, the one variadic function with such a
+        // parameter, is defined in Zig there (main.zig), and the wrapper's
+        // own is renamed out of its way.
+        var bindings_flags: std.ArrayList([]const u8) = .empty;
+        try bindings_flags.appendSlice(b.allocator, all_flags.items);
+        if (target.result.cpu.arch == .aarch64 and target.result.os.tag == .windows) {
+            try bindings_flags.append(b.allocator, "-DImGui_TextColored=ghostty_imgui_TextColored_unused");
+        }
         lib.root_module.addIncludePath(upstream.path(""));
         lib.root_module.addCSourceFiles(.{
             .root = upstream.path(""),
@@ -228,7 +240,7 @@ pub fn build(b: *std.Build) !void {
                 "dcimgui.cpp",
                 "dcimgui_internal.cpp",
             },
-            .flags = all_flags.items,
+            .flags = bindings_flags.items,
         });
         lib.root_module.addCSourceFiles(.{
             .root = b.path(""),
