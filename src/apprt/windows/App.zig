@@ -4741,6 +4741,8 @@ test "win32: a prompt disables the other windows until the outermost one ends an
     var app: App = undefined;
     app.prompt_depth = 0;
     app.quick = null;
+    // No terminal, so no inspector window for the prompt to disable.
+    app.surfaces = .empty;
     app.windows = .empty;
     defer app.windows.deinit(std.testing.allocator);
     try app.windows.appendSlice(std.testing.allocator, &.{ &a, &b, &c });
