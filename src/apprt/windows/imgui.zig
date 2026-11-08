@@ -1001,17 +1001,19 @@ test "win32: ImGui views draw side by side and leave no USER objects" {
     testTick(&first);
     testTick(&second);
     testTick(&first);
+    testTick(&second);
     try testing.expectEqual(4, first_owner.draws);
-    try testing.expectEqual(2, second_owner.draws);
+    try testing.expectEqual(4, second_owner.draws);
 
-    // The first one's end leaves no context current; the second makes its
-    // own current for its frame.
+    // The first one ends with the second's context current, so it makes
+    // its own current for its end, and leaves none current; the second
+    // makes its own current for its frame.
     const hwnd = first.hwnd;
     first.deinit();
     try testing.expect(!win32.IsWindow(hwnd).toBool());
     testTick(&second);
-    try testing.expectEqual(4, second_owner.draws);
-    try testing.expectEqual(2, second.presents);
+    try testing.expectEqual(6, second_owner.draws);
+    try testing.expectEqual(3, second.presents);
     second.deinit();
 
     try testing.expectEqual(before, win32.GetGuiResources(win32.current_process, win32.GR_USEROBJECTS));
