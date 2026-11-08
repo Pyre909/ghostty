@@ -27,6 +27,9 @@ view: imgui.View,
 /// `App.endPrompt` enables it again.
 prompt_disabled: bool,
 
+/// The title bar is dark (`applyTheme`).
+dark_frame: bool,
+
 /// GTK's title, and its default size, here the client area's at 96 DPI.
 const title = "Ghostty: Terminal Inspector";
 const width = 1000;
@@ -58,6 +61,7 @@ pub fn create(surface: *Surface) !*Inspector {
     errdefer alloc.destroy(self);
     self.surface = surface;
     self.prompt_disabled = false;
+    self.dark_frame = false;
 
     try activate(core);
     errdefer deactivate(core);
@@ -75,6 +79,7 @@ pub fn create(surface: *Surface) !*Inspector {
         .{ .ptr = self, .ready = ready, .draw = draw, .close = close },
     );
     place(self.view.hwnd, frame, Window.dpiOf(app, self.view.hwnd));
+    self.applyTheme();
     // The view's context is current, for the inspector's fonts and flags.
     CoreInspector.setup();
     self.view.show();
@@ -105,6 +110,27 @@ fn place(hwnd: win32.HWND, frame: win32.HWND, dpi: u32) void {
     const at = TitleDialog.centred(over, w, h, monitor.rcWork);
     if (!win32.SetWindowPos(hwnd, null, at.left, at.top, at.right - at.left, at.bottom - at.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE).toBool())
         log.warn("cannot place the inspector window err={}", .{win32.GetLastError()});
+}
+
+/// Give the window the title bar the frames have (`Window.frameDark`), as
+/// GTK's inspector window follows the app's color scheme. A failed call
+/// leaves `dark_frame` as it was, so the next one tries again.
+pub fn applyTheme(self: *Inspector) void {
+    const app = self.surface.app;
+    const dark = Window.frameDark(&app.config, app.system_scheme, app.window_theme_override);
+    if (dark == self.dark_frame) return;
+    const value: win32.BOOL = if (dark) .TRUE else .FALSE;
+    const hr = win32.DwmSetWindowAttribute(
+        self.view.hwnd,
+        win32.DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &value,
+        @sizeOf(win32.BOOL),
+    );
+    if (hr < 0) {
+        log.warn("cannot set the inspector's title bar mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
+        return;
+    }
+    self.dark_frame = dark;
 }
 
 /// Close the window, and end the core's recording if the core is live.

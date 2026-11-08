@@ -1665,7 +1665,13 @@ pub const App = struct {
         if (scheme == self.system_scheme) return;
         self.system_scheme = scheme;
         for (self.windows.items) |window| window.applyTheme();
+        self.applyInspectorThemes();
         self.wakeup();
+    }
+
+    /// Every open inspector's title bar follows the frames' (`Inspector.applyTheme`).
+    fn applyInspectorThemes(self: *App) void {
+        for (self.surfaces.items) |surface| if (surface.inspector) |inspector| inspector.applyTheme();
     }
 
     /// `.set_window_theme`, which the core gives the app: the theme every
@@ -1680,6 +1686,7 @@ pub const App = struct {
     fn setWindowTheme(self: *App, theme: apprt.action.WindowTheme) bool {
         self.window_theme_override = theme;
         for (self.windows.items) |window| window.applyTheme();
+        self.applyInspectorThemes();
         self.wakeup();
         return true;
     }
@@ -2679,6 +2686,7 @@ pub const App = struct {
             window.applyTheme();
             Transparency.applyBlur(window);
         }
+        self.applyInspectorThemes();
         for (self.surfaces.items) |surface| surface.overlays.invalidate();
         // `bell-features` may show a ringing bell otherwise now.
         for (self.surfaces.items) |surface| {
@@ -18234,6 +18242,60 @@ test "win32: an inspector that cannot open leaves nothing behind" {
     try std.testing.expect(!core.active);
     // For `unregisterClasses`.
     try imgui.View.registerClass(app.hinstance, null, null);
+}
+
+test "win32: an inspector's title bar follows the frames' mode" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+
+    var core: Inspector.TestCore = .{};
+    Inspector.test_core = &core;
+    defer Inspector.test_core = null;
+    a.core_state = .live;
+    defer a.core_state = .none;
+    defer _ = a.controlInspector(.hide);
+
+    // Opened under a dark theme, it is dark.
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
+    try std.testing.expect(try app.performAction(target, .inspector, .show));
+    const inspector = a.inspector orelse return error.TestUnexpectedResult;
+    try std.testing.expect(inspector.dark_frame);
+
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .light));
+    try std.testing.expect(!inspector.dark_frame);
+
+    // The system's mode read last is the other one, as if Windows had just
+    // switched, and the title bar shows it. The system's mode itself is
+    // never changed.
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .system));
+    const now = systemColorScheme();
+    app.system_scheme = if (now == .dark) .light else .dark;
+    app.applyInspectorThemes();
+    try std.testing.expectEqual(now != .dark, inspector.dark_frame);
+    app.systemSchemeChanged();
+    try std.testing.expectEqual(now == .dark, inspector.dark_frame);
+
+    // A new configuration's `window-theme`.
+    app.config.@"window-theme" = .light;
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .config));
+    try std.testing.expect(!inspector.dark_frame);
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .dark;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(inspector.dark_frame);
 }
 
 test "win32: the command palette has a jump to each terminal that is not closing" {
