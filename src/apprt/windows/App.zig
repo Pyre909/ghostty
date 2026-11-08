@@ -18122,18 +18122,10 @@ test "win32: the inspector action opens, keeps and closes a live terminal's insp
     window.tab().focused = a;
     const target: apprt.Target = .{ .surface = &a.core_surface };
 
-    var core: Inspector.TestCore = .{};
-    Inspector.test_core = &core;
-    defer Inspector.test_core = null;
-    // Back to `.none` before the teardown, which would stop a live core,
-    // and the inspector closed before that, while the core is live.
-    a.core_state = .live;
-    defer a.core_state = .none;
-    defer _ = a.controlInspector(.hide);
-
     // The frame in the middle of its work area, so that a window centred
     // over it is not against an edge, and one placed where the frame is
-    // is not centred.
+    // is not centred. Done before the terminal is marked live: a live
+    // terminal's resize reaches its core, which a test's does not have.
     const work = (Window.monitorInfo(win32.MonitorFromWindow(window.hwnd, win32.MONITOR_DEFAULTTONEAREST)) orelse
         return error.TestUnexpectedResult).rcWork;
     try std.testing.expect(win32.SetWindowPos(
@@ -18145,6 +18137,15 @@ test "win32: the inspector action opens, keeps and closes a live terminal's insp
         300,
         win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
     ).toBool());
+
+    var core: Inspector.TestCore = .{};
+    Inspector.test_core = &core;
+    defer Inspector.test_core = null;
+    // Back to `.none` before the teardown, which would stop a live core,
+    // and the inspector closed before that, while the core is live.
+    a.core_state = .live;
+    defer a.core_state = .none;
+    defer _ = a.controlInspector(.hide);
 
     try std.testing.expect(try app.performAction(target, .inspector, .toggle));
     const opened = a.inspector orelse return error.TestUnexpectedResult;
