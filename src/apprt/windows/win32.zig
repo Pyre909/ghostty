@@ -187,6 +187,8 @@ pub const HWND_TOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))))
 pub const HWND_NOTOPMOST: HWND = @ptrFromInt(@as(usize, @bitCast(@as(isize, -2))));
 pub const GWLP_USERDATA: c_int = -21;
 
+/// No message: a window procedure does nothing with it.
+pub const WM_NULL: UINT = 0x0000;
 pub const WM_DESTROY: UINT = 0x0002;
 pub const WM_SIZE: UINT = 0x0005;
 pub const WM_ACTIVATE: UINT = 0x0006;
@@ -233,6 +235,10 @@ pub const WM_SYSDEADCHAR: UINT = 0x0107;
 pub const WM_KEYLAST: UINT = 0x0109;
 pub const WM_SYSCOMMAND: UINT = 0x0112;
 pub const WM_TIMER: UINT = 0x0113;
+/// The range of the client area's mouse messages, WM_MOUSEMOVE to
+/// WM_MOUSEHWHEEL.
+pub const WM_MOUSEFIRST: UINT = 0x0200;
+pub const WM_MOUSELAST: UINT = 0x020E;
 pub const WM_MOUSEMOVE: UINT = 0x0200;
 pub const WM_LBUTTONDOWN: UINT = 0x0201;
 pub const WM_LBUTTONUP: UINT = 0x0202;

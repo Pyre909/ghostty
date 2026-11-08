@@ -60,6 +60,9 @@ pub extern fn ImGui_ImplWin32_Init(hwnd: *anyopaque) callconv(.c) bool;
 pub extern fn ImGui_ImplWin32_Shutdown() callconv(.c) void;
 pub extern fn ImGui_ImplWin32_NewFrame() callconv(.c) void;
 pub extern fn ImGui_ImplWin32_WndProcHandler(hwnd: *anyopaque, msg: c_uint, wparam: usize, lparam: isize) callconv(.c) isize;
+// The same for the context `io` belongs to, whichever context is current
+// (the C++ takes an ImGuiIO&).
+pub extern fn ImGui_ImplWin32_WndProcHandlerEx(hwnd: *anyopaque, msg: c_uint, wparam: usize, lparam: isize, io: *c.ImGuiIO) callconv(.c) isize;
 pub extern fn ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd: *anyopaque) callconv(.c) f32;
 
 // Internal API types and functions from dcimgui_internal.h We declare these

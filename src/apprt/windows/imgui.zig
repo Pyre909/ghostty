@@ -36,6 +36,11 @@ var test_load_compiler: if (builtin.is_test) ?LoadCompiler else void =
 var test_no_device: if (builtin.is_test) bool else void =
     if (builtin.is_test) false else {};
 
+/// For tests: the gap `View.inputFrame` keeps, in place of
+/// `View.input_frame_ns`.
+var test_input_frame_ns: if (builtin.is_test) ?u64 else void =
+    if (builtin.is_test) null else {};
+
 /// D3DCompile for the DirectX 11 backend (see the file comment). It
 /// returns E_FAIL, with both blobs null, when the compiler cannot be
 /// loaded. The backend's CreateDeviceObjects then returns false, and its
@@ -66,13 +71,18 @@ export fn ghostty_imgui_D3DCompile(
 
 /// A top-level window that Dear ImGui draws in, with an ImGui context, a
 /// device and a flip-model swap chain of its own. Its owner builds the UI
-/// (`Owner.draw`). Frames come from WM_PAINT and from a timer at 30 per
-/// second, the most GTK's inspector redraws. All of it runs on the UI
-/// thread. The window takes no input yet: the Win32 backend's message
-/// handler is not called, and ImGui leaves the pointer's shape alone.
+/// (`Owner.draw`). Frames come from WM_PAINT, from a timer at 30 per
+/// second, the most GTK's inspector redraws on its own, and from input
+/// (`inputFrame`). All of it runs on the UI thread. Its input goes to
+/// ImGui through the Win32 backend's message handler; ImGui leaves the
+/// pointer's shape alone, as GTK's does.
 pub const View = struct {
     hwnd: win32.HWND,
     ctx: *cimgui.c.ImGuiContext,
+
+    /// The context's, which the message handler is given.
+    io: *cimgui.c.ImGuiIO,
+
     owner: Owner,
 
     /// The app's count of system modal loops (`App.modal_loop_depth`), and
@@ -95,6 +105,9 @@ pub const View = struct {
     /// A failure was logged since the last frame presented, so another is
     /// not (`failed`): one that persists would repeat at every frame.
     quiet: bool,
+
+    /// When the last frame began to draw (`inputFrame`).
+    last_frame: ?std.Io.Timestamp,
 
     pub const Owner = struct {
         ptr: *anyopaque,
@@ -133,6 +146,13 @@ pub const View = struct {
     /// The window's frame timer (WM_TIMER).
     const timer_id: win32.UINT_PTR = 1;
     const frame_ms: win32.UINT = 1000 / 30;
+
+    /// The least time between the start of a frame and one that input
+    /// asks for: frames at 60 per second at most while the pointer moves,
+    /// each of which runs the owner's draw twice (the inspector's reads
+    /// the terminal's state under its lock). GTK's draws on input at its
+    /// frame clock's rate, the display's.
+    const input_frame_ns: u64 = std.time.ns_per_s / 60;
 
     /// The window property the Win32 backend keeps the context in.
     const context_prop = "IMGUI_CONTEXT";
@@ -208,14 +228,15 @@ pub const View = struct {
         const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         io.IniFilename = null;
         io.LogFilename = null;
-        // Its first frame would set the pointer's shape wherever the
-        // pointer is, over a terminal too, and nothing here answers
-        // WM_SETCURSOR for it.
+        // The backend's NewFrame sets the pointer's shape whenever ImGui
+        // wants another, wherever the pointer is, over a terminal too.
+        // GTK's inspector leaves it as it is.
         io.ConfigFlags |= cimgui.c.ImGuiConfigFlags_NoMouseCursorChange;
 
         self.* = .{
             .hwnd = hwnd,
             .ctx = ctx,
+            .io = io,
             .owner = owner,
             .modal_depth = modal_depth,
             .modal_loops = .{},
@@ -223,6 +244,7 @@ pub const View = struct {
             .recovery = .{},
             .presents = 0,
             .quiet = false,
+            .last_frame = null,
         };
         _ = self.gpuForFrame();
         _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -267,6 +289,7 @@ pub const View = struct {
         var rc: win32.RECT = undefined;
         if (!win32.GetClientRect(self.hwnd, &rc).toBool()) return;
         if (rc.right <= rc.left or rc.bottom <= rc.top) return;
+        self.last_frame = .now(global.io(), .awake);
 
         cimgui.c.ImGui_SetCurrentContext(self.ctx);
         const gpu = self.gpuForFrame() orelse return;
@@ -458,6 +481,11 @@ pub const View = struct {
         self.gpu = null;
         cimgui.ImGui_ImplDX11_Shutdown();
         shutdownWin32(self.hwnd);
+        // The Win32 backend captures the mouse while a button is down and
+        // releases it at the button's release, which it no longer sees.
+        // Kept, the capture would bring the terminals' clicks (they are
+        // on this thread) here, where nothing takes them.
+        if (win32.GetCapture() == self.hwnd) _ = win32.ReleaseCapture();
         if (gpu.target) |target| api.release(target);
         // Unbound and flushed, released objects are destroyed now rather
         // than at a flush that never comes (as the renderer's releaseGpu).
@@ -466,6 +494,26 @@ pub const View = struct {
         api.release(gpu.swap_chain);
         api.release(gpu.context);
         api.release(gpu.device);
+    }
+
+    /// Whether `msg` is input that the Win32 backend hands to ImGui: a key
+    /// or a character, the mouse in the client area or leaving it, or the
+    /// keyboard focus.
+    fn isInput(msg: win32.UINT) bool {
+        return (msg >= win32.WM_KEYFIRST and msg <= win32.WM_KEYLAST) or
+            (msg >= win32.WM_MOUSEFIRST and msg <= win32.WM_MOUSELAST) or
+            msg == win32.WM_MOUSELEAVE or msg == win32.WM_SETFOCUS or msg == win32.WM_KILLFOCUS;
+    }
+
+    /// A frame for input just given to ImGui, as GTK's inspector draws
+    /// one, unless the last began less than `input_frame_ns` ago: the
+    /// timer's next frame, within 1/30 s, then draws it.
+    fn inputFrame(self: *View) void {
+        const gap = if (builtin.is_test) test_input_frame_ns orelse input_frame_ns else input_frame_ns;
+        if (self.last_frame) |last| {
+            if (last.untilNow(global.io(), .awake).nanoseconds < gap) return;
+        }
+        _ = win32.InvalidateRect(self.hwnd, null, .FALSE);
     }
 
     fn wndProc(
@@ -479,6 +527,19 @@ pub const View = struct {
         const ptr = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
         if (ptr == 0) return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
         const self: *View = @ptrFromInt(@as(usize, @bitCast(ptr)));
+
+        // ImGui's input, by the Win32 backend's handler for the view's own
+        // context, whichever is current. It ignores input while there is
+        // no device, as the backend ends with it (`makeGpu`); no frame is
+        // drawn then either. Nonzero is a message ImGui answered, which
+        // only its WM_SETCURSOR can be, and `init`'s flags turn that off.
+        // Every message still reaches the cases below and DefWindowProcW,
+        // so the window's frame keeps its keys and clicks: Alt+F4,
+        // Alt+Space, the title bar and the borders.
+        const answer = cimgui.ImGui_ImplWin32_WndProcHandlerEx(hwnd, msg, wparam, lparam, self.io);
+        if (answer != 0) return answer;
+        if (isInput(msg)) self.inputFrame();
+
         switch (msg) {
             // Every pixel is the swap chain's.
             win32.WM_ERASEBKGND => return 1,
@@ -505,6 +566,14 @@ pub const View = struct {
                 self.modal_loops.exit(self.modal_depth);
                 return 0;
             },
+
+            // Alt with a key: DefWindowProcW would beep about a menu
+            // mnemonic the window has none of. Alt+Space still opens the
+            // window menu, as over a terminal.
+            win32.WM_SYSCHAR => if (wparam != ' ') return 0,
+
+            // A bare Alt or F10 would put the window into menu mode.
+            win32.WM_SYSCOMMAND => if (Window.isBareKeyMenu(wparam, lparam)) return 0,
 
             // The owner may free the view here.
             win32.WM_CLOSE => {
@@ -726,12 +795,22 @@ fn noCompiler() error{D3DCompilerMissing}!api.D3DCompileFn {
     return error.D3DCompilerMissing;
 }
 
-/// For tests: a view's owner that counts what the view asks of it, and
-/// draws one rectangle per frame.
+/// For tests: a view's owner that counts what the view asks of it, draws
+/// one rectangle per frame, and keeps what its draws saw of ImGui's input.
 const TestOwner = struct {
     ready: bool = true,
     draws: u32 = 0,
     closes: u32 = 0,
+
+    /// As the last draw saw them: the pointer, the left button and the A
+    /// key.
+    pointer: cimgui.c.ImVec2 = .{ .x = 0, .y = 0 },
+    left_down: bool = false,
+    a_down: bool = false,
+
+    /// Every character the draws saw typed, the first few.
+    chars: [4]cimgui.c.ImWchar = undefined,
+    chars_len: usize = 0,
 
     fn owner(self: *TestOwner) View.Owner {
         return .{ .ptr = self, .ready = isReady, .draw = draw, .close = close };
@@ -745,6 +824,20 @@ const TestOwner = struct {
     fn draw(ptr: *anyopaque) void {
         const self: *TestOwner = @ptrCast(@alignCast(ptr));
         self.draws += 1;
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+        self.pointer = io.MousePos;
+        self.left_down = io.MouseDown[0];
+        self.a_down = cimgui.c.ImGui_IsKeyDown(cimgui.c.ImGuiKey_A);
+        // ImGui keeps typed characters for one of its frames, and the
+        // view runs two per frame: the first draw sees them, or the
+        // second when ImGui holds them back behind input that came first
+        // (its event trickling). So they are gathered across draws.
+        const typed = io.InputQueueCharacters;
+        if (typed.Size > 0) for (typed.Data[0..@intCast(typed.Size)]) |ch| {
+            if (self.chars_len == self.chars.len) break;
+            self.chars[self.chars_len] = ch;
+            self.chars_len += 1;
+        };
         cimgui.c.ImDrawList_AddRectFilled(
             cimgui.c.ImGui_GetForegroundDrawList(),
             .{ .x = 8, .y = 8 },
@@ -1034,4 +1127,117 @@ test "win32: ImGui views draw side by side and leave no USER objects" {
     second.deinit();
 
     try testing.expectEqual(before, win32.GetGuiResources(win32.current_process, win32.GR_USEROBJECTS));
+}
+
+/// For tests: a mouse message's lParam for the client point (x, y).
+fn testPoint(x: u16, y: u16) win32.LPARAM {
+    return @intCast(@as(u32, y) << 16 | x);
+}
+
+test "win32: an ImGui view gives ImGui its mouse and its characters" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var owner: TestOwner = .{};
+    var depth: u32 = 0;
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
+    defer view.deinit();
+
+    _ = win32.SendMessageW(view.hwnd, win32.WM_MOUSEMOVE, 0, testPoint(20, 12));
+    _ = win32.SendMessageW(view.hwnd, win32.WM_LBUTTONDOWN, 0, testPoint(20, 12));
+    _ = win32.SendMessageW(view.hwnd, win32.WM_CHAR, 'a', 1);
+    _ = win32.SendMessageW(view.hwnd, win32.WM_CHAR, 0xe9, 1);
+    testTick(&view);
+    try testing.expectEqual(20, owner.pointer.x);
+    try testing.expectEqual(12, owner.pointer.y);
+    try testing.expect(owner.left_down);
+    try testing.expectEqualSlices(cimgui.c.ImWchar, &.{ 'a', 0xe9 }, owner.chars[0..owner.chars_len]);
+
+    _ = win32.SendMessageW(view.hwnd, win32.WM_LBUTTONUP, 0, testPoint(20, 12));
+    testTick(&view);
+    try testing.expect(!owner.left_down);
+    // The capture taken at the press is let go at the release.
+    try testing.expect(win32.GetCapture() == null);
+}
+
+test "win32: an ImGui view gives ImGui its keys, and its focus" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var owner: TestOwner = .{};
+    var depth: u32 = 0;
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
+    defer view.deinit();
+
+    // A, scan code 0x1E, pressed once.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_SETFOCUS, 0, 0);
+    _ = win32.SendMessageW(view.hwnd, win32.WM_KEYDOWN, 'A', 0x001E0001);
+    testTick(&view);
+    try testing.expect(owner.a_down);
+    // Its release never comes; the focus leaving lets it go, as it does
+    // in ImGui whatever the backend.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_KILLFOCUS, 0, 0);
+    testTick(&view);
+    try testing.expect(!owner.a_down);
+}
+
+test "win32: input to an ImGui view asks for a frame, unless one just began" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var owner: TestOwner = .{};
+    var depth: u32 = 0;
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
+    defer view.deinit();
+    defer test_input_frame_ns = null;
+
+    // Shown, as a hidden window has nothing to repaint; not activated, so
+    // that it takes no focus. Then a frame, with the repaint that showing
+    // asked for done with.
+    _ = win32.ShowWindow(view.hwnd, win32.SW_SHOWNOACTIVATE);
+    testTick(&view);
+    _ = win32.ValidateRect(view.hwnd, null);
+
+    // Within the gap: the timer's frame draws it.
+    test_input_frame_ns = 3600 * std.time.ns_per_s;
+    _ = win32.SendMessageW(view.hwnd, win32.WM_MOUSEMOVE, 0, testPoint(5, 5));
+    try testing.expect(!win32.GetUpdateRect(view.hwnd, null, .FALSE).toBool());
+
+    test_input_frame_ns = 0;
+    _ = win32.SendMessageW(view.hwnd, win32.WM_MOUSEMOVE, 0, testPoint(6, 5));
+    try testing.expect(win32.GetUpdateRect(view.hwnd, null, .FALSE).toBool());
+
+    // A message that is no input asks for nothing.
+    _ = win32.ValidateRect(view.hwnd, null);
+    _ = win32.SendMessageW(view.hwnd, win32.WM_NULL, 0, 0);
+    try testing.expect(!win32.GetUpdateRect(view.hwnd, null, .FALSE).toBool());
+}
+
+test "win32: an ImGui view that loses its device lets the mouse go" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var owner: TestOwner = .{};
+    var depth: u32 = 0;
+    var view: View = undefined;
+    try view.init(class.hinstance, L("test"), test_rect, &depth, owner.owner());
+    defer view.deinit();
+
+    // Pressed, the backend takes the capture, and the device goes before
+    // the release comes.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_LBUTTONDOWN, 0, testPoint(10, 10));
+    try testing.expect(win32.GetCapture() == view.hwnd);
+    view.failed("Present", api.DXGI_ERROR_DEVICE_REMOVED);
+    try testing.expect(view.gpu == null);
+    try testing.expect(win32.GetCapture() == null);
+
+    // Input without a device is ignored: the next device's frame has
+    // none of it.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_CHAR, 'q', 1);
+    testTick(&view);
+    try testing.expect(view.gpu != null);
+    try testing.expectEqual(0, owner.chars_len);
 }
