@@ -142,6 +142,10 @@ pub const PROC_THREAD_ATTRIBUTE_THREAD = 0x00010000;
 pub const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES = 0x08;
 pub const PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH = 0x10;
 pub const S_OK = 0;
+/// SetThreadErrorMode dwNewMode: the system shows no critical-error message
+/// box, such as the loader's for a DLL that is no image, and the call that
+/// met the error fails instead.
+pub const SEM_FAILCRITICALERRORS = 0x0001;
 /// GetStdHandle/SetStdHandle nStdHandle values ((DWORD)-12, -10, -11).
 pub const STD_ERROR_HANDLE: DWORD = 0xFFFFFFF4;
 pub const STD_INPUT_HANDLE: DWORD = 0xFFFFFFF6;
@@ -366,6 +370,16 @@ pub const exp = struct {
             hFile: ?HANDLE,
             dwFlags: DWORD,
         ) callconv(.winapi) ?HMODULE;
+        /// The process's previous error mode.
+        /// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-seterrormode
+        pub extern "kernel32" fn SetErrorMode(uMode: UINT) callconv(.winapi) UINT;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-getthreaderrormode
+        pub extern "kernel32" fn GetThreadErrorMode() callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setthreaderrormode
+        pub extern "kernel32" fn SetThreadErrorMode(
+            dwNewMode: DWORD,
+            lpOldMode: ?*DWORD,
+        ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
         pub extern "kernel32" fn GetProcAddress(
             hModule: HMODULE,

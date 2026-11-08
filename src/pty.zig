@@ -461,6 +461,23 @@ const WindowsPty = struct {
 
             const dll_w = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, dll);
             defer alloc.free(dll_w);
+            // With no critical-error box for this load: for a conpty.dll
+            // that is no image, such as one cut short, the loader would
+            // otherwise show "Bad Image" and wait for it to be answered,
+            // holding the terminal that is opening. Such a DLL is reported
+            // below and the system's ConPTY used. This thread's mode only,
+            // and back as it was after: the process's mode is the
+            // program's, which may embed libghostty. Microsoft's
+            // SetThreadErrorMode page explains this mode as preventing
+            // "error mode dialogs from hanging the application".
+            var mode: windows.DWORD = undefined;
+            const no_box = windows.exp.kernel32.SetThreadErrorMode(
+                windows.exp.kernel32.GetThreadErrorMode() | windows.SEM_FAILCRITICALERRORS,
+                &mode,
+            ) != windows.FALSE;
+            defer if (no_box) {
+                _ = windows.exp.kernel32.SetThreadErrorMode(mode, null);
+            };
             const module = windows.exp.kernel32.LoadLibraryExW(
                 dll_w,
                 null,
@@ -730,9 +747,24 @@ test "WindowsPty: ConPTY package only with conpty.dll and OpenConsole.exe" {
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "conpty.dll", .data = "not a DLL" });
     try expectSystem(ConPty.load(alloc, dir), .no_open_console);
 
-    // With OpenConsole.exe beside it, it is loaded, which fails.
+    // With OpenConsole.exe beside it, it is loaded, which fails, with no
+    // error box. On Windows 11 the loader's box showed only when both the
+    // process's and the thread's error modes allowed it, so both are set to
+    // the system's default, 0, first, which a program can inherit from
+    // what started it: a runner started with SEM_FAILCRITICALERRORS would
+    // hide the box. Without the load's own mode the box waits for an
+    // answer and the test never ends. The load leaves the thread's mode as
+    // it found it. The process's mode is put back at once: every thread
+    // has it.
+    var mode: windows.DWORD = undefined;
+    try testing.expect(windows.exp.kernel32.SetThreadErrorMode(0, &mode) != windows.FALSE);
+    defer _ = windows.exp.kernel32.SetThreadErrorMode(mode, null);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "OpenConsole.exe", .data = "" });
-    try expectSystem(ConPty.load(alloc, dir), .load_failed);
+    const process_mode = windows.exp.kernel32.SetErrorMode(0);
+    const loaded = ConPty.load(alloc, dir);
+    _ = windows.exp.kernel32.SetErrorMode(process_mode);
+    try expectSystem(loaded, .load_failed);
+    try testing.expectEqual(@as(windows.DWORD, 0), windows.exp.kernel32.GetThreadErrorMode());
 
     // A DLL without the ConPTY functions, which is freed: the loader no
     // longer has it, and its file can be deleted.
