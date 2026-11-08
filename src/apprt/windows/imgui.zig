@@ -1308,6 +1308,31 @@ test "win32: an ImGui view that loses its device lets the mouse and keys go" {
     try testing.expect(!owner.left_down);
     try testing.expect(!owner.a_down);
 }
+
+test "win32: an ImGui view's input reaches its own context, whichever is current" {
+    const testing = std.testing;
+    const class = try TestClass.init();
+    defer class.deinit();
+    var depth: u32 = 0;
+    var first_owner: TestOwner = .{};
+    var first: View = undefined;
+    try first.init(class.hinstance, L("first"), test_rect, &depth, first_owner.owner());
+    defer first.deinit();
+    var second_owner: TestOwner = .{};
+    var second: View = undefined;
+    try second.init(class.hinstance, L("second"), test_rect, &depth, second_owner.owner());
+    defer second.deinit();
+
+    // Typed into the first while the second's context is current, as after
+    // the second's frame, then while none is, as after another view's end.
+    testTick(&second);
+    _ = win32.SendMessageW(first.hwnd, win32.WM_CHAR, 'x', 1);
+    cimgui.c.ImGui_SetCurrentContext(null);
+    _ = win32.SendMessageW(first.hwnd, win32.WM_CHAR, 'y', 1);
+    testTick(&first);
+    testTick(&second);
+    try testing.expectEqualSlices(cimgui.c.ImWchar, &.{ 'x', 'y' }, first_owner.chars[0..first_owner.chars_len]);
+    try testing.expectEqual(0, second_owner.chars_len);
 }
 
 test "win32: an ImGui view's sizes follow its DPI" {
