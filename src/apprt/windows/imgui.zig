@@ -276,11 +276,28 @@ pub const View = struct {
     /// The Win32 backend's Shutdown, with the context current. It sets the
     /// window's context property to null rather than removing it, and a
     /// window must have its properties removed before it is destroyed
-    /// (the RemovePropA docs).
+    /// (the RemovePropA docs). It also clears the context's clipboard,
+    /// shell and IME handlers, which only the context's creation installs
+    /// and the backend's Init does not, so they are put back: without
+    /// them, a view that made another device copies nothing.
     fn shutdownWin32(hwnd: win32.HWND) void {
+        const platform: *cimgui.c.ImGuiPlatformIO = cimgui.c.ImGui_GetPlatformIO();
+        const kept = platform.*;
         cimgui.ImGui_ImplWin32_Shutdown();
+        inline for (platform_handlers) |name| @field(platform, name) = @field(kept, name);
         _ = win32.RemovePropA(hwnd, context_prop);
     }
+
+    /// The handlers `shutdownWin32` keeps, with their data.
+    const platform_handlers = .{
+        "Platform_GetClipboardTextFn",
+        "Platform_SetClipboardTextFn",
+        "Platform_ClipboardUserData",
+        "Platform_OpenInShellFn",
+        "Platform_OpenInShellUserData",
+        "Platform_SetImeDataFn",
+        "Platform_ImeUserData",
+    };
 
     /// Draw and present one frame, unless the window is minimized, the
     /// owner is not ready or there is no device.
@@ -1047,6 +1064,10 @@ test "win32: an ImGui view makes another device after it lost one" {
     // the main viewport's data from the Win32 backend
     // (Platform_GetWindowDpiScale), and the DirectX 11 backend's Shutdown
     // destroyed it. Twice, as the backends' Shutdown and Init must allow.
+    // The context keeps its clipboard, shell and IME handlers.
+    const platform: *cimgui.c.ImGuiPlatformIO = cimgui.c.ImGui_GetPlatformIO();
+    const handlers = platform.*;
+    try testing.expect(handlers.Platform_SetClipboardTextFn != null);
     for ([_]api.HRESULT{ api.DXGI_ERROR_DEVICE_REMOVED, api.DXGI_ERROR_DEVICE_RESET }, 0..) |hr, i| {
         view.failed("Present", hr);
         try testing.expect(view.gpu == null);
@@ -1054,6 +1075,10 @@ test "win32: an ImGui view makes another device after it lost one" {
         try testing.expect(view.gpu != null);
         try testing.expectEqual(2 * (i + 2), owner.draws);
         try testing.expectEqual(i + 2, view.presents);
+        try testing.expectEqual(handlers.Platform_GetClipboardTextFn, platform.Platform_GetClipboardTextFn);
+        try testing.expectEqual(handlers.Platform_SetClipboardTextFn, platform.Platform_SetClipboardTextFn);
+        try testing.expectEqual(handlers.Platform_OpenInShellFn, platform.Platform_OpenInShellFn);
+        try testing.expectEqual(handlers.Platform_SetImeDataFn, platform.Platform_SetImeDataFn);
     }
 }
 
