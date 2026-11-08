@@ -1413,6 +1413,9 @@ pub const App = struct {
     /// returns; disabled here, it would be an owner MessageBoxW found
     /// disabled, and left so.
     ///
+    /// The terminals' inspector windows are disabled as well, and enabled
+    /// again by `endPrompt`, unless they were disabled already.
+    ///
     /// The quick terminal, on screen, is above every window not always on
     /// top (`Window.showQuick`), and so would cover a box another window
     /// owns, or none does, as MessageBoxW makes it without MB_TOPMOST. It
@@ -1431,6 +1434,10 @@ pub const App = struct {
             if (win32.EnableWindow(window.hwnd, .FALSE).toBool()) continue;
             window.prompt_disabled = true;
         }
+        for (self.surfaces.items) |surface| if (surface.inspector) |inspector| {
+            if (win32.EnableWindow(inspector.view.hwnd, .FALSE).toBool()) continue;
+            inspector.prompt_disabled = true;
+        };
         const quick = self.quick orelse return;
         if (!win32.IsWindowVisible(quick.hwnd).toBool()) return;
         if (owner) |hwnd| if (win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) == quick.hwnd) return;
@@ -1534,6 +1541,10 @@ pub const App = struct {
             window.prompt_disabled = false;
             _ = win32.EnableWindow(window.hwnd, .TRUE);
         }
+        for (self.surfaces.items) |surface| if (surface.inspector) |inspector| if (inspector.prompt_disabled) {
+            inspector.prompt_disabled = false;
+            _ = win32.EnableWindow(inspector.view.hwnd, .TRUE);
+        };
         self.wakeup();
     }
 
@@ -18125,13 +18136,22 @@ test "win32: the inspector action opens, keeps and closes a live terminal's insp
     _ = win32.SendMessageW(hwnd, win32.WM_PAINT, 0, 0);
     try std.testing.expectEqual(renders + 2, core.renders);
 
-    // Under a prompt, nothing draws, and its close leaves the window open.
+    // A prompt disables the window, as it does the frames, and nothing
+    // draws; a close sent to it all the same leaves the window open.
     app.beginPrompt(null);
+    try std.testing.expect(!win32.IsWindowEnabled(hwnd).toBool());
     _ = win32.SendMessageW(hwnd, win32.WM_PAINT, 0, 0);
     try std.testing.expectEqual(renders + 2, core.renders);
     _ = win32.SendMessageW(hwnd, win32.WM_CLOSE, 0, 0);
     try std.testing.expectEqual(opened, a.inspector.?);
     app.endPrompt();
+    try std.testing.expect(win32.IsWindowEnabled(hwnd).toBool());
+    // One disabled already is left so.
+    _ = win32.EnableWindow(hwnd, .FALSE);
+    app.beginPrompt(null);
+    app.endPrompt();
+    try std.testing.expect(!win32.IsWindowEnabled(hwnd).toBool());
+    _ = win32.EnableWindow(hwnd, .TRUE);
 
     // Its close button closes it, as `hide` does.
     _ = win32.SendMessageW(hwnd, win32.WM_CLOSE, 0, 0);

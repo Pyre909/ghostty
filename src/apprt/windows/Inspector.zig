@@ -20,6 +20,10 @@ const Window = @import("Window.zig");
 surface: *Surface,
 view: imgui.View,
 
+/// The outermost prompt disabled the window (`App.beginPrompt`), and
+/// `App.endPrompt` enables it again.
+prompt_disabled: bool,
+
 /// GTK's title, and its default size, here at 96 DPI.
 const title = "Ghostty: Terminal Inspector";
 const width = 1000;
@@ -50,6 +54,7 @@ pub fn create(surface: *Surface) !*Inspector {
     const self = try alloc.create(Inspector);
     errdefer alloc.destroy(self);
     self.surface = surface;
+    self.prompt_disabled = false;
 
     try activate(core);
     errdefer deactivate(core);
@@ -93,9 +98,10 @@ fn draw(ptr: *anyopaque) void {
     render(core);
 }
 
-/// Closed as the `inspector` action closes it, except under a core frame
-/// or a prompt (`ready`): the frame may be using the core's inspector,
-/// which closing frees, so the window stays open until then.
+/// Closed as the `inspector` action closes it, except under a core frame,
+/// which may be using the core's inspector that closing frees (`ready`):
+/// the window then stays open. A prompt disables the window
+/// (`App.beginPrompt`), so it is not closed from under one either.
 fn close(ptr: *anyopaque) void {
     const self: *Inspector = @ptrCast(@alignCast(ptr));
     if (!self.surface.app.canReenterCore()) return;
