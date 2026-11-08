@@ -92,6 +92,10 @@ pub const View = struct {
     /// Frames presented, for the log's first one and for the tests.
     presents: u64,
 
+    /// A failure was logged since the last frame presented, so another is
+    /// not (`failed`): one that persists would repeat at every frame.
+    quiet: bool,
+
     pub const Owner = struct {
         ptr: *anyopaque,
 
@@ -219,6 +223,7 @@ pub const View = struct {
             .gpu = null,
             .recovery = .{},
             .presents = 0,
+            .quiet = false,
         };
         _ = self.gpuForFrame();
         _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
@@ -288,6 +293,7 @@ pub const View = struct {
         const hr = gpu.swap_chain.present(0, 0);
         if (api.failed(hr)) return self.failed("Present", hr);
         self.presents += 1;
+        self.quiet = false;
         if (self.presents == 1) log.info("ImGui window first present hwnd={x} drawable={}", .{ @intFromPtr(self.hwnd), gpu.drawable });
     }
 
@@ -396,13 +402,17 @@ pub const View = struct {
             }
         }
 
-        const back = gpu.swap_chain.getBuffer(0, api.ID3D11Texture2D) catch {
-            log.warn("ImGui window back buffer unavailable", .{});
+        // Called as is, for its HRESULT: a removed device fails here too.
+        var buffer: ?*anyopaque = null;
+        var hr = gpu.swap_chain.vtable.base.GetBuffer(@ptrCast(gpu.swap_chain), 0, &api.ID3D11Texture2D.IID, &buffer);
+        if (api.failed(hr)) {
+            self.failed("GetBuffer", hr);
             return null;
-        };
+        }
+        const back: *api.ID3D11Texture2D = @ptrCast(@alignCast(buffer orelse return null));
         defer api.release(back);
         var target: ?*api.ID3D11RenderTargetView = null;
-        const hr = gpu.device.vtable.CreateRenderTargetView(gpu.device, back.resource(), null, &target);
+        hr = gpu.device.vtable.CreateRenderTargetView(gpu.device, back.resource(), null, &target);
         if (api.failed(hr)) {
             self.failed("CreateRenderTargetView", hr);
             return null;
@@ -417,11 +427,13 @@ pub const View = struct {
         return hr == api.DXGI_ERROR_DEVICE_REMOVED or hr == api.DXGI_ERROR_DEVICE_RESET;
     }
 
-    /// Log a failed call of `what`. A lost device is released, and the
-    /// next frame makes another.
+    /// Log a failed call of `what`, unless one was logged since the last
+    /// frame presented (`quiet`). A lost device is released, and the next
+    /// frame makes another.
     fn failed(self: *View, what: []const u8, hr: api.HRESULT) void {
         if (!isDeviceLoss(hr)) {
-            log.warn("{s} failed for an ImGui window hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
+            if (!self.quiet) log.warn("{s} failed for an ImGui window hr=0x{x}; not logged again until a frame presents", .{ what, @as(u32, @bitCast(hr)) });
+            self.quiet = true;
             return;
         }
         self.loseDevice(what, hr);
