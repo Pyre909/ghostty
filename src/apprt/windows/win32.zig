@@ -858,6 +858,29 @@ pub extern "ole32" fn CoCreateInstance(
     iid: *const w.GUID,
     out: *?*anyopaque,
 ) callconv(.winapi) HRESULT;
+/// Frees what a COM method allocated for its caller, such as a string it
+/// returned (combaseapi.h).
+/// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cotaskmemfree
+pub extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+
+// The common item dialog (SaveDialog.zig).
+
+/// FILEOPENDIALOGOPTIONS (shobjidl.h). A Save dialog starts with
+/// OVERWRITEPROMPT, NOCHANGEDIR, PATHMUSTEXIST and NOREADONLYRETURN set.
+pub const FOS_OVERWRITEPROMPT: DWORD = 0x2;
+pub const FOS_NOCHANGEDIR: DWORD = 0x8;
+/// Only items with a path in the file system.
+pub const FOS_FORCEFILESYSTEM: DWORD = 0x40;
+pub const FOS_PATHMUSTEXIST: DWORD = 0x800;
+pub const FOS_NOREADONLYRETURN: DWORD = 0x8000;
+/// The shell item for a path (shobjidl.h), as the dialog returns one.
+/// https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-shcreateitemfromparsingname
+pub extern "shell32" fn SHCreateItemFromParsingName(
+    path: LPCWSTR,
+    bind: ?*anyopaque,
+    iid: *const w.GUID,
+    out: *?*anyopaque,
+) callconv(.winapi) HRESULT;
 
 // DWM
 /// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute

@@ -34,6 +34,7 @@ const Overrides = @import("Overrides.zig");
 const ipc = @import("ipc.zig");
 const KeyState = @import("KeyState.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
+const SaveDialog = @import("SaveDialog.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
@@ -802,6 +803,18 @@ pub const App = struct {
         /// own WM_CLOSE closes it (`Surface.requestClose`, `ChildExited`).
         close_surface: *CoreSurface,
 
+        /// `.export_terminal_io`: ask where to save `contents`, the
+        /// terminal IO events of `from`'s inspector, and save them there
+        /// (`exportQueued`). The action comes inside the inspector's frame,
+        /// with the renderer's lock held: a dialog's modal loop there would
+        /// stop the terminal's threads, and could start another frame. The
+        /// request owns `contents`, freed when it is carried out or dropped
+        /// (`freeRequest`).
+        export_io: struct {
+            from: *CoreSurface,
+            contents: []u8,
+        },
+
         /// A request of `ghostty +new-window`, `+new-tab` or
         /// `+toggle-quick-terminal`, read by the IPC thread
         /// (`ipcRequests`). The request owns it, freed when it is carried
@@ -1179,6 +1192,7 @@ pub const App = struct {
             // answer ran out, that it was busy and would do it, which it
             // now never does.
             .ipc => |ipc_request| ipc_request.destroy(self.core_app.alloc),
+            .export_io => |export_io| self.core_app.alloc.free(export_io.contents),
             else => {},
         }
         request.* = .dropped;
@@ -1414,7 +1428,8 @@ pub const App = struct {
     /// disabled, and left so.
     ///
     /// The terminals' inspector windows are disabled as well, and enabled
-    /// again by `endPrompt`, unless they were disabled already.
+    /// again by `endPrompt`, unless they were disabled already, but for one
+    /// that owns this prompt, left to the prompt's dialog as a frame is.
     ///
     /// The quick terminal, on screen, is above every window not always on
     /// top (`Window.showQuick`), and so would cover a box another window
@@ -1435,6 +1450,7 @@ pub const App = struct {
             window.prompt_disabled = true;
         }
         for (self.surfaces.items) |surface| if (surface.inspector) |inspector| {
+            if (owner != null and inspector.view.hwnd == owner.?) continue;
             if (win32.EnableWindow(inspector.view.hwnd, .FALSE).toBool()) continue;
             inspector.prompt_disabled = true;
         };
@@ -1869,6 +1885,7 @@ pub const App = struct {
                 .app => false,
                 .surface => |v| v.rt_surface.controlInspector(value),
             },
+            .export_terminal_io => try self.requestExport(target, value),
 
             else => false,
         };
@@ -2064,6 +2081,28 @@ pub const App = struct {
             log.warn("cannot record a command palette to toggle err={}", .{err});
             return false;
         };
+        return true;
+    }
+
+    /// `.export_terminal_io`, from the "Export to file" button of a
+    /// terminal's inspector: `run` asks where to save the events and saves
+    /// them (`exportQueued`). They are lent only for the call, so they are
+    /// copied, as GTK and the macOS app copy them, and running out of
+    /// memory goes back to the inspector, which logs it. `false` for the
+    /// app.
+    fn requestExport(
+        self: *App,
+        target: apprt.Target,
+        value: apprt.action.ExportTerminalIO,
+    ) Allocator.Error!bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        const alloc = self.core_app.alloc;
+        const contents = try alloc.dupe(u8, value.contents);
+        errdefer alloc.free(contents);
+        try self.requests.append(alloc, .{ .export_io = .{ .from = from, .contents = contents } });
         return true;
     }
 
@@ -2928,8 +2967,9 @@ pub const App = struct {
     /// waits on it: windows it asked for lose it as their parent, splits,
     /// changes to splits and focus moves it asked for are dropped, and so is
     /// a focus move to it; with a move of its tab to a new window, so is
-    /// what waits behind that move (`dropBehind`); and a title prompt it
-    /// opened closes (`TitleDialog.forget`).
+    /// what waits behind that move (`dropBehind`); its terminal IO events
+    /// not yet exported are freed; and a title prompt it opened closes
+    /// (`TitleDialog.forget`).
     /// Called by `Surface.detachCore`, the first step of every teardown,
     /// while the address is still that surface's, so that a surface created
     /// later at the same address cannot pass for it.
@@ -2991,6 +3031,9 @@ pub const App = struct {
             },
             .title_prompt => |prompt| {
                 if (prompt.from == core_surface) request.* = .dropped;
+            },
+            .export_io => |export_io| {
+                if (export_io.from == core_surface) self.freeRequest(request);
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
@@ -3673,6 +3716,14 @@ pub const App = struct {
                 .search_key => |key| SearchBar.replay(key.from, key.key),
                 .title_prompt => |prompt| _ = TitleDialog.open(prompt.from.rt_surface, prompt.target),
                 .close_surface => |from| from.rt_surface.requestClose(),
+                // Dropped first, as `palette_run` is, and the events freed
+                // here, from the copy: the dialog's loop can add requests,
+                // which can move the list.
+                .export_io => |export_io| {
+                    self.requests.items[i] = .dropped;
+                    defer self.core_app.alloc.free(export_io.contents);
+                    self.exportQueued(export_io.from.rt_surface, export_io.contents);
+                },
                 // Dropped first, as `palette_run` is: freed there.
                 .ipc => |request| {
                     self.requests.items[i] = .dropped;
@@ -3701,6 +3752,50 @@ pub const App = struct {
         } else {
             window.focusHidden(t, surface);
         }
+    }
+
+    /// An export `requestExport` queued: ask where to save the terminal
+    /// IO events `contents` of `from`'s inspector, and save them there.
+    /// The dialog belongs to the inspector while it is open, as the click
+    /// came from there and the activation goes back there, else to the
+    /// terminal's frame. A cancel says nothing, as in GTK and the macOS
+    /// app; a failure is logged and told in a notice too, as the log goes
+    /// only to stderr, which reaches nobody here (`dialog.fatalNotice`).
+    fn exportQueued(self: *App, from: *Surface, contents: []const u8) void {
+        const owner = if (from.inspector) |inspector| inspector.view.hwnd else from.hwnd;
+        const path = switch (SaveDialog.ask(self, owner, .{
+            .title = L("Export Terminal IO Events"),
+            .name = L("ghostty-terminal-io.txt"),
+            .ok = L("Export"),
+        })) {
+            .cancelled => return,
+            // Logged by `SaveDialog.ask`.
+            .failed => {
+                notice(self, owner, L("Ghostty could not save the terminal IO events."));
+                return;
+            },
+            .path => |chosen| chosen,
+        };
+        defer self.core_app.alloc.free(path);
+        writeExport(self.core_app.alloc, path, contents) catch |err| {
+            log.warn("cannot save the terminal IO events err={}", .{err});
+            notice(self, owner, L("Ghostty could not save the terminal IO events."));
+        };
+    }
+
+    /// Save `contents` at `path` whole or not at all, as the macOS app
+    /// writes with `.atomic` and GTK with g_file_replace_contents: to a new
+    /// file beside it, which then takes its place. A failure leaves a file
+    /// already there as it was. std hands the path to NT with its own
+    /// prefix, so it is not limited to MAX_PATH.
+    fn writeExport(alloc: Allocator, path: []const u16, contents: []const u8) !void {
+        const io = global.io();
+        const wtf8 = try std.unicode.wtf16LeToWtf8Alloc(alloc, path);
+        defer alloc.free(wtf8);
+        var file = try std.Io.Dir.cwd().createFileAtomic(io, wtf8, .{ .replace = true });
+        defer file.deinit(io);
+        try file.file.writeStreamingAll(io, contents);
+        try file.replace(io);
     }
 
     /// What a new terminal takes from `parent`, the surface that asked for
@@ -18324,6 +18419,312 @@ test "win32: an inspector's title bar follows the frames' mode" {
     changed.@"window-theme" = .dark;
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expect(inspector.dark_frame);
+}
+
+/// For tests: a terminal's inspector opened over the core's stand-in
+/// (`Inspector.test_core`), with the Save dialog answered here
+/// (`SaveDialog.test_ask`), which records what it was asked and what was
+/// enabled while it was open, and the notices after it counted
+/// (`dialog.test_message_box`).
+const TestExport = struct {
+    var app: *App = undefined;
+    var frame: win32.HWND = undefined;
+    var inspector: win32.HWND = undefined;
+    var core: Inspector.TestCore = .{};
+
+    /// Where the dialog answers to save, in WTF-8; null answers Cancel.
+    var answer: ?[]const u8 = null;
+    var asks: usize = 0;
+    var asked_by: ?win32.HWND = null;
+    var named = false;
+    /// While the dialog was open.
+    var inspector_enabled = false;
+    var frame_enabled = true;
+    var could_reenter = true;
+
+    var notices: usize = 0;
+    var told_by: ?win32.HWND = null;
+
+    fn ask(owner: ?win32.HWND, spec: SaveDialog.Spec) SaveDialog.Answer {
+        asks += 1;
+        asked_by = owner;
+        named = std.mem.eql(u16, std.mem.span(spec.name), std.mem.span(L("ghostty-terminal-io.txt")));
+        inspector_enabled = win32.IsWindowEnabled(inspector).toBool();
+        frame_enabled = win32.IsWindowEnabled(frame).toBool();
+        could_reenter = app.canReenterCore();
+        const path = answer orelse return .cancelled;
+        const wide = std.unicode.wtf8ToWtf16LeAllocZ(app.core_app.alloc, path) catch return .failed;
+        return .{ .path = wide };
+    }
+
+    fn box(owner: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
+        _ = text;
+        _ = buttons;
+        notices += 1;
+        told_by = owner;
+        return win32.IDOK;
+    }
+
+    /// Open the inspector of `a`, marked live, in `to`. `stop` undoes it,
+    /// also after a failure here.
+    fn start(to: *App, a: *Surface) !void {
+        app = to;
+        frame = a.window.hwnd;
+        core = .{};
+        answer = null;
+        asks = 0;
+        asked_by = null;
+        named = false;
+        inspector_enabled = false;
+        frame_enabled = true;
+        could_reenter = true;
+        notices = 0;
+        told_by = null;
+        Inspector.test_core = &core;
+        a.core_state = .live;
+        SaveDialog.test_ask = &ask;
+        @import("dialog.zig").test_message_box = &box;
+        try std.testing.expect(try to.performAction(.{ .surface = &a.core_surface }, .inspector, .show));
+        inspector = (a.inspector orelse return error.TestUnexpectedResult).view.hwnd;
+    }
+
+    /// Close the inspector, while the core is live, then end the rest.
+    fn stop(a: *Surface) void {
+        _ = a.controlInspector(.hide);
+        @import("dialog.zig").test_message_box = null;
+        SaveDialog.test_ask = null;
+        a.core_state = .none;
+        Inspector.test_core = null;
+    }
+
+    /// How many entries `dir` holds.
+    fn entries(dir: std.Io.Dir) !usize {
+        var it = dir.iterate();
+        var n: usize = 0;
+        while (try it.next(std.testing.io)) |_| n += 1;
+        return n;
+    }
+};
+
+test "win32: an export from the inspector saves its events where the dialog says, once out of its frame" {
+    // The inspector's Export button performs the action inside its frame,
+    // lending the events for the call. They are copied, and `run` asks
+    // where to save them once it is out of that frame, in a dialog the
+    // inspector owns: the click came from there.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "io.txt" });
+    defer alloc.free(path);
+    TestExport.answer = path;
+
+    // As the inspector formats them, with a character past ASCII and a
+    // NUL inside, neither of which ends what is saved.
+    const events = "Seq\tKind\tDescription\n1\tprint\t'\u{e9}' (U+E9)\n2\texecute\tNUL \x00\n";
+
+    // The app has no inspector to export from.
+    try std.testing.expect(!try app.performAction(.app, .export_terminal_io, .{ .contents = events }));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    const lent = try alloc.dupe(u8, events);
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = lent }));
+    // The inspector frees them once the action returns.
+    @memset(lent, 'x');
+    alloc.free(lent);
+    try std.testing.expectEqual(0, TestExport.asks);
+
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(@as(?win32.HWND, TestExport.inspector), TestExport.asked_by);
+    try std.testing.expect(TestExport.named);
+    try std.testing.expectEqual(0, TestExport.notices);
+    const saved = try tmp.dir.readFileAlloc(std.testing.io, "io.txt", alloc, .unlimited);
+    defer alloc.free(saved);
+    try std.testing.expectEqualSlices(u8, events, saved);
+    // The file it was written to first is gone.
+    try std.testing.expectEqual(1, try TestExport.entries(tmp.dir));
+}
+
+test "win32: an export cancelled saves nothing and says nothing" {
+    // As in GTK and the macOS app.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(0, TestExport.notices);
+}
+
+test "win32: an export that cannot be saved is told, and leaves a file already there whole" {
+    // The log goes only to stderr, which reaches nobody, so a notice the
+    // inspector owns tells it as well. The events go to a new file that
+    // then replaces the old one, as the macOS app writes them: a failure
+    // to replace it leaves it as it was.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const events = "Seq\tKind\tDescription\n";
+
+    // In a folder that is not there.
+    const missing = try std.fs.path.join(alloc, &.{ dir, "missing", "io.txt" });
+    defer alloc.free(missing);
+    TestExport.answer = missing;
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = events }));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.notices);
+    try std.testing.expectEqual(@as(?win32.HWND, TestExport.inspector), TestExport.told_by);
+    try std.testing.expectEqual(0, try TestExport.entries(tmp.dir));
+
+    // Over a file another program holds open with no delete sharing: it
+    // could be written in place, but not replaced.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "io.txt", .data = "old" });
+    const path = try std.fs.path.join(alloc, &.{ dir, "io.txt" });
+    defer alloc.free(path);
+    const wide = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    const held = win32.CreateFileW(
+        wide.ptr,
+        internal_os.windows.GENERIC_READ,
+        internal_os.windows.FILE_SHARE_READ | internal_os.windows.FILE_SHARE_WRITE,
+        null,
+        win32.OPEN_EXISTING,
+        0,
+        null,
+    );
+    try std.testing.expect(held != win32.INVALID_HANDLE_VALUE);
+    defer _ = win32.CloseHandle(held);
+    TestExport.answer = path;
+    TestExport.notices = 0;
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = events }));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.notices);
+    const kept = try tmp.dir.readFileAlloc(std.testing.io, "io.txt", alloc, .unlimited);
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("old", kept);
+    // And the new file is gone.
+    try std.testing.expectEqual(1, try TestExport.entries(tmp.dir));
+}
+
+test "win32: an export's dialog is a prompt its inspector owns" {
+    // Terminals pause, and the frames take no input, while it is open, as
+    // with any prompt (`beginPrompt`); the inspector that owns it is left
+    // to the dialog, which disables its owner and gives the activation
+    // back to it as it closes.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expect(!TestExport.could_reenter);
+    try std.testing.expect(!TestExport.frame_enabled);
+    try std.testing.expect(TestExport.inspector_enabled);
+    // Enabled again once it has closed.
+    try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
+    try std.testing.expect(win32.IsWindowEnabled(TestExport.inspector).toBool());
+    try std.testing.expect(app.canReenterCore());
+}
+
+test "win32: an export whose terminal closes first is dropped, and freed" {
+    // The request owns the events until it is carried out: a terminal
+    // closing first frees them (`forgetClosing`), and so does a quit
+    // before `run` gets to it (`freeRequests`). The test's allocator
+    // finds any left.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.forgetClosing(&a.core_surface);
+    try std.testing.expect(app.requests.items[0] == .dropped);
+    app.createRequested();
+    try std.testing.expectEqual(0, TestExport.asks);
+
+    // Never carried out: freed when the app ends, here by `testCleanup`.
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.quit = true;
+    app.createRequested();
+    app.quit = false;
+    try std.testing.expectEqual(0, TestExport.asks);
+    try std.testing.expect(app.requests.items[0] == .export_io);
 }
 
 test "win32: the command palette has a jump to each terminal that is not closing" {

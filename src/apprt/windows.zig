@@ -372,6 +372,7 @@ test {
     _ = @import("windows/Overlays.zig");
     _ = @import("windows/ReadOnly.zig");
     _ = @import("windows/ResizeOverlay.zig");
+    _ = @import("windows/SaveDialog.zig");
     _ = @import("windows/ScrollBar.zig");
     _ = @import("windows/SearchBar.zig");
     _ = @import("windows/Surface.zig");
