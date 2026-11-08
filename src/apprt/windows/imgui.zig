@@ -545,7 +545,8 @@ pub const View = struct {
 
     /// A frame for input just given to ImGui, as GTK's inspector draws
     /// one, unless the last began less than `input_frame_ns` ago: the
-    /// timer's next frame, within 1/30 s, then draws it.
+    /// timer's next frame, within 1/30 s, then draws it, when there is a
+    /// timer (`show`).
     fn inputFrame(self: *View) void {
         const gap = if (builtin.is_test) test_input_frame_ns orelse input_frame_ns else input_frame_ns;
         if (self.last_frame) |last| {
