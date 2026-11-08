@@ -11,7 +11,7 @@ pub const c = @import("dcimgui_c");
 // A va_list there is a pointer to the arguments in 8-byte slots, as
 // MSVC's is.
 comptime {
-    if (builtin.cpu.arch == .aarch64 and builtin.os.tag == .windows)
+    if (builtin.target.cpu.arch == .aarch64 and builtin.target.os.tag == .windows)
         @export(&textColored, .{ .name = "ImGui_TextColored" });
 }
 
