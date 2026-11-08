@@ -504,6 +504,13 @@ pub const View = struct {
         // Kept, the capture would bring the terminals' clicks (they are
         // on this thread) here, where nothing takes them.
         if (win32.GetCapture() == self.hwnd) _ = win32.ReleaseCapture();
+        // ImGui's side of it: a press it has, queued or seen, would stay
+        // down under the next device, as its release came to no backend,
+        // and ImGui would take the next click for a repeat of it and drop
+        // it. A key held the same. The pointer is unknown until it moves.
+        cimgui.c.ImGuiIO_ClearEventsQueue(self.io);
+        cimgui.c.ImGuiIO_ClearInputMouse(self.io);
+        cimgui.c.ImGuiIO_ClearInputKeys(self.io);
         if (gpu.target) |target| api.release(target);
         // Unbound and flushed, released objects are destroyed now rather
         // than at a flush that never comes (as the renderer's releaseGpu).
@@ -1264,7 +1271,7 @@ test "win32: input to an ImGui view asks for a frame, unless one just began" {
     try testing.expect(!win32.GetUpdateRect(view.hwnd, null, .FALSE).toBool());
 }
 
-test "win32: an ImGui view that loses its device lets the mouse go" {
+test "win32: an ImGui view that loses its device lets the mouse and keys go" {
     const testing = std.testing;
     const class = try TestClass.init();
     defer class.deinit();
@@ -1282,12 +1289,25 @@ test "win32: an ImGui view that loses its device lets the mouse go" {
     try testing.expect(view.gpu == null);
     try testing.expect(win32.GetCapture() == null);
 
-    // Input without a device is ignored: the next device's frame has
-    // none of it.
-    _ = win32.SendMessageW(view.hwnd, win32.WM_CHAR, 'q', 1);
+    // ImGui had the press queued, and the next device's frame does not
+    // see it.
     testTick(&view);
     try testing.expect(view.gpu != null);
-    try testing.expectEqual(0, owner.chars_len);
+    try testing.expect(!owner.left_down);
+
+    // A press and a key that a frame saw, then the device goes.
+    _ = win32.SendMessageW(view.hwnd, win32.WM_SETFOCUS, 0, 0);
+    _ = win32.SendMessageW(view.hwnd, win32.WM_LBUTTONDOWN, 0, testPoint(10, 10));
+    _ = win32.SendMessageW(view.hwnd, win32.WM_KEYDOWN, 'A', 0x001E0001);
+    testTick(&view);
+    try testing.expect(owner.left_down and owner.a_down);
+    view.failed("Present", api.DXGI_ERROR_DEVICE_RESET);
+    try testing.expect(win32.GetCapture() == null);
+    testTick(&view);
+    try testing.expect(view.gpu != null);
+    try testing.expect(!owner.left_down);
+    try testing.expect(!owner.a_down);
+}
 }
 
 test "win32: an ImGui view's sizes follow its DPI" {
