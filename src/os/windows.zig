@@ -188,6 +188,14 @@ pub const IO_STATUS_BLOCK = windows.IO_STATUS_BLOCK;
 pub const NTSTATUS = windows.NTSTATUS;
 pub const OBJECT_ATTRIBUTES = windows.OBJECT.ATTRIBUTES;
 
+/// https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ne-minwinbase-file_info_by_handle_class
+pub const FILE_INFO_BY_HANDLE_CLASS = enum(c_int) {
+    /// With a FILE_DISPOSITION_INFO, which has the layout of
+    /// FILE_DISPOSITION_INFORMATION.
+    FileDispositionInfo = 4,
+    _,
+};
+
 /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/ne-sysinfoapi-computer_name_format
 pub const COMPUTER_NAME_FORMAT = enum(c_int) {
     NetBIOS = 0,
@@ -476,6 +484,15 @@ pub const exp = struct {
         ) callconv(.winapi) ?HANDLE;
         /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
         pub extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) BOOL;
+        /// The information is not const: ntdll has faulted on read-only
+        /// memory for a disposition (see std's NtSetInformationFile).
+        /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle
+        pub extern "kernel32" fn SetFileInformationByHandle(
+            hFile: HANDLE,
+            FileInformationClass: FILE_INFO_BY_HANDLE_CLASS,
+            lpFileInformation: *anyopaque,
+            dwBufferSize: DWORD,
+        ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilew
         pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.winapi) BOOL;
         /// Sets the thread's last error.

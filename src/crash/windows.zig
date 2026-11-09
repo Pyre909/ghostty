@@ -280,7 +280,7 @@ pub const Dumper = struct {
         const name = self.fileName();
         const file = kernel32.CreateFileW(
             name.ptr,
-            os_windows.GENERIC_WRITE,
+            os_windows.GENERIC_WRITE | os_windows.DELETE,
             0,
             null,
             os_windows.CREATE_NEW,
@@ -288,6 +288,13 @@ pub const Dumper = struct {
             null,
         );
         if (file == os_windows.INVALID_HANDLE_VALUE) return .{ .failed = windows.GetLastError() };
+
+        // Marked for deletion until the dump is whole: a partial dump is
+        // no use to a debugger. The process can end while this is under
+        // way, since the crashing thread waits only so long, and nothing
+        // here would run then. But the system closes a dead process's
+        // handles, and closing this one removes a file still marked.
+        const marked = deleteOnClose(file, true);
 
         const info: MINIDUMP_EXCEPTION_INFORMATION = .{
             .ThreadId = self.crasher.load(.acquire),
@@ -304,7 +311,7 @@ pub const Dumper = struct {
             .UserStreamCount = 1,
             .UserStreamArray = @ptrCast(&stream),
         };
-        const ok = self.write(
+        var ok = self.write(
             windows.GetCurrentProcess(),
             windows.GetCurrentProcessId(),
             file,
@@ -312,15 +319,33 @@ pub const Dumper = struct {
             &info,
             &streams,
             null,
-        );
-        const err = windows.GetLastError();
+        ) != .FALSE;
+        var err = windows.GetLastError();
+        if (ok and marked and !deleteOnClose(file, false)) {
+            ok = false;
+            err = windows.GetLastError();
+        }
         _ = kernel32.CloseHandle(file);
-        if (ok == .FALSE) {
-            // A partial dump is no use to a debugger.
-            _ = kernel32.DeleteFileW(name.ptr);
+        if (!ok) {
+            // Closing it removed a marked file.
+            if (!marked) _ = kernel32.DeleteFileW(name.ptr);
             return .{ .failed = err };
         }
         return .{ .written = name[self.dir_len..] };
+    }
+
+    /// Sets or clears the file's delete disposition. While it is set,
+    /// closing the last handle to the file deletes it.
+    fn deleteOnClose(file: windows.HANDLE, delete: bool) bool {
+        var info: os_windows.FILE_DISPOSITION_INFORMATION = .{
+            .DeleteFile = if (delete) .TRUE else .FALSE,
+        };
+        return kernel32.SetFileInformationByHandle(
+            file,
+            .FileDispositionInfo,
+            &info,
+            @sizeOf(os_windows.FILE_DISPOSITION_INFORMATION),
+        ) != .FALSE;
     }
 
     /// "ghostty-YYYYMMDD-HHMMSS-<pid>.dmp", UTC, after the directory: the
@@ -570,6 +595,44 @@ fn testPointers(context: *windows.CONTEXT, record: *ExceptionRecord) ExceptionPo
     return .{ .ExceptionRecord = record, .ContextRecord = context };
 }
 
+/// A MiniDumpWriteDump that the tests steer, in place of dbgcore's. It
+/// writes "hello".
+const TestWrite = struct {
+    /// What the write answers. FALSE comes with ERROR_DISK_FULL.
+    var succeed: bool = true;
+    /// Whether the file was marked for deletion while being written.
+    var delete_pending: bool = false;
+
+    fn reset() void {
+        succeed = true;
+        delete_pending = false;
+    }
+
+    fn write(
+        _: windows.HANDLE,
+        _: u32,
+        file: windows.HANDLE,
+        _: u32,
+        _: ?*const MINIDUMP_EXCEPTION_INFORMATION,
+        _: ?*const MINIDUMP_USER_STREAM_INFORMATION,
+        _: ?*const anyopaque,
+    ) callconv(.winapi) windows.BOOL {
+        var io_status: windows.IO_STATUS_BLOCK = undefined;
+        var info: os_windows.FILE_STANDARD_INFORMATION = undefined;
+        delete_pending = os_windows.exp.ntdll.NtQueryInformationFile(
+            file,
+            &io_status,
+            &info,
+            @sizeOf(os_windows.FILE_STANDARD_INFORMATION),
+            .Standard,
+        ) == .SUCCESS and info.DeletePending != .FALSE;
+        _ = kernel32.WriteFile(file, "hello", 5, null, null);
+        if (succeed) return .TRUE;
+        kernel32.SetLastError(.DISK_FULL);
+        return .FALSE;
+    }
+};
+
 /// The parts of a minidump file the tests read (minidumpapiset.h).
 const TestDump = struct {
     bytes: []const u8,
@@ -697,6 +760,61 @@ test "win32: a crash directory longer than MAX_PATH takes a dump" {
     const bytes = try testOnlyDump(long, alloc);
     defer alloc.free(bytes);
     try testing.expectEqualSlices(u8, "MDMP", bytes[0..4]);
+}
+
+test "win32: a dump is marked for deletion until it is whole" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    var d: Dumper = undefined;
+    try d.start(dir, small_type);
+    defer d.stop();
+    TestWrite.reset();
+    d.write = TestWrite.write;
+
+    var context: windows.CONTEXT = undefined;
+    var record: ExceptionRecord = undefined;
+    const pointers = testPointers(&context, &record);
+    try testing.expect(d.dump(&pointers, .exception, "") == .written);
+
+    // Marked while it was written, so that a process ending then would
+    // have left nothing, and kept once written.
+    try testing.expect(TestWrite.delete_pending);
+    const bytes = try testOnlyDump(tmp.dir, alloc);
+    defer alloc.free(bytes);
+    try testing.expectEqualStrings("hello", bytes);
+}
+
+test "win32: a dump that fails leaves no file" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    var d: Dumper = undefined;
+    try d.start(dir, small_type);
+    defer d.stop();
+    TestWrite.reset();
+    TestWrite.succeed = false;
+    d.write = TestWrite.write;
+
+    var context: windows.CONTEXT = undefined;
+    var record: ExceptionRecord = undefined;
+    const pointers = testPointers(&context, &record);
+    const result = d.dump(&pointers, .exception, "");
+    try testing.expect(result == .failed);
+    try testing.expectEqual(windows.Win32Error.DISK_FULL, result.failed);
+
+    const names = try testDumps(tmp.dir, alloc);
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    try testing.expectEqual(0, names.len);
 }
 
 test "win32: only a process's first crash is dumped" {
