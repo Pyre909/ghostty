@@ -153,7 +153,6 @@ extern "kernel32" fn CreateEventW(
     name: ?windows.LPCWSTR,
 ) callconv(.winapi) ?windows.HANDLE;
 extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) windows.BOOL;
-extern "kernel32" fn ResetEvent(event: windows.HANDLE) callconv(.winapi) windows.BOOL;
 extern "kernel32" fn DeleteFileW(name: [*:0]const u16) callconv(.winapi) windows.BOOL;
 
 // --- The dumper ----------------------------------------------------------
@@ -275,13 +274,6 @@ pub const Dumper = struct {
             os_windows.WAIT_OBJECT_0 => self.result,
             else => .none,
         };
-    }
-
-    /// Lets the next crash dump again. Tests only.
-    pub fn reset(self: *Dumper) void {
-        _ = ResetEvent(self.done);
-        self.result = .none;
-        self.crasher.store(0, .release);
     }
 
     fn run(self: *Dumper) void {
