@@ -74,14 +74,8 @@ fn release(obj: anytype) void {
 /// reference is the caller's.
 fn query(obj: anytype, comptime T: type) error{ToastFailed}!*T {
     var out: ?*anyopaque = null;
-    try check(obj.vtable.base.QueryInterface(obj, &T.IID, &out), "QueryInterface");
+    try win32.checkHr(obj.vtable.base.QueryInterface(obj, &T.IID, &out), error.ToastFailed, "toast: QueryInterface");
     return @ptrCast(@alignCast(out orelse return error.ToastFailed));
-}
-
-fn check(hr: HRESULT, what: []const u8) error{ToastFailed}!void {
-    if (hr >= 0) return;
-    log.warn("toast: {s} failed hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
-    return error.ToastFailed;
 }
 
 const IToastNotificationManagerStatics = extern struct {
@@ -216,7 +210,7 @@ const String = struct {
 
     fn init(text: []const u16) error{ToastFailed}!String {
         var handle: HSTRING = null;
-        try check(win32.WindowsCreateString(text.ptr, @intCast(text.len), &handle), "WindowsCreateString");
+        try win32.checkHr(win32.WindowsCreateString(text.ptr, @intCast(text.len), &handle), error.ToastFailed, "toast: WindowsCreateString");
         return .{ .handle = handle };
     }
 
@@ -239,7 +233,7 @@ fn factoryOf(comptime T: type, comptime name: []const u8) error{ToastFailed}!*T 
     const class = try String.init(std.unicode.utf8ToUtf16LeStringLiteral(name));
     defer class.deinit();
     var out: ?*anyopaque = null;
-    try check(win32.RoGetActivationFactory(class.handle, &T.IID, &out), "RoGetActivationFactory(" ++ name ++ ")");
+    try win32.checkHr(win32.RoGetActivationFactory(class.handle, &T.IID, &out), error.ToastFailed, "toast: RoGetActivationFactory(" ++ name ++ ")");
     return @ptrCast(@alignCast(out orelse return error.ToastFailed));
 }
 
@@ -620,14 +614,14 @@ pub const Toasts = struct {
         const statics = try factoryOf(IToastNotificationManagerStatics, "Windows.UI.Notifications.ToastNotificationManager");
         defer release(statics);
         var notifier_out: ?*IToastNotifier = null;
-        try check(statics.vtable.CreateToastNotifierWithId(statics, id.handle, &notifier_out), "CreateToastNotifierWithId");
+        try win32.checkHr(statics.vtable.CreateToastNotifierWithId(statics, id.handle, &notifier_out), error.ToastFailed, "toast: CreateToastNotifierWithId");
         const notifier = notifier_out orelse return error.ToastFailed;
         errdefer release(notifier);
 
         const statics2 = try query(statics, IToastNotificationManagerStatics2);
         defer release(statics2);
         var history_out: ?*IToastNotificationHistory = null;
-        try check(statics2.vtable.get_History(statics2, &history_out), "get_History");
+        try win32.checkHr(statics2.vtable.get_History(statics2, &history_out), error.ToastFailed, "toast: get_History");
         const history = history_out orelse return error.ToastFailed;
         errdefer release(history);
 
@@ -680,22 +674,22 @@ pub const Toasts = struct {
             const class = try String.init(std.unicode.utf8ToUtf16LeStringLiteral("Windows.Data.Xml.Dom.XmlDocument"));
             defer class.deinit();
             var out: ?*anyopaque = null;
-            try check(win32.RoActivateInstance(class.handle, &out), "RoActivateInstance(XmlDocument)");
+            try win32.checkHr(win32.RoActivateInstance(class.handle, &out), error.ToastFailed, "toast: RoActivateInstance(XmlDocument)");
             break :document @as(*Object, @ptrCast(@alignCast(out orelse return error.ToastFailed)));
         };
         defer release(document);
         const io = try query(document, IXmlDocumentIO);
         defer release(io);
-        try check(io.vtable.LoadXml(io, content.handle), "LoadXml");
+        try win32.checkHr(io.vtable.LoadXml(io, content.handle), error.ToastFailed, "toast: LoadXml");
         const xml_document = try query(document, IXmlDocument);
         defer release(xml_document);
 
         var notification: ?*IToastNotification = null;
-        try check(self.factory.vtable.CreateToastNotification(
+        try win32.checkHr(self.factory.vtable.CreateToastNotification(
             self.factory,
             xml_document,
             &notification,
-        ), "CreateToastNotification");
+        ), error.ToastFailed, "toast: CreateToastNotification");
         const toast_notification = notification orelse return error.ToastFailed;
         defer release(toast_notification);
 
@@ -705,15 +699,15 @@ pub const Toasts = struct {
         defer tag.deinit();
         const group = try String.decimal(toast.group);
         defer group.deinit();
-        try check(tagged.vtable.put_Tag(tagged, tag.handle), "put_Tag");
-        try check(tagged.vtable.put_Group(tagged, group.handle), "put_Group");
+        try win32.checkHr(tagged.vtable.put_Tag(tagged, tag.handle), error.ToastFailed, "toast: put_Tag");
+        try win32.checkHr(tagged.vtable.put_Group(tagged, group.handle), error.ToastFailed, "toast: put_Group");
 
         const handler = try Activated.create(self.hwnd, self.message, toast.group);
         defer _ = Activated.releaseRef(handler);
         var token: EventToken = undefined;
-        try check(toast_notification.vtable.add_Activated(toast_notification, handler, &token), "add_Activated");
+        try win32.checkHr(toast_notification.vtable.add_Activated(toast_notification, handler, &token), error.ToastFailed, "toast: add_Activated");
 
-        try check(self.notifier.vtable.Show(self.notifier, toast_notification), "Show");
+        try win32.checkHr(self.notifier.vtable.Show(self.notifier, toast_notification), error.ToastFailed, "toast: Show");
     }
 
     fn removeOpaque(ptr: *anyopaque, group: u64, tag: u64) void {
@@ -722,14 +716,14 @@ pub const Toasts = struct {
         defer t.deinit();
         const g = String.decimal(group) catch return;
         defer g.deinit();
-        check(self.history.vtable.RemoveGroupedTagWithId(self.history, t.handle, g.handle, self.app_id.handle), "RemoveGroupedTagWithId") catch {};
+        win32.checkHr(self.history.vtable.RemoveGroupedTagWithId(self.history, t.handle, g.handle, self.app_id.handle), error.ToastFailed, "toast: RemoveGroupedTagWithId") catch {};
     }
 
     fn removeGroupOpaque(ptr: *anyopaque, group: u64) void {
         const self: *Toasts = @ptrCast(@alignCast(ptr));
         const g = String.decimal(group) catch return;
         defer g.deinit();
-        check(self.history.vtable.RemoveGroupWithId(self.history, g.handle, self.app_id.handle), "RemoveGroupWithId") catch {};
+        win32.checkHr(self.history.vtable.RemoveGroupWithId(self.history, g.handle, self.app_id.handle), error.ToastFailed, "toast: RemoveGroupWithId") catch {};
     }
 
     fn removeGroupsOnThreadOpaque(ptr: *anyopaque, groups: []const u64) Removal {
@@ -756,13 +750,13 @@ pub const Toasts = struct {
         const statics = factoryOf(IToastNotificationManagerStatics2, "Windows.UI.Notifications.ToastNotificationManager") catch return;
         defer release(statics);
         var out: ?*IToastNotificationHistory = null;
-        check(statics.vtable.get_History(statics, &out), "get_History") catch return;
+        win32.checkHr(statics.vtable.get_History(statics, &out), error.ToastFailed, "toast: get_History") catch return;
         const history = out orelse return;
         defer release(history);
         for (groups) |group| {
             const g = String.decimal(group) catch continue;
             defer g.deinit();
-            check(history.vtable.RemoveGroupWithId(history, g.handle, id), "RemoveGroupWithId") catch {};
+            win32.checkHr(history.vtable.RemoveGroupWithId(history, g.handle, id), error.ToastFailed, "toast: RemoveGroupWithId") catch {};
         }
     }
 };

@@ -26,26 +26,20 @@ const GUID = windows.GUID;
 const CLSID_TaskbarList: GUID = GUID.parse("{56fdf344-fd6d-11d0-958a-006097c9a090}");
 const IID_ITaskbarList3: GUID = GUID.parse("{ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf}");
 
-fn check(hr: HRESULT, what: []const u8) error{TaskbarListFailed}!void {
-    if (hr >= 0) return;
-    log.warn("taskbar: {s} failed hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
-    return error.TaskbarListFailed;
-}
-
 /// The taskbar buttons' progress bars, one reference, the caller's; on the
 /// thread that uses it, which must be in an apartment (CoInitializeEx).
 pub fn create() error{TaskbarListFailed}!*ITaskbarList3 {
     var out: ?*anyopaque = null;
-    try check(win32.CoCreateInstance(
+    try win32.checkHr(win32.CoCreateInstance(
         &CLSID_TaskbarList,
         null,
         win32.CLSCTX_INPROC_SERVER,
         &IID_ITaskbarList3,
         &out,
-    ), "CoCreateInstance");
+    ), error.TaskbarListFailed, "taskbar: CoCreateInstance");
     const list: *ITaskbarList3 = @ptrCast(@alignCast(out orelse return error.TaskbarListFailed));
     errdefer list.release();
-    try check(list.vtable.HrInit(list), "HrInit");
+    try win32.checkHr(list.vtable.HrInit(list), error.TaskbarListFailed, "taskbar: HrInit");
     return list;
 }
 
@@ -118,11 +112,11 @@ pub const ITaskbarList3 = extern struct {
     pub fn show(self: *ITaskbarList3, hwnd: HWND, progress: Progress) void {
         log.debug("taskbar progress state={s} value={d}", .{ @tagName(progress.state), progress.shownValue() });
         if (progress.state == .indeterminate) {
-            check(self.vtable.SetProgressState(self, hwnd, .none), "SetProgressState") catch {};
+            win32.checkHr(self.vtable.SetProgressState(self, hwnd, .none), error.TaskbarListFailed, "taskbar: SetProgressState") catch {};
         }
-        check(self.vtable.SetProgressState(self, hwnd, progress.state), "SetProgressState") catch {};
+        win32.checkHr(self.vtable.SetProgressState(self, hwnd, progress.state), error.TaskbarListFailed, "taskbar: SetProgressState") catch {};
         if (!progress.state.filled()) return;
-        check(self.vtable.SetProgressValue(self, hwnd, progress.shownValue(), 100), "SetProgressValue") catch {};
+        win32.checkHr(self.vtable.SetProgressValue(self, hwnd, progress.shownValue(), 100), error.TaskbarListFailed, "taskbar: SetProgressValue") catch {};
     }
 };
 

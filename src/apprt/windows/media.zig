@@ -125,12 +125,6 @@ const MediaError = enum(usize) {
     _,
 };
 
-fn check(hr: HRESULT, what: []const u8) error{MediaFailed}!void {
-    if (hr >= 0) return;
-    log.warn("bell audio: {s} failed hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
-    return error.MediaFailed;
-}
-
 /// An untyped vtable slot, there so that the slots after it keep their
 /// index.
 const Slot = *const anyopaque;
@@ -384,7 +378,7 @@ pub const Bell = struct {
         self.player = null;
         switch (self.mf) {
             .started => |mf| {
-                check(mf.MFShutdown(), "MFShutdown") catch {};
+                win32.checkHr(mf.MFShutdown(), error.MediaFailed, "bell audio: MFShutdown") catch {};
                 if (builtin.is_test) test_record.shutdowns += 1;
                 self.mf = .{ .loaded = mf };
             },
@@ -399,7 +393,7 @@ pub const Bell = struct {
             .unloaded, .missing => return null,
             .started => |mf| return mf,
             .loaded => |mf| {
-                check(mf.MFStartup(MF_VERSION, MFSTARTUP_LITE), "MFStartup") catch return null;
+                win32.checkHr(mf.MFStartup(MF_VERSION, MFSTARTUP_LITE), error.MediaFailed, "bell audio: MFStartup") catch return null;
                 if (builtin.is_test) test_record.startups += 1;
                 self.mf = .{ .started = mf };
                 return mf;
@@ -465,24 +459,24 @@ const Player = struct {
         defer _ = notify.vtable.Release(notify);
 
         var attrs_out: ?*IMFAttributes = null;
-        try check(mf.MFCreateAttributes(&attrs_out, 1), "MFCreateAttributes");
+        try win32.checkHr(mf.MFCreateAttributes(&attrs_out, 1), error.MediaFailed, "bell audio: MFCreateAttributes");
         const attrs = attrs_out orelse return error.MediaFailed;
         defer _ = attrs.vtable.Release(attrs);
-        try check(attrs.vtable.SetUnknown(attrs, &MF_MEDIA_ENGINE_CALLBACK, notify), "SetUnknown");
+        try win32.checkHr(attrs.vtable.SetUnknown(attrs, &MF_MEDIA_ENGINE_CALLBACK, notify), error.MediaFailed, "bell audio: SetUnknown");
 
         var factory_out: ?*anyopaque = null;
-        try check(win32.CoCreateInstance(
+        try win32.checkHr(win32.CoCreateInstance(
             &CLSID_MFMediaEngineClassFactory,
             null,
             win32.CLSCTX_INPROC_SERVER,
             &IID_IMFMediaEngineClassFactory,
             &factory_out,
-        ), "CoCreateInstance");
+        ), error.MediaFailed, "bell audio: CoCreateInstance");
         const factory: *IMFMediaEngineClassFactory = @ptrCast(@alignCast(factory_out orelse return error.MediaFailed));
         defer _ = factory.vtable.Release(factory);
 
         var engine_out: ?*IMFMediaEngine = null;
-        try check(factory.vtable.CreateInstance(factory, MF_MEDIA_ENGINE_AUDIOONLY, attrs, &engine_out), "CreateInstance");
+        try win32.checkHr(factory.vtable.CreateInstance(factory, MF_MEDIA_ENGINE_AUDIOONLY, attrs, &engine_out), error.MediaFailed, "bell audio: CreateInstance");
         const engine = engine_out orelse return error.MediaFailed;
         errdefer {
             _ = engine.vtable.Shutdown(engine);
@@ -497,7 +491,7 @@ const Player = struct {
         defer alloc.free(wide);
         const url = win32.SysAllocString(wide.ptr) orelse return error.OutOfMemory;
         defer win32.SysFreeString(url);
-        try check(engine.vtable.SetSource(engine, url), "SetSource");
+        try win32.checkHr(engine.vtable.SetSource(engine, url), error.MediaFailed, "bell audio: SetSource");
 
         log.debug("bell audio: source {s} required={}", .{ path, required });
         return .{ .engine = engine, .path = copy, .required = required };
@@ -527,9 +521,9 @@ const Player = struct {
             return;
         }
         const e = self.engine;
-        check(e.vtable.SetVolume(e, volume), "SetVolume") catch {};
+        win32.checkHr(e.vtable.SetVolume(e, volume), error.MediaFailed, "bell audio: SetVolume") catch {};
         _ = e.vtable.SetCurrentTime(e, 0);
-        check(e.vtable.Play(e), "Play") catch {};
+        win32.checkHr(e.vtable.Play(e), error.MediaFailed, "bell audio: Play") catch {};
     }
 };
 

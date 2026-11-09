@@ -14,6 +14,7 @@ const std = @import("std");
 const internal_os = @import("../../os/main.zig");
 
 const win32 = @This();
+const log = std.log.scoped(.win32);
 
 const w = std.os.windows;
 
@@ -847,6 +848,15 @@ pub extern "shell32" fn DragFinish(drop: HDROP) callconv(.winapi) void;
 pub const COINIT_MULTITHREADED: DWORD = 0x0;
 pub const COINIT_APARTMENTTHREADED: DWORD = 0x2;
 pub const COINIT_DISABLE_OLE1DDE: DWORD = 0x4;
+/// `fail` if `hr` is a failure, logged with `what`: how the Save dialog,
+/// the bell's audio, the taskbar's progress and the toasts check their
+/// COM and WinRT calls. `fail` is an error value, so each keeps its own
+/// error set: `error.ToastFailed` is an `error{ToastFailed}`.
+pub fn checkHr(hr: HRESULT, comptime fail: anytype, what: []const u8) @TypeOf(fail)!void {
+    if (hr >= 0) return;
+    log.warn("{s} failed hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
+    return fail;
+}
 pub extern "ole32" fn CoInitializeEx(reserved: ?*anyopaque, coinit: DWORD) callconv(.winapi) HRESULT;
 pub extern "ole32" fn CoUninitialize() callconv(.winapi) void;
 pub const CLSCTX_INPROC_SERVER: DWORD = 0x1;

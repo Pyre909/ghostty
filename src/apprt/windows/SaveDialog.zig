@@ -116,23 +116,17 @@ fn answerOf(hr: HRESULT) Answer {
     return if (hr == cancelled_hr) .cancelled else .failed;
 }
 
-fn check(hr: HRESULT, what: []const u8) error{SaveDialogFailed}!void {
-    if (hr >= 0) return;
-    log.warn("save dialog: {s} failed hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
-    return error.SaveDialogFailed;
-}
-
 /// A Save dialog, one reference, the caller's; on a thread in a
 /// single-threaded apartment, as the UI thread is (`App.init`).
 fn create() error{SaveDialogFailed}!*IFileSaveDialog {
     var out: ?*anyopaque = null;
-    try check(win32.CoCreateInstance(
+    try win32.checkHr(win32.CoCreateInstance(
         &CLSID_FileSaveDialog,
         null,
         win32.CLSCTX_INPROC_SERVER,
         &IID_IFileSaveDialog,
         &out,
-    ), "CoCreateInstance");
+    ), error.SaveDialogFailed, "save dialog: CoCreateInstance");
     return @ptrCast(@alignCast(out orelse return error.SaveDialogFailed));
 }
 
@@ -204,19 +198,19 @@ pub const IFileSaveDialog = extern struct {
     /// replacing a file, and only items with a path in the file system.
     fn prepare(self: *IFileSaveDialog, spec: Spec) error{SaveDialogFailed}!void {
         var options: windows.DWORD = 0;
-        try check(self.vtable.GetOptions(self, &options), "GetOptions");
-        try check(self.vtable.SetOptions(self, options | win32.FOS_FORCEFILESYSTEM), "SetOptions");
-        try check(self.vtable.SetFileTypes(self, file_types.len, &file_types), "SetFileTypes");
-        try check(self.vtable.SetDefaultExtension(self, L("txt")), "SetDefaultExtension");
-        try check(self.vtable.SetFileName(self, spec.name), "SetFileName");
-        try check(self.vtable.SetTitle(self, spec.title), "SetTitle");
-        try check(self.vtable.SetOkButtonLabel(self, spec.ok), "SetOkButtonLabel");
+        try win32.checkHr(self.vtable.GetOptions(self, &options), error.SaveDialogFailed, "save dialog: GetOptions");
+        try win32.checkHr(self.vtable.SetOptions(self, options | win32.FOS_FORCEFILESYSTEM), error.SaveDialogFailed, "save dialog: SetOptions");
+        try win32.checkHr(self.vtable.SetFileTypes(self, file_types.len, &file_types), error.SaveDialogFailed, "save dialog: SetFileTypes");
+        try win32.checkHr(self.vtable.SetDefaultExtension(self, L("txt")), error.SaveDialogFailed, "save dialog: SetDefaultExtension");
+        try win32.checkHr(self.vtable.SetFileName(self, spec.name), error.SaveDialogFailed, "save dialog: SetFileName");
+        try win32.checkHr(self.vtable.SetTitle(self, spec.title), error.SaveDialogFailed, "save dialog: SetTitle");
+        try win32.checkHr(self.vtable.SetOkButtonLabel(self, spec.ok), error.SaveDialogFailed, "save dialog: SetOkButtonLabel");
     }
 
     /// The file the user chose, after a Show that succeeded, in `alloc`.
     fn chosen(self: *IFileSaveDialog, alloc: Allocator) error{ SaveDialogFailed, OutOfMemory }![:0]u16 {
         var out: ?*IShellItem = null;
-        try check(self.vtable.GetResult(self, &out), "GetResult");
+        try win32.checkHr(self.vtable.GetResult(self, &out), error.SaveDialogFailed, "save dialog: GetResult");
         const item = out orelse return error.SaveDialogFailed;
         defer item.release();
         return item.path(alloc);
@@ -246,7 +240,7 @@ pub const IShellItem = extern struct {
     /// The item's path in the file system, in `alloc`.
     fn path(self: *IShellItem, alloc: Allocator) error{ SaveDialogFailed, OutOfMemory }![:0]u16 {
         var name: ?[*:0]u16 = null;
-        try check(self.vtable.GetDisplayName(self, SIGDN_FILESYSPATH, &name), "GetDisplayName");
+        try win32.checkHr(self.vtable.GetDisplayName(self, SIGDN_FILESYSPATH, &name), error.SaveDialogFailed, "save dialog: GetDisplayName");
         const got = name orelse return error.SaveDialogFailed;
         defer win32.CoTaskMemFree(@ptrCast(got));
         return alloc.dupeSentinel(u16, std.mem.span(got), 0);
