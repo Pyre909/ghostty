@@ -1480,10 +1480,15 @@ pub const App = struct {
     /// as under any prompt (`canReenterCore` is false). A prompt a tick
     /// opens shows beside it, as one would beside theirs, with Cancel for
     /// Enter (`dialog.confirm`); output pauses until it is answered.
-    /// Opened inside a core frame or another prompt, it is an ordinary
-    /// one. Left with `endPrompt`.
+    ///
+    /// Opened inside a tick, another prompt or one of our window
+    /// procedures, it is an ordinary one: a procedure may have the core
+    /// beneath it, as a key's has the core's key callback, which sets no
+    /// flag of its own. `run`'s own calls into the core, outside any
+    /// procedure, queue what they ask for (`requests`). Left with
+    /// `endPrompt`.
     pub fn beginUnframedPrompt(self: *App, owner: ?win32.HWND) void {
-        const unframed = self.canReenterCore();
+        const unframed = handler_depth == 0 and self.canReenterCore();
         self.beginPrompt(owner);
         if (unframed) self.unframed_prompt = true;
     }
@@ -19124,6 +19129,53 @@ test "win32: an export's dialog goes on ticking the core, and no prompt inside i
 
     // The next prompt is an ordinary one again.
     app.beginPrompt(null);
+    try std.testing.expectEqual(0, TestExport.wakeups());
+    app.endPrompt();
+}
+
+test "win32: a Save dialog asked inside a window procedure or another prompt ticks nothing" {
+    // Only `run` asks, outside any core frame. Asked inside one of our
+    // window procedures, as a key's, where the core's callback may be
+    // beneath it, the dialog is an ordinary prompt, whose loop ticks
+    // nothing (`beginUnframedPrompt`). Nor inside another prompt, which
+    // is as ordinary as before once the dialog closes. No procedure asks
+    // today, so the count is raised here as each procedure raises it.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    App.test_tick = &TestExport.tick;
+    defer App.test_tick = null;
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+    TestExport.probe = true;
+
+    {
+        App.handler_depth += 1;
+        defer App.handler_depth -= 1;
+        try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+        app.createRequested();
+    }
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(0, TestExport.ticked);
+    try std.testing.expectEqual(0, TestExport.ticked_after);
+
+    app.beginPrompt(null);
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.createRequested();
+    try std.testing.expectEqual(2, TestExport.asks);
+    try std.testing.expectEqual(0, TestExport.ticked);
     try std.testing.expectEqual(0, TestExport.wakeups());
     app.endPrompt();
 }
