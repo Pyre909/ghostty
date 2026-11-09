@@ -1,0 +1,91 @@
+{
+  "vendored": [
+    {
+      "name": "glad",
+      "path": "vendor/glad",
+      "license": "(WTFPL OR CC0-1.0) AND Apache-2.0",
+      "url": "https://github.com/Dav1dde/glad",
+      "texts": [
+        {
+          "file": "dist/windows/licenses/Apache-2.0.txt"
+        },
+        {
+          "file": "vendor/glad/include/KHR/khrplatform.h",
+          "from": "Copyright (c) 2008-2018 The Khronos Group Inc.",
+          "to": "DEALINGS IN THE MATERIALS."
+        }
+      ]
+    },
+    {
+      "name": "stb",
+      "path": "src/stb",
+      "license": "MIT OR Unlicense",
+      "url": "https://github.com/nothings/stb",
+      "texts": [
+        {
+          "file": "src/stb/stb_image.h",
+          "from": "This software is available under 2 licenses",
+          "to": "WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+        }
+      ]
+    }
+  ],
+  "packages": {
+    "bindings": {
+      "note": "C bindings that Dear Bindings generated from Dear ImGui's headers, under Dear ImGui's license (imgui).",
+      "texts": []
+    },
+    "conpty": {
+      "texts": [
+        {
+          "file": "dist/windows/conpty-LICENSE.txt"
+        }
+      ]
+    },
+    "freetype": {
+      "add": [
+        {
+          "package_file": "docs/FTL.TXT"
+        },
+        {
+          "package_file": "src/bdf/README",
+          "from": "Copyright (C) 2001-2002 by Francesco Zappa Nardelli",
+          "to": "SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+        },
+        {
+          "package_file": "src/bdf/README",
+          "from": "*** Portions of the driver",
+          "to": "THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+        },
+        {
+          "package_file": "src/pcf/README",
+          "from": "Copyright (C) 2000 by Francesco Zappa Nardelli",
+          "to": "SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+        }
+      ]
+    },
+    "iterm2_themes": {
+      "url": "https://github.com/mbadolato/iTerm2-Color-Schemes",
+      "texts": [
+        {
+          "file": "dist/windows/licenses/iTerm2-Color-Schemes.txt"
+        }
+      ]
+    },
+    "uucode": {
+      "add": [
+        {
+          "file": "dist/windows/licenses/uucode-LICENSE_unicode.txt"
+        },
+        {
+          "file": "dist/windows/licenses/uucode-LICENSE_Bjoern_Hoehrmann.txt"
+        }
+      ]
+    }
+  },
+  "installed": {
+    "bin/OpenConsole.exe": "conpty",
+    "bin/conpty.dll": "conpty",
+    "share/ghostty/themes": "iterm2_themes"
+  }
+}
