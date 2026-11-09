@@ -726,6 +726,10 @@ def make(args: argparse.Namespace) -> None:
     zig = shutil.which(args.zig)
     if zig is None:
         raise Error(f"{args.zig} is not on PATH")
+    # which() keeps a relative path relative, and zig runs from REPO.
+    # resolve() rather than absolute(): a symlinked zig's LICENSE is
+    # beside the real binary.
+    zig = str(Path(zig).resolve())
     fixed = toolchain(zig, zig_license(zig, args.zig_license))
     when = zip_time()
     name = f"ghostty-{args.version}-windows-{args.arch}"

@@ -931,6 +931,23 @@ class TestCheckout(unittest.TestCase):
                 finally:
                     stray.unlink()
 
+    def test_relative_zig(self) -> None:
+        import contextlib
+
+        # A relative --zig from a directory other than the checkout, a
+        # link to the real zig, as a package manager installs it.
+        caller = self.repo / "zig-out" / "caller"
+        zig = self.repo / "zig-out" / "zig-0.17" / "zig"
+        write(zig, "#!/bin/sh\n")
+        zig.chmod(0o755)
+        (caller / "bin").mkdir(parents=True)
+        (caller / "bin" / "zig").symlink_to(zig)
+        self.enterContext(contextlib.chdir(caller))
+        seen = mock.patch.object(mz, "zig_license", side_effect=mz.Error("stop"))
+        with seen as zig_license:
+            self.assertEqual(self.make("--zig", "./bin/zig"), "make_zip: stop\n")
+        self.assertEqual(zig_license.call_args.args[0], str(zig.resolve()))
+
     def test_tracked_change(self) -> None:
         write(self.repo / "src/shell-integration/bash/ghostty.bash", "changed\n")
         self.assertRegex(self.make(), "tracked files have changes")
