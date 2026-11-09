@@ -28,6 +28,17 @@
           "to": "WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
         }
       ]
+    },
+    {
+      "name": "bash-preexec",
+      "path": "src/shell-integration/bash/bash-preexec.sh",
+      "license": "MIT",
+      "url": "https://github.com/rcaloras/bash-preexec",
+      "texts": [
+        {
+          "file": "dist/windows/licenses/bash-preexec-LICENSE.txt"
+        }
+      ]
     }
   ],
   "embedded": [
@@ -102,6 +113,7 @@
   "installed": {
     "bin/OpenConsole.exe": "conpty",
     "bin/conpty.dll": "conpty",
+    "share/ghostty/shell-integration/bash/bash-preexec.sh": "bash-preexec",
     "share/ghostty/themes": "iterm2_themes"
   }
 }

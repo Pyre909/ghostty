@@ -36,8 +36,10 @@ dist/windows/third-party.json adds what the report cannot know:
                 font itself;
     packages    the texts, by package name, for a fetched package that has
                 no license file at its root;
-    installed   packages whose files the build installs rather than links
-                (the ConPTY host, the themes), by installed path.
+    installed   files the build installs rather than links (the ConPTY
+                host, the themes, bash-preexec), by installed path, each
+                naming the package or vendored entry it comes from. Each
+                path must be in the app.
 
 A fetched package's license texts are the files at its root named LICENSE,
 LICENCE, COPYING, NOTICE, UNLICENSE or OFL, optionally with a -SUFFIX and a
@@ -363,6 +365,7 @@ def collect(
     # with a path in this repository. A package's texts are read only if
     # the app links it. Longest path first, so that the closest covers.
     covers: list[tuple[str, Callable[[], Component]]] = []
+    vendored: dict[str, Component] = {}
     check_keys(overrides, {"vendored", "embedded", "packages", "installed"}, "the file")
     for v in overrides.get("vendored", []):
         check_keys(
@@ -371,7 +374,8 @@ def collect(
         c = Component(v["name"], license=v.get("license"), url=v.get("url"))
         c.texts = [text_of(repo, t) for t in v["texts"]]
         if not c.texts:
-            raise Error(f"third-party.json: vendored {v['name']} has no texts")
+            raise Error(f"{OVERRIDES.name}: vendored {v['name']} has no texts")
+        vendored[c.name] = c
         covers.append((norm(v["path"], v["name"]), functools.partial(_same, c)))
     for pkg in report["packages"]:
         rel = in_repo(pkg["hash"])
@@ -435,13 +439,22 @@ def collect(
             c.texts.insert(0, (label, "\n".join(sorted(set(notices)))))
         add(c)
 
+    # Installed files, from a fetched package or from vendored code. A
+    # path that is not in the app is an error, so that a misspelt one
+    # cannot drop a notice.
     by_name = {n: h for h, p in where.items() for n in p["names"]}
     for path, name in overrides.get("installed", {}).items():
+        if name in vendored and name in by_name:
+            raise Error(
+                f"{OVERRIDES.name}: {name} names both a package and vendored code"
+            )
+        if name not in vendored and name not in by_name:
+            raise Error(
+                f"{OVERRIDES.name}: no package or vendored code is named {name}"
+            )
         if not (tree / path).exists():
-            continue
-        if name not in by_name:
-            raise Error(f"third-party.json: no package is named {name}")
-        add(fetched(by_name[name]))
+            raise Error(f"{OVERRIDES.name}: installed {path} is not in the app")
+        add(vendored[name] if name in vendored else fetched(by_name[name]))
 
     for c in fixed:
         add(c)

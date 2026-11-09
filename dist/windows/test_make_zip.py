@@ -122,6 +122,8 @@ class Fixture(unittest.TestCase):
         )
         write(r / "pkg/simdutf/vendor/LICENSE-MIT", "simdutf MIT\n")
         write(r / "dist/windows/conpty-LICENSE.txt", "conpty MIT\n")
+        write(r / "src/shell/preexec.sh", "# preexec\n")
+        write(r / "dist/windows/licenses/preexec-LICENSE.txt", "preexec MIT\n")
         write(r / "src/font/res/Emoji.ttf", copyright_font("Copyright 2022 B"))
         write(r / "src/font/res/Emoji-Text.ttf", copyright_font("Copyright 2013 A"))
         write(r / "src/font/res/Emoji-Bold.ttf", copyright_font("Copyright 2013 A"))
@@ -213,6 +215,11 @@ class Fixture(unittest.TestCase):
                         }
                     ],
                 },
+                {
+                    "name": "preexec",
+                    "path": "src/shell/preexec.sh",
+                    "texts": [{"file": "dist/windows/licenses/preexec-LICENSE.txt"}],
+                },
             ],
             "embedded": [
                 {
@@ -230,9 +237,15 @@ class Fixture(unittest.TestCase):
                 "bindings": {"note": "Generated from imgui's headers.", "texts": []},
                 "conpty": {"texts": [{"file": "dist/windows/conpty-LICENSE.txt"}]},
             },
-            "installed": {"bin/conpty.dll": "conpty", "share/ghostty/themes": "themes"},
+            "installed": {
+                "bin/conpty.dll": "conpty",
+                "share/ghostty/themes": "themes",
+                "share/ghostty/shell/preexec.sh": "preexec",
+            },
         }
         write(self.tree / "bin/conpty.dll", pe(0x8664))
+        write(self.tree / "share/ghostty/themes/Dark", "palette = 0=#000000\n")
+        write(self.tree / "share/ghostty/shell/preexec.sh", "# preexec\n")
         self.fixed = [
             mz.Component("Zig", license="MIT", texts=[("LICENSE", "Zig MIT")])
         ]
@@ -254,8 +267,8 @@ class Fixture(unittest.TestCase):
 
 class TestCollect(Fixture):
     def test_lists_what_is_linked_or_installed(self) -> None:
-        # Not ghostty (its own paths), breakpad (fetched, not linked) or
-        # themes (not installed); glad once, though two packages link it.
+        # Not ghostty (its own paths) or breakpad (fetched, not linked);
+        # glad once, though two packages link it.
         self.assertEqual(
             [c.name for c in self.collect()],
             [
@@ -263,8 +276,10 @@ class TestCollect(Fixture):
                 "conpty",
                 "glad",
                 "Noto",
+                "preexec",
                 "simdutf",
                 "stb",
+                "themes",
                 "zf",
                 "Zig",
                 "zlib",
@@ -285,10 +300,15 @@ class TestCollect(Fixture):
         )
 
     def test_installed_package(self) -> None:
-        write(self.tree / "share/ghostty/themes/Dark", "palette = 0=#000000\n")
         themes = self.by_name()["themes"]
         self.assertEqual(
             (themes.license, themes.texts), ("MIT", [("LICENSE", "themes MIT")])
+        )
+
+    def test_installed_vendored_code(self) -> None:
+        # Installed, never linked, so only `installed` can list it.
+        self.assertEqual(
+            self.by_name()["preexec"].texts, [("preexec-LICENSE.txt", "preexec MIT")]
         )
 
     def test_fetched_package(self) -> None:
@@ -431,6 +451,16 @@ class TestCollect(Fixture):
         def no_embedded_texts(o: dict[str, Any]) -> None:
             o["embedded"][0]["texts"] = []
 
+        def installed_path_misspelt(o: dict[str, Any]) -> None:
+            o["installed"]["share/ghostty/shel/preexec.sh"] = "preexec"
+
+        def installed_name_unknown(o: dict[str, Any]) -> None:
+            o["installed"]["bin/conpty.dll"] = "conptyy"
+
+        def installed_name_ambiguous(o: dict[str, Any]) -> None:
+            o["vendored"][2]["name"] = "themes"
+            o["installed"]["share/ghostty/shell/preexec.sh"] = "themes"
+
         for change, error in [
             (unknown_key, r"package conpty has unknown keys \['text'\]"),
             (unknown_text_key, r"has unknown keys \['form'\]"),
@@ -444,6 +474,12 @@ class TestCollect(Fixture):
             (embedded_outside, "outside the repository"),
             (no_embedded_paths, "embedded Noto has no paths"),
             (no_embedded_texts, "embedded Noto has no texts"),
+            (
+                installed_path_misspelt,
+                "installed share/ghostty/shel/preexec.sh is not in the app",
+            ),
+            (installed_name_unknown, "no package or vendored code is named conptyy"),
+            (installed_name_ambiguous, "themes names both a package and vendored code"),
         ]:
             with self.subTest(change=change.__name__):
                 self.setUp()
