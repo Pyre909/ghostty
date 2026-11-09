@@ -410,7 +410,7 @@ pub const Dumper = struct {
         const head = std.fmt.bufPrint(&self.comment, "ghostty {s} {s} {s}-windows thread={s} {t}", .{
             build_config.version_string,
             build_config.mode_string,
-            @tagName(builtin.cpu.arch),
+            @tagName(builtin.target.cpu.arch),
             self.thread_type,
             self.kind,
         }) catch unreachable; // bounded: see the assert on `comment`
