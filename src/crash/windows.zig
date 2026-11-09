@@ -1085,6 +1085,64 @@ test "win32: the unhandled-exception filter dumps, then lets Windows end the pro
     try testing.expect(std.mem.endsWith(u8, std.mem.sliceTo(comment, 0), "thread=other exception"));
 }
 
+/// An unhandled-exception filter from before ours, for the tests.
+const TestFilter = struct {
+    /// A verdict ours never gives itself: the Windows SDK's value for
+    /// "run the handler".
+    const EXCEPTION_EXECUTE_HANDLER = 1;
+
+    var calls: usize = 0;
+    var info: ?*windows.EXCEPTION_POINTERS = null;
+    /// Whether the dump was written by the time it was called.
+    var dumped: bool = false;
+
+    fn filter(i: *windows.EXCEPTION_POINTERS) callconv(.winapi) os_windows.LONG {
+        calls += 1;
+        info = i;
+        dumped = installed.load(.acquire) and dumper.result == .written;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+};
+
+test "win32: the unhandled-exception filter passes on the previous filter's verdict" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    var context: windows.CONTEXT = undefined;
+    var record: ExceptionRecord = undefined;
+    var pointers = testPointers(&context, &record);
+    const info: *windows.EXCEPTION_POINTERS = @ptrCast(&pointers);
+
+    TestFilter.calls = 0;
+    previous_filter = TestFilter.filter;
+    defer previous_filter = null;
+
+    // Without a dumper there is no dump, and the verdict is still the
+    // previous filter's.
+    try testing.expectEqual(TestFilter.EXCEPTION_EXECUTE_HANDLER, filter(info));
+    try testing.expectEqual(1, TestFilter.calls);
+    try testing.expect(!TestFilter.dumped);
+
+    try dumper.start(dir, small_type);
+    installed.store(true, .release);
+    defer {
+        installed.store(false, .release);
+        dumper.stop();
+    }
+
+    // The dump first: what the previous filter then does with the
+    // exception may leave no other record of it.
+    try testing.expectEqual(TestFilter.EXCEPTION_EXECUTE_HANDLER, filter(info));
+    try testing.expectEqual(2, TestFilter.calls);
+    try testing.expect(TestFilter.info == info);
+    try testing.expect(TestFilter.dumped);
+    const bytes = try testOnlyDump(tmp.dir, alloc);
+    defer alloc.free(bytes);
+}
+
 test "win32: the first vectored handler remembers only what Zig's ends the process for" {
     defer pending = null;
     var context: windows.CONTEXT = undefined;
