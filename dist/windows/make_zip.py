@@ -30,6 +30,10 @@ dist/windows/third-party.json adds what the report cannot know:
 
     vendored    code copied into this repository, by path, with its
                 license texts;
+    embedded    files in this repository that the app embeds whole (with
+                @embedFile), which the report cannot see, with their
+                license texts; a font's copyright notice is read from the
+                font itself;
     packages    the texts, by package name, for a fetched package that has
                 no license file at its root;
     installed   packages whose files the build installs rather than links
@@ -59,6 +63,7 @@ import os
 import posixpath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -106,6 +111,8 @@ LICENSE_FILE = re.compile(
     r"^(licen[cs]e|copying|notice|unlicense|ofl)(-[a-z0-9]+)?(\.(txt|md|rst))?$",
     re.ASCII | re.IGNORECASE,
 )
+
+FONTS = (".ttf", ".otf")
 
 # Zip times start in 1980.
 ZIP_EPOCH = 315532800
@@ -221,6 +228,35 @@ def license_files(directory: Path) -> list[tuple[str, str]]:
     return [(name, read_text(p)) for name, p in names]
 
 
+def font_copyright(path: Path) -> str:
+    """A font's copyright notice: name ID 0 in its name table, from the
+    record for Windows in US English. The OFL asks that every copy of a
+    font carry it. https://learn.microsoft.com/typography/opentype/spec/name"""
+    data = path.read_bytes()
+    if data[:4] not in (b"\0\1\0\0", b"OTTO", b"true"):
+        raise Error(f"{path} is not a TrueType or OpenType font")
+    try:
+        (tables,) = struct.unpack_from(">H", data, 4)
+        for i in range(tables):
+            tag, _, offset, _ = struct.unpack_from(">4sIII", data, 12 + 16 * i)
+            if tag != b"name":
+                continue
+            _, records, strings = struct.unpack_from(">HHH", data, offset)
+            for j in range(records):
+                key = struct.unpack_from(">6H", data, offset + 6 + 12 * j)
+                platform, encoding, language, name_id, length, at = key
+                # Windows, Unicode BMP, en-US, the copyright notice.
+                if (platform, encoding, language, name_id) != (3, 1, 0x409, 0):
+                    continue
+                start = offset + strings + at
+                if start + length > len(data):
+                    raise Error(f"{path}: its copyright notice runs past the end")
+                return data[start : start + length].decode("utf-16-be").strip()
+    except (struct.error, UnicodeDecodeError) as e:
+        raise Error(f"{path}: cannot read its name table: {e}") from None
+    raise Error(f"{path} has no copyright notice for Windows in US English")
+
+
 def _same(c: Component) -> Component:
     return c
 
@@ -327,7 +363,7 @@ def collect(
     # with a path in this repository. A package's texts are read only if
     # the app links it. Longest path first, so that the closest covers.
     covers: list[tuple[str, Callable[[], Component]]] = []
-    check_keys(overrides, {"vendored", "packages", "installed"}, "the file")
+    check_keys(overrides, {"vendored", "embedded", "packages", "installed"}, "the file")
     for v in overrides.get("vendored", []):
         check_keys(
             v, {"name", "path", "license", "url", "texts"}, f"vendored {v.get('name')}"
@@ -370,6 +406,34 @@ def collect(
                     raise Error(
                         f"{path} is vendored code that {OVERRIDES.name} does not list"
                     )
+
+    # Embedded files: the report lists modules and C sources, never a file
+    # that @embedFile compiles in, so these are listed by hand and are in
+    # every build. A listed file that is gone is an error, so that a
+    # renamed one cannot leave a stale entry.
+    for e in overrides.get("embedded", []):
+        what = f"embedded {e.get('name')}"
+        check_keys(e, {"name", "paths", "license", "url", "texts"}, what)
+        if not e["paths"]:
+            raise Error(f"{OVERRIDES.name}: {what} has no paths")
+        c = Component(e["name"], license=e.get("license"), url=e.get("url"))
+        notices = []
+        for p in e["paths"]:
+            file = repo / norm(p, e["name"])
+            if not file.is_file():
+                raise Error(f"{OVERRIDES.name}: {what}: {file} is missing")
+            if file.suffix.lower() in FONTS:
+                notices.append(font_copyright(file))
+        c.texts = [text_of(repo, t) for t in e["texts"]]
+        if not c.texts:
+            raise Error(f"{OVERRIDES.name}: {what} has no texts")
+        if notices:
+            # The copyright lines differ from font to font, so they come
+            # first and on their own, apart from a license text that
+            # render() may print once for many parts.
+            label = "Copyright notices in the fonts"
+            c.texts.insert(0, (label, "\n".join(sorted(set(notices)))))
+        add(c)
 
     by_name = {n: h for h, p in where.items() for n in p["names"]}
     for path, name in overrides.get("installed", {}).items():

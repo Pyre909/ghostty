@@ -30,6 +30,22 @@
       ]
     }
   ],
+  "embedded": [
+    {
+      "name": "Noto Emoji",
+      "paths": [
+        "src/font/res/NotoColorEmoji.ttf",
+        "src/font/res/NotoEmoji-Regular.ttf"
+      ],
+      "license": "OFL-1.1",
+      "url": "https://github.com/googlefonts/noto-emoji",
+      "texts": [
+        {
+          "file": "src/font/res/OFL.txt"
+        }
+      ]
+    }
+  ],
   "packages": {
     "bindings": {
       "note": "C bindings that Dear Bindings generated from Dear ImGui's headers, under Dear ImGui's license (imgui).",

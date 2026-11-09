@@ -11,6 +11,9 @@ installed, and one with no license file.
 
 from __future__ import annotations
 
+import json
+import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -63,6 +66,40 @@ def pe(machine: int) -> bytes:
     return bytes(head) + b"PE\0\0" + machine.to_bytes(2, "little") + bytes(18)
 
 
+def font(*records: tuple[int, int, int, int, str]) -> bytes:
+    """A TrueType font that holds an OS/2 table that is not a name table,
+    then a name table with these records: platform, encoding, language,
+    name ID, text."""
+    entries, strings = b"", b""
+    for platform, encoding, language, name_id, text in records:
+        data = text.encode("utf-16-be")
+        entries += struct.pack(
+            ">6H", platform, encoding, language, name_id, len(data), len(strings)
+        )
+        strings += data
+    name = struct.pack(">HHH", 0, len(records), 6 + len(entries)) + entries + strings
+    other = b"\xff" * 6
+    head = struct.pack(">IHHHH", 0x00010000, 2, 0, 0, 0)
+    at = len(head) + 2 * 16
+    return (
+        head
+        + struct.pack(">4sIII", b"OS/2", 0, at, len(other))
+        + struct.pack(">4sIII", b"name", 0, at + len(other), len(name))
+        + other
+        + name
+    )
+
+
+def copyright_font(text: str) -> bytes:
+    # The Mac record, the German one and the family name are not it.
+    return font(
+        (1, 0, 0, 0, "Mac copyright"),
+        (3, 1, 0x407, 0, "Urheberrecht"),
+        (3, 1, 0x409, 1, "Family"),
+        (3, 1, 0x409, 0, text),
+    )
+
+
 class Fixture(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -85,6 +122,10 @@ class Fixture(unittest.TestCase):
         )
         write(r / "pkg/simdutf/vendor/LICENSE-MIT", "simdutf MIT\n")
         write(r / "dist/windows/conpty-LICENSE.txt", "conpty MIT\n")
+        write(r / "src/font/res/Emoji.ttf", copyright_font("Copyright 2022 B"))
+        write(r / "src/font/res/Emoji-Text.ttf", copyright_font("Copyright 2013 A"))
+        write(r / "src/font/res/Emoji-Bold.ttf", copyright_font("Copyright 2013 A"))
+        write(r / "src/font/res/OFL.txt", "OFL text\n")
         fetched = {
             "N-V-zlib": (["zlib"], {"LICENSE": "zlib license\n"}),
             "N-V-breakpad": (["breakpad"], {}),
@@ -173,6 +214,18 @@ class Fixture(unittest.TestCase):
                     ],
                 },
             ],
+            "embedded": [
+                {
+                    "name": "Noto",
+                    "paths": [
+                        "src/font/res/Emoji.ttf",
+                        "src/font/res/Emoji-Text.ttf",
+                        "src/font/res/Emoji-Bold.ttf",
+                    ],
+                    "license": "OFL-1.1",
+                    "texts": [{"file": "src/font/res/OFL.txt"}],
+                }
+            ],
             "packages": {
                 "bindings": {"note": "Generated from imgui's headers.", "texts": []},
                 "conpty": {"texts": [{"file": "dist/windows/conpty-LICENSE.txt"}]},
@@ -205,7 +258,30 @@ class TestCollect(Fixture):
         # themes (not installed); glad once, though two packages link it.
         self.assertEqual(
             [c.name for c in self.collect()],
-            ["bindings", "conpty", "glad", "simdutf", "stb", "zf", "Zig", "zlib"],
+            [
+                "bindings",
+                "conpty",
+                "glad",
+                "Noto",
+                "simdutf",
+                "stb",
+                "zf",
+                "Zig",
+                "zlib",
+            ],
+        )
+
+    def test_embedded_files(self) -> None:
+        # Each font's own copyright line, once, ahead of the license.
+        self.assertEqual(
+            self.by_name()["Noto"].texts,
+            [
+                (
+                    "Copyright notices in the fonts",
+                    "Copyright 2013 A\nCopyright 2022 B",
+                ),
+                ("OFL.txt", "OFL text"),
+            ],
         )
 
     def test_installed_package(self) -> None:
@@ -340,6 +416,21 @@ class TestCollect(Fixture):
         def missing_file(o: dict[str, Any]) -> None:
             o["packages"]["conpty"]["texts"][0]["file"] = "dist/windows/gone.txt"
 
+        def unknown_embedded_key(o: dict[str, Any]) -> None:
+            o["embedded"][0]["note"] = "x"
+
+        def embedded_file_gone(o: dict[str, Any]) -> None:
+            o["embedded"][0]["paths"].append("src/font/res/Gone.ttf")
+
+        def embedded_outside(o: dict[str, Any]) -> None:
+            o["embedded"][0]["paths"].append("../Elsewhere.ttf")
+
+        def no_embedded_paths(o: dict[str, Any]) -> None:
+            o["embedded"][0]["paths"] = []
+
+        def no_embedded_texts(o: dict[str, Any]) -> None:
+            o["embedded"][0]["texts"] = []
+
         for change, error in [
             (unknown_key, r"package conpty has unknown keys \['text'\]"),
             (unknown_text_key, r"has unknown keys \['form'\]"),
@@ -348,6 +439,11 @@ class TestCollect(Fixture):
             (package_file_in_vendored, "is not in a package"),
             (both_files, "names neither or both"),
             (missing_file, "dist/windows/gone.txt is missing"),
+            (unknown_embedded_key, r"embedded Noto has unknown keys \['note'\]"),
+            (embedded_file_gone, "embedded Noto: .*Gone.ttf is missing"),
+            (embedded_outside, "outside the repository"),
+            (no_embedded_paths, "embedded Noto has no paths"),
+            (no_embedded_texts, "embedded Noto has no texts"),
         ]:
             with self.subTest(change=change.__name__):
                 self.setUp()
@@ -397,6 +493,23 @@ class TestText(unittest.TestCase):
         self.assertEqual(mz.excerpt(text, "START", "START", "f"), "START here")
         with self.assertRaisesRegex(mz.Error, "no line contains 'GONE'"):
             mz.excerpt(text, "GONE", "END", "f")
+
+    def test_font_copyright(self) -> None:
+        good = copyright_font("Copyright 2013 A")
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp, "f.ttf")
+            p.write_bytes(good)
+            self.assertEqual(mz.font_copyright(p), "Copyright 2013 A")
+            for data, error in [
+                (b"PK\3\4" + bytes(40), "is not a TrueType or OpenType font"),
+                (font((1, 0, 0, 0, "Mac only")), "has no copyright notice"),
+                (good[:-1], "runs past the end"),
+                (b"\0\1\0\0\0\1" + bytes(6), "cannot read its name table"),
+            ]:
+                with self.subTest(error=error):
+                    p.write_bytes(data)
+                    with self.assertRaisesRegex(mz.Error, error):
+                        mz.font_copyright(p)
 
     def test_license_file_names(self) -> None:
         for name in [
@@ -450,6 +563,24 @@ class TestText(unittest.TestCase):
             out,
         )
         self.assertTrue(out.endswith("other\n"))
+
+
+class TestRepository(unittest.TestCase):
+    """Checks of this repository's own files, not of make_zip."""
+
+    def test_embedded_fonts_are_listed(self) -> None:
+        # The package report cannot see @embedFile, so a font that
+        # embedded.zig starts shipping must be added to third-party.json.
+        src = (mz.REPO / "src/font/embedded.zig").read_text("utf-8")
+        shipped, marker, _ = src.partition("// Fonts below are ONLY used for testing.")
+        self.assertTrue(marker, "embedded.zig no longer marks its test fonts")
+        embeds = {
+            f"src/font/{p}" for p in re.findall(r'@embedFile\("(res/[^"]+)"\)', shipped)
+        }
+        self.assertTrue(embeds)
+        overrides = json.loads(mz.OVERRIDES.read_text("utf-8"))
+        listed = {p for e in overrides.get("embedded", []) for p in e["paths"]}
+        self.assertEqual(embeds - listed, set())
 
 
 class TestTree(unittest.TestCase):
