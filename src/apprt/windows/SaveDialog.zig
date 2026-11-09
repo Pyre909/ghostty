@@ -5,9 +5,12 @@
 //!
 //! IFileDialog::Show, as MessageBoxW does, disables its owner and runs its
 //! own message loop until the dialog ends, so it is run as
-//! `dialog.messageBox` runs MessageBoxW: inside `App.beginPrompt` and
-//! `App.endPrompt`, owned by `App.promptOwner`, and answered Cancel with
-//! no dialog once the windows close for good (`App.terminating`).
+//! `dialog.messageBox` runs MessageBoxW: as a prompt, owned by
+//! `App.promptOwner`, and answered Cancel with no dialog once the windows
+//! close for good (`App.terminating`). Unlike a message box, which is
+//! answered in a moment, it can stay open while the user looks for a
+//! folder; it is opened outside any core frame, so its loop goes on
+//! ticking the core (`App.beginUnframedPrompt`).
 //!
 //! The interfaces are vtable structs in the order of the mingw header Zig
 //! ships (lib/libc/include/any-windows-any/shobjidl.h), as taskbar.zig's
@@ -80,7 +83,7 @@ pub fn ask(app: *App, hwnd: ?HWND, spec: Spec) Answer {
         return .cancelled;
     }
     const owner = app.promptOwner(hwnd);
-    app.beginPrompt(owner);
+    app.beginUnframedPrompt(owner);
     defer app.endPrompt();
     if (builtin.is_test) if (test_ask) |answer| return answer(owner, spec);
     return show(app.core_app.alloc, owner, spec);

@@ -281,6 +281,12 @@ pub const App = struct {
     /// loop; see `canReenterCore`.
     prompt_depth: u32,
 
+    /// Whether the prompt open now was opened outside any core frame
+    /// (`beginUnframedPrompt`), so that its loop may tick the core while
+    /// it is the only one open (`promptMayTick`). Cleared as the outermost
+    /// prompt ends (`endPrompt`).
+    unframed_prompt: bool,
+
     /// Number of system modal loops (window size/move, window menu, a
     /// terminal's scroll bar) the main thread is currently inside. `run`
     /// does not get control back until such a loop ends, so while this is
@@ -975,6 +981,7 @@ pub const App = struct {
             .quit_timer = .off,
             .ticking = false,
             .prompt_depth = 0,
+            .unframed_prompt = false,
             .modal_loop_depth = 0,
             .teardown_depth = 0,
             .terminal_loops = 0,
@@ -1392,6 +1399,8 @@ pub const App = struct {
     /// user answers, because nothing drains the app mailbox meanwhile. Surface
     /// teardown is deferred rather than refused (`Surface.destroyPosted`), so
     /// it cannot wait on threads that are blocked on that undrained mailbox.
+    /// A prompt opened outside any core frame drains it all the same
+    /// (`beginUnframedPrompt`), though this stays false under it.
     pub fn canReenterCore(self: *const App) bool {
         return !self.ticking and self.prompt_depth == 0;
     }
@@ -1401,8 +1410,9 @@ pub const App = struct {
     /// window.
     ///
     /// No surface can be used while a prompt is open: ticks stop
-    /// (`canReenterCore`), so every window's output pauses, and input does
-    /// not reach the core. MessageBoxW disables only its owner, though, so
+    /// (`canReenterCore`), so every window's output pauses, but under an
+    /// unframed prompt (`beginUnframedPrompt`), and input does not reach
+    /// the core. MessageBoxW disables only its owner, though, so
     /// the outermost prompt disables every other window as well, and
     /// `endPrompt` enables them again; a disabled window takes no input for
     /// its terminals either. A window that was already disabled is left as
@@ -1458,6 +1468,31 @@ pub const App = struct {
         if (!win32.IsWindowVisible(quick.hwnd).toBool()) return;
         if (owner) |hwnd| if (win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) == quick.hwnd) return;
         quick.prompt_lowered = quick.setTopmost(false);
+    }
+
+    /// Enter a prompt as `beginPrompt` does, for one opened outside any
+    /// core frame, as `run` opens the Save dialog (`SaveDialog.ask`): its
+    /// loop ticks the core on a wakeup while it is the only prompt open
+    /// (`promptMayTick`), as a system modal loop's does, so output goes on
+    /// and no terminal's IO thread blocks on a full app mailbox, however
+    /// long the user takes. GTK's and macOS's save panels do not stop the
+    /// app either. Input reaches no terminal and teardown is deferred, as
+    /// under any prompt (`canReenterCore` is false). Opened inside a core
+    /// frame or another prompt, it is an ordinary one. Left with
+    /// `endPrompt`.
+    pub fn beginUnframedPrompt(self: *App, owner: ?win32.HWND) void {
+        const unframed = self.canReenterCore();
+        self.beginPrompt(owner);
+        if (unframed) self.unframed_prompt = true;
+    }
+
+    /// Whether a wakeup may tick the core while a prompt is open: the only
+    /// one open is unframed (`beginUnframedPrompt`), so no core frame is
+    /// beneath the tick. A prompt inside it, as one a tick opens, may have
+    /// one beneath it, so none ticks then. A tick on the stack refuses
+    /// another anyway (`tick`).
+    fn promptMayTick(self: *const App) bool {
+        return self.unframed_prompt and self.prompt_depth == 1;
     }
 
     /// The window a prompt with no window of its own belongs to
@@ -1539,6 +1574,7 @@ pub const App = struct {
     pub fn endPrompt(self: *App) void {
         self.prompt_depth -= 1;
         if (self.prompt_depth > 0) return;
+        self.unframed_prompt = false;
         if (self.quick) |quick| if (quick.prompt_lowered) {
             quick.prompt_lowered = false;
             _ = quick.setTopmost(true);
@@ -4141,8 +4177,14 @@ pub const App = struct {
             // Those loops are entered from DefWindowProcW, never from inside
             // a core frame, so ticking here is safe; canReenterCore still
             // guards against the one exception, a prompt beneath the loop.
+            // So is an unframed prompt's loop, which has none beneath it
+            // either (`beginUnframedPrompt`).
             WM_GHOSTTY_WAKEUP => {
-                if (self.modal_loop_depth > 0) self.tickFromHandler();
+                if (self.modal_loop_depth > 0) {
+                    self.tickFromHandler();
+                } else if (self.promptMayTick()) {
+                    self.tick() catch |err| log.warn("core tick failed err={}", .{err});
+                }
                 return 0;
             },
 
@@ -5008,6 +5050,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.terminating = false;
     app.ticking = false;
     app.prompt_depth = 0;
+    app.unframed_prompt = false;
     app.teardown_depth = 0;
     app.terminal_loops = 0;
     app.surfaces = .empty;
@@ -18445,6 +18488,16 @@ const TestExport = struct {
     var notices: usize = 0;
     var told_by: ?win32.HWND = null;
 
+    /// With `probe`, the dialog dispatches a wakeup (`wakeups`), then
+    /// another under a prompt of its own, then one more after it, and
+    /// counts the ticks each starts. Ticks are counted only where a test
+    /// sets `App.test_tick` to `tick`.
+    var probe = false;
+    var ticks: usize = 0;
+    var ticked: usize = 0;
+    var nested_ticked: usize = 0;
+    var ticked_after: usize = 0;
+
     fn ask(owner: ?win32.HWND, spec: SaveDialog.Spec) SaveDialog.Answer {
         asks += 1;
         asked_by = owner;
@@ -18452,6 +18505,13 @@ const TestExport = struct {
         inspector_enabled = win32.IsWindowEnabled(inspector).toBool();
         frame_enabled = win32.IsWindowEnabled(frame).toBool();
         could_reenter = app.canReenterCore();
+        if (probe) {
+            ticked = wakeups();
+            app.beginPrompt(null);
+            nested_ticked = wakeups();
+            app.endPrompt();
+            ticked_after = wakeups();
+        }
         const path = answer orelse return .cancelled;
         const wide = std.unicode.wtf8ToWtf16LeAllocZ(app.core_app.alloc, path) catch return .failed;
         return .{ .path = wide };
@@ -18463,6 +18523,22 @@ const TestExport = struct {
         notices += 1;
         told_by = owner;
         return win32.IDOK;
+    }
+
+    fn tick(_: *App) void {
+        ticks += 1;
+    }
+
+    /// The ticks a wakeup posted now starts, dispatched as the dialog's
+    /// loop would dispatch it.
+    fn wakeups() usize {
+        const before = ticks;
+        app.wakeup();
+        var posted: win32.MSG = undefined;
+        while (win32.PeekMessageW(&posted, app.msg_hwnd, WM_GHOSTTY_WAKEUP, WM_GHOSTTY_WAKEUP, win32.PM_REMOVE).toBool()) {
+            _ = App.wndProc(app.msg_hwnd, posted.message, posted.wParam, posted.lParam);
+        }
+        return ticks - before;
     }
 
     /// Open the inspector of `a`, marked live, in `to`. `stop` undoes it,
@@ -18480,6 +18556,11 @@ const TestExport = struct {
         could_reenter = true;
         notices = 0;
         told_by = null;
+        probe = false;
+        ticks = 0;
+        ticked = 0;
+        nested_ticked = 0;
+        ticked_after = 0;
         Inspector.test_core = &core;
         a.core_state = .live;
         SaveDialog.test_ask = &ask;
@@ -18657,10 +18738,10 @@ test "win32: an export that cannot be saved is told, and leaves a file already t
 }
 
 test "win32: an export's dialog is a prompt its inspector owns" {
-    // Terminals pause, and the frames take no input, while it is open, as
-    // with any prompt (`beginPrompt`); the inspector that owns it is left
-    // to the dialog, which disables its owner and gives the activation
-    // back to it as it closes.
+    // The frames take no input while it is open, as with any prompt
+    // (`beginPrompt`); the inspector that owns it is left to the dialog,
+    // which disables its owner and gives the activation back to it as it
+    // closes.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -18688,6 +18769,60 @@ test "win32: an export's dialog is a prompt its inspector owns" {
     try std.testing.expect(win32.IsWindowEnabled(window.hwnd).toBool());
     try std.testing.expect(win32.IsWindowEnabled(TestExport.inspector).toBool());
     try std.testing.expect(app.canReenterCore());
+}
+
+test "win32: an export's dialog goes on ticking the core, and no prompt inside it does" {
+    // The dialog can stay open while the user looks for a folder, and a
+    // terminal whose output filled the app mailbox meanwhile would stop
+    // until it closed, where GTK's and the macOS app's save panels stop
+    // none. `run` opens it outside any core frame, so a wakeup in its
+    // loop ticks the core (`beginUnframedPrompt`). A prompt that may have
+    // a core frame beneath it does not: one opened inside the dialog, as
+    // a tick's clipboard question would be, nor any other.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    App.test_tick = &TestExport.tick;
+    defer App.test_tick = null;
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+    TestExport.probe = true;
+
+    // Outside a modal loop the handler does not tick: `run` does, after
+    // every message. Nor under an ordinary prompt.
+    try std.testing.expectEqual(0, TestExport.wakeups());
+    app.beginPrompt(null);
+    try std.testing.expectEqual(0, TestExport.wakeups());
+    app.endPrompt();
+    // Nor the wakeup its end posts, taken here so that the dialog's count
+    // is of its own.
+    try std.testing.expectEqual(0, TestExport.wakeups());
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(1, TestExport.ticked);
+    try std.testing.expectEqual(0, TestExport.nested_ticked);
+    try std.testing.expectEqual(1, TestExport.ticked_after);
+    // Input still reaches no terminal while it is open.
+    try std.testing.expect(!TestExport.could_reenter);
+
+    // The next prompt is an ordinary one again.
+    app.beginPrompt(null);
+    try std.testing.expectEqual(0, TestExport.wakeups());
+    app.endPrompt();
 }
 
 test "win32: an export whose terminal closes first is dropped, and freed" {
