@@ -1474,12 +1474,14 @@ pub const App = struct {
     /// core frame, as `run` opens the Save dialog (`SaveDialog.ask`): its
     /// loop ticks the core on a wakeup while it is the only prompt open
     /// (`promptMayTick`), as a system modal loop's does, so output goes on
-    /// and no terminal's IO thread blocks on a full app mailbox, however
-    /// long the user takes. GTK's and macOS's save panels do not stop the
-    /// app either. Input reaches no terminal and teardown is deferred, as
-    /// under any prompt (`canReenterCore` is false). Opened inside a core
-    /// frame or another prompt, it is an ordinary one. Left with
-    /// `endPrompt`.
+    /// and no terminal's IO thread blocks on a full app mailbox while the
+    /// user looks for a folder. GTK's and macOS's save panels do not stop
+    /// the app either. Input reaches no terminal and teardown is deferred,
+    /// as under any prompt (`canReenterCore` is false). A prompt a tick
+    /// opens shows beside it, as one would beside theirs, with Cancel for
+    /// Enter (`dialog.confirm`); output pauses until it is answered.
+    /// Opened inside a core frame or another prompt, it is an ordinary
+    /// one. Left with `endPrompt`.
     pub fn beginUnframedPrompt(self: *App, owner: ?win32.HWND) void {
         const unframed = self.canReenterCore();
         self.beginPrompt(owner);
@@ -22707,10 +22709,12 @@ const PromptSeen = struct {
     var len: usize = 0;
     var count: usize = 0;
     var answer: c_int = win32.IDCANCEL;
+    /// The button Enter pressed: MB_DEFBUTTON1 or MB_DEFBUTTON2.
+    var default: win32.UINT = 0;
 
     fn seen(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
         _ = owner;
-        _ = buttons;
+        default = buttons & win32.MB_DEFMASK;
         const said = std.mem.span(prompt);
         len = @min(said.len, text.len);
         @memcpy(text[0..len], said[0..len]);
@@ -22801,6 +22805,47 @@ test "win32: a read-only terminal whose command has exited asks to close as read
     b.close(true);
     try PromptSeen.expectSaid(read_only);
     try std.testing.expect(!b.closing);
+}
+
+test "win32: a terminal's close asked inside another prompt has Cancel for Enter" {
+    // A tick under the Save dialog's loop can ask (`beginUnframedPrompt`):
+    // a read-only terminal whose command exits asks to close, with OK for
+    // Enter. The user is typing into the dialog then, and the box can take
+    // the activation from it, so the Enter meant for Save must not close
+    // the terminal (`dialog.confirm`). Alone, the box keeps OK.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &PromptSeen.seen;
+    defer message_box.* = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+    const read_only = "This terminal is read-only. Close it anyway?";
+    PromptSeen.answer = win32.IDCANCEL;
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    try std.testing.expect(try testChildExited(&app, a, 0));
+
+    a.close(true);
+    try PromptSeen.expectSaid(read_only);
+    try std.testing.expectEqual(win32.MB_DEFBUTTON1, PromptSeen.default);
+
+    app.beginUnframedPrompt(null);
+    a.close(true);
+    app.endPrompt();
+    try PromptSeen.expectSaid(read_only);
+    try std.testing.expectEqual(win32.MB_DEFBUTTON2, PromptSeen.default);
+    try std.testing.expect(!a.closing);
 }
 
 /// For tests: the core's answers to a terminal's buttons

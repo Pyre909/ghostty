@@ -12,7 +12,8 @@ const log = std.log.scoped(.win32);
 /// Prompts that grant access default to Cancel, as GTK's clipboard
 /// confirmation dialog does (`default-response: "cancel"`): a program can
 /// raise one at any moment, so a key the user was already typing must not
-/// answer it.
+/// answer it. So does any confirmation opened while another prompt is
+/// open (`confirm`), whatever it asks.
 pub const ConfirmDefault = enum {
     ok,
     cancel,
@@ -35,7 +36,13 @@ pub fn confirm(
     text: win32.LPCWSTR,
     default: ConfirmDefault,
 ) bool {
-    return messageBox(app, hwnd, text, win32.MB_OKCANCEL | default.style()) == win32.IDOK;
+    // Inside another prompt, as a tick under the Save dialog asks one
+    // (`App.beginUnframedPrompt`) for a program: a read-only terminal
+    // whose command exits asks to close. The user is typing into the
+    // dialog then, and this box can take the activation from it, so the
+    // Enter meant for Save must not answer it OK.
+    const pressed: ConfirmDefault = if (app.prompt_depth > 0) .cancel else default;
+    return messageBox(app, hwnd, text, win32.MB_OKCANCEL | pressed.style()) == win32.IDOK;
 }
 
 /// The Retry/Cancel form of `confirm`: true for Retry, the default button.
