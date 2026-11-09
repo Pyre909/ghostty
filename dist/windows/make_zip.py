@@ -16,7 +16,8 @@ writes, in zig-out/dist (or --out):
 and prints their SHA-256 sums the way sha256sum does. It builds with the
 zig on PATH (or --zig), ReleaseFast with the debug information kept for the
 .pdb files, from a checkout whose tracked files have no uncommitted changes
-(unless --allow-dirty).
+and whose src/shell-integration, which the install copies whole, holds
+only tracked files (unless --allow-dirty).
 
 The zips are reproducible: their entries are sorted, they hold no directory
 entries and no owners, and every entry has one time, SOURCE_DATE_EPOCH or
@@ -707,6 +708,21 @@ def make(args: argparse.Namespace) -> None:
         dirty = git("status", "--porcelain", "--untracked-files=no")
         if dirty:
             raise Error(f"tracked files have changes (or pass --allow-dirty):\n{dirty}")
+        # Scoped to that path: a repository-wide --ignored would always
+        # list the build's own zig-out and .zig-cache.
+        stray = git(
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+            "--",
+            "src/shell-integration",
+        )
+        if stray:
+            raise Error(
+                "the install copies src/shell-integration whole, and it holds "
+                f"files git does not track (or pass --allow-dirty):\n{stray}"
+            )
     zig = shutil.which(args.zig)
     if zig is None:
         raise Error(f"{args.zig} is not on PATH")

@@ -12,6 +12,7 @@ installed, and one with no license file.
 from __future__ import annotations
 
 import json
+import os
 import re
 import struct
 import subprocess
@@ -869,6 +870,70 @@ class TestZip(unittest.TestCase):
         os.environ["SOURCE_DATE_EPOCH"] = "soon"
         with self.assertRaisesRegex(mz.Error, "not a number"):
             mz.zip_time()
+
+
+class TestCheckout(unittest.TestCase):
+    """make()'s checks on the checkout, against a real git repository.
+    A zig that is not on PATH stops make() just after them."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        self.enterContext(mock.patch.object(mz, "REPO", self.repo))
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+            )
+        )
+        write(self.repo / ".gitignore", "zig-out/\n.DS_Store\n")
+        write(self.repo / "src/shell-integration/bash/ghostty.bash", "bash\n")
+        for cmd in [
+            ["init", "-q"],
+            ["add", "."],
+            [
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-qm",
+                "t",
+            ],
+        ]:
+            subprocess.run(["git", *cmd], cwd=self.repo, check=True)
+        # The build's own output: ignored, outside src/shell-integration.
+        write(self.repo / "zig-out/bin/ghostty.exe", "exe")
+
+    def make(self, *extra: str) -> str:
+        import contextlib
+        import io
+
+        err = io.StringIO()
+        argv = ["--arch", "x86_64", "--version", "1.4.1", "--zig", "no-such-zig"]
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(mz.main([*argv, *extra]), 1)
+        return err.getvalue()
+
+    def test_clean(self) -> None:
+        self.assertEqual(self.make(), "make_zip: no-such-zig is not on PATH\n")
+
+    def test_files_git_does_not_track(self) -> None:
+        # Untracked, in a directory git does not track, and ignored.
+        for path in ["bash/scratch.sh", "nu/new/x.nu", ".DS_Store"]:
+            with self.subTest(path):
+                stray = self.repo / "src/shell-integration" / path
+                write(stray, "stray")
+                try:
+                    self.assertIn(f"src/shell-integration/{path}", self.make())
+                    self.assertIn("not on PATH", self.make("--allow-dirty"))
+                finally:
+                    stray.unlink()
+
+    def test_tracked_change(self) -> None:
+        write(self.repo / "src/shell-integration/bash/ghostty.bash", "changed\n")
+        self.assertRegex(self.make(), "tracked files have changes")
 
 
 class TestRun(unittest.TestCase):
