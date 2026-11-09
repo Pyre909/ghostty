@@ -6,8 +6,9 @@
 //! IFileDialog::Show, as MessageBoxW does, disables its owner and runs its
 //! own message loop until the dialog ends, so it is run as
 //! `dialog.messageBox` runs MessageBoxW: as a prompt, owned by
-//! `App.promptOwner`, and answered Cancel with no dialog once the windows
-//! close for good (`App.terminating`). Unlike a message box, which is
+//! `App.promptOwner`, and answered Cancel with no dialog once the app
+//! quits (`App.quit`) or its windows close for good (`App.terminating`).
+//! Unlike a message box, which is
 //! answered in a moment, it can stay open while the user looks for a
 //! folder; it is opened outside any core frame, so its loop goes on
 //! ticking the core (`App.beginUnframedPrompt`).
@@ -78,8 +79,8 @@ pub var test_ask: if (builtin.is_test) ?*const fn (?HWND, Spec) Answer else void
 
 /// Ask where to save a text file, from `hwnd`'s window.
 pub fn ask(app: *App, hwnd: ?HWND, spec: Spec) Answer {
-    if (app.terminating) {
-        log.warn("a Save dialog while the windows close is answered Cancel", .{});
+    if (app.quit or app.terminating) {
+        log.warn("a Save dialog once the app quits is answered Cancel", .{});
         return .cancelled;
     }
     const owner = app.promptOwner(hwnd);

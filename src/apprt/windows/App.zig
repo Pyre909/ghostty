@@ -3643,10 +3643,15 @@ pub const App = struct {
 
         // By index, reading the length again each time round: the notice for
         // a failure runs a message loop, and a request added meanwhile is
-        // still created here.
-        defer self.requests.clearRetainingCapacity();
+        // still created here. Not once that loop's app quits, as it does
+        // when the session ends (`endSession`): those left are freed, as
+        // `terminate` would free them, and none carried out.
         var i: usize = 0;
-        while (i < self.requests.items.len) : (i += 1) {
+        defer {
+            for (self.requests.items[i..]) |*request| self.freeRequest(request);
+            self.requests.clearRetainingCapacity();
+        }
+        while (i < self.requests.items.len and !self.quit) : (i += 1) {
             switch (self.requests.items[i]) {
                 // Brought to the front, as every new_window brings Ghostty
                 // forward on macOS: a global keybind's (`hotkeyPressed`) is
@@ -18594,6 +18599,10 @@ const TestExport = struct {
     var notices: usize = 0;
     var told_by: ?win32.HWND = null;
 
+    /// With `quits`, the app quits while the dialog is open, as the
+    /// session's end makes it quit (`endSession`).
+    var quits = false;
+
     /// With `probe`, the dialog dispatches a wakeup (`wakeups`), then
     /// another under a prompt of its own, then one more after it, and
     /// counts the ticks each starts. Ticks are counted only where a test
@@ -18611,6 +18620,7 @@ const TestExport = struct {
         inspector_enabled = win32.IsWindowEnabled(inspector).toBool();
         frame_enabled = win32.IsWindowEnabled(frame).toBool();
         could_reenter = app.canReenterCore();
+        if (quits) app.quit = true;
         if (probe) {
             ticked = wakeups();
             app.beginPrompt(null);
@@ -18662,6 +18672,7 @@ const TestExport = struct {
         could_reenter = true;
         notices = 0;
         told_by = null;
+        quits = false;
         probe = false;
         ticks = 0;
         ticked = 0;
@@ -19070,6 +19081,76 @@ test "win32: an export whose terminal closes first is dropped, and freed" {
     app.quit = false;
     try std.testing.expectEqual(0, TestExport.asks);
     try std.testing.expect(app.requests.items[0] == .export_io);
+}
+
+test "win32: an export's dialog that sees the app quit is the last request carried out" {
+    // The dialog can stay open while the session ends, which only marks
+    // the app to quit (`endSession`): it cannot be torn down under a
+    // prompt. Nothing queued behind the dialog is carried out then, not a
+    // move nor another export's dialog, and what is left is freed. The
+    // test's allocator finds any left.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // a | b, with the focus on a, where a move right would take it to b.
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    b.core_state = .live;
+    defer b.core_state = .none;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+    TestExport.quits = true;
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    try app.requests.append(alloc, .{ .goto = .{ .from = &a.core_surface, .to = .right } });
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.createRequested();
+    app.quit = false;
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: a Save dialog asked once the app quits is answered Cancel, unshown" {
+    // As once the windows close for good (`terminating`): the app is on
+    // its way out, and nothing it asked would be done.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    const Never = struct {
+        var asks: usize = 0;
+        fn ask(_: ?win32.HWND, _: SaveDialog.Spec) SaveDialog.Answer {
+            asks += 1;
+            return .cancelled;
+        }
+    };
+    SaveDialog.test_ask = &Never.ask;
+    defer SaveDialog.test_ask = null;
+    const spec: SaveDialog.Spec = .{ .title = L("Title"), .name = L("name.txt"), .ok = L("Save") };
+
+    app.quit = true;
+    const quitting = SaveDialog.ask(&app, null, spec);
+    app.quit = false;
+    try std.testing.expect(quitting == .cancelled);
+    app.terminating = true;
+    const terminating = SaveDialog.ask(&app, null, spec);
+    app.terminating = false;
+    try std.testing.expect(terminating == .cancelled);
+    try std.testing.expectEqual(0, Never.asks);
+    try std.testing.expectEqual(0, app.prompt_depth);
 }
 
 test "win32: the command palette has a jump to each terminal that is not closing" {
