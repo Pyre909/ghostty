@@ -695,10 +695,15 @@ const TestDump = struct {
 
 fn testDumps(dir: std.Io.Dir, alloc: Allocator) ![][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
-    errdefer names.deinit(alloc);
+    errdefer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
     var it = dir.iterate();
     while (try it.next(testing.io)) |entry| {
-        if (isOurs(entry.name)) try names.append(alloc, try alloc.dupe(u8, entry.name));
+        if (!isOurs(entry.name)) continue;
+        try names.ensureUnusedCapacity(alloc, 1);
+        names.appendAssumeCapacity(try alloc.dupe(u8, entry.name));
     }
     return names.toOwnedSlice(alloc);
 }
