@@ -402,6 +402,10 @@ pub fn install(
 
     const dir = try crash.defaultDir(io, alloc, environ_map);
     defer alloc.free(dir.path);
+    // The directory comes from the environment as it is set. A relative
+    // one (the XDG specification calls it invalid) would be another
+    // directory whenever the working directory changed, so no dumps then.
+    if (!std.fs.path.isAbsolute(dir.path)) return error.CrashDirNotAbsolute;
     try std.Io.Dir.cwd().createDirPath(io, dir.path);
     prune(io, alloc, dir.path) catch |err| {
         log.warn("could not delete old crash dumps err={}", .{err});
@@ -682,6 +686,21 @@ test "win32: only a process's first crash is dumped" {
         alloc.free(names);
     }
     try testing.expectEqual(1, names.len);
+}
+
+test "win32: a relative crash directory installs nothing" {
+    const alloc = testing.allocator;
+    // A relative path, then a drive-relative one.
+    for ([_][]const u8{ "state", "C:state" }) |home| {
+        var environ_map: std.process.Environ.Map = .init(alloc);
+        defer environ_map.deinit();
+        try environ_map.put("XDG_STATE_HOME", home);
+        try testing.expectError(
+            error.CrashDirNotAbsolute,
+            install(testing.io, alloc, &environ_map),
+        );
+        try testing.expect(!installed.load(.acquire));
+    }
 }
 
 test "win32: the exceptions Zig's segfault handler ends the process for" {
