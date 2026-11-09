@@ -48,10 +48,12 @@ unless it is vendored, and a path with a "vendor" component must be
 vendored, so that new vendored code cannot slip in unnoticed.
 
 Two parts of the toolchain are always linked: Zig's standard library and
-compiler_rt (Zig's LICENSE) and mingw-w64's C runtime startup code (its
-COPYING). The LLVM runtime libraries Zig compiles in (libc++, libc++abi,
-libunwind) need no notice: the LLVM exception to their Apache-2.0 license
-waives its notice conditions for portions embedded in a compiled program.
+compiler_rt (Zig's LICENSE) and mingw-w64's C runtime (its COPYING),
+including its printf and number conversion, whose gdtoa files carry their
+own notices, read from Zig's copy of them. The LLVM runtime libraries Zig
+compiles in (libc++, libc++abi, libunwind) need no notice: the LLVM
+exception to their Apache-2.0 license waives its notice conditions for
+portions embedded in a compiled program.
 https://llvm.org/LICENSE.txt
 """
 
@@ -624,11 +626,51 @@ def zig_lib_dir(zig: str) -> Path:
     return Path(re.sub(r"\\(.)", unescape, m.group(1)))
 
 
+def gdtoa(mingw: Path) -> Component:
+    """gdtoa, David M. Gay's number conversion, which mingw-w64's printf
+    and strtold link in. Each file carries its own copyright line above a
+    permission notice and disclaimer that must appear in the
+    documentation; COPYING sets such parts aside. A notice is printed
+    once with every copyright line above it, and a file whose notice
+    cannot be read is an error, so that a new Zig cannot drop one."""
+    # A notice, wrapped as one line, to its text, files and copyrights.
+    groups: dict[str, tuple[str, list[str], dict[str, None]]] = {}
+    for f in sorted((mingw / "gdtoa").glob("*.[ch]")):
+        text = read_text(f)
+        lines = [ln.strip() for ln in text.split("\n")]
+        copyrights = [ln for ln in lines if ln.startswith("Copyright (C)")]
+        if not copyrights:
+            # Generated headers carry no notice; any other file must.
+            if "copyright" in text.lower():
+                raise Error(f"{f}: no line starts with 'Copyright (C)'")
+            continue
+        notice = excerpt(text, "Permission to use", "SOFTWARE.", f.name)
+        group = groups.setdefault(" ".join(notice.split()), (notice, [], {}))
+        group[1].append(f.name)
+        group[2].update(dict.fromkeys(copyrights))
+    if not groups:
+        raise Error(f"{mingw / 'gdtoa'} holds no gdtoa sources")
+    texts = []
+    # The notice most files share first, as plain "gdtoa".
+    ordered = sorted(groups.values(), key=lambda g: (-len(g[1]), g[1]))
+    for i, (notice, files, holders) in enumerate(ordered):
+        label = "gdtoa" if i == 0 else f"gdtoa {', '.join(files)}"
+        lines = sorted(holders) + ["All Rights Reserved", "", notice]
+        texts.append((label, "\n".join(lines)))
+    return Component(
+        "gdtoa",
+        note="Part of mingw-w64's C runtime, by David M. Gay.",
+        texts=texts,
+    )
+
+
 def toolchain(zig: str, license_path: Path) -> list[Component]:
-    mingw = zig_lib_dir(zig) / "libc" / "mingw" / "COPYING"
+    lib = zig_lib_dir(zig) / "libc" / "mingw"
+    mingw = lib / "COPYING"
     if not mingw.is_file():
         raise Error(f"{mingw} is missing")
     return [
+        gdtoa(lib),
         Component(
             "Zig standard library and compiler_rt",
             license="MIT",

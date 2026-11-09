@@ -20,6 +20,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 # Import make_zip from beside this file, without leaving a __pycache__.
 sys.dont_write_bytecode = True
@@ -599,6 +600,113 @@ class TestText(unittest.TestCase):
             out,
         )
         self.assertTrue(out.endswith("other\n"))
+
+
+LUCENT = """\
+Permission to use, copy, modify, and distribute this software and
+its documentation, provided that this notice and warranty disclaimer
+appear in supporting documentation.
+
+LUCENT DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE."""
+
+
+class TestToolchain(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.lib = Path(tmp.name, "lib")
+        self.mingw = self.lib / "libc/mingw"
+        g = self.mingw / "gdtoa"
+        write(self.mingw / "COPYING", "ZPL\n")
+        write(
+            g / "gdtoa.c",
+            "/***\nThe author of this software is David M. Gay.\n\n"
+            "Copyright (C) 1998, 1999 by Lucent Technologies\nAll Rights Reserved\n\n"
+            f"{LUCENT}\n\n***/\nint gdtoa;\n",
+        )
+        # The same notice wrapped another way, under another copyright.
+        write(
+            g / "strtodnrp.c",
+            "/***\n  Copyright (C) 2004 by David M. Gay.\nBased on Lucent's.\n\n"
+            f"{' '.join(LUCENT.split(chr(10) + chr(10))[0].split())}\n\n"
+            f"{LUCENT.split(chr(10) + chr(10))[1]}\n***/\n",
+        )
+        write(
+            g / "qnan.c",
+            "/*\nCopyright (C) 2005 by David M. Gay\n"
+            "Permission to use this. THE AUTHOR DISCLAIMS\nTHIS SOFTWARE.\n*/\n",
+        )
+        # Enough copyright lines that a set's order is not sorted by luck.
+        for name, years in [
+            ("dmisc.c", "1998"),
+            ("hd_init.c", "2000"),
+            ("strtodg.c", "1998-2001"),
+            ("ulp.c", "1997, 1998"),
+        ]:
+            write(
+                g / name,
+                f"/***\nCopyright (C) {years} by Lucent Technologies\n\n{LUCENT}\n***/\n",
+            )
+        write(g / "gd_arith.h", "#define IEEE_8087\n")
+        write(self.lib / "LICENSE", "Copyright (c) Zig contributors\n")
+
+    def test_gdtoa(self) -> None:
+        c = mz.gdtoa(self.mingw)
+        self.assertEqual(
+            c.texts,
+            [
+                (
+                    "gdtoa",
+                    (
+                        "Copyright (C) 1997, 1998 by Lucent Technologies\n"
+                        "Copyright (C) 1998 by Lucent Technologies\n"
+                        "Copyright (C) 1998, 1999 by Lucent Technologies\n"
+                        "Copyright (C) 1998-2001 by Lucent Technologies\n"
+                        "Copyright (C) 2000 by Lucent Technologies\n"
+                        "Copyright (C) 2004 by David M. Gay.\n"
+                        f"All Rights Reserved\n\n{LUCENT}"
+                    ),
+                ),
+                (
+                    "gdtoa qnan.c",
+                    (
+                        "Copyright (C) 2005 by David M. Gay\nAll Rights Reserved\n\n"
+                        "Permission to use this. THE AUTHOR DISCLAIMS\nTHIS SOFTWARE."
+                    ),
+                ),
+            ],
+        )
+
+    def test_gdtoa_fails_closed(self) -> None:
+        for text, error in [
+            ("/*\nCopyright (C) 1998 Lucent\n*/\n", "misc.c: no line contains 'Perm"),
+            ("/* Copyright (C) 1998 Lucent */\n", "misc.c: no line starts with 'Copy"),
+        ]:
+            with self.subTest(error=error):
+                write(self.mingw / "gdtoa/misc.c", text)
+                with self.assertRaisesRegex(mz.Error, error):
+                    mz.gdtoa(self.mingw)
+        for f in (self.mingw / "gdtoa").iterdir():
+            f.unlink()
+        with self.assertRaisesRegex(mz.Error, "holds no gdtoa sources"):
+            mz.gdtoa(self.mingw)
+
+    def test_toolchain(self) -> None:
+        with (
+            mock.patch.object(mz, "zig_lib_dir", return_value=self.lib),
+            mock.patch.object(mz, "run", return_value="0.17.0\n"),
+        ):
+            parts = mz.toolchain("zig", self.lib / "LICENSE")
+        self.assertEqual(
+            [(c.name, c.texts[0][0]) for c in parts],
+            [
+                ("gdtoa", "gdtoa"),
+                ("Zig standard library and compiler_rt", "LICENSE"),
+                ("mingw-w64 C runtime", "COPYING"),
+            ],
+        )
 
 
 class TestRepository(unittest.TestCase):
