@@ -24,6 +24,11 @@ entries and no owners, and every entry has one time, SOURCE_DATE_EPOCH or
 else the time of the HEAD commit. Two runs on the same build with the same
 Python (its zlib compresses) give the same bytes.
 
+The .pdb files hold the absolute paths the build used, among them the
+checkout's, and so a home directory and its user name. The app zip holds
+none. Publish a -pdb zip built in CI, or from a checkout at a neutral path
+such as /build/ghostty.
+
 THIRD-PARTY-NOTICES.txt follows what the build links, not a list kept by
 hand. `zig build windows-packages` (src/build/WindowsPackages.zig) reports
 every package with the paths the app links from it, and
