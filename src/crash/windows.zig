@@ -144,7 +144,8 @@ pub const Dumper = struct {
     write: MiniDumpWriteDumpFn,
     dump_type: u32,
 
-    /// The crash directory and a separator, UTF-16, then room for a name.
+    /// The crash directory, `\\?\`-prefixed, and a separator, UTF-16,
+    /// then room for a name.
     path: [windows.PATH_MAX_WIDE + 1]u16 = undefined,
     dir_len: usize = 0,
 
@@ -183,8 +184,9 @@ pub const Dumper = struct {
         failed: windows.Win32Error,
     };
 
-    /// `dir` is the crash directory, which must exist. The dumper is not
-    /// movable once started: its thread holds a pointer to it.
+    /// `dir` is the crash directory, which must exist and be absolute.
+    /// The dumper is not movable once started: its thread holds a pointer
+    /// to it.
     pub fn start(self: *Dumper, dir: []const u8, dump_type: u32) !void {
         const write = try loadMiniDumpWriteDump();
         const request = kernel32.CreateEventW(null, .FALSE, .FALSE, null) orelse
@@ -201,11 +203,21 @@ pub const Dumper = struct {
             .done = done,
             .thread = undefined,
         };
-        // std's paths are WTF-8 on Windows.
-        if (try std.unicode.calcWtf16LeLen(dir) + 1 + max_name_len + 1 > self.path.len) return error.NameTooLong;
-        const n = try std.unicode.wtf8ToWtf16Le(&self.path, dir);
-        self.path[n] = '\\';
-        self.dir_len = n + 1;
+        // CreateFileW takes a path longer than MAX_PATH only with the
+        // `\\?\` prefix. The conversion std's own file functions use
+        // (so that this accepts the directories they do) makes the NT form
+        // of it, `\??\`: the same path but for its second character.
+        const nt = try std.Io.Threaded.sliceToPrefixedFileW(null, dir, .{ .allow_relative = false });
+        var n = nt.len;
+        if (!std.mem.startsWith(u16, nt.span(), &.{ '\\', '?', '?', '\\' })) return error.BadPathName;
+        if (n + 1 + max_name_len + 1 > self.path.len) return error.NameTooLong;
+        @memcpy(self.path[0..n], nt.span());
+        self.path[1] = '\\';
+        if (self.path[n - 1] != '\\') {
+            self.path[n] = '\\';
+            n += 1;
+        }
+        self.dir_len = n;
 
         // MiniDumpWriteDump's own stack use is modest; a megabyte leaves
         // room for the system's stack walking.
@@ -650,6 +662,41 @@ test "win32: a panic's crash dump holds its code, thread and message" {
     const comment = dump.stream(CommentStreamA) orelse return error.NoComment;
     try testing.expect(std.mem.indexOf(u8, comment, "thread=io panic: the message") != null);
     try testing.expect(std.mem.indexOf(u8, comment, build_config.version_string) != null);
+}
+
+test "win32: a crash directory longer than MAX_PATH takes a dump" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(base);
+
+    // Five 50-letter directories: past MAX_PATH wherever the tests run.
+    const name: [50]u8 = @splat('d');
+    const sub = try std.fs.path.join(alloc, &.{ &name, &name, &name, &name, &name });
+    defer alloc.free(sub);
+    try tmp.dir.createDirPath(testing.io, sub);
+    var long = try tmp.dir.openDir(testing.io, sub, .{ .iterate = true });
+    defer long.close(testing.io);
+    const dir = try std.fs.path.join(alloc, &.{ base, sub });
+    defer alloc.free(dir);
+    try testing.expect(dir.len > windows.MAX_PATH);
+
+    var d: Dumper = undefined;
+    try d.start(dir, small_type);
+    defer d.stop();
+    // The documented prefix, not its NT form, which CreateFileW also
+    // takes on Windows 11.
+    try testing.expectEqualSlices(u16, &.{ '\\', '\\', '?', '\\' }, d.path[0..4]);
+
+    var context: windows.CONTEXT = undefined;
+    var record: ExceptionRecord = undefined;
+    const pointers = testPointers(&context, &record);
+    try testing.expect(d.dump(&pointers, .exception, "") == .written);
+
+    const bytes = try testOnlyDump(long, alloc);
+    defer alloc.free(bytes);
+    try testing.expectEqualSlices(u8, "MDMP", bytes[0..4]);
 }
 
 test "win32: only a process's first crash is dumped" {
