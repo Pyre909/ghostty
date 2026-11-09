@@ -367,9 +367,8 @@ pub const Dumper = struct {
     const max_name_len = "ghostty-YYYYMMDD-HHMMSS-4294967295.dmp".len;
 
     fn fileName(self: *Dumper) [:0]const u16 {
-        // 100 ns intervals since 1601 to seconds since 1970.
-        const since_1601: u64 = @intCast(@divFloor(windows.ntdll.RtlGetSystemTimePrecise(), 10_000_000));
-        const es: std.time.epoch.EpochSeconds = .{ .secs = since_1601 - -std.time.epoch.windows };
+        const now = windows.fromSysTime(windows.ntdll.RtlGetSystemTimePrecise());
+        const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(now.toSeconds()) };
         const yd = es.getEpochDay().calculateYearDay();
         const md = yd.calculateMonthDay();
         const ds = es.getDaySeconds();
