@@ -184,6 +184,22 @@ pub fn init(opts: InitOpts) !void {
         };
     }
 
+    // Sentry does not build for Windows: the app writes its own minidumps
+    // there. Only the app itself; a host that embeds libghostty, and the
+    // tool binaries, keep their own crash handling.
+    if (comptime builtin.os.tag == .windows and
+        build_config.artifact == .exe and
+        build_config.exe_entrypoint == .ghostty)
+    {
+        if (opts == .main) {
+            var environ_map = try self.environ.createMap(self.alloc);
+            defer environ_map.deinit();
+            crash.windows.install(self.io(), self.alloc, &environ_map) catch |err| {
+                std.log.warn("crash dumps unavailable err={}", .{err});
+            };
+        }
+    }
+
     // const sentrylib = @import("sentry");
     // if (sentrylib.captureEvent(sentrylib.Value.initMessageEvent(
     //     .info,

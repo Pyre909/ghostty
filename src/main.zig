@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_config = @import("build_config.zig");
 
 /// See build_config.ExeEntrypoint for why we do this.
@@ -20,6 +21,31 @@ pub const std_options: std.Options = if (@hasDecl(entrypoint, "std_options"))
     entrypoint.std_options
 else
     .{};
+
+/// The Windows app writes a minidump before a panic or a fatal exception
+/// ends it (crash/windows.zig). Everything else keeps Zig's handlers.
+const crash_dumps = builtin.os.tag == .windows and
+    build_config.exe_entrypoint == .ghostty;
+const crash_windows = if (crash_dumps) @import("crash/windows.zig") else struct {};
+
+/// Zig's panic handler, with a dump first on Windows. The default is
+/// std.lang.panic's own; a root `panic` cannot defer to it, since that
+/// reads this declaration.
+pub const panic = if (crash_dumps)
+    std.debug.FullPanic(crash_windows.panic)
+else switch (builtin.zig_backend) {
+    .stage2_loongarch,
+    .stage2_powerpc,
+    .stage2_riscv64,
+    => std.debug.simple_panic,
+    else => std.debug.FullPanic(std.debug.defaultPanic),
+};
+
+/// std.debug's overrides. Only `handleSegfault`, on Windows, which Zig's
+/// segfault handler calls once it has decided to end the process.
+pub const debug = if (crash_dumps) struct {
+    pub const handleSegfault = crash_windows.handleSegfault;
+} else struct {};
 
 comptime {
     // Force-reference our memset override so its export is emitted.
