@@ -3824,15 +3824,121 @@ pub const App = struct {
     /// file beside it, which then takes its place. A failure leaves a file
     /// already there as it was. std hands the path to NT with its own
     /// prefix, so it is not limited to MAX_PATH.
+    ///
+    /// The new file is made with the access its folder hands down, and a
+    /// file it replaces may have had its own: one the user had closed to
+    /// others would open to whoever the folder lets in. So the new file is
+    /// given the old one's DACL first, as Foundation's `.atomic` write
+    /// gives its new file the old one's mode, and GLib's replace its owner
+    /// and mode. If that DACL cannot be read or given, nothing is saved.
+    /// The owner is not kept, as Foundation keeps none.
+    ///
+    /// It is given as Explorer and icacls give one (SetSecurityInfo), so
+    /// a DACL one of them set comes out as it was. One set otherwise, as
+    /// a program can set it in full as it makes a file, comes out as they
+    /// would set it: marked auto-inherited, and if it is not protected,
+    /// with the folder's inheritable entries beside its own.
     fn writeExport(alloc: Allocator, path: []const u16, contents: []const u8) !void {
         const io = global.io();
         const wtf8 = try std.unicode.wtf16LeToWtf8Alloc(alloc, path);
         defer alloc.free(wtf8);
+        const old = try FileDacl.ofPath(io, wtf8);
+        defer if (old) |dacl| dacl.deinit();
         var file = try std.Io.Dir.cwd().createFileAtomic(io, wtf8, .{ .replace = true });
         defer file.deinit(io);
+        if (old) |dacl| try dacl.keepOn(alloc, file.file.handle);
         try file.file.writeStreamingAll(io, contents);
         try file.replace(io);
     }
+
+    /// A file's DACL as GetSecurityInfo gives it, and the descriptor that
+    /// holds it, freed by `deinit`: what an export keeps of a file it
+    /// replaces (`writeExport`).
+    const FileDacl = struct {
+        descriptor: win32.PSECURITY_DESCRIPTOR,
+        /// Null for a null DACL, which lets everyone in.
+        dacl: ?*win32.ACL,
+        /// Whether it takes nothing from the parent's.
+        protected: bool,
+
+        /// The DACL of the file at `path`, or null if there is no file
+        /// there. Opened for reading, which takes READ_CONTROL.
+        fn ofPath(io: std.Io, path: []const u8) !?FileDacl {
+            const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                else => return err,
+            };
+            defer file.close(io);
+            return try of(file.handle);
+        }
+
+        /// The DACL of the file open as `handle`, with READ_CONTROL.
+        fn of(handle: win32.HANDLE) !FileDacl {
+            var dacl: ?*win32.ACL = null;
+            var descriptor: ?win32.PSECURITY_DESCRIPTOR = null;
+            const err = win32.GetSecurityInfo(handle, win32.SE_FILE_OBJECT, win32.DACL_SECURITY_INFORMATION, null, null, &dacl, null, &descriptor);
+            if (err != 0) {
+                log.warn("cannot read a file's DACL err={d}", .{err});
+                return error.DaclUnreadable;
+            }
+            const sd = descriptor orelse return error.DaclUnreadable;
+            var control: u16 = 0;
+            var revision: win32.DWORD = 0;
+            if (!win32.GetSecurityDescriptorControl(sd, &control, &revision).toBool()) {
+                _ = win32.LocalFree(sd);
+                return error.DaclUnreadable;
+            }
+            return .{ .descriptor = sd, .dacl = dacl, .protected = control & win32.SE_DACL_PROTECTED != 0 };
+        }
+
+        fn deinit(self: FileDacl) void {
+            _ = win32.LocalFree(self.descriptor);
+        }
+
+        /// The DACL in SDDL ("D:" and its flags and entries), in `alloc`.
+        fn text(self: FileDacl, alloc: Allocator) ![]u16 {
+            var string: ?[*:0]u16 = null;
+            if (!win32.ConvertSecurityDescriptorToStringSecurityDescriptorW(self.descriptor, win32.SDDL_REVISION_1, win32.DACL_SECURITY_INFORMATION, &string, null).toBool())
+                return error.DaclUnreadable;
+            const got = string orelse return error.DaclUnreadable;
+            defer _ = win32.LocalFree(got);
+            return alloc.dupe(u16, std.mem.span(got));
+        }
+
+        /// Give the file open as `file` this DACL, protected or not as
+        /// here. Not if it has the same one already, as it has when the
+        /// old file took all its access from the folder they share: it is
+        /// then left as std made it.
+        fn keepOn(self: FileDacl, alloc: Allocator, file: win32.HANDLE) !void {
+            // std made it for writing, which takes READ_CONTROL.
+            const has = try of(file);
+            defer has.deinit();
+            const want = try self.text(alloc);
+            defer alloc.free(want);
+            const got = try has.text(alloc);
+            defer alloc.free(got);
+            if (std.mem.eql(u16, want, got)) return;
+            // But not WRITE_DAC. SetSecurityInfo reads the descriptor it
+            // changes, so READ_CONTROL with it: without, it is refused.
+            const dac = win32.ReOpenFile(
+                file,
+                win32.WRITE_DAC | win32.READ_CONTROL,
+                internal_os.windows.FILE_SHARE_READ | internal_os.windows.FILE_SHARE_WRITE | internal_os.windows.FILE_SHARE_DELETE,
+                0,
+            );
+            if (dac == win32.INVALID_HANDLE_VALUE) {
+                log.warn("cannot open a new file to give it a DACL err={}", .{win32.GetLastError()});
+                return error.DaclNotKept;
+            }
+            defer _ = win32.CloseHandle(dac);
+            const protection = if (self.protected) win32.PROTECTED_DACL_SECURITY_INFORMATION else win32.UNPROTECTED_DACL_SECURITY_INFORMATION;
+            const err = win32.SetSecurityInfo(dac, win32.SE_FILE_OBJECT, win32.DACL_SECURITY_INFORMATION | protection, null, null, self.dacl, null);
+            if (err != 0) {
+                log.warn("cannot give a new file a DACL err={d}", .{err});
+                return error.DaclNotKept;
+            }
+        }
+    };
 
     /// What a new terminal takes from `parent`, the surface that asked for
     /// it, as `context`: its font size with `window-inherit-font-size`, for
@@ -18735,6 +18841,110 @@ test "win32: an export that cannot be saved is told, and leaves a file already t
     try std.testing.expectEqualStrings("old", kept);
     // And the new file is gone.
     try std.testing.expectEqual(1, try TestExport.entries(tmp.dir));
+}
+
+/// For tests: a new file at `path` (WTF-8) with the DACL in `sddl`, set
+/// as Explorer and icacls set one, through SetSecurityInfo.
+fn testFileWithDacl(alloc: Allocator, path: []const u8, sddl: []const u8) !void {
+    const wide_sddl = try std.unicode.utf8ToUtf16LeAllocZ(alloc, sddl);
+    defer alloc.free(wide_sddl);
+    var got: ?win32.PSECURITY_DESCRIPTOR = null;
+    if (!win32.ConvertStringSecurityDescriptorToSecurityDescriptorW(wide_sddl, win32.SDDL_REVISION_1, &got, null).toBool())
+        return error.TestUnexpectedResult;
+    const descriptor = got orelse return error.TestUnexpectedResult;
+    defer _ = win32.LocalFree(descriptor);
+    var present: win32.BOOL = .FALSE;
+    var dacl: ?*win32.ACL = null;
+    var defaulted: win32.BOOL = .FALSE;
+    if (!win32.GetSecurityDescriptorDacl(descriptor, &present, &dacl, &defaulted).toBool() or !present.toBool())
+        return error.TestUnexpectedResult;
+    var control: u16 = 0;
+    var revision: win32.DWORD = 0;
+    if (!win32.GetSecurityDescriptorControl(descriptor, &control, &revision).toBool())
+        return error.TestUnexpectedResult;
+    const protection = if (control & win32.SE_DACL_PROTECTED != 0)
+        win32.PROTECTED_DACL_SECURITY_INFORMATION
+    else
+        win32.UNPROTECTED_DACL_SECURITY_INFORMATION;
+
+    const wide = try std.unicode.wtf8ToWtf16LeAllocZ(alloc, path);
+    defer alloc.free(wide);
+    // CREATE_NEW, with the access SetSecurityInfo takes.
+    const handle = win32.CreateFileW(wide.ptr, win32.WRITE_DAC | win32.READ_CONTROL, 0, null, 1, 0, null);
+    if (handle == win32.INVALID_HANDLE_VALUE) return error.TestUnexpectedResult;
+    defer _ = win32.CloseHandle(handle);
+    if (win32.SetSecurityInfo(handle, win32.SE_FILE_OBJECT, win32.DACL_SECURITY_INFORMATION | protection, null, null, dacl, null) != 0)
+        return error.TestUnexpectedResult;
+}
+
+/// For tests: the DACL of the file at `path` (WTF-8) in SDDL, in `alloc`.
+fn testDaclText(alloc: Allocator, path: []const u8) ![]u16 {
+    const dacl = (try App.FileDacl.ofPath(std.testing.io, path)) orelse return error.TestUnexpectedResult;
+    defer dacl.deinit();
+    return dacl.text(alloc);
+}
+
+test "win32: an export over a file keeps the file's DACL" {
+    // The new file takes the access its folder hands down, and the file
+    // it replaces may have had its own, as one the user closed to others
+    // has. The export keeps that, as the macOS app's `.atomic` write keeps
+    // the old file's mode: a DACL protected from the folder's, letting
+    // only the owner in, and one that is not, with an entry of its own
+    // beside the folder's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "io.txt" });
+    defer alloc.free(path);
+    const events = "Seq\tKind\tDescription\n";
+
+    // What a file new in the folder gets.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "new.txt", .data = "" });
+    const new_path = try std.fs.path.join(alloc, &.{ dir, "new.txt" });
+    defer alloc.free(new_path);
+    const new = try testDaclText(alloc, new_path);
+    defer alloc.free(new);
+    try tmp.dir.deleteFile(std.testing.io, "new.txt");
+
+    TestExport.answer = path;
+    for ([_][]const u8{ "D:P(A;;FA;;;OW)", "D:(A;;FR;;;WD)" }) |sddl| {
+        try testFileWithDacl(alloc, path, sddl);
+        const before = try testDaclText(alloc, path);
+        defer alloc.free(before);
+        // Not a new file's, which the export would give it if it kept
+        // nothing.
+        try std.testing.expect(!std.mem.eql(u16, new, before));
+
+        try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = events }));
+        app.createRequested();
+        try std.testing.expectEqual(0, TestExport.notices);
+        const saved = try tmp.dir.readFileAlloc(std.testing.io, "io.txt", alloc, .unlimited);
+        defer alloc.free(saved);
+        try std.testing.expectEqualStrings(events, saved);
+        const after = try testDaclText(alloc, path);
+        defer alloc.free(after);
+        try std.testing.expectEqualSlices(u16, before, after);
+        try std.testing.expectEqual(1, try TestExport.entries(tmp.dir));
+        try tmp.dir.deleteFile(std.testing.io, "io.txt");
+    }
 }
 
 test "win32: an export's dialog is a prompt its inspector owns" {

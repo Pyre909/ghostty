@@ -1936,9 +1936,45 @@ pub extern "advapi32" fn GetSecurityInfo(
     descriptor: ?*?PSECURITY_DESCRIPTOR,
 ) callconv(.winapi) DWORD;
 /// SE_OBJECT_TYPE (accctrl.h).
+pub const SE_FILE_OBJECT: c_int = 1;
 pub const SE_KERNEL_OBJECT: c_int = 6;
 pub const OWNER_SECURITY_INFORMATION: DWORD = 0x0000_0001;
 pub const DACL_SECURITY_INFORMATION: DWORD = 0x0000_0004;
+/// With DACL_SECURITY_INFORMATION in SetSecurityInfo: the DACL given
+/// inherits nothing from the parent, or may (winnt.h).
+pub const PROTECTED_DACL_SECURITY_INFORMATION: DWORD = 0x8000_0000;
+pub const UNPROTECTED_DACL_SECURITY_INFORMATION: DWORD = 0x2000_0000;
+/// A replaced file's DACL, given to the file an export replaces it with
+/// (`App.writeExport`).
+/// https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo
+pub extern "advapi32" fn SetSecurityInfo(
+    handle: HANDLE,
+    object_type: c_int,
+    information: DWORD,
+    owner: ?PSID,
+    group: ?PSID,
+    dacl: ?*ACL,
+    sacl: ?*ACL,
+) callconv(.winapi) DWORD;
+/// https://learn.microsoft.com/en-us/windows/win32/api/sddl/nf-sddl-convertsecuritydescriptortostringsecuritydescriptorw
+pub extern "advapi32" fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+    descriptor: PSECURITY_DESCRIPTOR,
+    revision: DWORD,
+    information: DWORD,
+    string: *?[*:0]u16,
+    length: ?*DWORD,
+) callconv(.winapi) BOOL;
+/// The same file again, with other access: WRITE_DAC on a file std made
+/// for writing.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile
+pub extern "kernel32" fn ReOpenFile(
+    original: HANDLE,
+    access: DWORD,
+    share: DWORD,
+    flags: DWORD,
+) callconv(.winapi) HANDLE;
+/// https://learn.microsoft.com/en-us/windows/win32/secauthz/standard-access-rights
+pub const WRITE_DAC: DWORD = 0x0004_0000;
 /// The object's mandatory label, which READ_CONTROL lets a process read
 /// though it is in the SACL
 /// (https://learn.microsoft.com/en-us/windows/win32/secauthz/security-information).
@@ -1984,6 +2020,13 @@ pub extern "advapi32" fn GetSecurityDescriptorControl(
     revision: *DWORD,
 ) callconv(.winapi) BOOL;
 pub const SE_DACL_PROTECTED: u16 = 0x1000;
+/// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-getsecuritydescriptordacl
+pub extern "advapi32" fn GetSecurityDescriptorDacl(
+    descriptor: PSECURITY_DESCRIPTOR,
+    present: *BOOL,
+    dacl: *?*ACL,
+    defaulted: *BOOL,
+) callconv(.winapi) BOOL;
 
 // The overlays (Overlays.zig): windows of our own that the pointer passes
 // through to the terminal under them, placed just above that one.
