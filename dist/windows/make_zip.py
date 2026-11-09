@@ -120,7 +120,8 @@ SHARE_FILES = ("share/terminfo/ghostty.terminfo",)
 SHARE_DIRS = ("share/ghostty/shell-integration", "share/ghostty/themes")
 
 # https://semver.org's regular expression. The version also names the
-# zips, and this admits no path separators.
+# zips, and this admits no path separators. Use fullmatch: Python's $
+# also matches before a final newline.
 SEMVER = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)"
@@ -734,7 +735,7 @@ def sha256(path: Path) -> str:
 
 
 def make(args: argparse.Namespace) -> None:
-    if not SEMVER.match(args.version):
+    if not SEMVER.fullmatch(args.version):
         raise Error(f"{args.version!r} is not a semantic version")
     if not args.allow_dirty:
         dirty = git("status", "--porcelain", "--untracked-files=no")

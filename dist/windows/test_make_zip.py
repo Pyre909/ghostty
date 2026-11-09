@@ -1062,7 +1062,7 @@ class TestRun(unittest.TestCase):
 class TestArguments(unittest.TestCase):
     def test_versions(self) -> None:
         for v in ["1.4.1", "1.4.1-dev", "0.0.0", "1.4.1-rc.1+abc.5", "10.20.30"]:
-            self.assertTrue(mz.SEMVER.match(v), v)
+            self.assertTrue(mz.SEMVER.fullmatch(v), v)
         for v in [
             "1.4",
             "v1.4.1",
@@ -1071,15 +1071,24 @@ class TestArguments(unittest.TestCase):
             "1.4.1/x",
             "1.4.1-a/../b",
             "1.4.1 ",
+            "1.4.1\n",
             "１.4.1",
         ]:
-            self.assertFalse(mz.SEMVER.match(v), v)
+            self.assertFalse(mz.SEMVER.fullmatch(v), v)
 
     def test_bad_version_stops_before_building(self) -> None:
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(mz.main(["--arch", "x86_64", "--version", "1.4"]), 1)
-        self.assertEqual(err.getvalue(), "make_zip: '1.4' is not a semantic version\n")
+        # "1.4.1\n" as a version read from a file with its newline.
+        for version in ["1.4", "1.4.1\n"]:
+            with self.subTest(version=version):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    # A zig that cannot build, should the check let it by.
+                    argv = ["--arch", "x86_64", "--version", version]
+                    argv += ["--zig", "no-such-zig"]
+                    self.assertEqual(mz.main(argv), 1)
+                self.assertEqual(
+                    err.getvalue(), f"make_zip: {version!r} is not a semantic version\n"
+                )
 
 
 if __name__ == "__main__":
