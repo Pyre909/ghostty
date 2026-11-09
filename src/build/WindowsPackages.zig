@@ -24,14 +24,23 @@
 //! to the directory `zig build` runs in, unless it is absolute. A path
 //! dependency's hash is its path.
 //!
-//!   zig build windows-packages -Dtarget=x86_64-windows-gnu --prefix /tmp/report
+//! The step exists only in a Windows app build asked for it:
+//!
+//!   zig build windows-packages -Dapp-runtime=windows -Demit-windows-packages \
+//!     -Dtarget=x86_64-windows-gnu --prefix /tmp/report
+//!   cat /tmp/report/windows-packages.json
+const WindowsPackages = @This();
+
 const std = @import("std");
 const LibVtPackages = @import("LibVtPackages.zig");
+
+/// The step that installs the two files.
+step: *std.Build.Step,
 
 /// Defines the step for the app whose root module is `root`. Like
 /// lib-vt-packages, the report is computed while build.zig runs, and a
 /// malformed `.third_party` field fails only this step.
-pub fn init(b: *std.Build, root: *std.Build.Module) error{OutOfMemory}!void {
+pub fn init(b: *std.Build, root: *std.Build.Module) !WindowsPackages {
     const step = b.step(
         "windows-packages",
         "Write windows-packages.json, the packages the Windows app links",
@@ -44,7 +53,7 @@ pub fn init(b: *std.Build, root: *std.Build.Module) error{OutOfMemory}!void {
                 "windows-packages: {t}, see the error above",
                 .{err},
             )).step);
-            return;
+            return .{ .step = step };
         },
     };
 
@@ -57,6 +66,7 @@ pub fn init(b: *std.Build, root: *std.Build.Module) error{OutOfMemory}!void {
         .prefix,
         file[0],
     ).step);
+    return .{ .step = step };
 }
 
 /// One entry in windows-package-dirs.json.

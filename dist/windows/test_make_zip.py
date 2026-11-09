@@ -1017,7 +1017,7 @@ class TestCheckout(unittest.TestCase):
             self.assertEqual(self.make("--zig", "./bin/zig"), "make_zip: stop\n")
         self.assertEqual(zig_license.call_args.args[0], str(zig.resolve()))
 
-    def test_builds_leave_out_docs(self) -> None:
+    def test_build_options(self) -> None:
         # Both builds, so that they resolve the same options.
         zig = self.repo / "zig-out" / "zig"
         write(zig, "#!/bin/sh\n")
@@ -1038,6 +1038,10 @@ class TestCheckout(unittest.TestCase):
         self.assertEqual(len(builds), 2)
         for args in builds:
             self.assertIn("-Demit-docs=false", args)
+        # The report is asked for only where it is wanted.
+        self.assertEqual(
+            ["-Demit-windows-packages" in args for args in builds], [True, False]
+        )
 
     def test_failed_pdb_zip_keeps_the_earlier_pair(self) -> None:
         zig = self.repo / "zig-out" / "zig"

@@ -70,6 +70,7 @@ emit_themes: bool = false,
 emit_xcframework: bool = false,
 emit_webdata: bool = false,
 emit_unicode_table_gen: bool = false,
+emit_windows_packages: bool = false,
 
 /// Feature gates for libghostty-vt artifacts (-Dvt-features). The full
 /// Ghostty application ignores this and always enables everything.
@@ -578,6 +579,13 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
         bool,
         "emit-unicode-table-gen",
         "Build and install executables that generate unicode tables with 'build'",
+    ) orelse false;
+
+    config.emit_windows_packages = b.option(
+        bool,
+        "emit-windows-packages",
+        "Define the windows-packages step, which reports the packages " ++
+            "a Windows app build links, for dist/windows/make_zip.py.",
     ) orelse false;
 
     config.emit_bench = b.option(

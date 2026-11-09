@@ -24,6 +24,7 @@ pub const HelpStrings = @import("HelpStrings.zig");
 pub const LibVtPackages = @import("LibVtPackages.zig");
 pub const SharedDeps = @import("SharedDeps.zig");
 pub const UnicodeTables = @import("UnicodeTables.zig");
+pub const WindowsPackages = @import("WindowsPackages.zig");
 
 // Steps
 pub const LibtoolStep = @import("LibtoolStep.zig");

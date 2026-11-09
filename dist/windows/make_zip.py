@@ -795,7 +795,9 @@ def make(args: argparse.Namespace) -> None:
             "-Demit-docs=false",
             f"-Dversion-string={args.version}",
         ]
-        zig_build(zig, ["windows-packages", *flags], stage / "report")
+        # Only this build reads every package's build.zig.zon.
+        report = ["windows-packages", "-Demit-windows-packages"]
+        zig_build(zig, [*report, *flags], stage / "report")
         top = stage / name
         zig_build(zig, flags, top)
         check_tree(top, args.arch)

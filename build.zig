@@ -247,6 +247,13 @@ pub fn build(b: *std.Build) !void {
             exe.install();
             if (resources) |v| v.install();
             if (i18n) |v| v.install();
+
+            // The packages the Windows app links, for make_zip.py's
+            // notices. Defined only when asked so app builds skip reading
+            // every package's build.zig.zon.
+            if (config.emit_windows_packages and
+                config.target.result.os.tag == .windows)
+                _ = try buildpkg.WindowsPackages.init(b, exe.exe.root_module);
         }
     } else if (!config.emit_lib_vt) {
         // The macOS Ghostty Library
