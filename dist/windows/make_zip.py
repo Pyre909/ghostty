@@ -137,8 +137,9 @@ LICENSE_FILE = re.compile(
 
 FONTS = (".ttf", ".otf")
 
-# Zip times start in 1980.
+# Zip times start in 1980 and end with 2107.
 ZIP_EPOCH = 315532800
+ZIP_LAST = 4354819199
 
 # A zip entry's time: year, month, day, hour, minute, second.
 DateTime = tuple[int, int, int, int, int, int]
@@ -613,6 +614,12 @@ def zip_time() -> DateTime:
         raise Error(
             f"SOURCE_DATE_EPOCH is {epoch!r}, not a number of seconds"
         ) from None
+    # Raise rather than clamp, so that a zip is never misdated, and before
+    # gmtime, which fails its own way past what time_t holds.
+    if seconds > ZIP_LAST:
+        raise Error(
+            f"the zips' time, {seconds}, is after 2107, which a zip cannot record"
+        )
     t = time.gmtime(max(seconds, ZIP_EPOCH))
     return (t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
 

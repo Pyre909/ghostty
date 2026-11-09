@@ -928,14 +928,21 @@ class TestZip(unittest.TestCase):
         for value, want in [
             ("1762691444", (2025, 11, 9, 12, 30, 44)),
             ("0", (1980, 1, 1, 0, 0, 0)),
+            ("4354819199", (2107, 12, 31, 23, 59, 59)),
         ]:
             with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": value}):
                 self.assertEqual(mz.zip_time(), want)
-        with (
-            mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "soon"}),
-            self.assertRaisesRegex(mz.Error, "not a number"),
-        ):
-            mz.zip_time()
+        for value, error in [
+            ("soon", "not a number"),
+            ("4354819200", "after 2107"),
+            ("99999999999999999999", "after 2107"),
+        ]:
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": value}),
+                self.assertRaisesRegex(mz.Error, error),
+            ):
+                mz.zip_time()
 
 
 class TestCheckout(unittest.TestCase):
