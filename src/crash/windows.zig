@@ -41,6 +41,12 @@ const os_windows = internal_os.windows;
 const kernel32 = os_windows.exp.kernel32;
 const log = std.log.scoped(.crash);
 
+/// Whether this build writes crash dumps: the app's exe only. A host that
+/// embeds libghostty keeps its own process-wide handlers, and the tool
+/// binaries keep Zig's.
+pub const enabled = build_config.artifact == .exe and
+    build_config.exe_entrypoint == .ghostty;
+
 /// How many of our dumps the crash directory keeps. Older ones are deleted
 /// when the app starts, so a crash briefly makes it one more.
 pub const keep = 10;
@@ -450,15 +456,14 @@ var previous_filter: ?os_windows.LPTOP_LEVEL_EXCEPTION_FILTER = null;
 /// remembered by `remember` on the faulting thread.
 threadlocal var pending: ?*const ExceptionPointers = null;
 
-/// Sets up crash dumps for this process: the exe only, never a host that
-/// embeds libghostty, whose process-wide handlers are its own. Deletes
-/// all but the newest `keep` dumps.
+/// Sets up crash dumps for this process, in a build with them `enabled`.
+/// Deletes all but the newest `keep` dumps.
 pub fn install(
     io: std.Io,
     alloc: Allocator,
     environ_map: *const std.process.Environ.Map,
 ) !void {
-    comptime assert(build_config.artifact == .exe);
+    comptime assert(enabled);
     if (installed.load(.acquire)) return;
 
     const dir = try crash.defaultDir(io, alloc, environ_map);

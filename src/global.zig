@@ -185,12 +185,8 @@ pub fn init(opts: InitOpts) !void {
     }
 
     // Sentry does not build for Windows: the app writes its own minidumps
-    // there. Only the app itself; a host that embeds libghostty, and the
-    // tool binaries, keep their own crash handling.
-    if (comptime builtin.os.tag == .windows and
-        build_config.artifact == .exe and
-        build_config.exe_entrypoint == .ghostty)
-    {
+    // there.
+    if (comptime crash.windows.enabled) {
         if (opts == .main) {
             var environ_map = try self.environ.createMap(self.alloc);
             defer environ_map.deinit();
