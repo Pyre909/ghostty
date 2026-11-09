@@ -509,8 +509,7 @@ pub const Win32Error = w.Win32Error;
 /// Sets the thread's last error. Cleared to `.SUCCESS` before a call whose
 /// answer for a failure is also one of its results, it tells the two apart
 /// afterwards.
-/// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setlasterror
-pub extern "kernel32" fn SetLastError(code: Win32Error) callconv(.winapi) void;
+pub const SetLastError = internal_os.windows.exp.kernel32.SetLastError;
 pub const GetModuleHandleW = internal_os.windows.exp.kernel32.GetModuleHandleW;
 pub const GetProcAddress = internal_os.windows.exp.kernel32.GetProcAddress;
 pub const LoadLibraryExW = internal_os.windows.exp.kernel32.LoadLibraryExW;
@@ -1809,15 +1808,8 @@ pub const INFINITE: DWORD = 0xFFFF_FFFF;
 pub const WAIT_OBJECT_0: DWORD = 0x0000_0000;
 pub const WAIT_TIMEOUT: DWORD = 0x0000_0102;
 pub const WAIT_FAILED: DWORD = 0xFFFF_FFFF;
-/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventw
-pub extern "kernel32" fn CreateEventW(
-    attributes: ?*SECURITY_ATTRIBUTES,
-    manual_reset: BOOL,
-    initial_state: BOOL,
-    name: ?LPCWSTR,
-) callconv(.winapi) ?HANDLE;
-/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
-pub extern "kernel32" fn SetEvent(event: HANDLE) callconv(.winapi) BOOL;
+pub const CreateEventW = internal_os.windows.exp.kernel32.CreateEventW;
+pub const SetEvent = internal_os.windows.exp.kernel32.SetEvent;
 /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-resetevent
 pub extern "kernel32" fn ResetEvent(event: HANDLE) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitformultipleobjects

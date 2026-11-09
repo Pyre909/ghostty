@@ -41,6 +41,10 @@ pub const UNICODE_STRING = windows.UNICODE_STRING;
 
 // Structs and opaque types
 pub const LPPROC_THREAD_ATTRIBUTE_LIST = ?*anyopaque;
+/// A top-level exception filter, as SetUnhandledExceptionFilter takes it.
+pub const LPTOP_LEVEL_EXCEPTION_FILTER = *const fn (
+    ExceptionInfo: *windows.EXCEPTION_POINTERS,
+) callconv(.winapi) LONG;
 pub const SECURITY_ATTRIBUTES = windows.SECURITY_ATTRIBUTES;
 pub const STARTF_USESTDHANDLES = windows.STARTF_USESTDHANDLES;
 pub const STARTUPINFOW = windows.STARTUPINFOW;
@@ -87,6 +91,8 @@ pub const TRUE: windows.BOOL = .fromBool(true);
 /// AttachConsole dwProcessId: the console of the process that started us.
 pub const ATTACH_PARENT_PROCESS: DWORD = 0xFFFFFFFF;
 pub const CP_UTF8 = 65001;
+/// CreateFileW dwCreationDisposition: fail if the file exists.
+pub const CREATE_NEW: DWORD = 1;
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
 pub const CTRL_BREAK_EVENT = 1;
 pub const CTRL_C_EVENT = 0;
@@ -111,6 +117,7 @@ pub const FILE_SHARE_READ = 0x00000001;
 pub const FILE_SHARE_WRITE = 0x00000002;
 pub const FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
 pub const GENERIC_READ = 0x80000000;
+pub const GENERIC_WRITE: DWORD = 0x40000000;
 /// GetModuleHandleExW dwFlags: lpModuleName is an address inside the
 /// module rather than its name.
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS = 0x00000004;
@@ -460,6 +467,32 @@ pub const exp = struct {
             bInheritHandle: BOOL,
             dwOptions: DWORD,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventw
+        pub extern "kernel32" fn CreateEventW(
+            lpEventAttributes: ?*SECURITY_ATTRIBUTES,
+            bManualReset: BOOL,
+            bInitialState: BOOL,
+            lpName: ?LPCWSTR,
+        ) callconv(.winapi) ?HANDLE;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent
+        pub extern "kernel32" fn SetEvent(hEvent: HANDLE) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilew
+        pub extern "kernel32" fn DeleteFileW(lpFileName: LPCWSTR) callconv(.winapi) BOOL;
+        /// Sets the thread's last error.
+        /// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setlasterror
+        pub extern "kernel32" fn SetLastError(dwErrCode: windows.Win32Error) callconv(.winapi) void;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-raiseexception
+        pub extern "kernel32" fn RaiseException(
+            dwExceptionCode: DWORD,
+            dwExceptionFlags: DWORD,
+            nNumberOfArguments: DWORD,
+            lpArguments: ?[*]const ULONG_PTR,
+        ) callconv(.winapi) void;
+        /// The filter it replaces, null for none.
+        /// https://learn.microsoft.com/en-us/windows/win32/api/errhandlingapi/nf-errhandlingapi-setunhandledexceptionfilter
+        pub extern "kernel32" fn SetUnhandledExceptionFilter(
+            lpTopLevelExceptionFilter: ?LPTOP_LEVEL_EXCEPTION_FILTER,
+        ) callconv(.winapi) ?LPTOP_LEVEL_EXCEPTION_FILTER;
     };
     pub const user32 = struct {
         /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclientrect

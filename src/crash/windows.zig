@@ -86,8 +86,6 @@ comptime {
 }
 
 const EXCEPTION_NONCONTINUABLE = 0x1;
-const GENERIC_WRITE = 0x40000000;
-const CREATE_NEW = 1;
 
 // dbghelp declares the minidump structures inside #pragma pack(4)
 // (minidumpapiset.h; mingw-w64's psdk_inc/_dbg_common.h). On a 64-bit
@@ -134,26 +132,6 @@ const MiniDumpWriteDumpFn = *const fn (
     user_streams: ?*const MINIDUMP_USER_STREAM_INFORMATION,
     callback: ?*const anyopaque,
 ) callconv(.winapi) windows.BOOL;
-
-const TopLevelFilter = *const fn (*windows.EXCEPTION_POINTERS) callconv(.winapi) c_long;
-
-extern "kernel32" fn SetUnhandledExceptionFilter(
-    filter: ?TopLevelFilter,
-) callconv(.winapi) ?TopLevelFilter;
-extern "kernel32" fn RaiseException(
-    code: u32,
-    flags: u32,
-    count: u32,
-    arguments: ?[*]const usize,
-) callconv(.winapi) void;
-extern "kernel32" fn CreateEventW(
-    attributes: ?*windows.SECURITY_ATTRIBUTES,
-    manual_reset: windows.BOOL,
-    initial_state: windows.BOOL,
-    name: ?windows.LPCWSTR,
-) callconv(.winapi) ?windows.HANDLE;
-extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) windows.BOOL;
-extern "kernel32" fn DeleteFileW(name: [*:0]const u16) callconv(.winapi) windows.BOOL;
 
 // --- The dumper ----------------------------------------------------------
 
@@ -209,10 +187,10 @@ pub const Dumper = struct {
     /// movable once started: its thread holds a pointer to it.
     pub fn start(self: *Dumper, dir: []const u8, dump_type: u32) !void {
         const write = try loadMiniDumpWriteDump();
-        const request = CreateEventW(null, .FALSE, .FALSE, null) orelse
+        const request = kernel32.CreateEventW(null, .FALSE, .FALSE, null) orelse
             return windows.unexpectedError(windows.GetLastError());
         errdefer _ = kernel32.CloseHandle(request);
-        const done = CreateEventW(null, .TRUE, .FALSE, null) orelse
+        const done = kernel32.CreateEventW(null, .TRUE, .FALSE, null) orelse
             return windows.unexpectedError(windows.GetLastError());
         errdefer _ = kernel32.CloseHandle(done);
 
@@ -238,7 +216,7 @@ pub const Dumper = struct {
     /// lives as long as the process.
     pub fn stop(self: *Dumper) void {
         self.stopping.store(true, .release);
-        _ = SetEvent(self.request);
+        _ = kernel32.SetEvent(self.request);
         self.thread.join();
         _ = kernel32.CloseHandle(self.request);
         _ = kernel32.CloseHandle(self.done);
@@ -269,7 +247,7 @@ pub const Dumper = struct {
         self.message_len = @min(message.len, self.message.len);
         @memcpy(self.message[0..self.message_len], message[0..self.message_len]);
 
-        _ = SetEvent(self.request);
+        _ = kernel32.SetEvent(self.request);
         return switch (kernel32.WaitForSingleObject(self.done, timeout_ms)) {
             os_windows.WAIT_OBJECT_0 => self.result,
             else => .none,
@@ -282,7 +260,7 @@ pub const Dumper = struct {
             _ = kernel32.WaitForSingleObject(self.request, os_windows.INFINITE);
             if (self.stopping.load(.acquire)) return;
             self.result = self.writeDump();
-            _ = SetEvent(self.done);
+            _ = kernel32.SetEvent(self.done);
         }
     }
 
@@ -290,10 +268,10 @@ pub const Dumper = struct {
         const name = self.fileName();
         const file = kernel32.CreateFileW(
             name.ptr,
-            GENERIC_WRITE,
+            os_windows.GENERIC_WRITE,
             0,
             null,
-            CREATE_NEW,
+            os_windows.CREATE_NEW,
             os_windows.FILE_ATTRIBUTE_NORMAL,
             null,
         );
@@ -327,7 +305,7 @@ pub const Dumper = struct {
         _ = kernel32.CloseHandle(file);
         if (ok == .FALSE) {
             // A partial dump is no use to a debugger.
-            _ = DeleteFileW(name.ptr);
+            _ = kernel32.DeleteFileW(name.ptr);
             return .{ .failed = err };
         }
         return .{ .written = name[self.dir_len..] };
@@ -405,7 +383,7 @@ fn loadMiniDumpWriteDump() !MiniDumpWriteDumpFn {
 
 var dumper: Dumper = undefined;
 var installed: std.atomic.Value(bool) = .init(false);
-var previous_filter: ?TopLevelFilter = null;
+var previous_filter: ?os_windows.LPTOP_LEVEL_EXCEPTION_FILTER = null;
 
 /// The exception Zig's segfault handler is about to end the process for,
 /// remembered by `remember` on the faulting thread.
@@ -433,7 +411,7 @@ pub fn install(
     try dumper.start(dir.path, if (full) full_type else small_type);
     installed.store(true, .release);
 
-    previous_filter = SetUnhandledExceptionFilter(filter);
+    previous_filter = kernel32.SetUnhandledExceptionFilter(filter);
     if (std.options.enable_segfault_handler) {
         // First in the chain, ahead of Zig's (added at startup, last).
         _ = windows.ntdll.RtlAddVectoredExceptionHandler(1, remember);
@@ -476,7 +454,7 @@ pub fn handleSegfault(addr: ?usize, name: []const u8, ctx: ?std.debug.CpuContext
 /// The unhandled-exception filter (ReleaseFast, and a fault while
 /// panicking). Windows' own handling follows: the process ends with the
 /// exception's code and an Application Error event.
-fn filter(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
+fn filter(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) os_windows.LONG {
     if (installed.load(.acquire)) _ = dumper.dump(@ptrCast(info), .exception, "");
     if (previous_filter) |f| return f(info);
     return windows.EXCEPTION_CONTINUE_SEARCH;
@@ -547,7 +525,7 @@ fn crashTest(what: []const u8) void {
     } else if (std.mem.eql(u8, what, "stack")) {
         _ = recurse(0);
     } else if (std.mem.eql(u8, what, "raise")) {
-        RaiseException(test_code, EXCEPTION_NONCONTINUABLE, 0, null);
+        kernel32.RaiseException(test_code, EXCEPTION_NONCONTINUABLE, 0, null);
     }
 }
 
