@@ -386,9 +386,12 @@ def collect(
         for tp in pkg["third_party"]:
             if tp["path"] is not None:
                 path = norm(posixpath.join(rel, tp["path"]), tp["name"])
+                # Vendored code takes the version of the build.zig.zon
+                # that lists it, unless its entry sets its own.
+                ver = tp.get("version") or pkg["version"]
                 lazy = functools.cache(
-                    lambda name=tp["name"], path=path: described(
-                        name, repo / path, None
+                    lambda name=tp["name"], path=path, ver=ver: described(
+                        name, repo / path, ver
                     )
                 )
                 covers.append((path, lazy))

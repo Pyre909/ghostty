@@ -168,6 +168,7 @@ class Fixture(unittest.TestCase):
                     "pkg/simdutf",
                     ["vendor", "vendor/simdutf.cpp"],
                     [tp("simdutf", "Apache-2.0 OR MIT", path="vendor")],
+                    "9.0.0",
                 ),
                 package("pkg/zlib", [], [tp("zlib", "Zlib", version="1.3.1")]),
                 package("N-V-zlib", ["adler32.c"]),
@@ -259,11 +260,14 @@ class Fixture(unittest.TestCase):
     def by_name(self) -> dict[str, mz.Component]:
         return {c.name: c for c in self.collect()}
 
-    def linked(self, pkg_hash: str) -> list[str]:
+    def package(self, pkg_hash: str) -> dict[str, Any]:
         for p in self.report["packages"]:
             if p["hash"] == pkg_hash:
-                return p["linked_paths"]  # type: ignore[no-any-return]
+                return p  # type: ignore[no-any-return]
         raise KeyError(pkg_hash)
+
+    def linked(self, pkg_hash: str) -> list[str]:
+        return self.package(pkg_hash)["linked_paths"]  # type: ignore[no-any-return]
 
 
 class TestCollect(Fixture):
@@ -344,7 +348,13 @@ class TestCollect(Fixture):
             [("LICENSE-MIT", "simdutf MIT")],
             "a .third_party path's files",
         )
+        self.assertEqual(c["simdutf"].versions, ["9.0.0"], "its build.zig.zon's")
         self.assertEqual(c["bindings"].note, "Generated from imgui's headers.")
+
+    def test_vendored_version_of_its_own(self) -> None:
+        (simdutf,) = self.package("pkg/simdutf")["third_party"]
+        simdutf["version"] = "8.0.0"
+        self.assertEqual(self.by_name()["simdutf"].versions, ["8.0.0"])
 
     def test_closest_vendored_path_covers(self) -> None:
         write(self.repo / "src/stb/deep/LICENSE", "deep\n")
