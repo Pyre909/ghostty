@@ -243,11 +243,13 @@ class Fixture(unittest.TestCase):
             },
             "installed": {
                 "bin/conpty.dll": "conpty",
+                "bin/OpenConsole.exe": "conpty",
                 "share/ghostty/themes": "themes",
                 "share/ghostty/shell/preexec.sh": "preexec",
             },
         }
         write(self.tree / "bin/conpty.dll", pe(0x8664))
+        write(self.tree / "bin/OpenConsole.exe", pe(0x8664))
         write(self.tree / "share/ghostty/themes/Dark", "palette = 0=#000000\n")
         write(self.tree / "share/ghostty/shell/preexec.sh", "# preexec\n")
         self.fixed = [
@@ -311,6 +313,33 @@ class TestCollect(Fixture):
         self.assertEqual(
             (themes.license, themes.texts), ("MIT", [("LICENSE", "themes MIT")])
         )
+
+    def test_installed_twice(self) -> None:
+        # Two installed files of one package give its version and text once.
+        self.package("N-V-conpty")["version"] = "1.25.0"
+        conpty = self.by_name()["conpty"]
+        self.assertEqual(
+            (conpty.versions, conpty.texts),
+            (["1.25.0"], [("conpty-LICENSE.txt", "conpty MIT")]),
+        )
+
+    def test_two_versions_of_one_package(self) -> None:
+        write(self.repo / "zig-pkg/zf-0.2.0-y/LICENSE.md", "zf 0.2 MIT\n")
+        self.dirs["packages"].append(
+            {"hash": "zf-0.2.0-y", "dir": "zig-pkg/zf-0.2.0-y", "names": ["zf"]}
+        )
+        self.report["packages"].append(
+            package("zf-0.2.0-y", ["src/zf.zig"], version="0.2.0")
+        )
+        zf = self.by_name()["zf"]
+        self.assertEqual(
+            (zf.versions, zf.texts),
+            (
+                ["0.1.0", "0.2.0"],
+                [("LICENSE.md", "zf MIT"), ("LICENSE.md", "zf 0.2 MIT")],
+            ),
+        )
+        self.assertIn("\nzf 0.1.0, 0.2.0\n", mz.render([zf]))
 
     def test_installed_vendored_code(self) -> None:
         # Installed, never linked, so only `installed` can list it.
