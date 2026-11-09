@@ -3,6 +3,7 @@ const Ghostty = @This();
 const std = @import("std");
 const Config = @import("Config.zig");
 const SharedDeps = @import("SharedDeps.zig");
+const WindowsPackages = @import("WindowsPackages.zig");
 
 /// The primary Ghostty executable.
 exe: *std.Build.Step.Compile,
@@ -120,6 +121,12 @@ pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
     if (self.launcher_install_step) |step| b.getInstallStep().dependOn(&step.step);
+
+    // The packages the Windows app links, for the portable zip's
+    // licenses. Defined here, not in init, because build.zig inits a
+    // second exe (valgrind's) and installs only this one.
+    if (self.exe.rootModuleTarget().os.tag == .windows)
+        WindowsPackages.init(b, self.exe.root_module) catch @panic("OOM");
 }
 
 /// If we're in NixOS but not in the shell environment then we issue

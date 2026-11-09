@@ -179,7 +179,7 @@ pub fn init(b: *std.Build, root: *Module) !LibVtPackages {
 }
 
 /// Builds the JSON report.
-fn report(b: *std.Build, root: *Module) ![]const u8 {
+pub fn report(b: *std.Build, root: *Module) ![]const u8 {
     const arena = b.allocator;
 
     var walk: Walk = .{ .arena = arena };
