@@ -18588,6 +18588,8 @@ const TestExport = struct {
 
     /// Where the dialog answers to save, in WTF-8; null answers Cancel.
     var answer: ?[]const u8 = null;
+    /// With `fail`, the dialog fails instead, as one that cannot be shown.
+    var fail = false;
     var asks: usize = 0;
     var asked_by: ?win32.HWND = null;
     var named = false;
@@ -18628,6 +18630,7 @@ const TestExport = struct {
             app.endPrompt();
             ticked_after = wakeups();
         }
+        if (fail) return .failed;
         const path = answer orelse return .cancelled;
         const wide = std.unicode.wtf8ToWtf16LeAllocZ(app.core_app.alloc, path) catch return .failed;
         return .{ .path = wide };
@@ -18664,6 +18667,7 @@ const TestExport = struct {
         frame = a.window.hwnd;
         core = .{};
         answer = null;
+        fail = false;
         asks = 0;
         asked_by = null;
         named = false;
@@ -18784,6 +18788,82 @@ test "win32: an export cancelled saves nothing and says nothing" {
     app.createRequested();
     try std.testing.expectEqual(1, TestExport.asks);
     try std.testing.expectEqual(0, TestExport.notices);
+}
+
+test "win32: an export whose dialog fails is told, and saves nothing" {
+    // Unlike a cancel, which the user chose: the notice is how they learn
+    // the events were not saved. The inspector owns it, as it owns the
+    // dialog.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(dir);
+    const path = try std.fs.path.join(alloc, &.{ dir, "io.txt" });
+    defer alloc.free(path);
+    TestExport.answer = path;
+    TestExport.fail = true;
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(1, TestExport.notices);
+    try std.testing.expectEqual(@as(?win32.HWND, TestExport.inspector), TestExport.told_by);
+    try std.testing.expectEqual(0, try TestExport.entries(tmp.dir));
+}
+
+test "win32: an export whose inspector closed first is asked and told from its window" {
+    // The inspector can close before `run` reaches the request, and its
+    // terminal's window then owns the dialog and the notice: not the one
+    // a prompt with no owner falls back to (`fallbackOwner`), here the
+    // first window, with no terminal focused.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    core_app.focused_surface = null;
+    const first = try testFrame(&app);
+    const f = try testPane(&app, first);
+    first.tab().tree = try .init(alloc, f);
+    first.tab().focused = f;
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    defer TestExport.stop(a);
+    try TestExport.start(&app, a);
+    TestExport.fail = true;
+
+    try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
+    _ = a.controlInspector(.hide);
+    try std.testing.expect(a.inspector == null);
+    app.createRequested();
+    try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(@as(?win32.HWND, window.hwnd), TestExport.asked_by);
+    try std.testing.expectEqual(1, TestExport.notices);
+    try std.testing.expectEqual(@as(?win32.HWND, window.hwnd), TestExport.told_by);
 }
 
 test "win32: an export that cannot be saved is told, and leaves a file already there whole" {
