@@ -11,6 +11,8 @@ installed, and one with no license file.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -923,24 +925,16 @@ class TestZip(unittest.TestCase):
                 self.assertEqual(zf.read("top/bin/b"), b"bee")
 
     def test_zip_time(self) -> None:
-        import os
-
-        old = os.environ.get("SOURCE_DATE_EPOCH")
-        self.addCleanup(
-            lambda: (
-                os.environ.__setitem__("SOURCE_DATE_EPOCH", old)
-                if old
-                else os.environ.pop("SOURCE_DATE_EPOCH", None)
-            )
-        )
         for value, want in [
             ("1762691444", (2025, 11, 9, 12, 30, 44)),
             ("0", (1980, 1, 1, 0, 0, 0)),
         ]:
-            os.environ["SOURCE_DATE_EPOCH"] = value
-            self.assertEqual(mz.zip_time(), want)
-        os.environ["SOURCE_DATE_EPOCH"] = "soon"
-        with self.assertRaisesRegex(mz.Error, "not a number"):
+            with mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": value}):
+                self.assertEqual(mz.zip_time(), want)
+        with (
+            mock.patch.dict(os.environ, {"SOURCE_DATE_EPOCH": "soon"}),
+            self.assertRaisesRegex(mz.Error, "not a number"),
+        ):
             mz.zip_time()
 
 
@@ -979,9 +973,6 @@ class TestCheckout(unittest.TestCase):
         write(self.repo / "zig-out/bin/ghostty.exe", "exe")
 
     def make(self, *extra: str) -> str:
-        import contextlib
-        import io
-
         err = io.StringIO()
         argv = ["--arch", "x86_64", "--version", "1.4.1", "--zig", "no-such-zig"]
         with contextlib.redirect_stderr(err):
@@ -1004,8 +995,6 @@ class TestCheckout(unittest.TestCase):
                     stray.unlink()
 
     def test_relative_zig(self) -> None:
-        import contextlib
-
         # A relative --zig from a directory other than the checkout, a
         # link to the real zig, as a package manager installs it.
         caller = self.repo / "zig-out" / "caller"
@@ -1087,9 +1076,6 @@ class TestArguments(unittest.TestCase):
             self.assertFalse(mz.SEMVER.match(v), v)
 
     def test_bad_version_stops_before_building(self) -> None:
-        import contextlib
-        import io
-
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
             self.assertEqual(mz.main(["--arch", "x86_64", "--version", "1.4"]), 1)
