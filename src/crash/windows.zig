@@ -54,10 +54,10 @@ pub const test_code: u32 = 0xE047_4852; // 'R', see crashTest
 /// list (with the PDB identity a debugger needs), unloaded modules and
 /// handles. No other memory: the heap and data sections hold scrollback,
 /// which can hold anything that was typed or printed.
-const small_type: u32 = 0x1000 | 0x20 | 0x4; // WithThreadInfo, WithUnloadedModules, WithHandleData
+const small_type: u32 = MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpWithHandleData;
 
 /// With GHOSTTY_CRASH_DUMP=full: all of the process's memory, as asked.
-const full_type: u32 = small_type | 0x2 | 0x800; // WithFullMemory, WithFullMemoryInfo
+const full_type: u32 = small_type | MiniDumpWithFullMemory | MiniDumpWithFullMemoryInfo;
 
 // --- Windows declarations ------------------------------------------------
 
@@ -117,8 +117,19 @@ comptime {
     }
 }
 
-/// MINIDUMP_STREAM_TYPE's CommentStreamA: text a debugger shows with the
-/// dump (cdb prints it as "Comment:").
+// MINIDUMP_TYPE (minidumpapiset.h).
+const MiniDumpWithFullMemory = 0x2;
+const MiniDumpWithHandleData = 0x4;
+const MiniDumpWithUnloadedModules = 0x20;
+const MiniDumpWithFullMemoryInfo = 0x800;
+const MiniDumpWithThreadInfo = 0x1000;
+
+// MINIDUMP_STREAM_TYPE. The dumper writes the comment itself; the tests
+// read the others.
+const ThreadListStream = 3;
+const ModuleListStream = 4;
+const ExceptionStream = 6;
+/// Text a debugger shows with the dump (cdb prints it as "Comment:").
 const CommentStreamA = 10;
 
 const MiniDumpWriteDumpFn = *const fn (
@@ -672,7 +683,7 @@ const TestDump = struct {
         const count = self.u32At(8);
         const dir = self.u32At(12);
         for (0..count) |i| {
-            const entry = dir + i * 12;
+            const entry = dir + i * 12; // sizeof(MINIDUMP_DIRECTORY)
             if (self.u32At(entry) != kind) continue;
             const size = self.u32At(entry + 4);
             const rva = self.u32At(entry + 8);
@@ -705,7 +716,7 @@ fn testOnlyDump(dir: std.Io.Dir, alloc: Allocator) ![]u8 {
 
 /// The exception stream's thread id and exception code.
 fn testException(dump: TestDump) !struct { u32, u32 } {
-    const exception = dump.stream(6) orelse return error.NoExceptionStream;
+    const exception = dump.stream(ExceptionStream) orelse return error.NoExceptionStream;
     return .{
         std.mem.readInt(u32, exception[0..4], .little),
         std.mem.readInt(u32, exception[8..12], .little),
@@ -746,9 +757,9 @@ test "win32: a panic's crash dump holds its code, thread and message" {
     try testing.expectEqual(panic_code, code);
 
     // Every thread, this one and the dumper's at least, and the modules.
-    const threads = dump.stream(3) orelse return error.NoThreadList;
+    const threads = dump.stream(ThreadListStream) orelse return error.NoThreadList;
     try testing.expect(std.mem.readInt(u32, threads[0..4], .little) >= 2);
-    const modules = dump.stream(4) orelse return error.NoModuleList;
+    const modules = dump.stream(ModuleListStream) orelse return error.NoModuleList;
     try testing.expect(std.mem.readInt(u32, modules[0..4], .little) >= 1);
 
     const comment = dump.stream(CommentStreamA) orelse return error.NoComment;
