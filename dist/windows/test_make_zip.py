@@ -375,17 +375,29 @@ class TestCollect(Fixture):
             ("", "vendor/new/x.c", "vendor/new/x.c"),
             ("pkg/opengl", "../../vendor/other/a.h", "vendor/other/a.h"),
             ("pkg/simdutf", "../../src/vendor/b.c", "src/vendor/b.c"),
+            # A path that only begins like vendored code's is not its.
+            ("", "vendor/gladx/x.c", "vendor/gladx/x.c"),
+            # "vendor" as the last component, as an include directory.
+            ("pkg/simdutf", "../../src/vendor", "src/vendor"),
         ]:
             with self.subTest(path=path):
+                self.setUp()
                 self.linked(pkg).append(path)
                 with self.assertRaisesRegex(mz.Error, f"^{shown} is vendored code"):
                     self.collect()
-                self.linked(pkg).pop()
 
     def test_path_outside_the_repository_fails(self) -> None:
-        self.linked("pkg/opengl").append("../../../elsewhere/x.h")
-        with self.assertRaisesRegex(mz.Error, "outside the repository"):
-            self.collect()
+        for pkg, path in [
+            ("pkg/opengl", "../../../elsewhere/x.h"),
+            ("", "/abs/vendor/x.h"),
+            # Outside only once its separators are read as Windows' are.
+            ("pkg/opengl", "..\\..\\..\\elsewhere\\x.h"),
+        ]:
+            with self.subTest(path=path):
+                self.setUp()
+                self.linked(pkg).append(path)
+                with self.assertRaisesRegex(mz.Error, "outside the repository"):
+                    self.collect()
 
     def test_linked_package_without_license_fails(self) -> None:
         del self.overrides["packages"]["bindings"]
@@ -464,6 +476,9 @@ class TestCollect(Fixture):
         def no_embedded_texts(o: dict[str, Any]) -> None:
             o["embedded"][0]["texts"] = []
 
+        def no_vendored_texts(o: dict[str, Any]) -> None:
+            o["vendored"][1]["texts"] = []
+
         def installed_path_misspelt(o: dict[str, Any]) -> None:
             o["installed"]["share/ghostty/shel/preexec.sh"] = "preexec"
 
@@ -487,6 +502,7 @@ class TestCollect(Fixture):
             (embedded_outside, "outside the repository"),
             (no_embedded_paths, "embedded Noto has no paths"),
             (no_embedded_texts, "embedded Noto has no texts"),
+            (no_vendored_texts, "vendored stb has no texts"),
             (
                 installed_path_misspelt,
                 "installed share/ghostty/shel/preexec.sh is not in the app",
