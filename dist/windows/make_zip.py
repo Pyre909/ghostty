@@ -67,6 +67,7 @@ import json
 import os
 import posixpath
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -636,12 +637,13 @@ def run(cmd: list[str]) -> str:
             cmd, cwd=REPO, check=True, capture_output=True, encoding="utf-8"
         ).stdout
     except subprocess.CalledProcessError as e:
-        raise Error(f"{' '.join(cmd)} failed:\n{e.stderr}") from None
+        raise Error(f"{shlex.join(cmd)} failed:\n{e.stderr}") from None
 
 
 def zig_build(zig: str, args: list[str], prefix: Path) -> None:
     cmd = [zig, "build", *args, "--prefix", str(prefix)]
-    print("+", " ".join(cmd), file=sys.stderr, flush=True)
+    # Quoted, so that a path with a space pastes back as one argument.
+    print("+", shlex.join(cmd), file=sys.stderr, flush=True)
     if subprocess.run(cmd, check=False, cwd=REPO).returncode != 0:
         raise Error("zig build failed")
 

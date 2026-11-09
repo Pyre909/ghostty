@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shlex
 import struct
 import subprocess
 import sys
@@ -1064,6 +1065,29 @@ class TestRun(unittest.TestCase):
             text=True,
         ).stdout
         self.assertEqual(out.strip(), ascii("J\u00f6rg"))
+
+
+class TestEcho(unittest.TestCase):
+    """Commands the script prints paste back as the same arguments."""
+
+    def test_failed_command(self) -> None:
+        cmd = [sys.executable, "-I", "-c", "import sys; sys.exit(1)", "a b"]
+        with self.assertRaises(mz.Error) as e:
+            mz.run(cmd)
+        self.assertEqual(shlex.split(str(e.exception).split(" failed:")[0]), cmd)
+
+    def test_build(self) -> None:
+        err = io.StringIO()
+        done: subprocess.CompletedProcess[bytes] = subprocess.CompletedProcess([], 0)
+        with (
+            contextlib.redirect_stderr(err),
+            mock.patch.object(subprocess, "run", return_value=done),
+        ):
+            mz.zig_build("/opt/my zig/zig", ["-Dx=1"], Path("/out dir/stage"))
+        self.assertEqual(
+            shlex.split(err.getvalue().removeprefix("+ ")),
+            ["/opt/my zig/zig", "build", "-Dx=1", "--prefix", "/out dir/stage"],
+        )
 
 
 class TestArguments(unittest.TestCase):
