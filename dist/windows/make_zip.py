@@ -98,6 +98,23 @@ BIN = frozenset(
     }
 )
 
+# Everything the build installs in share, two levels down: one level
+# would not see docs installed in share/ghostty/doc.
+SHARE = frozenset(
+    {
+        "bash-completion/completions",
+        "bat/syntaxes",
+        "fish/vendor_completions.d",
+        "ghostty/shell-integration",
+        "ghostty/themes",
+        "icons/hicolor",
+        "nvim/site",
+        "terminfo/ghostty.terminfo",
+        "vim/vimfiles",
+        "zsh/site-functions",
+    }
+)
+
 # Files and non-empty directories in share that Ghostty needs at run time.
 SHARE_FILES = ("share/terminfo/ghostty.terminfo",)
 SHARE_DIRS = ("share/ghostty/shell-integration", "share/ghostty/themes")
@@ -534,6 +551,19 @@ def check_tree(top: Path, arch: str) -> None:
                 if machine != ARCHES[arch]:
                     got = "not a PE file" if machine is None else f"{machine:#06x}"
                     problems.append(f"bin/{name} is {got}, not {arch}")
+    share = top / "share"
+    if share.is_dir():
+        names = set()
+        for child in share.iterdir():
+            # A file, or an empty directory, stands for itself.
+            below = (
+                {p.relative_to(share).as_posix() for p in child.iterdir()}
+                if child.is_dir()
+                else set()
+            )
+            names |= below or {child.name}
+        problems += [f"share/{n} is missing" for n in sorted(SHARE - names)]
+        problems += [f"share/{n} is not expected" for n in sorted(names - SHARE)]
     for f in SHARE_FILES:
         if not (top / f).is_file():
             problems.append(f"{f} is missing")
@@ -541,6 +571,8 @@ def check_tree(top: Path, arch: str) -> None:
         if not (top / d).is_dir() or not any((top / d).iterdir()):
             problems.append(f"{d} is missing or empty")
     if problems:
+        # A missing share file can be reported twice.
+        problems = list(dict.fromkeys(problems))
         raise Error(
             "the build installed an unexpected tree:\n  " + "\n  ".join(problems)
         )
@@ -743,6 +775,9 @@ def make(args: argparse.Namespace) -> None:
             f"-Dtarget={args.arch}-windows-gnu",
             "-Doptimize=ReleaseFast",
             "-Dstrip=false",
+            # Its default looks for pandoc on the build host, which would
+            # make what the zip holds depend on the host.
+            "-Demit-docs=false",
             f"-Dversion-string={args.version}",
         ]
         zig_build(zig, ["windows-packages", *flags], stage / "report")

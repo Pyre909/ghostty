@@ -749,6 +749,12 @@ class TestTree(unittest.TestCase):
         write(top / "share/terminfo/ghostty.terminfo", "ghostty|Ghostty,\n")
         write(top / "share/ghostty/shell-integration/bash/ghostty.bash", "#\n")
         write(top / "share/ghostty/themes/Dark", "#\n")
+        for d in mz.SHARE - {
+            "terminfo/ghostty.terminfo",
+            "ghostty/shell-integration",
+            "ghostty/themes",
+        }:
+            write(top / "share" / d / "file", "#\n")
 
     def test_checks(self) -> None:
         def stray_top(t: Path) -> None:
@@ -775,6 +781,22 @@ class TestTree(unittest.TestCase):
         def terminfo(t: Path) -> None:
             (t / "share/terminfo/ghostty.terminfo").unlink()
 
+        def man(t: Path) -> None:
+            write(t / "share/man/man1/ghostty.1", "x")
+
+        def doc(t: Path) -> None:
+            write(t / "share/ghostty/doc/ghostty.1.md", "x")
+
+        def stray_share(t: Path) -> None:
+            write(t / "share/README", "x")
+
+        def empty_share_dir(t: Path) -> None:
+            (t / "share/kio").mkdir()
+
+        def no_completions(t: Path) -> None:
+            (t / "share/zsh/site-functions/file").unlink()
+            (t / "share/zsh/site-functions").rmdir()
+
         with tempfile.TemporaryDirectory() as tmp:
             self.make_tree(Path(tmp))
             mz.check_tree(Path(tmp), "x86_64")
@@ -788,6 +810,11 @@ class TestTree(unittest.TestCase):
             (not_pe, "bin/ghostty.com is not a PE file"),
             (empty, "share/ghostty/themes is missing or empty"),
             (terminfo, "share/terminfo/ghostty.terminfo is missing"),
+            (man, "share/man/man1 is not expected"),
+            (doc, "share/ghostty/doc is not expected"),
+            (stray_share, "share/README is not expected"),
+            (empty_share_dir, "share/kio is not expected"),
+            (no_completions, "share/zsh/site-functions is missing"),
         ]
         for change, error in cases:
             with (
@@ -947,6 +974,28 @@ class TestCheckout(unittest.TestCase):
         with seen as zig_license:
             self.assertEqual(self.make("--zig", "./bin/zig"), "make_zip: stop\n")
         self.assertEqual(zig_license.call_args.args[0], str(zig.resolve()))
+
+    def test_builds_leave_out_docs(self) -> None:
+        # Both builds, so that they resolve the same options.
+        zig = self.repo / "zig-out" / "zig"
+        write(zig, "#!/bin/sh\n")
+        zig.chmod(0o755)
+        builds = []
+
+        def build(zig: str, args: list[str], prefix: Path) -> None:
+            builds.append(args)
+            if len(builds) == 2:
+                raise mz.Error("stop")
+
+        with (
+            mock.patch.object(mz, "zig_license", return_value=zig),
+            mock.patch.object(mz, "toolchain", return_value=[]),
+            mock.patch.object(mz, "zig_build", side_effect=build),
+        ):
+            self.assertEqual(self.make("--zig", str(zig)), "make_zip: stop\n")
+        self.assertEqual(len(builds), 2)
+        for args in builds:
+            self.assertIn("-Demit-docs=false", args)
 
     def test_tracked_change(self) -> None:
         write(self.repo / "src/shell-integration/bash/ghostty.bash", "changed\n")
