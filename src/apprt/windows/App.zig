@@ -1497,9 +1497,13 @@ pub const App = struct {
     /// one open is unframed (`beginUnframedPrompt`), so no core frame is
     /// beneath the tick. A prompt inside it, as one a tick opens, may have
     /// one beneath it, so none ticks then. A tick on the stack refuses
-    /// another anyway (`tick`).
+    /// another anyway (`tick`). Nor once the app quits, as the session's
+    /// end makes it under the dialog (`endSession`): `run` ticks no more
+    /// then either, and a prompt a tick raised would hold the end up. A
+    /// terminal blocked on the mailbox meanwhile is drained by the
+    /// teardown's wait for its threads (`waitForThread`).
     fn promptMayTick(self: *const App) bool {
-        return self.unframed_prompt and self.prompt_depth == 1;
+        return self.unframed_prompt and self.prompt_depth == 1 and !self.quit;
     }
 
     /// The window a prompt with no window of its own belongs to
@@ -19222,7 +19226,8 @@ test "win32: an export's dialog that sees the app quit is the last request carri
     // the app to quit (`endSession`): it cannot be torn down under a
     // prompt. Nothing queued behind the dialog is carried out then, not a
     // move nor another export's dialog, and what is left is freed. The
-    // test's allocator finds any left.
+    // test's allocator finds any left. Nor does the dialog's loop tick the
+    // core any more, as `run` does not.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -19231,6 +19236,9 @@ test "win32: an export's dialog that sees the app quit is the last request carri
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    App.test_tick = &TestExport.tick;
+    defer App.test_tick = null;
 
     // a | b, with the focus on a, where a move right would take it to b.
     const window = try testFrame(&app);
@@ -19244,6 +19252,7 @@ test "win32: an export's dialog that sees the app quit is the last request carri
     defer TestExport.stop(a);
     try TestExport.start(&app, a);
     TestExport.quits = true;
+    TestExport.probe = true;
 
     try std.testing.expect(try app.performAction(target, .export_terminal_io, .{ .contents = "Seq\tKind\tDescription\n" }));
     try app.requests.append(alloc, .{ .goto = .{ .from = &a.core_surface, .to = .right } });
@@ -19251,6 +19260,7 @@ test "win32: an export's dialog that sees the app quit is the last request carri
     app.createRequested();
     app.quit = false;
     try std.testing.expectEqual(1, TestExport.asks);
+    try std.testing.expectEqual(0, TestExport.ticked);
     try std.testing.expect(window.tab().focused == a);
     try std.testing.expectEqual(0, app.requests.items.len);
 }
