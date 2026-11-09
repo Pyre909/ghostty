@@ -5,8 +5,9 @@ Builds Ghostty's portable Windows zips.
 
 writes, in zig-out/dist (or --out):
 
-    ghostty-1.4.1-windows-x86_64.zip      the app: bin, share, LICENSE.txt
-                                          and THIRD-PARTY-NOTICES.txt, in a
+    ghostty-1.4.1-windows-x86_64.zip      the app: bin, share, README.txt
+                                          (this folder's), LICENSE.txt and
+                                          THIRD-PARTY-NOTICES.txt, in a
                                           ghostty-1.4.1-windows-x86_64 folder
     ghostty-1.4.1-windows-x86_64-pdb.zip  the program databases, in the same
                                           folder, so that unzipping both in
@@ -816,6 +817,7 @@ def make(args: argparse.Namespace) -> None:
         pdb: dict[str, Path | bytes] = {}
         for zip_name, path in files_under(top, name).items():
             (pdb if zip_name.endswith(".pdb") else app)[zip_name] = path
+        app[f"{name}/README.txt"] = REPO / "dist" / "windows" / "README.txt"
         app[f"{name}/LICENSE.txt"] = REPO / "LICENSE"
         app[f"{name}/THIRD-PARTY-NOTICES.txt"] = render(components).encode("utf-8")
 

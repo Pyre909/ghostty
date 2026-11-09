@@ -1079,6 +1079,51 @@ class TestCheckout(unittest.TestCase):
             )
         self.assertEqual({p.name: p.read_bytes() for p in out.iterdir()}, old)
 
+    def test_app_zip_top(self) -> None:
+        # The files make() adds beside what the build installed, through
+        # the real write_zip.
+        zig = self.repo / "zig-out" / "zig"
+        write(zig, "#!/bin/sh\n")
+        zig.chmod(0o755)
+        write(self.repo / "LICENSE", "Ghostty MIT\n")
+        write(self.repo / "dist/windows/README.txt", "Crash dumps\n")
+
+        def build(zig: str, args: list[str], prefix: Path) -> None:
+            if prefix.name == "report":
+                for name in ["windows-packages.json", "windows-package-dirs.json"]:
+                    write(prefix / name, "{}")
+            else:
+                write(prefix / "bin/ghostty.exe", "exe")
+                write(prefix / "bin/ghostty.pdb", "pdb")
+
+        with (
+            mock.patch.object(mz, "zig_license", return_value=zig),
+            mock.patch.object(mz, "toolchain", return_value=[]),
+            mock.patch.object(mz, "zig_build", side_effect=build),
+            mock.patch.object(mz, "check_tree"),
+            mock.patch.object(mz, "collect", return_value=[]),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(
+                mz.main(["--arch", "x86_64", "--version", "1.4.1", "--zig", str(zig)]),
+                0,
+            )
+        name = "ghostty-1.4.1-windows-x86_64"
+        with zipfile.ZipFile(self.repo / "zig-out/dist" / f"{name}.zip") as z:
+            self.assertEqual(
+                sorted(z.namelist()),
+                [
+                    f"{name}/LICENSE.txt",
+                    f"{name}/README.txt",
+                    f"{name}/THIRD-PARTY-NOTICES.txt",
+                    f"{name}/bin/ghostty.exe",
+                ],
+            )
+            self.assertEqual(z.read(f"{name}/README.txt"), b"Crash dumps\n")
+            self.assertEqual(z.read(f"{name}/LICENSE.txt"), b"Ghostty MIT\n")
+        with zipfile.ZipFile(self.repo / "zig-out/dist" / f"{name}-pdb.zip") as z:
+            self.assertEqual(z.namelist(), [f"{name}/bin/ghostty.pdb"])
+
     def test_tracked_change(self) -> None:
         write(self.repo / "src/shell-integration/bash/ghostty.bash", "changed\n")
         self.assertRegex(self.make(), "tracked files have changes")
