@@ -1049,11 +1049,12 @@ test "win32: pruning keeps the newest crash dumps and nothing else" {
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
     defer alloc.free(dir);
 
-    // Written newest first, so that the directory's order is not the names'.
-    var i: usize = keep + 3;
-    while (i > 0) : (i -= 1) {
+    // Oldest first, which is also the order a directory lists them in
+    // (NTFS by name, a file system without an index as they were made):
+    // a prune that skipped its sort would delete the newest.
+    for (1..keep + 4) |day| {
         var buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "ghostty-202611{d:0>2}-120000-7.dmp", .{i});
+        const name = try std.fmt.bufPrint(&buf, "ghostty-202611{d:0>2}-120000-7.dmp", .{day});
         try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = "" });
     }
     const others = [_][]const u8{ "ghostty.exe.1234.dmp", "0c9f.ghosttycrash", "notes.txt" };
