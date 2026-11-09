@@ -21,8 +21,9 @@
 //! A thread that exists only for that writes the dump, as Microsoft's
 //! MiniDumpWriteDump documentation advises: the crashing thread's stack may
 //! be exhausted (a stack overflow) or corrupt. The crashing thread hands
-//! over its exception pointers and waits, for at most `timeout_ms`, which
-//! also bounds a deadlock inside the dump (for example on the loader lock).
+//! over its exception record and context and waits, for at most
+//! `Dumper.timeout_ms`, which also bounds a deadlock inside the dump (for
+//! example on the loader lock).
 //!
 //! Fast fail (`__fastfail`, /GS checks, heap corruption) runs no handler in
 //! the process, so none of this sees it. WER's LocalDumps can capture those;
@@ -48,9 +49,6 @@ pub const keep = 10;
 /// customer codes (bit 29 set): "GH" and a letter.
 pub const panic_code: u32 = 0xE047_4850; // 'P'
 pub const test_code: u32 = 0xE047_4852; // 'R', see crashTest
-
-/// How long a crashing thread waits for its dump before dying anyway.
-const timeout_ms = 10_000;
 
 /// The dump by default: every thread's stack and registers, the module
 /// list (with the PDB identity a debugger needs), unloaded modules and
@@ -144,6 +142,9 @@ pub const Dumper = struct {
     write: MiniDumpWriteDumpFn,
     dump_type: u32,
 
+    /// How long a crashing thread waits for its dump before dying anyway.
+    timeout_ms: u32 = 10_000,
+
     /// The crash directory, `\\?\`-prefixed, and a separator, UTF-16,
     /// then room for a name.
     path: [windows.PATH_MAX_WIDE + 1]u16 = undefined,
@@ -161,7 +162,10 @@ pub const Dumper = struct {
     crasher: std.atomic.Value(u32) = .init(0),
 
     // The request, written by the crashing thread before `request` is set.
-    pointers: *const ExceptionPointers = undefined,
+    // The record and context are copies: the crashing thread's own may be
+    // gone before they are read, once it has given up waiting.
+    record: ExceptionRecord = undefined,
+    context: windows.CONTEXT = undefined,
     kind: Kind = .exception,
     thread_type: []const u8 = "",
     message: [512]u8 = undefined,
@@ -235,6 +239,7 @@ pub const Dumper = struct {
     }
 
     /// Asks for a dump of the calling thread's crash and waits for it.
+    /// The exception is copied: `pointers` need last only for the call.
     /// Returns at once when another thread's dump is under way (after
     /// waiting for it, so that this thread does not end the process
     /// before it is written), or when this thread is the dumper or is
@@ -248,11 +253,12 @@ pub const Dumper = struct {
         const me = windows.GetCurrentThreadId();
         if (me == self.thread_id.load(.acquire)) return .none;
         if (self.crasher.cmpxchgStrong(0, me, .acq_rel, .acquire)) |other| {
-            if (other != me) _ = kernel32.WaitForSingleObject(self.done, timeout_ms);
+            if (other != me) _ = kernel32.WaitForSingleObject(self.done, self.timeout_ms);
             return .none;
         }
 
-        self.pointers = pointers;
+        self.record = pointers.ExceptionRecord.*;
+        self.context = pointers.ContextRecord.*;
         self.kind = kind;
         // The thread's role, which only this thread can read.
         self.thread_type = if (crash.sentry.thread_state) |s| @tagName(s.type) else "other";
@@ -260,7 +266,7 @@ pub const Dumper = struct {
         @memcpy(self.message[0..self.message_len], message[0..self.message_len]);
 
         _ = kernel32.SetEvent(self.request);
-        return switch (kernel32.WaitForSingleObject(self.done, timeout_ms)) {
+        return switch (kernel32.WaitForSingleObject(self.done, self.timeout_ms)) {
             os_windows.WAIT_OBJECT_0 => self.result,
             else => .none,
         };
@@ -296,9 +302,13 @@ pub const Dumper = struct {
         // handles, and closing this one removes a file still marked.
         const marked = deleteOnClose(file, true);
 
+        const pointers: ExceptionPointers = .{
+            .ExceptionRecord = &self.record,
+            .ContextRecord = &self.context,
+        };
         const info: MINIDUMP_EXCEPTION_INFORMATION = .{
             .ThreadId = self.crasher.load(.acquire),
-            .ExceptionPointers = self.pointers,
+            .ExceptionPointers = &pointers,
             .ClientPointers = .FALSE,
         };
         const comment = self.commentText();
@@ -602,10 +612,16 @@ const TestWrite = struct {
     var succeed: bool = true;
     /// Whether the file was marked for deletion while being written.
     var delete_pending: bool = false;
+    /// When set, the write waits for it before it reads the exception.
+    var release: ?windows.HANDLE = null;
+    /// The exception code the write was given.
+    var code: u32 = 0;
 
     fn reset() void {
         succeed = true;
         delete_pending = false;
+        release = null;
+        code = 0;
     }
 
     fn write(
@@ -613,7 +629,7 @@ const TestWrite = struct {
         _: u32,
         file: windows.HANDLE,
         _: u32,
-        _: ?*const MINIDUMP_EXCEPTION_INFORMATION,
+        exception: ?*const MINIDUMP_EXCEPTION_INFORMATION,
         _: ?*const MINIDUMP_USER_STREAM_INFORMATION,
         _: ?*const anyopaque,
     ) callconv(.winapi) windows.BOOL {
@@ -627,6 +643,8 @@ const TestWrite = struct {
             .Standard,
         ) == .SUCCESS and info.DeletePending != .FALSE;
         _ = kernel32.WriteFile(file, "hello", 5, null, null);
+        if (release) |event| _ = kernel32.WaitForSingleObject(event, os_windows.INFINITE);
+        code = exception.?.ExceptionPointers.ExceptionRecord.ExceptionCode;
         if (succeed) return .TRUE;
         kernel32.SetLastError(.DISK_FULL);
         return .FALSE;
@@ -815,6 +833,45 @@ test "win32: a dump that fails leaves no file" {
         alloc.free(names);
     }
     try testing.expectEqual(0, names.len);
+}
+
+test "win32: a crash's record outlives a thread that gave up waiting" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    const release = kernel32.CreateEventW(null, .TRUE, .FALSE, null) orelse
+        return error.TestUnexpectedResult;
+    defer _ = kernel32.CloseHandle(release);
+
+    var d: Dumper = undefined;
+    try d.start(dir, small_type);
+    {
+        // Last first: the write is let go, then the dumper is joined.
+        defer d.stop();
+        defer _ = kernel32.SetEvent(release);
+        TestWrite.reset();
+        TestWrite.release = release;
+        d.write = TestWrite.write;
+        d.timeout_ms = 50;
+
+        // The thread panics, gives up on its dump and is gone, stack and
+        // all, while the dump is still being written.
+        const Crasher = struct {
+            fn run(dd: *Dumper, out: *Dumper.Result) void {
+                out.* = dumpHere(dd, panic_code, "gone", @returnAddress());
+            }
+        };
+        var result: Dumper.Result = .{ .failed = .SUCCESS };
+        const t = try std.Thread.spawn(.{}, Crasher.run, .{ &d, &result });
+        t.join();
+        try testing.expect(result == .none);
+    }
+
+    // Only then did the write read the exception it was given.
+    try testing.expectEqual(panic_code, TestWrite.code);
 }
 
 test "win32: only a process's first crash is dumped" {
