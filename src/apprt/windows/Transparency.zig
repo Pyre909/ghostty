@@ -229,8 +229,8 @@ var layer_failed_logged = false;
 /// composed opaque, where its pixels would otherwise add to what is behind
 /// the frame. Whether it is; a layered window shows nothing until its
 /// attributes are set, so if they cannot be, it is not layered after all,
-/// and shows as GDI drew it, said once for the process (without the
-/// manifest's Windows 8 declaration every child fails, error 87).
+/// and shows as GDI drew it, said once for the process (without a
+/// manifest declaring Windows 8 or later every child fails, error 87).
 pub fn layer(hwnd: win32.HWND) bool {
     const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE);
     const layered: isize = win32.WS_EX_LAYERED;
