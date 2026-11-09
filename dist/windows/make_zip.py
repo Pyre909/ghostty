@@ -817,12 +817,14 @@ def make(args: argparse.Namespace) -> None:
         app[f"{name}/LICENSE.txt"] = REPO / "LICENSE"
         app[f"{name}/THIRD-PARTY-NOTICES.txt"] = render(components).encode("utf-8")
 
-        done = []
-        for dest, files in ((out / f"{name}.zip", app), (out / f"{name}-pdb.zip", pdb)):
+        pair = [(out / f"{name}.zip", app), (out / f"{name}-pdb.zip", pdb)]
+        # Both are written before either is published, so that a failure
+        # leaves the earlier pair rather than one zip from each build.
+        for dest, files in pair:
             write_zip(stage / dest.name, files, when)
+        for dest, _ in pair:
             os.replace(stage / dest.name, dest)
-            done.append(dest)
-    for dest in done:
+    for dest, _ in pair:
         print(f"{sha256(dest)}  {dest.name}")
 
 

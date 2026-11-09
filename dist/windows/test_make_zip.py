@@ -1039,6 +1039,42 @@ class TestCheckout(unittest.TestCase):
         for args in builds:
             self.assertIn("-Demit-docs=false", args)
 
+    def test_failed_pdb_zip_keeps_the_earlier_pair(self) -> None:
+        zig = self.repo / "zig-out" / "zig"
+        write(zig, "#!/bin/sh\n")
+        zig.chmod(0o755)
+        out = self.repo / "zig-out" / "dist"
+        old = {
+            "ghostty-1.4.1-windows-x86_64.zip": b"earlier app",
+            "ghostty-1.4.1-windows-x86_64-pdb.zip": b"earlier pdb",
+        }
+        for name, data in old.items():
+            write(out / name, data)
+
+        def build(zig: str, args: list[str], prefix: Path) -> None:
+            prefix.mkdir()
+            if prefix.name == "report":
+                for name in ["windows-packages.json", "windows-package-dirs.json"]:
+                    write(prefix / name, "{}")
+
+        def write_zip(path: Path, files: dict[str, Any], when: Any) -> None:
+            if path.name.endswith("-pdb.zip"):
+                raise mz.Error("the disk is full")
+            path.write_bytes(b"new app")
+
+        with (
+            mock.patch.object(mz, "zig_license", return_value=zig),
+            mock.patch.object(mz, "toolchain", return_value=[]),
+            mock.patch.object(mz, "zig_build", side_effect=build),
+            mock.patch.object(mz, "check_tree"),
+            mock.patch.object(mz, "collect", return_value=[]),
+            mock.patch.object(mz, "write_zip", side_effect=write_zip),
+        ):
+            self.assertEqual(
+                self.make("--zig", str(zig)), "make_zip: the disk is full\n"
+            )
+        self.assertEqual({p.name: p.read_bytes() for p in out.iterdir()}, old)
+
     def test_tracked_change(self) -> None:
         write(self.repo / "src/shell-integration/bash/ghostty.bash", "changed\n")
         self.assertRegex(self.make(), "tracked files have changes")
