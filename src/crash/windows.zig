@@ -188,10 +188,12 @@ pub const Dumper = struct {
         failed: windows.Win32Error,
     };
 
+    const thread_name = "crash-dump";
+
     /// `dir` is the crash directory, which must exist and be absolute.
     /// The dumper is not movable once started: its thread holds a pointer
     /// to it.
-    pub fn start(self: *Dumper, dir: []const u8, dump_type: u32) !void {
+    pub fn start(self: *Dumper, io: std.Io, dir: []const u8, dump_type: u32) !void {
         const write = try loadMiniDumpWriteDump();
         const request = kernel32.CreateEventW(null, .FALSE, .FALSE, null) orelse
             return windows.unexpectedError(windows.GetLastError());
@@ -226,6 +228,8 @@ pub const Dumper = struct {
         // MiniDumpWriteDump's own stack use is modest; a megabyte leaves
         // room for the system's stack walking.
         self.thread = try std.Thread.spawn(.{ .stack_size = 1024 * 1024 }, run, .{self});
+        // The name is in every dump: its thread list holds this thread too.
+        self.thread.setName(io, thread_name) catch {};
     }
 
     /// Stops the thread and closes the events. Tests only: the app's dumper
@@ -459,7 +463,7 @@ pub fn install(
     };
 
     const full = if (environ_map.get("GHOSTTY_CRASH_DUMP")) |v| std.mem.eql(u8, v, "full") else false;
-    try dumper.start(dir.path, if (full) full_type else small_type);
+    try dumper.start(io, dir.path, if (full) full_type else small_type);
     installed.store(true, .release);
 
     previous_filter = kernel32.SetUnhandledExceptionFilter(filter);
@@ -717,8 +721,11 @@ test "win32: a panic's crash dump holds its code, thread and message" {
     defer alloc.free(dir);
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     defer d.stop();
+
+    var name_buf: [std.Thread.max_name_len:0]u8 = undefined;
+    try testing.expectEqualStrings(Dumper.thread_name, (try d.thread.getName(&name_buf)).?);
 
     // The thread's role is a threadlocal, which the dumper's thread
     // cannot read: the panicking thread hands it over.
@@ -769,7 +776,7 @@ test "win32: a crash directory longer than MAX_PATH takes a dump" {
     try testing.expect(dir.len > windows.MAX_PATH);
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     defer d.stop();
     // The documented prefix, not its NT form, which CreateFileW also
     // takes on Windows 11.
@@ -793,7 +800,7 @@ test "win32: a dump is marked for deletion until it is whole" {
     defer alloc.free(dir);
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     defer d.stop();
     TestWrite.reset();
     d.write = TestWrite.write;
@@ -819,7 +826,7 @@ test "win32: a dump that fails leaves no file" {
     defer alloc.free(dir);
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     defer d.stop();
     TestWrite.reset();
     TestWrite.succeed = false;
@@ -852,7 +859,7 @@ test "win32: a crash's record outlives a thread that gave up waiting" {
     defer _ = kernel32.CloseHandle(release);
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     {
         // Last first: the write is let go, then the dumper is joined.
         defer d.stop();
@@ -887,7 +894,7 @@ test "win32: only a process's first crash is dumped" {
     defer alloc.free(dir);
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     defer d.stop();
 
     var context: windows.CONTEXT = undefined;
@@ -973,7 +980,7 @@ test "win32: a second crashing thread waits for the first one's dump" {
     };
 
     var d: Dumper = undefined;
-    try d.start(dir, small_type);
+    try d.start(testing.io, dir, small_type);
     var released: std.atomic.Value(bool) = .init(false);
     var first: Crasher = .{ .dumper = &d, .pointers = &pointers, .released = &released };
     var second: Crasher = .{ .dumper = &d, .pointers = &pointers, .released = &released, .entered = entered };
@@ -1067,7 +1074,7 @@ test "win32: the unhandled-exception filter dumps, then lets Windows end the pro
     try testing.expectEqual(windows.EXCEPTION_CONTINUE_SEARCH, filter(info));
 
     // The app's own dumper, as `install` starts it.
-    try dumper.start(dir, small_type);
+    try dumper.start(testing.io, dir, small_type);
     installed.store(true, .release);
     defer {
         installed.store(false, .release);
@@ -1126,7 +1133,7 @@ test "win32: the unhandled-exception filter passes on the previous filter's verd
     try testing.expectEqual(1, TestFilter.calls);
     try testing.expect(!TestFilter.dumped);
 
-    try dumper.start(dir, small_type);
+    try dumper.start(testing.io, dir, small_type);
     installed.store(true, .release);
     defer {
         installed.store(false, .release);
