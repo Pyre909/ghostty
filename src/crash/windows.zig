@@ -612,6 +612,9 @@ const TestWrite = struct {
     var succeed: bool = true;
     /// Whether the file was marked for deletion while being written.
     var delete_pending: bool = false;
+    /// When set, the write sets it once the file is there, to say that
+    /// it has begun.
+    var started: ?windows.HANDLE = null;
     /// When set, the write waits for it before it reads the exception.
     var release: ?windows.HANDLE = null;
     /// The exception code the write was given.
@@ -620,6 +623,7 @@ const TestWrite = struct {
     fn reset() void {
         succeed = true;
         delete_pending = false;
+        started = null;
         release = null;
         code = 0;
     }
@@ -643,6 +647,7 @@ const TestWrite = struct {
             .Standard,
         ) == .SUCCESS and info.DeletePending != .FALSE;
         _ = kernel32.WriteFile(file, "hello", 5, null, null);
+        if (started) |event| _ = kernel32.SetEvent(event);
         if (release) |event| _ = kernel32.WaitForSingleObject(event, os_windows.INFINITE);
         code = exception.?.ExceptionPointers.ExceptionRecord.ExceptionCode;
         if (succeed) return .TRUE;
@@ -923,6 +928,86 @@ test "win32: a relative crash directory installs nothing" {
         );
         try testing.expect(!installed.load(.acquire));
     }
+}
+
+test "win32: a second crashing thread waits for the first one's dump" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    var events: [3]windows.HANDLE = undefined;
+    for (&events, 0..) |*event, i| {
+        errdefer for (events[0..i]) |made| {
+            _ = kernel32.CloseHandle(made);
+        };
+        event.* = kernel32.CreateEventW(null, .TRUE, .FALSE, null) orelse
+            return error.TestUnexpectedResult;
+    }
+    defer for (events) |event| {
+        _ = kernel32.CloseHandle(event);
+    };
+    const started, const release, const entered = events;
+
+    var context: windows.CONTEXT = undefined;
+    var record: ExceptionRecord = undefined;
+    const pointers = testPointers(&context, &record);
+
+    const Crasher = struct {
+        dumper: *Dumper,
+        pointers: *const ExceptionPointers,
+        /// Whether the first thread's write has been let go.
+        released: *const std.atomic.Value(bool),
+        /// Set when the thread runs, if not null.
+        entered: ?windows.HANDLE = null,
+        result: Dumper.Result = .{ .failed = .SUCCESS },
+        /// What `released` was when `dump` returned.
+        saw_released: bool = false,
+
+        fn run(self: *@This()) void {
+            if (self.entered) |event| _ = kernel32.SetEvent(event);
+            self.result = self.dumper.dump(self.pointers, .exception, "");
+            self.saw_released = self.released.load(.acquire);
+        }
+    };
+
+    var d: Dumper = undefined;
+    try d.start(dir, small_type);
+    var released: std.atomic.Value(bool) = .init(false);
+    var first: Crasher = .{ .dumper = &d, .pointers = &pointers, .released = &released };
+    var second: Crasher = .{ .dumper = &d, .pointers = &pointers, .released = &released, .entered = entered };
+    {
+        // Last first: the write is let go, then the dumper is joined.
+        defer d.stop();
+        defer _ = kernel32.SetEvent(release);
+        TestWrite.reset();
+        TestWrite.started = started;
+        TestWrite.release = release;
+        d.write = TestWrite.write;
+
+        // The first thread's dump is under way and held there.
+        const a = try std.Thread.spawn(.{}, Crasher.run, .{&first});
+        _ = kernel32.WaitForSingleObject(started, d.timeout_ms);
+
+        // The second crashes meanwhile. A thread that did not wait would
+        // be back well within the pause, before the write is let go.
+        const b = std.Thread.spawn(.{}, Crasher.run, .{&second}) catch |err| {
+            _ = kernel32.SetEvent(release);
+            a.join();
+            return err;
+        };
+        _ = kernel32.WaitForSingleObject(entered, d.timeout_ms);
+        std.Io.sleep(testing.io, .fromMilliseconds(50), .awake) catch {};
+        released.store(true, .release);
+        _ = kernel32.SetEvent(release);
+        a.join();
+        b.join();
+    }
+
+    try testing.expect(first.result == .written);
+    try testing.expect(second.result == .none);
+    try testing.expect(second.saw_released);
 }
 
 test "win32: the exceptions Zig's segfault handler ends the process for" {
