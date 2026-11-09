@@ -77,24 +77,32 @@ const Package = struct {
 };
 
 /// Builds windows-package-dirs.json: Ghostty, then every package Zig
-/// fetched or found for this build, sorted by hash. The build runner's
-/// table (`std.Build.package_map`) holds each package's directory and the
-/// name and hash of each of its dependencies; the root package's are in
-/// `root_deps`.
+/// fetched or found for this build, sorted by hash. The table Zig
+/// generates into the build runner (`@import("root").dependencies`) holds
+/// each package's directory and the name and hash of each of its
+/// dependencies; the root package's are in `root_deps`.
 fn dirs(b: *std.Build) error{OutOfMemory}![]const u8 {
     const arena = b.allocator;
-    const map = std.Build.package_map;
+    // The table LibVtPackages.report reads, read the same way. An
+    // unavailable package declares neither deps nor build_root.
+    const all = @import("root").dependencies;
 
     var names: std.StringArrayHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
-    try addNames(arena, &names, @import("root").dependencies.root_deps);
-    for (map.values()) |pkg| try addNames(arena, &names, pkg.deps);
-
+    try addNames(arena, &names, all.root_deps);
     var packages: std.ArrayList(Package) = .empty;
-    for (map.keys(), map.values()) |hash, pkg| {
-        if (!pkg.available) continue;
-        const found: [][]const u8 = if (names.getPtr(hash)) |list| list.items else &.{};
-        std.mem.sort([]const u8, found, {}, lessThan);
-        try packages.append(arena, .{ .hash = hash, .dir = pkg.build_root, .names = found });
+    inline for (@typeInfo(all.packages).@"struct".decl_names) |hash| {
+        const pkg = @field(all.packages, hash);
+        const available = !@hasDecl(pkg, "available") or pkg.available;
+        if (available) {
+            try addNames(arena, &names, pkg.deps);
+            try packages.append(arena, .{ .hash = hash, .dir = pkg.build_root, .names = &.{} });
+        }
+    }
+    // Names are known once every package's deps are read.
+    for (packages.items) |*pkg| {
+        const list = names.getPtr(pkg.hash) orelse continue;
+        std.mem.sort([]const u8, list.items, {}, lessThan);
+        pkg.names = list.items;
     }
     std.mem.sort(Package, packages.items, {}, struct {
         fn f(_: void, l: Package, r: Package) bool {
