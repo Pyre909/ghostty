@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -868,6 +869,29 @@ class TestZip(unittest.TestCase):
         os.environ["SOURCE_DATE_EPOCH"] = "soon"
         with self.assertRaisesRegex(mz.Error, "not a number"):
             mz.zip_time()
+
+
+class TestRun(unittest.TestCase):
+    def test_reads_utf8_whatever_the_locale(self) -> None:
+        # A Python without UTF-8 mode on a Windows code page, running a
+        # child that prints "Jörg" in UTF-8, as zig prints a path.
+        code = "\n".join(
+            [
+                "import locale, sys",
+                f"sys.path.insert(0, {str(Path(mz.__file__).parent)!r})",
+                "locale.getencoding = lambda: 'cp1252'",
+                "import make_zip",
+                "child = 'import sys; sys.stdout.buffer.write(bytes([74, 195, 182, 114, 103]))'",
+                "print(ascii(make_zip.run([sys.executable, '-I', '-c', child])))",
+            ]
+        )
+        out = subprocess.run(
+            [sys.executable, "-I", "-B", "-X", "utf8=0", "-c", code],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        self.assertEqual(out.strip(), ascii("J\u00f6rg"))
 
 
 class TestArguments(unittest.TestCase):

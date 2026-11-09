@@ -588,9 +588,11 @@ def git(*args: str) -> str:
 
 
 def run(cmd: list[str]) -> str:
+    # zig and git print UTF-8; without UTF-8 mode, as on Windows before
+    # Python 3.15, text=True would decode with the ANSI code page.
     try:
         return subprocess.run(
-            cmd, cwd=REPO, check=True, capture_output=True, text=True
+            cmd, cwd=REPO, check=True, capture_output=True, encoding="utf-8"
         ).stdout
     except subprocess.CalledProcessError as e:
         raise Error(f"{' '.join(cmd)} failed:\n{e.stderr}") from None
