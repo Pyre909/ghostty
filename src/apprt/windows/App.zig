@@ -1988,6 +1988,10 @@ pub const App = struct {
             .quit_timer => self.setQuitTimer(value),
 
             .set_title => self.setTitle(target, value),
+            .pwd => switch (target) {
+                .app => false,
+                .surface => |v| v.rt_surface.setPwd(value.pwd),
+            },
             .close_window => self.closeWindow(target),
             .close_tab => self.closeTab(target, value),
             .present_terminal => presentTerminal(target),
@@ -5654,6 +5658,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.core_surface.rt_surface = surface;
     surface.title = null;
     surface.title_override = null;
+    surface.pwd = null;
     surface.initial_size = null;
     surface.min_size = null;
     surface.ime = .{};
@@ -8025,6 +8030,38 @@ test "win32: a window is titled after its focused terminal" {
 
     _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("right"), caption(window, &buf));
+}
+
+test "win32: a terminal keeps the directory its shell reports" {
+    // The core frees what it reports once the action returns, so the
+    // terminal's copy must be its own.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    try std.testing.expect(pane.pwd == null);
+
+    var reported = "C:\\src\\one".*;
+    try std.testing.expect(pane.setPwd(&reported));
+    @memset(&reported, 'x');
+    try std.testing.expectEqualStrings("C:\\src\\one", pane.pwd.?);
+
+    // The next one replaces it (the testing allocator fails a leak of
+    // the one before), and an empty report is none.
+    try std.testing.expect(pane.setPwd("D:\\"));
+    try std.testing.expectEqualStrings("D:\\", pane.pwd.?);
+    try std.testing.expect(pane.setPwd(""));
+    try std.testing.expect(pane.pwd == null);
+
+    // One still set when the terminal goes is freed with it.
+    try std.testing.expect(pane.setPwd("C:\\src"));
 }
 
 test "win32: a click on an inactive window picks the terminal it focuses" {

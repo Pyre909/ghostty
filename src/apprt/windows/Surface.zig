@@ -100,6 +100,13 @@ pub const Surface = struct {
     /// changes `title` only, and shows once this is cleared.
     title_override: ?[:0]u8,
 
+    /// The working directory the terminal's shell last reported (`.pwd`,
+    /// from OSC 7 or 9;9), or null when it reported none. Owned by this
+    /// struct. Kept here because the core's own copy is read under the
+    /// renderer's lock (`CoreSurface.pwd`), which this thread may already
+    /// hold where the windows are described to be saved.
+    pwd: ?[]u8,
+
     /// The client size the core asked for through `.initial_size`, or null
     /// when `window-width`/`window-height` are unset. The core divides the
     /// cell area by the content scale but adds the padding in device pixels
@@ -809,6 +816,7 @@ pub const Surface = struct {
             .hwnd = undefined,
             .title = null,
             .title_override = null,
+            .pwd = null,
             .initial_size = null,
             .min_size = null,
             .closing = false,
@@ -1037,6 +1045,8 @@ pub const Surface = struct {
         self.title = null;
         if (self.title_override) |v| self.app.core_app.alloc.free(v);
         self.title_override = null;
+        if (self.pwd) |v| self.app.core_app.alloc.free(v);
+        self.pwd = null;
         self.ime.pending.clearAndFree(self.app.core_app.alloc);
         self.notifications.deinit(self.app.core_app.alloc);
         self.search_bar.deinit();
@@ -1992,6 +2002,20 @@ pub const Surface = struct {
         if (self.title) |old| alloc.free(old);
         self.title = copy;
         return self.showTitleChange();
+    }
+
+    /// `.pwd`: the working directory the shell reported, copied since the
+    /// core frees `path` when this returns; empty for none. Returns false
+    /// if it could not be stored, and the one before is then kept.
+    pub fn setPwd(self: *Surface, path: []const u8) bool {
+        const alloc = self.app.core_app.alloc;
+        const copy: ?[]u8 = if (path.len == 0) null else alloc.dupe(u8, path) catch |err| {
+            log.warn("failed to store the working directory err={}", .{err});
+            return false;
+        };
+        if (self.pwd) |old| alloc.free(old);
+        self.pwd = copy;
+        return true;
     }
 
     /// The title from the terminal's title prompt (`TitleDialog.commit`):
