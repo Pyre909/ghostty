@@ -1513,6 +1513,28 @@ fn expectListed(found: *const Found, want: []const []const u8) !void {
     for (want, found.available()) |w, m| try std.testing.expectEqualStrings(w, m);
 }
 
+test "win32: the unsafe paste prompt asks in the user's language" {
+    const i18n = @import("../../os/main.zig").i18n;
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Warning: Potentially Unsafe Paste", "Achtung" },
+        .{
+            "Pasting this text into the terminal may be dangerous as it looks like some commands may be executed.",
+            "Das kann Befehle starten.",
+        },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+    var question: Question = .{};
+    try std.testing.expectEqualSlices(
+        u16,
+        std.unicode.utf8ToUtf16LeStringLiteral("Achtung\n\nDas kann Befehle starten."),
+        std.mem.span(clipboardPrompt(.paste, &question)),
+    );
+}
+
 test "win32: clipboard prompts word pastes, reads and writes apart, and default to Cancel" {
     var question: Question = .{};
     var other: Question = .{};

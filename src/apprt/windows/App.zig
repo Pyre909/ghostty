@@ -12590,6 +12590,9 @@ const TestKittyPrompt = struct {
     /// Enter presses, the title bar's mode, and an image's pixels where
     /// they are drawn.
     const View = struct {
+        caption: Text = .{},
+        allow: Text = .{},
+        deny: Text = .{},
         heading: Text = .{},
         part: Text = .{},
         count: isize = 0,
@@ -12613,6 +12616,9 @@ const TestKittyPrompt = struct {
         fn of(dialog: win32.HWND) View {
             const parts = win32.GetDlgItem(dialog, ClipboardDialog.id_parts);
             var v: View = .{
+                .caption = .of(dialog),
+                .allow = .of(win32.GetDlgItem(dialog, win32.IDOK)),
+                .deny = .of(win32.GetDlgItem(dialog, win32.IDCANCEL)),
                 .heading = .of(win32.GetDlgItem(dialog, ClipboardDialog.id_heading)),
                 .part = .of(parts),
                 .count = if (parts) |p| win32.SendMessageW(p, win32.CB_GETCOUNT, 0, 0) else 0,
@@ -12724,6 +12730,11 @@ const TestKittyPrompt = struct {
     /// with the clipboard free for other programs to open and change.
     fn expectAsked(want: win32.LPCWSTR) !void {
         defer forget();
+        // GTK's heading and buttons, in the language in use.
+        var words: Question = .{};
+        try first.caption.expect(std.mem.span(words.one("Authorize Clipboard Access")));
+        try first.allow.expect(std.mem.span(words.one("Allow")));
+        try first.deny.expect(std.mem.span(words.one("Deny")));
         try first.heading.expect(std.mem.span(want));
         try std.testing.expectEqual(@as(isize, win32.DC_HASDEFID) << 16 | win32.IDCANCEL, first.default);
         try std.testing.expectEqual(1, first.previews);
@@ -12865,6 +12876,16 @@ test "win32: a Kitty clipboard read serves what was read, asking first, and answ
 test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
     var question: Question = .{};
     const alloc = std.testing.allocator;
+    // In a language of the user's, where a build has them.
+    const i18n = internal_os.i18n;
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Authorize Clipboard Access", "Zugriff erlauben" },
+        .{ "Allow", "Erlauben" },
+        .{ "Deny", "Nicht erlauben" },
+    });
+    defer alloc.free(catalog);
+    if (comptime i18n.windows.embedded) try i18n.windows.testUse(catalog);
+    defer if (comptime i18n.windows.embedded) i18n.windows.testUse(null) catch unreachable;
     const clipboard = @import("clipboard.zig");
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
