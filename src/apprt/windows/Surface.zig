@@ -796,6 +796,12 @@ pub const Surface = struct {
 
         /// What the terminal is opened as, for `apprt.surface.newConfig`.
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// The terminal is one of a saved window's (`Session.apply`): it
+        /// starts in `working_directory`, or with none in the configured
+        /// one, and never in the directory of the terminal made before
+        /// it, which `apprt.surface.newConfig` may have chosen.
+        restored: bool = false,
     };
 
     /// Heap-allocate and initialize, including the core surface, as a child
@@ -904,7 +910,11 @@ pub const Surface = struct {
         defer config.deinit();
         // A path asked for is checked as an inherited one is.
         const wd = if (opts.overrides) |o| o.workingDirectory(opts.working_directory) else opts.working_directory;
-        inheritWorkingDirectory(&config, app.config.@"working-directory", wd);
+        if (opts.restored and wd == null) {
+            config.@"working-directory" = app.config.@"working-directory";
+        } else {
+            inheritWorkingDirectory(&config, app.config.@"working-directory", wd);
+        }
         // Before init, which clears `first`.
         self.ran_command = (if (opts.overrides) |o| o.command != null else false) or
             (app.core_app.first and config.@"initial-command" != null);

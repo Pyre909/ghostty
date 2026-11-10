@@ -325,10 +325,26 @@ pub fn shownTitle(self: *const Window, alloc: std.mem.Allocator, t: *const Tab) 
 /// the shown one or at the end, as `window-new-tab-position` asks; its
 /// index. The tab is not shown yet (`selectTab`).
 pub fn insertTab(self: *Window, surface: *Surface) !usize {
+    return self.insertTabAt(surface, .configured);
+}
+
+/// Where a new tab goes among the others.
+pub const TabPlace = enum {
+    /// Where `window-new-tab-position` asks.
+    configured,
+    /// After them all: a saved window's tabs come back in their order.
+    end,
+};
+
+/// `insertTab`, at `place`.
+pub fn insertTabAt(self: *Window, surface: *Surface, place: TabPlace) !usize {
     const t = try self.tabFor(surface);
     errdefer comptime unreachable;
-    const at = switch (self.app.config.@"window-new-tab-position") {
-        .current => self.selected + 1,
+    const at = switch (place) {
+        .configured => switch (self.app.config.@"window-new-tab-position") {
+            .current => self.selected + 1,
+            .end => self.tabs.items.len,
+        },
         .end => self.tabs.items.len,
     };
     self.tabs.insertAssumeCapacity(at, t);
@@ -348,9 +364,10 @@ fn tabFor(self: *Window, surface: *Surface) Allocator.Error!*Tab {
 }
 
 /// A new terminal, made with `opts` at the size of the client area, in a
-/// tab of its own (`insertTab`); the tab's index. Hidden until the tab is
-/// shown (`selectTab`), once the app owns the terminal (`App.newTab`).
-pub fn newTab(self: *Window, opts: Surface.Options) !usize {
+/// tab of its own at `place` (`insertTabAt`); the tab's index. Hidden
+/// until the tab is shown (`selectTab`), once the app owns the terminal
+/// (`App.newTab`).
+pub fn newTab(self: *Window, opts: Surface.Options, place: TabPlace) !usize {
     const area = self.newTabArea() orelse return App.Error.Win32CallFailed;
     const surface = surface: {
         if (builtin.is_test) if (test_create_pane) |make| break :surface try make(self, opts);
@@ -358,7 +375,7 @@ pub fn newTab(self: *Window, opts: Surface.Options) !usize {
     };
     // Nothing owns the terminal until it is in a tab.
     errdefer surface.discard();
-    return try self.insertTab(surface);
+    return try self.insertTabAt(surface, place);
 }
 
 /// Where a new tab's terminal goes: under the bar as it will be with
@@ -1151,13 +1168,62 @@ pub fn makeTransparent(self: *Window) void {
 }
 
 /// Where `show` leaves the frame it shows.
-pub const Placing = enum {
+pub const Placing = union(enum) {
     /// A new window: at `window-position-x` and `window-position-y`, when
     /// both are set (`applyInitialPosition`).
     configured,
     /// Where it is: where its maker put it (`placeForDrop`), or Windows.
     as_is,
+    /// A saved window (`window-save-state`), as `placeRestored` found it
+    /// is to show: as it was, whatever the configuration asks of a new
+    /// window's size, position, `maximize` and `fullscreen`.
+    restored: Restored,
+
+    pub const Restored = struct {
+        /// Where it is when neither maximized nor covering its monitor.
+        rect: win32.RECT,
+        maximized: bool,
+        fullscreen: bool,
+    };
 };
+
+/// Put the still-hidden frame of a saved window where it will show, for
+/// its terminals to be made at the size they will have: at the place
+/// `restoredRect` gives it on the monitor nearest to where it was, or,
+/// for one that will be maximized or cover its monitor, over that
+/// monitor's work area or all of it. Splits are refused where a terminal
+/// would not fit (`split`), so a frame left at the size Windows made it
+/// would lose terminals that fit the window as it shows. `show` then
+/// shows it as the returned placing says. Left as it is, logged, if its
+/// monitor cannot be read.
+pub fn placeRestored(self: *Window, saved: SavedPlace) Placing {
+    const flags = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOOWNERZORDER;
+    const was: win32.RECT = .{
+        .left = saved.rect[0],
+        .top = saved.rect[1],
+        .right = saved.rect[2],
+        .bottom = saved.rect[3],
+    };
+    const info = monitorInfo(win32.MonitorFromRect(&was, win32.MONITOR_DEFAULTTONEAREST)) orelse
+        return .as_is;
+    var rect = restoredRect(saved.rect, saved.dpi, dpiOf(self.app, self.hwnd), info.rcWork);
+    self.moveTo(rect, flags);
+    // On a monitor with another DPI the frame got WM_DPICHANGED as it
+    // arrived: placed again at the scale it has there, as a new
+    // window's position is (`applyInitialPosition`).
+    const dpi = dpiOf(self.app, self.hwnd);
+    const again = restoredRect(saved.rect, saved.dpi, dpi, info.rcWork);
+    if (!std.meta.eql(again, rect)) {
+        rect = again;
+        self.moveTo(rect, flags);
+    }
+    if (saved.fullscreen) {
+        self.moveTo(info.rcMonitor, flags);
+    } else if (saved.maximized) {
+        self.moveTo(info.rcWork, flags);
+    }
+    return .{ .restored = .{ .rect = rect, .maximized = saved.maximized, .fullscreen = saved.fullscreen } };
+}
 
 /// Size the still-hidden frame to `window-width`/`window-height`, place it
 /// as `placing` says, maximize it if `maximize` asks, cover its monitor if
@@ -1170,9 +1236,9 @@ pub fn show(self: *Window, placing: Placing) void {
     // work area, which must be the one the position is on, not the one
     // Windows made the frame on.
     if (placing == .configured) self.applyInitialPosition();
-    if (self.tab().focused) |surface| {
+    if (placing != .restored) if (self.tab().focused) |surface| {
         if (surface.initial_size) |size| self.applyInitialSize(surface, size);
-    }
+    };
 
     // Again after the size, from the frame it left, which the placing
     // keeps inside a work area, and before `maximize` and `fullscreen`,
@@ -1189,13 +1255,29 @@ pub fn show(self: *Window, placing: Placing) void {
     // implementation details ("When does STARTF_USESHOWWINDOW override the
     // parameter passed to ShowWindow()?", The Old New Thing), and does not
     // give it to a later window shown with SW_SHOWNORMAL instead.
-    const maximize = self.app.config.maximize;
+    const maximize = switch (placing) {
+        .restored => |r| r.maximized,
+        else => self.app.config.maximize,
+    };
+    // A saved window that was either goes back to its own rect: until
+    // now its frame was over what it will cover (`placeRestored`).
+    switch (placing) {
+        .restored => |r| if (r.maximized or r.fullscreen) self.moveTo(
+            r.rect,
+            win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOOWNERZORDER,
+        ),
+        else => {},
+    }
     if (maximize) _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWMAXIMIZED);
 
     // `fullscreen` starts every window covering its monitor, as on GTK;
     // the macOS-only kinds of it are taken as the one kind there is. After
     // the size above, which leaving fullscreen goes back to.
-    if (self.app.config.fullscreen != .false) self.toggleFullscreen();
+    const fullscreen = switch (placing) {
+        .restored => |r| r.fullscreen,
+        else => self.app.config.fullscreen != .false,
+    };
+    if (fullscreen) self.toggleFullscreen();
 
     if (!maximize) _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNORMAL);
     _ = win32.UpdateWindow(self.hwnd);

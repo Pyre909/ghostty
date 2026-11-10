@@ -2429,7 +2429,7 @@ pub const App = struct {
         opts.overrides = overrides;
 
         const window = parent.rt_surface.window;
-        const index = try window.newTab(opts);
+        const index = try window.newTab(opts, .configured);
         errdefer comptime unreachable;
         self.surfaces.appendAssumeCapacity(window.tabs.items[index].focused.?);
         overrideTitle(window.tabs.items[index].focused.?, overrides);
@@ -29074,4 +29074,267 @@ test "win32: any split tree is saved as it is, in the order a state lists one" {
     }
     // The trees did come in another order than a state's.
     try std.testing.expect(unordered > 0);
+}
+
+/// For tests: the terminals a saved window's are made as
+/// (`Window.test_create_pane`), each titled, as a program titles one,
+/// with the directory it was asked to start in; and after `fail_after`
+/// of them, none.
+const TestRestore = struct {
+    var fail_after: ?usize = null;
+    var made: usize = 0;
+    var unrestored: usize = 0;
+    /// The least width the frame had as a terminal was made in it, but
+    /// for a window's first, which is made before the frame is placed.
+    var narrowest: i32 = std.math.maxInt(i32);
+
+    fn start() void {
+        fail_after = null;
+        made = 0;
+        unrestored = 0;
+        narrowest = std.math.maxInt(i32);
+        Window.test_create_pane = &create;
+    }
+
+    fn stop() void {
+        Window.test_create_pane = null;
+    }
+
+    fn create(w: *Window, opts: Surface.Options) anyerror!*Surface {
+        if (fail_after) |n| if (made >= n) return error.OutOfMemory;
+        made += 1;
+        if (!opts.restored) unrestored += 1;
+        if (w.tab().focused != null) {
+            var frame: win32.RECT = undefined;
+            if (!win32.GetWindowRect(w.hwnd, &frame).toBool()) return error.TestUnexpectedResult;
+            narrowest = @min(narrowest, frame.right - frame.left);
+        }
+        const pane = try testPane(w.app, w);
+        // Whoever asked for it makes it the app's.
+        _ = w.app.surfaces.pop();
+        errdefer pane.discard();
+        var buf: [Session.State.max_pwd + 1]u8 = undefined;
+        const asked = try std.fmt.bufPrintSentinel(&buf, "{s}", .{opts.working_directory orelse ""}, 0);
+        if (!pane.setTitle(asked)) return error.OutOfMemory;
+        return pane;
+    }
+
+    /// Every terminal was started in the directory it ends up with.
+    fn expectDirectories(app: *const App) !void {
+        for (app.surfaces.items) |pane| {
+            try std.testing.expectEqualStrings(pane.pwd orelse "", pane.title.?);
+        }
+    }
+
+    /// `state` with each window where one can be on the test's monitor
+    /// as it is, neither maximized nor covering it: what comes back is
+    /// then what was saved.
+    fn onScreen(app: *App, arena: std.mem.Allocator, state: Session.State) !Session.State {
+        const probe = try testFrame(app);
+        defer _ = win32.DestroyWindow(probe.hwnd);
+        const dpi = Window.dpiOf(app, probe.hwnd);
+        const windows = try arena.dupe(Session.State.Window, state.windows);
+        for (windows, 0..) |*window, i| {
+            const at: i32 = @intCast(40 * (i + 1));
+            window.rect = .{ at, at, at + 1200, at + 700 };
+            window.dpi = dpi;
+            window.maximized = false;
+            window.fullscreen = false;
+        }
+        return .{ .version = state.version, .windows = windows };
+    }
+
+    fn closeAll(app: *App) void {
+        while (app.windows.getLastOrNull()) |window| {
+            if (!win32.DestroyWindow(window.hwnd).toBool()) break;
+        }
+    }
+};
+
+test "win32: saved windows opened again are the windows that were saved" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+    // Tabs come back in their order wherever a new tab would go.
+    app.config.@"window-new-tab-position" = .current;
+
+    var prng: std.Random.DefaultPrng = .init(0x57a7_e005);
+    const random = prng.random();
+    for (0..25) |_| {
+        const random_state = try Session.State.testRandom(arena, random, .{ .windows = 2, .tabs = 4, .leaves = 6, .even = true });
+        const state = try TestRestore.onScreen(&app, arena, random_state);
+        try std.testing.expectEqual(state.windows.len, Session.apply(&app, state));
+        try std.testing.expectEqual(0, TestRestore.unrestored);
+        try TestRestore.expectDirectories(&app);
+        for (app.windows.items) |window| {
+            try std.testing.expect(win32.IsWindowVisible(window.hwnd).toBool());
+        }
+        const back = (try Session.snapshot(&app, arena, &testStateLocal)).?;
+        try std.testing.expectEqualDeep(state, back);
+        TestRestore.closeAll(&app);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+    }
+}
+
+test "win32: a saved window comes back as it was, not as a new window is configured" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+
+    // A row of terminals, the last focused.
+    const leaves = 8;
+    var nodes: [2 * leaves - 1]Session.State.Node = undefined;
+    for (0..leaves - 1) |i| {
+        nodes[2 * i] = .{ .split = .{
+            .layout = .horizontal,
+            .ratio = @floatCast(1.0 / @as(f64, @floatFromInt(leaves - i))),
+            .left = @intCast(2 * i + 1),
+            .right = @intCast(2 * i + 2),
+        } };
+        nodes[2 * i + 1] = .{ .leaf = .{} };
+    }
+    nodes[nodes.len - 1] = .{ .leaf = .{ .title = "last" } };
+    const probe = try testFrame(&app);
+    const dpi = Window.dpiOf(&app, probe.hwnd);
+    const monitor = Window.monitorInfo(win32.MonitorFromWindow(probe.hwnd, win32.MONITOR_DEFAULTTONEAREST)).?;
+    _ = win32.DestroyWindow(probe.hwnd);
+    var saved: Session.State.Window = .{
+        .rect = .{ 60, 40, 1060, 640 },
+        .dpi = dpi,
+        .maximized = true,
+        .fullscreen = false,
+        .selected = 0,
+        .tabs = &.{.{ .focused = nodes.len - 1, .nodes = &nodes }},
+    };
+    try std.testing.expectEqual(1, Session.apply(&app, .{ .version = 1, .windows = &.{saved} }));
+    var window = app.windows.items[0];
+    try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
+    try std.testing.expectEqual(leaves, app.surfaces.items.len);
+    // Its terminals were made in a frame as wide as it then shows, not
+    // in one of the size it restores to, where fewer would fit.
+    try std.testing.expectEqual(monitor.rcWork.right - monitor.rcWork.left, TestRestore.narrowest);
+    try std.testing.expectEqualStrings("last", window.tab().focused.?.title_override.?);
+    // It is the same window again, with the rect it restores to.
+    try std.testing.expectEqualDeep(saved, (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0]);
+    TestRestore.closeAll(&app);
+
+    // Covering its monitor, it comes back so, to go back where it was.
+    saved.maximized = false;
+    saved.fullscreen = true;
+    TestRestore.start();
+    try std.testing.expectEqual(1, Session.apply(&app, .{ .version = 1, .windows = &.{saved} }));
+    window = app.windows.items[0];
+    try std.testing.expect(window.fullscreen != null);
+    try std.testing.expectEqual(leaves, app.surfaces.items.len);
+    try std.testing.expectEqual(monitor.rcMonitor.right - monitor.rcMonitor.left, TestRestore.narrowest);
+    try std.testing.expectEqualDeep(saved, (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0]);
+    window.toggleFullscreen();
+    try std.testing.expectEqual(saved.rect, window.savedPlace().?.rect);
+    TestRestore.closeAll(&app);
+
+    // What the configuration asks of a new window is not asked of one
+    // that comes back.
+    app.config.maximize = true;
+    app.config.fullscreen = .true;
+    app.config.@"window-position-x" = 7;
+    app.config.@"window-position-y" = 3;
+    saved.fullscreen = false;
+    saved.tabs = &.{.{ .focused = 0, .nodes = &.{.{ .leaf = .{} }} }};
+    try std.testing.expectEqual(1, Session.apply(&app, .{ .version = 1, .windows = &.{saved} }));
+    window = app.windows.items[0];
+    try std.testing.expect(!win32.IsZoomed(window.hwnd).toBool());
+    try std.testing.expect(window.fullscreen == null);
+    try std.testing.expectEqual(saved.rect, window.savedPlace().?.rect);
+}
+
+test "win32: what of a saved state cannot be made is left out, and the rest opens" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+
+    // Two windows, each of two tabs: (a | (b / c)) with c focused and
+    // titled, and d.
+    const tabs: []const Session.State.Tab = &.{
+        .{ .focused = 4, .nodes = &.{
+            .{ .split = .{ .layout = .horizontal, .ratio = 0.25, .left = 1, .right = 2 } },
+            .{ .leaf = .{ .pwd = "C:\\a" } },
+            .{ .split = .{ .layout = .vertical, .ratio = 0.75, .left = 3, .right = 4 } },
+            .{ .leaf = .{ .pwd = "C:\\b", .title = "b" } },
+            .{ .leaf = .{ .pwd = "C:\\c", .title = "c" } },
+        } },
+        .{ .title = "second", .focused = 0, .nodes = &.{.{ .leaf = .{ .pwd = "C:\\d" } }} },
+    };
+    const one: Session.State.Window = .{
+        .rect = .{ 0, 0, 1, 1 },
+        .dpi = 96,
+        .maximized = false,
+        .fullscreen = false,
+        .selected = 1,
+        .tabs = tabs,
+    };
+    const state = try TestRestore.onScreen(&app, arena, .{ .version = 1, .windows = &.{ one, one } });
+
+    // Whichever terminal is the first that cannot be made, nothing is
+    // leaked or left half made, every terminal there is belongs to a
+    // tab of a window shown, and what was made before it is all there.
+    for (0..9) |n| {
+        TestRestore.start();
+        TestRestore.fail_after = n;
+        const opened = Session.apply(&app, state);
+        // A window opens with its first terminal: a | b / c is three,
+        // d the fourth, and the second window's first the fifth.
+        try std.testing.expectEqual(@as(usize, if (n == 0) 0 else if (n < 5) 1 else 2), opened);
+        try std.testing.expectEqual(opened, app.windows.items.len);
+        try std.testing.expectEqual(n, app.surfaces.items.len);
+        try TestRestore.expectDirectories(&app);
+        for (app.surfaces.items) |pane| try std.testing.expect(pane.window.find(pane) != null);
+        if (try Session.snapshot(&app, arena, &testStateLocal)) |made| {
+            try Session.State.check(arena, made, &testStateLocal);
+        }
+        if (n == 2) {
+            // b / c could not be split: b stands for both, with the
+            // focus that was c's.
+            const window = app.windows.items[0];
+            try std.testing.expectEqual(1, window.tabs.items.len);
+            try std.testing.expectEqualStrings("b", window.tab().focused.?.title_override.?);
+            try std.testing.expectEqualStrings("C:\\b", window.tab().focused.?.pwd.?);
+        }
+        if (n == 3) {
+            // The tab that showed could not be made: the first shows.
+            try std.testing.expectEqual(0, app.windows.items[0].selected);
+        }
+        if (n >= 4) try std.testing.expectEqual(1, app.windows.items[0].selected);
+        TestRestore.closeAll(&app);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+    }
 }

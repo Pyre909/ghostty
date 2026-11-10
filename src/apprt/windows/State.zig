@@ -285,8 +285,16 @@ fn testIsLocal(host: []const u8) bool {
     return std.mem.eql(u8, host, "ME");
 }
 
-/// A random state within every bound, allocated with `arena`.
-fn testRandom(arena: Allocator, random: std.Random) !State {
+/// For tests: a random state within every bound, of at most `most`
+/// windows, tabs in each and terminals in each tab, allocated with
+/// `arena`. With `even`, each split's ratio gives every terminal under
+/// it the same share, so that all of them fit a window of some size;
+/// otherwise it is any ratio, either end included.
+pub fn testRandom(
+    arena: Allocator,
+    random: std.Random,
+    most: struct { windows: usize = 4, tabs: usize = 5, leaves: usize = 12, even: bool = false },
+) !State {
     const titles = [_]?[]const u8{ null, null, "build", "a \"quoted\" one", "\\back\\slash", "naïve ✓ 日本", "tab\there" };
     const pwds = [_]?[]const u8{ null, "C:\\", "C:\\src\\ghostty", "D:\\with space\\ünï", "\\\\ME\\share\\dir", "\\\\wsl.localhost\\Ubuntu\\home\\me" };
     const pick = struct {
@@ -295,13 +303,13 @@ fn testRandom(arena: Allocator, random: std.Random) !State {
         }
     }.of;
 
-    const windows = try arena.alloc(Window, random.intRangeAtMost(usize, 1, 4));
+    const windows = try arena.alloc(Window, random.intRangeAtMost(usize, 1, most.windows));
     for (windows) |*window| {
-        const tabs = try arena.alloc(Tab, random.intRangeAtMost(usize, 1, 5));
+        const tabs = try arena.alloc(Tab, random.intRangeAtMost(usize, 1, most.tabs));
         for (tabs) |*tab| {
             // Grown as a walk in preorder: each node is a split while
             // leaves remain to hand out below it.
-            const leaves = random.intRangeAtMost(usize, 1, 12);
+            const leaves = random.intRangeAtMost(usize, 1, most.leaves);
             const nodes = try arena.alloc(Node, 2 * leaves - 1);
             var next: u32 = 0;
             // (node to fill, leaves it holds)
@@ -324,7 +332,9 @@ fn testRandom(arena: Allocator, random: std.Random) !State {
                 const right: u32 = @intCast(left + 2 * left_count - 1);
                 nodes[index] = .{ .split = .{
                     .layout = random.enumValue(Split.Layout),
-                    .ratio = switch (random.uintLessThan(u8, 8)) {
+                    .ratio = if (most.even)
+                        @floatCast(@as(f64, @floatFromInt(left_count)) / @as(f64, @floatFromInt(count)))
+                    else switch (random.uintLessThan(u8, 8)) {
                         0 => 0,
                         1 => 1,
                         else => @floatCast(random.float(f32)),
@@ -364,7 +374,7 @@ test "win32: a window state read back is the one written" {
     var prng: std.Random.DefaultPrng = .init(0x57a7_e001);
     const random = prng.random();
     for (0..300) |_| {
-        const state = try testRandom(arena, random);
+        const state = try testRandom(arena, random, .{});
         const text = try encode(testing.allocator, state, &testIsLocal);
         defer testing.allocator.free(text);
         const back = try decode(arena, text, &testIsLocal);
