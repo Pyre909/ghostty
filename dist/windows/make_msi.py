@@ -61,10 +61,12 @@ Each folder is one component, with a value under
 HKCU\\Software\\Pyre909\\Ghostty\\Installed as its key path, as Windows
 Installer asks of components in a user's profile, and a component's GUID
 depends only on its folder's path, so that it stays the same from version
-to version. The product and package codes depend on the zip's and the
-icon's bytes and on the source generated here: the same zip gives the
-same product, and anything else another one, which the upgrade code,
-the same for every package, lets replace the installed one.
+to version. The product and package codes depend on all that the package
+is made from: the zip's and the icon's bytes, the source generated here,
+what is added to the compiled package, and the version of msitools. The
+same of each gives the same product, and anything else another one,
+which the upgrade code, the same for every package, lets replace the
+installed one.
 
 The package is reproducible: two runs on the same zip with the same
 msitools give the same bytes. Its files have the times they have in the
@@ -508,33 +510,37 @@ def set_times(msi: Path, started: int, when: int) -> None:
     msi.write_bytes(data)
 
 
+def additions(app: App) -> list[str]:
+    """The rows the package wixl compiled lacks, each as a statement for
+    msibuild: see the module's notes on wixl."""
+    bin_dir = f"dir{app.dirs().index(EXE.rpartition('/')[0])}"
+    # The PATH entry: "=" sets the variable, "-" removes the entry again
+    # on uninstall, and "[~];" keeps the variable's value in front.
+    path = (
+        "INSERT INTO `Environment` (`Environment`, `Name`, `Value`, `Component_`) "
+        f"VALUES ('UserPath', '=-PATH', '[~];[{bin_dir}]', 'cmp{bin_dir[3:]}')"
+    )
+    actions = [
+        "INSERT INTO `InstallExecuteSequence` (`Action`, `Sequence`) "
+        f"VALUES ('{action}', {sequence})"
+        for action, sequence in ENVIRONMENT_ACTIONS.items()
+    ]
+    # A name of "-" and no value: the notifications' key is deleted, with
+    # what is in it, when the component is removed. Removing the two
+    # values the source has there would leave what else is in the key.
+    key = (
+        "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Component_`) "
+        f"VALUES ('regToast', 1, '{TOAST_KEY}', '-', 'cmp0')"
+    )
+    return [path, *actions, key]
+
+
 def finish(
     tools: dict[str, str], msi: Path, app: App, package_code: str, started: int
 ) -> None:
     """Edits the package wixl compiled: see the module's notes on wixl."""
-
-    def sql(statement: str) -> None:
+    for statement in additions(app):
         run([tools["msibuild"], str(msi), "-q", statement], msi.parent)
-
-    # The PATH entry: "=" sets the variable, "-" removes the entry again
-    # on uninstall, and "[~];" keeps the variable's value in front.
-    bin_dir = f"dir{app.dirs().index(EXE.rpartition('/')[0])}"
-    sql(
-        "INSERT INTO `Environment` (`Environment`, `Name`, `Value`, `Component_`) "
-        f"VALUES ('UserPath', '=-PATH', '[~];[{bin_dir}]', 'cmp{bin_dir[3:]}')"
-    )
-    for action, sequence in ENVIRONMENT_ACTIONS.items():
-        sql(
-            "INSERT INTO `InstallExecuteSequence` (`Action`, `Sequence`) "
-            f"VALUES ('{action}', {sequence})"
-        )
-    # A name of "-" and no value: the notifications' key is deleted, with
-    # what is in it, when the component is removed. Removing the two
-    # values the source has there would leave what else is in the key.
-    sql(
-        "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Component_`) "
-        f"VALUES ('regToast', 1, '{TOAST_KEY}', '-', 'cmp0')"
-    )
     # msibuild -s sets the summary's subject, author, platform and
     # package code, and leaves the rest.
     was = summary(tools, msi)
@@ -698,11 +704,15 @@ def make(args: argparse.Namespace) -> None:
             raise Error(f"{EXE} is {got}, not {app.arch}")
         shutil.copyfile(ICON, stage / "ghostty.ico")
         # Everything the package is made from, but the codes themselves.
+        # A package that differs from an installed one and has its
+        # codes is taken for the installed one.
         made_from = "\n".join(
             [
                 make_zip.sha256(zip_path),
                 make_zip.sha256(ICON),
                 source(app, "00000000-0000-0000-0000-000000000000"),
+                *additions(app),
+                run([tools["wixl"], "--version"], stage),
             ]
         )
         digest = hashlib.sha256(made_from.encode("utf-8")).hexdigest()

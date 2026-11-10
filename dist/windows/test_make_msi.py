@@ -637,8 +637,27 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(
             self.property(linked, "ARPURLINFOABOUT"), "https://example.invalid/ghostty"
         )
-        seen = {c for msi in (self.x64, other, iconed, linked) for c in codes(msi)}
-        self.assertEqual(len(seen), 8)
+        # What it adds to the package wixl compiled: an action a place
+        # later.
+        actions = mm.ENVIRONMENT_ACTIONS | {"WriteEnvironmentStrings": 5201}
+        with mock.patch.object(mm, "ENVIRONMENT_ACTIONS", actions):
+            added = build(self.zip, self.tmp / "added")
+        sequence = {
+            r["Action"]: r["Sequence"]
+            for r in self.table(added, "InstallExecuteSequence")
+        }
+        self.assertEqual(sequence["WriteEnvironmentStrings"], "5201")
+        # And the msitools that made it.
+        real = mm.run
+
+        def run(cmd: list[str], cwd: Path) -> str:
+            return "0.0\n" if cmd[1:] == ["--version"] else real(cmd, cwd)
+
+        with mock.patch.object(mm, "run", side_effect=run):
+            tooled = build(self.zip, self.tmp / "tooled")
+        packages = (self.x64, other, iconed, linked, added, tooled)
+        seen = {c for msi in packages for c in codes(msi)}
+        self.assertEqual(len(seen), 2 * len(packages))
 
     def test_replaces_same_and_older_and_refuses_newer(self) -> None:
         rows = self.table(self.x64, "Upgrade")
