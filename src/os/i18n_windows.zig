@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = @import("windows.zig");
 const build_config = @import("../build_config.zig");
 const Catalog = @import("i18n_catalog.zig");
 const locales = @import("i18n_locales.zig").locales;
@@ -20,7 +21,7 @@ const log = std.log.scoped(.i18n);
 
 /// Whether the catalogs are part of this program: of the Windows app that
 /// translates, and of nothing else.
-const embedded = build_config.i18n and
+pub const embedded = build_config.i18n and
     builtin.os.tag == .windows and
     build_config.app_runtime == .windows;
 
@@ -127,16 +128,6 @@ fn named(comptime name: []const u8) Match {
     return .{ .locale = index };
 }
 
-/// The first of `names`, in the user's order, that Ghostty has an answer
-/// for: a catalog, or English. Null if it has none for any of them.
-pub fn first(names: []const []const u8) ?Match {
-    for (names) |name| switch (match(name)) {
-        .none => {},
-        else => |m| return m,
-    };
-    return null;
-}
-
 /// Choose the language to translate to: `language`, the configuration's,
 /// if it is set, or else the first of the languages the user reads
 /// Windows in that Ghostty has. Called once, as the app starts.
@@ -191,14 +182,14 @@ fn displayLanguages(buf: *[1024]u16) ?[]const u16 {
     // user lists a handful.
     var len: std.os.windows.ULONG = buf.len;
     var count: std.os.windows.ULONG = 0;
-    if (!GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &count, buf, &len).toBool()) {
+    if (!windows.exp.kernel32.GetUserPreferredUILanguages(windows.MUI_LANGUAGE_NAME, &count, buf, &len).toBool()) {
         log.warn("GetUserPreferredUILanguages failed err={}", .{std.os.windows.GetLastError()});
         return null;
     }
     return buf[0..@min(len, buf.len)];
 }
 
-/// The user's display languages' answer, as `first` gives it; English if
+/// The user's display languages' answer, as `listed` gives it; English if
 /// Ghostty has none.
 fn system() Match {
     var buf: [1024]u16 = undefined;
@@ -220,16 +211,6 @@ fn listed(names: []const u16) Match {
     }
     return .source;
 }
-
-/// https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getuserpreferreduilanguages
-extern "kernel32" fn GetUserPreferredUILanguages(
-    flags: std.os.windows.DWORD,
-    count: *std.os.windows.ULONG,
-    buffer: ?[*]u16,
-    len: *std.os.windows.ULONG,
-) callconv(.winapi) std.os.windows.BOOL;
-/// Names ("de-DE") rather than language ids.
-const MUI_LANGUAGE_NAME: std.os.windows.DWORD = 0x8;
 
 /// `msgid` in the language in use, or itself.
 pub fn translate(msgid: [*:0]const u8) [*:0]const u8 {
@@ -316,17 +297,6 @@ test "a language Windows names finds its catalog" {
     for ([_][]const u8{ "en-US", "en-GB", "en", "en_US.UTF-8", "C", "POSIX", "C.UTF-8" }) |name| {
         try testing.expectEqual(Match.source, match(name));
     }
-}
-
-test "the first language with an answer is taken, and English is one" {
-    const testing = std.testing;
-    const de: Match = .{ .locale = indexOf("de").? };
-    try testing.expectEqual(de, first(&.{ "de-DE", "fr-FR" }).?);
-    try testing.expectEqual(de, first(&.{ "sv-SE", "de-DE", "fr-FR" }).?);
-    try testing.expectEqual(Match.source, first(&.{ "en-US", "de-DE" }).?);
-    try testing.expectEqual(Match.source, first(&.{ "sv-SE", "en-GB", "de-DE" }).?);
-    try testing.expect(first(&.{ "sv-SE", "fi-FI" }) == null);
-    try testing.expect(first(&.{}) == null);
 }
 
 test "the configuration's language is chosen before the display languages', and one unknown reads English" {

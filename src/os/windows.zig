@@ -209,6 +209,9 @@ pub const COMPUTER_NAME_FORMAT = enum(c_int) {
 };
 
 // Exported functions by library
+/// GetUserPreferredUILanguages: names ("de-DE") rather than language ids.
+pub const MUI_LANGUAGE_NAME: DWORD = 0x8;
+
 pub const exp = struct {
     pub const kernel32 = struct {
         pub extern "kernel32" fn CreatePipe(
@@ -275,6 +278,13 @@ pub const exp = struct {
             NameType: COMPUTER_NAME_FORMAT,
             lpBuffer: LPSTR,
             nSize: *DWORD,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/winnls/nf-winnls-getuserpreferreduilanguages
+        pub extern "kernel32" fn GetUserPreferredUILanguages(
+            dwFlags: DWORD,
+            pulNumLanguages: *ULONG,
+            pwszLanguagesBuffer: ?[*]u16,
+            pcchLanguagesBuffer: *ULONG,
         ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw
         pub extern "kernel32" fn GetTempPathW(

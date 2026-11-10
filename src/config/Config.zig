@@ -124,7 +124,9 @@ pub const compatibility = std.StaticStringMap(
 ///
 /// On Windows the language is named as on Linux (`de`, `pt_BR`) or as Windows
 /// names it (`de-DE`, `zh-Hant-TW`), and without this setting it is the first
-/// of your Windows display languages that Ghostty is translated to.
+/// of your Windows display languages that Ghostty is translated to or that
+/// is English: with English listed before such a language, Ghostty stays in
+/// English.
 ///
 /// GTK and Windows only.
 /// Available since 1.3.0.

@@ -1871,6 +1871,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
 }
 
 test "win32: the palette's commands and jumps are in the user's language" {
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
     const alloc = testing.allocator;
     var config: Config = try .default(alloc);
     defer config.deinit();

@@ -627,6 +627,7 @@ test "win32: a context menu item's shortcut cannot underline, reorder or hide it
 }
 
 test "win32: the context menu's items and submenus are in the user's language" {
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
     const alloc = testing.allocator;
     var set: Binding.Set = .{};
     defer set.deinit(alloc);
@@ -636,8 +637,8 @@ test "win32: the context menu's items and submenus are in the user's language" {
     const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
         .{ "Copy", "Kopieren" },
         // A translation's '&' is text, not the mark of an access key.
-        .{ "Paste", "Ein & Aus" },
-        .{ "Change Title\u{2026}", "Titel \u{e4}ndern\u{2026}" },
+        .{ "Paste", "An & Aus" },
+        .{ "Change Title\u{2026}", "Namen \u{e4}ndern\u{2026}" },
         .{ "Split", "Teilen" },
     });
     defer alloc.free(catalog);
@@ -648,8 +649,8 @@ test "win32: the context menu's items and submenus are in the user's language" {
     const items = menuItems(.{ .selection = true }, &set);
     var text: [text_max:0]u16 = undefined;
     try testing.expectEqualSlices(u16, L("Kopieren\tCtrl+Shift+C"), itemText(&text, try testItem(&items, "Copy")));
-    try testing.expectEqualSlices(u16, L("Ein && Aus"), itemText(&text, try testItem(&items, "Paste")));
-    try testing.expectEqualSlices(u16, L("Titel \u{e4}ndern\u{2026}"), itemText(&text, try testItem(&items, "Change Title\u{2026}")));
+    try testing.expectEqualSlices(u16, L("An && Aus"), itemText(&text, try testItem(&items, "Paste")));
+    try testing.expectEqualSlices(u16, L("Namen \u{e4}ndern\u{2026}"), itemText(&text, try testItem(&items, "Change Title\u{2026}")));
     // One the catalog has nothing for, as written.
     try testing.expectEqualSlices(u16, L("Clear"), itemText(&text, try testItem(&items, "Clear")));
 
