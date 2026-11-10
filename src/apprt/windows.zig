@@ -234,6 +234,13 @@
 //! take, the thumb's positions run only from 0 to 2^31 less the screen's
 //! rows, and the arrows and the track reach the rest.
 //!
+//! A wheel's notch scrolls the system's lines per notch, in the core's
+//! ticks (`Surface.Mouse.Notches`). A precision touchpad's pan, which
+//! Windows sends as wheel turns of less than a notch, and a
+//! high-resolution wheel scroll line by line, as GTK's and macOS's
+//! precision scrolling does, a notch's worth as many lines as a notch
+//! (`Surface.Mouse.Lines`).
+//!
 //! ## Dropped files
 //!
 //! Files dropped on a terminal (WM_DROPFILES; its window has
@@ -275,8 +282,7 @@
 //! ## What is still missing
 //!
 //! Not implemented: the tab overview, dragging a tab into another
-//! window, dropped text (only files are taken) and precision-touchpad
-//! scrolling.
+//! window and dropped text (only files are taken).
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for every action it does not name; this runtime never claims an action
 //! it did not carry out.

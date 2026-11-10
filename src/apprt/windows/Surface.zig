@@ -474,8 +474,8 @@ pub const Surface = struct {
         /// Where the left button last went down. `syncMouse` places a
         /// release it has to invent away from it.
         left_press_pos: apprt.CursorPos,
-        wheel_x: Notches,
-        wheel_y: Notches,
+        wheel_x: Wheel,
+        wheel_y: Wheel,
         /// The last `.mouse_shape` and its stock cursor, applied in
         /// WM_SETCURSOR. `cursor` is null only if LoadCursorW failed; the
         /// class arrow shows then.
@@ -641,11 +641,10 @@ pub const Surface = struct {
         /// (`Surface.scrollCallback`): for x it rounds each event and keeps
         /// no remainder, and for y it drops the remainder whenever an event
         /// crosses a row (it stores `poff - amount * cell_size` with the
-        /// untruncated `amount`). A high-resolution wheel's small deltas, and
-        /// settings that are not a multiple of 3, would lose rows either
-        /// way, so only whole ticks are passed on. A change of direction
-        /// drops the remainder, so a reversal counts from its own first
-        /// delta.
+        /// untruncated `amount`). Settings that are not a multiple of 3
+        /// would lose rows either way, so only whole ticks are passed on.
+        /// A change of direction drops the remainder, so a reversal counts
+        /// from its own first delta.
         const Notches = struct {
             /// In 1/WHEEL_DELTA of a line (or character).
             rem: i64 = 0,
@@ -654,14 +653,84 @@ pub const Surface = struct {
             const per_tick = 3;
 
             fn add(self: *Notches, delta: i32, per_notch: u32) ?i64 {
-                if (delta == 0 or per_notch == 0) return null;
-                if (self.rem != 0 and (self.rem < 0) != (delta < 0)) self.rem = 0;
-                self.rem += @as(i64, delta) * per_notch;
-                const tick = win32.WHEEL_DELTA * per_tick;
-                const whole = @divTrunc(self.rem, tick);
-                if (whole == 0) return null;
-                self.rem -= whole * tick;
-                return whole;
+                return wholeOf(&self.rem, delta, per_notch, win32.WHEEL_DELTA * per_tick);
+            }
+        };
+
+        /// Whole lines (characters, for the horizontal wheel) out of the
+        /// deltas of a wheel that turns by less than a notch: a precision
+        /// touchpad's pan, which Windows sends as wheel messages, and a
+        /// high-resolution wheel. As whole ticks (`Notches`) these would
+        /// wait for a notch's worth and then scroll its lines at once;
+        /// counted in lines they scroll line by line, as a touchpad does
+        /// on GTK and macOS. A notch's worth of them is as many lines as a
+        /// notch is. Only whole lines are passed on, for the reason only
+        /// whole ticks are, and a change of direction drops the remainder
+        /// as there.
+        const Lines = struct {
+            /// In 1/WHEEL_DELTA of a line (or character).
+            rem: i64 = 0,
+
+            fn add(self: *Lines, delta: i32, per_notch: u32) ?i64 {
+                return wholeOf(&self.rem, delta, per_notch, win32.WHEEL_DELTA);
+            }
+        };
+
+        /// `delta`, at `per_notch` lines a notch, added to `rem`: the whole
+        /// `unit`s of 1/WHEEL_DELTA of a line there are then, taken out of
+        /// it, or null if there is none.
+        fn wholeOf(rem: *i64, delta: i32, per_notch: u32, unit: i32) ?i64 {
+            if (delta == 0 or per_notch == 0) return null;
+            if (rem.* != 0 and (rem.* < 0) != (delta < 0)) rem.* = 0;
+            rem.* += @as(i64, delta) * per_notch;
+            const whole = @divTrunc(rem.*, unit);
+            if (whole == 0) return null;
+            rem.* -= whole * unit;
+            return whole;
+        }
+
+        /// One wheel's turns as the core takes them. Windows does not say
+        /// what turned the wheel, so a delta of whole notches is taken for
+        /// a wheel that turns by notches and counts in ticks (`Notches`),
+        /// and any other for one that does not and counts in lines
+        /// (`Lines`). Each kind drops what the other left, as a change of
+        /// direction does: less than a tick, or than a line.
+        const Wheel = struct {
+            notches: Notches = .{},
+            lines: Lines = .{},
+
+            const Turn = union(enum) {
+                /// Ticks, for `Surface.scrollCallback` as they are.
+                ticks: i64,
+                /// Lines, or characters, which it takes in pixels with
+                /// `precision` (`scrollBy`).
+                lines: i64,
+            };
+
+            fn add(self: *Wheel, delta: i32, per_notch: u32) ?Turn {
+                if (delta == 0) return null;
+                if (@rem(delta, win32.WHEEL_DELTA) == 0) {
+                    self.lines.rem = 0;
+                    return .{ .ticks = self.notches.add(delta, per_notch) orelse return null };
+                }
+                self.notches.rem = 0;
+                return .{ .lines = self.lines.add(delta, per_notch) orelse return null };
+            }
+
+            /// What the core is given for `turn` along an axis whose cells
+            /// are `cell` pixels: the ticks, or the lines' pixels with
+            /// `precision`, of which the core scrolls a row for each
+            /// cell's worth, times `mouse-scroll-multiplier`'s precision
+            /// value. A whole number of cells, so that with the default
+            /// of 1 the core has no remainder to drop.
+            fn scrollBy(turn: Turn, cell: u32) struct { f64, input.ScrollMods } {
+                return switch (turn) {
+                    .ticks => |n| .{ @floatFromInt(n), .{} },
+                    .lines => |n| .{
+                        @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(cell)),
+                        .{ .precision = true },
+                    },
+                };
             }
         };
     };
@@ -2395,19 +2464,21 @@ pub const Surface = struct {
 
                     // Positive is away from the user: the core's "up"
                     // (`Surface.scrollCallback`'s doc comment).
-                    if (self.mouse.wheel_y.add(delta, per_notch)) |ticks| {
-                        core_surface.scrollCallback(0, @floatFromInt(ticks), .{}) catch |err|
+                    if (self.mouse.wheel_y.add(delta, per_notch)) |turn| {
+                        const yoff, const mods = Mouse.Wheel.scrollBy(turn, core_surface.size.cell.height);
+                        core_surface.scrollCallback(0, yoff, mods) catch |err|
                             log.warn("scroll callback failed err={}", .{err});
                     }
                 } else if (self.mouse.wheel_x.add(
                     delta,
                     wheelSetting(win32.SPI_GETWHEELSCROLLCHARS),
-                )) |ticks| {
+                )) |turn| {
                     // Positive is to the right here. The core's positive x
                     // is reported as button 6, X11's scroll-left
                     // (`Surface.scrollCallback`), and GTK negates its
                     // rightward delta to match; so does this.
-                    core_surface.scrollCallback(@floatFromInt(-ticks), 0, .{}) catch |err|
+                    const xoff, const mods = Mouse.Wheel.scrollBy(turn, core_surface.size.cell.width);
+                    core_surface.scrollCallback(-xoff, 0, mods) catch |err|
                         log.warn("scroll callback failed err={}", .{err});
                 }
                 return 0;
@@ -3662,6 +3733,107 @@ test "win32: wheel ticks follow the lines to scroll per notch" {
     // A screen's worth of lines, or any other UINT, does not overflow.
     var n: Surface.Mouse.Notches = .{};
     try std.testing.expectEqual(1_431_655_764, n.add(120, std.math.maxInt(u32) - 1).?);
+}
+
+test "win32: a wheel that turns by less than a notch scrolls line by line" {
+    const Wheel = Surface.Mouse.Wheel;
+    const Turn = Wheel.Turn;
+
+    // A third of a notch at 3 lines a notch is a line, each time; a notch
+    // is a tick, which the core scrolls as its lines.
+    var w: Wheel = .{};
+    for (0..3) |_| try std.testing.expectEqual(Turn{ .lines = 1 }, w.add(40, 3).?);
+    try std.testing.expectEqual(Turn{ .ticks = 1 }, w.add(120, 3).?);
+    try std.testing.expectEqual(Turn{ .lines = -1 }, w.add(-40, 3).?);
+    try std.testing.expectEqual(Turn{ .ticks = -2 }, w.add(-240, 3).?);
+    try std.testing.expectEqual(null, w.add(0, 3));
+
+    // Less than a line waits for the rest of it, and what is over a line
+    // is kept: 18 turns of 7 are a notch and 6, so 3 lines and 18 of the
+    // 120 parts of the next.
+    w = .{};
+    var lines: i64 = 0;
+    for (0..18) |i| {
+        if (w.add(7, 3)) |turn| lines += turn.lines;
+        try std.testing.expectEqual(@divTrunc(@as(i64, @intCast(i + 1)) * 7 * 3, 120), lines);
+    }
+    try std.testing.expectEqual(3, lines);
+    // No turn at all is neither kind, and drops nothing.
+    try std.testing.expectEqual(null, w.add(0, 3));
+    try std.testing.expectEqual(18, w.lines.rem);
+
+    // As many lines as the notch has, whatever it is set to, and none
+    // with the wheel turned off.
+    w = .{};
+    try std.testing.expectEqual(null, w.add(30, 1));
+    try std.testing.expectEqual(Turn{ .lines = 1 }, w.add(90, 1).?);
+    try std.testing.expectEqual(Turn{ .lines = 10 }, w.add(100, 12).?);
+    try std.testing.expectEqual(null, w.add(100, 0));
+    try std.testing.expectEqual(0, w.lines.rem);
+
+    // A reversal counts from its own first delta.
+    w = .{};
+    try std.testing.expectEqual(null, w.add(30, 3));
+    try std.testing.expectEqual(Turn{ .lines = -1 }, w.add(-50, 3).?);
+    try std.testing.expectEqual(-30, w.lines.rem);
+
+    // So does a turn of the other kind: a notch drops the part of a line,
+    // and a smaller turn the part of a tick.
+    w = .{};
+    try std.testing.expectEqual(null, w.add(30, 3));
+    try std.testing.expectEqual(Turn{ .ticks = 1 }, w.add(120, 3).?);
+    try std.testing.expectEqual(0, w.lines.rem);
+    try std.testing.expectEqual(null, w.add(30, 3));
+    w = .{};
+    try std.testing.expectEqual(null, w.add(120, 1));
+    try std.testing.expectEqual(120, w.notches.rem);
+    try std.testing.expectEqual(null, w.add(119, 1));
+    try std.testing.expectEqual(0, w.notches.rem);
+    try std.testing.expectEqual(119, w.lines.rem);
+
+    // The ends of a delta and of the setting do not overflow.
+    w = .{};
+    try std.testing.expectEqual(
+        Turn{ .lines = @divTrunc(@as(i64, std.math.maxInt(i16)) * std.math.maxInt(u32), 120) },
+        w.add(std.math.maxInt(i16), std.math.maxInt(u32)).?,
+    );
+}
+
+test "win32: a wheel's sum of small turns is the lines of their sum" {
+    // Any run of turns one way, none of them whole notches: the lines
+    // passed on are those of the deltas' sum, and what is kept is the
+    // rest of it, less than a line.
+    var prng: std.Random.DefaultPrng = .init(0x77_68_65_65_6c);
+    const random = prng.random();
+    for (0..2000) |_| {
+        const per_notch = random.intRangeAtMost(u32, 1, 40);
+        const sign: i32 = if (random.boolean()) 1 else -1;
+        var w: Surface.Mouse.Wheel = .{};
+        var sum: i64 = 0;
+        var lines: i64 = 0;
+        for (0..random.intRangeAtMost(usize, 1, 60)) |_| {
+            var delta = random.intRangeAtMost(i32, 1, 600);
+            if (@rem(delta, 120) == 0) delta += 1;
+            sum += @as(i64, sign * delta) * per_notch;
+            if (w.add(sign * delta, per_notch)) |turn| {
+                try std.testing.expect(turn.lines != 0);
+                lines += turn.lines;
+            }
+        }
+        try std.testing.expectEqual(@divTrunc(sum, 120), lines);
+        try std.testing.expectEqual(@rem(sum, 120), w.lines.rem);
+        try std.testing.expectEqual(0, w.notches.rem);
+    }
+}
+
+test "win32: a wheel's ticks go to the core as they are, its lines in pixels" {
+    const Wheel = Surface.Mouse.Wheel;
+    const ticks = Wheel.scrollBy(.{ .ticks = -2 }, 17);
+    try std.testing.expectEqual(-2.0, ticks[0]);
+    try std.testing.expectEqual(input.ScrollMods{}, ticks[1]);
+    const lines = Wheel.scrollBy(.{ .lines = -3 }, 17);
+    try std.testing.expectEqual(-51.0, lines[0]);
+    try std.testing.expectEqual(input.ScrollMods{ .precision = true }, lines[1]);
 }
 
 test "win32: wheel points off the client area clamp to its edge" {
