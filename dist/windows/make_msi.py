@@ -37,7 +37,11 @@ The package:
     cannot (msiexec /qn or /passive, which is how winget runs it), it
     installs around it: the open Ghostty goes on as the version it was,
     and Windows Installer moves the files it holds aside and deletes
-    them at the next restart;
+    them at the next restart. It does not ask about an x64 Ghostty on
+    Arm64 Windows either: the emulator's cache service holds that
+    Ghostty's files as well, the Restart Manager lists the service as a
+    critical application, and Windows Installer then installs around
+    the open Ghostty whatever window it has;
 
     when uninstalled, removes what it installed, and the app ID that
     Ghostty registers for its notifications the first time it shows one

@@ -33,9 +33,10 @@ and the crash dumps.
 
 The installer never closes Ghostty. Where it can ask, as after a
 double click, and Ghostty is open, it names Ghostty and asks for it to
-be closed first: close Ghostty, then choose Retry. Where it cannot ask
-(msiexec /qn or /passive), it installs or removes around the open
-Ghostty, which goes on as the version it was until it is closed.
+be closed first: close Ghostty, then choose Retry. Where it does not
+ask (msiexec /qn or /passive, and the x64 build on Arm64 Windows), it
+installs or removes around the open Ghostty, which goes on as the
+version it was until it is closed.
 
 
 Crash dumps
