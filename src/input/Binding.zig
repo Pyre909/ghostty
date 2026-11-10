@@ -592,9 +592,9 @@ pub const Action = union(enum) {
 
     /// Toggle the tab overview.
     ///
-    /// This is only supported on Linux and when the system's libadwaita
-    /// version is 1.4 or newer. The current libadwaita version can be
-    /// found by running `ghostty +version`.
+    /// This is only supported on Linux and Windows. On Linux it needs
+    /// the system's libadwaita version to be 1.4 or newer. The current
+    /// libadwaita version can be found by running `ghostty +version`.
     toggle_tab_overview,
 
     /// Change the title of the current focused surface via a pop-up prompt.
