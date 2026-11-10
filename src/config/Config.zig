@@ -2324,8 +2324,9 @@ keybind: Keybinds = .{},
 ///   * `default` will use the default system behavior. On macOS, this
 ///     will only save state if the application is forcibly terminated
 ///     or if it is configured systemwide via Settings.app. On Windows,
-///     this will only save state when the Windows session ends: at a
-///     shutdown, a restart or a sign-out.
+///     this will only save state when the Windows session ends (at a
+///     shutdown, a restart or a sign-out) or when an installer closes
+///     Ghostty to update it.
 ///
 ///   * `never` will never save window state.
 ///
@@ -2352,7 +2353,9 @@ keybind: Keybinds = .{},
 /// command given to Ghostty (such as with `-e`) is not saved. Closing the
 /// last window by hand saves nothing. A launch that is given a command, a
 /// working directory or a title opens that window and leaves the saved
-/// state for a later launch.
+/// state for a later launch. With `initial-command` set in the
+/// configuration every launch is such a launch, so no state is saved or
+/// restored. At most the 64 most recent saves are kept.
 ///
 /// This is currently only supported on macOS and Windows. This has no effect
 /// on Linux.
