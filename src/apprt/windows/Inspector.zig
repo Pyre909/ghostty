@@ -13,7 +13,6 @@ const CoreInspector = @import("../../inspector/main.zig").Inspector;
 const CoreSurface = @import("../../Surface.zig");
 const imgui = @import("imgui.zig");
 const win32 = @import("win32.zig");
-const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
 const TitleDialog = @import("TitleDialog.zig");
 const Window = @import("Window.zig");

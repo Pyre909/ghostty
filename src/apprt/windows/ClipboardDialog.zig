@@ -376,7 +376,8 @@ const Dialog = struct {
         TitleDialog.darkTitleBar(hwnd, self.window.dark_frame);
         self.window.clipboard_prompt = hwnd;
         if (win32.GetWindow(hwnd, win32.GW_OWNER)) |owner| TitleDialog.placeOverOwner(hwnd, owner);
-        // The box's words are this dialog's own, and stay as written.
+        // GTK's heading and buttons. The box's words are this dialog's
+        // own, and stay as written.
         label(hwnd, null, "Authorize Clipboard Access");
         label(hwnd, win32.IDOK, "Allow");
         label(hwnd, win32.IDCANCEL, "Deny");

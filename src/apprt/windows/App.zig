@@ -11733,7 +11733,6 @@ test "win32: a command's end and the configuration's errors are told in the user
     if (comptime !i18n.windows.embedded) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
-    const W = std.unicode.utf8ToUtf16LeStringLiteral;
     const errors = "One or more configuration errors were found. Please review the " ++
         "errors below, and either reload your configuration or ignore these errors.";
     const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
@@ -11745,12 +11744,6 @@ test "win32: a command's end and the configuration's errors are told in the user
     defer alloc.free(catalog);
     try i18n.windows.testUse(catalog);
     defer i18n.windows.testUse(null) catch unreachable;
-
-    // The banner's titles, each kept while the other is read.
-    const succeeded = ChildExited.title(0);
-    const failed = ChildExited.title(1);
-    try testing.expectEqualSlices(u16, W("Befehl erfolgreich"), succeeded);
-    try testing.expectEqualSlices(u16, W("Befehl fehlgeschlagen"), failed);
 
     // The notification's.
     var buf: [128]u8 = undefined;
@@ -19786,7 +19779,13 @@ const TestExport = struct {
     fn ask(owner: ?win32.HWND, spec: SaveDialog.Spec) SaveDialog.Answer {
         asks += 1;
         asked_by = owner;
-        named = std.mem.eql(u16, std.mem.span(spec.name), std.mem.span(L("ghostty-terminal-io.txt")));
+        // The file's name as written, GTK's title and button in the
+        // language in use.
+        var title: Question = .{};
+        var ok: Question = .{};
+        named = std.mem.eql(u16, std.mem.span(spec.name), std.mem.span(L("ghostty-terminal-io.txt"))) and
+            std.mem.eql(u16, std.mem.span(spec.title), std.mem.span(title.one("Export Terminal IO Events"))) and
+            std.mem.eql(u16, std.mem.span(spec.ok), std.mem.span(ok.one("Export")));
         inspector_enabled = win32.IsWindowEnabled(inspector).toBool();
         frame_enabled = win32.IsWindowEnabled(frame).toBool();
         could_reenter = app.canReenterCore();
@@ -19877,6 +19876,14 @@ const TestExport = struct {
 };
 
 test "win32: an export from the inspector saves its events where the dialog says, once out of its frame" {
+    // In a language of the user's, where a build has them.
+    const export_catalog = try @import("../../os/i18n_catalog.zig").write(std.testing.allocator, &.{
+        .{ "Export Terminal IO Events", "Ereignisse exportieren" },
+        .{ "Export", "Exportieren" },
+    });
+    defer std.testing.allocator.free(export_catalog);
+    if (comptime internal_os.i18n.windows.embedded) try internal_os.i18n.windows.testUse(export_catalog);
+    defer if (comptime internal_os.i18n.windows.embedded) internal_os.i18n.windows.testUse(null) catch unreachable;
     // The inspector's Export button performs the action inside its frame,
     // lending the events for the call. They are copied, and `run` asks
     // where to save them once it is out of that frame, in a dialog the
@@ -20574,6 +20581,56 @@ fn paletteRowPoint(window: *const Window, row: usize) win32.LPARAM {
 
 fn paletteKey(window: *const Window, vk: win32.WPARAM) void {
     _ = win32.SendMessageW(window.palette.edit.?, win32.WM_KEYDOWN, vk, 0);
+}
+
+test "win32: the search bar's and the palette's placeholders are the user's language's" {
+    const i18n = internal_os.i18n;
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    window.relayout();
+
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Find\u{2026}", "Suchen\u{2026}" },
+        .{ "Execute a command\u{2026}", "Befehl ausf\u{fc}hren\u{2026}" },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    try std.testing.expect(try app.performAction(target, .start_search, .{ .needle = "" }));
+    try std.testing.expect(try app.performAction(target, .toggle_command_palette, {}));
+    app.createRequested();
+
+    // Each field was made, and given its words where they stay. The test
+    // program's fields are not the ones that show a placeholder, so what
+    // they were given is read where it is kept.
+    try std.testing.expect(a.search_bar.edit != null and window.palette.edit != null);
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    try std.testing.expectEqualSlices(u16, W("Suchen\u{2026}"), std.mem.sliceTo(&SearchBar.placeholder.buf, 0));
+    try std.testing.expectEqualSlices(
+        u16,
+        W("Befehl ausf\u{fc}hren\u{2026}"),
+        std.mem.sliceTo(&CommandPalette.placeholder.buf, 0),
+    );
 }
 
 test "win32: toggle_command_palette opens the command palette over its window, and closes it" {

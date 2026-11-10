@@ -51,6 +51,10 @@ const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const RECT = win32.RECT;
 const L = win32.L;
 const Question = @import("dialog.zig").Question;
+/// The field's placeholder in the user's language, one for every bar and
+/// for the program's time: nothing documents that the field copies it.
+pub var placeholder: Question = .{};
+
 const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttySearchBarClass";
@@ -163,8 +167,6 @@ pub const Bar = struct {
         if (edit_proc == null) edit_proc = @ptrFromInt(@as(usize, @bitCast(old)));
         // GTK's placeholder; Common Controls v6 shows it while the field
         // is empty, and an older EDIT ignores the message.
-        // The field keeps a copy of it.
-        var placeholder: Question = .{};
         _ = win32.SendMessageW(edit, win32.EM_SETCUEBANNER, 0, @bitCast(@intFromPtr(placeholder.one("Find\u{2026}"))));
         return true;
     }

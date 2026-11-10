@@ -417,6 +417,27 @@ fn close(surface: *Surface) void {
     surface.requestClose();
 }
 
+test "win32: the child-exited banner's words are the user's language's, each title kept while the other is read" {
+    const i18n = @import("../../os/main.zig").i18n;
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Command Succeeded", "Befehl erfolgreich" },
+        .{ "Command Failed", "Befehl fehlgeschlagen" },
+        .{ "Close", "Schlie\u{df}en" },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+    const succeeded = title(0);
+    const failed_title = title(1);
+    try testing.expectEqualSlices(u16, W("Befehl erfolgreich"), succeeded);
+    try testing.expectEqualSlices(u16, W("Befehl fehlgeschlagen"), failed_title);
+    try testing.expectEqualSlices(u16, W("Schlie\u{df}en"), buttonText());
+}
+
 test "win32: the child-exited banner's title and colour follow the exit code, as GTK's" {
     const testing = std.testing;
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Command Succeeded"), title(0));
