@@ -1123,13 +1123,18 @@ pub const Placing = enum {
 /// the first WM_SIZE, unless the size already sent one) reach the terminal
 /// from here; its core is live by now.
 pub fn show(self: *Window, placing: Placing) void {
+    // Placed before the size as well as after it: the size is counted at
+    // the scale of the frame's monitor and kept inside that monitor's
+    // work area, which must be the one the position is on, not the one
+    // Windows made the frame on.
+    if (placing == .configured) self.applyInitialPosition();
     if (self.tab().focused) |surface| {
         if (surface.initial_size) |size| self.applyInitialSize(surface, size);
     }
 
-    // After the size, which the placing keeps inside a work area, and
-    // before `maximize` and `fullscreen`, which leave the placed rect as
-    // the one the window comes back to.
+    // Again after the size, from the frame it left, which the placing
+    // keeps inside a work area, and before `maximize` and `fullscreen`,
+    // which leave the placed rect as the one the window comes back to.
     if (placing == .configured) self.applyInitialPosition();
 
     // `maximize` starts every window maximized, as on GTK, which applies it

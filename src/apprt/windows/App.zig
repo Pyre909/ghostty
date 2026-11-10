@@ -6474,6 +6474,23 @@ test "win32: a new window shows at window-position-x and window-position-y" {
     try std.testing.expectEqual(monitor.rcWork.right, visible.right);
     try std.testing.expectEqual(monitor.rcWork.bottom, visible.bottom);
 
+    // With a size of its own, it has that size, and what shows of it
+    // still has its corner at the position: placed again once sized.
+    app.config.@"window-position-x" = 60;
+    app.config.@"window-position-y" = 40;
+    const sized = try testFrame(&app);
+    const pane = try testPane(&app, sized);
+    sized.tab().tree = try .init(alloc, pane);
+    sized.tab().focused = pane;
+    pane.initial_size = .{ .width = 320, .height = 180 };
+    sized.show(.configured);
+    const scale = try pane.getContentScale();
+    const client = try clientRect(sized.hwnd);
+    try std.testing.expectEqual(Window.scaledSize(320, scale.x) + ScrollBar.width(pane), client.right);
+    const sized_visible = TabBar.visibleBounds(sized.hwnd) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(60, sized_visible.left);
+    try std.testing.expectEqual(40, sized_visible.top);
+
     // A tab moved into a window of its own: that one is no new window,
     // and stays where Windows put it, which is never there.
     app.config.@"window-position-x" = 7;
