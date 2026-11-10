@@ -62,6 +62,15 @@ pub fn notice(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR) void {
 pub var test_message_box: if (builtin.is_test) ?*const fn (?win32.HWND, win32.LPCWSTR, win32.UINT) c_int else void =
     if (builtin.is_test) null else {};
 
+/// For a test that reaches a prompt it set no answer for
+/// (`test_message_box`): Cancel, and an error in the log, which fails the
+/// test. The box itself would wait for ever for an answer, on a desktop
+/// nobody sees, and hold up the whole run rather than fail one test.
+fn unanswered() c_int {
+    log.err("a test reached a prompt it has no answer for", .{});
+    return win32.IDCANCEL;
+}
+
 /// The prompt behind `confirm`, `retry` and `notice`, with `buttons`.
 ///
 /// MessageBoxW runs a nested message loop. `prompt_depth` tells every
@@ -84,7 +93,10 @@ fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();
-    if (builtin.is_test) if (test_message_box) |answer| return answer(owner, text, buttons);
+    if (builtin.is_test) return if (test_message_box) |answer|
+        answer(owner, text, buttons)
+    else
+        unanswered();
     return win32.MessageBoxW(owner, text, L("Ghostty"), buttons | win32.MB_ICONWARNING);
 }
 
@@ -111,9 +123,9 @@ pub fn fatalNotice(err: anyerror) void {
     var wide: [buf.len + 1]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&wide, text) catch unreachable;
     wide[n] = 0;
-    if (builtin.is_test) if (test_message_box) |answer| {
-        _ = answer(null, wide[0..n :0], win32.MB_OK);
+    if (builtin.is_test) {
+        _ = if (test_message_box) |answer| answer(null, wide[0..n :0], win32.MB_OK) else unanswered();
         return;
-    };
+    }
     _ = win32.MessageBoxW(null, wide[0..n :0], L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
 }
