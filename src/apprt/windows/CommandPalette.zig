@@ -113,6 +113,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .reload_config,
         .quit,
         .inspector,
+        .show_on_screen_keyboard,
         => true,
 
         // Nothing to do.
@@ -121,15 +122,14 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no tab overview, GTK inspector, updater, undo, secure input or
-        // on-screen keyboard here.
+        // no tab overview, GTK inspector, updater, undo or secure input
+        // here.
         .toggle_tab_overview,
         .close_all_windows,
         .check_for_updates,
         .undo,
         .redo,
         .show_gtk_inspector,
-        .show_on_screen_keyboard,
         .toggle_secure_input,
         => false,
     };

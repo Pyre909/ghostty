@@ -84,6 +84,8 @@ pub fn route(key: Binding.Action.Key) Route {
         .reset_window_size,
         .prompt_window_title,
         .set_window_title,
+        // The window's keyboard, which types into the field as well.
+        .show_on_screen_keyboard,
         // Its tabs'.
         .new_tab,
         .previous_tab,
@@ -159,7 +161,6 @@ pub fn route(key: Binding.Action.Key) Route {
         .write_screen_file,
         .write_selection_file,
         .toggle_readonly,
-        .show_on_screen_keyboard,
         .toggle_secure_input,
         .toggle_mouse_reporting,
         .end_key_sequence,

@@ -300,6 +300,12 @@
 //! core as a text-only key event, and DefWindowProcW never turns it into
 //! WM_CHARs. The candidate window is placed at the cursor cell
 //! (`Surface.imePlace`). See `Surface.Ime`.
+//!
+//! `show_on_screen_keyboard` asks Windows for its touch keyboard for the
+//! terminal's window, and is performed if Windows says the keyboard
+//! shows (`input_pane.zig`), which is Windows' to decide: on a machine
+//! with a keyboard and no touch screen it says no. Windows hides it
+//! again; nothing here does.
 
 const std = @import("std");
 
@@ -401,6 +407,7 @@ test {
     _ = @import("windows/dialog.zig");
     _ = @import("windows/drop.zig");
     _ = @import("windows/imgui.zig");
+    _ = @import("windows/input_pane.zig");
     _ = @import("windows/ipc.zig");
     _ = @import("windows/IpcClient.zig");
     _ = @import("windows/IpcServer.zig");

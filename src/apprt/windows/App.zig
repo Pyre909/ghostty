@@ -44,6 +44,7 @@ const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
+const input_pane = @import("input_pane.zig");
 const toast = @import("toast.zig");
 const media = @import("media.zig");
 const confirm = @import("dialog.zig").confirm;
@@ -1912,6 +1913,7 @@ pub const App = struct {
             .toggle_split_zoom => self.toggleSplitZoom(target),
             .goto_window => self.gotoWindow(target, value),
             .float_window => floatWindow(target, value),
+            .show_on_screen_keyboard => showOnScreenKeyboard(target),
             .progress_report => progressReport(target, value),
             .desktop_notification => self.desktopNotification(target, value),
             .command_finished => commandFinished(target, value),
@@ -3638,6 +3640,18 @@ pub const App = struct {
 
     /// `.float_window`, from `toggle_window_float_on_top`: made at once,
     /// since it changes no terminal's size (`Window.setFloating`).
+    /// The `.show_on_screen_keyboard` action: ask Windows for its touch
+    /// keyboard for the terminal's window (`input_pane.tryShow`). As on
+    /// GTK (`Application.showOnScreenKeyboard`), performed is the
+    /// platform's answer: whether the keyboard shows.
+    fn showOnScreenKeyboard(target: apprt.Target) bool {
+        const window = switch (target) {
+            .app => return false,
+            .surface => |v| v.rt_surface.window,
+        };
+        return input_pane.tryShow(window.hwnd) catch false;
+    }
+
     fn floatWindow(target: apprt.Target, value: apprt.action.FloatWindow) bool {
         const window = switch (target) {
             .app => return false,
@@ -18926,6 +18940,13 @@ test "win32: the command palette lists only what performAction carries out" {
     // The size the core gives every terminal as it is made, which
     // reset_window_size goes back to.
     try std.testing.expect(try app.performAction(target, .initial_size, .{ .width = 800, .height = 600 }));
+    // Windows' answer to show_on_screen_keyboard.
+    input_pane.test_try_show = &struct {
+        fn shown(_: win32.HWND) error{InputPaneFailed}!bool {
+            return true;
+        }
+    }.shown;
+    defer input_pane.test_try_show = null;
 
     const Case = struct { input.Binding.Action.Key, apprt.Action.Key };
     const cases = [_]Case{
@@ -18936,7 +18957,6 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .undo, .undo },
         .{ .redo, .redo },
         .{ .show_gtk_inspector, .show_gtk_inspector },
-        .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
         .{ .toggle_secure_input, .secure_input },
         // Listed.
         .{ .new_window, .new_window },
@@ -18975,6 +18995,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .reset_window_size, .reset_window_size },
         .{ .toggle_command_palette, .toggle_command_palette },
         .{ .toggle_readonly, .readonly },
+        .{ .show_on_screen_keyboard, .show_on_screen_keyboard },
         // The app's.
         .{ .toggle_quick_terminal, .toggle_quick_terminal },
         .{ .toggle_visibility, .toggle_visibility },
@@ -19037,9 +19058,64 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(39, listed);
+    try std.testing.expectEqual(40, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
+}
+
+test "win32: show_on_screen_keyboard asks for the keyboard of the terminal's window" {
+    // Performed is Windows' answer for the window the terminal is in:
+    // that the keyboard shows, that it does not, or a call that failed.
+    // The app has no window to ask for.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const other = try testFrame(&app);
+    const d = try testPane(&app, other);
+    other.tab().tree = try .init(alloc, d);
+    other.tab().focused = d;
+
+    const Pane = struct {
+        var asked: ?win32.HWND = null;
+        var calls: usize = 0;
+        var answer: error{InputPaneFailed}!bool = true;
+        fn tryShow(frame: win32.HWND) error{InputPaneFailed}!bool {
+            asked = frame;
+            calls += 1;
+            return answer;
+        }
+    };
+    Pane.asked = null;
+    Pane.calls = 0;
+    Pane.answer = true;
+    input_pane.test_try_show = &Pane.tryShow;
+    defer input_pane.test_try_show = null;
+
+    try std.testing.expect(try app.performAction(.{ .surface = &d.core_surface }, .show_on_screen_keyboard, {}));
+    try std.testing.expectEqual(other.hwnd, Pane.asked.?);
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .show_on_screen_keyboard, {}));
+    try std.testing.expectEqual(window.hwnd, Pane.asked.?);
+    try std.testing.expectEqual(2, Pane.calls);
+
+    Pane.answer = false;
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .show_on_screen_keyboard, {}));
+    Pane.answer = error.InputPaneFailed;
+    try std.testing.expect(!try app.performAction(.{ .surface = &a.core_surface }, .show_on_screen_keyboard, {}));
+    try std.testing.expectEqual(4, Pane.calls);
+
+    Pane.answer = true;
+    try std.testing.expect(!try app.performAction(.app, .show_on_screen_keyboard, {}));
+    try std.testing.expectEqual(4, Pane.calls);
 }
 
 test "win32: the inspector opens only for a live terminal" {

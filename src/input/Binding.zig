@@ -697,10 +697,12 @@ pub const Action = union(enum) {
 
     /// Show the on-screen keyboard if one is present.
     ///
-    /// Only implemented on Linux (GTK). On GNOME, the "Screen Keyboard"
-    /// accessibility feature must be turned on, which can be found under
-    /// Settings > Accessibility > Typing. Other platforms are as of now
-    /// untested.
+    /// Only implemented on Linux (GTK) and Windows. On GNOME, the "Screen
+    /// Keyboard" accessibility feature must be turned on, which can be
+    /// found under Settings > Accessibility > Typing. On Windows this is
+    /// the touch keyboard, which Windows shows where it would for a text
+    /// box: not, for one, on a machine with a keyboard and no touch
+    /// screen.
     show_on_screen_keyboard,
 
     /// Open the configuration file in an editor.
