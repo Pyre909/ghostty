@@ -256,7 +256,7 @@ pub fn deinitTabs(self: *Window, alloc: Allocator) void {
     self.tabs.deinit(alloc);
 }
 
-fn freeTab(alloc: Allocator, t: *Tab) void {
+pub fn freeTab(alloc: Allocator, t: *Tab) void {
     t.tree.deinit();
     if (t.title_override) |title| alloc.free(title);
     alloc.destroy(t);
@@ -455,6 +455,40 @@ pub fn removeTab(self: *Window, t: *Tab) void {
         self.relayout();
     }
     freeTab(self.app.core_app.alloc, t);
+}
+
+/// `removeTab` for a tab that `undo` may put back (`Undo`): it leaves the
+/// window's tabs, but is kept, with every terminal of its parked. After
+/// `Undo.parks`, in a window with another tab.
+pub fn parkTab(self: *Window, t: *Tab) void {
+    const index = self.tabIndex(t).?;
+    // Its title prompt goes; the title it has stays with it.
+    TitleDialog.tabRemoved(self, t);
+    if (self.unlinkTab(index)) {
+        self.showTab();
+        hideTab(t);
+    } else {
+        self.relayout();
+    }
+    t.pending_focus = null;
+    var it = t.tree.iterator();
+    while (it.next()) |entry| {
+        entry.view.closing = true;
+        entry.view.park();
+    }
+    self.app.undo.pushTab(self.app, self, t, index);
+}
+
+/// Put `t`, which `parkTab` took out, back among the tabs at `index`, or
+/// at the end if fewer are left, and show it. Room for it was made.
+pub fn relinkTab(self: *Window, t: *Tab, index: usize) void {
+    const at = @min(index, self.tabs.items.len);
+    // `selected` goes on naming the tab that shows, which `selectTab`
+    // then hides.
+    if (at <= self.selected) self.selected += 1;
+    self.tabs.insertAssumeCapacity(at, t);
+    self.bar.tabsChanged(self);
+    self.selectTab(at);
 }
 
 /// Take the tab at `index` out of `tabs`, for `removeTab` and `takeTab`,
@@ -2246,9 +2280,13 @@ pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMod
     )) return true;
 
     // The tabs do not change while the prompt was open: only `run` adds a
-    // terminal, and a teardown is deferred (`App.canReenterCore`).
+    // terminal, and a teardown is deferred (`App.canReenterCore`). Marked
+    // as closing whole, and as one, for `undo`.
+    const group = self.app.undo.newGroup();
     for (self.tabs.items, 0..) |x, i| {
         if (!closes(i, at, mode)) continue;
+        x.closing = true;
+        x.group = group;
         var it = x.tree.iterator();
         while (it.next()) |entry| {
             if (entry.view.closing) continue;

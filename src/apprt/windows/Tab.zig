@@ -36,6 +36,16 @@ focused: ?*Surface = null,
 /// begins to close (`App.forgetClosing`).
 pending_focus: ?*Surface = null,
 
+/// The tab is closing whole (`Window.requestCloseTabs`): each of its
+/// terminals has a teardown posted, and with `undo` bound the first to
+/// run parks the whole tab (`Surface.destroy`). Cleared when `undo` puts
+/// the tab back.
+closing: bool = false,
+
+/// The number shared by the tabs closed with this one by one action, or
+/// zero (`Undo.Entry.group`).
+group: u64 = 0,
+
 /// The tab's title as `set_tab_title` gave it, which the window shows in
 /// place of its focused terminal's (`Window.tabTitle`); null for none.
 /// Owned, from the app's allocator.

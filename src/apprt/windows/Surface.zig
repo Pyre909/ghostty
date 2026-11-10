@@ -1056,14 +1056,26 @@ pub const Surface = struct {
         const window = self.window;
         if (window.find(self)) |at| {
             const t = window.tabs.items[at.index];
+            const app = self.app;
+            // Its tab goes with it: it is the tab's last terminal, or the
+            // tab is closing whole and this is the first of its teardowns
+            // to run. With another tab to show, the tab is kept for
+            // `undo`; the teardowns of its other terminals then find
+            // them parked.
+            const whole = at.handle == .root or t.closing;
+            if (whole and window.tabs.items.len > 1 and app.undo.parks(app, window, self)) {
+                window.parkTab(t);
+                return false;
+            }
             if (at.handle != .root) {
-                const app = self.app;
                 // Asked first: it makes room for the entry, so that
                 // nothing can fail once the terminal has left its tab.
-                const parks = app.undo.parks(app, window, self);
+                // Not one by one for a tab closing whole.
+                const parks = !t.closing and app.undo.parks(app, window, self);
                 var left = window.takePane(t, at.handle) catch |err| {
                     log.err("unable to take a closing terminal out of its window err={}", .{err});
                     self.closing = false;
+                    t.closing = false;
                     return false;
                 };
                 if (parks) {
@@ -1094,7 +1106,7 @@ pub const Surface = struct {
     /// and what waits on the terminal forgets it, but the core runs on,
     /// and its search bar and overlays are only hidden, to show again with
     /// it. Nothing here pumps messages.
-    fn park(self: *Surface) void {
+    pub fn park(self: *Surface) void {
         self.closeInspector();
         self.releaseInput();
         _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);

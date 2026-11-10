@@ -649,8 +649,12 @@ pub const App = struct {
         visibility,
 
         /// Take the last close back (`Undo.undo`): a terminal returns to
-        /// its tab, which is laid out again, with the focus.
+        /// its tab, or a tab to its window, which is laid out again, with
+        /// the focus.
         undo,
+
+        /// Close again what `undo` last brought back (`Undo.redo`).
+        redo,
 
         /// A new split beside `parent`, in `direction`.
         split: struct {
@@ -1947,6 +1951,7 @@ pub const App = struct {
             .toggle_quick_terminal => self.requestQuickTerminal(),
             .toggle_visibility => self.requestVisibility(),
             .undo => self.requestUndo(),
+            .redo => self.requestRedo(),
             .new_tab => self.requestTab(target),
             .goto_tab => self.gotoTab(target, value),
             .move_tab => self.moveTab(target, value),
@@ -2999,6 +3004,16 @@ pub const App = struct {
         return true;
     }
 
+    /// `.redo`, as `requestUndo`.
+    fn requestRedo(self: *App) bool {
+        if (!self.undo.pendingRedo()) return false;
+        self.requests.append(self.core_app.alloc, .redo) catch |err| {
+            log.warn("cannot record closing again err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     /// Whether `target` is a terminal parked for `undo` (`Undo`): hidden
     /// and in no tab, with its core running.
     fn parkedTarget(self: *const App, target: apprt.Target) bool {
@@ -3264,7 +3279,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .visibility, .undo, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
+            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -3882,6 +3897,7 @@ pub const App = struct {
                 },
                 .visibility => self.toggleVisibility(),
                 .undo => _ = self.undo.undo(self),
+                .redo => _ = self.undo.redo(self),
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
                     error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
@@ -11539,6 +11555,225 @@ test "win32: a parked terminal is refused what would show, prompt or move the fo
 
     // The other terminal is asked as ever.
     try std.testing.expect(try app.performAction(.{ .surface = &t.a.core_surface }, .new_split, .right));
+}
+
+test "win32: a tab closed where undo is bound is parked whole, and undo shows it in its place" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // From the tab shown, and from one before the tab shown, where the
+    // tab that comes back takes the shown one's index.
+    for ([_]usize{ 0, 2 }) |from| {
+        const t = try TestUndo.init(&app);
+        const window = t.window;
+        const t0 = window.tab();
+        const p1 = try testTab(&app, window);
+        window.selectTab(1);
+        const p2 = try testTab(&app, window);
+        window.selectTab(from);
+        try std.testing.expectEqual(3, window.tabs.items.len);
+
+        // One entry for the tab, though each of its two terminals had a
+        // teardown posted: the second finds its terminal parked.
+        try std.testing.expect(window.closeTabs(0, .this));
+        testPump();
+        try std.testing.expectEqual(2, window.tabs.items.len);
+        try std.testing.expectEqual(1, app.undo.entries.items.len);
+        for ([_]*Surface{ t.a, t.b }) |pane| {
+            try std.testing.expect(TestUndo.has(&app, pane));
+            try std.testing.expect(pane.parked);
+            try std.testing.expect(!shown(pane.hwnd));
+        }
+        const stays = if (from == 0) p1 else p2;
+        try std.testing.expectEqual(stays, window.tab().focused.?);
+        try std.testing.expect(shown(stays.hwnd));
+
+        try std.testing.expect(try app.performAction(.app, .undo, {}));
+        app.createRequested();
+        try std.testing.expectEqual(3, window.tabs.items.len);
+        try std.testing.expectEqual(t0, window.tabs.items[0]);
+        try std.testing.expectEqual(t0, window.tab());
+        try std.testing.expect(!t0.closing);
+        for ([_]*Surface{ t.a, t.b }) |pane| {
+            try std.testing.expect(!pane.parked);
+            try std.testing.expect(!pane.closing);
+            try std.testing.expect(shown(pane.hwnd));
+        }
+        try std.testing.expect(!shown(p1.hwnd));
+        try std.testing.expect(!shown(p2.hwnd));
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
+    }
+}
+
+test "win32: tabs closed by one action come back by one undo, and go again by one redo" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    const t0 = window.tab();
+    const p1 = try testTab(&app, window);
+    window.selectTab(1);
+    const t1 = window.tab();
+    const p2 = try testTab(&app, window);
+    const t2 = window.tabs.items[2];
+
+    try std.testing.expect(window.closeTabs(1, .other));
+    testPump();
+    try std.testing.expectEqualSlices(*Window.Tab, &.{t1}, window.tabs.items);
+    try std.testing.expectEqual(2, app.undo.entries.items.len);
+    try std.testing.expectEqual(4, app.surfaces.items.len);
+
+    // Back where they were, around the tab the user is in, which stays
+    // the one shown.
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqualSlices(*Window.Tab, &.{ t0, t1, t2 }, window.tabs.items);
+    try std.testing.expectEqual(t1, window.tab());
+    try std.testing.expect(shown(p1.hwnd));
+    try std.testing.expect(!shown(t.a.hwnd));
+    try std.testing.expect(!shown(p2.hwnd));
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expect(!try app.performAction(.app, .undo, {}));
+
+    // Closed again, unasked, and kept for undo again.
+    try std.testing.expect(try app.performAction(.app, .redo, {}));
+    app.createRequested();
+    try std.testing.expectEqualSlices(*Window.Tab, &.{t1}, window.tabs.items);
+    try std.testing.expectEqual(2, app.undo.entries.items.len);
+    try std.testing.expect(t.a.parked and t.b.parked and p2.parked);
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
+
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqualSlices(*Window.Tab, &.{ t0, t1, t2 }, window.tabs.items);
+    try std.testing.expectEqual(t1, window.tab());
+}
+
+test "win32: a split closed in a tab that then closes comes back after the tab, or ends with it" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // Taken back in turn: the tab first, with the terminal it had left,
+    // then the split into it.
+    {
+        const t = try TestUndo.init(&app);
+        const window = t.window;
+        const t0 = window.tab();
+        const p1 = try testTab(&app, window);
+        TestUndo.close(t.b);
+        // The tab's last terminal takes the tab, which is parked whole.
+        TestUndo.close(t.a);
+        try std.testing.expectEqual(2, app.undo.entries.items.len);
+        try std.testing.expectEqual(p1, window.tab().focused.?);
+
+        try std.testing.expect(try app.performAction(.app, .undo, {}));
+        app.createRequested();
+        try std.testing.expectEqual(t0, window.tab());
+        try std.testing.expect(!t.a.parked);
+        try std.testing.expect(t.b.parked);
+        try std.testing.expect(try app.performAction(.app, .undo, {}));
+        app.createRequested();
+        try std.testing.expect(!t.b.parked);
+        try std.testing.expect(window.find(t.b) != null);
+        try std.testing.expect(shown(t.b.hwnd));
+        try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
+    }
+    // The tab's time is up: its terminals are torn down, and so is the
+    // one closed in it before, which had nowhere left to go back to. A
+    // leak of the tab or of the tree fails the test.
+    {
+        const t = try TestUndo.init(&app);
+        const p1 = try testTab(&app, t.window);
+        TestUndo.close(t.b);
+        Undo.test_now = 2000;
+        TestUndo.close(t.a);
+        Undo.test_now = 7000;
+        TestUndo.tick(&app);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        testPump();
+        try std.testing.expectEqualSlices(*Surface, &.{p1}, app.surfaces.items);
+        try std.testing.expect(win32.DestroyWindow(t.window.hwnd).toBool());
+    }
+    // The window goes with a tab and a split parked in it.
+    {
+        const t = try TestUndo.init(&app);
+        _ = try testTab(&app, t.window);
+        TestUndo.close(t.b);
+        TestUndo.close(t.a);
+        try std.testing.expect(win32.DestroyWindow(t.window.hwnd).toBool());
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+    }
+}
+
+test "win32: redo closes a split again until something else closes or its time is up" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    const before = .{ try paneRect(window, t.a), try paneRect(window, t.b) };
+
+    // Nothing undone yet.
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
+    TestUndo.close(t.b);
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+
+    try std.testing.expect(try app.performAction(.app, .redo, {}));
+    try std.testing.expect(!t.b.parked);
+    app.createRequested();
+    try std.testing.expect(t.b.parked);
+    try std.testing.expect(t.b.closing);
+    try std.testing.expect(window.find(t.b) == null);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
+
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(before[0], try paneRect(window, t.a));
+    try std.testing.expectEqual(before[1], try paneRect(window, t.b));
+
+    // Too late.
+    Undo.test_now = 1000 + 5000;
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
+
+    // Another close in between starts over.
+    Undo.test_now = 10_000;
+    TestUndo.close(t.b);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expect(app.undo.pendingRedo());
+    TestUndo.close(t.a);
+    try std.testing.expect(t.a.parked);
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {
