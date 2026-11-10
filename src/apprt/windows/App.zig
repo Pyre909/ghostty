@@ -6505,6 +6505,22 @@ test "win32: a new window shows at window-position-x and window-position-y" {
     try std.testing.expectEqual(60, sized_visible.left);
     try std.testing.expectEqual(40, sized_visible.top);
 
+    // As `new_window` makes one.
+    const Panes = struct {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
+            const made = try testPane(w.app, w);
+            // `App.newWindow` makes it the app's.
+            _ = w.app.surfaces.pop();
+            return made;
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+    const made = try app.newWindow(null, .normal, null);
+    const made_visible = TabBar.visibleBounds(made.hwnd) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(60, made_visible.left);
+    try std.testing.expectEqual(40, made_visible.top);
+
     // A tab moved into a window of its own: that one is no new window,
     // and stays where Windows put it, which is never there.
     app.config.@"window-position-x" = 7;
