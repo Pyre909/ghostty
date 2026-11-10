@@ -29,6 +29,7 @@ const Inspector = @import("Inspector.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
 const Undo = @import("Undo.zig");
+const Session = @import("Session.zig");
 const IpcClient = @import("IpcClient.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
@@ -5659,6 +5660,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.title = null;
     surface.title_override = null;
     surface.pwd = null;
+    surface.ran_command = false;
     surface.initial_size = null;
     surface.min_size = null;
     surface.ime = .{};
@@ -28761,4 +28763,315 @@ fn testIpcInitialWindow() !void {
     const named = Made.named orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(std.os.windows.GetCurrentProcessId(), named.pid);
     try std.testing.expectEqualStrings(class, named.class orelse return error.TestUnexpectedResult);
+}
+
+/// This machine in the window state tests: `ME` and nothing else.
+fn testStateLocal(host: []const u8) bool {
+    return std.mem.eql(u8, host, "ME");
+}
+
+/// For tests: the title given to each terminal under `handle`, from left
+/// to right, but for those closing.
+fn testKeptTitles(
+    arena: std.mem.Allocator,
+    tree: *const Window.Tree,
+    handle: Window.Tree.Node.Handle,
+    out: *std.ArrayList([]const u8),
+) !void {
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |pane| if (!pane.closing) try out.append(arena, pane.title_override.?),
+        .split => |s| {
+            try testKeptTitles(arena, tree, s.left, out);
+            try testKeptTitles(arena, tree, s.right, out);
+        },
+    }
+}
+
+/// For tests: that the state's node `index` and all under it are the
+/// tree's `handle` and all under it; the index after its last node.
+fn testSameTree(
+    tree: *const Window.Tree,
+    handle: Window.Tree.Node.Handle,
+    nodes: []const Session.State.Node,
+    index: u32,
+) !u32 {
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |pane| {
+            try std.testing.expectEqualStrings(pane.title_override.?, nodes[index].leaf.title.?);
+            return index + 1;
+        },
+        .split => |s| {
+            const saved = nodes[index].split;
+            try std.testing.expectEqualStrings(@tagName(s.layout), @tagName(saved.layout));
+            try std.testing.expectEqual(s.ratio, saved.ratio);
+            try std.testing.expectEqual(index + 1, saved.left);
+            try std.testing.expectEqual(try testSameTree(tree, s.left, nodes, saved.left), saved.right);
+            return testSameTree(tree, s.right, nodes, saved.right);
+        },
+    }
+}
+
+test "win32: the open windows are described as they are, to be saved" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Nothing open is nothing to save.
+    try std.testing.expect(try Session.snapshot(&app, arena, &testStateLocal) == null);
+
+    // A window of two tabs: a | (b | c) with the first split moved and b
+    // focused, and d alone, which shows.
+    const first = try testFrame(&app);
+    const a = try testPane(&app, first);
+    const b = try testPane(&app, first);
+    const c = try testPane(&app, first);
+    first.tab().tree = try testRow(alloc, &.{ a, b, c });
+    first.tab().tree.resizeInPlace(.root, 0.25);
+    first.tab().focused = b;
+    first.relayout();
+    const d = try testTab(&app, first);
+    first.selectTab(1);
+
+    // The titles the user gave are kept, a program's are not; and a
+    // directory only as a state takes one.
+    try std.testing.expect(a.setTitleOverride("left"));
+    try std.testing.expect(a.setTitle("vim"));
+    try std.testing.expect(b.setTitle("cmd"));
+    try std.testing.expect(b.setPwd("C:\\src"));
+    try std.testing.expect(c.setPwd("\\\\other\\share"));
+    try std.testing.expect(d.setPwd("\\\\ME\\share\\logs"));
+    try std.testing.expect(first.setWindowTitle("main"));
+    try std.testing.expect(first.setTabTitle(d, "logs"));
+
+    // And a window of one terminal.
+    const second = try testFrame(&app);
+    const e = try testPane(&app, second);
+    second.tab().tree = try .init(alloc, e);
+    second.tab().focused = e;
+
+    const place = .{ first.savedPlace().?, second.savedPlace().? };
+    const expected: Session.State = .{ .version = 1, .windows = &.{
+        .{
+            .rect = place[0].rect,
+            .dpi = place[0].dpi,
+            .maximized = false,
+            .fullscreen = false,
+            .title = "main",
+            .selected = 1,
+            .tabs = &.{
+                .{ .focused = 3, .nodes = &.{
+                    .{ .split = .{ .layout = .horizontal, .ratio = 0.25, .left = 1, .right = 2 } },
+                    .{ .leaf = .{ .title = "left" } },
+                    .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = 3, .right = 4 } },
+                    .{ .leaf = .{ .pwd = "C:\\src" } },
+                    .{ .leaf = .{} },
+                } },
+                .{ .title = "logs", .focused = 0, .nodes = &.{
+                    .{ .leaf = .{ .pwd = "\\\\ME\\share\\logs" } },
+                } },
+            },
+        },
+        .{
+            .rect = place[1].rect,
+            .dpi = place[1].dpi,
+            .maximized = false,
+            .fullscreen = false,
+            .selected = 0,
+            .tabs = &.{.{ .focused = 0, .nodes = &.{.{ .leaf = .{} }} }},
+        },
+    } };
+    const state = (try Session.snapshot(&app, arena, &testStateLocal)).?;
+    try std.testing.expectEqualDeep(expected, state);
+    // It is one a later launch takes.
+    const text = try Session.State.encode(arena, state, &testStateLocal);
+    try std.testing.expectEqualDeep(expected, try Session.State.decode(arena, text, &testStateLocal));
+
+    // A terminal that is closing is left out, and the split it was in
+    // is then its other side.
+    c.closing = true;
+    var tabs = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0].tabs;
+    try std.testing.expectEqualDeep(Session.State.Tab{ .focused = 2, .nodes = &.{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.25, .left = 1, .right = 2 } },
+        .{ .leaf = .{ .title = "left" } },
+        .{ .leaf = .{ .pwd = "C:\\src" } },
+    } }, tabs[0]);
+    // With the focused one closing too, the focus is the first's.
+    b.closing = true;
+    tabs = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0].tabs;
+    try std.testing.expectEqualDeep(Session.State.Tab{ .focused = 0, .nodes = &.{
+        .{ .leaf = .{ .title = "left" } },
+    } }, tabs[0]);
+    // A tab whose terminals all are is left out, and the tab that
+    // shows is then counted among those kept.
+    a.closing = true;
+    var windows = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows;
+    try std.testing.expectEqual(1, windows[0].tabs.len);
+    try std.testing.expectEqual(0, windows[0].selected);
+    try std.testing.expectEqualStrings("logs", windows[0].tabs[0].title.?);
+    for ([_]*Surface{ a, b, c }) |pane| pane.closing = false;
+
+    // So is a tab with a terminal started with a command: only a shell
+    // could come back in its place.
+    b.ran_command = true;
+    windows = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows;
+    try std.testing.expectEqual(1, windows[0].tabs.len);
+    try std.testing.expectEqual(0, windows[0].selected);
+    // Unless that terminal is closing: the rest of its tab is kept.
+    b.closing = true;
+    windows = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows;
+    try std.testing.expectEqual(2, windows[0].tabs.len);
+    try std.testing.expectEqual(3, windows[0].tabs[0].nodes.len);
+    b.closing = false;
+    b.ran_command = false;
+
+    // A window that is closing, the quick terminal, and a window with
+    // no tab kept are left out.
+    first.closing = true;
+    windows = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows;
+    try std.testing.expectEqual(1, windows.len);
+    try std.testing.expectEqual(place[1].rect, windows[0].rect);
+    first.closing = false;
+    second.quick = true;
+    try std.testing.expectEqual(1, (try Session.snapshot(&app, arena, &testStateLocal)).?.windows.len);
+    second.quick = false;
+    e.ran_command = true;
+    try std.testing.expectEqual(1, (try Session.snapshot(&app, arena, &testStateLocal)).?.windows.len);
+    first.closing = true;
+    try std.testing.expect(try Session.snapshot(&app, arena, &testStateLocal) == null);
+    first.closing = false;
+    e.ran_command = false;
+}
+
+test "win32: a terminal parked for undo is not among the windows to save" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const t = try TestUndo.init(&app);
+    var tab = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0].tabs[0];
+    try std.testing.expectEqual(3, tab.nodes.len);
+
+    TestUndo.close(t.b);
+    try std.testing.expect(t.b.parked);
+    tab = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0].tabs[0];
+    try std.testing.expectEqualDeep(Session.State.Tab{ .focused = 0, .nodes = &.{.{ .leaf = .{} }} }, tab);
+}
+
+test "win32: any split tree is saved as it is, in the order a state lists one" {
+    // A tree's nodes are in the order its splits were made, which is not
+    // the order a state lists them in. Whatever the tree, the state is a
+    // valid one with the same splits and terminals in the same places;
+    // and with some terminals closing, a valid one of the others, in
+    // their order.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const window = try testFrame(&app);
+    var panes: [9]*Surface = undefined;
+    for (&panes, 0..) |*pane, i| {
+        pane.* = try testPane(&app, window);
+        var name: [8]u8 = undefined;
+        try std.testing.expect(pane.*.setTitleOverride(try std.fmt.bufPrint(&name, "p{d}", .{i})));
+    }
+    // The tab's first tree holds only the first; the others are owned
+    // by the app alone until a round's tree takes them.
+    window.tab().tree = try .init(alloc, panes[0]);
+
+    var prng: std.Random.DefaultPrng = .init(0x57a7_e004);
+    const random = prng.random();
+    var unordered: usize = 0;
+    for (0..200) |_| {
+        const count = random.intRangeAtMost(usize, 1, panes.len);
+        var tree: Window.Tree = try .init(alloc, panes[0]);
+        for (panes[1..count]) |pane| {
+            var pick: Window.Tree.Node.Handle = .root;
+            var seen: usize = 0;
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                seen += 1;
+                if (random.uintLessThan(usize, seen) == 0) pick = entry.handle;
+            }
+            var single: Window.Tree = try .init(alloc, pane);
+            defer single.deinit();
+            const next = try tree.split(alloc, pick, random.enumValue(Window.Tree.Split.Direction), 0.5, &single);
+            tree.deinit();
+            tree = next;
+        }
+        for (tree.nodes, 0..) |node, i| if (node == .split) {
+            tree.resizeInPlace(Window.Tree.Node.Handle.root.offset(i), @floatCast(random.float(f32)));
+        };
+        window.tab().tree.deinit();
+        window.tab().tree = tree;
+        window.tab().focused = panes[random.uintLessThan(usize, count)];
+
+        // Whole: the same tree.
+        var tab = (try Session.snapshot(&app, arena, &testStateLocal)).?.windows[0].tabs[0];
+        try std.testing.expectEqual(tree.nodes.len, tab.nodes.len);
+        try std.testing.expectEqual(tree.nodes.len, try testSameTree(&tree, .root, tab.nodes, 0));
+        try std.testing.expectEqualStrings(
+            window.tab().focused.?.title_override.?,
+            tab.nodes[tab.focused].leaf.title.?,
+        );
+        for (tree.nodes, 0..) |node, i| if (node == .split) {
+            if (node.split.left.idx() != i + 1) unordered += 1;
+        };
+
+        // With some closing: the others, in their order.
+        var kept: usize = 0;
+        for (panes[0..count]) |pane| {
+            pane.closing = random.boolean();
+            if (!pane.closing) kept += 1;
+        }
+        defer for (panes[0..count]) |pane| {
+            pane.closing = false;
+        };
+        const state = try Session.snapshot(&app, arena, &testStateLocal);
+        if (kept == 0) {
+            try std.testing.expect(state == null);
+            continue;
+        }
+        try Session.State.check(arena, state.?, &testStateLocal);
+        tab = state.?.windows[0].tabs[0];
+        try std.testing.expectEqual(2 * kept - 1, tab.nodes.len);
+        var titles: std.ArrayList([]const u8) = .empty;
+        try testKeptTitles(arena, &tree, .root, &titles);
+        var at: usize = 0;
+        for (tab.nodes) |node| if (node == .leaf) {
+            try std.testing.expectEqualStrings(titles.items[at], node.leaf.title.?);
+            at += 1;
+        };
+        try std.testing.expectEqual(kept, at);
+        const focused = window.tab().focused.?;
+        if (!focused.closing) try std.testing.expectEqualStrings(
+            focused.title_override.?,
+            tab.nodes[tab.focused].leaf.title.?,
+        );
+    }
+    // The trees did come in another order than a state's.
+    try std.testing.expect(unordered > 0);
 }

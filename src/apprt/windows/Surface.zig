@@ -107,6 +107,12 @@ pub const Surface = struct {
     /// hold where the windows are described to be saved.
     pwd: ?[]u8,
 
+    /// Whether the terminal was started with a command of its own, from
+    /// `-e` or `--command` (`Overrides`) or as the first terminal under
+    /// `initial-command`, in place of the configured shell. Its tab is
+    /// then not one `window-save-state` can bring back (`Session`).
+    ran_command: bool,
+
     /// The client size the core asked for through `.initial_size`, or null
     /// when `window-width`/`window-height` are unset. The core divides the
     /// cell area by the content scale but adds the padding in device pixels
@@ -817,6 +823,7 @@ pub const Surface = struct {
             .title = null,
             .title_override = null,
             .pwd = null,
+            .ran_command = false,
             .initial_size = null,
             .min_size = null,
             .closing = false,
@@ -898,7 +905,10 @@ pub const Surface = struct {
         // A path asked for is checked as an inherited one is.
         const wd = if (opts.overrides) |o| o.workingDirectory(opts.working_directory) else opts.working_directory;
         inheritWorkingDirectory(&config, app.config.@"working-directory", wd);
-        // Before init, which clears `first`. Without it a drop takes the
+        // Before init, which clears `first`.
+        self.ran_command = (if (opts.overrides) |o| o.command != null else false) or
+            (app.core_app.first and config.@"initial-command" != null);
+        // Before init as well. Without it a drop takes the
         // quoting for a shell Ghostty does not know, the most careful.
         self.shell = drop.shellOf(alloc, &config, app.core_app.first) catch |err| shell: {
             log.warn("unable to tell the shell a file drop is quoted for err={}", .{err});

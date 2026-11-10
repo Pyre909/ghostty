@@ -146,6 +146,7 @@ pub const WS_CLIPSIBLINGS: DWORD = 0x04000000;
 pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_HIDE: c_int = 0;
 pub const SW_SHOWNORMAL: c_int = 1;
+pub const SW_SHOWMINIMIZED: c_int = 2;
 pub const SW_SHOWNOACTIVATE: c_int = 4;
 /// Minimizes the window and activates the next one in the Z order.
 pub const SW_MINIMIZE: c_int = 6;
@@ -649,6 +650,8 @@ pub extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
 pub const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
 pub extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement
+/// WINDOWPLACEMENT.flags: a minimized window comes back maximized.
+pub const WPF_RESTORETOMAXIMIZED: UINT = 0x0002;
 pub const WINDOWPLACEMENT = extern struct {
     length: UINT,
     flags: UINT,

@@ -3955,6 +3955,56 @@ pub fn toggleFullscreen(self: *Window) void {
     self.relayout();
 }
 
+/// A window's place as `window-save-state` keeps it.
+pub const SavedPlace = struct {
+    /// Where it is when neither maximized nor covering its monitor.
+    rect: [4]i32,
+    dpi: u32,
+    maximized: bool,
+    fullscreen: bool,
+};
+
+/// The place to save for a frame at `frame` with `placement`, covering
+/// its monitor if `restore` is what that put aside, on a monitor of
+/// `dpi`. A window covering its monitor is saved as what it comes back
+/// to. One that is maximized, or minimized, is saved with the rect it
+/// restores to; any other with the rect it has, which for a window
+/// snapped to a side is not its placement's (`Restore.rect`).
+pub fn savedPlaceOf(
+    placement: win32.WINDOWPLACEMENT,
+    frame: win32.RECT,
+    restore: ?Restore,
+    dpi: u32,
+) SavedPlace {
+    const p = if (restore) |r| r.placement else placement;
+    const shown = if (restore) |r| r.rect else frame;
+    const minimized = p.showCmd == win32.SW_SHOWMINIMIZED;
+    const maximized = p.showCmd == win32.SW_SHOWMAXIMIZED or
+        (minimized and p.flags & win32.WPF_RESTORETOMAXIMIZED != 0);
+    const rect = if (maximized or minimized) p.rcNormalPosition else shown;
+    return .{
+        .rect = .{ rect.left, rect.top, rect.right, rect.bottom },
+        .dpi = dpi,
+        .maximized = maximized,
+        .fullscreen = restore != null,
+    };
+}
+
+/// The window's place to save (`savedPlaceOf`), or null, logged, if it
+/// cannot be read.
+pub fn savedPlace(self: *const Window) ?SavedPlace {
+    var placement = std.mem.zeroes(win32.WINDOWPLACEMENT);
+    placement.length = @sizeOf(win32.WINDOWPLACEMENT);
+    var frame: win32.RECT = undefined;
+    if (!win32.GetWindowPlacement(self.hwnd, &placement).toBool() or
+        !win32.GetWindowRect(self.hwnd, &frame).toBool())
+    {
+        log.warn("cannot read a window's place to save it err={}", .{win32.GetLastError()});
+        return null;
+    }
+    return savedPlaceOf(placement, frame, self.fullscreen, dpiOf(self.app, self.hwnd));
+}
+
 /// Move and size the frame to `rect`, in screen coordinates.
 fn moveTo(self: *Window, rect: win32.RECT, flags: win32.UINT) void {
     _ = win32.SetWindowPos(
@@ -4348,6 +4398,52 @@ test "win32: a saved window goes where it was, at today's scale, on a monitor th
     // The widest rect a state holds, at the largest scale, overflows
     // nothing.
     try eq(.{ 0, 0, 1920, 1040 }, restoredRect(.{ -32767, -32767, 32767, 32767 }, 48, 960, work));
+}
+
+test "win32: a window is saved with the place it comes back to" {
+    const normal: win32.RECT = .{ .left = 100, .top = 50, .right = 900, .bottom = 650 };
+    const snapped: win32.RECT = .{ .left = 0, .top = 0, .right = 960, .bottom = 1040 };
+    const monitor: win32.RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+    var placement = std.mem.zeroes(win32.WINDOWPLACEMENT);
+    placement.rcNormalPosition = normal;
+    placement.showCmd = @intCast(win32.SW_SHOWNORMAL);
+
+    // As it is: the rect it has, which for a snapped one is not its
+    // placement's.
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 0, 0, 960, 1040 }, .dpi = 144, .maximized = false, .fullscreen = false },
+        savedPlaceOf(placement, snapped, null, 144),
+    );
+
+    // Maximized, or minimized from either: the rect it restores to.
+    var maximized = placement;
+    maximized.showCmd = @intCast(win32.SW_SHOWMAXIMIZED);
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = true, .fullscreen = false },
+        savedPlaceOf(maximized, monitor, null, 96),
+    );
+    var minimized = placement;
+    minimized.showCmd = @intCast(win32.SW_SHOWMINIMIZED);
+    const off: win32.RECT = .{ .left = -32000, .top = -32000, .right = -31840, .bottom = -31972 };
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = false, .fullscreen = false },
+        savedPlaceOf(minimized, off, null, 96),
+    );
+    minimized.flags = win32.WPF_RESTORETOMAXIMIZED;
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = true, .fullscreen = false },
+        savedPlaceOf(minimized, off, null, 96),
+    );
+
+    // Covering its monitor: what it comes back to, not the monitor.
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 0, 0, 960, 1040 }, .dpi = 96, .maximized = false, .fullscreen = true },
+        savedPlaceOf(placement, monitor, .{ .placement = placement, .rect = snapped }, 96),
+    );
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = true, .fullscreen = true },
+        savedPlaceOf(placement, monitor, .{ .placement = maximized, .rect = monitor }, 96),
+    );
 }
 
 test "win32: an initial size is kept inside the monitor work area" {

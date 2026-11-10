@@ -112,6 +112,26 @@ pub const Leaf = struct {
     title: ?[]const u8 = null,
 };
 
+/// Whether a share's server is this machine (`windows_pwd.IsLocal`).
+pub const IsLocal = windows_pwd.IsLocal;
+
+/// `v` as a state's title: itself, or none when a state would not take
+/// it (`checkTitle`), as a program's title that is not text.
+pub fn titleOrNone(v: ?[]const u8) ?[]const u8 {
+    checkTitle(v) catch return null;
+    return v;
+}
+
+/// `v` as a state's directory: itself, or none when a state would not
+/// take it (`checkPwd`). `alloc` is used and given back within the call.
+pub fn pwdOrNone(alloc: Allocator, v: ?[]const u8, isLocal: IsLocal) Allocator.Error!?[]const u8 {
+    checkPwd(alloc, v, isLocal) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    return v;
+}
+
 /// Why a state is refused. `Syntax` is text that is not this format at
 /// all; the others each name the rule a well-formed state broke.
 pub const Invalid = error{
