@@ -1541,7 +1541,7 @@ pub const StreamHandler = struct {
         if (comptime builtin.target.os.tag == .windows) {
             var arena: std.heap.ArenaAllocator = .init(self.alloc);
             defer arena.deinit();
-            switch (try windows_pwd.parse(arena.allocator(), url, &isLocalHost)) {
+            switch (try windows_pwd.parse(arena.allocator(), url, &windows_pwd.isLocalHost)) {
                 .path => |path| try self.pwdChanged(path),
                 .refused => |why| log.warn("reported working directory refused ({t}): {s}", .{ why, url }),
             }
@@ -1602,14 +1602,6 @@ pub const StreamHandler = struct {
         defer arena_alloc.deinit();
         const path = try uri.path.toRawMaybeAlloc(stack_alloc.allocator());
         try self.pwdChanged(path);
-    }
-
-    /// Whether an OSC 7 host names this machine, for `windows_pwd.parse`.
-    fn isLocalHost(host: []const u8) bool {
-        return internal_os.hostname.isLocal(host) catch |err| {
-            log.warn("failed to get hostname for OSC 7 validation: {}", .{err});
-            return false;
-        };
     }
 
     /// The pwd the shell reported, for the terminal, the surface and, while

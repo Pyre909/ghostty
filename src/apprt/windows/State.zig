@@ -12,8 +12,9 @@
 //!   says, in a directory the file names.
 //! - Each directory must be one a shell could have reported
 //!   (src/termio/windows_pwd.zig), and in the form that gives. A share on
-//!   another server is refused as it is there: opening one connects to
-//!   that server as the user.
+//!   another server is never opened, as none is taken from a shell:
+//!   opening one connects to that server as the user. It is not written,
+//!   and one read is left out (`decode`).
 //! - A tab's splits are a flat list of nodes, as the split tree's own
 //!   (src/datastruct/split_tree.zig), in preorder: a split's left child
 //!   is the node after it. No type here holds itself, so no file decides
@@ -35,22 +36,29 @@ const windows_pwd = @import("../../termio/windows_pwd.zig");
 /// The format's version. Another one's file is not read.
 pub const format_version = 1;
 
-/// The most windows in one state, tabs in one window, and nodes in one
-/// tab; 127 nodes are 64 terminals.
+/// The most windows in one state.
 pub const max_windows = 16;
+
+/// The most tabs in one window.
 pub const max_tabs = 64;
+
+/// The most nodes in one tab: 127 nodes are 64 terminals.
 pub const max_nodes = 127;
 
-/// The longest title and directory, in bytes.
+/// The longest title, in bytes.
 pub const max_title = 1024;
+
+/// The longest directory, in bytes.
 pub const max_pwd = 4096;
 
 /// The largest coordinate of a window's rectangle either way, which is
 /// what a virtual screen's can be.
 pub const max_coordinate = 32767;
 
-/// The scales a window can have been saved at: 50% to 1000% of 96.
+/// The least scale a window can have been saved at: 50% of 96.
 pub const min_dpi = 48;
+
+/// The largest: 1000% of 96.
 pub const max_dpi = 960;
 
 version: u32,
@@ -112,8 +120,10 @@ pub const Leaf = struct {
     title: ?[]const u8 = null,
 };
 
-/// Whether a share's server is this machine (`windows_pwd.IsLocal`).
+/// Whether a share's server is this machine (`windows_pwd.IsLocal`), and
+/// the one that says so of this machine.
 pub const IsLocal = windows_pwd.IsLocal;
+pub const isLocalHost = windows_pwd.isLocalHost;
 
 /// `v` as a state's title: itself, or none when a state would not take
 /// it (`checkTitle`), as a program's title that is not text.
@@ -154,7 +164,7 @@ pub const Invalid = error{
 pub fn encode(
     alloc: Allocator,
     state: State,
-    isLocal: windows_pwd.IsLocal,
+    isLocal: IsLocal,
 ) (Allocator.Error || Invalid)![]u8 {
     try check(alloc, state, isLocal);
     return std.json.Stringify.valueAlloc(alloc, state, .{});
@@ -162,10 +172,16 @@ pub fn encode(
 
 /// The state `text` holds. Everything of it is allocated with `arena`,
 /// and nothing points into `text`.
+///
+/// A share's directory whose server is not this machine is left out,
+/// and its terminal starts where a new one does. Every other rule is
+/// about the text alone, and refuses the whole state; this one is about
+/// what the machine is called today, and a state saved under another
+/// name is still the user's windows.
 pub fn decode(
     arena: Allocator,
     text: []const u8,
-    isLocal: windows_pwd.IsLocal,
+    isLocal: IsLocal,
 ) (Allocator.Error || Invalid)!State {
     const state = std.json.parseFromSliceLeaky(State, arena, text, .{
         .ignore_unknown_fields = true,
@@ -173,6 +189,21 @@ pub fn decode(
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Syntax,
+    };
+    for (state.windows) |window| for (window.tabs) |tab| {
+        // The nodes are this call's own, just allocated in `arena`.
+        for (@constCast(tab.nodes)) |*node| switch (node.*) {
+            .split => {},
+            .leaf => |*leaf| if (leaf.pwd) |pwd| {
+                if (pwd.len > max_pwd) continue;
+                switch (try windows_pwd.parse(arena, pwd, isLocal)) {
+                    .refused => |why| if (why == .remote_host) {
+                        leaf.pwd = null;
+                    },
+                    .path => {},
+                }
+            },
+        };
     };
     try check(arena, state, isLocal);
     return state;
@@ -183,7 +214,7 @@ pub fn decode(
 pub fn check(
     alloc: Allocator,
     state: State,
-    isLocal: windows_pwd.IsLocal,
+    isLocal: IsLocal,
 ) (Allocator.Error || Invalid)!void {
     if (state.version != format_version) return error.Version;
     if (state.windows.len == 0 or state.windows.len > max_windows) return error.Windows;
@@ -265,7 +296,7 @@ fn checkTitle(title: ?[]const u8) Invalid!void {
 fn checkPwd(
     alloc: Allocator,
     pwd: ?[]const u8,
-    isLocal: windows_pwd.IsLocal,
+    isLocal: IsLocal,
 ) (Allocator.Error || Invalid)!void {
     const v = pwd orelse return;
     if (v.len > max_pwd) return error.Pwd;
@@ -311,11 +342,9 @@ pub fn testRandom(
             // leaves remain to hand out below it.
             const leaves = random.intRangeAtMost(usize, 1, most.leaves);
             const nodes = try arena.alloc(Node, 2 * leaves - 1);
-            var next: u32 = 0;
             // (node to fill, leaves it holds)
             var stack: std.ArrayList(struct { u32, usize }) = .empty;
             try stack.append(arena, .{ 0, leaves });
-            next = 1;
             var focus: std.ArrayList(u32) = .empty;
             // Preorder needs each subtree's nodes together, so a split's
             // right child is numbered only after its whole left side;
@@ -508,10 +537,8 @@ test "win32: a window state that breaks a rule is refused whole" {
         .{ error.Title, "\"build\"", "\"" ++ &@as([max_title + 1]u8, @splat('x')) ++ "\"" },
         .{ error.Title, "\"title\":null,\"selected\"", "\"title\":\"\",\"selected\"" },
 
-        // Directories no shell's report gives: another machine's share,
-        // a device, relative ones, a URL (a report's other form, which
+        // Directories no shell's report gives: a device, relative ones, a URL (a report's other form, which
         // is not the form kept), and one with a name no directory has.
-        .{ error.Pwd, "C:\\\\src", "\\\\\\\\other\\\\share" },
         .{ error.Pwd, "C:\\\\src", "\\\\\\\\.\\\\pipe\\\\x" },
         .{ error.Pwd, "C:\\\\src", "\\\\\\\\?\\\\GLOBALROOT\\\\Device" },
         .{ error.Pwd, "C:\\\\src", "C:src" },
@@ -534,6 +561,22 @@ test "win32: a window state that breaks a rule is refused whole" {
 
     // This machine's share is a directory a report gives.
     _ = try testEdited(arena, "C:\\\\src", "\\\\\\\\ME\\\\share");
+    // Another machine's, as this one's is under the name it had before,
+    // is left out, and the rest is the state: it is still the user's
+    // windows. It is never written.
+    var foreign = testGolden();
+    const tab = foreign.windows[0].tabs[0];
+    const nodes = try arena.dupe(Node, tab.nodes);
+    nodes[1].leaf.pwd = null;
+    foreign = .{ .version = format_version, .windows = &.{.{
+        .rect = foreign.windows[0].rect,
+        .dpi = foreign.windows[0].dpi,
+        .maximized = false,
+        .fullscreen = false,
+        .selected = 0,
+        .tabs = &.{.{ .title = tab.title, .focused = tab.focused, .nodes = nodes }},
+    }} };
+    try testing.expectEqualDeep(foreign, try testEdited(arena, "C:\\\\src", "\\\\\\\\other\\\\share"));
     // As is one just short of the longest (20 names are 4022 bytes).
     _ = try testEdited(arena, "C:\\\\src", comptime testLongPwd(20));
     // Either end of a split is a ratio.
@@ -619,4 +662,10 @@ test "win32: a window state that would not be read is not written" {
     window.tabs = &.{tab};
     state.windows = &.{window};
     try testing.expectError(error.Pwd, encode(testing.allocator, state, &testIsLocal));
+
+    // Nor is another machine's share, though one read is only left out.
+    nodes[1].leaf.pwd = "\\\\other\\share";
+    try testing.expectError(error.Pwd, encode(testing.allocator, state, &testIsLocal));
+    nodes[1].leaf.pwd = "\\\\ME\\share";
+    testing.allocator.free(try encode(testing.allocator, state, &testIsLocal));
 }

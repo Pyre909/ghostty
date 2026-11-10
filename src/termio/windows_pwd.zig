@@ -51,6 +51,7 @@
 //! Pure, so that its tests also run off Windows.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const internal_os = @import("../os/main.zig");
 const uri = @import("../os/uri.zig");
 const osc7Host = @import("stream_handler.zig").osc7Host;
 
@@ -92,6 +93,15 @@ pub const Result = union(enum) {
 /// Whether a URL's host or a share's server names this machine
 /// (`os.hostname.isLocal` on Windows; a stand-in in tests).
 pub const IsLocal = *const fn (host: []const u8) bool;
+
+/// The `IsLocal` of this machine. A name that cannot be compared is not
+/// this machine's.
+pub fn isLocalHost(host: []const u8) bool {
+    return internal_os.hostname.isLocal(host) catch |err| {
+        std.log.scoped(.windows_pwd).warn("cannot tell whether a host is this machine err={}", .{err});
+        return false;
+    };
+}
 
 /// The working directory `value` reports, an OSC 7 URL or an OSC 9;9 path.
 pub fn parse(alloc: Allocator, value: []const u8, isLocal: IsLocal) Allocator.Error!Result {
