@@ -73,6 +73,17 @@ pub const Restore = struct {
 /// (`quick`).
 pub const Kind = enum { normal, quick };
 
+/// What `toggle_visibility` did to a window that nothing has undone since
+/// (`hidden`).
+pub const Hidden = enum {
+    no,
+    /// Hidden by the toggle, which shows it again.
+    hidden,
+    /// Hidden by it while in the foreground: the one its show brings
+    /// forward.
+    front,
+};
+
 app: *App,
 
 /// The frame. Written from WM_NCCREATE; a message before it
@@ -161,6 +172,12 @@ quick_return: ?win32.HWND,
 /// For the quick terminal: its show or hide animation while one runs
 /// (`QuickAnimation`), else null.
 quick_animation: ?QuickAnimation,
+
+/// Whether `toggle_visibility` hid this window (`hideForToggle`), so that
+/// its next show shows it again (`App.toggleVisibility`). Forgotten once
+/// the window is restored, or the quick terminal shown, by the toggle or
+/// by the user: one the user then minimizes is the user's to restore.
+hidden: Hidden,
 
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
@@ -967,6 +984,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .decoration = null,
         .quick = kind == .quick,
         .quick_return = null,
+        .hidden = .no,
         .quick_animation = null,
         .modal_loops = .{},
         .step_drag = null,
@@ -1154,6 +1172,8 @@ pub fn show(self: *Window, placing: Placing) void {
 /// keyboard.
 pub fn showQuick(self: *Window) bool {
     assert(self.quick);
+    // Whoever shows it: no longer `toggle_visibility`'s to show.
+    self.hidden = .no;
     self.quick_return = if (App.foregroundWindow()) |front|
         (if (ofApp(self.app, front)) null else front)
     else
@@ -1187,6 +1207,38 @@ pub fn showQuick(self: *Window) bool {
     if (self.bringToFront()) return true;
     log.info("the quick terminal shows without the keyboard: SetForegroundWindow refused", .{});
     return false;
+}
+
+/// `toggle_visibility`'s hide, for this window if it shows
+/// (`App.toggleVisibility`): minimized, or the quick terminal hidden as
+/// its own toggle hides it (`hideQuick`) unless nothing could then show it
+/// again (`App.quickAlone`), and remembered for the toggle's show
+/// (`hidden`). `front` says it is the one in the foreground, which then
+/// goes to the next window in the Z order; any other is minimized with
+/// the activation left where it is.
+pub fn hideForToggle(self: *Window, front: bool) void {
+    if (self.quick) {
+        if (!self.quickShown() or self.app.quickAlone()) return;
+        self.hideQuick();
+    } else {
+        if (!win32.IsWindowVisible(self.hwnd).toBool() or win32.IsIconic(self.hwnd).toBool()) return;
+        // The BOOL is the previous visibility, not success.
+        _ = win32.ShowWindow(self.hwnd, if (front) win32.SW_MINIMIZE else win32.SW_SHOWMINNOACTIVE);
+    }
+    self.hidden = if (front) .front else .hidden;
+}
+
+/// `toggle_visibility`'s show, for a window it hid that is not the one to
+/// come forward, which `present` shows (`App.toggleVisibility`): restored
+/// as it was, maximized if it was, or the quick terminal shown.
+pub fn showForToggle(self: *Window) void {
+    if (self.quick) {
+        _ = self.showQuick();
+        return;
+    }
+    // The BOOL is the previous visibility, not success. WM_SIZE forgets
+    // that the toggle hid it.
+    _ = win32.ShowWindow(self.hwnd, win32.SW_RESTORE);
 }
 
 /// `toggle_quick_terminal` with the quick terminal shown, or autohide
@@ -1825,6 +1877,12 @@ fn handleMessage(
                 while (it.next()) |entry| entry.view.occlusionChanged(false);
                 return 0;
             }
+
+            // Not minimized, so restored if `toggle_visibility` minimized
+            // it: no longer the toggle's to show. The quick terminal is
+            // sized while it is hidden, and forgets as it shows
+            // (`showQuick`).
+            if (!self.quick) self.hidden = .no;
 
             // Each terminal gets its WM_SIZE synchronously, which resizes
             // its core.

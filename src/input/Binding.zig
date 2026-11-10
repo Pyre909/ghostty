@@ -897,7 +897,9 @@ pub const Action = union(enum) {
     ///
     /// Note: When the focused surface is fullscreen, this method does nothing.
     ///
-    /// Only implemented on macOS.
+    /// Only implemented on macOS and Windows. On Windows the windows are
+    /// minimized, each keeping its taskbar button, whether or not one is
+    /// fullscreen, and the quick terminal is hidden.
     toggle_visibility,
 
     /// Toggle the window background opacity between transparent and opaque.

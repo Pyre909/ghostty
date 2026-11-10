@@ -147,6 +147,8 @@ pub const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 pub const SW_HIDE: c_int = 0;
 pub const SW_SHOWNORMAL: c_int = 1;
 pub const SW_SHOWNOACTIVATE: c_int = 4;
+/// Minimizes the window and activates the next one in the Z order.
+pub const SW_MINIMIZE: c_int = 6;
 pub const SW_SHOWMINNOACTIVE: c_int = 7;
 pub const SW_SHOWNA: c_int = 8;
 pub const SW_MAXIMIZE: c_int = 3;

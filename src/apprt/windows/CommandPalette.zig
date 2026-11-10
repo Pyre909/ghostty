@@ -108,6 +108,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .reset_window_size,
         .toggle_command_palette,
         .toggle_quick_terminal,
+        .toggle_visibility,
         .open_config,
         .reload_config,
         .quit,
@@ -124,7 +125,6 @@ pub fn supported(key: Binding.Action.Key) bool {
         // on-screen keyboard here.
         .toggle_tab_overview,
         .close_all_windows,
-        .toggle_visibility,
         .check_for_updates,
         .undo,
         .redo,

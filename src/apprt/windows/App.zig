@@ -637,6 +637,9 @@ pub const App = struct {
         /// (`toggleQuick`).
         quick_terminal,
 
+        /// Hide every window, or show those it hid (`toggleVisibility`).
+        visibility,
+
         /// A new split beside `parent`, in `direction`.
         split: struct {
             parent: *CoreSurface,
@@ -1895,6 +1898,7 @@ pub const App = struct {
 
             .new_window => self.requestWindow(target),
             .toggle_quick_terminal => self.requestQuickTerminal(),
+            .toggle_visibility => self.requestVisibility(),
             .new_tab => self.requestTab(target),
             .goto_tab => self.gotoTab(target, value),
             .move_tab => self.moveTab(target, value),
@@ -2929,6 +2933,77 @@ pub const App = struct {
         return true;
     }
 
+    /// `.toggle_visibility`, which the core performs for the app wherever
+    /// it is bound: recorded for `run`, as `requestQuickTerminal` records
+    /// its toggle, since it moves the foreground. `true` once recorded.
+    fn requestVisibility(self: *App) bool {
+        self.requests.append(self.core_app.alloc, .visibility) catch |err| {
+            log.warn("cannot record toggling the windows' visibility err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `toggle_visibility`, carried out (`createRequested`). With one of
+    /// Ghostty's windows in the foreground (`frontWindow`), every window
+    /// that shows is hidden (`Window.hideForToggle`): minimized, where
+    /// macOS hides its application, since Windows has no Dock icon to bring
+    /// a hidden program back by and a minimized window keeps its taskbar
+    /// button; Windows Terminal's `globalSummon` minimizes its window the
+    /// same way. The one in front goes last, and the others without the
+    /// activation, so that minimizing it does not bring another of them
+    /// forward. A window covering its monitor is hidden like any other:
+    /// macOS does nothing with a native fullscreen window focused, which
+    /// cannot hide, but hides a non-native one, which is what this
+    /// runtime's are.
+    ///
+    /// With none in the foreground, the windows the toggle hid, and that
+    /// nothing has shown since, are shown again (`Window.showForToggle`)
+    /// and the one that was in front comes forward with the keyboard
+    /// (`Window.present`), as macOS brings back only the windows it hid.
+    /// With none of them left, the window last used comes forward
+    /// (`fallbackOwner`), as macOS activates the application.
+    fn toggleVisibility(self: *App) void {
+        if (self.frontWindow()) |front| {
+            // One comes forward at the next show: one hidden in front
+            // before, and still hidden, is shown with the rest.
+            for (self.windows.items) |window| {
+                if (window.hidden == .front) window.hidden = .hidden;
+            }
+            for (self.windows.items) |window| {
+                if (window != front) window.hideForToggle(false);
+            }
+            front.hideForToggle(true);
+            return;
+        }
+
+        var front: ?*Window = null;
+        for (self.windows.items) |window| switch (window.hidden) {
+            .no => {},
+            .hidden => window.showForToggle(),
+            .front => front = window,
+        };
+        const window = front orelse self.fallbackOwner() orelse return;
+        _ = window.present();
+    }
+
+    /// The window of Ghostty's that is in the foreground, or that owns the
+    /// window there, as its prompt or its title dialog (`inForeground`).
+    /// Null with another program's window in the foreground, or an
+    /// inspector's, which no terminal window owns.
+    fn frontWindow(self: *const App) ?*Window {
+        const front = foregroundWindow() orelse return null;
+        const root = win32.GetAncestor(front, win32.GA_ROOTOWNER) orelse return null;
+        // Not one that is minimized, which Windows can leave in the
+        // foreground with no other window to give it to: nothing of it
+        // shows, and the toggle would hide nothing and show nothing.
+        if (win32.IsIconic(root).toBool()) return null;
+        for (self.windows.items) |window| {
+            if (window.hwnd == root) return window;
+        }
+        return null;
+    }
+
     /// `toggle_quick_terminal`, carried out (`createRequested`): show the
     /// quick terminal, or hide it if it shows or is coming in
     /// (`Window.quickShown`), wherever the focus is, as GTK and macOS
@@ -3084,7 +3159,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
+            .quick_terminal, .visibility, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -3688,6 +3763,7 @@ pub const App = struct {
                     log.warn("failed to create the quick terminal err={}", .{err});
                     notice(self, null, L("Ghostty could not open the quick terminal."));
                 },
+                .visibility => self.toggleVisibility(),
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
                     error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
@@ -5239,6 +5315,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .decoration = null,
         .quick = false,
         .quick_return = null,
+        .hidden = .no,
         .quick_animation = null,
         .modal_loops = .{},
         .step_drag = null,
@@ -15820,6 +15897,312 @@ const TestQuick = struct {
     }
 };
 
+/// For the toggle_visibility tests: what GetForegroundWindow answers
+/// (`App.test_get_foreground`), and the toggle as a binding performs it.
+const TestVisibility = struct {
+    var in_front: ?win32.HWND = null;
+
+    fn foregroundNow() ?win32.HWND {
+        return in_front;
+    }
+
+    /// `toggle_visibility`, recorded as the core performs it for the app,
+    /// then carried out as `run` carries it out, with `front` in the
+    /// foreground.
+    fn toggle(app: *App, front: ?win32.HWND) !void {
+        in_front = front;
+        try std.testing.expect(try app.performAction(.app, .toggle_visibility, {}));
+        try std.testing.expectEqual(1, app.requests.items.len);
+        app.createRequested();
+        try std.testing.expectEqual(0, app.requests.items.len);
+    }
+
+    fn minimized(window: *const Window) bool {
+        return win32.IsIconic(window.hwnd).toBool();
+    }
+};
+
+test "win32: toggle_visibility minimizes the windows that show, then shows those it hid" {
+    // On a desktop of its own (testOnOwnDesktop): it shows its windows,
+    // minimizes and restores them, away from the user's desktop.
+    try testOnOwnDesktop(testToggleVisibility, .{});
+}
+
+/// The toggle_visibility test, run by its test on a desktop of its own.
+fn testToggleVisibility() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    // With no window it hid left to show, the toggle asks the core for
+    // the last focused terminal (`fallbackOwner`).
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    App.test_get_foreground = &TestVisibility.foregroundNow;
+    defer App.test_get_foreground = null;
+    Window.test_foreground = &ForegroundSeen.seen;
+    defer Window.test_foreground = null;
+    ForegroundSeen.last = null;
+    const toggle = TestVisibility.toggle;
+    const minimized = TestVisibility.minimized;
+
+    // Two windows that show, one not shown yet, and one the user
+    // minimized.
+    var windows: [4]*Window = undefined;
+    var panes: [4]*Surface = undefined;
+    for (&windows, &panes) |*w, *p| {
+        w.* = try testFrame(&app);
+        p.* = try testPane(&app, w.*);
+        w.*.tab().tree = try .init(alloc, p.*);
+        try std.testing.expectEqual(.no, w.*.hidden);
+    }
+    const a = windows[0];
+    const b = windows[1];
+    const unshown = windows[2];
+    const users = windows[3];
+    _ = win32.ShowWindow(a.hwnd, win32.SW_SHOWNOACTIVATE);
+    _ = win32.ShowWindow(b.hwnd, win32.SW_SHOWNOACTIVATE);
+    _ = win32.ShowWindow(users.hwnd, win32.SW_SHOWMINNOACTIVE);
+
+    // With one in the foreground: those that show are minimized, and
+    // remembered, the one in front as that; nothing comes forward.
+    try toggle(&app, b.hwnd);
+    try std.testing.expect(minimized(a));
+    try std.testing.expect(minimized(b));
+    try std.testing.expectEqual(.hidden, a.hidden);
+    try std.testing.expectEqual(.front, b.hidden);
+    try std.testing.expect(!win32.IsWindowVisible(unshown.hwnd).toBool());
+    try std.testing.expectEqual(.no, unshown.hidden);
+    try std.testing.expect(minimized(users));
+    try std.testing.expectEqual(.no, users.hidden);
+    try std.testing.expect(ForegroundSeen.last == null);
+
+    // With none there: those it hid come back, the one that was in front
+    // forward, and are no longer its own; the user's stays minimized and
+    // the other hidden.
+    try toggle(&app, null);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!minimized(b));
+    try std.testing.expectEqual(.no, a.hidden);
+    try std.testing.expectEqual(.no, b.hidden);
+    try std.testing.expectEqual(b.hwnd, ForegroundSeen.last.?);
+    try std.testing.expect(minimized(users));
+    try std.testing.expect(!win32.IsWindowVisible(unshown.hwnd).toBool());
+
+    // A window one of them owns, as a prompt, in the foreground: its
+    // owner is the one in front.
+    const prompt = try TestQuick.owned(a);
+    defer _ = win32.DestroyWindow(prompt);
+    try toggle(&app, prompt);
+    try std.testing.expectEqual(.front, a.hidden);
+    try std.testing.expectEqual(.hidden, b.hidden);
+    try std.testing.expect(minimized(a));
+    try std.testing.expect(minimized(b));
+
+    // One the user restores meanwhile is the user's from then on:
+    // minimized again by hand, the toggle leaves it so.
+    _ = win32.ShowWindow(b.hwnd, win32.SW_RESTORE);
+    try std.testing.expectEqual(.no, b.hidden);
+    try std.testing.expectEqual(.front, a.hidden);
+    _ = win32.ShowWindow(b.hwnd, win32.SW_SHOWMINNOACTIVE);
+    try std.testing.expectEqual(.no, b.hidden);
+    ForegroundSeen.last = null;
+    try toggle(&app, null);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(minimized(b));
+    try std.testing.expectEqual(a.hwnd, ForegroundSeen.last.?);
+
+    // One hidden in front that is still hidden when another is: shown
+    // with the rest, and the later one comes forward.
+    _ = win32.ShowWindow(b.hwnd, win32.SW_RESTORE);
+    try toggle(&app, a.hwnd);
+    try std.testing.expectEqual(.front, a.hidden);
+    try std.testing.expectEqual(.hidden, b.hidden);
+    _ = win32.ShowWindow(b.hwnd, win32.SW_RESTORE);
+    try toggle(&app, b.hwnd);
+    try std.testing.expectEqual(.hidden, a.hidden);
+    try std.testing.expectEqual(.front, b.hidden);
+    try std.testing.expect(minimized(a));
+    try std.testing.expect(minimized(b));
+    ForegroundSeen.last = null;
+    try toggle(&app, null);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!minimized(b));
+    try std.testing.expectEqual(b.hwnd, ForegroundSeen.last.?);
+
+    // Another program's window in the foreground, and none of its own
+    // hidden: nothing is minimized, and the first window comes forward.
+    const other = try TestQuick.foreign();
+    defer _ = win32.DestroyWindow(other);
+    ForegroundSeen.last = null;
+    try toggle(&app, other);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!minimized(b));
+    try std.testing.expectEqual(.no, a.hidden);
+    try std.testing.expectEqual(.no, b.hidden);
+    try std.testing.expectEqual(a.hwnd, ForegroundSeen.last.?);
+
+    // Or the one the user was last in, restored if it was minimized, as
+    // a request to bring it forward restores it (`Window.present`).
+    try core_app.surfaces.append(alloc, panes[3]);
+    core_app.focused_surface = &panes[3].core_surface;
+    try toggle(&app, other);
+    try std.testing.expect(!minimized(users));
+    try std.testing.expectEqual(users.hwnd, ForegroundSeen.last.?);
+    try std.testing.expectEqual(.no, users.hidden);
+    core_app.focused_surface = null;
+
+    // A minimized window of its own in the foreground, as Windows leaves
+    // one there with no other window to activate, is not in front: the
+    // toggle shows.
+    _ = win32.ShowWindow(users.hwnd, win32.SW_SHOWMINNOACTIVE);
+    ForegroundSeen.last = null;
+    try toggle(&app, users.hwnd);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!minimized(b));
+    try std.testing.expectEqual(a.hwnd, ForegroundSeen.last.?);
+
+    // One that covers its monitor is hidden like any other, and comes
+    // back covering it.
+    a.toggleFullscreen();
+    try std.testing.expect(a.fullscreen != null);
+    const covering = try windowRect(a.hwnd);
+    try toggle(&app, a.hwnd);
+    try std.testing.expect(minimized(a));
+    try std.testing.expect(minimized(b));
+    try std.testing.expectEqual(.front, a.hidden);
+    ForegroundSeen.last = null;
+    try toggle(&app, null);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!minimized(b));
+    try std.testing.expect(a.fullscreen != null);
+    try std.testing.expectEqual(covering, try windowRect(a.hwnd));
+    try std.testing.expectEqual(a.hwnd, ForegroundSeen.last.?);
+}
+
+test "win32: toggle_visibility hides the quick terminal with the windows, unless it is alone" {
+    // On a desktop of its own (testOnOwnDesktop), as the quick terminal's
+    // own tests.
+    try testOnOwnDesktop(testToggleVisibilityQuick, .{});
+}
+
+/// The toggle_visibility test with a quick terminal, run by its test on a
+/// desktop of its own.
+fn testToggleVisibilityQuick() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    const minimized = TestVisibility.minimized;
+
+    // `TestQuick`'s GetForegroundWindow, with the toggle carried out and
+    // the quick terminal's animation, if it started one, carried to its
+    // end.
+    const toggle = struct {
+        fn f(of: *App, front: ?win32.HWND) !void {
+            TestQuick.in_front = front;
+            TestQuick.front = null;
+            try std.testing.expect(try of.performAction(.app, .toggle_visibility, {}));
+            try std.testing.expectEqual(1, of.requests.items.len);
+            of.createRequested();
+            try std.testing.expectEqual(0, of.requests.items.len);
+            if (of.quick) |q| TestQuick.settle(q);
+        }
+    }.f;
+
+    // The quick terminal alone, in front: it stays, as its own toggle
+    // would not hide it either, with nothing to show it again
+    // (`quickAlone`).
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+    try std.testing.expect(app.quickAlone());
+    try toggle(&app, quick.hwnd);
+    try std.testing.expect(quick.quickShown());
+    try std.testing.expectEqual(.no, quick.hidden);
+
+    // With a window beside it, and itself in front: both go, the quick
+    // terminal as its own toggle hides it, and it is the one to come
+    // forward.
+    const a = try testFrame(&app);
+    const pa = try testPane(&app, a);
+    a.tab().tree = try .init(alloc, pa);
+    _ = win32.ShowWindow(a.hwnd, win32.SW_SHOWNOACTIVATE);
+    try toggle(&app, quick.hwnd);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(.front, quick.hidden);
+    try std.testing.expect(minimized(a));
+    try std.testing.expectEqual(.hidden, a.hidden);
+    try std.testing.expect(TestQuick.front == null);
+
+    // Laid out while it is hidden, as a reload lays it out, it is still
+    // the toggle's to show: only a window that is restored forgets.
+    testResize(quick, 900, 500);
+    try std.testing.expectEqual(.front, quick.hidden);
+
+    try toggle(&app, null);
+    try std.testing.expect(quick.quickShown());
+    try std.testing.expectEqual(.no, quick.hidden);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expectEqual(.no, a.hidden);
+    try std.testing.expectEqual(quick.hwnd, TestQuick.front.?);
+
+    // With the window in front: both go again, and the window is the one
+    // to come forward, after the quick terminal shows.
+    try toggle(&app, a.hwnd);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(.hidden, quick.hidden);
+    try std.testing.expect(minimized(a));
+    try std.testing.expectEqual(.front, a.hidden);
+    try toggle(&app, null);
+    try std.testing.expect(quick.quickShown());
+    try std.testing.expect(!minimized(a));
+    try std.testing.expectEqual(a.hwnd, TestQuick.front.?);
+
+    // Hidden by it, then shown by its own toggle: no longer this one's
+    // to show; the window still is.
+    try toggle(&app, quick.hwnd);
+    try std.testing.expectEqual(.front, quick.hidden);
+    TestQuick.in_front = null;
+    try TestQuick.toggle(&app);
+    try std.testing.expect(quick.quickShown());
+    try std.testing.expectEqual(.no, quick.hidden);
+    try std.testing.expectEqual(.hidden, a.hidden);
+    try std.testing.expect(minimized(a));
+    // Hidden again by its own, it stays hidden when the toggle shows.
+    try TestQuick.toggle(&app);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(.no, quick.hidden);
+    try toggle(&app, null);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    // The window comes forward: the first that shows, with none hidden
+    // in front.
+    try std.testing.expectEqual(a.hwnd, TestQuick.front.?);
+
+    // Hidden already when the windows are, it is not the toggle's to
+    // show.
+    try toggle(&app, a.hwnd);
+    try std.testing.expect(minimized(a));
+    try std.testing.expectEqual(.no, quick.hidden);
+    try toggle(&app, null);
+    try std.testing.expect(!minimized(a));
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+}
+
 test "win32: toggle_quick_terminal makes the quick terminal, then hides and shows it" {
     // On a desktop of its own (testOnOwnDesktop): it reads whether the
     // quick terminal is topmost, and keeps it off the user's desktop.
@@ -18549,7 +18932,6 @@ test "win32: the command palette lists only what performAction carries out" {
         // Left out.
         .{ .toggle_tab_overview, .toggle_tab_overview },
         .{ .close_all_windows, .close_all_windows },
-        .{ .toggle_visibility, .toggle_visibility },
         .{ .check_for_updates, .check_for_updates },
         .{ .undo, .undo },
         .{ .redo, .redo },
@@ -18595,6 +18977,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .toggle_readonly, .readonly },
         // The app's.
         .{ .toggle_quick_terminal, .toggle_quick_terminal },
+        .{ .toggle_visibility, .toggle_visibility },
         .{ .reload_config, .reload_config },
         .{ .set_window_theme, .set_window_theme },
         .{ .quit, .quit },
@@ -18632,7 +19015,7 @@ test "win32: the command palette lists only what performAction carries out" {
             else => if (apprt.Action.Value(case[1]) == void) {} else unreachable,
         };
         const to: apprt.Target = switch (case[0]) {
-            .toggle_quick_terminal, .reload_config, .quit, .set_window_theme => .app,
+            .toggle_quick_terminal, .toggle_visibility, .reload_config, .quit, .set_window_theme => .app,
             else => target,
         };
         // Answered before it would ask the core whether to confirm, or
@@ -18654,7 +19037,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(38, listed);
+    try std.testing.expectEqual(39, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
 }
@@ -25440,7 +25823,7 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         "global:ctrl+numpad_home=new_window",
         // Not performed by this runtime yet: every action the command
         // palette leaves out, alone or chained.
-        "global:ctrl+c=toggle_visibility",
+        "global:ctrl+c=toggle_tab_overview",
         "global:ctrl+d=check_for_updates",
         "global:ctrl+e=close_all_windows",
         "global:ctrl+g=paste_from_selection",
@@ -25458,19 +25841,20 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
     try std.testing.expectEqual(5, TestHotkeys.refused(&app, error.Unsupported));
 
     // Ctrl+Alt+Q with Shift types nothing on that layout, and registers,
-    // as does a toggle chained to an action this runtime performs, the
-    // quick terminal's toggle, the session's window theme, and `ignore`,
-    // which the palette leaves out but which asks for its keys to be
-    // taken.
+    // as does an action this runtime does not perform chained to one it
+    // does, the quick terminal's toggle, the windows' visibility toggle,
+    // the session's window theme, and `ignore`, which the palette leaves
+    // out but which asks for its keys to be taken.
     try TestHotkeys.apply(&app, &.{
         "global:ctrl+alt+shift+q=new_window",
-        "global:ctrl+c=toggle_visibility",
+        "global:ctrl+c=toggle_tab_overview",
         "chain=new_window",
         "global:ctrl+b=toggle_quick_terminal",
+        "global:ctrl+e=toggle_visibility",
         "global:ctrl+d=set_window_theme:dark",
         "global:ctrl+a=ignore",
     });
-    try std.testing.expectEqual(5, TestHotkeys.take().len);
+    try std.testing.expectEqual(6, TestHotkeys.take().len);
 }
 
 test "win32: two global keybinds on the same keys register once, for the physical key" {
