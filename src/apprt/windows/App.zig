@@ -3201,6 +3201,9 @@ pub const App = struct {
             .surface => |v| v,
         };
         const surface = from.rt_surface;
+        // A drag of its window's border in steps counted by the cell that
+        // was: its next size counts anew (`Window.stepSizing`).
+        surface.window.step_drag = null;
         const t = surface.window.tabOf(surface) orelse return true;
         if (t != surface.window.tab() or !t.tree.isSplit()) return true;
         self.requests.append(self.core_app.alloc, .{ .relayout = from }) catch |err| {
@@ -5237,6 +5240,8 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .quick_return = null,
         .quick_animation = null,
         .modal_loops = .{},
+        .step_drag = null,
+        .system_track = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
         .prompt_lowered = false,
@@ -6273,6 +6278,252 @@ test "win32: size_limit keeps the least a terminal's window may be, at its font'
     try std.testing.expect(!try app.performAction(.app, .size_limit, limit));
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .size_limit, limit));
     try std.testing.expectEqual(Surface.MinSize{ .width = 140, .height = 128, .dpi = 144 }, a.min_size.?);
+}
+
+/// For tests: WM_SIZING for a drag of `window`'s border at `edge` that
+/// asks for `rect`: what the window answers, `rect` as it leaves it.
+fn testSizing(window: *Window, edge: Window.SizingEdge, rect: *win32.RECT) win32.LRESULT {
+    return win32.SendMessageW(window.hwnd, win32.WM_SIZING, @backingInt(edge), @bitCast(@intFromPtr(rect)));
+}
+
+/// For tests: a frame with one focused terminal for a drag in steps, its
+/// cells 10 by 20 and, at 72 DPI, a pixel a point, its padding 3 and 4
+/// across and 5 and 6 down, on a screen with 6 pixels over its 30 cells
+/// across and 13 over its 10 down. So the frame's widths count by 10 from
+/// 6 under its own, and its heights by 20 from 13 under its own. Live,
+/// with no core call made on it: the caller sets it back to `.none`
+/// before the teardown, which would stop a live core.
+fn testStepFrame(app: *App) !struct { *Window, *Surface, win32.RECT } {
+    const window = try testFrame(app);
+    testResize(window, 900, 700);
+    const a = try testPane(app, window);
+    window.tab().tree = try testRow(app.core_app.alloc, &.{a});
+    window.tab().focused = a;
+    a.core_state = .live;
+    const core = &a.core_surface;
+    core.size.cell = .{ .width = 10, .height = 20 };
+    core.size.screen = .{ .width = 7 + 300 + 6, .height = 11 + 200 + 13 };
+    core.font_size.xdpi = 72;
+    core.font_size.ydpi = 72;
+    core.config.window_padding_left = 3;
+    core.config.window_padding_right = 4;
+    core.config.window_padding_top = 5;
+    core.config.window_padding_bottom = 6;
+    app.config.@"window-step-resize" = true;
+    var frame: win32.RECT = undefined;
+    if (!win32.GetWindowRect(window.hwnd, &frame).toBool()) return error.TestUnexpectedResult;
+    return .{ window, a, frame };
+}
+
+test "win32: a drag of the border sizes the frame by the focused terminal's cells" {
+    // `window-step-resize`: WM_SIZING carries the frame a drag asks for,
+    // and takes back the nearest that leaves the focused terminal whole
+    // cells, moving only the edges the drag does.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window, const a, const frame = try testStepFrame(&app);
+    defer a.core_state = .none;
+    const core = &a.core_surface;
+    const width = frame.right - frame.left;
+    const height = frame.bottom - frame.top;
+
+    // The bottom right corner out by 23 and 31: 29 and 44 from where the
+    // sizes count, so 3 cells and 2.
+    _ = win32.SendMessageW(window.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    var rect = frame;
+    rect.right += 23;
+    rect.bottom += 31;
+    try std.testing.expectEqual(1, testSizing(window, .bottom_right, &rect));
+    try std.testing.expectEqual(frame.left, rect.left);
+    try std.testing.expectEqual(frame.top, rect.top);
+    try std.testing.expectEqual(frame.left + width - 6 + 30, rect.right);
+    try std.testing.expectEqual(frame.top + height - 13 + 40, rect.bottom);
+
+    // The terminal's size changes as the drag goes on, as beside a split
+    // it does by less than the frame's: the drag still counts from where
+    // it began. The left edge out by 12, 18 from there: 2 cells. The
+    // others stay, the bottom with its 13 over.
+    core.size.screen = .{ .width = 7 + 300 + 9, .height = 11 + 200 + 2 };
+    rect = frame;
+    rect.left -= 12;
+    try std.testing.expectEqual(1, testSizing(window, .left, &rect));
+    try std.testing.expectEqual(frame.right - (width - 6 + 20), rect.left);
+    try std.testing.expectEqual(frame.top, rect.top);
+    try std.testing.expectEqual(frame.right, rect.right);
+    try std.testing.expectEqual(frame.bottom, rect.bottom);
+
+    // The top edge in by 9, 4 from there: no cell.
+    rect = frame;
+    rect.top += 9;
+    try std.testing.expectEqual(1, testSizing(window, .top, &rect));
+    try std.testing.expectEqual(frame.left, rect.left);
+    try std.testing.expectEqual(frame.bottom - (height - 13), rect.top);
+    try std.testing.expectEqual(frame.right, rect.right);
+    try std.testing.expectEqual(frame.bottom, rect.bottom);
+
+    // The cell changes inside the drag, to 7 by 15: the screen has 1 over
+    // its 44 cells across and 7 over its 13 down, and the next size
+    // counts by them, from the frame as it is. Out by 10 and 10, 11 and
+    // 17 from there: 2 cells and 1.
+    core.size.cell = .{ .width = 7, .height = 15 };
+    try std.testing.expect(try app.performAction(.{ .surface = core }, .cell_size, .{ .width = 7, .height = 15 }));
+    rect = frame;
+    rect.right += 10;
+    rect.bottom += 10;
+    try std.testing.expectEqual(1, testSizing(window, .bottom_right, &rect));
+    try std.testing.expectEqual(frame.left + width - 1 + 14, rect.right);
+    try std.testing.expectEqual(frame.top + height - 7 + 15, rect.bottom);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+
+    // A new drag counts from the frame as it finds it: 2 over across now.
+    core.size.screen.width = 7 + 301 + 2;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    rect = frame;
+    try std.testing.expectEqual(1, testSizing(window, .right, &rect));
+    try std.testing.expectEqual(frame.left + width - 2, rect.right);
+    try std.testing.expectEqual(frame.bottom, rect.bottom);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+}
+
+test "win32: a drag of the border is left alone with nothing to step by" {
+    // No terminal with a core and a cell has the focus, or the option is
+    // off: WM_SIZING goes to DefWindowProcW, which answers 0, and the
+    // frame is the one asked for.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window, const a, const frame = try testStepFrame(&app);
+    defer a.core_state = .none;
+    const core = &a.core_surface;
+    var asked = frame;
+    asked.right += 23;
+    asked.bottom += 31;
+
+    const Drag = struct {
+        /// A drag of the bottom right corner to `to`: whether the window
+        /// changed it.
+        fn steps(w: *Window, to: win32.RECT) !bool {
+            _ = win32.SendMessageW(w.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+            defer _ = win32.SendMessageW(w.hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+            var rect = to;
+            const answer = testSizing(w, .bottom_right, &rect);
+            const changed = !std.meta.eql(rect, to);
+            try std.testing.expectEqual(@as(win32.LRESULT, @intFromBool(changed)), answer);
+            return changed;
+        }
+    };
+    try std.testing.expect(try Drag.steps(window, asked));
+
+    a.core_state = .none;
+    try std.testing.expect(!try Drag.steps(window, asked));
+    a.core_state = .live;
+    try std.testing.expect(try Drag.steps(window, asked));
+
+    window.tab().focused = null;
+    try std.testing.expect(!try Drag.steps(window, asked));
+    window.tab().focused = a;
+
+    core.size.cell.width = 0;
+    try std.testing.expect(!try Drag.steps(window, asked));
+    core.size.cell = .{ .width = 10, .height = 0 };
+    try std.testing.expect(!try Drag.steps(window, asked));
+    core.size.cell.height = 20;
+    try std.testing.expect(try Drag.steps(window, asked));
+
+    app.config.@"window-step-resize" = false;
+    try std.testing.expect(!try Drag.steps(window, asked));
+}
+
+test "win32: a drag in steps keeps within Windows' bounds and the frame's least" {
+    // Windows holds a frame within the bounds its WM_GETMINMAXINFO comes
+    // back with (WM_WINDOWPOSCHANGING), growing or cutting it from its
+    // top left corner: a stepped size outside them would not stay whole
+    // cells, and would move a frame dragged by its left or top edge.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const window, const a, const frame = try testStepFrame(&app);
+    defer a.core_state = .none;
+    const width = frame.right - frame.left;
+    const height = frame.bottom - frame.top;
+
+    // Windows' own: a least 97 under the frame each way, a most 18 and 25
+    // over it.
+    var info = std.mem.zeroes(win32.MINMAXINFO);
+    info.ptMinTrackSize = .{ .x = width - 97, .y = height - 97 };
+    info.ptMaxTrackSize = .{ .x = width + 18, .y = height + 25 };
+    _ = win32.SendMessageW(window.hwnd, win32.WM_GETMINMAXINFO, 0, @bitCast(@intFromPtr(&info)));
+    // The frame's own least is under that one.
+    try std.testing.expectEqual(win32.POINT{ .x = width - 97, .y = height - 97 }, info.ptMinTrackSize);
+
+    // Out by 23 and 31: the nearest sizes, 24 and 27 out, are over the
+    // most, and a step under each is not.
+    _ = win32.SendMessageW(window.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    var rect = frame;
+    rect.right += 23;
+    rect.bottom += 31;
+    try std.testing.expectEqual(1, testSizing(window, .bottom_right, &rect));
+    try std.testing.expectEqual(frame.left + width + 14, rect.right);
+    try std.testing.expectEqual(frame.top + height + 7, rect.bottom);
+
+    // Far in, by the top left corner: the first whole cells at or over
+    // the least, 96 and 93 under the frame, and the bottom right corner
+    // stays.
+    rect = frame;
+    rect.left = frame.right - 50;
+    rect.top = frame.bottom - 50;
+    try std.testing.expectEqual(1, testSizing(window, .top_left, &rect));
+    try std.testing.expectEqual(frame.right - (width - 96), rect.left);
+    try std.testing.expectEqual(frame.bottom - (height - 93), rect.top);
+    try std.testing.expectEqual(frame.right, rect.right);
+    try std.testing.expectEqual(frame.bottom, rect.bottom);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
+
+    // With no least of Windows' own, the frame's: what its
+    // WM_GETMINMAXINFO answers. A drag far in stops at the first whole
+    // cells at or over it.
+    info = std.mem.zeroes(win32.MINMAXINFO);
+    info.ptMaxTrackSize = .{ .x = 10_000, .y = 10_000 };
+    _ = win32.SendMessageW(window.hwnd, win32.WM_GETMINMAXINFO, 0, @bitCast(@intFromPtr(&info)));
+    const own = info.ptMinTrackSize;
+    try std.testing.expect(own.x > 10 and own.y > 20);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_ENTERSIZEMOVE, 0, 0);
+    rect = frame;
+    rect.right = frame.left + 1;
+    rect.bottom = frame.top + 1;
+    try std.testing.expectEqual(1, testSizing(window, .bottom_right, &rect));
+    const least_w = rect.right - rect.left;
+    const least_h = rect.bottom - rect.top;
+    try std.testing.expect(least_w >= own.x and least_w - 10 < own.x);
+    try std.testing.expect(least_h >= own.y and least_h - 20 < own.y);
+    try std.testing.expectEqual(0, @mod(least_w - (width - 6), 10));
+    try std.testing.expectEqual(0, @mod(least_h - (height - 13), 20));
+    _ = win32.SendMessageW(window.hwnd, win32.WM_EXITSIZEMOVE, 0, 0);
 }
 
 test "win32: a frame is no smaller than its terminals need, nor than its monitor" {

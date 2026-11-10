@@ -43,7 +43,9 @@
 //! under the pointer (`TabBar.Drag`); a drop on another Ghostty window's
 //! bar also makes a new window. A divider between terminals is dragged
 //! from its line or 3 DIP beside it, and a double click there equalizes
-//! the tab's splits (`Dividers`). An action that lays out terminals,
+//! the tab's splits (`Dividers`). With `window-step-resize` a drag of the
+//! frame's border sizes it by the focused terminal's cells
+//! (`Window.stepSizing`). An action that lays out terminals,
 //! moves the focus to another window or tab, or frees core state, such as
 //! `.new_split`, `.goto_tab`, `.toggle_fullscreen`,
 //! `.move_tab_to_new_window` or a full `.reload_config`, is recorded and

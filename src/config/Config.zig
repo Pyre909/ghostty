@@ -2333,7 +2333,7 @@ keybind: Keybinds = .{},
 
 /// Resize the window in discrete increments of the focused surface's cell size.
 /// If this is disabled, surfaces are resized in pixel increments. Currently
-/// only supported on macOS.
+/// only supported on macOS and Windows.
 @"window-step-resize": bool = false,
 
 /// The position where new tabs are created. Valid values:

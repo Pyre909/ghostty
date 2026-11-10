@@ -262,6 +262,10 @@ pub const WM_XBUTTONDBLCLK: UINT = 0x020D;
 pub const WM_MOUSEHWHEEL: UINT = 0x020E;
 pub const WM_ENTERMENULOOP: UINT = 0x0211;
 pub const WM_EXITMENULOOP: UINT = 0x0212;
+/// Sent while the user drags a window's border: wParam is the edge or
+/// corner dragged (WMSZ_*) and lParam the RECT the frame is about to take,
+/// which the window may change, answering TRUE.
+pub const WM_SIZING: UINT = 0x0214;
 /// Sent to the window losing the mouse capture, whatever took it.
 pub const WM_CAPTURECHANGED: UINT = 0x0215;
 pub const WM_ENTERSIZEMOVE: UINT = 0x0231;

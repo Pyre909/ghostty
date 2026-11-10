@@ -25,6 +25,7 @@ const assert = std.debug.assert;
 
 const apprt = @import("../../apprt.zig");
 const configpkg = @import("../../config.zig");
+const CoreSurface = @import("../../Surface.zig");
 const terminal = @import("../../terminal/main.zig");
 
 const win32 = @import("win32.zig");
@@ -163,6 +164,17 @@ quick_animation: ?QuickAnimation,
 
 /// This window's share of `App.modal_loop_depth`; see `ModalLoops`.
 modal_loops: ModalLoops,
+
+/// A drag of the frame's border in steps (`window-step-resize`): what its
+/// sizes count from and step by, from the drag's first WM_SIZING
+/// (`stepSizing`). WM_ENTERSIZEMOVE forgets the last drag's, and a cell
+/// that changes forgets this one's (`App.cellSize`).
+step_drag: ?StepDrag,
+
+/// The bounds Windows itself keeps a drag of this frame's border within,
+/// as its last WM_GETMINMAXINFO carried them, before `minTrackSize` raised
+/// the least. A drag in steps keeps within them too (`stepDragNow`).
+system_track: TrackBounds,
 
 /// Explorer said the frame's taskbar button exists (`App.taskbar_created`),
 /// which ITaskbarList3 asks to wait for (`showProgress`).
@@ -888,6 +900,8 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .quick_return = null,
         .quick_animation = null,
         .modal_loops = .{},
+        .step_drag = null,
+        .system_track = .{},
         .taskbar_button = false,
         .prompt_disabled = false,
         .prompt_lowered = false,
@@ -1776,8 +1790,17 @@ fn handleMessage(
         // SetWindowPos, which DefWindowProcW holds to it in
         // WM_WINDOWPOSCHANGING.
         win32.WM_GETMINMAXINFO => {
-            self.minTrackSize(@ptrFromInt(@as(usize, @bitCast(lparam))));
+            const info: *win32.MINMAXINFO = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            self.system_track = .{ .least = info.ptMinTrackSize, .most = info.ptMaxTrackSize };
+            self.minTrackSize(info);
             return 0;
+        },
+
+        // A drag of the frame's border, by the mouse or the keys, is about
+        // to size it to the rect at lParam, which `window-step-resize`
+        // makes whole cells (`stepSizing`). DefWindowProcW below otherwise.
+        win32.WM_SIZING => if (self.stepSizing(wparam, @ptrFromInt(@as(usize, @bitCast(lparam))))) {
+            return 1;
         },
 
         // Sent to every top-level window, so to every frame: the app reads
@@ -1834,6 +1857,8 @@ fn handleMessage(
 
         // The system modal loops. See App.wndProc's WM_GHOSTTY_WAKEUP.
         win32.WM_ENTERSIZEMOVE, win32.WM_ENTERMENULOOP => {
+            // A drag of the border counts its steps anew (`stepSizing`).
+            if (msg == win32.WM_ENTERSIZEMOVE) self.step_drag = null;
             self.modal_loops.enter(&self.app.modal_loop_depth);
             return 0;
         },
@@ -2564,16 +2589,28 @@ fn adopt(self: *Window, t: *Tab, tree: Tree) void {
 /// terminal with no core needs a pixel.
 pub fn leastExtent(surface: *Surface, across: bool) i32 {
     const bar = if (across) ScrollBar.width(surface) else 0;
-    const core = surface.liveCore() orelse return 1 +| bar;
+    const along = measureAlong(surface.liveCore() orelse return 1 +| bar, across);
+    const least = @max(1, along.cell + along.padding);
+    return std.math.lossyCast(i32, least) +| bar;
+}
+
+/// A terminal's core measured across or down, in pixels: its cell, and the
+/// padding the configuration asks for on both sides of its grid together.
+const Along = struct { cell: u64, padding: u64 };
+
+/// `core` measured across (`across`) or down, the padding scaled as
+/// `leastExtent` says.
+fn measureAlong(core: *const CoreSurface, across: bool) Along {
     const config = &core.config;
-    const cell: u64 = if (across) core.size.cell.width else core.size.cell.height;
     const dpi: u64 = if (across) core.font_size.xdpi else core.font_size.ydpi;
     const near: u64, const far: u64 = if (across)
         .{ config.window_padding_left, config.window_padding_right }
     else
         .{ config.window_padding_top, config.window_padding_bottom };
-    const least = @max(1, cell + near * dpi / 72 + far * dpi / 72);
-    return std.math.lossyCast(i32, least) +| bar;
+    return .{
+        .cell = if (across) core.size.cell.width else core.size.cell.height,
+        .padding = near * dpi / 72 + far * dpi / 72,
+    };
 }
 
 /// The least `view` is laid out across (`across`) or down: a terminal's
@@ -3310,6 +3347,74 @@ fn leastClient(self: *const Window) struct { width: i32, height: i32 } {
     return .{ .width = width, .height = height };
 }
 
+/// WM_SIZING with `window-step-resize`: `rect`, the frame a drag of the
+/// border at `edge` (a WMSZ_*) is about to give the window, becomes the
+/// nearest that leaves the focused terminal whole cells, as macOS sizes a
+/// window by its focused terminal's cell (`cellSizeDidChange` in
+/// BaseTerminalController.swift). Windows asks from where the pointer is
+/// each time, not from the last answer, so a slow drag steps too. The
+/// steps are the drag's (`step_drag`), counted from the frame as its first
+/// WM_SIZING finds it: with splits a frame a cell wider does not make the
+/// focused terminal a cell wider, so no size leaves every terminal whole
+/// cells, and counting anew at each message would give one place of the
+/// pointer more than one size. Only a drag steps: a maximized or snapped
+/// frame, and one `resizeClient` sizes, is as large as it was asked to be.
+/// False, with `rect` as it was, without the option or without a terminal
+/// to count by.
+fn stepSizing(self: *Window, edge: win32.WPARAM, rect: *win32.RECT) bool {
+    if (!self.app.config.@"window-step-resize") return false;
+    const drag = self.step_drag orelse drag: {
+        const now = self.stepDragNow() orelse return false;
+        self.step_drag = now;
+        break :drag now;
+    };
+    stepRect(rect, @fromBackingInt(edge), drag.across, drag.down);
+    return true;
+}
+
+/// What a drag of the border that starts now steps by: the focused
+/// terminal's cells, from the frame as it is, within Windows' bounds and
+/// the window's own least (`minTrackSize`). Null with no terminal to count
+/// by: none focused, or one with no core or no cell.
+fn stepDragNow(self: *const Window) ?StepDrag {
+    const surface = self.tab().focused orelse return null;
+    const core = surface.liveCore() orelse return null;
+    var frame: win32.RECT = undefined;
+    if (!win32.GetWindowRect(self.hwnd, &frame).toBool()) {
+        log.warn("unable to read the window frame for its steps err={}", .{win32.GetLastError()});
+        return null;
+    }
+    var info = std.mem.zeroes(win32.MINMAXINFO);
+    info.ptMinTrackSize = self.system_track.least;
+    self.minTrackSize(&info);
+    const least = info.ptMinTrackSize;
+    const most = self.system_track.most;
+    return .{
+        .across = stepsAlong(core, true, frame.right - frame.left, least.x, most.x) orelse return null,
+        .down = stepsAlong(core, false, frame.bottom - frame.top, least.y, most.y) orelse return null,
+    };
+}
+
+/// One direction of a drag in steps by `core`'s cells, for a frame
+/// `extent` long there now and kept from `least` to `most`. The steps
+/// count from what the frame would be with whole cells in the terminal:
+/// its length now less what the grid leaves over of the core's screen
+/// after the configured padding. Not after the core's own padding
+/// (`renderer.Size.padding`): with `window-padding-balance` that has what
+/// is left over spread into it. Null with no cell.
+fn stepsAlong(core: *const CoreSurface, across: bool, extent: i32, least: i32, most: i32) ?Steps {
+    const along = measureAlong(core, across);
+    if (along.cell == 0) return null;
+    const screen: u64 = if (across) core.size.screen.width else core.size.screen.height;
+    const over = (screen -| along.padding) % along.cell;
+    return .{
+        .base = extent -| std.math.lossyCast(i32, over),
+        .step = std.math.lossyCast(i32, along.cell),
+        .least = least,
+        .most = most,
+    };
+}
+
 /// After a DPI change applied Windows' suggested rect, which
 /// `minTrackSize` left as it was: if that left the client area less than
 /// its terminals need at the new DPI (`leastClient`) with the bar, grow it
@@ -3853,6 +3958,87 @@ pub fn applySuggestedRect(hwnd: win32.HWND, lparam: win32.LPARAM) void {
 /// ' ' and still opens the window menu.
 pub fn isBareKeyMenu(wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
     return wparam & win32.SC_MASK == win32.SC_KEYMENU and lparam == 0;
+}
+
+/// The edge or corner of a frame a WM_SIZING says is dragged (WMSZ_*).
+/// Any other value moves no edge.
+pub const SizingEdge = enum(win32.WPARAM) {
+    left = 1,
+    right = 2,
+    top = 3,
+    top_left = 4,
+    top_right = 5,
+    bottom = 6,
+    bottom_left = 7,
+    bottom_right = 8,
+    _,
+
+    const Moves = struct { left: bool = false, right: bool = false, top: bool = false, bottom: bool = false };
+
+    /// The edges of the frame's rect a drag of this one moves.
+    fn moves(self: SizingEdge) Moves {
+        return switch (self) {
+            .left => .{ .left = true },
+            .right => .{ .right = true },
+            .top => .{ .top = true },
+            .top_left => .{ .top = true, .left = true },
+            .top_right => .{ .top = true, .right = true },
+            .bottom => .{ .bottom = true },
+            .bottom_left => .{ .bottom = true, .left = true },
+            .bottom_right => .{ .bottom = true, .right = true },
+            _ => .{},
+        };
+    }
+};
+
+/// One direction of a drag of a frame's border in steps
+/// (`window-step-resize`), in pixels of the frame: the length the steps
+/// count from, one step, and the bounds the frame is kept within.
+pub const Steps = struct {
+    base: i32,
+    step: i32,
+    least: i32,
+    most: i32,
+
+    /// The length nearest `proposed` that is `base` and a whole number of
+    /// steps, half a step counting as the next one; then, by whole steps,
+    /// not over `most`, and last not under `least`, which a `most` under
+    /// it gives way to. `proposed` itself with no step.
+    pub fn nearest(self: Steps, proposed: i32) i32 {
+        if (self.step <= 0) return proposed;
+        const step: i64 = self.step;
+        const base: i64 = self.base;
+        var n = @divFloor(proposed - base + @divTrunc(step, 2), step);
+        n = @min(n, @divFloor(self.most - base, step));
+        // Never an error: the step is over 0.
+        n = @max(n, std.math.divCeil(i64, self.least - base, step) catch unreachable);
+        return std.math.lossyCast(i32, base + n * step);
+    }
+};
+
+/// What a drag of a frame's border steps by, across and down.
+const StepDrag = struct { across: Steps, down: Steps };
+
+/// Bounds for a drag of a frame's border, each a frame's width and height.
+/// None until Windows gives its own (`system_track`).
+const TrackBounds = struct {
+    least: win32.POINT = .{ .x = 0, .y = 0 },
+    most: win32.POINT = .{ .x = std.math.maxInt(i32), .y = std.math.maxInt(i32) },
+};
+
+/// `rect`, the frame a drag of `edge` asks for, at the nearest steps
+/// across and down (`Steps.nearest`). Only the dragged edges move: the
+/// others stay where Windows has them, which is where the drag began.
+fn stepRect(rect: *win32.RECT, edge: SizingEdge, across: Steps, down: Steps) void {
+    const m = edge.moves();
+    if (m.left or m.right) {
+        const width = across.nearest(rect.right -| rect.left);
+        if (m.left) rect.left = rect.right -| width else rect.right = rect.left +| width;
+    }
+    if (m.top or m.bottom) {
+        const height = down.nearest(rect.bottom -| rect.top);
+        if (m.top) rect.top = rect.bottom -| height else rect.bottom = rect.top +| height;
+    }
 }
 
 /// A window's share of `App.modal_loop_depth`: the system modal loops
@@ -4755,6 +4941,94 @@ pub fn testRandomTree(comptime T: type, random: std.Random, leaves: []T.View) !T
         tree.resizeInPlace(T.Node.Handle.root.offset(i), ratio);
     };
     return tree;
+}
+
+test "win32: a stepped length is the nearest whole steps within its bounds" {
+    var prng: std.Random.DefaultPrng = .init(0x57e9_51ce);
+    const random = prng.random();
+    for (0..20_000) |_| {
+        const s: Steps = .{
+            .base = random.intRangeAtMost(i32, -50, 3000),
+            .step = random.intRangeAtMost(i32, 1, 60),
+            .least = random.intRangeAtMost(i32, 0, 1200),
+            .most = random.intRangeAtMost(i32, 1100, 5000),
+        };
+        const proposed = random.intRangeAtMost(i32, -100, 6000);
+        const got = s.nearest(proposed);
+
+        // Whole steps from the base, and never under the least. Over the
+        // most only as the first step at or over the least.
+        try std.testing.expectEqual(0, @mod(got - s.base, s.step));
+        try std.testing.expect(got >= s.least);
+        if (got > s.most) {
+            try std.testing.expect(got - s.step < s.least);
+            continue;
+        }
+        // The nearest within the bounds: a step either way that is within
+        // them is no nearer, and the one above is farther (half a step
+        // goes up).
+        const d = @abs(got - proposed);
+        const below = got - s.step;
+        const above = got + s.step;
+        if (below >= s.least) try std.testing.expect(@abs(below - proposed) >= d);
+        if (above <= s.most) try std.testing.expect(@abs(above - proposed) > d);
+        // A stepped length stays.
+        try std.testing.expectEqual(got, s.nearest(got));
+    }
+}
+
+test "win32: a stepped length without a step, and at the ends of its type" {
+    const none: Steps = .{ .base = 10, .step = 0, .least = 500, .most = 5 };
+    try std.testing.expectEqual(123, none.nearest(123));
+
+    // Half a step goes up, less stays.
+    const s: Steps = .{ .base = 6, .step = 10, .least = 0, .most = 1000 };
+    try std.testing.expectEqual(106, s.nearest(110));
+    try std.testing.expectEqual(116, s.nearest(111));
+    const odd: Steps = .{ .base = 0, .step = 9, .least = 0, .most = 1000 };
+    try std.testing.expectEqual(90, odd.nearest(94));
+    try std.testing.expectEqual(99, odd.nearest(95));
+
+    // Nothing overflows.
+    const min = std.math.minInt(i32);
+    const max = std.math.maxInt(i32);
+    const wide: Steps = .{ .base = min, .step = 7, .least = min, .most = max };
+    try std.testing.expectEqual(max - 3, wide.nearest(max));
+    try std.testing.expectEqual(min, wide.nearest(min));
+    const high: Steps = .{ .base = min, .step = 7, .least = max, .most = min };
+    try std.testing.expectEqual(max, high.nearest(0));
+}
+
+test "win32: a stepped rect moves only its dragged edges" {
+    // 4 over across and 8 down, each under half a step: a dragged edge
+    // moves in by them, and no other moves.
+    const across: Steps = .{ .base = 16, .step = 9, .least = 100, .most = 5000 };
+    const down: Steps = .{ .base = 40, .step = 19, .least = 80, .most = 5000 };
+    const start: win32.RECT = .{
+        .left = 100,
+        .top = 50,
+        .right = 100 + 16 + 9 * 40 + 4,
+        .bottom = 50 + 40 + 19 * 10 + 8,
+    };
+    // WMSZ_LEFT to WMSZ_BOTTOMRIGHT are 1 to 8; 0 and 9 are no edge.
+    const cases = [_]struct { usize, []const u8 }{
+        .{ 0, "" },   .{ 1, "l" }, .{ 2, "r" },  .{ 3, "t" },  .{ 4, "tl" },
+        .{ 5, "tr" }, .{ 6, "b" }, .{ 7, "bl" }, .{ 8, "br" }, .{ 9, "" },
+    };
+    for (cases) |case| {
+        const code, const edges = case;
+        const drags = struct {
+            fn f(of: []const u8, edge: u8) bool {
+                return std.mem.indexOfScalar(u8, of, edge) != null;
+            }
+        }.f;
+        var rect = start;
+        stepRect(&rect, @fromBackingInt(code), across, down);
+        try std.testing.expectEqual(start.left + @as(i32, if (drags(edges, 'l')) 4 else 0), rect.left);
+        try std.testing.expectEqual(start.right - @as(i32, if (drags(edges, 'r')) 4 else 0), rect.right);
+        try std.testing.expectEqual(start.top + @as(i32, if (drags(edges, 't')) 8 else 0), rect.top);
+        try std.testing.expectEqual(start.bottom - @as(i32, if (drags(edges, 'b')) 8 else 0), rect.bottom);
+    }
 }
 
 test "win32: modal loops are counted per window and returned on destroy" {
