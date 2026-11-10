@@ -1109,6 +1109,7 @@ pub const Surface = struct {
     /// it. Nothing here pumps messages.
     pub fn park(self: *Surface) void {
         self.closeInspector();
+        self.settleCoreInput();
         self.releaseInput();
         _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
         self.search_bar.hideWindow();
@@ -1117,6 +1118,24 @@ pub const Surface = struct {
         self.destroy_deferred = false;
         self.parked = true;
         self.app.forgetClosing(&self.core_surface);
+    }
+
+    /// Tell the core, which runs on, that the buttons it holds are
+    /// released and its preedit is gone, before `releaseInput` forgets
+    /// them here: a terminal parked in the middle of a drag would
+    /// otherwise come back still selecting, or with a mouse report's
+    /// button down, and one parked in the middle of a composition with
+    /// its preedit drawn. The release is sent as for a drag that lost its
+    /// capture (`syncMouse`). Called where the core may be entered
+    /// (`App.canReenterCore`): from a teardown and from `App.run`.
+    fn settleCoreInput(self: *Surface) void {
+        const core_surface = self.liveCore() orelse return;
+        if (self.mouse.held.count() != 0) {
+            if (self.hasCapture()) _ = win32.ReleaseCapture();
+            _ = self.syncMouse(core_surface, null);
+        }
+        if (self.preedit != .none) self.setPreedit(core_surface, null, .none) catch |err|
+            log.warn("cannot clear the preedit of a parked terminal err={}", .{err});
     }
 
     /// Undo a `create` that succeeded, for a terminal no window holds yet:
