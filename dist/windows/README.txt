@@ -26,10 +26,12 @@ and the bin folder to the user's PATH, which command prompts opened
 afterwards see. It is not signed, so Windows may warn that its
 publisher is unknown.
 
-A newer installer replaces the installed version, and an older one is
-refused. Remove Ghostty under Settings > Apps > Installed apps. That
-leaves what Ghostty wrote in %LOCALAPPDATA%\ghostty: the configuration
-and the crash dumps.
+An installer of the same or a newer version replaces the installed
+Ghostty, and one of an older version is refused. Only a version's first
+three numbers count, so 1.4.1-dev and 1.4.1 replace each other. Remove
+Ghostty under Settings > Apps > Installed apps. That leaves what
+Ghostty wrote in %LOCALAPPDATA%\ghostty: the configuration and the
+crash dumps.
 
 The installer never closes Ghostty. Where it can ask, as after a
 double click, and Ghostty is open, it names Ghostty and asks for it to
@@ -49,7 +51,8 @@ When Ghostty crashes, it writes a minidump before it ends, to
 or to ghostty\crash under XDG_STATE_HOME when that variable is set. The
 files are named ghostty-<date>-<time>-<process id>.dmp, in UTC, and
 Ghostty keeps the newest 10 when it starts. In a command prompt,
-bin\ghostty +crash-report lists them.
+ghostty +crash-report lists them (from the zip's folder, where bin is
+not on the PATH, bin\ghostty +crash-report).
 
 A minidump holds the threads' stacks, the loaded modules and the open
 handles, not the heap, where the screen and the scrollback are kept

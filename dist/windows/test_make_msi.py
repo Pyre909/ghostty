@@ -1117,6 +1117,12 @@ class TestRepository(unittest.TestCase):
         self.assertIn("unofficial build", readme)
         self.assertIn(mm.HOMEPAGE, readme)
         self.assertIn(r"%LOCALAPPDATA%\Programs\Ghostty", readme)
+        self.assertIn("\nPortable zip\n", readme)
+        self.assertIn("\nInstaller\n", readme)
+        # A command as each package's user types it: the installer puts
+        # bin on the PATH, and the zip does not.
+        self.assertIn("\nghostty +crash-report lists them", readme)
+        self.assertIn(r"bin\ghostty +crash-report", readme)
 
 
 if __name__ == "__main__":
