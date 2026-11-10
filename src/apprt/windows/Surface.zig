@@ -136,6 +136,11 @@ pub const Surface = struct {
     /// does not use it (`Window.closing`).
     closing: bool,
 
+    /// The confirmation of that close is on screen, and the user has
+    /// not answered: `closing` is set, and the terminal is still one
+    /// the user has (`Session.snapshot`).
+    asking: bool = false,
+
     /// Closed, and kept for `undo` to bring back (`Undo`): hidden, in no
     /// tab's tree, its core running. `closing` stays set meanwhile, so
     /// that nothing closes it twice or jumps to it. Cleared when it is
@@ -916,7 +921,8 @@ pub const Surface = struct {
             inheritWorkingDirectory(&config, app.config.@"working-directory", wd);
         }
         // Before init, which clears `first`.
-        self.ran_command = (if (opts.overrides) |o| o.command != null else false) or
+        self.ran_command = app.command_launch or
+            (if (opts.overrides) |o| o.command != null else false) or
             (app.core_app.first and config.@"initial-command" != null);
         // Before init as well. Without it a drop takes the
         // quoting for a shell Ghostty does not know, the most careful.
@@ -1447,6 +1453,8 @@ pub const Surface = struct {
         self.closing = true;
 
         var question: Question = .{};
+        self.asking = true;
+        defer self.asking = false;
         if (process_alive and !confirm(self.app, self.hwnd, self.closePrompt(&question), .ok)) {
             // `self` is still valid: `confirm` raises `prompt_depth`, so no
             // teardown can run inside its modal loop: destroyPosted defers,

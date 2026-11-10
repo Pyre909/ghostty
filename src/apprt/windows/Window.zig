@@ -117,6 +117,12 @@ bar: TabBar.Bar,
 /// declines or the post fails; otherwise the teardown frees the window.
 closing: bool,
 
+/// Whether the question that `closing` waits on is still open
+/// (`requestClose`): the user has not said yes, and may yet say no. What
+/// is saved of the windows counts such a window as open
+/// (`Session.snapshot`), as a session's end can come while it asks.
+asking: bool = false,
+
 /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed; re-posted by
 /// `App.repostDeferredDestroys`, as a terminal's is
 /// (`Surface.destroy_deferred`).
@@ -2281,6 +2287,8 @@ pub fn requestClose(self: *Window) void {
         // (`App.promptOwner`). Cancelled, it stays shown.
         if (self.quick and !self.quickShown()) _ = self.showQuick();
         var question: Question = .{};
+        self.asking = true;
+        defer self.asking = false;
         if (!confirm(
             self.app,
             self.hwnd,
@@ -2306,6 +2314,8 @@ pub fn requestCloseAlone(self: *Window) void {
     assert(self.quick);
     if (self.app.terminating or self.closing) return;
     self.closing = true;
+    self.asking = true;
+    defer self.asking = false;
     if (!confirm(self.app, self.hwnd, alone_prompt, .cancel)) {
         self.closing = false;
         return;

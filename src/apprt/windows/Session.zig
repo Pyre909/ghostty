@@ -1,6 +1,8 @@
 //! `window-save-state` in the running app: the open windows described as
-//! a `State` (`snapshot`), and a state's windows opened again (`apply`).
-//! The format, and what of a state is taken, is State.zig's.
+//! a `State` (`snapshot`), a state's windows opened again (`apply`), the
+//! files the states are kept in between two runs (`Store`), and which
+//! end saves and which launch restores (`saves`, `launch`). The format,
+//! and what of a state is taken, is State.zig's.
 //!
 //! A snapshot reads only what this runtime keeps itself: the frames'
 //! places, the tabs' trees, and each terminal's stored titles and
@@ -18,18 +20,11 @@ const Surface = @import("Surface.zig").Surface;
 const Tab = @import("Tab.zig");
 const toast = @import("toast.zig");
 const Window = @import("Window.zig");
-const win32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
 
-/// Whether a share's server is this machine, for the directories a
-/// state holds (`State.check`).
-pub fn isLocalHost(host: []const u8) bool {
-    return internal_os.hostname.isLocal(host) catch |err| {
-        log.warn("cannot tell whether a host is this machine err={}", .{err});
-        return false;
-    };
-}
+/// The `State.IsLocal` of this machine.
+pub const isLocalHost = State.isLocalHost;
 
 /// The open windows as a state, or null when none of them is kept. All
 /// of it is allocated with `arena`, but for the titles and directories,
@@ -37,14 +32,15 @@ pub fn isLocalHost(host: []const u8) bool {
 ///
 /// Left out: the quick terminal, which is not a window to bring back; a
 /// window or a terminal that is closing, one parked for `undo` among
-/// them, since the user has closed it; and a tab with a terminal that
+/// them, since the user has closed it, but not one still asking
+/// whether to close, which the user has not; and a tab with a terminal that
 /// was started with a command, as macOS leaves out such a window: the
 /// state has no command in it, and a shell in that program's place is
 /// not what was open.
 pub fn snapshot(app: *const App, arena: Allocator, isLocal: State.IsLocal) Allocator.Error!?State {
     var windows: std.ArrayList(State.Window) = .empty;
     for (app.windows.items) |window| {
-        if (window.quick or window.closing) continue;
+        if (window.quick or (window.closing and !window.asking)) continue;
         if (windows.items.len == State.max_windows) {
             log.warn("more windows are open than a saved state holds, the rest are not saved", .{});
             break;
@@ -81,7 +77,7 @@ pub fn snapshot(app: *const App, arena: Allocator, isLocal: State.IsLocal) Alloc
 fn snapshotTab(arena: Allocator, t: *const Tab, isLocal: State.IsLocal) Allocator.Error!?State.Tab {
     if (t.tree.nodes.len == 0) return null;
     var it = t.tree.iterator();
-    while (it.next()) |entry| if (entry.view.ran_command and !entry.view.closing) return null;
+    while (it.next()) |entry| if (entry.view.ran_command and !closed(entry.view)) return null;
     if (!kept(&t.tree, .root)) return null;
 
     var nodes: std.ArrayList(State.Node) = .empty;
@@ -108,9 +104,17 @@ fn snapshotTab(arena: Allocator, t: *const Tab, isLocal: State.IsLocal) Allocato
 /// it, so walking it by recursion is bounded by what is on screen.
 fn kept(tree: *const Window.Tree, handle: Window.Tree.Node.Handle) bool {
     return switch (tree.nodes[handle.idx()]) {
-        .leaf => |surface| !surface.closing,
+        .leaf => |surface| !closed(surface),
         .split => |s| kept(tree, s.left) or kept(tree, s.right),
     };
+}
+
+/// Whether the user has closed `surface`: it is closing, and not still
+/// asking whether to (`Surface.close`). A session's end can come while
+/// that question is open, and the terminal is then one the user never
+/// closed.
+fn closed(surface: *const Surface) bool {
+    return surface.closing and !surface.asking;
 }
 
 /// Append what is kept under `handle`, which is something (`kept`), in
@@ -362,26 +366,32 @@ pub const Launch = enum {
 /// names what its window is to run, where, or under what title opens
 /// that window, and the saved ones wait: they would come back beside
 /// it, or instead of it, to a user who asked for one terminal.
+///
+/// `-e` and `--initial-command` are not looked for among the arguments:
+/// the configuration has read both into `initial-command`.
 pub fn launch(
     mode: configpkg.Config.WindowSaveState,
     initial_command: bool,
     arguments: []const [:0]const u8,
 ) Launch {
     if (mode == .never) return .forget;
-    if (initial_command) return .fresh;
+    if (initial_command or namesCommand(arguments)) return .fresh;
     for (arguments) |arg| {
-        // What follows it is the command's, whatever it looks like.
-        if (std.mem.eql(u8, arg, "-e")) return .fresh;
-        for ([_][]const u8{
-            "--command=",
-            "--initial-command=",
-            "--working-directory=",
-            "--title=",
-        }) |prefix| {
+        for ([_][]const u8{ "--working-directory=", "--title=" }) |prefix| {
             if (std.mem.startsWith(u8, arg, prefix)) return .fresh;
         }
     }
     return .restore;
+}
+
+/// Whether the launch's arguments give `command`, which every terminal
+/// of the process then runs in place of the user's shell. None of them
+/// is a terminal to save (`Surface.ran_command`).
+pub fn namesCommand(arguments: []const [:0]const u8) bool {
+    for (arguments) |arg| {
+        if (std.mem.startsWith(u8, arg, "--command=")) return true;
+    }
+    return false;
 }
 
 /// Why the app is closing its windows.
@@ -417,15 +427,18 @@ pub fn saves(mode: configpkg.Config.WindowSaveState, end: End) bool {
 pub const Store = struct {
     dir: std.Io.Dir,
 
-    /// The most files one launch takes; the rest wait for the next.
+    /// The most files one launch takes, the oldest first; the rest wait
+    /// for the next. Also the most that are kept: a save deletes the
+    /// oldest beyond it (`save`).
     pub const max_files = 64;
 
     /// A file this long or longer is not read.
     pub const max_bytes = 256 * 1024;
 
-    /// The most windows, and terminals in them, one launch opens from
-    /// the files it takes.
+    /// The most windows one launch opens from the files it takes.
     pub const max_windows = 32;
+
+    /// The most terminals in those windows.
     pub const max_terminals = 128;
 
     const state_suffix = ".json";
@@ -441,10 +454,13 @@ pub const Store = struct {
     pub const KeyBuf = [@max("class-".len + max_class, "hash-".len + 16, toast.app_id.len) + elevated_suffix.len]u8;
 
     /// The name of the directory for the instances of `class`: those
-    /// that would serve each other's requests share their saved
-    /// windows, and no others. An elevated instance has its own, since
-    /// what it opens runs as administrator, and a file the user's other
-    /// programs can write must not say what that is.
+    /// launched under one class share their saved windows, and no
+    /// others. An elevated instance has its own, so that the windows of
+    /// an ordinary one do not come back running as administrator, nor
+    /// the other way. The directory is the user's like the
+    /// configuration, and no better kept from the user's own programs:
+    /// a state names no program to run (`State`), so what a file there
+    /// can ask of either instance is shells in directories.
     ///
     /// A class is the name as it is only where that is a file name on
     /// every volume, and never one Windows reads as another: its
@@ -481,34 +497,73 @@ pub const Store = struct {
         defer environ_map.deinit();
         const path = try internal_os.xdg.state(io, alloc, &environ_map, .{ .subdir = subdir });
         defer alloc.free(path);
-        const cwd = std.Io.Dir.cwd();
-        try cwd.createDirPath(io, path);
-        return .{ .dir = try cwd.openDir(io, path, .{ .iterate = true }) };
+        return .{ .dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{ .open_options = .{ .iterate = true } }) };
     }
 
+    /// Give the directory back.
     pub fn close(self: Store) void {
         self.dir.close(global.io());
     }
 
+    /// The names of the state files there are, oldest first, in `arena`.
+    /// A name starts with the time it was saved at (`save`), so the
+    /// order of the names is the order of the saves; a file some other
+    /// program put there sorts wherever its name does.
+    fn names(self: Store, arena: Allocator) Allocator.Error![]const []const u8 {
+        const io = global.io();
+        var list: std.ArrayList([]const u8) = .empty;
+        var it = self.dir.iterate();
+        while (it.next(io) catch |err| stop: {
+            log.warn("cannot list the saved window states err={}", .{err});
+            break :stop null;
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (entry.name.len > max_name or !std.mem.endsWith(u8, entry.name, state_suffix)) continue;
+            try list.append(arena, try arena.dupe(u8, entry.name));
+        }
+        // Not the directory's order, which is the file system's to choose.
+        std.mem.sort([]const u8, list.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        return list.items;
+    }
+
     /// Write `state` as a file of this process's, whole or not at all: a
-    /// launch never reads one half written. The name is this process's
-    /// ID and the time, so that it is no other's, whatever became of a
-    /// process that had the ID before.
+    /// launch never reads one half written. The name is the time and
+    /// this process's ID, so that it is no other's, and the files sort
+    /// by age.
+    ///
+    /// Then the oldest files beyond `max_files` are deleted. Saves that
+    /// no launch takes, as where every launch is given a command, would
+    /// otherwise pile up without end, and all come back at once at the
+    /// first launch that does take them.
     pub fn save(self: Store, arena: Allocator, state: State, isLocal: State.IsLocal) !void {
         const io = global.io();
         const text = try State.encode(arena, state, isLocal);
         var name_buf: [max_name]u8 = undefined;
-        const name = std.fmt.bufPrint(&name_buf, "{d}-{x}" ++ state_suffix, .{
-            std.os.windows.GetCurrentProcessId(),
+        const name = std.fmt.bufPrint(&name_buf, "{x:0>24}-{d}" ++ state_suffix, .{
             @as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())),
+            std.os.windows.GetCurrentProcessId(),
         }) catch unreachable;
         var file = try self.dir.createFileAtomic(io, name, .{ .replace = true });
         defer file.deinit(io);
         try file.file.writeStreamingAll(io, text);
         try file.replace(io);
+
+        const all = try self.names(arena);
+        if (all.len <= max_files) return;
+        for (all[0 .. all.len - max_files]) |old| {
+            self.dir.deleteFile(io, old) catch |err| {
+                log.warn("cannot delete an old saved window state err={}", .{err});
+            };
+        }
     }
 
-    /// Delete every state there is, taken or not.
+    /// Delete every file there is: the states, taken or not, and what a
+    /// save or a launch that was cut short left behind. The directory
+    /// is this program's alone.
     pub fn forget(self: Store) void {
         const io = global.io();
         var it = self.dir.iterate();
@@ -517,8 +572,6 @@ pub const Store = struct {
             break :stop null;
         }) |entry| {
             if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, state_suffix) and
-                !std.mem.endsWith(u8, entry.name, claimed_suffix)) continue;
             self.dir.deleteFile(io, entry.name) catch |err| {
                 log.warn("cannot delete a saved window state err={}", .{err});
             };
@@ -536,32 +589,17 @@ pub const Store = struct {
     /// too long or is not a state is deleted the same, with a warning.
     pub fn claim(self: Store, arena: Allocator, isLocal: State.IsLocal) Allocator.Error![]const State.Window {
         const io = global.io();
-        var names: std.ArrayList([]const u8) = .empty;
-        var it = self.dir.iterate();
-        while (it.next(io) catch |err| stop: {
-            log.warn("cannot list the saved window states err={}", .{err});
-            break :stop null;
-        }) |entry| {
-            if (entry.kind != .file) continue;
-            if (entry.name.len > max_name or !std.mem.endsWith(u8, entry.name, state_suffix)) continue;
-            if (names.items.len == max_files) {
-                log.warn("more window states are saved than one launch takes, the rest wait", .{});
-                break;
-            }
-            try names.append(arena, try arena.dupe(u8, entry.name));
+        var all = try self.names(arena);
+        if (all.len > max_files) {
+            log.warn("more window states are saved than one launch takes, the rest wait", .{});
+            all = all[0..max_files];
         }
-        // The order they come back in is not the directory's to choose.
-        std.mem.sort([]const u8, names.items, {}, struct {
-            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.order(u8, a, b) == .lt;
-            }
-        }.lessThan);
 
         var windows: std.ArrayList(State.Window) = .empty;
         var terminals: usize = 0;
         var dropped: usize = 0;
         const pid = std.os.windows.GetCurrentProcessId();
-        for (names.items) |name| {
+        for (all) |name| {
             var buf: [max_name + 32]u8 = undefined;
             const mine = std.fmt.bufPrint(&buf, "{s}.{d}" ++ claimed_suffix, .{ name, pid }) catch unreachable;
             self.dir.rename(name, self.dir, mine, io) catch |err| {
@@ -619,10 +657,11 @@ test "win32: a launch that names what to open leaves the saved windows for anoth
         .{ .arguments = &.{ "--font-size=14", "--window-save-state=always" }, .launch = .restore },
         // Not the options, only names that begin as they do.
         .{ .arguments = &.{ "--title-report=true", "--working-directory", "--e" }, .launch = .restore },
-        .{ .arguments = &.{ "-e", "top" }, .launch = .fresh },
-        .{ .arguments = &.{ "--class=com.example.one", "-e", "top" }, .launch = .fresh },
+        // The configuration reads these two, not this rule.
+        .{ .arguments = &.{ "-e", "top" }, .launch = .restore },
+        .{ .arguments = &.{"--initial-command=top"}, .launch = .restore },
         .{ .arguments = &.{"--command=top"}, .launch = .fresh },
-        .{ .arguments = &.{"--initial-command=top"}, .launch = .fresh },
+        .{ .arguments = &.{ "--class=com.example.one", "--command=top" }, .launch = .fresh },
         .{ .arguments = &.{"--working-directory=C:\\src"}, .launch = .fresh },
         .{ .arguments = &.{"--title=build"}, .launch = .fresh },
     }) |case| {
@@ -635,6 +674,9 @@ test "win32: a launch that names what to open leaves the saved windows for anoth
         try testing.expectEqual(Launch.fresh, launch(.default, true, case.arguments));
         try testing.expectEqual(Launch.fresh, launch(.always, true, case.arguments));
     }
+    try testing.expect(namesCommand(&.{ "--title=a", "--command=top" }));
+    try testing.expect(!namesCommand(&.{ "--title=a", "--commands=top", "--initial-command=top", "-e", "top" }));
+    try testing.expect(!namesCommand(&.{}));
 }
 
 test "win32: the windows are saved at the ends the option names" {
