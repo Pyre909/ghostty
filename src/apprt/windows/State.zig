@@ -36,8 +36,10 @@ const windows_pwd = @import("../../termio/windows_pwd.zig");
 /// The format's version. Another one's file is not read.
 pub const format_version = 1;
 
-/// The most windows in one state.
-pub const max_windows = 16;
+/// The most windows in one state: as many as one launch opens
+/// (`Session.Store.max_windows`), so that a process saves all of what
+/// the next can bring back.
+pub const max_windows = 32;
 
 /// The most tabs in one window.
 pub const max_tabs = 64;

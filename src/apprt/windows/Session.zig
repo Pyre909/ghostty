@@ -542,6 +542,8 @@ pub const Store = struct {
     pub fn save(self: Store, arena: Allocator, state: State, isLocal: State.IsLocal) !void {
         const io = global.io();
         const text = try State.encode(arena, state, isLocal);
+        // No launch reads one this long (`claim`).
+        if (text.len >= max_bytes) return error.StreamTooLong;
         var name_buf: [max_name]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buf, "{x:0>24}-{d}" ++ state_suffix, .{
             @as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())),

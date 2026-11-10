@@ -29742,8 +29742,8 @@ test "win32: a launch opens no more saved windows and terminals than its most" {
     defer tmp.cleanup();
     const store: Session.Store = .{ .dir = tmp.dir };
 
-    // Three files of as many windows as one holds: two files' worth
-    // open, and the third file is gone with the others.
+    // Three files of as many windows as one holds: one file's worth
+    // open, and the other files are gone with it.
     const full = try arena.alloc(Session.State.Window, Session.State.max_windows);
     for (full) |*window| window.* = try testStateWindow(arena, 1);
     for ([_][]const u8{ "1-1.json", "2-1.json", "3-1.json" }) |name| {
@@ -29845,6 +29845,21 @@ test "win32: a save keeps no more states than a launch takes, and deletes the ol
     try std.testing.expectEqual(2, std.mem.count(u8, names, pid));
     const tail = names[std.mem.indexOf(u8, names, "-062.json\n").? + "-062.json\n".len ..];
     try std.testing.expectEqual(2, std.mem.count(u8, tail[0..std.mem.indexOf(u8, tail, "notes.txt").?], pid));
+
+    // A state longer than a launch reads is not written.
+    const long = try testStateWindow(arena, 64);
+    const pwd = try arena.alloc(u8, Session.State.max_pwd - 6);
+    for (pwd, 0..) |*c, i| c.* = if (i % 100 == 2) '\\' else 'a';
+    @memcpy(pwd[0..2], "C:");
+    for (@constCast(long.tabs[0].nodes)) |*node| switch (node.*) {
+        .leaf => |*leaf| leaf.pwd = pwd,
+        .split => {},
+    };
+    try std.testing.expectError(
+        error.StreamTooLong,
+        store.save(arena, .{ .version = 1, .windows = &.{long} }, &testStateLocal),
+    );
+    try std.testing.expectEqualStrings(names, try testNames(arena, tmp.dir));
 }
 
 /// For tests of saving: an app with two windows open, (a | b) and c,
