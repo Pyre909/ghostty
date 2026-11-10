@@ -17,6 +17,7 @@ const App = @import("App.zig").App;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 
 const Binding = input.Binding;
+const i18n = @import("../../os/main.zig").i18n;
 const uucode = @import("uucode");
 
 /// Whether this runtime carries out `key`, and so lists a command with
@@ -210,6 +211,12 @@ pub const Entries = struct {
 /// `command-palette-entry`) whose action is `supported`, with the
 /// shortcut `set` binds each action to, and one for each of `jumps`;
 /// sorted (`lessThan`).
+///
+/// In the user's language: a title and a description are translated
+/// here, as they are listed, rather than as the configuration loads,
+/// which is before its `language` is known. An entry of the user's own
+/// is looked up as the defaults are, and shows as written unless its
+/// text is a default's.
 pub fn build(
     alloc: Allocator,
     commands: []const input.Command,
@@ -223,7 +230,7 @@ pub fn build(
     var list: std.ArrayList(Entry) = try .initCapacity(a, commands.len + jumps.len);
     for (commands) |command| {
         if (!supported(command.action)) continue;
-        const cloned = try command.clone(a);
+        const cloned = try command.translated().clone(a);
         var shortcut: []const u8 = "";
         if (set.getTrigger(command.action)) |trigger| {
             var w: std.Io.Writer.Allocating = .init(a);
@@ -238,10 +245,11 @@ pub fn build(
         }));
     }
     for (jumps, 0..) |jump, i| {
-        const shown = jump.title orelse "Untitled";
+        const shown = jump.title orelse std.mem.span(i18n._("Untitled"));
         const pwd = jump.pwd orelse "";
         list.appendAssumeCapacity(try withFolded(a, .{
-            .title = try a.print("Focus: {s}", .{shown}),
+            // As GTK words it.
+            .title = try a.print("{s}: {s}", .{ i18n._("Focus"), shown }),
             .description = if (pwd.len > 0 and std.mem.indexOf(u8, shown, pwd) == null) try escaped(a, pwd) else "",
             .run = .{ .jump = jump.surface },
             .sort_key = i,
@@ -1860,6 +1868,61 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     try testing.expect(focus[2].run.jump == one);
     try testing.expectEqualStrings("", focus[3].shortcut);
     try testing.expectEqualStrings("", focus[3].action_key);
+}
+
+test "win32: the palette's commands and jumps are in the user's language" {
+    const alloc = testing.allocator;
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    const commands = config.@"command-palette-entry".value.items;
+    const jumps = [_]Jump{
+        .{ .surface = @ptrFromInt(0x10000), .title = null },
+        .{ .surface = @ptrFromInt(0x20000), .title = "vim" },
+    };
+
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Split Right", "Rechts teilen" },
+        .{ "Split the terminal to the right.", "Das Terminal nach rechts teilen." },
+        .{ "Focus", "Fokus" },
+        .{ "Untitled", "Unbenannt" },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+
+    var entries = try build(alloc, commands, &config.keybind.set, &jumps);
+    defer entries.deinit();
+    var saw_split = false;
+    var saw_tab = false;
+    var titles: [2][]const u8 = undefined;
+    for (entries.items) |*e| switch (e.run) {
+        .action => {
+            if (std.mem.eql(u8, e.action_key, "new_split:right")) {
+                saw_split = true;
+                try testing.expectEqualStrings("Rechts teilen", e.title);
+                try testing.expectEqualStrings("Das Terminal nach rechts teilen.", e.description);
+                // What the filter matches is what shows.
+                try testing.expect(std.mem.indexOf(u8, e.folded_title, "rechts") != null);
+            }
+            // One the catalog has nothing for, as written.
+            if (std.mem.eql(u8, e.action_key, "new_tab")) {
+                saw_tab = true;
+                try testing.expectEqualStrings("New Tab", e.title);
+            }
+        },
+        .jump => |surface| titles[@intFromPtr(surface) / 0x10000 - 1] = e.title,
+    };
+    try testing.expect(saw_split and saw_tab);
+    try testing.expectEqualStrings("Fokus: Unbenannt", titles[0]);
+    try testing.expectEqualStrings("Fokus: vim", titles[1]);
+
+    // The configuration's own are untouched: another language's palette
+    // starts from them.
+    for (commands) |c| {
+        if (c.action == .new_split and c.action.new_split == .right) {
+            try testing.expectEqualStrings("Split Right", c.title);
+        }
+    }
 }
 
 test "win32: a jump's working directory cannot reorder or hide the palette's text" {

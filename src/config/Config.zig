@@ -122,7 +122,11 @@ pub const compatibility = std.StaticStringMap(
 /// Warning: This setting cannot be reloaded at runtime. To change the language
 /// you must fully restart Ghostty.
 ///
-/// GTK only.
+/// On Windows the language is named as on Linux (`de`, `pt_BR`) or as Windows
+/// names it (`de-DE`, `zh-Hant-TW`), and without this setting it is the first
+/// of your Windows display languages that Ghostty is translated to.
+///
+/// GTK and Windows only.
 /// Available since 1.3.0.
 language: ?[:0]const u8 = null,
 

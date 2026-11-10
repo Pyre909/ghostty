@@ -919,6 +919,9 @@ pub const App = struct {
         };
         errdefer config.deinit();
 
+        // Before anything shows text. Once: the option is not reloaded.
+        internal_os.i18n.windows.use(config.language);
+
         registerClasses(hinstance) catch |err| {
             fatalNotice(err);
             return err;

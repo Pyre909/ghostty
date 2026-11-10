@@ -41,6 +41,7 @@ const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const Surface = @import("Surface.zig").Surface;
 const SearchBar = @import("SearchBar.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const i18n = @import("../../os/main.zig").i18n;
 
 const Binding = input.Binding;
 const log = std.log.scoped(.win32);
@@ -52,7 +53,8 @@ pub const Submenu = enum {
     window,
     config,
 
-    pub fn label(self: Submenu) []const u8 {
+    /// As the source words it (`Wide.label` translates).
+    pub fn label(self: Submenu) [:0]const u8 {
         return switch (self) {
             .split => "Split",
             .tab => "Tab",
@@ -72,7 +74,9 @@ pub const Command = union(enum) {
 
 /// An item as the menu always lists it.
 const Entry = struct {
-    label: []const u8,
+    /// As the source words it: GTK's text for the item, which is the
+    /// one the translations are of.
+    label: [:0]const u8,
     action: Command,
     /// GTK's section it is in; a line divides one section from the next.
     section: u8,
@@ -142,7 +146,9 @@ pub const Item = struct {
     /// Its command id: its place in the list, from 1, since
     /// TrackPopupMenuEx returns 0 when nothing is chosen.
     id: u16,
-    label: []const u8,
+    /// As the source words it; the menu shows it in the user's language
+    /// (`itemText`).
+    label: [:0]const u8,
     action: Command,
     section: u8,
     submenu: ?Submenu,
@@ -206,19 +212,21 @@ pub fn menuItems(state: State, set: *const Binding.Set) [count]Item {
     return items;
 }
 
-/// The longest text `itemText` writes: the longest label, a tab, and a
-/// shortcut whose every byte is a code point written as "U+XXXX".
+/// The longest text `itemText` writes: the longest label in any
+/// language, a tab, and a shortcut whose every byte is a code point
+/// written as "U+XXXX".
 const text_max = 512;
 
-/// `item`'s text as AppendMenuW takes it: its label, then a tab and its
-/// shortcut, which the menu right-aligns. In the shortcut, which comes
-/// from the configuration, an '&' is doubled, as a single one would
-/// underline the next character, and a code point that can reorder or
-/// hide text (`App.unsafeCodepoint`) is written as "U+XXXX", as the link
-/// preview writes one; a shortcut that is not UTF-8 is left out.
+/// `item`'s text as AppendMenuW takes it: its label in the user's
+/// language, then a tab and its shortcut, which the menu right-aligns.
+/// An '&' is doubled in both, as a single one would underline the next
+/// character. In the shortcut, which comes from the configuration, a
+/// code point that can reorder or hide text (`App.unsafeCodepoint`) is
+/// written as "U+XXXX", as the link preview writes one; a shortcut that
+/// is not UTF-8 is left out.
 pub fn itemText(buf: *[text_max:0]u16, item: *const Item) [:0]const u16 {
     var out: Wide = .{ .buf = buf };
-    out.utf8(item.label);
+    out.label(item.label);
     const shortcut = item.shortcut();
     if (shortcut.len > 0) if (std.unicode.Utf8View.init(shortcut)) |view| {
         out.unit('\t');
@@ -258,10 +266,22 @@ const Wide = struct {
         self.unit(@intCast(0xDC00 + (v & 0x3FF)));
     }
 
-    /// The labels and the escapes are valid UTF-8.
+    /// The escapes are valid UTF-8.
     fn utf8(self: *Wide, s: []const u8) void {
         var it = (std.unicode.Utf8View.init(s) catch unreachable).iterator();
         while (it.nextCodepoint()) |cp| self.codepoint(cp);
+    }
+
+    /// `msgid`, a label, in the user's language, each '&' doubled: a
+    /// translation's is text. Valid UTF-8: the source's is, and a
+    /// catalog is not used unless all of it is (`i18n.windows.use`).
+    fn label(self: *Wide, msgid: [:0]const u8) void {
+        const text = std.mem.span(i18n._(msgid));
+        var it = (std.unicode.Utf8View.init(text) catch unreachable).iterator();
+        while (it.nextCodepoint()) |cp| {
+            if (cp == '&') self.unit('&');
+            self.codepoint(cp);
+        }
     }
 };
 
@@ -440,7 +460,7 @@ fn fill(menu: win32.HMENU, items: *const [count]Item) ?win32.Win32Error {
         const popup = createMenu() orelse return win32.GetLastError();
         var buf: [text_max:0]u16 = undefined;
         var out: Wide = .{ .buf = &buf };
-        out.utf8(sub.label());
+        out.label(sub.label());
         buf[out.len] = 0;
         for (items[i..end]) |*item| {
             if (!appendItem(popup, item)) break;
@@ -604,6 +624,54 @@ test "win32: a context menu item's shortcut cannot underline, reorder or hide it
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Reset\tCtrl+U+0085"), itemText(&text, try testItem(&items, "Reset")));
     // Outside the BMP, as a surrogate pair.
     try testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("New Tab\tCtrl+\u{1F600}"), itemText(&text, try testItem(&items, "New Tab")));
+}
+
+test "win32: the context menu's items and submenus are in the user's language" {
+    const alloc = testing.allocator;
+    var set: Binding.Set = .{};
+    defer set.deinit(alloc);
+    try set.parseAndPut(alloc, "ctrl+shift+c=copy_to_clipboard:mixed");
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Copy", "Kopieren" },
+        // A translation's '&' is text, not the mark of an access key.
+        .{ "Paste", "Ein & Aus" },
+        .{ "Change Title\u{2026}", "Titel \u{e4}ndern\u{2026}" },
+        .{ "Split", "Teilen" },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+
+    // An item is still found by the source's word for it.
+    const items = menuItems(.{ .selection = true }, &set);
+    var text: [text_max:0]u16 = undefined;
+    try testing.expectEqualSlices(u16, L("Kopieren\tCtrl+Shift+C"), itemText(&text, try testItem(&items, "Copy")));
+    try testing.expectEqualSlices(u16, L("Ein && Aus"), itemText(&text, try testItem(&items, "Paste")));
+    try testing.expectEqualSlices(u16, L("Titel \u{e4}ndern\u{2026}"), itemText(&text, try testItem(&items, "Change Title\u{2026}")));
+    // One the catalog has nothing for, as written.
+    try testing.expectEqualSlices(u16, L("Clear"), itemText(&text, try testItem(&items, "Clear")));
+
+    // As Windows shows it: the submenus too.
+    const menu = build(&items) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyMenu(menu);
+    var buf: [text_max]u16 = undefined;
+    try testing.expectEqualSlices(u16, L("Kopieren\tCtrl+Shift+C"), testText(menu, 0, win32.MF_BYPOSITION, &buf));
+    var teilen = false;
+    var tab = false;
+    const n: win32.UINT = @intCast(win32.GetMenuItemCount(menu));
+    for (0..n) |i| {
+        const shown = testText(menu, @intCast(i), win32.MF_BYPOSITION, &buf);
+        if (std.mem.eql(u16, shown, L("Teilen"))) teilen = true;
+        if (std.mem.eql(u16, shown, L("Tab"))) tab = true;
+        try testing.expect(!std.mem.eql(u16, shown, L("Split")));
+    }
+    try testing.expect(teilen and tab);
+
+    // Back to the source's, which the other tests read.
+    try i18n.windows.testUse(null);
+    try testing.expectEqualSlices(u16, L("Copy\tCtrl+Shift+C"), itemText(&text, try testItem(&items, "Copy")));
 }
 
 /// For tests: the text of `menu`'s item at `pos`, or of the item with the
