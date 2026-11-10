@@ -3943,10 +3943,12 @@ pub const App = struct {
     /// only to stderr, which reaches nobody here (`dialog.fatalNotice`).
     fn exportQueued(self: *App, from: *Surface, contents: []const u8) void {
         const owner = if (from.inspector) |inspector| inspector.view.hwnd else from.hwnd;
+        var title: Question = .{};
+        var ok: Question = .{};
         const path = switch (SaveDialog.ask(self, owner, .{
-            .title = L("Export Terminal IO Events"),
+            .title = title.one("Export Terminal IO Events"),
             .name = L("ghostty-terminal-io.txt"),
-            .ok = L("Export"),
+            .ok = ok.one("Export"),
         })) {
             .cancelled => return,
             // Logged by `SaveDialog.ask`.
@@ -4692,8 +4694,9 @@ fn configErrorsText(alloc: Allocator, config: *const Config) ![:0]u16 {
     var text: std.Io.Writer.Allocating = .init(alloc);
     defer text.deinit();
     const w = &text.writer;
-    try w.writeAll("One or more configuration errors were found. Please review the " ++
-        "errors below, and either reload your configuration or ignore these errors.\n\n");
+    try w.writeAll(std.mem.span(internal_os.i18n._("One or more configuration errors were found. Please review the " ++
+        "errors below, and either reload your configuration or ignore these errors.")));
+    try w.writeAll("\n\n");
     const items = config._diagnostics.items();
     for (items[0..@min(items.len, config_errors_shown)]) |*diag| {
         try diag.format(w);
@@ -11723,6 +11726,57 @@ test "win32: a text file of no registered kind opens as a text file" {
     try std.testing.expect(hasProgram(ext(".exe")));
     try std.testing.expect(!hasProgram(ext(".ghostty-test-no-such-kind")));
     try std.testing.expect(!hasProgram(ext("")));
+}
+
+test "win32: a command's end and the configuration's errors are told in the user's language" {
+    const i18n = internal_os.i18n;
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const errors = "One or more configuration errors were found. Please review the " ++
+        "errors below, and either reload your configuration or ignore these errors.";
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Command Succeeded", "Befehl erfolgreich" },
+        .{ "Command Failed", "Befehl fehlgeschlagen" },
+        .{ "Command Finished", "Befehl abgeschlossen" },
+        .{ errors, "Fehler gefunden." },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+
+    // The banner's titles, each kept while the other is read.
+    const succeeded = ChildExited.title(0);
+    const failed = ChildExited.title(1);
+    try testing.expectEqualSlices(u16, W("Befehl erfolgreich"), succeeded);
+    try testing.expectEqualSlices(u16, W("Befehl fehlgeschlagen"), failed);
+
+    // The notification's.
+    var buf: [128]u8 = undefined;
+    const took: Config.Duration = .{ .duration = std.time.ns_per_s };
+    try testing.expectEqualStrings(
+        "Befehl erfolgreich",
+        @import("Surface.zig").commandFinishedText(&buf, .{ .exit_code = 0, .duration = took }).title,
+    );
+    try testing.expectEqualStrings(
+        "Befehl fehlgeschlagen",
+        @import("Surface.zig").commandFinishedText(&buf, .{ .exit_code = 2, .duration = took }).title,
+    );
+    try testing.expectEqualStrings(
+        "Befehl abgeschlossen",
+        @import("Surface.zig").commandFinishedText(&buf, .{ .exit_code = null, .duration = took }).title,
+    );
+
+    // The errors' first words, the diagnostics after them as they are.
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    try config.addDiagnosticFmt("bad line", .{});
+    const wide = try configErrorsText(alloc, &config);
+    defer alloc.free(wide);
+    const text = try std.unicode.utf16LeToUtf8Alloc(alloc, wide);
+    defer alloc.free(text);
+    try testing.expect(std.mem.startsWith(u8, text, "Fehler gefunden.\n\nbad line\n"));
 }
 
 test "win32: the configuration errors list at most twenty diagnostics" {

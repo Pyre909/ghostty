@@ -53,6 +53,7 @@ const clipboardPrompt = @import("clipboard.zig").clipboardPrompt;
 const ClipboardDialog = @import("ClipboardDialog.zig");
 const confirm = @import("dialog.zig").confirm;
 const Question = @import("dialog.zig").Question;
+const i18n = @import("../../os/main.zig").i18n;
 const drop = @import("drop.zig");
 const Shell = @import("../../termio/shell_integration.zig").Shell;
 const notice = @import("dialog.zig").notice;
@@ -3665,11 +3666,11 @@ pub fn commandFinishedText(
 ) struct { title: []const u8, body: []const u8 } {
     const took = value.duration.round(std.time.ns_per_ms);
     const code = value.exit_code orelse return .{
-        .title = "Command Finished",
+        .title = std.mem.span(i18n._("Command Finished")),
         .body = std.fmt.bufPrint(buf, "Command took {f}.", .{took}) catch unreachable,
     };
     return .{
-        .title = if (code == 0) "Command Succeeded" else "Command Failed",
+        .title = std.mem.span(if (code == 0) i18n._("Command Succeeded") else i18n._("Command Failed")),
         .body = std.fmt.bufPrint(buf, "Command took {f} and exited with code {d}.", .{ took, code }) catch unreachable,
     };
 }

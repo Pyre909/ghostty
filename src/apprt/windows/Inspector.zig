@@ -17,6 +17,7 @@ const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
 const TitleDialog = @import("TitleDialog.zig");
 const Window = @import("Window.zig");
+const Question = @import("dialog.zig").Question;
 
 const log = std.log.scoped(.win32);
 
@@ -71,9 +72,10 @@ pub fn create(surface: *Surface) !*Inspector {
     const frame = surface.window.hwnd;
     var over: win32.RECT = .{ .left = 0, .top = 0, .right = width, .bottom = height };
     _ = win32.GetWindowRect(frame, &over);
+    var translated: Question = .{};
     try self.view.init(
         app.hinstance,
-        L(title),
+        translated.one(title),
         over,
         &app.modal_loop_depth,
         .{ .ptr = self, .ready = ready, .draw = draw, .close = close },

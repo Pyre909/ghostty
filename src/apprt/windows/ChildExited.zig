@@ -55,6 +55,7 @@ const Window = @import("Window.zig");
 const Overlays = @import("Overlays.zig");
 const SearchBar = @import("SearchBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
+const Question = @import("dialog.zig").Question;
 
 const RECT = win32.RECT;
 const Size = Overlays.Size;
@@ -62,12 +63,19 @@ const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttyChildExitedClass";
 
-/// The button's label, GTK's.
-pub const button_label = "Close";
-const button_text: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral(button_label);
+/// The banners' words, GTK's, in the user's language: the two titles and
+/// the button's label. One set for every banner, read again as each is
+/// shown, on the thread the windows are on.
+var words: struct {
+    succeeded: Question = .{},
+    failed: Question = .{},
+    close: Question = .{},
+} = .{};
 
-const succeeded_text: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Command Succeeded");
-const failed_text: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Command Failed");
+/// The button's label.
+fn buttonText() [:0]const u16 {
+    return std.mem.span(words.close.one("Close"));
+}
 
 /// One line, `&` drawn as itself, cut with an ellipsis where it has no
 /// room.
@@ -100,7 +108,7 @@ pub const Banner = struct {
     /// A WM_MOUSELEAVE is asked for (TrackMouseEvent).
     tracking: bool = false,
 
-    /// Nothing to free: its texts are constants.
+    /// Nothing to free: its texts are `words`.
     pub fn deinit(self: *Banner, alloc: std.mem.Allocator) void {
         _ = alloc;
         self.text = null;
@@ -108,7 +116,7 @@ pub const Banner = struct {
 
     /// The button's label, measured with the title (`Overlays.placed`).
     pub fn measureMore(self: *Banner, hwnd: win32.HWND, font: ?win32.HGDIOBJ) void {
-        self.label_size = Overlays.measure(hwnd, font, button_text);
+        self.label_size = Overlays.measure(hwnd, font, buttonText());
     }
 
     /// Where the banner goes over a terminal `pane` big at `dpi`, in the
@@ -134,7 +142,7 @@ pub const Banner = struct {
         SearchBar.fill(hdc, l.button, colors.border);
         const face = if (self.pressed) colors.border else if (self.hover) colors.hover else colors.bar;
         SearchBar.fill(hdc, SearchBar.inset(l.button, line), face);
-        Overlays.drawText(hdc, font, button_text, l.label, colors.text, label_format);
+        Overlays.drawText(hdc, font, buttonText(), l.label, colors.text, label_format);
     }
 
     /// Whether `x`, `y`, in the banner `hwnd`'s client coordinates, is on
@@ -285,7 +293,10 @@ pub fn failed(exit_code: u32) bool {
 
 /// The banner's title for `exit_code`, GTK's.
 pub fn title(exit_code: u32) [:0]const u16 {
-    return if (failed(exit_code)) failed_text else succeeded_text;
+    return std.mem.span(if (failed(exit_code))
+        words.failed.one("Command Failed")
+    else
+        words.succeeded.one("Command Succeeded"));
 }
 
 /// The banner's background: libadwaita's success or error background
