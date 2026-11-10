@@ -3,6 +3,9 @@ const builtin = @import("builtin");
 const build_config = @import("../build_config.zig");
 const locales = @import("i18n_locales.zig");
 
+/// Translations where there is no libintl.
+pub const windows = @import("i18n_windows.zig");
+
 const log = std.log.scoped(.i18n);
 
 /// Set for faster membership lookup of locales.
@@ -29,7 +32,8 @@ pub fn init(resources_dir: []const u8) InitError!void {
     if (comptime !build_config.i18n) return;
 
     switch (builtin.target.os.tag) {
-        // i18n is unsupported on Windows
+        // Windows has no libintl to bind a directory of catalogs to. Its
+        // app carries them and chooses one as it starts (`windows.use`).
         .windows => return,
 
         else => {
@@ -69,6 +73,7 @@ pub fn initGlobalDomain() error{OutOfMemory}!void {
 pub fn _(msgid: [*:0]const u8) [*:0]const u8 {
     if (comptime !build_config.i18n) return msgid;
     if (@inComptime()) return msgid;
+    if (comptime builtin.target.os.tag == .windows) return windows.translate(msgid);
     return dgettext(build_config.bundle_id, msgid);
 }
 
@@ -200,6 +205,11 @@ test "canonicalizeLocale darwin" {
     // canonicalizeLocale does not handle encodings and will turn them into
     // underscores. We should parse them out before calling this function.
     try testing.expectEqualStrings("en_US.UTF_8", try canonicalizeLocale(&buf, "en_US.UTF-8"));
+}
+
+test {
+    _ = windows;
+    _ = @import("i18n_catalog.zig");
 }
 
 test "_ returns msgid at comptime" {

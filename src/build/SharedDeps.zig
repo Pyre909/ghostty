@@ -8,6 +8,7 @@ const HelpStrings = @import("HelpStrings.zig");
 const MetallibStep = @import("MetallibStep.zig");
 const UnicodeTables = @import("UnicodeTables.zig");
 const GhosttyFrameData = @import("GhosttyFrameData.zig");
+const GhosttyI18n = @import("GhosttyI18n.zig");
 const DistResource = @import("GhosttyDist.zig").Resource;
 const gtk_helpers = @import("gtk.zig");
 const translate_c = @import("translate_c");
@@ -745,9 +746,17 @@ fn addWin32(
     self: *const SharedDeps,
     step: *std.Build.Step.Compile,
 ) !void {
-    _ = self;
     for ([_][]const u8{ "user32", "gdi32", "imm32", "ole32", "shell32", "shlwapi", "advapi32", "oleaut32", "dwmapi", "d3d11", "dwrite" }) |lib| {
         step.root_module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
+    }
+
+    // The translations, which the app carries (src/os/i18n_windows.zig).
+    if (self.config.i18n) {
+        const catalogs = GhosttyI18n.catalogs(step.step.owner);
+        catalogs.addStepDependencies(&step.step);
+        step.root_module.addAnonymousImport("i18n_catalogs", .{
+            .root_source_file = catalogs,
+        });
     }
 }
 

@@ -16,12 +16,12 @@ steps: []*std.Build.Step,
 update_step: *std.Build.Step,
 
 pub fn init(b: *std.Build, cfg: *const Config) !GhosttyI18n {
-    _ = cfg;
-
     var steps: std.ArrayList(*std.Build.Step) = .empty;
     defer steps.deinit(b.allocator);
 
-    inline for (locales) |locale| {
+    // A Windows app has no libintl to read a directory of catalogs: it
+    // carries them (`catalogs`), and installs none.
+    if (cfg.target.result.os.tag != .windows) inline for (locales) |locale| {
         // There is no encoding suffix in the LC_MESSAGES path on FreeBSD,
         // so we need to remove it from `locale` to have a correct destination string.
         // (/usr/local/share/locale/en_AU/LC_MESSAGES)
@@ -40,13 +40,36 @@ pub fn init(b: *std.Build, cfg: *const Config) !GhosttyI18n {
                 .{ target_locale, domain },
             ),
         ).step);
-    }
+    };
 
     return .{
         .owner = b,
         .update_step = try createUpdateStep(b),
         .steps = try steps.toOwnedSlice(b.allocator),
     };
+}
+
+/// A Zig file whose `catalogs` are every locale's compiled catalog, in
+/// the order of `locales`, for a program that reads them itself
+/// (src/os/i18n_windows.zig). Little-endian whatever machine builds,
+/// which is what its reader takes (src/os/i18n_catalog.zig).
+pub fn catalogs(b: *std.Build) std.Build.LazyPath {
+    const wf = b.addWriteFiles();
+    inline for (locales) |locale| {
+        const msgfmt = b.addSystemCommand(&.{ "msgfmt", "--endianness=little", "-o", "-" });
+        msgfmt.addFileArg(b.path("po/" ++ locale ++ ".po"));
+        _ = wf.addCopyFile(msgfmt.captureStdOut(.{}), locale ++ ".mo");
+    }
+    return wf.add("i18n_catalogs.zig", comptime source: {
+        var source: []const u8 =
+            \\//! This file is auto-generated. Do not edit.
+            \\
+            \\pub const catalogs = [_][]const u8{
+            \\
+        ;
+        for (locales) |locale| source = source ++ "    @embedFile(\"" ++ locale ++ ".mo\"),\n";
+        break :source source ++ "};\n";
+    });
 }
 
 pub fn install(self: *const GhosttyI18n) void {
