@@ -4599,10 +4599,16 @@ fn logEffectiveDpiAwareness(user32: win32.HMODULE) void {
 /// is full (10,000 messages); the close is then undone, so that the user
 /// can ask again.
 pub fn postTeardown(hwnd: win32.HWND, closing: *bool) void {
-    if (win32.PostMessageW(hwnd, WM_GHOSTTY_DESTROY, 0, 0).toBool()) return;
-    log.err("failed to post a teardown err={}", .{win32.GetLastError()});
+    const fails = if (builtin.is_test) if (test_post_fails) |f| f(hwnd) else false else false;
+    if (!fails and win32.PostMessageW(hwnd, WM_GHOSTTY_DESTROY, 0, 0).toBool()) return;
+    log.warn("failed to post a teardown err={}", .{win32.GetLastError()});
     closing.* = false;
 }
+
+/// For tests: whether `postTeardown` fails for a window, as it does for
+/// all when the queue is full.
+pub var test_post_fails: if (builtin.is_test) ?*const fn (win32.HWND) bool else void =
+    if (builtin.is_test) null else {};
 
 /// ID_ICON_GHOSTTY in dist/windows/ghostty.rc, which the exe links.
 const icon_resource_id = 1;
@@ -11828,6 +11834,82 @@ test "win32: redo closes a split again until something else closes or its time i
     TestUndo.close(t.a);
     try std.testing.expect(t.a.parked);
     try std.testing.expect(!try app.performAction(.app, .redo, {}));
+}
+
+test "win32: a tab close that could not post its teardowns leaves a later close a split's" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const Fails = struct {
+        var only: ?win32.HWND = null;
+        fn all(_: win32.HWND) bool {
+            return true;
+        }
+        fn one(hwnd: win32.HWND) bool {
+            return hwnd == only;
+        }
+    };
+    defer test_post_fails = null;
+
+    // Not one posted: the close is taken back whole, and the tab is no
+    // longer one that is closing.
+    {
+        const t = try TestUndo.init(&app);
+        const window = t.window;
+        const t0 = window.tab();
+        _ = try testTab(&app, window);
+        test_post_fails = &Fails.all;
+        try std.testing.expect(window.closeTabs(0, .this));
+        test_post_fails = null;
+        testPump();
+        try std.testing.expect(!t0.closing);
+        try std.testing.expect(!t.a.closing and !t.b.closing);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+
+        // One split of it closed later is only that.
+        TestUndo.close(t.b);
+        try std.testing.expectEqual(2, window.tabs.items.len);
+        try std.testing.expect(t.b.parked);
+        try std.testing.expect(!t.a.parked and !t.a.closing);
+        try std.testing.expect(shown(t.a.hwnd));
+        try std.testing.expect(app.undo.entries.items[0].what == .pane);
+        try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
+    }
+    // One posted and one not: the one that runs closes alone, as a
+    // split, and the terminal whose close was taken back stays, shown.
+    {
+        const t = try TestUndo.init(&app);
+        const window = t.window;
+        const t0 = window.tab();
+        _ = try testTab(&app, window);
+        Fails.only = t.a.hwnd;
+        test_post_fails = &Fails.one;
+        try std.testing.expect(window.closeTabs(0, .this));
+        test_post_fails = null;
+        testPump();
+        try std.testing.expect(!t0.closing);
+        try std.testing.expectEqual(2, window.tabs.items.len);
+        try std.testing.expectEqual(t0, window.tab());
+        try std.testing.expect(t.b.parked);
+        try std.testing.expect(!t.a.parked and !t.a.closing);
+        try std.testing.expect(shown(t.a.hwnd));
+        try std.testing.expectEqual(1, app.undo.entries.items.len);
+        try std.testing.expect(app.undo.entries.items[0].what == .pane);
+
+        // When its time is up, only the one that closed ends.
+        Undo.test_now = TestUndo.due;
+        TestUndo.tick(&app);
+        testPump();
+        try std.testing.expect(!TestUndo.has(&app, t.b));
+        try std.testing.expect(TestUndo.has(&app, t.a));
+        try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
+    }
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {

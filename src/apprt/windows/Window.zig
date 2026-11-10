@@ -2293,6 +2293,9 @@ pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMod
             entry.view.closing = true;
             entry.view.postDestroy();
         }
+        // Not one teardown posted, or not all: the tab is not closing
+        // whole after all.
+        _ = x.closingWhole();
     }
     return true;
 }

@@ -39,7 +39,9 @@ pending_focus: ?*Surface = null,
 /// The tab is closing whole (`Window.requestCloseTabs`): each of its
 /// terminals has a teardown posted, and with `undo` bound the first to
 /// run parks the whole tab (`Surface.destroy`). Cleared when `undo` puts
-/// the tab back.
+/// the tab back. It means nothing once a terminal of the tab is not
+/// closing (`closingWhole`): a teardown that could not be posted takes
+/// its terminal's close back, and the tab then stays.
 closing: bool = false,
 
 /// The number shared by the tabs closed with this one by one action, or
@@ -50,3 +52,19 @@ group: u64 = 0,
 /// place of its focused terminal's (`Window.tabTitle`); null for none.
 /// Owned, from the app's allocator.
 title_override: ?[:0]u8 = null,
+
+/// Whether the tab is still closing whole: it was marked so, and every
+/// terminal of it is closing. A mark left by a close that did not post
+/// all its teardowns is cleared, so that a later close of one terminal
+/// of the tab is only that.
+pub fn closingWhole(self: *Tab) bool {
+    if (!self.closing) return false;
+    var it = self.tree.iterator();
+    while (it.next()) |entry| {
+        if (entry.view.closing) continue;
+        self.closing = false;
+        self.group = 0;
+        return false;
+    }
+    return true;
+}
