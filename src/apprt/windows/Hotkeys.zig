@@ -299,13 +299,30 @@ pub fn globalLeaf(set: *const Binding.Set, trigger: Binding.Trigger) ?Binding.Se
 /// none (`App.toggleQuick`). One refused, or held by another program,
 /// cannot be pressed.
 pub fn opensWindow(self: *const Hotkeys, set: *const Binding.Set) bool {
+    return self.performs(set, &.{ .new_window, .toggle_quick_terminal });
+}
+
+/// Whether a hotkey registered now performs toggle_visibility among its
+/// binding's actions in `set`, which shows again the windows it hid. No
+/// reason to keep a window that something else hid: the toggle shows
+/// only its own.
+pub fn showsHidden(self: *const Hotkeys, set: *const Binding.Set) bool {
+    return self.performs(set, &.{.toggle_visibility});
+}
+
+/// Whether a hotkey registered now performs one of `actions` among its
+/// binding's actions in `set`.
+fn performs(
+    self: *const Hotkeys,
+    set: *const Binding.Set,
+    comptime actions: []const std.meta.Tag(Binding.Action),
+) bool {
     for (self.entries.items) |entry| {
         if (entry.id == null) continue;
         const leaf = globalLeaf(set, entry.trigger) orelse continue;
-        for (leaf.actionsSlice()) |action| switch (action) {
-            .new_window, .toggle_quick_terminal => return true,
-            else => {},
-        };
+        for (leaf.actionsSlice()) |action| {
+            inline for (actions) |tag| if (action == tag) return true;
+        }
     }
     return false;
 }

@@ -1212,13 +1212,15 @@ pub fn showQuick(self: *Window) bool {
 /// `toggle_visibility`'s hide, for this window if it shows
 /// (`App.toggleVisibility`): minimized, or the quick terminal hidden as
 /// its own toggle hides it (`hideQuick`) unless nothing could then show it
-/// again (`App.quickAlone`), and remembered for the toggle's show
-/// (`hidden`). `front` says it is the one in the foreground, which then
+/// again (`App.quickAlone`, with no global toggle_visibility), and
+/// remembered for the toggle's show (`hidden`). `front` says it is the one in the foreground, which then
 /// goes to the next window in the Z order; any other is minimized with
 /// the activation left where it is.
 pub fn hideForToggle(self: *Window, front: bool) void {
     if (self.quick) {
-        if (!self.quickShown() or self.app.quickAlone()) return;
+        if (!self.quickShown()) return;
+        // A global toggle_visibility shows again what this hides.
+        if (self.app.quickAlone() and !self.app.togglesBack()) return;
         self.hideQuick();
     } else {
         if (!win32.IsWindowVisible(self.hwnd).toBool() or win32.IsIconic(self.hwnd).toBool()) return;

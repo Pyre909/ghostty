@@ -3045,8 +3045,16 @@ pub const App = struct {
         return !self.hotkeys.opensWindow(&self.config.keybind.set);
     }
 
+    /// Whether a global keybind's hotkey performs toggle_visibility, so
+    /// that the windows it hides can be shown again with none of them in
+    /// the foreground (`Hotkeys.showsHidden`).
+    pub fn togglesBack(self: *const App) bool {
+        return self.hotkeys.showsHidden(&self.config.keybind.set);
+    }
+
     /// The quick terminal, hidden or on its way out, left with nothing to
-    /// show it again (`quickAlone`) by a window's close or a reload
+    /// show it again (`quickAlone`, or toggle_visibility's own global
+    /// keybind for one it hid) by a window's close or a reload
     /// (`quick_check`): closed, as the last window's close quits the app
     /// rather than leave an invisible process (`setQuitTimer`), asking first
     /// if a program still runs in it, which shows it
@@ -3062,6 +3070,9 @@ pub const App = struct {
         if (self.quit) return;
         const quick = self.quick orelse return;
         if (quick.quickShown() or !self.quickAlone()) return;
+        // Hidden by toggle_visibility, whose global keybind shows it
+        // again.
+        if (quick.hidden != .no and self.togglesBack()) return;
         quick.requestClose();
     }
 
@@ -17779,6 +17790,83 @@ fn testQuickStrandedHotkey() !void {
     app.closeStrandedQuick();
     try std.testing.expect(!again.closing);
     try std.testing.expect(testTakeQuit());
+}
+
+test "win32: a quick terminal toggle_visibility hid stays while a global keybind toggles it back" {
+    try testOnOwnDesktop(testQuickToggledBack, .{});
+}
+
+/// The test of a quick terminal hidden by toggle_visibility with a global
+/// keybind for it, run by its test on a desktop of its own.
+fn testQuickToggledBack() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestQuick.start();
+    defer TestQuick.stop();
+    TestHotkeys.install(&app);
+    defer TestHotkeys.remove(&app);
+    core_app.surfaces = .empty;
+    core_app.focused_surface = null;
+
+    const toggle = struct {
+        fn f(of: *App, front: ?win32.HWND) !void {
+            TestQuick.in_front = front;
+            TestQuick.front = null;
+            try std.testing.expect(try of.performAction(.app, .toggle_visibility, {}));
+            of.createRequested();
+            if (of.quick) |q| TestQuick.settle(q);
+        }
+    }.f;
+
+    const a = try testFrame(&app);
+    const pa = try testPane(&app, a);
+    a.tab().tree = try .init(alloc, pa);
+    _ = win32.ShowWindow(a.hwnd, win32.SW_SHOWNOACTIVATE);
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=toggle_visibility"});
+    app.createRequested();
+    try TestQuick.toggle(&app);
+    const quick = app.quick orelse return error.TestUnexpectedResult;
+
+    // Hidden with the window, which then closes: the keybind shows the
+    // quick terminal again, so it is no stranded one.
+    try toggle(&app, a.hwnd);
+    try std.testing.expectEqual(.hidden, quick.hidden);
+    try TestQuick.closeFrame(&app, a);
+    app.closeStrandedQuick();
+    try std.testing.expect(!quick.closing);
+    try toggle(&app, null);
+    try std.testing.expect(quick.quickShown());
+    try std.testing.expectEqual(.no, quick.hidden);
+
+    // The only window, and in front: the toggle hides it, as the keybind
+    // shows it again.
+    try std.testing.expect(app.quickAlone());
+    try toggle(&app, quick.hwnd);
+    try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+    try std.testing.expectEqual(.front, quick.hidden);
+    app.quick_check = true;
+    app.closeStrandedQuick();
+    try std.testing.expect(!quick.closing);
+    try toggle(&app, null);
+    try std.testing.expect(quick.quickShown());
+
+    try toggle(&app, quick.hwnd);
+    try std.testing.expectEqual(.front, quick.hidden);
+
+    // A reload takes the keybind away with it hidden: nothing could show
+    // it again, and it closes.
+    try TestHotkeys.apply(&app, &.{});
+    app.createRequested();
+    app.closeStrandedQuick();
+    try std.testing.expect(quick.closing);
+    TestQuick.tearDown();
+    try std.testing.expect(app.quick == null);
 }
 
 /// For tests: where `Window.test_set_focus` was last told the focus goes,
