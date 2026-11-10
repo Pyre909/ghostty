@@ -347,7 +347,7 @@ pub fn messageFont(dpi: u32) ?win32.HGDIOBJ {
         log.warn("cannot make the message font err={}", .{win32.GetLastError()});
     }
     return win32.CreateFontW(
-        -scaleHeight(12, dpi, win32.USER_DEFAULT_SCREEN_DPI),
+        -scaleDpi(12, dpi, win32.USER_DEFAULT_SCREEN_DPI),
         0,
         0,
         0,
@@ -373,7 +373,7 @@ pub fn messageLogFont(dpi: u32) ?win32.LOGFONTW {
         return null;
     }
     var lf = ncm.lfMessageFont;
-    lf.lfHeight = scaleHeight(lf.lfHeight, dpi, systemDpi());
+    lf.lfHeight = scaleDpi(lf.lfHeight, dpi, systemDpi());
     return lf;
 }
 
@@ -387,10 +387,10 @@ fn systemDpi() u32 {
     return win32.USER_DEFAULT_SCREEN_DPI;
 }
 
-/// A font height at DPI `from` scaled to DPI `to`, rounded half away from
+/// A length at DPI `from` scaled to DPI `to`, rounded half away from
 /// zero, as MulDiv rounds; its sign kept (a negative LOGFONT height is the
 /// character height, a positive one the cell's).
-fn scaleHeight(height: i32, to: u32, from: u32) i32 {
+pub fn scaleDpi(height: i32, to: u32, from: u32) i32 {
     const n = @as(i64, height) * to;
     const d: i64 = from;
     const q = @divTrunc(@as(i64, @intCast(@abs(n))) * 2 + d, 2 * d);
@@ -964,10 +964,10 @@ test "win32: the tab bar's font is the system's message font" {
     // Whatever font the user set for the UI, scaled from the system DPI
     // to the bar's, as MulDiv rounds.
     const testing = std.testing;
-    try testing.expectEqual(-24, scaleHeight(-12, 192, 96));
-    try testing.expectEqual(-18, scaleHeight(-12, 144, 96));
-    try testing.expectEqual(14, scaleHeight(9, 144, 96));
-    try testing.expectEqual(-14, scaleHeight(-9, 144, 96));
+    try testing.expectEqual(-24, scaleDpi(-12, 192, 96));
+    try testing.expectEqual(-18, scaleDpi(-12, 144, 96));
+    try testing.expectEqual(14, scaleDpi(9, 144, 96));
+    try testing.expectEqual(-14, scaleDpi(-9, 144, 96));
 
     var ncm = std.mem.zeroes(win32.NONCLIENTMETRICSW);
     ncm.cbSize = @sizeOf(win32.NONCLIENTMETRICSW);

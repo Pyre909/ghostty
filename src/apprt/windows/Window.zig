@@ -1206,15 +1206,17 @@ pub fn placeRestored(self: *Window, saved: SavedPlace) Placing {
     };
     const info = monitorInfo(win32.MonitorFromRect(&was, win32.MONITOR_DEFAULTTONEAREST)) orelse
         return .as_is;
-    var rect = restoredRect(saved.rect, saved.dpi, dpiOf(self.app, self.hwnd), info.rcWork);
+    const before = dpiOf(self.app, self.hwnd);
+    var rect = restoredRect(saved.rect, saved.dpi, before, info.rcWork);
     self.moveTo(rect, flags);
     // On a monitor with another DPI the frame got WM_DPICHANGED as it
-    // arrived: placed again at the scale it has there, as a new
-    // window's position is (`applyInitialPosition`).
+    // arrived, and has the rect Windows suggested: placed again at the
+    // scale it has there, as a new window's position is
+    // (`applyInitialPosition`). The DPI says so, not the two rects,
+    // which are the same where both are held to the work area.
     const dpi = dpiOf(self.app, self.hwnd);
-    const again = restoredRect(saved.rect, saved.dpi, dpi, info.rcWork);
-    if (!std.meta.eql(again, rect)) {
-        rect = again;
+    if (dpi != before) {
+        rect = restoredRect(saved.rect, saved.dpi, dpi, info.rcWork);
         self.moveTo(rect, flags);
     }
     if (saved.fullscreen) {
@@ -3898,18 +3900,11 @@ pub fn constrainToWorkArea(
 /// ones it was saved on; with the same ones it goes where it was.
 pub fn restoredRect(rect: [4]i32, saved_dpi: u32, dpi: u32, work: win32.RECT) win32.RECT {
     const l, const t, const r, const b = rect;
-    const scale = struct {
-        fn of(length: i64, from: u32, to: u32) i32 {
-            if (from == to or from == 0) return @intCast(length);
-            // Rounded to nearest, as MulDiv does.
-            return std.math.lossyCast(i32, @divFloor(length * to + from / 2, from));
-        }
-    }.of;
     return constrainToWorkArea(
         l,
         t,
-        scale(@as(i64, r) - l, saved_dpi, dpi),
-        scale(@as(i64, b) - t, saved_dpi, dpi),
+        TabBar.scaleDpi(r - l, dpi, saved_dpi),
+        TabBar.scaleDpi(b - t, dpi, saved_dpi),
         work,
     );
 }
@@ -4052,18 +4047,32 @@ pub const SavedPlace = struct {
 /// to. One that is maximized, or minimized, is saved with the rect it
 /// restores to; any other with the rect it has, which for a window
 /// snapped to a side is not its placement's (`Restore.rect`).
+///
+/// A placement's rect is in workspace coordinates, which leave out the
+/// taskbar and the other bars at the monitor's top and left, and a
+/// frame's is in screen coordinates, as is everything a place is put
+/// back with: `workspace` is where the monitor's work area starts
+/// within the monitor, which makes the first the second. Saved as it
+/// is, a maximized window would come back that much up and to the left
+/// each time under a taskbar at the top or the left.
 pub fn savedPlaceOf(
     placement: win32.WINDOWPLACEMENT,
     frame: win32.RECT,
     restore: ?Restore,
     dpi: u32,
+    workspace: [2]i32,
 ) SavedPlace {
     const p = if (restore) |r| r.placement else placement;
     const shown = if (restore) |r| r.rect else frame;
     const minimized = p.showCmd == win32.SW_SHOWMINIMIZED;
     const maximized = p.showCmd == win32.SW_SHOWMAXIMIZED or
         (minimized and p.flags & win32.WPF_RESTORETOMAXIMIZED != 0);
-    const rect = if (maximized or minimized) p.rcNormalPosition else shown;
+    const rect: win32.RECT = if (maximized or minimized) .{
+        .left = p.rcNormalPosition.left + workspace[0],
+        .top = p.rcNormalPosition.top + workspace[1],
+        .right = p.rcNormalPosition.right + workspace[0],
+        .bottom = p.rcNormalPosition.bottom + workspace[1],
+    } else shown;
     return .{
         .rect = .{ rect.left, rect.top, rect.right, rect.bottom },
         .dpi = dpi,
@@ -4084,7 +4093,13 @@ pub fn savedPlace(self: *const Window) ?SavedPlace {
         log.warn("cannot read a window's place to save it err={}", .{win32.GetLastError()});
         return null;
     }
-    return savedPlaceOf(placement, frame, self.fullscreen, dpiOf(self.app, self.hwnd));
+    // The monitor the window is on, or was before it was minimized, is
+    // the one its placement's rect is counted on.
+    const workspace: [2]i32 = if (monitorInfo(win32.MonitorFromWindow(self.hwnd, win32.MONITOR_DEFAULTTONEAREST))) |info|
+        .{ info.rcWork.left - info.rcMonitor.left, info.rcWork.top - info.rcMonitor.top }
+    else
+        .{ 0, 0 };
+    return savedPlaceOf(placement, frame, self.fullscreen, dpiOf(self.app, self.hwnd), workspace);
 }
 
 /// Move and size the frame to `rect`, in screen coordinates.
@@ -4494,7 +4509,7 @@ test "win32: a window is saved with the place it comes back to" {
     // placement's.
     try std.testing.expectEqual(
         SavedPlace{ .rect = .{ 0, 0, 960, 1040 }, .dpi = 144, .maximized = false, .fullscreen = false },
-        savedPlaceOf(placement, snapped, null, 144),
+        savedPlaceOf(placement, snapped, null, 144, .{ 0, 0 }),
     );
 
     // Maximized, or minimized from either: the rect it restores to.
@@ -4502,29 +4517,44 @@ test "win32: a window is saved with the place it comes back to" {
     maximized.showCmd = @intCast(win32.SW_SHOWMAXIMIZED);
     try std.testing.expectEqual(
         SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = true, .fullscreen = false },
-        savedPlaceOf(maximized, monitor, null, 96),
+        savedPlaceOf(maximized, monitor, null, 96, .{ 0, 0 }),
     );
     var minimized = placement;
     minimized.showCmd = @intCast(win32.SW_SHOWMINIMIZED);
     const off: win32.RECT = .{ .left = -32000, .top = -32000, .right = -31840, .bottom = -31972 };
     try std.testing.expectEqual(
         SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = false, .fullscreen = false },
-        savedPlaceOf(minimized, off, null, 96),
+        savedPlaceOf(minimized, off, null, 96, .{ 0, 0 }),
     );
     minimized.flags = win32.WPF_RESTORETOMAXIMIZED;
     try std.testing.expectEqual(
         SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = true, .fullscreen = false },
-        savedPlaceOf(minimized, off, null, 96),
+        savedPlaceOf(minimized, off, null, 96, .{ 0, 0 }),
+    );
+
+    // Under a taskbar at the top or the left a placement's rect is not
+    // where the window is on the screen; a frame's is.
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 172, 90, 972, 690 }, .dpi = 96, .maximized = true, .fullscreen = false },
+        savedPlaceOf(maximized, monitor, null, 96, .{ 72, 40 }),
+    );
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 172, 90, 972, 690 }, .dpi = 96, .maximized = true, .fullscreen = false },
+        savedPlaceOf(minimized, off, null, 96, .{ 72, 40 }),
+    );
+    try std.testing.expectEqual(
+        SavedPlace{ .rect = .{ 0, 0, 960, 1040 }, .dpi = 144, .maximized = false, .fullscreen = false },
+        savedPlaceOf(placement, snapped, null, 144, .{ 72, 40 }),
     );
 
     // Covering its monitor: what it comes back to, not the monitor.
     try std.testing.expectEqual(
         SavedPlace{ .rect = .{ 0, 0, 960, 1040 }, .dpi = 96, .maximized = false, .fullscreen = true },
-        savedPlaceOf(placement, monitor, .{ .placement = placement, .rect = snapped }, 96),
+        savedPlaceOf(placement, monitor, .{ .placement = placement, .rect = snapped }, 96, .{ 0, 0 }),
     );
     try std.testing.expectEqual(
         SavedPlace{ .rect = .{ 100, 50, 900, 650 }, .dpi = 96, .maximized = true, .fullscreen = true },
-        savedPlaceOf(placement, monitor, .{ .placement = maximized, .rect = monitor }, 96),
+        savedPlaceOf(placement, monitor, .{ .placement = maximized, .rect = monitor }, 96, .{ 0, 0 }),
     );
 }
 
