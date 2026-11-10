@@ -1,8 +1,41 @@
-Ghostty for Windows, portable zip
+Ghostty for Windows, unofficial build
+
+This is a build of the fork at https://github.com/Pyre909/ghostty. The
+Ghostty project did not make, review or sign it. LICENSE.txt is
+Ghostty's license; THIRD-PARTY-NOTICES.txt lists the other software in
+this package and its licenses.
+
+It comes as a zip and as an installer, which hold the same files.
+
+
+Portable zip
+------------
 
 Unzip anywhere and run bin\ghostty.exe. Nothing is installed.
-LICENSE.txt is Ghostty's license; THIRD-PARTY-NOTICES.txt lists the
-other software in this zip and its licenses.
+
+
+Installer
+---------
+
+The .msi installs Ghostty for the current user only, in
+
+    %LOCALAPPDATA%\Programs\Ghostty
+
+and needs no administrator rights. It adds Ghostty to the Start menu
+and the bin folder to the user's PATH, which command prompts opened
+afterwards see. It is not signed, so Windows may warn that its
+publisher is unknown.
+
+A newer installer replaces the installed version, and an older one is
+refused. Remove Ghostty under Settings > Apps > Installed apps. That
+leaves what Ghostty wrote in %LOCALAPPDATA%\ghostty: the configuration
+and the crash dumps.
+
+The installer never closes Ghostty. Where it can ask, as after a
+double click, and Ghostty is open, it names Ghostty and asks for it to
+be closed first: close Ghostty, then choose Retry. Where it cannot ask
+(msiexec /qn or /passive), it installs or removes around the open
+Ghostty, which goes on as the version it was until it is closed.
 
 
 Crash dumps
@@ -26,8 +59,9 @@ of the process's memory and so whatever was on screen, set
 GHOSTTY_CRASH_DUMP=full before starting Ghostty.
 
 To read a dump with symbols, unzip the -pdb zip of the same version
-into the same place as this one, so that each .pdb file sits beside its
-program, and open the dump in WinDbg.
+into the same place as the zip, so that each .pdb file sits beside its
+program (for an installed Ghostty, copy them into its bin folder), and
+open the dump in WinDbg.
 
 Some crashes end the process before Ghostty can write anything, such as
 a fast fail when Windows finds the heap or the stack corrupted. Windows
