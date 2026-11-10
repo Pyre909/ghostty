@@ -11249,17 +11249,26 @@ test "win32: a teardown posted for a close taken back since leaves the terminal"
 }
 
 /// For tests: a window of `app` with the terminals a | b, b focused, and
-/// `undo` bound, so that a close is kept for it, at time 1000 with five
-/// seconds to take it back in.
+/// `undo` bound, so that a close is kept for it, at time `start` with
+/// `timeout_ms`, which it sets, to take it back in.
 const TestUndo = struct {
     window: *Window,
     a: *Surface,
     b: *Surface,
 
+    const start = 1000;
+    const timeout_ms = 5000;
+    /// When a close made at `start` ends.
+    const due = start + timeout_ms;
+
     fn init(app: *App) !TestUndo {
-        try TestHotkeys.apply(app, &.{"ctrl+shift+z=undo"});
+        var config: Config = try .default(app.core_app.alloc);
+        defer config.deinit();
+        try config.keybind.parseCLI(config._arena.?.allocator(), "ctrl+shift+z=undo");
+        config.@"undo-timeout" = .{ .duration = timeout_ms * std.time.ns_per_ms };
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
         try std.testing.expect(app.undo.enabled);
-        Undo.test_now = 1000;
+        Undo.test_now = start;
         const window = try testFrame(app);
         const a = try testPane(app, window);
         const b = try testPane(app, window);
@@ -11355,13 +11364,13 @@ test "win32: a parked split is torn down when its time is up, after any prompt" 
     try std.testing.expect(t.b.parked);
 
     // A timer that fires early ends nothing.
-    Undo.test_now = 5999;
+    Undo.test_now = TestUndo.due - 1;
     TestUndo.tick(&app);
     testPump();
     try std.testing.expect(t.b.parked);
 
     // In time, but while a prompt is up: the teardown waits for it.
-    Undo.test_now = 6000;
+    Undo.test_now = TestUndo.due;
     app.prompt_depth = 1;
     TestUndo.tick(&app);
     try std.testing.expectEqual(0, app.undo.entries.items.len);
@@ -11392,12 +11401,12 @@ test "win32: undo after the time is up takes nothing back, timer or not" {
 
     const t = try TestUndo.init(&app);
     TestUndo.close(t.b);
-    Undo.test_now = 6000;
+    Undo.test_now = TestUndo.due;
     try std.testing.expect(!try app.performAction(.app, .undo, {}));
     // An undo recorded just in time and carried out too late.
-    Undo.test_now = 5999;
+    Undo.test_now = TestUndo.due - 1;
     try std.testing.expect(try app.performAction(.app, .undo, {}));
-    Undo.test_now = 6000;
+    Undo.test_now = TestUndo.due;
     app.createRequested();
     try std.testing.expect(t.b.closing);
     testPump();
@@ -11752,7 +11761,7 @@ test "win32: a split closed in a tab that then closes comes back after the tab, 
         TestUndo.close(t.b);
         Undo.test_now = 2000;
         TestUndo.close(t.a);
-        Undo.test_now = 7000;
+        Undo.test_now = 2000 + TestUndo.timeout_ms;
         TestUndo.tick(&app);
         try std.testing.expectEqual(0, app.undo.entries.items.len);
         testPump();
@@ -11807,7 +11816,7 @@ test "win32: redo closes a split again until something else closes or its time i
     try std.testing.expectEqual(before[1], try paneRect(window, t.b));
 
     // Too late.
-    Undo.test_now = 1000 + 5000;
+    Undo.test_now = TestUndo.due;
     try std.testing.expect(!try app.performAction(.app, .redo, {}));
 
     // Another close in between starts over.
