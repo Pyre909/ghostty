@@ -28,6 +28,7 @@ const imgui = @import("imgui.zig");
 const Inspector = @import("Inspector.zig");
 const Dividers = @import("Dividers.zig");
 const Hotkeys = @import("Hotkeys.zig");
+const Undo = @import("Undo.zig");
 const IpcClient = @import("IpcClient.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
@@ -336,6 +337,11 @@ pub const App = struct {
     /// the configuration binds by `init` and by each `.config_change`.
     hotkeys: Hotkeys,
 
+    /// The closes `undo` can take back, and whether a close is kept for
+    /// it at all (`Undo`): as the configuration says, from `init` and each
+    /// `.config_change`.
+    undo: Undo,
+
     /// The virtual keys whose press a hotkey took (`hotkeyPressed`).
     /// Windows sends such a key's release to the window that has the
     /// keyboard focus when the key comes up (checked in the VM,
@@ -641,6 +647,10 @@ pub const App = struct {
 
         /// Hide every window, or show those it hid (`toggleVisibility`).
         visibility,
+
+        /// Take the last close back (`Undo.undo`): a terminal returns to
+        /// its tab, which is laid out again, with the focus.
+        undo,
 
         /// A new split beside `parent`, in `direction`.
         split: struct {
@@ -995,6 +1005,7 @@ pub const App = struct {
             .terminal_loops = 0,
             .terminating = false,
             .hotkeys = .{},
+            .undo = .{},
             .hotkey_up = .empty,
             .ipc = null,
             .ipc_instance = null,
@@ -1017,6 +1028,7 @@ pub const App = struct {
         self.hotkeys.refresh(alloc, msg_hwnd, &self.config) catch |err| {
             log.warn("cannot register the global keybinds err={}", .{err});
         };
+        self.undo.configure(self, &self.config);
     }
 
     pub fn terminate(self: *App) void {
@@ -1036,8 +1048,10 @@ pub const App = struct {
         self.destroyWindows();
         self.windows.deinit(self.core_app.alloc);
 
-        // Every terminal is a child window of a frame, so none is left.
+        // Every terminal is a child window of a frame, so none is left,
+        // nor any close to take back.
         self.surfaces.deinit(self.core_app.alloc);
+        self.undo.deinit(self);
 
         // Windows asked for and never created: the process is quitting.
         self.freeRequests();
@@ -1864,6 +1878,34 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
     ) !bool {
+        // A terminal parked for `undo` is in no tab and shows nowhere.
+        // What its program still asks for that only its own state keeps
+        // is done, so that it comes back as it then is; anything that
+        // would lay a window out, move the focus, prompt or notify is
+        // not. Named one by one, so that a new action is refused until
+        // someone decides otherwise.
+        const while_parked = switch (action) {
+            .set_title,
+            .pwd,
+            .mouse_shape,
+            .mouse_visibility,
+            .render,
+            .renderer_health,
+            .color_change,
+            .cell_size,
+            .size_limit,
+            .initial_size,
+            .scrollbar,
+            .readonly,
+            .show_child_exited,
+            .key_sequence,
+            .key_table,
+            .config_change,
+            => true,
+            else => false,
+        };
+        if (!while_parked and self.parkedTarget(target)) return false;
+
         return switch (action) {
             .quit => self.requestQuit(),
 
@@ -1904,6 +1946,7 @@ pub const App = struct {
             .new_window => self.requestWindow(target),
             .toggle_quick_terminal => self.requestQuickTerminal(),
             .toggle_visibility => self.requestVisibility(),
+            .undo => self.requestUndo(),
             .new_tab => self.requestTab(target),
             .goto_tab => self.gotoTab(target, value),
             .move_tab => self.moveTab(target, value),
@@ -2764,6 +2807,9 @@ pub const App = struct {
         self.hotkeys.refresh(self.core_app.alloc, self.msg_hwnd, &self.config) catch |err| {
             log.warn("cannot register the global keybinds err={}", .{err});
         };
+        // Only posts teardowns, so it is safe in the core frame a soft
+        // reload comes in.
+        self.undo.configure(self, &self.config);
         // With no window open (a global reload_config, or the soft reload
         // after a change of color scheme), decide again whether the app
         // stays open: a reload that registers a hotkey that opens a window
@@ -2938,6 +2984,28 @@ pub const App = struct {
             return false;
         };
         return true;
+    }
+
+    /// `.undo`: the last close is taken back from `run`, as a split is
+    /// made there, since the tab is laid out and the focus moves. `true`
+    /// once recorded; `false`, for the key to reach the terminal, when
+    /// there is no close to take back, as on macOS.
+    fn requestUndo(self: *App) bool {
+        if (!self.undo.pending()) return false;
+        self.requests.append(self.core_app.alloc, .undo) catch |err| {
+            log.warn("cannot record taking a close back err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Whether `target` is a terminal parked for `undo` (`Undo`): hidden
+    /// and in no tab, with its core running.
+    fn parkedTarget(self: *const App, target: apprt.Target) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |core_surface| self.undo.holds(core_surface),
+        };
     }
 
     /// `.toggle_visibility`, which the core performs for the app wherever
@@ -3196,7 +3264,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .visibility, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
+            .quick_terminal, .visibility, .undo, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -3813,6 +3881,7 @@ pub const App = struct {
                     notice(self, null, L("Ghostty could not open the quick terminal."));
                 },
                 .visibility => self.toggleVisibility(),
+                .undo => _ = self.undo.undo(self),
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
                     error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
@@ -4311,6 +4380,8 @@ pub const App = struct {
         _ = win32.SetWindowLongPtrW(surface.hwnd, win32.GWLP_USERDATA, 0);
 
         _ = self.surfaces.swapRemove(idx);
+        // No close to take back names a freed terminal.
+        self.undo.forgetSurface(self, surface);
         // As on macOS and GTK, a terminal's toasts go with it.
         surface.clearNotifications();
         // Already moved off a terminal that closed on its own
@@ -4351,6 +4422,10 @@ pub const App = struct {
         // the normal path the bar is gone already (`hwnd` null).
         if (window.bar.hwnd) |bar| _ = win32.SetWindowLongPtrW(bar, win32.GWLP_USERDATA, 0);
         window.bar.freeFont();
+
+        // Gone at the frame's WM_DESTROY already, unless `terminate` gave
+        // up on the frame.
+        self.undo.dropWindow(self, window);
 
         // In order: `windowBeside` goes by opening order.
         _ = self.windows.orderedRemove(idx);
@@ -4455,6 +4530,9 @@ pub const App = struct {
             // its loop.
             win32.WM_TIMER => if (wparam == quit_timer_id) {
                 self.quitTimerFired();
+                return 0;
+            } else if (wparam == Undo.timer_id) {
+                self.undo.expireDue(self);
                 return 0;
             },
 
@@ -5317,6 +5395,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.search_hide = null;
     app.quit = false;
     app.hotkeys = .{};
+    app.undo = .{};
     app.hotkey_up = .empty;
     app.ipc = null;
     app.ipc_instance = null;
@@ -5487,6 +5566,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.min_size = null;
     surface.ime = .{};
     surface.closing = false;
+    surface.parked = false;
     surface.destroy_deferred = false;
     surface.focused = false;
     surface.mouse = .init();
@@ -5536,6 +5616,8 @@ pub fn testCleanup(app: *App) void {
     }
     app.surfaces.deinit(alloc);
     app.windows.deinit(alloc);
+    app.undo.deinit(app);
+    Undo.test_now = null;
     app.freeRequests();
     app.bell_audio.deinit(alloc);
     app.hotkeys.deinit(alloc, app.msg_hwnd);
@@ -11148,6 +11230,315 @@ test "win32: a teardown posted for a close taken back since leaves the terminal"
     _ = win32.DispatchMessageW(&msg);
     try std.testing.expectEqual(0, app.surfaces.items.len);
     try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+/// For tests: a window of `app` with the terminals a | b, b focused, and
+/// `undo` bound, so that a close is kept for it, at time 1000 with five
+/// seconds to take it back in.
+const TestUndo = struct {
+    window: *Window,
+    a: *Surface,
+    b: *Surface,
+
+    fn init(app: *App) !TestUndo {
+        try TestHotkeys.apply(app, &.{"ctrl+shift+z=undo"});
+        try std.testing.expect(app.undo.enabled);
+        Undo.test_now = 1000;
+        const window = try testFrame(app);
+        const a = try testPane(app, window);
+        const b = try testPane(app, window);
+        window.tab().tree = try testRow(app.core_app.alloc, &.{ a, b });
+        window.tab().focused = b;
+        window.relayout();
+        return .{ .window = window, .a = a, .b = b };
+    }
+
+    /// Close `pane` as its shell's exit or a binding does, and run the
+    /// teardown it posts.
+    fn close(pane: *Surface) void {
+        _ = Surface.wndProc(pane.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+    }
+
+    /// The undo timer fires.
+    fn tick(app: *App) void {
+        // The message window finds its app as `init` leaves it.
+        _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
+        _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Undo.timer_id, 0);
+    }
+
+    fn has(app: *const App, pane: *const Surface) bool {
+        return std.mem.indexOfScalar(*Surface, app.surfaces.items, @constCast(pane)) != null;
+    }
+};
+
+test "win32: a split closed where undo is bound is parked, and undo puts it back as it was" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    const tab = window.tab();
+    const before = .{ try paneRect(window, t.a), try paneRect(window, t.b) };
+
+    // Closed: out of the tab and hidden, but not torn down.
+    TestUndo.close(t.b);
+    try std.testing.expect(TestUndo.has(&app, t.b));
+    try std.testing.expect(t.b.parked);
+    try std.testing.expect(t.b.closing);
+    try std.testing.expect(!shown(t.b.hwnd));
+    try std.testing.expect(window.find(t.b) == null);
+    try std.testing.expectEqual(t.a, tab.focused.?);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    try std.testing.expect(!std.meta.eql(before[0], try paneRect(window, t.a)));
+
+    // Its shell's exit meanwhile closes nothing a second time.
+    t.b.close(false);
+    testPump();
+    try std.testing.expect(t.b.parked);
+
+    // Taken back from `run`, not where the key is handled.
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    try std.testing.expect(t.b.parked);
+    app.createRequested();
+    try std.testing.expect(!t.b.parked);
+    try std.testing.expect(!t.b.closing);
+    try std.testing.expect(shown(t.b.hwnd));
+    try std.testing.expectEqual(t.b, tab.focused.?);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expectEqual(before[0], try paneRect(window, t.a));
+    try std.testing.expectEqual(before[1], try paneRect(window, t.b));
+    // A teardown still waiting from before finds a terminal that stays.
+    t.b.postDestroy();
+    testPump();
+    try std.testing.expect(TestUndo.has(&app, t.b));
+
+    // Nothing more to take back: the key is the terminal's.
+    try std.testing.expect(!try app.performAction(.app, .undo, {}));
+    try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: a parked split is torn down when its time is up, after any prompt" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    TestUndo.close(t.b);
+    try std.testing.expect(t.b.parked);
+
+    // A timer that fires early ends nothing.
+    Undo.test_now = 5999;
+    TestUndo.tick(&app);
+    testPump();
+    try std.testing.expect(t.b.parked);
+
+    // In time, but while a prompt is up: the teardown waits for it.
+    Undo.test_now = 6000;
+    app.prompt_depth = 1;
+    TestUndo.tick(&app);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expect(!try app.performAction(.app, .undo, {}));
+    testPump();
+    try std.testing.expect(TestUndo.has(&app, t.b));
+    try std.testing.expect(t.b.destroy_deferred);
+    app.prompt_depth = 0;
+    app.repostDeferredDestroys();
+    testPump();
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expectEqual(1, app.surfaces.items.len);
+
+    // A late timer with nothing parked does nothing.
+    TestUndo.tick(&app);
+    try std.testing.expectEqual(1, app.surfaces.items.len);
+}
+
+test "win32: undo after the time is up takes nothing back, timer or not" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    TestUndo.close(t.b);
+    Undo.test_now = 6000;
+    try std.testing.expect(!try app.performAction(.app, .undo, {}));
+    // An undo recorded just in time and carried out too late.
+    Undo.test_now = 5999;
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    Undo.test_now = 6000;
+    app.createRequested();
+    try std.testing.expect(t.b.closing);
+    testPump();
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expect(t.window.find(t.a) != null);
+}
+
+test "win32: a close is not taken back into a tab whose terminals have changed" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    TestUndo.close(t.b);
+
+    // A split made since: putting the old tree back would leave it in no
+    // tab, running and never shown.
+    const c = try testPane(&app, window);
+    window.setTree(window.tab(), try testRow(alloc, &.{ t.a, c }));
+    window.relayout();
+
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    testPump();
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expect(window.find(t.a) != null);
+    try std.testing.expect(window.find(c) != null);
+    try std.testing.expectEqual(2, app.surfaces.items.len);
+}
+
+test "win32: a close is kept only with undo bound and time to use it" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    for ([_][]const []const u8{ &.{}, &.{"ctrl+shift+z=redo"} }) |binds| {
+        try TestHotkeys.apply(&app, binds);
+        try std.testing.expect(!app.undo.enabled);
+        const window = try testFrame(&app);
+        const a = try testPane(&app, window);
+        const b = try testPane(&app, window);
+        window.tab().tree = try testRow(alloc, &.{ a, b });
+        window.relayout();
+        TestUndo.close(b);
+        try std.testing.expectEqual(1, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        try std.testing.expect(!try app.performAction(.app, .undo, {}));
+        try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
+    }
+
+    // Unbound by a reload: what was parked is torn down.
+    const t = try TestUndo.init(&app);
+    TestUndo.close(t.b);
+    try std.testing.expect(t.b.parked);
+    try TestHotkeys.apply(&app, &.{});
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    testPump();
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expect(TestUndo.has(&app, t.a));
+}
+
+test "win32: a parked split goes with its window, its tab, and the terminals it sat among" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // The window's last terminal takes the window, and the parked one in
+    // it; a leak of the tree kept for it fails the test.
+    {
+        const t = try TestUndo.init(&app);
+        TestUndo.close(t.b);
+        try std.testing.expect(t.b.parked);
+        TestUndo.close(t.a);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.windows.items.len);
+    }
+    // The frame destroyed outright.
+    {
+        const t = try TestUndo.init(&app);
+        TestUndo.close(t.b);
+        try std.testing.expect(win32.DestroyWindow(t.window.hwnd).toBool());
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+    }
+    // A terminal of the tree it left is freed without being parked, as
+    // when no room can be made for its entry: the parked one's tree could
+    // only be compared with freed terminals, so it ends.
+    {
+        const t = try TestUndo.init(&app);
+        const c = try testPane(&app, t.window);
+        t.window.setTree(t.window.tab(), try testRow(alloc, &.{ t.a, t.b, c }));
+        t.window.relayout();
+        TestUndo.close(c);
+        try std.testing.expect(c.parked);
+        app.undo.enabled = false;
+        TestUndo.close(t.b);
+        try std.testing.expect(!TestUndo.has(&app, t.b));
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        testPump();
+        try std.testing.expect(!TestUndo.has(&app, c));
+        try std.testing.expectEqual(1, app.surfaces.items.len);
+        try std.testing.expect(win32.DestroyWindow(t.window.hwnd).toBool());
+    }
+}
+
+test "win32: a parked terminal is refused what would show, prompt or move the focus" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    TestUndo.close(t.b);
+    try std.testing.expect(t.b.parked);
+    const target: apprt.Target = .{ .surface = &t.b.core_surface };
+    const queued = app.requests.items.len;
+
+    try std.testing.expect(!try app.performAction(target, .new_split, .right));
+    try std.testing.expect(!try app.performAction(target, .new_tab, {}));
+    try std.testing.expect(!try app.performAction(target, .goto_split, .previous));
+    try std.testing.expect(!try app.performAction(target, .present_terminal, {}));
+    try std.testing.expect(!try app.performAction(target, .ring_bell, {}));
+    try std.testing.expect(!try app.performAction(target, .undo, {}));
+    try std.testing.expectEqual(queued, app.requests.items.len);
+    try std.testing.expectEqual(
+        apprt.ClipboardReadResult.unsupported,
+        try t.b.clipboardRequest(.standard, .{ .paste = .standard }),
+    );
+
+    // Its title is still its own to change, for when it comes back.
+    try std.testing.expect(try app.performAction(target, .set_title, .{ .title = "later" }));
+    try std.testing.expectEqualStrings("later", t.b.effectiveTitle().?);
+
+    // The other terminal is asked as ever.
+    try std.testing.expect(try app.performAction(.{ .surface = &t.a.core_surface }, .new_split, .right));
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {

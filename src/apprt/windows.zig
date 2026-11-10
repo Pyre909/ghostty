@@ -404,6 +404,7 @@ test {
     _ = @import("windows/TabBar.zig");
     _ = @import("windows/TitleDialog.zig");
     _ = @import("windows/Transparency.zig");
+    _ = @import("windows/Undo.zig");
     _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/desktop_notifications.zig");

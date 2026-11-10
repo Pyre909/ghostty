@@ -123,6 +123,12 @@ pub const Surface = struct {
     /// does not use it (`Window.closing`).
     closing: bool,
 
+    /// Closed, and kept for `undo` to bring back (`Undo`): hidden, in no
+    /// tab's tree, its core running. `closing` stays set meanwhile, so
+    /// that nothing closes it twice or jumps to it. Cleared when it is
+    /// put back, and when its time runs out, as its teardown is posted.
+    parked: bool,
+
     /// WM_GHOSTTY_DESTROY arrived while teardown was not allowed
     /// (`App.canTearDown` was false: `App.canReenterCore` was, another
     /// surface's teardown was running, `App.teardown_depth`, or a
@@ -806,6 +812,7 @@ pub const Surface = struct {
             .initial_size = null,
             .min_size = null,
             .closing = false,
+            .parked = false,
             .destroy_deferred = false,
             .preedit = .none,
             .ime = .{},
@@ -1050,11 +1057,21 @@ pub const Surface = struct {
         if (window.find(self)) |at| {
             const t = window.tabs.items[at.index];
             if (at.handle != .root) {
-                window.removePane(t, at.handle) catch |err| {
+                const app = self.app;
+                // Asked first: it makes room for the entry, so that
+                // nothing can fail once the terminal has left its tab.
+                const parks = app.undo.parks(app, window, self);
+                var left = window.takePane(t, at.handle) catch |err| {
                     log.err("unable to take a closing terminal out of its window err={}", .{err});
                     self.closing = false;
                     return false;
                 };
+                if (parks) {
+                    self.park();
+                    app.undo.pushPane(app, window, t, left, self);
+                    return false;
+                }
+                left.deinit();
             } else if (window.tabs.items.len == 1) {
                 // The window's last terminal takes it with it.
                 return window.destroy();
@@ -1070,6 +1087,23 @@ pub const Surface = struct {
         self.overlays.destroy();
         self.stopCore();
         return win32.DestroyWindow(self.hwnd).toBool();
+    }
+
+    /// Settle a terminal that has left its tab to wait for `undo`
+    /// (`Undo`): what a teardown ends before the core stops ends here too,
+    /// and what waits on the terminal forgets it, but the core runs on,
+    /// and its search bar and overlays are only hidden, to show again with
+    /// it. Nothing here pumps messages.
+    fn park(self: *Surface) void {
+        self.closeInspector();
+        self.releaseInput();
+        _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
+        self.search_bar.hideWindow();
+        self.overlays.hideWindows();
+        self.occlusionChanged(false);
+        self.destroy_deferred = false;
+        self.parked = true;
+        self.app.forgetClosing(&self.core_surface);
     }
 
     /// Undo a `create` that succeeded, for a terminal no window holds yet:
@@ -1179,6 +1213,36 @@ pub const Surface = struct {
     /// on the main thread, is exactly the unpumped wait steps 2-4 exist to
     /// avoid. If those fields are renamed this stops compiling, which is the
     /// desired failure.
+    /// End what the mouse and the IME have under way in this terminal, as
+    /// it stops taking input: its core stops (`stopCore`), or it is hidden
+    /// away for `undo` (`park`).
+    fn releaseInput(self: *Surface) void {
+        // A drag in progress ends. Button messages for a `.stopping`
+        // surface are not handled, so nothing else would release the
+        // capture while a teardown pumps messages (App.waitForThread).
+        if (self.mouse.held.count() != 0) {
+            self.mouse.held = .empty;
+            if (self.hasCapture()) _ = win32.ReleaseCapture();
+        }
+        self.mouse.owed = .empty;
+        self.mouse.leave_owed = false;
+
+        // No mouse event reaches the core from here on, so the core cannot
+        // show a pointer it hid while typing; WM_SETCURSOR would keep it
+        // hidden over the window for the rest of a teardown.
+        self.mouse.hidden = false;
+        self.applyCursor();
+
+        // A composition ends too: nothing is left to draw its preedit or
+        // to take its result. The IME is not told; in a teardown the window
+        // is about to be destroyed, and ImmNotifyIME would send its
+        // messages back into it.
+        self.ime.pending.clearAndFree(self.app.core_app.alloc);
+        self.ime.composing = false;
+        self.ime.form = null;
+        self.preedit = .none;
+    }
+
     pub fn stopCore(self: *Surface) void {
         if (self.core_state != .live) return;
 
@@ -1194,30 +1258,7 @@ pub const Surface = struct {
         self.app.teardown_depth += 1;
         defer self.app.teardown_depth -= 1;
 
-        // A drag in progress ends with the core. Button messages for a
-        // `.stopping` surface are not handled, so nothing else would release
-        // the capture while this pumps messages (App.waitForThread).
-        if (self.mouse.held.count() != 0) {
-            self.mouse.held = .empty;
-            if (self.hasCapture()) _ = win32.ReleaseCapture();
-        }
-        self.mouse.owed = .empty;
-        self.mouse.leave_owed = false;
-
-        // No mouse event reaches the core from here on, so the core cannot
-        // show a pointer it hid while typing; WM_SETCURSOR would keep it
-        // hidden over the window for the rest of the teardown.
-        self.mouse.hidden = false;
-        self.applyCursor();
-
-        // A composition ends with the core too: nothing is left to draw its
-        // preedit or to take its result. The IME is not told; the window is
-        // about to be destroyed, and ImmNotifyIME would send its messages
-        // back into this teardown.
-        self.ime.pending.clearAndFree(self.app.core_app.alloc);
-        self.ime.composing = false;
-        self.ime.form = null;
-        self.preedit = .none;
+        self.releaseInput();
 
         const app = self.app;
         const cs = &self.core_surface;
@@ -1289,8 +1330,11 @@ pub const Surface = struct {
 
         // Every close sets `closing` before it posts, so a teardown that
         // finds it clear is a stale one: the close it was posted for has
-        // been taken back since, and this terminal is to stay.
-        if (!self.closing) return;
+        // been taken back since, and this terminal is to stay. One that
+        // finds the terminal parked is stale too: its close was carried
+        // out with the tab's (`Window.requestCloseTabs` posts to each of a
+        // tab's terminals), and the terminal's time is not up.
+        if (!self.closing or self.parked) return;
 
         if (!app.canTearDown()) {
             self.destroy_deferred = true;
@@ -1455,6 +1499,10 @@ pub const Surface = struct {
         // The core routes OSC 52 writes straight to setClipboard; they
         // never reach this function (`Surface.startClipboardRequest`).
         if (state == .osc_52_write) return .unsupported;
+
+        // Parked for `undo`, it shows nowhere: nothing could own a prompt,
+        // and nobody sees what would read the clipboard.
+        if (self.parked) return .unsupported;
 
         // A clipboard Windows has not. The core answers a Kitty request
         // for it with ENOSYS, as the protocol lists for a clipboard the
@@ -1723,6 +1771,8 @@ pub const Surface = struct {
     ) !void {
         var question: Question = .{};
         if (!self.supportsClipboard(clipboard_type)) return;
+        // As for a read (`clipboardRequest`).
+        if (self.parked) return;
 
         // After a prompt, the text alone, as GTK and macOS write it.
         const reps: ClipboardReps = .of(contents, confirm_write);

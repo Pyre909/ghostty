@@ -441,8 +441,10 @@ fn hideTab(t: *Tab) void {
 /// browser's do.
 pub fn removeTab(self: *Window, t: *Tab) void {
     const index = self.tabIndex(t) orelse return;
-    // Its title prompt goes with it, before it is freed.
+    // Its title prompt goes with it, before it is freed, and so does
+    // what `undo` would put back in it.
     TitleDialog.tabRemoved(self, t);
+    self.app.undo.forgetTab(self.app, t);
     // The next tab first, then the closing terminal hidden, so that it is
     // not shown, nor clicked, while its core stops (`Surface.destroy`).
     if (self.unlinkTab(index)) {
@@ -658,6 +660,9 @@ fn setParent(child: win32.HWND, parent: win32.HWND) bool {
 /// dropped, as `selectTab` drops one: it is a key's, made in this window.
 fn takeTab(self: *Window, index: usize) *Tab {
     const t = self.tabs.items[index];
+    // What `undo` would put back in it was parked in this frame, which
+    // the tab leaves.
+    self.app.undo.forgetTab(self.app, t);
     if (self.unlinkTab(index)) self.showTab() else self.relayout();
     t.pending_focus = null;
     return t;
@@ -2102,6 +2107,10 @@ fn handleMessage(
             // dispatched it.
             self.modal_loops.release(&self.app.modal_loop_depth);
 
+            // The terminals parked for `undo` go with the others below:
+            // no close of this window's is left to take back.
+            self.app.undo.dropWindow(self.app, self);
+
             // The child windows are destroyed next, and each frees its
             // terminal (App.surfaceDestroyed): the tree lets go of them
             // first. Nothing lays the window out after this.
@@ -2944,6 +2953,13 @@ pub fn toClient(self: *const Window, rect: *win32.RECT) bool {
 ///
 /// Fails only to allocate the new tree, and then changes nothing.
 pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
+    var left = try self.takePane(t, handle);
+    left.deinit();
+}
+
+/// `removePane`, returning the tree the terminal left, the caller's now:
+/// what `undo` puts back (`Undo`).
+pub fn takePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !Tree {
     const alloc = self.app.core_app.alloc;
     const surface = t.tree.nodes[handle.idx()].leaf;
 
@@ -2958,16 +2974,20 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
 
     const tree = try t.tree.remove(alloc, handle);
     errdefer comptime unreachable;
-    self.setTree(t, tree);
+    // As `setTree`, but for the old tree, which is kept.
+    const left = t.tree;
+    t.tree = tree;
+    Dividers.tabChanged(self, t);
     t.focused = focus;
 
     // A hidden tab's terminals are hidden already, and the focus and the
     // layout are the shown tab's.
-    if (t != self.tab()) return;
+    if (t != self.tab()) return left;
     // The focus moves first, so that it is never left on a hidden window.
     if (focus) |f| self.giveFocus(f);
     _ = win32.ShowWindow(surface.hwnd, win32.SW_HIDE);
     self.relayout();
+    return left;
 }
 
 /// Lay the terminals out over the client area (`layout`), then place their
@@ -5265,6 +5285,8 @@ test "win32: modal loops are counted per window and returned on destroy" {
     app.modal_loop_depth = 0;
     // Read by the frame's procedure before any other message.
     app.taskbar_created = 0;
+    // Read as a frame is destroyed.
+    app.undo = .{};
 
     var a: Window = undefined;
     var b: Window = undefined;
