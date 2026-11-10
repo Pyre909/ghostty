@@ -147,11 +147,17 @@ fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();
+    // A language written from the right is read and set from the right;
+    // without these its punctuation lands at the wrong end of each line.
+    const flags = buttons | if (i18n.windows.rightToLeft())
+        win32.MB_RTLREADING | win32.MB_RIGHT
+    else
+        0;
     if (builtin.is_test) return if (test_message_box) |answer|
-        answer(owner, text, buttons)
+        answer(owner, text, flags)
     else
         unanswered();
-    return win32.MessageBoxW(owner, text, L("Ghostty"), buttons | win32.MB_ICONWARNING);
+    return win32.MessageBoxW(owner, text, L("Ghostty"), flags | win32.MB_ICONWARNING);
 }
 
 /// A failure that ends the process before any window exists. The

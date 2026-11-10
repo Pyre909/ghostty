@@ -2222,11 +2222,17 @@ pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMod
     }
     if (!any) return false;
     if (self.app.terminating or self.closing) return true;
+    // The tab the user is in is the one that stays in two of the three,
+    // so those are asked in the words the action is listed with.
     var question: Question = .{};
     if (ask and !confirm(
         self.app,
         self.hwnd,
-        question.text("Close Tab?", "All terminal sessions in this tab will be terminated."),
+        switch (mode) {
+            .this => question.text("Close Tab?", "All terminal sessions in this tab will be terminated."),
+            .other => question.text("Close Other Tabs", "Close all tabs in this window except the current one."),
+            .right => question.text("Close Tabs to the Right", "Close all tabs to the right of the current one."),
+        },
         .ok,
     )) return true;
 

@@ -30,6 +30,25 @@ pub const embedded = build_config.i18n and
 /// translates.
 var catalog: ?Catalog = null;
 
+/// Whether the language in use is written from the right. With `catalog`.
+var right_to_left: bool = false;
+
+/// Whether the language translated to is written from right to left, so
+/// that a prompt in it is laid out from the right.
+pub fn rightToLeft() bool {
+    return right_to_left;
+}
+
+/// Whether `locale`, one of `locales`, is written from right to left: by
+/// its language, the letters before any `_` or `@`.
+fn fromTheRight(locale: []const u8) bool {
+    const language = locale[0 .. std.mem.indexOfAny(u8, locale, "_@") orelse locale.len];
+    for ([_][]const u8{ "ar", "fa", "he", "ur", "yi" }) |rtl| {
+        if (std.mem.eql(u8, language, rtl)) return true;
+    }
+    return false;
+}
+
 /// What a language the user names comes to.
 pub const Match = union(enum) {
     /// A catalog: its place in `locales`.
@@ -139,14 +158,17 @@ pub fn use(language: ?[]const u8) void {
     switch (choose(language, system())) {
         .source, .none => {
             catalog = null;
+            right_to_left = false;
             log.info("translations: none, the source's English", .{});
         },
         .locale => |i| {
+            right_to_left = false;
             catalog = usable(@import("i18n_catalogs").catalogs[i]) catch |err| {
                 catalog = null;
                 log.warn("translations: catalog unusable locale={s} err={}", .{ locales[i], err });
                 return;
             };
+            right_to_left = fromTheRight(locales[i]);
             log.info("translations: locale={s}", .{locales[i]});
         },
     }
@@ -220,12 +242,24 @@ pub fn translate(msgid: [*:0]const u8) [*:0]const u8 {
 
 /// For tests: translate with `bytes`, a catalog, or with none.
 pub fn testUse(bytes: ?[]const u8) error{ InvalidCatalog, NotUtf8 }!void {
+    right_to_left = false;
     catalog = if (bytes) |b| try usable(b) else null;
 }
 
 /// For tests: translate with the catalog built in for `locales[i]`.
 pub fn testUseLocale(i: usize) error{ InvalidCatalog, NotUtf8 }!void {
     try testUse(@import("i18n_catalogs").catalogs[i]);
+    right_to_left = fromTheRight(locales[i]);
+}
+
+test "a language is laid out from the right by its language code" {
+    const testing = std.testing;
+    try testing.expect(fromTheRight("he"));
+    try testing.expect(fromTheRight("ar_EG"));
+    try testing.expect(!fromTheRight("hr"));
+    try testing.expect(!fromTheRight("hu"));
+    try testing.expect(!fromTheRight("sr@latin"));
+    try testing.expect(!fromTheRight("zh_TW"));
 }
 
 test "each locale's own name finds it, as gettext and as Windows write it" {

@@ -60,6 +60,7 @@ const Window = @import("Window.zig");
 const Tab = @import("Tab.zig");
 const App = @import("App.zig").App;
 const label = @import("dialog.zig").label;
+const i18n = @import("../../os/main.zig").i18n;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 
@@ -94,6 +95,8 @@ pub const edit_id = 100;
 /// languages' labels, which a test measures. The dialog manager's usual
 /// 50 cuts one.
 pub const button_width = 56;
+/// The title prompt's width, in dialog units.
+const prompt_width = 232;
 /// The line above the field.
 pub const note_id = 101;
 
@@ -490,6 +493,7 @@ pub const Item = struct {
 /// and its controls.
 pub const Spec = struct {
     style: u32,
+    ex_style: u32 = 0,
     x: i16,
     y: i16,
     cx: i16,
@@ -507,9 +511,12 @@ pub fn spec(target: Target) Spec {
     return .{
         .style = win32.WS_POPUP | win32.WS_CAPTION | win32.WS_SYSMENU |
             win32.DS_MODALFRAME | win32.DS_SETFONT,
+        // Mirrored for a language written from the right, as its
+        // controls are with it.
+        .ex_style = if (i18n.windows.rightToLeft()) win32.WS_EX_LAYOUTRTL else 0,
         .x = 0,
         .y = 0,
-        .cx = 232,
+        .cx = prompt_width,
         .cy = 64,
         .caption = switch (target) {
             .surface => W("Change Terminal Title"),
@@ -551,7 +558,7 @@ const prompt_items = items: {
             .class = .button,
             .id = win32.IDOK,
             .style = child | win32.WS_TABSTOP | win32.WS_GROUP | win32.BS_DEFPUSHBUTTON,
-            .x = 225 - button_width - 4 - button_width,
+            .x = prompt_width - 7 - button_width - 4 - button_width,
             .y = 43,
             .cx = button_width,
             .cy = 14,
@@ -561,7 +568,7 @@ const prompt_items = items: {
             .class = .button,
             .id = win32.IDCANCEL,
             .style = child | win32.WS_TABSTOP | win32.BS_PUSHBUTTON,
-            .x = 225 - button_width,
+            .x = prompt_width - 7 - button_width,
             .y = 43,
             .cx = button_width,
             .cy = 14,
@@ -581,7 +588,7 @@ const prompt_items = items: {
 pub fn build(buf: []align(4) u16, s: Spec) error{NoSpaceLeft}![]align(4) const u16 {
     var w: Writer = .{ .buf = buf };
     try w.dword(s.style);
-    try w.dword(0); // extended style
+    try w.dword(s.ex_style);
     try w.word(@intCast(s.items.len));
     try w.short(s.x);
     try w.short(s.y);

@@ -16125,7 +16125,9 @@ const TestQuick = struct {
     /// showed then, and whether `watch_topmost` was always on top then;
     /// answered with `answer`, Cancel unless a test says otherwise.
     var asked: ?win32.HWND = null;
-    var asked_text: ?win32.LPCWSTR = null;
+    /// A copy: the prompt's own text is gone once it is answered.
+    var asked_text: [600]u16 = undefined;
+    var asked_len: usize = 0;
     var asked_buttons: win32.UINT = 0;
     var asked_shown: bool = false;
     var watch_topmost: ?win32.HWND = null;
@@ -16134,7 +16136,9 @@ const TestQuick = struct {
 
     fn ask(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
         asked = owner;
-        asked_text = prompt;
+        const said = std.mem.span(prompt);
+        asked_len = @min(said.len, asked_text.len);
+        @memcpy(asked_text[0..asked_len], said[0..asked_len]);
         asked_buttons = buttons;
         asked_shown = if (owner) |hwnd| win32.IsWindowVisible(hwnd).toBool() else false;
         if (watch_topmost) |hwnd| asked_topmost = hasStyle(hwnd, win32.GWL_EXSTYLE, win32.WS_EX_TOPMOST);
@@ -16144,7 +16148,7 @@ const TestQuick = struct {
     /// That the last prompt asked `text`, with `default` (MB_DEFBUTTON1
     /// or MB_DEFBUTTON2) the button Enter presses.
     fn expectAsked(text: win32.LPCWSTR, default: win32.UINT) !void {
-        try std.testing.expectEqualSlices(u16, std.mem.span(text), std.mem.span(asked_text.?));
+        try std.testing.expectEqualSlices(u16, std.mem.span(text), asked_text[0..asked_len]);
         try std.testing.expectEqual(default, asked_buttons & win32.MB_DEFMASK);
     }
 
@@ -23926,9 +23930,12 @@ const PromptSeen = struct {
     var answer: c_int = win32.IDCANCEL;
     /// The button Enter pressed: MB_DEFBUTTON1 or MB_DEFBUTTON2.
     var default: win32.UINT = 0;
+    /// All of what the box was asked for.
+    var flags: win32.UINT = 0;
 
     fn seen(owner: ?win32.HWND, prompt: win32.LPCWSTR, buttons: win32.UINT) c_int {
         _ = owner;
+        flags = buttons;
         default = buttons & win32.MB_DEFMASK;
         const said = std.mem.span(prompt);
         len = @min(said.len, text.len);
@@ -23943,6 +23950,94 @@ const PromptSeen = struct {
         try std.testing.expectEqualStrings(said, buf[0..n]);
     }
 };
+
+test "win32: a close is asked about in the user's language, from the right where that is written so" {
+    const i18n = internal_os.i18n;
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &PromptSeen.seen;
+    defer message_box.* = null;
+    PromptSeen.answer = win32.IDCANCEL;
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = try testTab(&app, window);
+    _ = try testTab(&app, window);
+    try std.testing.expectEqual(3, window.tabs.items.len);
+
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Close Split?", "Teil zu?" },
+        .{ "The currently running process in this split will be terminated.", "Der Prozess endet." },
+        .{ "Close Window?", "Fenster zu?" },
+        .{ "All terminal sessions in this window will be terminated.", "Alle im Fenster enden." },
+        .{ "Close Tab?", "Tab zu?" },
+        .{ "All terminal sessions in this tab will be terminated.", "Alle im Tab enden." },
+        .{ "Close Other Tabs", "Andere Tabs zu" },
+        .{ "Close all tabs in this window except the current one.", "Alle bis auf diesen." },
+        .{ "Close Tabs to the Right", "Tabs rechts zu" },
+        .{ "Close all tabs to the right of the current one.", "Alle rechts von diesem." },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+    Window.test_needs_confirm = true;
+    defer Window.test_needs_confirm = false;
+    const rtl = win32.MB_RTLREADING | win32.MB_RIGHT;
+
+    // A terminal, a window, and tabs: the one the user is in, which a
+    // close of the others keeps, so that one is not asked about "this tab".
+    a.close(true);
+    try PromptSeen.expectSaid("Teil zu?\n\nDer Prozess endet.");
+    try std.testing.expectEqual(0, PromptSeen.flags & rtl);
+    window.requestClose();
+    try PromptSeen.expectSaid("Fenster zu?\n\nAlle im Fenster enden.");
+    try std.testing.expect(window.requestCloseTabs(0, .this));
+    try PromptSeen.expectSaid("Tab zu?\n\nAlle im Tab enden.");
+    try std.testing.expect(window.requestCloseTabs(0, .other));
+    try PromptSeen.expectSaid("Andere Tabs zu\n\nAlle bis auf diesen.");
+    try std.testing.expect(window.requestCloseTabs(0, .right));
+    try PromptSeen.expectSaid("Tabs rechts zu\n\nAlle rechts von diesem.");
+    try std.testing.expectEqual(3, window.tabs.items.len);
+
+    // Hebrew, built in, is read from the right, and so is its prompt.
+    const locales = @import("../../os/i18n_locales.zig").locales;
+    const he = for (locales, 0..) |locale, i| {
+        if (std.mem.eql(u8, locale, "he")) break i;
+    } else return error.TestUnexpectedResult;
+    try i18n.windows.testUseLocale(he);
+    PromptSeen.count = 0;
+    window.requestClose();
+    try std.testing.expectEqual(1, PromptSeen.count);
+    try std.testing.expectEqual(rtl, PromptSeen.flags & rtl);
+    // And its title prompt is laid out from the right: Cancel, the last
+    // of its buttons, is left of OK.
+    const target: apprt.Target = .{ .surface = &a.core_surface };
+    inline for (.{ false, true }) |mirrored| {
+        if (!mirrored) try i18n.windows.testUse(catalog);
+        if (mirrored) try i18n.windows.testUseLocale(he);
+        try std.testing.expect(try app.performAction(target, .prompt_title, .surface));
+        app.createRequested();
+        const prompt = window.title_prompt.hwnd orelse return error.TestUnexpectedResult;
+        defer TitleDialog.close(window);
+        const ok = win32.GetDlgItem(prompt, win32.IDOK) orelse return error.TestUnexpectedResult;
+        const cancel = win32.GetDlgItem(prompt, win32.IDCANCEL) orelse return error.TestUnexpectedResult;
+        var ok_rect: win32.RECT = undefined;
+        var cancel_rect: win32.RECT = undefined;
+        _ = win32.GetWindowRect(ok, &ok_rect);
+        _ = win32.GetWindowRect(cancel, &cancel_rect);
+        try std.testing.expectEqual(mirrored, cancel_rect.left < ok_rect.left);
+    }
+}
 
 test "win32: a read-only terminal whose command has exited asks to close as read-only, any other as running a process" {
     // The core asks before a read-only terminal closes even once its

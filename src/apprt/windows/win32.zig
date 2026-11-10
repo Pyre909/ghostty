@@ -178,6 +178,9 @@ pub const WS_EX_TOOLWINDOW: DWORD = 0x00000080;
 /// translucent.
 /// https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles
 pub const WS_EX_LAYERED: DWORD = 0x00080000;
+/// The window's horizontal origin is its right edge: it and its children
+/// are laid out mirrored, as a right-to-left language reads.
+pub const WS_EX_LAYOUTRTL: DWORD = 0x00400000;
 /// SetLayeredWindowAttributes: the alpha applies.
 pub const LWA_ALPHA: DWORD = 0x00000002;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setlayeredwindowattributes
@@ -475,6 +478,9 @@ pub const MB_ICONERROR: UINT = 0x00000010;
 pub const MB_DEFBUTTON1: UINT = 0x00000000;
 pub const MB_DEFBUTTON2: UINT = 0x00000100;
 pub const MB_DEFMASK: UINT = 0x00000F00;
+/// The text right-justified, and read from right to left.
+pub const MB_RIGHT: UINT = 0x00080000;
+pub const MB_RTLREADING: UINT = 0x00100000;
 pub const IDOK: c_int = 1;
 pub const IDRETRY: c_int = 4;
 
