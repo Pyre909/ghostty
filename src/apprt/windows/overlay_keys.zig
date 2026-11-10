@@ -213,9 +213,9 @@ pub fn fieldOwns(vk: win32.UINT, mods: input.Mods, typed: bool) bool {
 }
 
 /// Which field a key was typed in: a terminal's search field, or its
-/// window's command palette's, open for that terminal. Copy, paste and
-/// select all act on it.
-pub const Field = enum { search, palette };
+/// window's command palette's, open for that terminal, or its window's
+/// tab overview's. Copy, paste and select all act on it.
+pub const Field = enum { search, palette, overview };
 
 /// What a binding found for a field's key did.
 const Outcome = enum {
@@ -305,6 +305,10 @@ pub fn replay(from: *CoreSurface, trigger: Binding.Trigger, field: Field) void {
             const p = &surface.window.palette;
             if (!p.open or p.surface != surface) break :palette null;
             break :palette p.edit;
+        },
+        .overview => overview: {
+            const o = &surface.window.overview;
+            break :overview if (o.open) o.edit else null;
         },
     };
     _ = perform(surface, edit, field, trigger, &leaf, .replay);

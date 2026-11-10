@@ -128,6 +128,21 @@
 //! its frame is deactivated, when the layout leaves no room for it, and
 //! with its terminal or window; the terminal gets the focus back.
 //!
+//! ## Tab overview
+//!
+//! `.toggle_tab_overview` opens a window's tab overview, or closes it,
+//! from `App.run` as the palette is (`TabOverview`). As GTK's and macOS's,
+//! it shows every tab of the window as a card, in the tabs' order, over
+//! all of the frame's client area: the card's label is the bar's, with the
+//! tab's `goto_tab` shortcut and a close glyph. Typing in its field keeps
+//! the tabs whose label or directory holds the text; the arrows, Tab,
+//! PgUp and PgDn move the selection, Enter or a click shows the tab,
+//! Delete with no text, the close glyph or a middle click closes it, "+"
+//! opens a new one, and Escape empties the field, then closes. A card's
+//! preview is the terminals' background, with nothing of the tab's
+//! screen: a hidden terminal has no frame to copy. The palette and the
+//! overview are never open together.
+//!
 //! ## Link previews
 //!
 //! `.mouse_over_link` shows the URL of the link under the pointer over the
@@ -284,8 +299,8 @@
 //!
 //! ## What is still missing
 //!
-//! Not implemented: the tab overview, dragging a tab into another
-//! window and dropped text (only files are taken).
+//! Not implemented: a picture of each tab in the tab overview, dragging
+//! a tab into another window and dropped text (only files are taken).
 //! `performAction` returns `false`, the contract's word for "unsupported",
 //! for every action it does not name; this runtime never claims an action
 //! it did not carry out.

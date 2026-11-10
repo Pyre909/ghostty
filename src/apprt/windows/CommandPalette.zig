@@ -108,6 +108,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .set_window_theme,
         .reset_window_size,
         .toggle_command_palette,
+        .toggle_tab_overview,
         .toggle_quick_terminal,
         .toggle_visibility,
         .open_config,
@@ -125,8 +126,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no tab overview, GTK inspector, updater or secure input here.
-        .toggle_tab_overview,
+        // no GTK inspector, updater or secure input here.
         .close_all_windows,
         .check_for_updates,
         .show_gtk_inspector,
@@ -513,6 +513,7 @@ const CoreSurface = @import("../../Surface.zig");
 const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
+const TabOverview = @import("TabOverview.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const Transparency = @import("Transparency.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -693,6 +694,8 @@ pub fn open(surface: *Surface) bool {
         log.info("no command palette over a title prompt", .{});
         return false;
     }
+    // The two are never open together.
+    TabOverview.close(window);
     const entries = forApp(app, null) catch |err| {
         log.warn("cannot list the command palette's entries err={}", .{err});
         return false;
@@ -916,7 +919,7 @@ pub fn close(window: *Window) void {
 /// (`TitleDialog.closedByKey`). Whichever terminal holds the keyboard
 /// focus now, in any window: Enter on a jump to another window's terminal
 /// leaves the focus there.
-fn closedByKey(app: *App, lparam: win32.LPARAM) void {
+pub fn closedByKey(app: *App, lparam: win32.LPARAM) void {
     const focus = Window.keyboardFocus() orelse return;
     for (app.surfaces.items) |surface| {
         if (surface.hwnd != focus) continue;
@@ -1844,7 +1847,6 @@ test "win32: the palette's entries are the supported commands and a jump per ter
             }
             try testing.expect(!std.mem.eql(u8, e.action_key, "show_gtk_inspector"));
             try testing.expect(!std.mem.eql(u8, e.action_key, "check_for_updates"));
-            try testing.expect(!std.mem.eql(u8, e.action_key, "toggle_tab_overview"));
         },
         .jump => {},
     };

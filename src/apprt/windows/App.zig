@@ -42,6 +42,7 @@ const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const TabOverview = @import("TabOverview.zig");
 const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
@@ -816,6 +817,10 @@ pub const App = struct {
         /// `.toggle_command_palette`: open the command palette over the
         /// window of `from`, or close it (`CommandPalette.toggle`).
         palette: *CoreSurface,
+
+        /// `.toggle_tab_overview`: open the tab overview over the window
+        /// of `from`, or close it (`TabOverview.toggle`).
+        overview: *CoreSurface,
 
         /// An entry chosen in the command palette open for `from` while
         /// the core could not be re-entered, the palette already closed:
@@ -2174,6 +2179,7 @@ pub const App = struct {
             .search_selected => searchCount(target, .selected, value.selected),
             .prompt_title => self.requestTitlePrompt(target, value),
             .toggle_command_palette => self.requestPalette(target),
+            .toggle_tab_overview => self.requestOverview(target),
             .toggle_background_opacity => self.requestBackgroundOpacity(),
             .mouse_over_link => linkPreview(target, value),
             .key_sequence => keySequence(target, value),
@@ -2384,6 +2390,23 @@ pub const App = struct {
         };
         self.requests.append(self.core_app.alloc, .{ .palette = from }) catch |err| {
             log.warn("cannot record a command palette to toggle err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// `.toggle_tab_overview`: the tab overview opens over the terminal's
+    /// window, or closes if it is open there, as GTK toggles its window's
+    /// (`TabOverview.toggle`). Carried out by `run`, as the palette is: it
+    /// takes the keyboard focus from the terminal, or gives it back.
+    /// `false` for the app.
+    fn requestOverview(self: *App, target: apprt.Target) bool {
+        const from = switch (target) {
+            .app => return false,
+            .surface => |v| v,
+        };
+        self.requests.append(self.core_app.alloc, .{ .overview = from }) catch |err| {
+            log.warn("cannot record a tab overview to toggle err={}", .{err});
             return false;
         };
         return true;
@@ -3461,7 +3484,7 @@ pub const App = struct {
             .overlay_key => |key| {
                 if (key.from == core_surface) request.* = .dropped;
             },
-            .palette => |from| {
+            .palette, .overview => |from| {
                 if (from == core_surface) request.* = .dropped;
             },
             // And an entry chosen to focus it.
@@ -4173,6 +4196,7 @@ pub const App = struct {
                 },
                 .overlay_key => |key| overlay_keys.replay(key.from, key.trigger, key.field),
                 .palette => |from| CommandPalette.toggle(from.rt_surface),
+                .overview => |from| TabOverview.toggle(from.rt_surface),
                 // Freed here; `pending` is not used after.
                 .palette_run => |chosen| {
                     self.requests.items[i] = .dropped;
@@ -4945,6 +4969,15 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     }
     errdefer _ = win32.UnregisterClassW(L(CommandPalette.class_name), hinstance);
 
+    var overview_class = palette_class;
+    overview_class.lpfnWndProc = &TabOverview.wndProc;
+    overview_class.lpszClassName = L(TabOverview.class_name);
+    if (win32.RegisterClassExW(&overview_class) == 0) {
+        log.err("failed to register the tab overview class err={}", .{win32.GetLastError()});
+        return App.Error.Win32ClassRegistrationFailed;
+    }
+    errdefer _ = win32.UnregisterClassW(L(TabOverview.class_name), hinstance);
+
     // The overlays' classes (`Overlays.registerClasses`).
     try Overlays.registerClasses(hinstance, arrow);
     errdefer Overlays.unregisterClasses(hinstance);
@@ -4981,6 +5014,7 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(TabBar.class_name), hinstance);
     _ = win32.UnregisterClassW(L(SearchBar.class_name), hinstance);
     _ = win32.UnregisterClassW(L(CommandPalette.class_name), hinstance);
+    _ = win32.UnregisterClassW(L(TabOverview.class_name), hinstance);
     Overlays.unregisterClasses(hinstance);
 }
 
@@ -5682,6 +5716,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .title_prompt = .{},
         .clipboard_prompt = null,
         .palette = .{},
+        .overview = .{},
         .divider_drag = null,
         .divider_wheel = false,
         .closing = false,
@@ -20569,12 +20604,12 @@ test "win32: the command palette lists only what performAction carries out" {
     const Case = struct { input.Binding.Action.Key, apprt.Action.Key };
     const cases = [_]Case{
         // Left out.
-        .{ .toggle_tab_overview, .toggle_tab_overview },
         .{ .close_all_windows, .close_all_windows },
         .{ .check_for_updates, .check_for_updates },
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .toggle_secure_input, .secure_input },
         // Listed.
+        .{ .toggle_tab_overview, .toggle_tab_overview },
         .{ .undo, .undo },
         .{ .redo, .redo },
         .{ .new_window, .new_window },
@@ -20681,7 +20716,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(40, listed);
+    try std.testing.expectEqual(41, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
 }
@@ -21887,6 +21922,350 @@ test "win32: the search bar's and the palette's placeholders are the user's lang
         W("Befehl ausf\u{fc}hren\u{2026}"),
         std.mem.sliceTo(&CommandPalette.placeholder.buf, 0),
     );
+}
+
+/// For tests: `toggle_tab_overview` from `surface`, carried out.
+fn toggleOverview(app: *App, surface: *Surface) !void {
+    try std.testing.expect(try app.performAction(.{ .surface = &surface.core_surface }, .toggle_tab_overview, {}));
+    app.createRequested();
+}
+
+/// For tests: a key pressed in `window`'s overview's field.
+fn overviewKey(window: *Window, vk: win32.WPARAM) void {
+    _ = win32.SendMessageW(window.overview.edit.?, win32.WM_KEYDOWN, vk, 0);
+}
+
+/// For tests: a button pressed and let go at the middle of `r` in
+/// `window`'s overview.
+fn overviewClick(window: *Window, down: win32.UINT, up: win32.UINT, r: win32.RECT) void {
+    const hwnd = window.overview.hwnd.?;
+    const at = testPoint(@divTrunc(r.left + r.right, 2), @divTrunc(r.top + r.bottom, 2));
+    _ = win32.SendMessageW(hwnd, down, 0, at);
+    _ = win32.SendMessageW(hwnd, up, 0, at);
+}
+
+/// For tests: a window 1000 by 700 with three tabs, the first shown,
+/// titled "one", "two" and "three", the second in C:\src.
+const TestOverview = struct {
+    window: *Window,
+    panes: [3]*Surface,
+
+    fn init(app: *App) !TestOverview {
+        const alloc = app.core_app.alloc;
+        const window = try testFrame(app);
+        testResize(window, 1000, 700);
+        const a = try testPane(app, window);
+        window.tab().tree = try .init(alloc, a);
+        window.tab().focused = a;
+        const b = try testPane(app, window);
+        _ = try window.insertTabAt(b, .end);
+        const c = try testPane(app, window);
+        _ = try window.insertTabAt(c, .end);
+        try std.testing.expect(a.setTitle("one"));
+        try std.testing.expect(b.setTitle("two"));
+        try std.testing.expect(c.setTitle("three"));
+        try std.testing.expect(b.setPwd("C:\\src"));
+        window.relayout();
+        return .{ .window = window, .panes = .{ a, b, c } };
+    }
+};
+
+test "win32: toggle_tab_overview opens the tab overview over its window, and closes it" {
+    // GTK's and macOS's toggle: every tab of the window as a card, over
+    // all of the frame, above the terminals, its field with the focus and
+    // the shown tab's card selected; again, it closes and the terminal
+    // gets the focus back. Opened and closed by `run`, after the core's
+    // key callback.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+    window.selectTab(1);
+
+    // Not for the app.
+    try std.testing.expect(!try app.performAction(.app, .toggle_tab_overview, {}));
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Recorded, and opened by `run`.
+    try std.testing.expect(try app.performAction(.{ .surface = &t.panes[1].core_surface }, .toggle_tab_overview, {}));
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .overview);
+    app.createRequested();
+    try std.testing.expect(o.open);
+    const hwnd = o.hwnd.?;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    for (t.panes) |pane| try std.testing.expect(above(window.hwnd, hwnd, pane.hwnd));
+    try std.testing.expect(above(window.hwnd, hwnd, window.bar.hwnd.?));
+    var client: win32.RECT = undefined;
+    try std.testing.expect(win32.GetClientRect(window.hwnd, &client).toBool());
+    try std.testing.expectEqual(client, try childRect(window, hwnd));
+    try std.testing.expect(FocusSeen.last == o.edit.?);
+    // A card for each tab, the shown one's selected, labelled as the bar
+    // labels it.
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, o.kept.items);
+    try std.testing.expectEqual(1, o.selectedTab().?);
+    try std.testing.expectEqualStrings("one", o.tabs[0].title);
+    try std.testing.expectEqualStrings("C:\\src", o.tabs[1].pwd.?);
+    try std.testing.expect(o.tabs[0].pwd == null);
+    try std.testing.expectEqual(3, TabOverview.layoutOf(window).?.count);
+
+    // The frame's focus goes to the field while it is open, and a layout
+    // keeps it above the terminals.
+    FocusSeen.last = null;
+    _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(FocusSeen.last == o.edit.?);
+    _ = win32.SetWindowPos(t.panes[1].hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
+    window.relayout();
+    try std.testing.expect(above(window.hwnd, hwnd, t.panes[1].hwnd));
+
+    // The command palette closes it, and it the palette.
+    try togglePalette(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd == null and window.palette.hwnd != null);
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd != null and window.palette.hwnd == null);
+
+    // Again: closed, the shown tab's terminal with the focus.
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd == null and !o.open);
+    try std.testing.expect(FocusSeen.last == t.panes[1].hwnd);
+    _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(FocusSeen.last == t.panes[1].hwnd);
+
+    // Not over a title prompt, which holds the frame; and one that opens
+    // closes it.
+    window.title_prompt.hwnd = window.hwnd;
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd == null);
+    window.title_prompt.hwnd = null;
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd != null);
+    try std.testing.expect(TitleDialog.open(t.panes[1], .surface));
+    try std.testing.expect(o.hwnd == null);
+    TitleDialog.close(window);
+
+    // Not for a closing terminal; and no room for a card closes it.
+    t.panes[1].closing = true;
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd == null);
+    t.panes[1].closing = false;
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd != null);
+    testResize(window, 1000, 120);
+    window.relayout();
+    try std.testing.expect(o.hwnd == null);
+    testResize(window, 1000, 700);
+
+    // Its window closing: closed first.
+    try toggleOverview(&app, t.panes[1]);
+    try std.testing.expect(o.hwnd != null);
+    _ = Window.wndProc(window.hwnd, win32.WM_SIZE, win32.SIZE_MINIMIZED, 0);
+    try std.testing.expect(o.hwnd == null);
+}
+
+test "win32: the tab overview's keys move its selection, show a tab and close one" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+
+    // The arrows and Tab, in a grid of one row here.
+    try toggleOverview(&app, t.panes[0]);
+    try std.testing.expectEqual(3, TabOverview.layoutOf(window).?.columns);
+    try std.testing.expectEqual(0, o.selectedTab().?);
+    overviewKey(window, win32.VK_RIGHT);
+    try std.testing.expectEqual(1, o.selectedTab().?);
+    overviewKey(window, win32.VK_TAB);
+    try std.testing.expectEqual(2, o.selectedTab().?);
+    overviewKey(window, win32.VK_RIGHT);
+    try std.testing.expectEqual(2, o.selectedTab().?);
+    overviewKey(window, win32.VK_TAB);
+    try std.testing.expectEqual(0, o.selectedTab().?);
+    overviewKey(window, win32.VK_DOWN);
+    try std.testing.expectEqual(0, o.selectedTab().?);
+    // The shown tab is still the first: nothing moved but the selection.
+    try std.testing.expectEqual(0, window.selected);
+
+    // Enter shows the selected card's tab and closes the overview, the
+    // focus on that tab's terminal.
+    overviewKey(window, win32.VK_LEFT);
+    overviewKey(window, win32.VK_RIGHT);
+    overviewKey(window, win32.VK_RIGHT);
+    overviewKey(window, win32.VK_RETURN);
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(2, window.selected);
+    try std.testing.expect(FocusSeen.last == t.panes[2].hwnd);
+
+    // Typing keeps the tabs whose label or directory holds the text, the
+    // first of them selected; Enter shows that one.
+    try toggleOverview(&app, t.panes[2]);
+    try std.testing.expectEqual(2, o.selectedTab().?);
+    _ = win32.SetWindowTextW(o.edit.?, L("T"));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, o.kept.items);
+    try std.testing.expectEqual(1, o.selectedTab().?);
+    _ = win32.SetWindowTextW(o.edit.?, L("SRC"));
+    try std.testing.expectEqualSlices(u32, &.{1}, o.kept.items);
+    // Delete is the field's while it holds text: no tab closes.
+    overviewKey(window, win32.VK_DELETE);
+    for (window.tabs.items) |x| try std.testing.expect(!x.closing);
+    // Escape empties the field first, the shown tab's card selected
+    // again; then it closes the overview.
+    overviewKey(window, win32.VK_ESCAPE);
+    try std.testing.expect(o.hwnd != null);
+    try std.testing.expectEqual(0, win32.GetWindowTextLengthW(o.edit.?));
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, o.kept.items);
+    try std.testing.expectEqual(2, o.selectedTab().?);
+    _ = win32.SetWindowTextW(o.edit.?, L("zzz"));
+    try std.testing.expectEqual(0, o.kept.items.len);
+    try std.testing.expect(o.selectedTab() == null);
+    // Enter with no card kept only closes.
+    overviewKey(window, win32.VK_RETURN);
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(2, window.selected);
+
+    // Delete with no text closes the selected card's tab, and the
+    // overview stays, the selection on the card that took its place; the
+    // focus is not moved by the tab going.
+    try toggleOverview(&app, t.panes[2]);
+    overviewKey(window, win32.VK_LEFT);
+    try std.testing.expectEqual(1, o.selectedTab().?);
+    FocusSeen.last = o.edit.?;
+    overviewKey(window, win32.VK_DELETE);
+    try std.testing.expect(window.tabs.items[1].closing);
+    testPump();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(o.hwnd != null and o.open);
+    overviewKey(window, win32.VK_RIGHT);
+    overviewKey(window, win32.VK_LEFT);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, o.kept.items);
+    try std.testing.expectEqualStrings("three", o.tabs[1].title);
+    try std.testing.expect(FocusSeen.last == o.edit.?);
+
+    // Asked first where a terminal is busy: answered no, the tab stays
+    // and so does the overview.
+    Window.test_needs_confirm = true;
+    defer Window.test_needs_confirm = false;
+    const Box = struct {
+        var asked: usize = 0;
+        fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+            asked += 1;
+            return win32.IDCANCEL;
+        }
+    };
+    @import("dialog.zig").test_message_box = &Box.box;
+    defer @import("dialog.zig").test_message_box = null;
+    overviewKey(window, win32.VK_DELETE);
+    try std.testing.expectEqual(1, Box.asked);
+    for (window.tabs.items) |x| try std.testing.expect(!x.closing);
+    try std.testing.expect(o.hwnd != null);
+
+    // A tab that comes while it is open has a card, and one renamed its
+    // new label, with no key needed: the next thing asked of it reads the
+    // tabs again.
+    const d = try testTab(&app, window);
+    try std.testing.expect(d.setTitle("four"));
+    _ = win32.SetWindowTextW(o.edit.?, L("fou"));
+    try std.testing.expectEqual(1, o.kept.items.len);
+    try std.testing.expectEqualStrings("four", o.tabs[o.selectedTab().?].title);
+    try std.testing.expect(o.hwnd != null);
+}
+
+test "win32: a click in the tab overview shows a tab, closes one or opens a new one" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+    const left = .{ win32.WM_LBUTTONDOWN, win32.WM_LBUTTONUP };
+    const middle = .{ win32.WM_MBUTTONDOWN, win32.WM_MBUTTONUP };
+
+    // A click on a card shows its tab and closes the overview.
+    try toggleOverview(&app, t.panes[0]);
+    var l = TabOverview.layoutOf(window).?;
+    overviewClick(window, left[0], left[1], l.previewRect(1));
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(1, window.selected);
+    try std.testing.expect(FocusSeen.last == t.panes[1].hwnd);
+
+    // Down on one card and up on another does nothing.
+    try toggleOverview(&app, t.panes[1]);
+    l = TabOverview.layoutOf(window).?;
+    const hwnd = o.hwnd.?;
+    const at = struct {
+        fn f(r: win32.RECT) win32.LPARAM {
+            return testPoint(@divTrunc(r.left + r.right, 2), @divTrunc(r.top + r.bottom, 2));
+        }
+    }.f;
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, at(l.previewRect(0)));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, at(l.previewRect(2)));
+    try std.testing.expect(o.hwnd != null);
+    try std.testing.expectEqual(1, window.selected);
+
+    // A card's close glyph closes its tab, and so does a middle click on
+    // the card; the overview stays open.
+    overviewClick(window, left[0], left[1], l.closeRect(2));
+    try std.testing.expect(window.tabs.items[2].closing);
+    try std.testing.expect(!window.tabs.items[0].closing and !window.tabs.items[1].closing);
+    testPump();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(o.hwnd != null);
+    _ = win32.SendMessageW(hwnd, win32.WM_MBUTTONDOWN, 0, at(l.previewRect(0)));
+    _ = win32.SendMessageW(hwnd, win32.WM_MBUTTONUP, 0, at(l.previewRect(1)));
+    for (window.tabs.items) |x| try std.testing.expect(!x.closing);
+    overviewClick(window, middle[0], middle[1], l.previewRect(0));
+    try std.testing.expect(window.tabs.items[0].closing);
+    testPump();
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expect(window.tab().focused == t.panes[1]);
+    try std.testing.expect(o.hwnd != null);
+
+    // The wheel scrolls no further than the cards go: one row fits.
+    _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, @as(win32.WPARAM, @bitCast(@as(isize, -120 * 3))) << 16, 0);
+    try std.testing.expectEqual(0, o.scroll);
+
+    // "+" closes the overview and asks for a new tab, as the bar's does.
+    overviewClick(window, left[0], left[1], l.plusRect());
+    try std.testing.expect(o.hwnd == null);
 }
 
 test "win32: toggle_command_palette opens the command palette over its window, and closes it" {
@@ -27688,7 +28067,7 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         "global:ctrl+numpad_home=new_window",
         // Not performed by this runtime yet: every action the command
         // palette leaves out, alone or chained.
-        "global:ctrl+c=toggle_tab_overview",
+        "global:ctrl+c=toggle_secure_input",
         "global:ctrl+d=check_for_updates",
         "global:ctrl+e=close_all_windows",
         "global:ctrl+g=paste_from_selection",
@@ -27712,7 +28091,7 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
     // out but which asks for its keys to be taken.
     try TestHotkeys.apply(&app, &.{
         "global:ctrl+alt+shift+q=new_window",
-        "global:ctrl+c=toggle_tab_overview",
+        "global:ctrl+c=show_gtk_inspector",
         "chain=new_window",
         "global:ctrl+b=toggle_quick_terminal",
         "global:ctrl+e=toggle_visibility",

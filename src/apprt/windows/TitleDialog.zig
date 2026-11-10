@@ -121,6 +121,8 @@ pub fn open(surface: *Surface, target: Target) bool {
         .surface, .window => null,
         .tab => window.tabOf(surface) orelse return false,
     };
+    // The prompt holds the frame disabled, the tab overview with it.
+    @import("TabOverview.zig").close(window);
 
     // The field starts with the title shown now: the override, else the
     // program's, as GTK starts it (surface.zig `promptTitle`, tab.zig

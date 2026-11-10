@@ -1531,6 +1531,7 @@ pub extern "user32" fn GetSysColor(index: c_int) callconv(.winapi) COLORREF;
 pub extern "user32" fn GetSysColorBrush(index: c_int) callconv(.winapi) ?HBRUSH;
 /// The face of dialog boxes and their buttons.
 pub const COLOR_BTNFACE: c_int = 15;
+pub const COLOR_HIGHLIGHT: c_int = 13;
 /// GetWindow: the window's owner.
 pub const GW_OWNER: UINT = 4;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-setstretchbltmode

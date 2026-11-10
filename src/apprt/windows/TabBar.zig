@@ -64,6 +64,9 @@ pub const Bar = struct {
     /// high-resolution wheel sends fractions of a notch, as `Notches` in
     /// Surface.zig keeps them.
     wheel_rem: i32 = 0,
+    /// The window's tab overview while it is open (TabOverview.zig),
+    /// which shows the same labels: drawn again whenever the bar is.
+    overview: ?win32.HWND = null,
     font: ?win32.HGDIOBJ = null,
     font_dpi: u32 = 0,
 
@@ -95,6 +98,7 @@ pub const Bar = struct {
     /// Draw the bar again: a tab came, went, moved or was renamed, another
     /// is shown, or the theme changed.
     pub fn invalidate(self: *const Bar) void {
+        if (self.overview) |hwnd| _ = win32.InvalidateRect(hwnd, null, .FALSE);
         const hwnd = self.hwnd orelse return;
         _ = win32.InvalidateRect(hwnd, null, .FALSE);
     }

@@ -41,6 +41,7 @@ const ScrollBar = @import("ScrollBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
 const CommandPalette = @import("CommandPalette.zig");
+const TabOverview = @import("TabOverview.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -225,6 +226,8 @@ clipboard_prompt: ?win32.HWND,
 
 /// The window's command palette, open or not (`CommandPalette`).
 palette: CommandPalette.Palette,
+/// The window's tab overview, open or not (`TabOverview`).
+overview: TabOverview.Overview,
 
 /// The divider being dragged with the pointer, from the press in its band
 /// until the drag ends (`Dividers.Drag`); null without one.
@@ -319,12 +322,19 @@ pub const bell_prefix = "🔔 ";
 ///
 /// Invalid UTF-8 is shown as U+FFFD, as macOS does (`Surface.setTitle`).
 pub fn shownTitle(self: *const Window, alloc: std.mem.Allocator, t: *const Tab) ![:0]u16 {
-    const title = tabTitle(t) orelse "Ghostty";
-    const ringing = if (t.focused) |s| s.bell_ringing else false;
-    if (!ringing or !self.app.config.@"bell-features".title) return wideFromUtf8(alloc, title);
-    const text = try std.mem.concat(alloc, u8, &.{ bell_prefix, title });
+    const text = try self.labelText(alloc, t);
     defer alloc.free(text);
     return wideFromUtf8(alloc, text);
+}
+
+/// `shownTitle`'s text as it is kept, in UTF-8, for the tab overview's
+/// card, which shows and filters on what the bar's label says. The caller
+/// frees it.
+pub fn labelText(self: *const Window, alloc: std.mem.Allocator, t: *const Tab) ![]u8 {
+    const title = tabTitle(t) orelse "Ghostty";
+    const ringing = if (t.focused) |s| s.bell_ringing else false;
+    if (!ringing or !self.app.config.@"bell-features".title) return alloc.dupe(u8, title);
+    return std.mem.concat(alloc, u8, &.{ bell_prefix, title });
 }
 
 /// Put `surface`, a new terminal not yet shown, in a tab of its own after
@@ -1060,6 +1070,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .title_prompt = .{},
         .clipboard_prompt = null,
         .palette = .{},
+        .overview = .{},
         .divider_drag = null,
         .divider_wheel = false,
         .closing = false,
@@ -1405,6 +1416,7 @@ pub fn hideQuick(self: *Window) void {
     // Asked before its prompt closes and the activation moves.
     const front = App.inForeground(self);
     CommandPalette.close(self);
+    TabOverview.close(self);
     TitleDialog.close(self);
     if (front) if (self.quick_return) |hwnd| giveBack(hwnd);
     if (self.animateQuick(false)) return;
@@ -2013,6 +2025,8 @@ fn handleMessage(
             // keep their sizes, since the core clamps the grid to at least
             // 1x1 and would reflow every line to one column and back.
             if (wparam == win32.SIZE_MINIMIZED) {
+                // The tab overview is not there when the window is back.
+                TabOverview.close(self);
                 var it = self.tab().tree.iterator();
                 while (it.next()) |entry| entry.view.occlusionChanged(false);
                 return 0;
@@ -2104,8 +2118,9 @@ fn handleMessage(
                 }
                 self.placeOverlays();
                 self.placeSearchBars();
-                // And the command palette's.
+                // And the command palette's, and the tab overview's.
                 CommandPalette.fontChanged(self);
+                TabOverview.fontChanged(self);
             }
             // A work area changed, as when the taskbar moves.
             if (wparam == win32.SPI_SETWORKAREA and self.quick) self.placeQuickAgain();
@@ -2573,6 +2588,7 @@ pub fn destroy(self: *Window) bool {
     // (`destroyPosted`). The command palette too.
     TitleDialog.close(self);
     CommandPalette.close(self);
+    TabOverview.close(self);
     search: while (true) {
         for (self.app.surfaces.items) |surface| {
             if (surface.window != self or surface.liveCore() == null) continue;
@@ -3142,8 +3158,10 @@ pub fn relayout(self: *Window) void {
     self.placeTerminals(client);
     self.placeOverlays();
     self.placeSearchBars();
-    // Above them all, or closed if it no longer fits.
+    // Above them all, or closed if it no longer fits. The tab overview
+    // covers them, and the bar.
     _ = CommandPalette.place(self);
+    _ = TabOverview.place(self);
 }
 
 /// Tell every terminal of every tab its new DPI, `dpi`: a child window
@@ -3173,12 +3191,14 @@ pub fn placeOverlays(self: *Window) void {
 }
 
 /// The window that gets the keyboard focus for `surface`: the field of its
-/// window's command palette while that is open and shows, which holds the
-/// keyboard until it closes (`CommandPalette.Palette.focusTarget`); else
+/// window's command palette, or of its tab overview, while that is open
+/// and shows, which holds the keyboard until it closes
+/// (`CommandPalette.Palette.focusTarget`); else
 /// its search field while the field had it last and shows, else the
 /// terminal (`SearchBar.Bar.focusTarget`).
 pub fn focusTarget(surface: *const Surface) win32.HWND {
     return surface.window.palette.focusTarget() orelse
+        surface.window.overview.focusTarget() orelse
         surface.search_bar.focusTarget() orelse
         surface.hwnd;
 }
@@ -3545,6 +3565,7 @@ pub fn applyTheme(self: *Window) void {
         }
     }
     CommandPalette.invalidate(self);
+    TabOverview.invalidate(self);
 }
 
 /// Whether a WM_SETTINGCHANGE is about the light or dark mode of apps,
