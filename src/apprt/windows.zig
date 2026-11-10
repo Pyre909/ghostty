@@ -399,6 +399,7 @@ test {
     _ = @import("windows/SaveDialog.zig");
     _ = @import("windows/ScrollBar.zig");
     _ = @import("windows/SearchBar.zig");
+    _ = @import("windows/State.zig");
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
     _ = @import("windows/TabBar.zig");
