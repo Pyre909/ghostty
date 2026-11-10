@@ -3006,11 +3006,16 @@ pub const App = struct {
             };
             return null;
         };
-        // Not one that is minimized, which Windows can leave in the
-        // foreground with no other window to give it to: nothing of it
-        // shows, and the toggle would hide nothing and show nothing. Nor
-        // an inspector's whose window is: the toggle then shows.
-        return if (win32.IsIconic(window.hwnd).toBool()) null else window;
+        // Not one that does not show: minimized, which Windows can leave
+        // in the foreground with no other window to give it to, or a
+        // quick terminal hidden or on its way out. The toggle would hide
+        // nothing and show nothing. Nor an inspector's whose window does
+        // not show: the toggle then shows.
+        const shows = if (window.quick)
+            window.quickShown()
+        else
+            !win32.IsIconic(window.hwnd).toBool();
+        return if (shows) window else null;
     }
 
     /// The frame that is `hwnd` or that owns it, as it owns a prompt or a
@@ -3666,8 +3671,6 @@ pub const App = struct {
         return true;
     }
 
-    /// `.float_window`, from `toggle_window_float_on_top`: made at once,
-    /// since it changes no terminal's size (`Window.setFloating`).
     /// The `.show_on_screen_keyboard` action: ask Windows for its touch
     /// keyboard for the terminal's window (`input_pane.tryShow`). As on
     /// GTK (`Application.showOnScreenKeyboard`), performed is the
@@ -3680,6 +3683,8 @@ pub const App = struct {
         return input_pane.tryShow(window.hwnd) catch false;
     }
 
+    /// `.float_window`, from `toggle_window_float_on_top`: made at once,
+    /// since it changes no terminal's size (`Window.setFloating`).
     fn floatWindow(target: apprt.Target, value: apprt.action.FloatWindow) bool {
         const window = switch (target) {
             .app => return false,
@@ -16291,6 +16296,16 @@ fn testToggleVisibilityQuick() !void {
     try toggle(&app, null);
     try std.testing.expect(!minimized(a));
     try std.testing.expect(!win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // Hidden and still the foreground window, as with its terminal's
+    // inspector in front: none of the windows in front shows, so the
+    // toggle shows, and goes on showing.
+    try toggle(&app, a.hwnd);
+    try std.testing.expect(minimized(a));
+    try toggle(&app, quick.hwnd);
+    try std.testing.expect(!minimized(a));
+    try toggle(&app, quick.hwnd);
+    try std.testing.expect(!minimized(a));
 }
 
 test "win32: toggle_quick_terminal makes the quick terminal, then hides and shows it" {
@@ -17927,6 +17942,23 @@ fn testQuickToggledBack() !void {
     app.createRequested();
     app.closeStrandedQuick();
     try std.testing.expect(quick.closing);
+    TestQuick.tearDown();
+    try std.testing.expect(app.quick == null);
+
+    // With the keybind back, one hidden otherwise than by the toggle is
+    // not the toggle's to show: it closes.
+    try TestHotkeys.apply(&app, &.{"global:ctrl+a=toggle_visibility"});
+    app.createRequested();
+    TestQuick.in_front = null;
+    try TestQuick.toggle(&app);
+    const again = app.quick orelse return error.TestUnexpectedResult;
+    again.hideQuick();
+    TestQuick.settle(again);
+    try std.testing.expect(!win32.IsWindowVisible(again.hwnd).toBool());
+    try std.testing.expectEqual(.no, again.hidden);
+    app.quick_check = true;
+    app.closeStrandedQuick();
+    try std.testing.expect(again.closing);
     TestQuick.tearDown();
     try std.testing.expect(app.quick == null);
 }
