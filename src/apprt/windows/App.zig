@@ -379,6 +379,12 @@ pub const App = struct {
     /// could not be had, and then nothing is restored.
     session: ?Session.Store,
 
+    /// Whether this process's end has come to where its windows are
+    /// saved (`saveSession`). They are saved there or not at all: after
+    /// it they are closing, and a second file would bring them back
+    /// twice.
+    session_ended: bool,
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -1021,6 +1027,7 @@ pub const App = struct {
             .ipc_instance = null,
             .ipc_class = null,
             .session = null,
+            .session_ended = false,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -1050,6 +1057,11 @@ pub const App = struct {
         // Then, so that the other programs have the keys back before the
         // teardown's waits for the terminals' threads.
         self.hotkeys.deinit(self.core_app.alloc, self.msg_hwnd);
+
+        // While the windows are still as the user left them. Those open
+        // here are a quit's: closing the last window leaves none, and a
+        // session's end has saved its own.
+        self.saveSession(.quit);
 
         // Every remaining window is destroyed with its terminals, as a
         // window close does it (Window.destroy), so that CoreApp.deinit,
@@ -1122,6 +1134,10 @@ pub const App = struct {
         win32.PostQuitMessage(0);
         // Even inside a handler: it touches neither the core nor a window.
         self.stopIpc();
+        // Here, before anything can close a window, and inside a handler
+        // too, where the windows outlive this call and `terminate` would
+        // find them: it only reads what this runtime keeps.
+        self.saveSession(.session);
         // One: the procedure of the frame this came to.
         if (handler_depth > 1 or !self.canTearDown()) {
             log.warn("the session ends inside a handler, a tick, a prompt, a teardown or a terminal's loop, so the windows close after it, with their toasts", .{});
@@ -1307,6 +1323,29 @@ pub const App = struct {
         const opened = Session.apply(self, .{ .version = Session.State.format_version, .windows = windows });
         log.info("opened saved windows count={} of={}", .{ opened, windows.len });
         return opened;
+    }
+
+    /// Save the open windows as the app ends, if the option says this
+    /// end saves them (`Session.saves`), to be opened by the next launch
+    /// (`restoreSession`). The first end to come here decides: none
+    /// after it saves anything. With no window to save nothing is
+    /// written, and what other processes saved is left as it is.
+    fn saveSession(self: *App, end: Session.End) void {
+        if (self.session_ended) return;
+        self.session_ended = true;
+        const store = self.session orelse return;
+        if (!Session.saves(self.config.@"window-save-state", end)) return;
+        var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+        defer arena.deinit();
+        const state = Session.snapshot(self, arena.allocator(), &Session.isLocalHost) catch |err| {
+            log.warn("cannot save the windows err={}", .{err});
+            return;
+        } orelse return;
+        store.save(arena.allocator(), state, &Session.isLocalHost) catch |err| {
+            log.warn("cannot save the windows err={}", .{err});
+            return;
+        };
+        log.info("saved the windows count={}", .{state.windows.len});
     }
 
     /// The store of this process's saved windows, for `run`: that of its
@@ -5571,6 +5610,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.ipc_instance = null;
     app.ipc_class = null;
     app.session = null;
+    app.session_ended = false;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -29707,4 +29747,177 @@ test "win32: a launch opens no more saved windows and terminals than its most" {
     }
     try std.testing.expectEqual(0, (try store.claim(arena, &testStateLocal)).len);
     try std.testing.expectEqualStrings("064-1.json\n065-1.json\n066-1.json\n", try testNames(arena, tmp.dir));
+}
+
+/// For tests of saving: an app with two windows open, (a | b) and c,
+/// and a directory of its own for its states, which `terminate` closes.
+const TestSave = struct {
+    tmp: std.testing.TmpDir,
+    core_app: CoreApp,
+    app: App,
+    arena_state: std.heap.ArenaAllocator,
+    terminated: bool,
+
+    fn init(self: *TestSave, mode: configpkg.Config.WindowSaveState) !void {
+        const alloc = std.testing.allocator;
+        self.core_app.alloc = alloc;
+        try testApp(&self.app, &self.core_app);
+        self.app.quit_timer = .off;
+        try registerClasses(self.app.hinstance);
+        self.terminated = false;
+        self.arena_state = .init(alloc);
+        self.tmp = std.testing.tmpDir(.{ .iterate = true });
+        self.app.session = .{ .dir = try self.tmp.dir.openDir(global.io(), ".", .{ .iterate = true }) };
+        self.app.config.@"window-save-state" = mode;
+    }
+
+    fn open(self: *TestSave) !void {
+        const alloc = std.testing.allocator;
+        const app = &self.app;
+        const f = try testFrame(app);
+        const a = try testPane(app, f);
+        const b = try testPane(app, f);
+        f.tab().tree = try testRow(alloc, &.{ a, b });
+        f.tab().tree.resizeInPlace(.root, 0.25);
+        f.tab().focused = b;
+        f.relayout();
+        try std.testing.expect(a.setPwd("C:\\a"));
+        try std.testing.expect(b.setTitleOverride("b"));
+        const g = try testFrame(app);
+        const c = try testPane(app, g);
+        g.tab().tree = try .init(alloc, c);
+        g.tab().focused = c;
+        try std.testing.expect(c.setPwd("C:\\c"));
+    }
+
+    fn deinit(self: *TestSave) void {
+        _ = testTakeQuit();
+        if (!self.terminated) {
+            if (self.app.session) |store| store.close();
+            testCleanup(&self.app);
+            unregisterClasses(self.app.hinstance);
+        }
+        self.tmp.cleanup();
+        self.arena_state.deinit();
+    }
+
+    fn terminate(self: *TestSave) void {
+        self.terminated = true;
+        self.app.terminate();
+    }
+
+    /// The windows as a state, as they are now, in a copy that outlives
+    /// them: a snapshot's strings are the terminals' own.
+    fn snapshot(self: *TestSave) !Session.State {
+        const arena = self.arena_state.allocator();
+        const state = (try Session.snapshot(&self.app, arena, &testStateLocal)) orelse
+            return error.TestUnexpectedResult;
+        return Session.State.decode(arena, try Session.State.encode(arena, state, &testStateLocal), &testStateLocal);
+    }
+
+    /// The one state saved, which is `want`; or none, for null.
+    fn expectSaved(self: *TestSave, want: ?Session.State) !void {
+        const arena = self.arena_state.allocator();
+        const names = try testNames(arena, self.tmp.dir);
+        const expected = want orelse return std.testing.expectEqualStrings("", names);
+        try std.testing.expectEqual(1, std.mem.count(u8, names, "\n"));
+        const name = names[0 .. names.len - 1];
+        var buf: [32]u8 = undefined;
+        const mine = try std.fmt.bufPrint(&buf, "{d}-", .{std.os.windows.GetCurrentProcessId()});
+        try std.testing.expectStringStartsWith(name, mine);
+        try std.testing.expectStringEndsWith(name, ".json");
+        const text = try self.tmp.dir.readFileAlloc(global.io(), name, arena, .unlimited);
+        try std.testing.expectEqualDeep(expected, try Session.State.decode(arena, text, &testStateLocal));
+    }
+};
+
+test "win32: a session's end saves the windows as they were, for the next launch to open" {
+    var t: TestSave = undefined;
+    try t.init(.always);
+    defer t.deinit();
+    try t.open();
+    const open = try t.snapshot();
+    try std.testing.expectEqual(2, open.windows.len);
+
+    t.app.endSession(0x1);
+    try std.testing.expectEqual(0, t.app.windows.items.len);
+    try t.expectSaved(open);
+
+    // A launch opens what was saved, which is then what it would save.
+    TestRestore.start();
+    defer TestRestore.stop();
+    try std.testing.expectEqual(2, t.app.restoreSession(&.{}));
+    try t.expectSaved(null);
+    const back = try t.snapshot();
+    try std.testing.expectEqual(2, back.windows.len);
+    for (open.windows, back.windows) |was, is| {
+        try std.testing.expectEqualDeep(was.tabs, is.tabs);
+        try std.testing.expectEqual(was.selected, is.selected);
+    }
+    TestRestore.closeAll(&t.app);
+
+    // `main` still runs `terminate`, which has nothing to save again.
+    t.terminate();
+    try t.expectSaved(null);
+}
+
+test "win32: a session's end inside a handler saves the windows once, though they close later" {
+    var t: TestSave = undefined;
+    try t.init(.always);
+    defer t.deinit();
+    try t.open();
+    const open = try t.snapshot();
+
+    // As Window.wndProc counts the handler the end comes to, with one
+    // more under it: the windows are left for `terminate`.
+    App.handler_depth += 2;
+    t.app.endSession(0x1);
+    App.handler_depth -= 2;
+    try std.testing.expectEqual(2, t.app.windows.items.len);
+    try t.expectSaved(open);
+
+    // What the user does between the two is not saved over it, nor
+    // beside it.
+    try std.testing.expect(t.app.windows.items[1].setWindowTitle("later"));
+    t.terminate();
+    try t.expectSaved(open);
+}
+
+test "win32: a quit saves the windows under window-save-state = always, and only there" {
+    for ([_]configpkg.Config.WindowSaveState{ .always, .default, .never }) |mode| {
+        var t: TestSave = undefined;
+        try t.init(mode);
+        defer t.deinit();
+        try t.open();
+        const open = try t.snapshot();
+        t.terminate();
+        try t.expectSaved(if (mode == .always) open else null);
+    }
+    // Nor does a session's end save them where the option says never.
+    var t: TestSave = undefined;
+    try t.init(.never);
+    defer t.deinit();
+    try t.open();
+    t.app.endSession(0x1);
+    t.terminate();
+    try t.expectSaved(null);
+}
+
+test "win32: an app with no window to save leaves the saved windows as they are" {
+    var t: TestSave = undefined;
+    try t.init(.always);
+    defer t.deinit();
+    const arena = t.arena_state.allocator();
+    // Another process's, saved before.
+    try testStateFile(arena, t.tmp.dir, "1-1.json", &.{try testStateWindow(arena, 1)}, 0);
+
+    // Only the quick terminal is open, which is not a window to save.
+    const f = try testFrame(&t.app);
+    const a = try testPane(&t.app, f);
+    f.tab().tree = try .init(std.testing.allocator, a);
+    f.tab().focused = a;
+    f.quick = true;
+    t.app.endSession(0x1);
+    t.terminate();
+    try std.testing.expectEqualStrings("1-1.json\n", try testNames(arena, t.tmp.dir));
 }

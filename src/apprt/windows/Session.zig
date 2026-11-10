@@ -384,6 +384,26 @@ pub fn launch(
     return .restore;
 }
 
+/// Why the app is closing its windows.
+pub const End = enum {
+    /// The `quit` action.
+    quit,
+
+    /// Windows shuts down, restarts, or signs the user out.
+    session,
+};
+
+/// Whether the windows open at `end` are saved, to come back at the next
+/// launch. Never those of a window the user closed: closing the last one
+/// leaves none open to save.
+pub fn saves(mode: configpkg.Config.WindowSaveState, end: End) bool {
+    _ = end;
+    return switch (mode) {
+        .always => true,
+        .default, .never => false,
+    };
+}
+
 /// Where the instances of one kind keep the states they save: a
 /// directory of their own (`key`) under the user's state directory,
 /// with a file for each process that saved one. A launch takes every
@@ -463,6 +483,24 @@ pub const Store = struct {
 
     pub fn close(self: Store) void {
         self.dir.close(global.io());
+    }
+
+    /// Write `state` as a file of this process's, whole or not at all: a
+    /// launch never reads one half written. The name is this process's
+    /// ID and the time, so that it is no other's, whatever became of a
+    /// process that had the ID before.
+    pub fn save(self: Store, arena: Allocator, state: State, isLocal: State.IsLocal) !void {
+        const io = global.io();
+        const text = try State.encode(arena, state, isLocal);
+        var name_buf: [max_name]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{d}-{x}" ++ state_suffix, .{
+            std.os.windows.GetCurrentProcessId(),
+            @as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())),
+        }) catch unreachable;
+        var file = try self.dir.createFileAtomic(io, name, .{ .replace = true });
+        defer file.deinit(io);
+        try file.file.writeStreamingAll(io, text);
+        try file.replace(io);
     }
 
     /// Delete every state there is, taken or not.
@@ -592,6 +630,15 @@ test "win32: a launch that names what to open leaves the saved windows for anoth
         try testing.expectEqual(Launch.fresh, launch(.default, true, case.arguments));
         try testing.expectEqual(Launch.fresh, launch(.always, true, case.arguments));
     }
+}
+
+test "win32: the windows are saved at the ends the option names" {
+    const testing = std.testing;
+    try testing.expect(saves(.always, .quit));
+    try testing.expect(saves(.always, .session));
+    try testing.expect(!saves(.never, .quit));
+    try testing.expect(!saves(.never, .session));
+    try testing.expect(!saves(.default, .quit));
 }
 
 test "win32: only the instances that share a class share their saved windows" {
