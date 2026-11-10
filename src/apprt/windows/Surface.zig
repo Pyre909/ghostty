@@ -1623,6 +1623,7 @@ pub const Surface = struct {
         state: apprt.ClipboardRequest,
         contents: []const terminal.clipboard.Content,
     ) !void {
+        var question: Question = .{};
         // MessageBoxW runs a nested modal loop. Win32 messages keep
         // pumping, but `core_app.tick` does not (`confirm` raises
         // App.prompt_depth), so the mailbox goes undrained for as long as
@@ -1636,7 +1637,7 @@ pub const Surface = struct {
         if (confirm(
             self.app,
             self.hwnd,
-            clipboardPrompt(state),
+            clipboardPrompt(state, &question),
             .cancel,
         )) {
             try self.core_surface.completeClipboardRequest(state, .{
@@ -1714,6 +1715,7 @@ pub const Surface = struct {
         contents: []const apprt.ClipboardContent,
         confirm_write: bool,
     ) !void {
+        var question: Question = .{};
         if (!self.supportsClipboard(clipboard_type)) return;
 
         // After a prompt, the text alone, as GTK and macOS write it.
@@ -1726,7 +1728,7 @@ pub const Surface = struct {
         if (confirm_write and !confirm(
             self.app,
             self.hwnd,
-            clipboardPrompt(.osc_52_write),
+            clipboardPrompt(.osc_52_write, &question),
             .cancel,
         )) return;
 

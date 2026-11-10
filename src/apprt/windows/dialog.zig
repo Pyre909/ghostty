@@ -38,6 +38,15 @@ pub const Question = struct {
         self.buf[len] = 0;
         return &self.buf;
     }
+
+    /// One message alone, as `text` gives two.
+    pub fn one(self: *Question, comptime msgid: [:0]const u8) win32.LPCWSTR {
+        const translation = std.mem.span(i18n._(msgid));
+        if (translation.len > max) return L(msgid);
+        const len = std.unicode.utf8ToUtf16Le(&self.buf, translation) catch return L(msgid);
+        self.buf[len] = 0;
+        return &self.buf;
+    }
 };
 
 /// The button of a `confirm` prompt that Enter and Space press.
@@ -173,9 +182,11 @@ test "win32: a question is asked in the user's language, or as written" {
     // With no catalog, and for what a catalog has nothing for.
     try testing.expectEqualSlices(u16, W("Close Tab?\n\nIt goes."), std.mem.span(q.text("Close Tab?", "It goes.")));
 
-    const long: [Question.max]u8 = @splat('x');
+    const fits: [Question.max]u8 = @splat('x');
+    const long: [Question.max + 1]u8 = @splat('x');
     const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
         .{ "Close Tab?", "Tab schlie\u{df}en?" },
+        .{ "Fits", &fits },
         .{ "Too long", &long },
     });
     defer alloc.free(catalog);
@@ -186,6 +197,11 @@ test "win32: a question is asked in the user's language, or as written" {
         W("Tab schlie\u{df}en?\n\nIt goes."),
         std.mem.span(q.text("Close Tab?", "It goes.")),
     );
+    try testing.expectEqualSlices(u16, W("Tab schlie\u{df}en?"), std.mem.span(q.one("Close Tab?")));
+    try testing.expectEqualSlices(u16, W("It goes."), std.mem.span(q.one("It goes.")));
+    // The longest one that fits, and one unit more.
+    try testing.expectEqual(Question.max, std.mem.span(q.one("Fits")).len);
+    try testing.expectEqualSlices(u16, W("Too long"), std.mem.span(q.one("Too long")));
     // One that does not fit is asked as written, whole.
     try testing.expectEqualSlices(u16, W("Too long\n\nIt goes."), std.mem.span(q.text("Too long", "It goes.")));
 }

@@ -48,6 +48,7 @@ const clipboard = @import("clipboard.zig");
 const Content = terminal.clipboard.Content;
 const Item = TitleDialog.Item;
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
+const Question = @import("dialog.zig").Question;
 const log = std.log.scoped(.win32);
 
 /// The user's answer.
@@ -135,8 +136,9 @@ pub fn ask(
 
     var template_buf: [template_capacity]u16 align(4) = undefined;
     var items: [max_items]Item = undefined;
+    var question: Question = .{};
     // The largest template fits, which a test checks.
-    const template = TitleDialog.build(&template_buf, self.spec(&items)) catch unreachable;
+    const template = TitleDialog.build(&template_buf, self.spec(&items, &question)) catch unreachable;
 
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
@@ -204,7 +206,9 @@ const Dialog = struct {
     /// The dialog's template: the heading and the note under it, the parts,
     /// the previews in one place, what a write leaves out, the box to
     /// remember, then Allow and Deny, the default, in dialog units.
-    fn spec(self: *const Dialog, items: *[max_items]Item) TitleDialog.Spec {
+    /// `question` holds the heading's text, so it has to live as long as
+    /// what this returns.
+    fn spec(self: *const Dialog, items: *[max_items]Item, question: *Question) TitleDialog.Spec {
         const child = win32.WS_CHILD | win32.WS_VISIBLE;
         const line = win32.SS_NOPREFIX | win32.SS_LEFTNOWORDWRAP | win32.SS_ENDELLIPSIS;
         const width = 300;
@@ -219,7 +223,7 @@ const Dialog = struct {
             .y = 7,
             .cx = inner,
             .cy = 9,
-            .text = std.mem.span(clipboard.clipboardPrompt(self.request)),
+            .text = std.mem.span(clipboard.clipboardPrompt(self.request, question)),
         });
         // The macOS app's second line (`ClipboardRequest.text`).
         list.appendAssumeCapacity(.{
@@ -725,7 +729,8 @@ test "win32: the Kitty clipboard prompt's template fits, every control on a DWOR
             .window = undefined,
         };
         var items: [max_items]Item = undefined;
-        const s = d.spec(&items);
+        var question: Question = .{};
+        const s = d.spec(&items, &question);
         const want: usize = if (request == .kitty_write) max_items else max_items - 1;
         try std.testing.expectEqual(want, s.items.len);
         var buf: [template_capacity]u16 align(4) = undefined;

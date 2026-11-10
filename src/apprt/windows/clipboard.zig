@@ -10,6 +10,7 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const App = @import("App.zig").App;
 const ConfirmDefault = @import("dialog.zig").ConfirmDefault;
+const Question = @import("dialog.zig").Question;
 const drop = @import("drop.zig");
 
 const log = std.log.scoped(.win32);
@@ -1389,9 +1390,15 @@ pub fn wideFromUtf8(alloc: Allocator, text: []const u8) (Allocator.Error || App.
 /// anywhere; a write replaces what the user copied. None may share wording,
 /// or the user approves one believing it is another. The GTK and macOS
 /// confirmation dialogs word them apart too.
-pub fn clipboardPrompt(state: apprt.ClipboardRequestType) win32.LPCWSTR {
+pub fn clipboardPrompt(state: apprt.ClipboardRequestType, question: *Question) win32.LPCWSTR {
     return switch (state) {
-        .paste => L("Pasting this text could be unsafe. Paste anyway?"),
+        // GTK's dialog, its heading and its body, which are translated.
+        // Its words for a read and a write say that the contents are
+        // shown below, which a message box does not do.
+        .paste => question.text(
+            "Warning: Potentially Unsafe Paste",
+            "Pasting this text into the terminal may be dangerous as it looks like some commands may be executed.",
+        ),
         .osc_52_read, .kitty_read => L("An application wants to read the clipboard. Allow it?"),
         .osc_52_write, .kitty_write => L("An application wants to write to the clipboard. Allow it?"),
 
@@ -1507,16 +1514,18 @@ fn expectListed(found: *const Found, want: []const []const u8) !void {
 }
 
 test "win32: clipboard prompts word pastes, reads and writes apart, and default to Cancel" {
-    const paste = std.mem.span(clipboardPrompt(.paste));
+    var question: Question = .{};
+    var other: Question = .{};
+    const paste = std.mem.span(clipboardPrompt(.paste, &question));
     const words = std.unicode.utf8ToUtf16LeStringLiteral;
     for ([_]apprt.ClipboardRequestType{ .osc_52_read, .kitty_read }) |state| {
-        const read = std.mem.span(clipboardPrompt(state));
+        const read = std.mem.span(clipboardPrompt(state, &other));
         try std.testing.expect(!std.mem.eql(u16, paste, read));
         try std.testing.expect(std.mem.indexOf(u16, read, words("aste")) == null);
         try std.testing.expect(std.mem.indexOf(u16, read, words("read")) != null);
     }
     for ([_]apprt.ClipboardRequestType{ .osc_52_write, .kitty_write }) |state| {
-        const write = std.mem.span(clipboardPrompt(state));
+        const write = std.mem.span(clipboardPrompt(state, &other));
         try std.testing.expect(std.mem.indexOf(u16, write, words("aste")) == null);
         try std.testing.expect(std.mem.indexOf(u16, write, words("read")) == null);
         try std.testing.expect(std.mem.indexOf(u16, write, words("write")) != null);

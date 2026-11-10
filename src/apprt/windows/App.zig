@@ -12679,6 +12679,7 @@ const TestKittyPrompt = struct {
 };
 
 test "win32: a Kitty clipboard read serves what was read, asking first, and answers once" {
+    var question: Question = .{};
     const alloc = std.testing.allocator;
     const clipboard = @import("clipboard.zig");
     var core_app: CoreApp = undefined;
@@ -12705,7 +12706,7 @@ test "win32: a Kitty clipboard read serves what was read, asking first, and answ
     const ClipboardDialog = @import("ClipboardDialog.zig");
     ClipboardDialog.test_run = &TestKittyPrompt.run;
     defer ClipboardDialog.test_run = null;
-    const read_prompt = clipboard.clipboardPrompt(.kitty_read);
+    const read_prompt = clipboard.clipboardPrompt(.kitty_read, &question);
 
     // Unasked, each type asked for under the name asked, and the listing.
     try writeClipboard(alloc, pane.hwnd, .of(&.{
@@ -12808,6 +12809,7 @@ test "win32: a Kitty clipboard read serves what was read, asking first, and answ
 }
 
 test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
+    var question: Question = .{};
     const alloc = std.testing.allocator;
     const clipboard = @import("clipboard.zig");
     var core_app: CoreApp = undefined;
@@ -12852,7 +12854,7 @@ test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
         const req = try testKittyWrite(alloc, .standard, "w");
         try std.testing.expectEqual(.started, try pane.clipboardRequest(.standard, .{ .kitty_write = req }));
     }
-    try TestKittyPrompt.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try TestKittyPrompt.expectAsked(clipboard.clipboardPrompt(.kitty_write, &question));
     try std.testing.expectEqual(2, TestKittyCore.completed);
     try std.testing.expect(TestKittyCore.confirmed);
 
@@ -12883,6 +12885,7 @@ test "win32: a Kitty clipboard write asks first, as a write, and answers once" {
 }
 
 test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers only an Allow with a password" {
+    var question: Question = .{};
     const alloc = std.testing.allocator;
     const clipboard = @import("clipboard.zig");
     const ClipboardDialog = @import("ClipboardDialog.zig");
@@ -12936,7 +12939,7 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
     try P.picked.part.expect(W("text/html (8 bytes)"));
     try std.testing.expectEqual(1, P.picked.previews);
     try P.picked.preview.expect(W("<b>h</b>"));
-    try P.expectAsked(clipboard.clipboardPrompt(.kitty_read));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_read, &question));
     try std.testing.expect(TestKittyCore.confirmed);
     try std.testing.expect(!TestKittyCore.remembered);
 
@@ -12997,7 +13000,7 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
         const n = try std.unicode.utf8ToUtf16Le(&wide, want);
         try P.picked.preview.expect(wide[0..n]);
     }
-    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write, &question));
 
     // A write of as many parts as the core commits, its types and then the
     // aliases that name new ones, lists every one: the last, the one
@@ -13017,7 +13020,7 @@ test "win32: the Kitty clipboard prompt shows each part, escaped, and remembers 
         try std.testing.expectEqual(max, P.first.count);
         try P.picked.part.expect(W("text/plain (6 bytes)"));
         try P.picked.preview.expect(W("landed"));
-        try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+        try P.expectAsked(clipboard.clipboardPrompt(.kitty_write, &question));
 
         const boxes = P.boxes;
         const denied = TestKittyCore.denied;
@@ -13100,6 +13103,7 @@ test "win32: a Kitty clipboard prompt's title bar follows its window's" {
     ClipboardDialog.test_run = &TestKittyPrompt.run;
     defer ClipboardDialog.test_run = null;
     const P = TestKittyPrompt;
+    var question: Question = .{};
 
     // A new configuration while the prompt is up re-themes it with the
     // frame.
@@ -13126,12 +13130,13 @@ test "win32: a Kitty clipboard prompt's title bar follows its window's" {
     try std.testing.expect(!window.dark_frame);
     try std.testing.expectEqual(@as(?bool, true), P.first.dark);
     try std.testing.expectEqual(@as(?bool, false), P.after.dark);
-    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write, &question));
     // Closed, it is forgotten.
     try std.testing.expect(window.clipboard_prompt == null);
 }
 
 test "win32: a Kitty clipboard prompt that can allocate nothing lists each part in its place and still answers" {
+    var question: Question = .{};
     const alloc = std.testing.allocator;
     const clipboard = @import("clipboard.zig");
     const ClipboardDialog = @import("ClipboardDialog.zig");
@@ -13187,7 +13192,7 @@ test "win32: a Kitty clipboard prompt that can allocate nothing lists each part 
     try P.picked.preview.expect(W("No preview available\r\n8 bytes"));
     const unwritten = P.first.unwritten orelse return error.TestUnexpectedResult;
     try unwritten.expect(W("Some types are not written: Windows has no clipboard format for them"));
-    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write, &question));
 
     // One part, named the same way.
     P.pick = null;
@@ -13197,7 +13202,7 @@ test "win32: a Kitty clipboard prompt that can allocate nothing lists each part 
     }
     try std.testing.expectEqual(0, P.first.count);
     try P.first.part.expect(W("Part 1 (4 bytes)"));
-    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write));
+    try P.expectAsked(clipboard.clipboardPrompt(.kitty_write, &question));
     try std.testing.expect(failing.has_induced_failure);
     try std.testing.expectEqual(0, failing.allocations);
 }
