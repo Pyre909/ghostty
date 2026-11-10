@@ -374,6 +374,11 @@ pub const App = struct {
     /// `ipc_instance` is.
     ipc_class: ?[:0]u8,
 
+    /// Where this instance's kind keeps its saved windows
+    /// (`window-save-state`), from `run` to `terminate`. Null where it
+    /// could not be had, and then nothing is restored.
+    session: ?Session.Store,
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -1015,6 +1020,7 @@ pub const App = struct {
             .ipc = null,
             .ipc_instance = null,
             .ipc_class = null,
+            .session = null,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -1062,6 +1068,11 @@ pub const App = struct {
         self.freeRequests();
 
         self.stopQuitTimer();
+
+        if (self.session) |store| {
+            self.session = null;
+            store.close();
+        }
 
         _ = win32.DestroyWindow(self.msg_hwnd);
         unregisterClasses(self.hinstance);
@@ -1238,8 +1249,19 @@ pub const App = struct {
     /// window's terminals name this instance's own pipe, as later ones do,
     /// and a `ghostty +new-tab` run in one of them reaches this instance,
     /// not the one that serves the shared pipe.
-    fn startUp(self: *App) !void {
+    ///
+    /// `arguments` are the process's, after its name: with them a launch
+    /// can ask for a window of its own, and then the saved ones are not
+    /// opened (`Session.launch`).
+    fn startUp(self: *App, arguments: []const [:0]const u8) !void {
         self.startIpc();
+
+        // The windows a session's end closed come back in place of the
+        // initial window, as macOS has them.
+        if (self.restoreSession(arguments) > 0) {
+            self.showConfigErrors();
+            return;
+        }
 
         // Create the initial window directly, not through the core's
         // `.new_window` as GTK's `activate` does. If it cannot open, the
@@ -1258,6 +1280,48 @@ pub const App = struct {
         self.showConfigErrors();
     }
 
+    /// Open the saved windows this launch is to have (`Session.launch`),
+    /// or delete them if it is to have none ever; how many opened. A
+    /// state is gone once it is taken, whatever comes of its windows.
+    fn restoreSession(self: *App, arguments: []const [:0]const u8) usize {
+        const store = self.session orelse return 0;
+        switch (Session.launch(
+            self.config.@"window-save-state",
+            self.config.@"initial-command" != null,
+            arguments,
+        )) {
+            .fresh => return 0,
+            .forget => {
+                store.forget();
+                return 0;
+            },
+            .restore => {},
+        }
+        var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+        defer arena.deinit();
+        const windows = store.claim(arena.allocator(), &Session.isLocalHost) catch |err| {
+            log.warn("cannot read the saved windows err={}", .{err});
+            return 0;
+        };
+        if (windows.len == 0) return 0;
+        const opened = Session.apply(self, .{ .version = Session.State.format_version, .windows = windows });
+        log.info("opened saved windows count={} of={}", .{ opened, windows.len });
+        return opened;
+    }
+
+    /// The store of this process's saved windows, for `run`: that of its
+    /// class, apart from an elevated instance's.
+    fn openSession(self: *App) void {
+        const identity = IpcServer.Identity.ofProcess() catch |err| {
+            log.warn("saving and restoring no windows, this process's token cannot be read err={}", .{err});
+            return;
+        };
+        self.session = Session.Store.open(self.core_app.alloc, self.config.class, identity.elevated) catch |err| {
+            log.warn("saving and restoring no windows, no directory for them err={}", .{err});
+            return;
+        };
+    }
+
     /// End a start that opened no window, for `err`: this instance's
     /// clients hear at once that it quits (and a new window's starts
     /// Ghostty), rather than waiting through the notice to be told it is
@@ -1272,7 +1336,16 @@ pub const App = struct {
         // The core learns the color scheme before the initial window, so
         // that its terminal starts with it.
         self.syncColorScheme();
-        try self.startUp();
+        self.openSession();
+        {
+            var arena: std.heap.ArenaAllocator = .init(self.core_app.alloc);
+            defer arena.deinit();
+            const arguments: []const [:0]const u8 = global.args().toSlice(arena.allocator()) catch |err| none: {
+                log.warn("cannot read the process's arguments err={}", .{err});
+                break :none &.{};
+            };
+            try self.startUp(arguments[@min(1, arguments.len)..]);
+        }
 
         var msg: win32.MSG = undefined;
         while (!self.quit) {
@@ -5497,6 +5570,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.ipc = null;
     app.ipc_instance = null;
     app.ipc_class = null;
+    app.session = null;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -28756,7 +28830,7 @@ fn testIpcInitialWindow() !void {
     var buf: [64]u8 = undefined;
     const class = try testIpcBase(&buf);
     app.config.class = class;
-    try app.startUp();
+    try app.startUp(&.{});
     try std.testing.expect(app.ipc_instance != null);
     try std.testing.expectEqual(1, app.windows.items.len);
     try std.testing.expectEqual(1, Made.count);
@@ -29337,4 +29411,300 @@ test "win32: what of a saved state cannot be made is left out, and the rest open
         TestRestore.closeAll(&app);
         try std.testing.expectEqual(0, app.surfaces.items.len);
     }
+}
+
+/// For tests: a window of one tab, `leaves` terminals side by side in
+/// it, each split's right side split again.
+fn testStateWindow(arena: std.mem.Allocator, leaves: u32) !Session.State.Window {
+    const nodes = try arena.alloc(Session.State.Node, 2 * leaves - 1);
+    for (nodes, 0..) |*node, i| {
+        const at: u32 = @intCast(i);
+        node.* = if (i % 2 == 0 and i + 1 < nodes.len)
+            .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = at + 1, .right = at + 2 } }
+        else
+            .{ .leaf = .{ .pwd = "C:\\" } };
+    }
+    const tabs = try arena.alloc(Session.State.Tab, 1);
+    tabs[0] = .{ .focused = @intCast(nodes.len - 1), .nodes = nodes };
+    return .{
+        .rect = .{ 40, 40, 1240, 740 },
+        .dpi = 96,
+        .maximized = false,
+        .fullscreen = false,
+        .selected = 0,
+        .tabs = tabs,
+    };
+}
+
+/// For tests: write `windows` as a state file `name` of `dir`, with
+/// spaces after it up to `size` bytes if that is more.
+fn testStateFile(
+    arena: std.mem.Allocator,
+    dir: std.Io.Dir,
+    name: []const u8,
+    windows: []const Session.State.Window,
+    size: usize,
+) !void {
+    const text = try Session.State.encode(arena, .{ .version = 1, .windows = windows }, &testStateLocal);
+    const data = try arena.alloc(u8, @max(size, text.len));
+    @memset(data, ' ');
+    @memcpy(data[0..text.len], text);
+    try dir.writeFile(global.io(), .{ .sub_path = name, .data = data });
+}
+
+/// For tests: the names in `dir`, sorted, each followed by a newline.
+fn testNames(arena: std.mem.Allocator, dir: std.Io.Dir) ![]const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(global.io())) |entry| try names.append(arena, try arena.dupe(u8, entry.name));
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    var out: std.ArrayList(u8) = .empty;
+    for (names.items) |name| {
+        try out.appendSlice(arena, name);
+        try out.append(arena, '\n');
+    }
+    return out.items;
+}
+
+test "win32: a launch opens the windows that were saved, once" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    app.session = .{ .dir = tmp.dir };
+
+    // Two processes each saved theirs: (a | b) and c in two tabs, and d.
+    const first = try TestRestore.onScreen(&app, arena, .{ .version = 1, .windows = &.{.{
+        .rect = .{ 0, 0, 1, 1 },
+        .dpi = 96,
+        .maximized = false,
+        .fullscreen = false,
+        .title = "one",
+        .selected = 1,
+        .tabs = &.{
+            .{ .focused = 2, .nodes = &.{
+                .{ .split = .{ .layout = .horizontal, .ratio = 0.25, .left = 1, .right = 2 } },
+                .{ .leaf = .{ .pwd = "C:\\a" } },
+                .{ .leaf = .{ .pwd = "C:\\b", .title = "b" } },
+            } },
+            .{ .title = "second", .focused = 0, .nodes = &.{.{ .leaf = .{ .pwd = "C:\\c" } }} },
+        },
+    }} });
+    var second = try TestRestore.onScreen(&app, arena, .{ .version = 1, .windows = &.{try testStateWindow(arena, 1)} });
+    second.windows = try arena.dupe(Session.State.Window, second.windows);
+    try testStateFile(arena, tmp.dir, "20-133.json", second.windows, 0);
+    try testStateFile(arena, tmp.dir, "10-133.json", first.windows, 0);
+    try tmp.dir.writeFile(global.io(), .{ .sub_path = "notes.txt", .data = "not a state" });
+
+    // No argument of these asks for a window of the launch's own.
+    try std.testing.expectEqual(2, app.restoreSession(&.{ "--class=com.example.one", "--font-size=14" }));
+    try std.testing.expectEqual(0, TestRestore.unrestored);
+    try TestRestore.expectDirectories(&app);
+    const both = try std.mem.concat(arena, Session.State.Window, &.{ first.windows, second.windows });
+    const back = (try Session.snapshot(&app, arena, &testStateLocal)).?;
+    try std.testing.expectEqualDeep(Session.State{ .version = 1, .windows = both }, back);
+    // The files went as they were taken, and nothing else did.
+    try std.testing.expectEqualStrings("notes.txt\n", try testNames(arena, tmp.dir));
+
+    // The next launch has none to open.
+    TestRestore.closeAll(&app);
+    try std.testing.expectEqual(0, app.restoreSession(&.{}));
+    try std.testing.expectEqual(0, app.windows.items.len);
+}
+
+test "win32: a launch with saved windows opens them in place of its initial window" {
+    try testOnOwnDesktop(testRestoreAtStartUp, .{});
+}
+
+fn testRestoreAtStartUp() !void {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    app.session = .{ .dir = tmp.dir };
+    var buf: [64]u8 = undefined;
+    app.config.class = try testIpcBase(&buf);
+
+    // A file that is no state, one as long as is never read, and what is
+    // no file of this: the launch has its initial window, and the two
+    // that could have been states are gone.
+    const saved: []const Session.State.Window = &.{ try testStateWindow(arena, 2), try testStateWindow(arena, 1) };
+    try tmp.dir.writeFile(global.io(), .{ .sub_path = "1-1.json", .data = "{\"version\":1,\"windows\":[" });
+    try testStateFile(arena, tmp.dir, "2-1.json", saved, Session.Store.max_bytes);
+    try tmp.dir.writeFile(global.io(), .{ .sub_path = "notes.txt", .data = "not a state" });
+    try tmp.dir.createDirPath(global.io(), "3-1.json");
+    try app.startUp(&.{});
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expectEqual(1, TestRestore.made);
+    try std.testing.expectEqual(1, TestRestore.unrestored);
+    try std.testing.expectEqualStrings("3-1.json\nnotes.txt\n", try testNames(arena, tmp.dir));
+    TestRestore.closeAll(&app);
+    app.stopIpc();
+
+    // One byte shorter is read: its windows are the launch's, and no
+    // initial window is beside them.
+    TestRestore.start();
+    try testStateFile(arena, tmp.dir, "2-1.json", saved, Session.Store.max_bytes - 1);
+    try app.startUp(&.{});
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expectEqual(3, TestRestore.made);
+    try std.testing.expectEqual(0, TestRestore.unrestored);
+    try std.testing.expectEqualStrings("3-1.json\nnotes.txt\n", try testNames(arena, tmp.dir));
+    TestRestore.closeAll(&app);
+    app.stopIpc();
+
+    // With no initial window asked for either, saved ones still open.
+    TestRestore.start();
+    app.config.@"initial-window" = false;
+    try testStateFile(arena, tmp.dir, "2-1.json", saved, 0);
+    try app.startUp(&.{});
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expectEqual(0, TestRestore.unrestored);
+    TestRestore.closeAll(&app);
+}
+
+test "win32: a launch that asks for a window of its own leaves the saved ones" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    app.session = .{ .dir = tmp.dir };
+    try testStateFile(arena, tmp.dir, "1-1.json", &.{try testStateWindow(arena, 1)}, 0);
+
+    try std.testing.expectEqual(0, app.restoreSession(&.{ "-e", "top" }));
+    try std.testing.expectEqual(0, app.restoreSession(&.{"--working-directory=C:\\src"}));
+    app.config.@"initial-command" = .{ .shell = "top" };
+    try std.testing.expectEqual(0, app.restoreSession(&.{}));
+    app.config.@"initial-command" = null;
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqualStrings("1-1.json\n", try testNames(arena, tmp.dir));
+
+    // They wait for a launch that asks for none.
+    try std.testing.expectEqual(1, app.restoreSession(&.{}));
+    try std.testing.expectEqualStrings("", try testNames(arena, tmp.dir));
+    TestRestore.closeAll(&app);
+}
+
+test "win32: a launch under window-save-state = never deletes the saved windows" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    TestRestore.start();
+    defer TestRestore.stop();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    app.session = .{ .dir = tmp.dir };
+    const saved: []const Session.State.Window = &.{try testStateWindow(arena, 1)};
+    try testStateFile(arena, tmp.dir, "1-1.json", saved, 0);
+    // One a launch took and never came to delete.
+    try testStateFile(arena, tmp.dir, "2-1.json.77.claimed", saved, 0);
+    try tmp.dir.writeFile(global.io(), .{ .sub_path = "notes.txt", .data = "not a state" });
+
+    app.config.@"window-save-state" = .never;
+    try std.testing.expectEqual(0, app.restoreSession(&.{}));
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expectEqualStrings("notes.txt\n", try testNames(arena, tmp.dir));
+
+    // And the launch after it, under another setting, has none.
+    app.config.@"window-save-state" = .always;
+    try std.testing.expectEqual(0, app.restoreSession(&.{}));
+}
+
+test "win32: a launch opens no more saved windows and terminals than its most" {
+    const alloc = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const store: Session.Store = .{ .dir = tmp.dir };
+
+    // Three files of as many windows as one holds: two files' worth
+    // open, and the third file is gone with the others.
+    const full = try arena.alloc(Session.State.Window, Session.State.max_windows);
+    for (full) |*window| window.* = try testStateWindow(arena, 1);
+    for ([_][]const u8{ "1-1.json", "2-1.json", "3-1.json" }) |name| {
+        try testStateFile(arena, tmp.dir, name, full, 0);
+    }
+    try std.testing.expectEqual(Session.Store.max_windows, (try store.claim(arena, &testStateLocal)).len);
+    try std.testing.expectEqualStrings("", try testNames(arena, tmp.dir));
+
+    // Two windows of half the terminals each are all a launch opens,
+    // and the one terminal more is left out.
+    const half = try testStateWindow(arena, Session.Store.max_terminals / 2);
+    const small = try testStateWindow(arena, 1);
+    try testStateFile(arena, tmp.dir, "1-1.json", &.{ half, half }, 0);
+    try testStateFile(arena, tmp.dir, "2-1.json", &.{small}, 0);
+    const most = try store.claim(arena, &testStateLocal);
+    try std.testing.expectEqual(2, most.len);
+    for (most) |window| try std.testing.expectEqual(half.tabs[0].nodes.len, window.tabs[0].nodes.len);
+    try std.testing.expectEqualStrings("", try testNames(arena, tmp.dir));
+
+    // A window with too many is left out, and one after it that has
+    // room still opens.
+    try testStateFile(arena, tmp.dir, "1-1.json", &.{ half, small }, 0);
+    try testStateFile(arena, tmp.dir, "2-1.json", &.{ half, small }, 0);
+    const windows = try store.claim(arena, &testStateLocal);
+    try std.testing.expectEqual(3, windows.len);
+    try std.testing.expectEqual(half.tabs[0].nodes.len, windows[0].tabs[0].nodes.len);
+    try std.testing.expectEqual(1, windows[1].tabs[0].nodes.len);
+    try std.testing.expectEqual(1, windows[2].tabs[0].nodes.len);
+
+    // No more files than its most are taken; the rest wait their turn.
+    var buf: [32]u8 = undefined;
+    for (0..Session.Store.max_files + 3) |i| {
+        const name = try std.fmt.bufPrint(&buf, "{d:0>3}-1.json", .{i});
+        try tmp.dir.writeFile(global.io(), .{ .sub_path = name, .data = "x" });
+    }
+    try std.testing.expectEqual(0, (try store.claim(arena, &testStateLocal)).len);
+    try std.testing.expectEqualStrings("064-1.json\n065-1.json\n066-1.json\n", try testNames(arena, tmp.dir));
 }

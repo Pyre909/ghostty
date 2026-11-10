@@ -9,11 +9,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const configpkg = @import("../../config.zig");
+const global = @import("../../global.zig");
 const internal_os = @import("../../os/main.zig");
 const App = @import("App.zig").App;
 pub const State = @import("State.zig");
 const Surface = @import("Surface.zig").Surface;
 const Tab = @import("Tab.zig");
+const toast = @import("toast.zig");
 const Window = @import("Window.zig");
 const win32 = @import("win32.zig");
 
@@ -152,7 +155,7 @@ fn emit(
     }
 }
 
-/// Open the windows `state` describes, which is one `State.check` took;
+/// Open the windows `state` describes, each as `State.check` took it;
 /// how many opened. Each comes back with its tabs in their order, its
 /// splits at their ratios, and its terminals as new shells in the
 /// directories saved, at the place `Window.placeRestored` gives it.
@@ -340,4 +343,292 @@ fn subtreeEnd(nodes: []const State.Node, index: u32) u32 {
         if (nodes[at] == .split) open += 2;
     }
     return at;
+}
+
+/// What a launch does with the states saved before it.
+pub const Launch = enum {
+    /// Opens their windows, in place of the initial window.
+    restore,
+
+    /// Leaves them for a later launch, and starts as if there were none.
+    fresh,
+
+    /// Deletes them, as `window-save-state = never` says a launch does.
+    forget,
+};
+
+/// What this launch does, from the option, whether an `initial-command`
+/// is set, and the process's arguments after its name. A launch that
+/// names what its window is to run, where, or under what title opens
+/// that window, and the saved ones wait: they would come back beside
+/// it, or instead of it, to a user who asked for one terminal.
+pub fn launch(
+    mode: configpkg.Config.WindowSaveState,
+    initial_command: bool,
+    arguments: []const [:0]const u8,
+) Launch {
+    if (mode == .never) return .forget;
+    if (initial_command) return .fresh;
+    for (arguments) |arg| {
+        // What follows it is the command's, whatever it looks like.
+        if (std.mem.eql(u8, arg, "-e")) return .fresh;
+        for ([_][]const u8{
+            "--command=",
+            "--initial-command=",
+            "--working-directory=",
+            "--title=",
+        }) |prefix| {
+            if (std.mem.startsWith(u8, arg, prefix)) return .fresh;
+        }
+    }
+    return .restore;
+}
+
+/// Where the instances of one kind keep the states they save: a
+/// directory of their own (`key`) under the user's state directory,
+/// with a file for each process that saved one. A launch takes every
+/// file there is (`claim`), so that the windows of each process that a
+/// session's end closed come back, in whichever launch is first.
+pub const Store = struct {
+    dir: std.Io.Dir,
+
+    /// The most files one launch takes; the rest wait for the next.
+    pub const max_files = 64;
+
+    /// A file this long or longer is not read.
+    pub const max_bytes = 256 * 1024;
+
+    /// The most windows, and terminals in them, one launch opens from
+    /// the files it takes.
+    pub const max_windows = 32;
+    pub const max_terminals = 128;
+
+    const state_suffix = ".json";
+    const claimed_suffix = ".claimed";
+
+    /// The longest name of a state file. Those this runtime writes are
+    /// far shorter; a longer one is not its own.
+    const max_name = 96;
+
+    const max_class = 64;
+    const elevated_suffix = ".elevated";
+
+    pub const KeyBuf = [@max("class-".len + max_class, "hash-".len + 16, toast.app_id.len) + elevated_suffix.len]u8;
+
+    /// The name of the directory for the instances of `class`: those
+    /// that would serve each other's requests share their saved
+    /// windows, and no others. An elevated instance has its own, since
+    /// what it opens runs as administrator, and a file the user's other
+    /// programs can write must not say what that is.
+    ///
+    /// A class is the name as it is only where that is a file name on
+    /// every volume, and never one Windows reads as another: its
+    /// prefix keeps it from a device's name (`CON`), and one ending in
+    /// a dot, which Windows drops, is hashed like the rest.
+    pub fn key(buf: *KeyBuf, class: ?[]const u8, elevated: bool) []const u8 {
+        const tail = if (elevated) elevated_suffix else "";
+        const c = class orelse
+            return std.fmt.bufPrint(buf, "{s}{s}", .{ toast.app_id, tail }) catch unreachable;
+        if (plainClass(c))
+            return std.fmt.bufPrint(buf, "class-{s}{s}", .{ c, tail }) catch unreachable;
+        return std.fmt.bufPrint(buf, "hash-{x:0>16}{s}", .{ std.hash.Wyhash.hash(0, c), tail }) catch unreachable;
+    }
+
+    fn plainClass(class: []const u8) bool {
+        if (class.len == 0 or class.len > max_class) return false;
+        if (class[class.len - 1] == '.') return false;
+        for (class) |c| switch (c) {
+            'A'...'Z', 'a'...'z', '0'...'9', '.', '_', '-' => {},
+            else => return false,
+        };
+        return true;
+    }
+
+    /// The store of this process's kind, its directory made if there
+    /// was none.
+    pub fn open(alloc: Allocator, class: ?[]const u8, elevated: bool) !Store {
+        const io = global.io();
+        var key_buf: KeyBuf = undefined;
+        const parent = "ghostty/window-state/";
+        var subdir_buf: [parent.len + @typeInfo(KeyBuf).array.len]u8 = undefined;
+        const subdir = std.fmt.bufPrint(&subdir_buf, parent ++ "{s}", .{key(&key_buf, class, elevated)}) catch unreachable;
+        var environ_map = try global.environMap();
+        defer environ_map.deinit();
+        const path = try internal_os.xdg.state(io, alloc, &environ_map, .{ .subdir = subdir });
+        defer alloc.free(path);
+        const cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(io, path);
+        return .{ .dir = try cwd.openDir(io, path, .{ .iterate = true }) };
+    }
+
+    pub fn close(self: Store) void {
+        self.dir.close(global.io());
+    }
+
+    /// Delete every state there is, taken or not.
+    pub fn forget(self: Store) void {
+        const io = global.io();
+        var it = self.dir.iterate();
+        while (it.next(io) catch |err| stop: {
+            log.warn("cannot list the saved window states err={}", .{err});
+            break :stop null;
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, state_suffix) and
+                !std.mem.endsWith(u8, entry.name, claimed_suffix)) continue;
+            self.dir.deleteFile(io, entry.name) catch |err| {
+                log.warn("cannot delete a saved window state err={}", .{err});
+            };
+        }
+    }
+
+    /// Take the states there are, and give their windows, each as
+    /// `State.check` took it, in `arena`.
+    ///
+    /// A file is taken by renaming it to a name of this process's, which
+    /// one process only can do: two launches at once never both open
+    /// its windows. It is deleted as soon as it is read, before any of
+    /// it is used, so that a state whose windows end the process is
+    /// not met again by the next launch. One that cannot be read, is
+    /// too long or is not a state is deleted the same, with a warning.
+    pub fn claim(self: Store, arena: Allocator, isLocal: State.IsLocal) Allocator.Error![]const State.Window {
+        const io = global.io();
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = self.dir.iterate();
+        while (it.next(io) catch |err| stop: {
+            log.warn("cannot list the saved window states err={}", .{err});
+            break :stop null;
+        }) |entry| {
+            if (entry.kind != .file) continue;
+            if (entry.name.len > max_name or !std.mem.endsWith(u8, entry.name, state_suffix)) continue;
+            if (names.items.len == max_files) {
+                log.warn("more window states are saved than one launch takes, the rest wait", .{});
+                break;
+            }
+            try names.append(arena, try arena.dupe(u8, entry.name));
+        }
+        // The order they come back in is not the directory's to choose.
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+
+        var windows: std.ArrayList(State.Window) = .empty;
+        var terminals: usize = 0;
+        var dropped: usize = 0;
+        const pid = std.os.windows.GetCurrentProcessId();
+        for (names.items) |name| {
+            var buf: [max_name + 32]u8 = undefined;
+            const mine = std.fmt.bufPrint(&buf, "{s}.{d}" ++ claimed_suffix, .{ name, pid }) catch unreachable;
+            self.dir.rename(name, self.dir, mine, io) catch |err| {
+                // Another launch has it.
+                if (err != error.FileNotFound) log.warn("cannot take a saved window state err={}", .{err});
+                continue;
+            };
+            const read = self.dir.readFileAlloc(io, mine, arena, .limited(max_bytes));
+            self.dir.deleteFile(io, mine) catch |err| {
+                log.warn("cannot delete a saved window state err={}", .{err});
+            };
+            const text = read catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.warn("ignored a saved window state that cannot be read err={}", .{err});
+                    continue;
+                },
+            };
+            const state = State.decode(arena, text, isLocal) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    log.warn("ignored a saved window state that is not one err={}", .{err});
+                    continue;
+                },
+            };
+            for (state.windows) |window| {
+                const count = terminalsOf(window);
+                if (windows.items.len == max_windows or terminals + count > max_terminals) {
+                    dropped += 1;
+                    continue;
+                }
+                terminals += count;
+                try windows.append(arena, window);
+            }
+        }
+        if (dropped > 0) log.warn("more windows were saved than one launch opens, left out count={}", .{dropped});
+        return windows.items;
+    }
+
+    fn terminalsOf(window: State.Window) usize {
+        var count: usize = 0;
+        for (window.tabs) |t| {
+            for (t.nodes) |node| count += @intFromBool(node == .leaf);
+        }
+        return count;
+    }
+};
+
+test "win32: a launch that names what to open leaves the saved windows for another" {
+    const testing = std.testing;
+    const Case = struct { arguments: []const [:0]const u8, launch: Launch };
+    for ([_]Case{
+        .{ .arguments = &.{}, .launch = .restore },
+        .{ .arguments = &.{"--class=com.example.one"}, .launch = .restore },
+        .{ .arguments = &.{ "--font-size=14", "--window-save-state=always" }, .launch = .restore },
+        // Not the options, only names that begin as they do.
+        .{ .arguments = &.{ "--title-report=true", "--working-directory", "--e" }, .launch = .restore },
+        .{ .arguments = &.{ "-e", "top" }, .launch = .fresh },
+        .{ .arguments = &.{ "--class=com.example.one", "-e", "top" }, .launch = .fresh },
+        .{ .arguments = &.{"--command=top"}, .launch = .fresh },
+        .{ .arguments = &.{"--initial-command=top"}, .launch = .fresh },
+        .{ .arguments = &.{"--working-directory=C:\\src"}, .launch = .fresh },
+        .{ .arguments = &.{"--title=build"}, .launch = .fresh },
+    }) |case| {
+        errdefer std.debug.print("arguments={any}\n", .{case.arguments});
+        try testing.expectEqual(case.launch, launch(.default, false, case.arguments));
+        try testing.expectEqual(case.launch, launch(.always, false, case.arguments));
+        // The option alone says whether they are deleted.
+        try testing.expectEqual(Launch.forget, launch(.never, false, case.arguments));
+        try testing.expectEqual(Launch.forget, launch(.never, true, case.arguments));
+        try testing.expectEqual(Launch.fresh, launch(.default, true, case.arguments));
+        try testing.expectEqual(Launch.fresh, launch(.always, true, case.arguments));
+    }
+}
+
+test "win32: only the instances that share a class share their saved windows" {
+    const testing = std.testing;
+    const long: [65]u8 = @splat('a');
+    const classes = [_]?[]const u8{
+        null,
+        "com.example.one",
+        "com.example.two",
+        // One Windows would read as the first, with its dot dropped.
+        "com.example.one.",
+        "..",
+        "CON",
+        "a b",
+        "a/b",
+        "a\\..\\b",
+        "",
+        long[0..64],
+        &long,
+    };
+    var bufs: [classes.len * 2]Store.KeyBuf = undefined;
+    var keys: [classes.len * 2][]const u8 = undefined;
+    for (classes, 0..) |class, i| {
+        keys[2 * i] = Store.key(&bufs[2 * i], class, false);
+        keys[2 * i + 1] = Store.key(&bufs[2 * i + 1], class, true);
+    }
+    for (keys, 0..) |key, i| {
+        errdefer std.debug.print("key={s}\n", .{key});
+        // A name of one directory, and not one Windows changes.
+        try testing.expect(key.len > 0 and key.len <= @typeInfo(Store.KeyBuf).array.len);
+        for (key) |c| try testing.expect(std.ascii.isAlphanumeric(c) or c == '.' or c == '_' or c == '-');
+        try testing.expect(key[key.len - 1] != '.');
+        try testing.expect(!std.ascii.eqlIgnoreCase(key, "con") and !std.ascii.startsWithIgnoreCase(key, "con."));
+        for (keys[i + 1 ..]) |other| try testing.expect(!std.ascii.eqlIgnoreCase(key, other));
+    }
+    var buf: Store.KeyBuf = undefined;
+    try testing.expectEqualStrings("class-com.example.one", Store.key(&buf, "com.example.one", false));
+    try testing.expectEqualStrings("class-com.example.one.elevated", Store.key(&buf, "com.example.one", true));
+    try testing.expectEqualStrings(toast.app_id, Store.key(&buf, null, false));
 }
