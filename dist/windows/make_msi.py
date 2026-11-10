@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import collections
 import hashlib
 import os
 import re
@@ -504,12 +505,18 @@ def check(
 ) -> None:
     """Fails unless the package is what this script means to build, read
     back from the package itself: above all what `finish` changed, and
-    what makes the install one for the current user."""
+    what makes the install one for the current user. A folder, its
+    component and a file are found by what the package's tables say of
+    them, not by the ids `source` gave them."""
     problems = []
 
     def want(what: str, got: object, expected: object) -> None:
         if got != expected:
             problems.append(f"{what} is {got!r}, not {expected!r}")
+
+    def long(name: str) -> str:
+        # A name is "short|long" when it is not a short one.
+        return name.rpartition("|")[2]
 
     info = summary(tools, msi)
     want("the platform", info.get("Template"), f"{PLATFORMS[app.arch]};1033")
@@ -530,11 +537,35 @@ def check(
     want(
         "ProductVersion", properties.get("ProductVersion"), product_version(app.version)
     )
-    bin_dir = f"dir{app.dirs().index(EXE.rpartition('/')[0])}"
+    directories = {r["Directory"]: r for r in table(tools, msi, "Directory")}
+    want(
+        "where it installs",
+        sorted(
+            (r["Directory_Parent"], long(r["DefaultDir"]))
+            for r in directories.values()
+            if "UserPrograms" in (r["Directory"], r["Directory_Parent"])
+        ),
+        [("LocalAppDataFolder", "Programs"), ("UserPrograms", PRODUCT)],
+    )
+    # Each folder under the one it installs to, by its path under that
+    # one ("" for itself), and the component that installs it.
+    folders = {}
+    for d in directories:
+        parts, at = [], d
+        while (
+            at in directories and directories[at]["Directory_Parent"] != "UserPrograms"
+        ):
+            parts.append(long(directories[at]["DefaultDir"]))
+            at = directories[at]["Directory_Parent"]
+        if at in directories:
+            folders["/".join(reversed(parts))] = d
+    components = table(tools, msi, "Component")
+    component_of = {r["Directory_"]: r["Component"] for r in components}
+    bin_dir = folders.get(EXE.rpartition("/")[0])
     want(
         "the environment",
         [tuple(r.values()) for r in table(tools, msi, "Environment")],
-        [("UserPath", "=-PATH", f"[~];[{bin_dir}]", f"cmp{bin_dir[3:]}")],
+        [("UserPath", "=-PATH", f"[~];[{bin_dir}]", component_of.get(bin_dir))],
     )
     sequence = {
         r["Action"]: int(r["Sequence"])
@@ -551,11 +582,23 @@ def check(
             for r in registry
             if r["Key"] == TOAST_KEY
         ],
-        [("-", "", "cmp0")],
+        [("-", "", component_of.get(folders.get("")))],
     )
-    # A file's name is "short|long" when the name is not a short one.
-    names = sorted(r["FileName"].rpartition("|")[2] for r in table(tools, msi, "File"))
-    want("the files", names, sorted(f.rpartition("/")[2] for f in app.files))
+    # Every file where the zip has it and of the size it has there: the
+    # ones that are not, the package's first and then the zip's.
+    path_of = {d: path for path, d in folders.items()}
+    folder_of = {r["Component"]: path_of.get(r["Directory_"]) for r in components}
+    got = collections.Counter(
+        (
+            f"{folder_of.get(r['Component_'])}/{long(r['FileName'])}".lstrip("/"),
+            int(r["FileSize"]),
+        )
+        for r in table(tools, msi, "File")
+    )
+    expected = collections.Counter((f, i.file_size) for f, i in app.files.items())
+    differ = sorted((got - expected).elements()) + sorted((expected - got).elements())
+    if differ:
+        problems.append(f"the package's files and the zip's differ in {differ!r}")
     if problems:
         raise Error("the package is not as meant:\n  " + "\n  ".join(problems))
 

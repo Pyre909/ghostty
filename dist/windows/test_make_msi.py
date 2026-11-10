@@ -799,7 +799,18 @@ class TestCheck(Temp):
         product = properties["ProductCode"].strip("{}")
         package = mm.summary(found, good)["Revision number (UUID)"].strip("{}")
         mm.check(found, good, app, product, package)
-        gone = mm.table(found, good, "File")[0]
+        files = {
+            r["FileName"].rpartition("|")[2]: r["File"]
+            for r in mm.table(found, good, "File")
+        }
+        folders = {
+            r["DefaultDir"].rpartition("|")[2]: r["Directory"]
+            for r in mm.table(found, good, "Directory")
+        }
+        components = {
+            r["Directory_"]: r["Component"] for r in mm.table(found, good, "Component")
+        }
+        top, bin_dir = folders["Ghostty"], folders["bin"]
         for n, (statement, problem) in enumerate(
             [
                 (
@@ -823,9 +834,53 @@ class TestCheck(Temp):
                     "UPDATE `Registry` SET `Root` = 2",
                     "the registry roots is {'2'}, not {'1'}",
                 ),
+                # Another folder than the one under the user's programs.
                 (
-                    f"DELETE FROM `File` WHERE `File` = '{gone['File']}'",
-                    "the files is [",
+                    "UPDATE `Directory` SET `Directory_Parent` = 'TARGETDIR' WHERE `Directory` = 'UserPrograms'",
+                    "where it installs is [('TARGETDIR', 'Programs'), ('UserPrograms', 'Ghostty')], not [('LocalAppDataFolder', ",
+                ),
+                # The files: one gone, one in another folder, and one of
+                # another size than the zip's.
+                (
+                    f"DELETE FROM `File` WHERE `File` = '{files['LICENSE.txt']}'",
+                    "the package's files and the zip's differ in [('LICENSE.txt', 8)]",
+                ),
+                (
+                    f"UPDATE `File` SET `Component_` = '{components[bin_dir]}' WHERE `File` = '{files['README.txt']}'",
+                    "the package's files and the zip's differ in [('bin/README.txt', 7), ('README.txt', 7)]",
+                ),
+                (
+                    f"UPDATE `File` SET `FileSize` = 9 WHERE `File` = '{files['ghostty.exe']}'",
+                    "the package's files and the zip's differ in [('bin/ghostty.exe', 9), ('bin/ghostty.exe', 88)]",
+                ),
+                # What make_msi.py adds to the package, there but wrong:
+                # the PATH entry of another folder, or removed with
+                # another folder's component, an action out of its
+                # place, and a notification key that is made, not
+                # deleted.
+                (
+                    f"UPDATE `Environment` SET `Value` = '[~];[{top}]'",
+                    f"the environment is [('UserPath', '=-PATH', '[~];[{top}]', ",
+                ),
+                (
+                    f"UPDATE `Environment` SET `Component_` = '{components[top]}'",
+                    f"the environment is [('UserPath', '=-PATH', '[~];[{bin_dir}]', '{components[top]}')], not ",
+                ),
+                (
+                    "UPDATE `InstallExecuteSequence` SET `Sequence` = 6600 WHERE `Action` = 'RemoveEnvironmentStrings'",
+                    "RemoveEnvironmentStrings's place is 6600, not 3300",
+                ),
+                (
+                    "UPDATE `InstallExecuteSequence` SET `Sequence` = 1 WHERE `Action` = 'WriteEnvironmentStrings'",
+                    "WriteEnvironmentStrings's place is 1, not 5200",
+                ),
+                (
+                    "UPDATE `Registry` SET `Name` = '+' WHERE `Registry` = 'regToast'",
+                    "the notification key's row is [('+', '', ",
+                ),
+                (
+                    f"UPDATE `Registry` SET `Component_` = '{components[bin_dir]}' WHERE `Registry` = 'regToast'",
+                    f"the notification key's row is [('-', '', '{components[bin_dir]}')]",
                 ),
             ]
         ):
