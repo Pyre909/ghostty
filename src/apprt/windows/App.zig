@@ -11521,6 +11521,51 @@ test "win32: a parked split goes with its window, its tab, and the terminals it 
     }
 }
 
+test "win32: a split parked out of a tab ends when the tab moves to another window" {
+    // It was parked in the frame the tab leaves, and its tab's tree, now
+    // another window's, is not this entry's to put back.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    _ = try testTab(&app, t.window);
+    TestUndo.close(t.b);
+    try std.testing.expect(t.b.parked);
+
+    try std.testing.expect((try app.moveTabToNewWindow(&t.a.core_surface, null)).? == .whole);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expect(!try app.performAction(.app, .undo, {}));
+    testPump();
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expect(TestUndo.has(&app, t.a));
+    try std.testing.expectEqual(2, app.windows.items.len);
+}
+
+test "win32: nothing closed in the quick terminal is kept for undo" {
+    // It hides whole: what came back would come back unseen.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    t.window.quick = true;
+    defer t.window.quick = false;
+    TestUndo.close(t.b);
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+}
+
 test "win32: a parked terminal is refused what would show, prompt or move the focus" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
