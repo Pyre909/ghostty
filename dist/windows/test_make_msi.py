@@ -38,6 +38,12 @@ WHEN = (2026, 1, 2, 3, 4, 6)
 WIX = "{" + mm.WIX + "}"
 
 
+def time_of(i: int) -> tuple[int, int, int, int, int, int]:
+    """A time for a zip's entry `i`, the latest of them (03:04:12) for
+    the third, so that neither the first nor the last entry has it."""
+    return (2026, 1, 2, 3, 4, 12 if i == 2 else 2 * (i % 6))
+
+
 def pe(machine: int) -> bytes:
     head = bytearray(64)
     head[:2] = b"MZ"
@@ -165,12 +171,11 @@ class TestReadApp(Temp):
         dest = self.tmp / "ghostty-1.4.1-windows-x86_64.zip"
         with zipfile.ZipFile(dest, "w") as zf:
             for i, (name, data) in enumerate(sorted(app_files().items())):
-                when = (2026, 1, 2, 3, 4, 2 * i)
-                zf.writestr(zipfile.ZipInfo(f"{dest.stem}/{name}", when), data)
+                zf.writestr(zipfile.ZipInfo(f"{dest.stem}/{name}", time_of(i)), data)
         with zipfile.ZipFile(dest) as zf:
             app = mm.read_app(zf)
-        # 2026-01-02T03:04:14Z: the eighth file's time, read as UTC.
-        self.assertEqual(app.when(), 1767323054)
+        # 2026-01-02T03:04:12Z: the third file's time, read as UTC.
+        self.assertEqual(app.when(), 1767323052)
 
     def test_folder_name(self) -> None:
         for top, why in [
@@ -582,6 +587,20 @@ class TestPackage(unittest.TestCase):
     def test_reproducible(self) -> None:
         self.assertEqual(self.x64.read_bytes(), self.again.read_bytes())
 
+    def test_beside_the_zip_unless_told(self) -> None:
+        z = app_zip(self.tmp / "beside")
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(mm.main([str(z)]), 0)
+        msi = z.with_suffix(".msi")
+        self.assertEqual(printed.getvalue(), f"{mz.sha256(msi)}  {msi.name}\n")
+        # The two and nothing else, and the package the same bytes as
+        # the one made of that zip in another folder.
+        self.assertEqual(
+            sorted(p.name for p in z.parent.iterdir()), sorted([msi.name, z.name])
+        )
+        self.assertEqual(msi.read_bytes(), self.x64.read_bytes())
+
     def test_platform(self) -> None:
         self.assertEqual(mm.summary(self.tools, self.x64)["Template"], "x64;1033")
         self.assertEqual(mm.summary(self.tools, self.arm)["Template"], "Arm64;1033")
@@ -806,9 +825,8 @@ class TestPackage(unittest.TestCase):
         expected = {}
         with zipfile.ZipFile(dest, "w") as zf:
             for i, (name, data) in enumerate(sorted(app_files().items())):
-                when = (2026, 1, 2, 3, 4, 2 * i)
-                zf.writestr(zipfile.ZipInfo(f"{top}/{name}", when), data)
-                expected[name.rpartition("/")[2]] = when
+                zf.writestr(zipfile.ZipInfo(f"{top}/{name}", time_of(i)), data)
+                expected[name.rpartition("/")[2]] = time_of(i)
         msi = build(dest, self.tmp / "times")
         # The cabinet's entries are named by the File table's keys. Each
         # is 16 bytes, among them a date and a time as MS-DOS packs them,
@@ -840,7 +858,7 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(got, expected)
         # And the package says it was made at the latest of them.
         self.assertEqual(
-            mm.summary(self.tools, msi)["Created"], "Fri Jan  2 03:04:14 2026"
+            mm.summary(self.tools, msi)["Created"], "Fri Jan  2 03:04:12 2026"
         )
 
     def test_shortcut(self) -> None:
