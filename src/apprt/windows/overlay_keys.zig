@@ -1,6 +1,6 @@
-//! Keys typed into an overlay's field, the search bar's or the command
-//! palette's: which of the terminal's bindings still act while the field
-//! has the keyboard focus.
+//! Keys typed into an overlay's field, the search bar's, the command
+//! palette's or the tab overview's: which of the terminal's bindings still
+//! act while the field has the keyboard focus.
 //!
 //! GTK's overlays keep the window's accelerators working while their entry
 //! has the focus; the entry takes everything else. Here the field's own

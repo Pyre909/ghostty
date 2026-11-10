@@ -1813,7 +1813,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     for (commands) |c| {
         if (supported(c.action)) commands_kept += 1;
     }
-    // Some are left out: the GTK inspector, undo, the tab overview.
+    // Some are left out: the GTK inspector, for one.
     try testing.expect(commands_kept < commands.len);
     try testing.expectEqual(commands_kept + jumps.len, entries.items.len);
 

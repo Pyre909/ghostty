@@ -13,7 +13,6 @@
 //! one they would have to be told they show.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const input = @import("../../input.zig");
@@ -23,7 +22,6 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const SearchBar = @import("SearchBar.zig");
-const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
@@ -70,10 +68,7 @@ pub const Metrics = struct {
         };
     }
 
-    fn scale(v: i32, dpi: u32) i32 {
-        const base: i32 = @intCast(win32.USER_DEFAULT_SCREEN_DPI);
-        return @divTrunc(v * @as(i32, @intCast(dpi)) + @divTrunc(base, 2), base);
-    }
+    const scale = SearchBar.Metrics.scale;
 };
 
 /// What a point of the overview is over. A card is named by its place
@@ -139,10 +134,12 @@ pub const Layout = struct {
         return 2 * m.pad + m.header;
     }
 
+    /// A card's height: its preview and its title's line.
     pub fn cardHeight(self: Layout) i32 {
         return self.preview_height + self.m.title;
     }
 
+    /// The rows the cards fill, the last perhaps in part.
     pub fn rows(self: Layout) usize {
         return (self.count + self.columns - 1) / self.columns;
     }
@@ -167,18 +164,21 @@ pub const Layout = struct {
         return .{ .left = left, .top = top, .right = left + self.card_width, .bottom = top + self.cardHeight() };
     }
 
+    /// Card `i`'s preview, above its title.
     pub fn previewRect(self: Layout, i: usize) RECT {
         var r = self.cardRect(i);
         r.bottom = r.top + self.preview_height;
         return r;
     }
 
+    /// Card `i`'s title line, under its preview.
     pub fn titleRect(self: Layout, i: usize) RECT {
         var r = self.cardRect(i);
         r.top += self.preview_height;
         return r;
     }
 
+    /// Card `i`'s close glyph, at the right of its title line.
     pub fn closeRect(self: Layout, i: usize) RECT {
         const t = self.titleRect(i);
         const right = t.right - self.m.inset;
@@ -186,6 +186,7 @@ pub const Layout = struct {
         return .{ .left = right - self.m.close, .top = top, .right = right, .bottom = top + self.m.close };
     }
 
+    /// The "+", at the right of the field.
     pub fn plusRect(self: Layout) RECT {
         const right = self.width - self.m.pad;
         return .{ .left = right - self.m.header, .top = self.m.pad, .right = right, .bottom = self.m.pad + self.m.header };
@@ -201,6 +202,8 @@ pub const Layout = struct {
         };
     }
 
+    /// What the point is over. A card's close glyph comes before the
+    /// card, and a card scrolled out of the grid is not hit.
     pub fn hit(self: Layout, x: i32, y: i32) Hit {
         if (contains(self.plusRect(), x, y)) return .plus;
         if (!contains(self.gridRect(), x, y)) return .none;
@@ -352,6 +355,7 @@ pub fn fieldKey(vk: win32.WPARAM, shift: bool, field_empty: bool) Key {
 // minimized or goes. Not when the frame is deactivated: a tab closed from
 // it may ask first, and it is still there after the answer.
 
+/// The overview's window class, registered with the app's others.
 pub const class_name = "GhosttyTabOverviewClass";
 
 /// The field's placeholder in the user's language, for the program's
@@ -360,8 +364,9 @@ pub var placeholder: Question = .{};
 
 /// What the overview shows of a tab: its label, as the bar's
 /// (`Window.labelText`), its focused terminal's directory, and the
-/// shortcut of its `goto_tab`, or "".
+/// shortcut of its `goto_tab`, or ""; and which tab it is (`Tab.id`).
 const Shown = struct {
+    id: u64,
     title: []const u8,
     pwd: ?[]const u8,
     shortcut: []const u8,
@@ -384,16 +389,23 @@ pub const Overview = struct {
     kept: std.ArrayList(u32) = .empty,
     /// The selected card, among those kept.
     selected: usize = 0,
-    /// The tab the window showed at the last `sync`, by its address, only
-    /// ever compared: when another shows, the selection goes to it.
-    shown_tab: usize = 0,
+    /// The tab the window showed at the last `sync` (`Tab.id`), 0 before
+    /// the first: when another shows, the selection goes to it.
+    shown_tab: u64 = 0,
     scroll: i32 = 0,
-    /// What the pointer is over, what the left button went down on, and
-    /// the card the middle one did: each acts if its button comes up on
-    /// the same.
+    /// What is left of a high-resolution wheel's turn, in 120ths of a
+    /// pixel, as the tab bar keeps it.
+    wheel_rem: i32 = 0,
+    /// What the pointer is over, and what the left button went down on,
+    /// which acts if the button comes up on the same. A card is a place
+    /// in the grid, and the tabs may change under a held button, so the
+    /// press also names its card's tab (`pressed_tab`), and acts only if
+    /// that tab is still the one there. `middle` is the tab the middle
+    /// button went down on, likewise.
     hover: Hit = .none,
     pressed: Hit = .none,
-    middle: ?usize = null,
+    pressed_tab: u64 = 0,
+    middle: ?u64 = null,
     /// Whether the window has asked for the WM_MOUSELEAVE that ends
     /// `hover`.
     tracking_leave: bool = false,
@@ -446,6 +458,20 @@ pub const Overview = struct {
     pub fn selectedTab(self: *const Overview) ?usize {
         if (self.selected >= self.kept.items.len) return null;
         return self.kept.items[self.selected];
+    }
+
+    /// Which tab the card at `at` was at the last `sync`, 0 for none.
+    fn idAt(self: *const Overview, at: usize) u64 {
+        if (at >= self.kept.items.len) return 0;
+        return self.tabs[self.kept.items[at]].id;
+    }
+
+    /// Which tab `hit` is on, 0 for none.
+    fn idOf(self: *const Overview, hit: Hit) u64 {
+        return switch (hit) {
+            .card, .close => |at| self.idAt(at),
+            .none, .plus => 0,
+        };
     }
 
     /// Free everything, as its window is destroyed.
@@ -566,14 +592,17 @@ pub fn fontChanged(window: *Window) void {
 }
 
 /// Read the window's tabs again, and which of them the query keeps. The
-/// selection stays on its place among the cards, or the last of them, so
-/// that closing card after card with Delete goes down the grid; it goes to
-/// the shown tab's card when the window shows another tab than it did.
+/// selection stays on its tab, wherever that tab's card now is; once the
+/// tab is gone, or no longer kept, it stays on its place among the cards,
+/// or the last of them, so that closing card after card with Delete goes
+/// down the grid. It goes to the shown tab's card when the window shows
+/// another tab than it did.
 ///
 /// Out of memory, it shows no card until the next one: it never closes
 /// here, nor moves the focus, as this runs wherever a tab changes.
 fn sync(window: *Window) void {
     const o = &window.overview;
+    const selected_tab = o.idAt(o.selected);
     if (o.arena) |*a| a.deinit();
     o.arena = null;
     o.tabs = &.{};
@@ -585,7 +614,12 @@ fn sync(window: *Window) void {
         o.tabs = &.{};
         o.kept.clearRetainingCapacity();
     };
-    const shown_tab = @intFromPtr(window.tab());
+    if (selected_tab != 0) {
+        for (0..o.kept.items.len) |at| {
+            if (o.idAt(at) == selected_tab) o.selected = at;
+        }
+    }
+    const shown_tab = window.tab().id;
     if (shown_tab != o.shown_tab) {
         o.shown_tab = shown_tab;
         selectShown(window);
@@ -608,6 +642,7 @@ fn read(window: *Window) !void {
             if (CommandPalette.shortcutLabel(&w.writer, trigger) catch return error.OutOfMemory) shortcut = w.written();
         }
         tab.* = .{
+            .id = t.id,
             .title = try window.labelText(a, t),
             .pwd = if (t.focused) |s| if (s.pwd) |pwd| try a.dupe(u8, pwd) else null else null,
             .shortcut = shortcut,
@@ -710,11 +745,15 @@ fn move(window: *Window, dir: Dir) void {
 }
 
 /// Show the tab at `index`, as a click on its label in the bar does
-/// (`Window.clickTab`), which keeps a zoom in it; the overview closes
-/// first, so that the focus goes to the tab's terminal.
+/// (`Window.clickTab`), which keeps a zoom in it, then close. In that
+/// order: while the overview is open the focus stays in its field
+/// (`Window.focusTarget`), so closing hands it straight to the new tab's
+/// terminal. Closed first, the tab being left would get the focus for a
+/// moment, which clears its bell and tells its program of a focus it
+/// never had.
 fn choose(window: *Window, index: usize) void {
-    close(window);
     window.clickTab(index);
+    close(window);
 }
 
 /// Close the tab at `index`, as its close glyph in the bar does: it may
@@ -827,8 +866,17 @@ pub fn wndProc(
             sync(window);
             const l = layoutOf(window) orelse return 0;
             const notch = @divTrunc(l.cardHeight(), 3);
-            const by = @divTrunc(@as(i32, win32.wheelDelta(wparam)) * notch, win32.WHEEL_DELTA);
-            o.scroll = std.math.clamp(o.scroll - by, 0, l.max_scroll);
+            const delta: i32 = win32.wheelDelta(wparam);
+            // A high-resolution wheel's fractions of a notch add up, as
+            // in the tab bar; a turn the other way drops what was left.
+            if (o.wheel_rem != 0 and (delta < 0) != (o.wheel_rem < 0)) o.wheel_rem = 0;
+            o.wheel_rem += delta * notch;
+            const pixels = @divTrunc(o.wheel_rem, win32.WHEEL_DELTA);
+            o.wheel_rem -= pixels * win32.WHEEL_DELTA;
+            const scroll = std.math.clamp(o.scroll - pixels, 0, l.max_scroll);
+            // At either end nothing is kept for the way on.
+            if (pixels != 0 and scroll == o.scroll) o.wheel_rem = 0;
+            o.scroll = scroll;
             _ = win32.InvalidateRect(hwnd, null, .FALSE);
             return 0;
         },
@@ -839,7 +887,11 @@ pub fn wndProc(
                 var tme: win32.TRACKMOUSEEVENT = .{ .cbSize = @sizeOf(win32.TRACKMOUSEEVENT), .dwFlags = win32.TME_LEAVE, .hwndTrack = hwnd, .dwHoverTime = 0 };
                 o.tracking_leave = win32.TrackMouseEvent(&tme).toBool();
             }
-            setHover(window, hitOf(window, lparam));
+            // Against the cards as last read, with no `sync`: every
+            // change to them draws the overview again, and the highlight
+            // names no tab.
+            const hit: Hit = if (layoutOf(window)) |l| l.hit(win32.xLparam(lparam), win32.yLparam(lparam)) else .none;
+            setHover(window, hit);
             return 0;
         },
 
@@ -852,6 +904,7 @@ pub fn wndProc(
         win32.WM_LBUTTONDOWN => {
             if (!current or !o.open) return 0;
             o.pressed = hitOf(window, lparam);
+            o.pressed_tab = o.idOf(o.pressed);
             if (o.pressed != .none) _ = win32.SetCapture(hwnd);
             _ = win32.InvalidateRect(hwnd, null, .FALSE);
             return 0;
@@ -860,22 +913,25 @@ pub fn wndProc(
         win32.WM_LBUTTONUP => {
             if (!current or !o.open) return 0;
             const pressed = o.pressed;
+            const pressed_tab = o.pressed_tab;
             o.pressed = .none;
             if (pressed == .none) return 0;
             const hit = hitOf(window, lparam);
-            _ = win32.ReleaseCapture();
+            const same = std.meta.eql(hit, pressed) and o.idOf(hit) == pressed_tab;
+            if (o.middle == null) _ = win32.ReleaseCapture();
             _ = win32.InvalidateRect(hwnd, null, .FALSE);
             // Nothing of the overview is touched after: it may be closed.
-            if (std.meta.eql(hit, pressed)) act(window, hit);
+            if (same) act(window, hit);
             return 0;
         },
 
         win32.WM_MBUTTONDOWN => {
             if (!current or !o.open) return 0;
-            o.middle = switch (hitOf(window, lparam)) {
-                .card, .close => |at| at,
-                .none, .plus => null,
-            };
+            const id = o.idOf(hitOf(window, lparam));
+            o.middle = if (id != 0) id else null;
+            // Captured, as the tab bar's, so that its release is seen
+            // wherever it comes.
+            if (o.middle != null) _ = win32.SetCapture(hwnd);
             return 0;
         },
 
@@ -883,27 +939,34 @@ pub fn wndProc(
             if (!current or !o.open) return 0;
             const middle = o.middle orelse return 0;
             o.middle = null;
-            switch (hitOf(window, lparam)) {
-                .card, .close => |at| if (at == middle) act(window, .{ .close = at }),
+            const hit = hitOf(window, lparam);
+            const same = o.idOf(hit) == middle;
+            if (o.pressed == .none) _ = win32.ReleaseCapture();
+            switch (hit) {
+                .card, .close => |at| if (same) act(window, .{ .close = at }),
                 .none, .plus => {},
             }
             return 0;
         },
 
-        // The tabs under a press may be others once the capture is taken
-        // away, by a prompt for one.
+        // The capture went elsewhere, to a prompt for one of the tabs or
+        // to another window: neither press acts.
         win32.WM_CAPTURECHANGED => {
+            if (@as(usize, @bitCast(lparam)) == @intFromPtr(hwnd)) return 0;
             o.pressed = .none;
+            o.middle = null;
             return 0;
         },
 
         win32.WM_DESTROY => {
             if (window.bar.overview == hwnd) window.bar.overview = null;
-            if (current) o.free(window.app.core_app.alloc);
             return 0;
         },
 
+        // Freed here, after the field is destroyed, which has the font
+        // and is painted with the brush until then.
         win32.WM_NCDESTROY => {
+            if (current) o.free(window.app.core_app.alloc);
             _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, 0);
         },
 
@@ -955,9 +1018,9 @@ fn editProc(
                 CommandPalette.closedByKey(window.app, lparam);
                 return 0;
             },
+            // The field tells of its change itself (EN_CHANGE).
             .clear => {
                 _ = win32.SetWindowTextW(hwnd, L(""));
-                textChanged(window);
                 return 0;
             },
             .close_tab => {

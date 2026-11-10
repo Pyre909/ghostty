@@ -2043,6 +2043,8 @@ pub const Surface = struct {
         };
         if (self.pwd) |old| alloc.free(old);
         self.pwd = copy;
+        // The tab overview filters by it, and nothing else shows it.
+        if (self.window.overview.hwnd) |hwnd| _ = win32.InvalidateRect(hwnd, null, .FALSE);
         return true;
     }
 

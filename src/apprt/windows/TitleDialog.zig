@@ -58,6 +58,7 @@ const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const Tab = @import("Tab.zig");
+const TabOverview = @import("TabOverview.zig");
 const App = @import("App.zig").App;
 const label = @import("dialog.zig").label;
 const i18n = @import("../../os/main.zig").i18n;
@@ -122,7 +123,7 @@ pub fn open(surface: *Surface, target: Target) bool {
         .tab => window.tabOf(surface) orelse return false,
     };
     // The prompt holds the frame disabled, the tab overview with it.
-    @import("TabOverview.zig").close(window);
+    TabOverview.close(window);
 
     // The field starts with the title shown now: the override, else the
     // program's, as GTK starts it (surface.zig `promptTitle`, tab.zig

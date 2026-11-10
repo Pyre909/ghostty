@@ -247,7 +247,7 @@ pub fn tab(self: *const Window) *Tab {
 pub fn appendTab(self: *Window, alloc: Allocator) Allocator.Error!*Tab {
     try self.tabs.ensureUnusedCapacity(alloc, 1);
     const t = try alloc.create(Tab);
-    t.* = .{};
+    t.* = .{ .id = Tab.newId() };
     self.tabs.appendAssumeCapacity(t);
     return t;
 }
@@ -375,7 +375,7 @@ fn tabFor(self: *Window, surface: *Surface) Allocator.Error!*Tab {
     try self.tabs.ensureUnusedCapacity(alloc, 1);
     const t = try alloc.create(Tab);
     errdefer alloc.destroy(t);
-    t.* = .{ .tree = try .init(alloc, surface), .focused = surface };
+    t.* = .{ .id = Tab.newId(), .tree = try .init(alloc, surface), .focused = surface };
     return t;
 }
 

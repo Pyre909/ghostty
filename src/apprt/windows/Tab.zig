@@ -8,6 +8,21 @@ const Tab = @This();
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 
+/// The next `id`. Tabs are made on the UI thread only.
+var next_id: u64 = 0;
+
+/// A new tab's `id`.
+pub fn newId() u64 {
+    next_id += 1;
+    return next_id;
+}
+
+/// What tells this tab from every other the process ever made, where a
+/// tab is remembered across messages without being held (the tab
+/// overview): an address would be another tab's once this one is freed.
+/// Given by `Window` where it makes the tab; never 0 there.
+id: u64 = 0,
+
 /// The tab's terminals: never empty from `Window.create` until the frame's
 /// WM_DESTROY empties it.
 tree: Window.Tree = .empty,

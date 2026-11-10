@@ -21939,7 +21939,7 @@ fn overviewKey(window: *Window, vk: win32.WPARAM) void {
 /// `window`'s overview.
 fn overviewClick(window: *Window, down: win32.UINT, up: win32.UINT, r: win32.RECT) void {
     const hwnd = window.overview.hwnd.?;
-    const at = testPoint(@divTrunc(r.left + r.right, 2), @divTrunc(r.top + r.bottom, 2));
+    const at = testMid(r);
     _ = win32.SendMessageW(hwnd, down, 0, at);
     _ = win32.SendMessageW(hwnd, up, 0, at);
 }
@@ -22231,11 +22231,7 @@ test "win32: a click in the tab overview shows a tab, closes one or opens a new 
     try toggleOverview(&app, t.panes[1]);
     l = TabOverview.layoutOf(window).?;
     const hwnd = o.hwnd.?;
-    const at = struct {
-        fn f(r: win32.RECT) win32.LPARAM {
-            return testPoint(@divTrunc(r.left + r.right, 2), @divTrunc(r.top + r.bottom, 2));
-        }
-    }.f;
+    const at = testMid;
     _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, at(l.previewRect(0)));
     _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, at(l.previewRect(2)));
     try std.testing.expect(o.hwnd != null);
@@ -22259,13 +22255,267 @@ test "win32: a click in the tab overview shows a tab, closes one or opens a new 
     try std.testing.expect(window.tab().focused == t.panes[1]);
     try std.testing.expect(o.hwnd != null);
 
-    // The wheel scrolls no further than the cards go: one row fits.
-    _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, @as(win32.WPARAM, @bitCast(@as(isize, -120 * 3))) << 16, 0);
+    // The wheel scrolls nothing where every card shows.
+    _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, testWheel(-360), 0);
+    try std.testing.expectEqual(0, o.scroll);
+}
+
+test "win32: the tab overview's selection and a held press follow their tab, not its place" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+    // Somewhere no card is: a press there only reads the tabs again.
+    const nowhere = testPoint(1, 1);
+
+    // The third tab shown, the second's card selected. The first tab
+    // goes: the selection is still on "two", now the first card.
+    window.selectTab(2);
+    try toggleOverview(&app, t.panes[2]);
+    const hwnd = o.hwnd.?;
+    overviewKey(window, win32.VK_LEFT);
+    try std.testing.expectEqualStrings("two", o.tabs[o.selectedTab().?].title);
+    try std.testing.expect(window.closeTabs(0, .this));
+    testPump();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, nowhere);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, nowhere);
+    try std.testing.expectEqual(0, o.selected);
+    try std.testing.expectEqualStrings("two", o.tabs[o.selectedTab().?].title);
+
+    // The selected card's own tab goes: the selection keeps its place,
+    // on the card that took it. The shown tab is the other, so it is not
+    // the window showing another tab that moved it.
+    const d = try testTab(&app, window);
+    try std.testing.expect(d.setTitle("four"));
+    window.selectTab(0);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, nowhere);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, nowhere);
+    try std.testing.expectEqual(0, o.selected);
+    overviewKey(window, win32.VK_RIGHT);
+    const gone = o.tabs[o.selectedTab().?].title;
+    try std.testing.expectEqual(1, o.selected);
+    overviewKey(window, win32.VK_DELETE);
+    testPump();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, nowhere);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, nowhere);
+    try std.testing.expectEqual(1, o.selected);
+    try std.testing.expect(!std.mem.eql(u8, gone, o.tabs[o.selectedTab().?].title));
+    try std.testing.expectEqual(0, window.selected);
+
+    // The window shows another tab: its card is selected.
+    overviewKey(window, win32.VK_LEFT);
+    try std.testing.expectEqual(0, o.selected);
+    window.selectTab(1);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, nowhere);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, nowhere);
+    try std.testing.expectEqual(1, o.selected);
+    try std.testing.expect(o.hwnd != null);
+
+    // A press held on the first card while its tab goes: the release, on
+    // the card that took its place, shows no tab and closes none. So for
+    // the middle button.
+    const e = try testTab(&app, window);
+    try std.testing.expect(e.setTitle("five"));
+    try std.testing.expectEqual(3, window.tabs.items.len);
+    window.selectTab(2);
+    const first = testMid(TabOverview.layoutOf(window).?.previewRect(0));
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONDOWN, 0, first);
+    try std.testing.expect(o.pressed == .card);
+    try std.testing.expect(window.closeTabs(0, .this));
+    testPump();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    _ = win32.SendMessageW(hwnd, win32.WM_LBUTTONUP, 0, first);
+    try std.testing.expect(o.hwnd != null);
+    try std.testing.expectEqual(1, window.selected);
+
+    // A press the capture is taken from acts no more. Two tabs, so
+    // that a close would mark its tab and not close the window.
+    _ = win32.SendMessageW(hwnd, win32.WM_MBUTTONDOWN, 0, first);
+    try std.testing.expect(o.middle != null);
+    _ = win32.SendMessageW(hwnd, win32.WM_CAPTURECHANGED, 0, 0);
+    _ = win32.SendMessageW(hwnd, win32.WM_MBUTTONUP, 0, first);
+    for (window.tabs.items) |x| try std.testing.expect(!x.closing);
+
+    _ = win32.SendMessageW(hwnd, win32.WM_MBUTTONDOWN, 0, first);
+    try std.testing.expect(o.middle != null);
+    try std.testing.expect(window.closeTabs(0, .this));
+    testPump();
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    _ = win32.SendMessageW(hwnd, win32.WM_MBUTTONUP, 0, first);
+    try std.testing.expect(o.middle == null);
+    try std.testing.expect(!window.tabs.items[0].closing);
+}
+
+test "win32: a directory change redraws the tab overview, and Enter shows the card that was selected" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+    window.selectTab(2);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    try toggleOverview(&app, t.panes[2]);
+    const hwnd = o.hwnd.?;
+    _ = win32.SetWindowTextW(o.edit.?, L("src"));
+    try std.testing.expectEqualSlices(u32, &.{1}, o.kept.items);
+
+    // The first tab's terminal moves into a directory the query keeps:
+    // the overview has something to draw, and its selection is still the
+    // second tab's card, which Enter shows.
+    _ = win32.ValidateRect(hwnd, null);
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    try std.testing.expect(t.panes[0].setPwd("C:\\src\\lib"));
+    try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    overviewKey(window, win32.VK_RETURN);
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(1, window.selected);
+}
+
+test "win32: a card chosen in the tab overview never gives the tab being left the focus" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const Seen = struct {
+        var old: ?win32.HWND = null;
+        var old_hits: usize = 0;
+        fn seen(hwnd: win32.HWND) void {
+            FocusSeen.seen(hwnd);
+            if (hwnd == old) old_hits += 1;
+        }
+    };
+    Window.test_set_focus = &Seen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+
+    // Enter on another tab's card: the focus goes from the field to that
+    // tab's terminal, and the shown tab's, behind the overview, is never
+    // given it on the way. The key's release is withheld from the
+    // terminal that took the focus.
+    try toggleOverview(&app, t.panes[0]);
+    Seen.old = t.panes[0].hwnd;
+    Seen.old_hits = 0;
+    overviewKey(window, win32.VK_RIGHT);
+    try std.testing.expectEqual(0, t.panes[1].ime.swallow_up.count());
+    overviewKey(window, win32.VK_RETURN);
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(1, window.selected);
+    try std.testing.expect(FocusSeen.last == t.panes[1].hwnd);
+    try std.testing.expectEqual(0, Seen.old_hits);
+    try std.testing.expectEqual(1, t.panes[1].ime.swallow_up.count());
+
+    // So for a click.
+    try toggleOverview(&app, t.panes[1]);
+    Seen.old = t.panes[1].hwnd;
+    Seen.old_hits = 0;
+    const l = TabOverview.layoutOf(window).?;
+    overviewClick(window, win32.WM_LBUTTONDOWN, win32.WM_LBUTTONUP, l.previewRect(2));
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expect(FocusSeen.last == t.panes[2].hwnd);
+    try std.testing.expectEqual(0, Seen.old_hits);
+
+    // Escape with nothing typed closes, the shown tab's terminal with the
+    // focus, the key's release withheld from it.
+    try toggleOverview(&app, t.panes[2]);
+    try std.testing.expectEqual(0, t.panes[2].ime.swallow_up.count());
+    overviewKey(window, win32.VK_ESCAPE);
+    try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(2, window.selected);
+    try std.testing.expect(FocusSeen.last == t.panes[2].hwnd);
+    try std.testing.expectEqual(1, t.panes[2].ime.swallow_up.count());
+}
+
+test "win32: the tab overview's wheel scrolls its rows, a fraction of a notch at a time, and its \"+\" asks for a tab" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const o = &window.overview;
+    // One column, so three rows, more than show.
+    const m: TabOverview.Metrics = .init(Window.dpiOf(&app, window.hwnd));
+    testResize(window, 2 * m.pad + m.card_min + 8 * m.gap, 2 * m.card_min);
+    window.relayout();
+    try toggleOverview(&app, t.panes[0]);
+    const hwnd = o.hwnd.?;
+    const l = TabOverview.layoutOf(window).?;
+    try std.testing.expectEqual(1, l.columns);
+    try std.testing.expect(l.max_scroll > 0);
+    const notch = @divTrunc(l.cardHeight(), 3);
+    try std.testing.expect(notch < l.max_scroll);
+
+    // A notch down scrolls a third of a card.
+    _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    try std.testing.expectEqual(notch, o.scroll);
+    _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, testWheel(120), 0);
+    try std.testing.expectEqual(0, o.scroll);
+    // A notch in 120 parts scrolls as far: none of them is lost.
+    for (0..120) |_| _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, testWheel(-1), 0);
+    try std.testing.expectEqual(notch, o.scroll);
+    // No further than the cards go, either way.
+    for (0..40) |_| _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
+    try std.testing.expectEqual(l.max_scroll, o.scroll);
+    for (0..40) |_| _ = win32.SendMessageW(hwnd, win32.WM_MOUSEWHEEL, testWheel(120), 0);
     try std.testing.expectEqual(0, o.scroll);
 
-    // "+" closes the overview and asks for a new tab, as the bar's does.
-    overviewClick(window, left[0], left[1], l.plusRect());
+    // "+" closes the overview and asks for a new tab from the shown
+    // tab's terminal, as the bar's does. Live, so that it is asked.
+    t.panes[0].core_state = .live;
+    defer t.panes[0].core_state = .none;
+    t.panes[0].core_surface.rt_app = &app;
+    overviewClick(window, win32.WM_LBUTTONDOWN, win32.WM_LBUTTONUP, l.plusRect());
     try std.testing.expect(o.hwnd == null);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .tab);
+    app.requests.clearRetainingCapacity();
 }
 
 test "win32: toggle_command_palette opens the command palette over its window, and closes it" {
