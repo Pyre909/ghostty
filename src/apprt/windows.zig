@@ -404,6 +404,7 @@ test {
     _ = @import("windows/Surface.zig");
     _ = @import("windows/Tab.zig");
     _ = @import("windows/TabBar.zig");
+    _ = @import("windows/TabOverview.zig");
     _ = @import("windows/TitleDialog.zig");
     _ = @import("windows/Transparency.zig");
     _ = @import("windows/Undo.zig");
