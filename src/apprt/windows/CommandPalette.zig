@@ -115,6 +115,8 @@ pub fn supported(key: Binding.Action.Key) bool {
         .quit,
         .inspector,
         .show_on_screen_keyboard,
+        .undo,
+        .redo,
         => true,
 
         // Nothing to do.
@@ -123,13 +125,10 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no tab overview, GTK inspector, updater, undo or secure input
-        // here.
+        // no tab overview, GTK inspector, updater or secure input here.
         .toggle_tab_overview,
         .close_all_windows,
         .check_for_updates,
-        .undo,
-        .redo,
         .show_gtk_inspector,
         .toggle_secure_input,
         => false,
@@ -1844,7 +1843,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
                 try testing.expectEqualStrings("Ctrl+Shift+I", e.shortcut);
             }
             try testing.expect(!std.mem.eql(u8, e.action_key, "show_gtk_inspector"));
-            try testing.expect(!std.mem.eql(u8, e.action_key, "undo"));
+            try testing.expect(!std.mem.eql(u8, e.action_key, "check_for_updates"));
             try testing.expect(!std.mem.eql(u8, e.action_key, "toggle_tab_overview"));
         },
         .jump => {},

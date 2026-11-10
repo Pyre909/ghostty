@@ -20572,11 +20572,11 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .toggle_tab_overview, .toggle_tab_overview },
         .{ .close_all_windows, .close_all_windows },
         .{ .check_for_updates, .check_for_updates },
-        .{ .undo, .undo },
-        .{ .redo, .redo },
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .toggle_secure_input, .secure_input },
         // Listed.
+        .{ .undo, .undo },
+        .{ .redo, .redo },
         .{ .new_window, .new_window },
         .{ .new_tab, .new_tab },
         .{ .new_split, .new_split },
@@ -20670,7 +20670,12 @@ test "win32: the command palette lists only what performAction carries out" {
             app.config.@"background-opacity" = 1;
         };
         const performed = try app.performAction(to, case[1], value);
-        if (CommandPalette.supported(case[0]) != performed) {
+        // Listed, and performed only with something closed to bring
+        // back or close again (`requestUndo`), which nothing here is:
+        // the keys then go to the terminal.
+        const conditional = case[0] == .undo or case[0] == .redo;
+        if (conditional) try std.testing.expect(CommandPalette.supported(case[0]));
+        if ((CommandPalette.supported(case[0]) and !conditional) != performed) {
             std.debug.print("{t}: listed={} performed={}\n", .{ case[0], CommandPalette.supported(case[0]), performed });
             return error.TestUnexpectedResult;
         }
@@ -27687,8 +27692,8 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         "global:ctrl+d=check_for_updates",
         "global:ctrl+e=close_all_windows",
         "global:ctrl+g=paste_from_selection",
-        "global:ctrl+h=undo",
-        "chain=redo",
+        "global:ctrl+h=show_gtk_inspector",
+        "chain=toggle_secure_input",
     });
     try std.testing.expectEqual(0, TestHotkeys.take().len);
     try std.testing.expectEqual(1, TestHotkeys.refused(&app, error.CatchAll));
