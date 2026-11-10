@@ -1672,19 +1672,24 @@ pub const App = struct {
     }
 
     /// Re-post WM_GHOSTTY_DESTROY for every terminal and every window whose
-    /// teardown was deferred. Called where `canTearDown` holds: by `run`,
+    /// teardown was deferred. One that cannot be posted stays deferred,
+    /// and closing, for the next call: its close was accepted long ago,
+    /// part of it may be done (a terminal `undo` let go of is hidden, in
+    /// no tab, and nothing else would ever end it), and nobody is at
+    /// hand to ask again, as the one who just closed something is
+    /// (`postTeardown`). Called where `canTearDown` holds: by `run`,
     /// by `Surface.destroyPosted` and `Window.destroyPosted` once their own
     /// teardown is done, and by `endTerminalLoop`.
     pub fn repostDeferredDestroys(self: *App) void {
         for (self.surfaces.items) |surface| {
             if (!surface.destroy_deferred) continue;
-            surface.destroy_deferred = false;
             surface.postDestroy();
+            if (surface.closing) surface.destroy_deferred = false else surface.closing = true;
         }
         for (self.windows.items) |window| {
             if (!window.destroy_deferred) continue;
-            window.destroy_deferred = false;
             window.postDestroy();
+            if (window.closing) window.destroy_deferred = false else window.closing = true;
         }
     }
 
@@ -11910,6 +11915,50 @@ test "win32: a tab close that could not post its teardowns leaves a later close 
         try std.testing.expect(TestUndo.has(&app, t.a));
         try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
     }
+}
+
+test "win32: a parked terminal whose teardown cannot be posted is ended once it can" {
+    // Out of every tab, hidden and named by no entry, it would otherwise
+    // run on for good with its close taken back.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const Fails = struct {
+        fn all(_: win32.HWND) bool {
+            return true;
+        }
+    };
+    defer test_post_fails = null;
+
+    const t = try TestUndo.init(&app);
+    TestUndo.close(t.b);
+    Undo.test_now = TestUndo.due;
+    test_post_fails = &Fails.all;
+    TestUndo.tick(&app);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expect(!t.b.parked);
+    try std.testing.expect(t.b.closing);
+    try std.testing.expect(t.b.destroy_deferred);
+
+    // Posted again in vain: still owed.
+    app.repostDeferredDestroys();
+    testPump();
+    try std.testing.expect(TestUndo.has(&app, t.b));
+    try std.testing.expect(t.b.closing);
+    try std.testing.expect(t.b.destroy_deferred);
+
+    test_post_fails = null;
+    app.repostDeferredDestroys();
+    try std.testing.expect(!t.b.destroy_deferred);
+    testPump();
+    try std.testing.expect(!TestUndo.has(&app, t.b));
+    try std.testing.expect(TestUndo.has(&app, t.a));
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {

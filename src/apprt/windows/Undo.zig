@@ -276,8 +276,9 @@ fn end(self: *Undo, app: *App, entry: *Entry, freed: ?*const Surface) void {
 
 /// Post the teardown of `surface`, parked until now. `closing` is still
 /// set from its close. Should the post fail, the teardown is left as one
-/// deferred, which the app posts again (`App.repostDeferredDestroys`):
-/// nothing else would ever end a hidden terminal that no entry names.
+/// deferred, which the app posts again until it is posted
+/// (`App.repostDeferredDestroys`): nothing else would ever end a hidden
+/// terminal that no entry names.
 fn unpark(surface: *Surface) void {
     surface.parked = false;
     surface.postDestroy();
