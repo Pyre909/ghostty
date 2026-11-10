@@ -643,6 +643,8 @@ pub extern "user32" fn GetDC(hwnd: ?HWND) callconv(.winapi) ?HDC;
 pub const GetClientRect = internal_os.windows.exp.user32.GetClientRect;
 pub extern "user32" fn GetWindowRect(hwnd: HWND, rect: *RECT) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement
+/// WINDOWPLACEMENT.flags: a minimized window comes back maximized.
+pub const WPF_RESTORETOMAXIMIZED: UINT = 0x0002;
 pub const WINDOWPLACEMENT = extern struct {
     length: UINT,
     flags: UINT,

@@ -897,11 +897,13 @@ pub const Action = union(enum) {
     /// Ghostty becomes focused. When hiding all windows, focus is yielded
     /// to the next application as determined by the OS.
     ///
-    /// Note: When the focused surface is fullscreen, this method does nothing.
+    /// Note: On macOS, when the focused surface is fullscreen, this method
+    /// does nothing.
     ///
     /// Only implemented on macOS and Windows. On Windows the windows are
     /// minimized, each keeping its taskbar button, whether or not one is
-    /// fullscreen, and the quick terminal is hidden.
+    /// fullscreen, and the quick terminal is hidden, unless it is the only
+    /// window and no global keybind for this action could show it again.
     toggle_visibility,
 
     /// Toggle the window background opacity between transparent and opaque.

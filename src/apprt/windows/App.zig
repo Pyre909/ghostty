@@ -2993,16 +2993,30 @@ pub const App = struct {
     }
 
     /// The window of Ghostty's that is in the foreground, or that owns the
-    /// window there, as its prompt or its title dialog (`inForeground`).
-    /// Null with another program's window in the foreground, or an
-    /// inspector's, which no terminal window owns.
+    /// window there, as its prompt or its title dialog (`inForeground`),
+    /// or whose terminal's inspector is there: no terminal window owns an
+    /// inspector, but with it in front the user is in Ghostty, as macOS
+    /// hides its application with an inspector's window key. Null with
+    /// another program's window in the foreground.
     fn frontWindow(self: *const App) ?*Window {
         const front = foregroundWindow() orelse return null;
-        const root = win32.GetAncestor(front, win32.GA_ROOTOWNER) orelse return null;
+        const window = self.windowOf(front) orelse inspected: {
+            for (self.surfaces.items) |surface| if (surface.inspector) |inspector| {
+                if (inspector.view.hwnd == front) break :inspected surface.window;
+            };
+            return null;
+        };
         // Not one that is minimized, which Windows can leave in the
         // foreground with no other window to give it to: nothing of it
-        // shows, and the toggle would hide nothing and show nothing.
-        if (win32.IsIconic(root).toBool()) return null;
+        // shows, and the toggle would hide nothing and show nothing. Nor
+        // an inspector's whose window is: the toggle then shows.
+        return if (win32.IsIconic(window.hwnd).toBool()) null else window;
+    }
+
+    /// The frame that is `hwnd` or that owns it, as it owns a prompt or a
+    /// title dialog: `hwnd`'s root owner, if that is a frame.
+    pub fn windowOf(self: *const App, hwnd: win32.HWND) ?*Window {
+        const root = win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) orelse return null;
         for (self.windows.items) |window| {
             if (window.hwnd == root) return window;
         }
@@ -16038,6 +16052,21 @@ fn testToggleVisibility() !void {
     try std.testing.expectEqual(b.hwnd, ForegroundSeen.last.?);
     try std.testing.expect(minimized(users));
     try std.testing.expect(!win32.IsWindowVisible(unshown.hwnd).toBool());
+
+    // One that was maximized comes back maximized, in front or not.
+    _ = win32.ShowWindow(b.hwnd, win32.SW_SHOWMAXIMIZED);
+    for ([_]*Window{ a, b }) |front| {
+        try toggle(&app, front.hwnd);
+        try std.testing.expect(minimized(a));
+        try std.testing.expect(minimized(b));
+        try toggle(&app, null);
+        try std.testing.expect(!minimized(a));
+        try std.testing.expect(!minimized(b));
+        try std.testing.expect(win32.IsZoomed(b.hwnd).toBool());
+        try std.testing.expect(!win32.IsZoomed(a.hwnd).toBool());
+    }
+    _ = win32.ShowWindow(b.hwnd, win32.SW_SHOWNOACTIVATE);
+    try std.testing.expect(!win32.IsZoomed(b.hwnd).toBool());
 
     // A window one of them owns, as a prompt, in the foreground: its
     // owner is the one in front.

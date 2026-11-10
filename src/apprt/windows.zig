@@ -63,10 +63,12 @@
 //! `quit-after-last-window-closed` is false and a registered global
 //! keybind opens a window, the only way to open one with none left
 //! (`App.setQuitTimer`). `toggle_visibility` with one of Ghostty's windows
-//! in the foreground minimizes every window that shows and hides the
-//! quick terminal; with none there it shows those again and brings
-//! forward the one that was in front (`App.toggleVisibility`). An
-//! inspector's window is left as it is.
+//! in the foreground, or a terminal's inspector, minimizes every window
+//! that shows and hides the quick terminal, unless that is the only
+//! window and no global keybind for the action could show it again; with
+//! none there it shows those again and brings forward the one that was
+//! in front (`App.toggleVisibility`). An inspector's window is left as
+//! it is.
 //!
 //! ## Search
 //!
