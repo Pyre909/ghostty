@@ -11102,6 +11102,54 @@ test "win32: a terminal with no core closes through a posted teardown" {
     try std.testing.expectEqual(0, app.windows.items.len);
 }
 
+test "win32: a teardown posted for a close taken back since leaves the terminal" {
+    // A teardown is a posted message, so the close it was posted for can
+    // be taken back before it arrives. Every close sets `closing` first,
+    // and the teardown runs only while that still stands.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
+
+    _ = Surface.wndProc(pane.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expect(pane.closing);
+    pane.closing = false;
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        pane.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expectEqual(1, app.surfaces.items.len);
+    try std.testing.expectEqual(1, app.windows.items.len);
+    try std.testing.expect(!pane.destroy_deferred);
+
+    // Asked again, it closes as before.
+    _ = Surface.wndProc(pane.hwnd, win32.WM_CLOSE, 0, 0);
+    try std.testing.expect(win32.PeekMessageW(
+        &msg,
+        pane.hwnd,
+        WM_GHOSTTY_DESTROY,
+        WM_GHOSTTY_DESTROY,
+        win32.PM_REMOVE,
+    ).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expectEqual(0, app.surfaces.items.len);
+    try std.testing.expectEqual(0, app.windows.items.len);
+}
+
 test "win32: new windows and splits are recorded where they are asked for" {
     // A `new_window` or `new_split` binding performs the action from inside
     // the core's key callback, so the action only records the request;
@@ -24637,7 +24685,14 @@ test "win32: a teardown posted while a terminal's context menu is open waits for
         var alive: bool = false;
         var deferred: bool = false;
         fn post() void {
-            if (close_window) window.postDestroy() else surface.postDestroy();
+            // `closing` first, as every close sets it before it posts.
+            if (close_window) {
+                window.closing = true;
+                window.postDestroy();
+            } else {
+                surface.closing = true;
+                surface.postDestroy();
+            }
             testPump();
             alive = std.mem.indexOfScalar(*Surface, app_.surfaces.items, surface) != null and
                 std.mem.indexOfScalar(*Window, app_.windows.items, window) != null;
@@ -24647,7 +24702,8 @@ test "win32: a teardown posted while a terminal's context menu is open waits for
     };
     Posted.app_ = &app;
     MenuSeen.during = &Posted.post;
-    // Chosen, as a dismissed one would be: performed on a live terminal.
+    // Chosen, and dropped, as its terminal or its window is closing by
+    // then; the teardown waits all the same.
     MenuSeen.choose = "Paste";
 
     for ([_]struct { *Surface, *Window, bool }{ .{ a, first, false }, .{ b, second, true } }) |c| {
@@ -24659,7 +24715,7 @@ test "win32: a teardown posted while a terminal's context menu is open waits for
         testRightClick(c[0], 20, 30);
         try std.testing.expect(Posted.alive);
         try std.testing.expect(Posted.deferred);
-        try std.testing.expectEqualStrings("paste_from_clipboard;", PaletteSeen.take());
+        try std.testing.expectEqualStrings("", PaletteSeen.take());
         // Posted again, not run, inside the handler.
         try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, c[0]) != null);
         testPump();
@@ -25824,7 +25880,10 @@ const BarLoop = struct {
         }
         ticked = ticks - before;
         const target = surface orelse return 7;
-        if (window) |win| win.postDestroy() else target.postDestroy();
+        if (window) |win| win.postDestroy() else {
+            target.closing = true;
+            target.postDestroy();
+        }
         testPump();
         alive = std.mem.indexOfScalar(*Surface, app.surfaces.items, target) != null;
         if (window) |win| alive = alive and std.mem.indexOfScalar(*Window, app.windows.items, win) != null;

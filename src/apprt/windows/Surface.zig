@@ -1287,6 +1287,11 @@ pub const Surface = struct {
         // terminate drives teardown itself; see App.terminate.
         if (app.terminating) return;
 
+        // Every close sets `closing` before it posts, so a teardown that
+        // finds it clear is a stale one: the close it was posted for has
+        // been taken back since, and this terminal is to stay.
+        if (!self.closing) return;
+
         if (!app.canTearDown()) {
             self.destroy_deferred = true;
             return;
@@ -4613,6 +4618,7 @@ test "win32: a teardown dispatched inside another waits for it" {
     surface.app = &app;
     surface.window = &s.window;
     surface.core_state = .none;
+    surface.closing = true;
     s.window.tabs = .fromOwnedSlice(&s.tabs);
     s.window.selected = 0;
     // The window's only terminal, so a teardown that runs takes the window.
