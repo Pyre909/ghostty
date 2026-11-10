@@ -17,6 +17,17 @@ branch: []const u8,
 /// Initialize the version and detect it from the Git environment. This
 /// allocates using the build allocator and doesn't free.
 pub fn detect(b: *std.Build) !Version {
+    // What git says of the checkout is read while the build is configured,
+    // and Zig keeps a configuration for the next `zig build` unless the
+    // configure logic says that it saw something no file dependency
+    // records (std.Build.Graph.CachePoison). Running a child process says
+    // no such thing, so it is said here: otherwise a build that nothing
+    // else poisons, as libghostty-vt's alone (-Demit-lib-vt), keeps the
+    // version of the commit it was first configured at. The app's builds
+    // are configured anew each time only because a dependency of theirs
+    // looks for a program.
+    b.graph.poisonCache();
+
     // Execute a bunch of git commands to determine the automatic version.
     var code: u8 = 0;
     const branch: []const u8 = b: {
