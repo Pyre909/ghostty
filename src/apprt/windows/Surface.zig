@@ -1533,8 +1533,18 @@ pub const Surface = struct {
         if (state == .osc_52_write) return .unsupported;
 
         // Parked for `undo`, it shows nowhere: nothing could own a prompt,
-        // and nobody sees what would read the clipboard.
-        if (self.parked) return .unsupported;
+        // and nobody sees what would read the clipboard. A Kitty request
+        // is denied, which answers it once, as a prompt refused does;
+        // `.unsupported` would tell the program that Windows has no
+        // clipboard. The others have no answer to give, and a paste
+        // binding is then passed on as not performed.
+        if (self.parked) switch (state) {
+            .kitty_read, .kitty_write => {
+                self.denyClipboard(state);
+                return .started;
+            },
+            else => return .unsupported,
+        };
 
         // A clipboard Windows has not. The core answers a Kitty request
         // for it with ENOSYS, as the protocol lists for a clipboard the

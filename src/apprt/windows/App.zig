@@ -1877,23 +1877,14 @@ pub const App = struct {
         _ = self.setQuitTimer(.start);
     }
 
-    /// Actions this runtime actually performs. Anything not named here
-    /// returns `false`, which is the contract's word for "unsupported" -- see
-    /// the `apprt.Action` docs (actions are OPTIONAL). Returning `true` for an
-    /// action that did not happen would be a lie the core cannot detect.
-    pub fn performAction(
-        self: *App,
-        target: apprt.Target,
-        comptime action: apprt.Action.Key,
-        value: apprt.Action.Value(action),
-    ) !bool {
-        // A terminal parked for `undo` is in no tab and shows nowhere.
-        // What its program still asks for that only its own state keeps
-        // is done, so that it comes back as it then is; anything that
-        // would lay a window out, move the focus, prompt or notify is
-        // not. Named one by one, so that a new action is refused until
-        // someone decides otherwise.
-        const while_parked = switch (action) {
+    /// Whether `action` is carried out for a terminal parked for `undo`
+    /// (`performAction`). Every action is named, so that a new one does
+    /// not compile until someone has decided.
+    fn whileParked(comptime action: apprt.Action.Key) bool {
+        return switch (action) {
+            // What only the terminal's own state keeps, for it to come
+            // back as it then is. The search counts and the progress are
+            // stored, and shown only where the terminal shows.
             .set_title,
             .pwd,
             .mouse_shape,
@@ -1910,9 +1901,82 @@ pub const App = struct {
             .key_sequence,
             .key_table,
             .config_change,
+            .search_total,
+            .search_selected,
+            .progress_report,
             => true,
-            else => false,
+
+            // What would lay a window out, move the focus, prompt,
+            // notify, or act on a window the terminal is no longer in.
+            .quit,
+            .new_window,
+            .new_tab,
+            .close_tab,
+            .new_split,
+            .close_all_windows,
+            .toggle_maximize,
+            .toggle_fullscreen,
+            .toggle_tab_overview,
+            .toggle_window_decorations,
+            .toggle_quick_terminal,
+            .toggle_command_palette,
+            .toggle_visibility,
+            .toggle_background_opacity,
+            .move_tab,
+            .goto_tab,
+            .goto_split,
+            .goto_window,
+            .resize_split,
+            .equalize_splits,
+            .toggle_split_zoom,
+            .present_terminal,
+            .reset_window_size,
+            .inspector,
+            .show_gtk_inspector,
+            .render_inspector,
+            .export_terminal_io,
+            .desktop_notification,
+            .set_tab_title,
+            .set_window_title,
+            .prompt_title,
+            .mouse_over_link,
+            .open_config,
+            .quit_timer,
+            .float_window,
+            .secure_input,
+            .reload_config,
+            .close_window,
+            .ring_bell,
+            .selection_changed,
+            .undo,
+            .redo,
+            .check_for_updates,
+            .open_url,
+            .show_on_screen_keyboard,
+            .command_finished,
+            .start_search,
+            .end_search,
+            .copy_title_to_clipboard,
+            .move_tab_to_new_window,
+            .resize_window,
+            .set_window_theme,
+            => false,
         };
+    }
+
+    /// Actions this runtime actually performs. Anything not named here
+    /// returns `false`, which is the contract's word for "unsupported" -- see
+    /// the `apprt.Action` docs (actions are OPTIONAL). Returning `true` for an
+    /// action that did not happen would be a lie the core cannot detect.
+    pub fn performAction(
+        self: *App,
+        target: apprt.Target,
+        comptime action: apprt.Action.Key,
+        value: apprt.Action.Value(action),
+    ) !bool {
+        // A terminal parked for `undo` is in no tab and shows nowhere:
+        // most of what its program asks for is refused.
+        const while_parked = comptime whileParked(action);
         if (!while_parked and self.parkedTarget(target)) return false;
 
         return switch (action) {
@@ -11600,19 +11664,46 @@ test "win32: a parked terminal is refused what would show, prompt or move the fo
     TestUndo.close(t.b);
     try std.testing.expect(t.b.parked);
     const target: apprt.Target = .{ .surface = &t.b.core_surface };
+    // With a request waiting, a `goto_split` is recorded after it and
+    // not judged here: one for the parked terminal must not be.
+    try std.testing.expect(try app.performAction(.app, .new_window, {}));
     const queued = app.requests.items.len;
+    Window.test_foreground = &ForegroundSeen.seen;
+    defer Window.test_foreground = null;
+    ForegroundSeen.last = null;
 
     try std.testing.expect(!try app.performAction(target, .new_split, .right));
     try std.testing.expect(!try app.performAction(target, .new_tab, {}));
     try std.testing.expect(!try app.performAction(target, .goto_split, .previous));
     try std.testing.expect(!try app.performAction(target, .present_terminal, {}));
+    try std.testing.expect(ForegroundSeen.last == null);
     try std.testing.expect(!try app.performAction(target, .ring_bell, {}));
     try std.testing.expect(!try app.performAction(target, .undo, {}));
     try std.testing.expectEqual(queued, app.requests.items.len);
+
+    // A paste has no answer to give, and is passed on as not performed.
+    // A Kitty request is denied: the program is told no, not that
+    // Windows has no clipboard.
+    TestKittyCore.reset();
+    Surface.test_clipboard_core = &TestKittyCore.complete;
+    defer Surface.test_clipboard_core = null;
+    Surface.test_clipboard_deny = &TestKittyCore.deny;
+    defer Surface.test_clipboard_deny = null;
     try std.testing.expectEqual(
         apprt.ClipboardReadResult.unsupported,
         try t.b.clipboardRequest(.standard, .{ .paste = .standard }),
     );
+    try std.testing.expectEqual(0, TestKittyCore.denied);
+    {
+        const req = try testKittyRead(alloc, .standard, &.{"text/plain"}, true);
+        try std.testing.expectEqual(.started, try t.b.clipboardRequest(.standard, .{ .kitty_read = req }));
+    }
+    try std.testing.expectEqual(1, TestKittyCore.denied);
+    try std.testing.expectEqual(0, TestKittyCore.completed);
+
+    // What only its own state keeps is stored for when it comes back.
+    try std.testing.expect(try app.performAction(target, .search_total, .{ .total = 5 }));
+    try std.testing.expectEqual(5, t.b.search_bar.total.?);
 
     // Its title is still its own to change, for when it comes back.
     try std.testing.expect(try app.performAction(target, .set_title, .{ .title = "later" }));
@@ -11659,8 +11750,19 @@ test "win32: a tab closed where undo is bound is parked whole, and undo shows it
         try std.testing.expectEqual(stays, window.tab().focused.?);
         try std.testing.expect(shown(stays.hwnd));
 
+        // A parked tab's terminals are refused as a parked split is.
+        const bells = App.test_bells;
+        const queued = app.requests.items.len;
+        const in_tab: apprt.Target = .{ .surface = &t.a.core_surface };
+        try std.testing.expect(!try app.performAction(in_tab, .ring_bell, {}));
+        try std.testing.expect(!try app.performAction(in_tab, .new_split, .right));
+        try std.testing.expectEqual(bells, App.test_bells);
+        try std.testing.expectEqual(queued, app.requests.items.len);
+
         try std.testing.expect(try app.performAction(.app, .undo, {}));
         app.createRequested();
+        try std.testing.expect(try app.performAction(in_tab, .ring_bell, {}));
+        try std.testing.expectEqual(bells + 1, App.test_bells);
         try std.testing.expectEqual(3, window.tabs.items.len);
         try std.testing.expectEqual(t0, window.tabs.items[0]);
         try std.testing.expectEqual(t0, window.tab());
