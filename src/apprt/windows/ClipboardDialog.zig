@@ -49,6 +49,7 @@ const Content = terminal.clipboard.Content;
 const Item = TitleDialog.Item;
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 const Question = @import("dialog.zig").Question;
+const label = @import("dialog.zig").label;
 const log = std.log.scoped(.win32);
 
 /// The user's answer.
@@ -327,9 +328,9 @@ const Dialog = struct {
             .class = .button,
             .id = win32.IDOK,
             .style = child | win32.WS_TABSTOP | win32.WS_GROUP | win32.BS_PUSHBUTTON,
-            .x = width - 7 - 50 - 4 - 50,
+            .x = width - 7 - TitleDialog.button_width - 4 - TitleDialog.button_width,
             .y = y,
-            .cx = 50,
+            .cx = TitleDialog.button_width,
             .cy = 14,
             .text = W("Allow"),
         });
@@ -337,9 +338,9 @@ const Dialog = struct {
             .class = .button,
             .id = win32.IDCANCEL,
             .style = child | win32.WS_TABSTOP | win32.BS_DEFPUSHBUTTON,
-            .x = width - 7 - 50,
+            .x = width - 7 - TitleDialog.button_width,
             .y = y,
-            .cx = 50,
+            .cx = TitleDialog.button_width,
             .cy = 14,
             .text = W("Deny"),
         });
@@ -375,6 +376,10 @@ const Dialog = struct {
         TitleDialog.darkTitleBar(hwnd, self.window.dark_frame);
         self.window.clipboard_prompt = hwnd;
         if (win32.GetWindow(hwnd, win32.GW_OWNER)) |owner| TitleDialog.placeOverOwner(hwnd, owner);
+        // The box's words are this dialog's own, and stay as written.
+        label(hwnd, null, "Authorize Clipboard Access");
+        label(hwnd, win32.IDOK, "Allow");
+        label(hwnd, win32.IDCANCEL, "Deny");
 
         if (self.parts.len > 1) {
             // One entry per part, in order, even for a part that cannot be

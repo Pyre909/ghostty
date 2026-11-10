@@ -59,6 +59,7 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const Tab = @import("Tab.zig");
 const App = @import("App.zig").App;
+const label = @import("dialog.zig").label;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 
@@ -89,6 +90,12 @@ pub const Prompt = struct {
 
 /// The field's control id.
 pub const edit_id = 100;
+/// A button's width, in dialog units: room for the longest of the
+/// languages' labels, which a test measures. The dialog manager's usual
+/// 50 cuts one.
+pub const button_width = 56;
+/// The line above the field.
+pub const note_id = 101;
 
 /// Room for either prompt's template, in 16-bit units (`spec`).
 pub const template_capacity = 512;
@@ -144,6 +151,14 @@ pub fn open(surface: *Surface, target: Target) bool {
         return false;
     };
     window.title_prompt.hwnd = hwnd;
+    switch (target) {
+        .surface => label(hwnd, null, "Change Terminal Title"),
+        .tab => label(hwnd, null, "Change Tab Title"),
+        .window => label(hwnd, null, "Change Window Title"),
+    }
+    label(hwnd, note_id, "Leave blank to restore the default title.");
+    label(hwnd, win32.IDOK, "OK");
+    label(hwnd, win32.IDCANCEL, "Cancel");
 
     const edit = win32.GetDlgItem(hwnd, edit_id);
     if (edit) |e| {
@@ -514,7 +529,7 @@ const prompt_items = items: {
     break :items [_]Item{
         .{
             .class = .static,
-            .id = 0xFFFF,
+            .id = note_id,
             .style = child | win32.SS_NOPREFIX,
             .x = 7,
             .y = 7,
@@ -536,9 +551,9 @@ const prompt_items = items: {
             .class = .button,
             .id = win32.IDOK,
             .style = child | win32.WS_TABSTOP | win32.WS_GROUP | win32.BS_DEFPUSHBUTTON,
-            .x = 121,
+            .x = 225 - button_width - 4 - button_width,
             .y = 43,
-            .cx = 50,
+            .cx = button_width,
             .cy = 14,
             .text = W("OK"),
         },
@@ -546,9 +561,9 @@ const prompt_items = items: {
             .class = .button,
             .id = win32.IDCANCEL,
             .style = child | win32.WS_TABSTOP | win32.BS_PUSHBUTTON,
-            .x = 175,
+            .x = 225 - button_width,
             .y = 43,
-            .cx = 50,
+            .cx = button_width,
             .cy = 14,
             .text = W("Cancel"),
         },

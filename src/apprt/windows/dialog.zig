@@ -49,6 +49,18 @@ pub const Question = struct {
     }
 };
 
+/// Give a dialog's control, or with no `id` its caption, the user's
+/// language for `msgid`, the text its template has. The template keeps a
+/// fixed size that way, whatever a translation's length.
+pub fn label(hwnd: win32.HWND, id: ?c_int, comptime msgid: [:0]const u8) void {
+    var buf: Question = .{};
+    const text = buf.one(msgid);
+    _ = if (id) |control|
+        win32.SetDlgItemTextW(hwnd, control, text)
+    else
+        win32.SetWindowTextW(hwnd, text);
+}
+
 /// The button of a `confirm` prompt that Enter and Space press.
 ///
 /// Prompts that grant access default to Cancel, as GTK's clipboard

@@ -13234,6 +13234,93 @@ fn expectText(comptime want: []const u8, hwnd: win32.HWND) !void {
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral(want), buf[0..@intCast(n)]);
 }
 
+test "win32: the title prompt's labels are the user's language's, and each fits its control" {
+    const i18n = internal_os.i18n;
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const locales = @import("../../os/i18n_locales.zig").locales;
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
+    const target: apprt.Target = .{ .surface = &pane.core_surface };
+
+    defer i18n.windows.testUse(null) catch unreachable;
+    var cut: usize = 0;
+    for (locales, 0..) |locale, i| {
+        errdefer std.debug.print("locale={s}\n", .{locale});
+        try i18n.windows.testUseLocale(i);
+        try std.testing.expect(try app.performAction(target, .prompt_title, .surface));
+        app.createRequested();
+        const prompt = window.title_prompt.hwnd orelse return error.TestUnexpectedResult;
+        defer TitleDialog.close(window);
+
+        // What each shows is the catalog's.
+        const ok = win32.GetDlgItem(prompt, win32.IDOK) orelse return error.TestUnexpectedResult;
+        const cancel = win32.GetDlgItem(prompt, win32.IDCANCEL) orelse return error.TestUnexpectedResult;
+        const note = win32.GetDlgItem(prompt, TitleDialog.note_id) orelse return error.TestUnexpectedResult;
+        var want: [256]u16 = undefined;
+        var got: [256]u16 = undefined;
+        inline for (.{
+            .{ prompt, "Change Terminal Title" },
+            .{ ok, "OK" },
+            .{ cancel, "Cancel" },
+            .{ note, "Leave blank to restore the default title." },
+        }) |case| {
+            const n = try std.unicode.utf8ToUtf16Le(&want, std.mem.span(i18n._(case[1])));
+            const len: usize = @intCast(win32.GetWindowTextW(case[0], &got, got.len));
+            try std.testing.expectEqualSlices(u16, want[0..n], got[0..len]);
+        }
+
+        // And none is cut: the note in its line, a button's label inside
+        // its frame. The clipboard prompt's buttons are as wide and in
+        // the same font, so theirs are measured here too.
+        // Every language is measured before any fails the test, so that
+        // one run names them all.
+        const before = cut;
+        if (!try labelFits(&app, note, "Leave blank to restore the default title.", 0)) cut += 1;
+        inline for (.{ "OK", "Cancel", "Allow", "Deny" }) |msgid| {
+            if (!try labelFits(&app, ok, msgid, 8)) cut += 1;
+        }
+        if (cut != before) std.debug.print("locale={s}\n", .{locale});
+    }
+    try std.testing.expectEqual(0, cut);
+}
+
+/// For tests: `msgid` in the language in use, drawn in `control`'s font,
+/// is no wider than `control` less `frame` pixels at 96 DPI. One that is
+/// wider is printed with both widths.
+fn labelFits(app: *const App, control: win32.HWND, comptime msgid: [:0]const u8, frame: c_int) !bool {
+    const hdc = win32.GetDC(control) orelse return error.TestUnexpectedResult;
+    defer _ = win32.ReleaseDC(control, hdc);
+    const font: usize = @bitCast(win32.SendMessageW(control, win32.WM_GETFONT, 0, 0));
+    try std.testing.expect(font != 0);
+    const old = win32.SelectObject(hdc, @ptrFromInt(font));
+    defer if (old) |o| {
+        _ = win32.SelectObject(hdc, o);
+    };
+    var wide: [256]u16 = undefined;
+    const n = try std.unicode.utf8ToUtf16Le(&wide, std.mem.span(internal_os.i18n._(msgid)));
+    var r: win32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = win32.DrawTextW(hdc, &wide, @intCast(n), &r, win32.DT_SINGLELINE | win32.DT_CALCRECT);
+    var client: win32.RECT = undefined;
+    try std.testing.expect(win32.GetClientRect(control, &client).toBool());
+    const room = client.right - @divTrunc(frame * @as(c_int, @intCast(Window.dpiOf(app, control))), 96);
+    if (r.right > room) {
+        std.debug.print("{s}: {} px of text in {} px\n", .{ msgid, r.right, room });
+        return false;
+    }
+    return true;
+}
+
 test "win32: prompt_title waits for run, and the terminal's title from it shows over the program's" {
     // The dialog takes the keyboard focus from the terminal, so the action
     // is recorded and the dialog opened by createRequested. OK sets the

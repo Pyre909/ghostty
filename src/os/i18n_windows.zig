@@ -223,6 +223,11 @@ pub fn testUse(bytes: ?[]const u8) error{ InvalidCatalog, NotUtf8 }!void {
     catalog = if (bytes) |b| try usable(b) else null;
 }
 
+/// For tests: translate with the catalog built in for `locales[i]`.
+pub fn testUseLocale(i: usize) error{ InvalidCatalog, NotUtf8 }!void {
+    try testUse(@import("i18n_catalogs").catalogs[i]);
+}
+
 test "each locale's own name finds it, as gettext and as Windows write it" {
     const testing = std.testing;
     for (locales, 0..) |locale, i| {
