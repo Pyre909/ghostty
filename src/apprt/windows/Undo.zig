@@ -405,7 +405,7 @@ pub fn pendingRedo(self: *const Undo) bool {
 
 /// Take the last close back, and with it those made as one with it: a
 /// terminal returns to its tab, where and as large as it was, with the
-/// focus; a tab returns to its place among the window's tabs, shown if
+/// focus, and its tab is shown; a tab returns to its place among the window's tabs, shown if
 /// it alone comes back; and the window comes forward. Returns whether
 /// anything came back. A close that cannot be taken back, because its
 /// tab's terminals are no longer the ones it left, is torn down instead.
@@ -457,7 +457,10 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
             if (pane.tab == window.tab()) {
                 window.showPane(surface);
             } else {
+                // Its tab is shown, as a tab that comes back is: an
+                // `undo` that showed nothing would seem to do nothing.
                 pane.tab.focused = surface;
+                window.selectTab(window.tabIndex(pane.tab).?);
             }
             self.redos.append(alloc, .{
                 .window = window,

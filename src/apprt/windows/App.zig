@@ -12063,6 +12063,41 @@ test "win32: a parked terminal whose teardown cannot be posted is ended once it 
     try std.testing.expect(TestUndo.has(&app, t.a));
 }
 
+test "win32: a split taken back into a tab that is not shown shows that tab" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    const t0 = window.tab();
+    const p1 = try testTab(&app, window);
+    window.relayout();
+    const before = .{ try paneRect(window, t.a), try paneRect(window, t.b) };
+
+    TestUndo.close(t.b);
+    window.selectTab(1);
+    try std.testing.expect(shown(p1.hwnd));
+    try std.testing.expect(!shown(t.a.hwnd));
+
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expect(!t.b.parked);
+    try std.testing.expect(window.find(t.b) != null);
+    try std.testing.expectEqual(t0, window.tab());
+    try std.testing.expectEqual(t.b, t0.focused.?);
+    try std.testing.expect(shown(t.a.hwnd));
+    try std.testing.expect(shown(t.b.hwnd));
+    try std.testing.expect(!shown(p1.hwnd));
+    try std.testing.expectEqual(before[0], try paneRect(window, t.a));
+    try std.testing.expectEqual(before[1], try paneRect(window, t.b));
+}
+
 test "win32: new windows and splits are recorded where they are asked for" {
     // A `new_window` or `new_split` binding performs the action from inside
     // the core's key callback, so the action only records the request;
