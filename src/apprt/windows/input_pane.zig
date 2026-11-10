@@ -70,7 +70,8 @@ const IInputPane2 = extern struct {
 /// For tests: what `tryShow` answers for a window. A test never asks
 /// Windows, which would show its keyboard over the desktop the tests run
 /// on: with no answer set, the call fails.
-pub var test_try_show: ?*const fn (HWND) error{InputPaneFailed}!bool = null;
+pub var test_try_show: if (builtin.is_test) ?*const fn (HWND) error{InputPaneFailed}!bool else void =
+    if (builtin.is_test) null else {};
 
 /// Ask Windows to show the touch keyboard for `frame`, a top-level window
 /// of the calling thread, which must be in an apartment (CoInitializeEx).
