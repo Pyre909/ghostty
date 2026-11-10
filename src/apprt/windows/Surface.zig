@@ -3845,9 +3845,9 @@ test "win32: a horizontal wheel's small turns scroll what its notch does" {
     // worth of small turns is one line, a column's pixels.
     const Wheel = Surface.Mouse.Wheel;
     const Turn = Wheel.Turn;
-    var notch: Wheel = .horizontal;
+    var notch = Surface.Mouse.init().wheel_x;
     try std.testing.expectEqual(Turn{ .ticks = 1 }, notch.add(120, 3).?);
-    var small: Wheel = .horizontal;
+    var small = Surface.Mouse.init().wheel_x;
     try std.testing.expect(small.add(40, 3) == null);
     try std.testing.expect(small.add(40, 3) == null);
     try std.testing.expectEqual(Turn{ .lines = 1 }, small.add(40, 3).?);
