@@ -3807,6 +3807,31 @@ pub fn constrainToWorkArea(
     return .{ .left = left, .top = top, .right = left + w, .bottom = top + h };
 }
 
+/// Where a window saved at `rect` (left, top, right, bottom) on a
+/// monitor of `saved_dpi` goes now (`window-save-state`), on a monitor
+/// of `dpi` whose work area is `work`: at the corner it had, with its
+/// size scaled by how the monitor's scale changed, so that its terminals
+/// keep their cells, then kept inside the work area as a new window is
+/// (`constrainToWorkArea`). The monitors there are now need not be the
+/// ones it was saved on; with the same ones it goes where it was.
+pub fn restoredRect(rect: [4]i32, saved_dpi: u32, dpi: u32, work: win32.RECT) win32.RECT {
+    const l, const t, const r, const b = rect;
+    const scale = struct {
+        fn of(length: i64, from: u32, to: u32) i32 {
+            if (from == to or from == 0) return @intCast(length);
+            // Rounded to nearest, as MulDiv does.
+            return std.math.lossyCast(i32, @divFloor(length * to + from / 2, from));
+        }
+    }.of;
+    return constrainToWorkArea(
+        l,
+        t,
+        scale(@as(i64, r) - l, saved_dpi, dpi),
+        scale(@as(i64, b) - t, saved_dpi, dpi),
+        work,
+    );
+}
+
 /// Bring the window to the front, restoring it first if it is
 /// minimized, as GTK's `gtk.Window.present` does; for `goto_window`, a
 /// toast's click (`App.notificationClicked`), the command palette's jump
@@ -4295,6 +4320,35 @@ pub const ModalLoops = struct {
         return self.count != 0;
     }
 };
+
+test "win32: a saved window goes where it was, at today's scale, on a monitor there is" {
+    const work: win32.RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
+    const eq = struct {
+        fn f(expected: [4]i32, actual: win32.RECT) !void {
+            try std.testing.expectEqual(expected, [4]i32{ actual.left, actual.top, actual.right, actual.bottom });
+        }
+    }.f;
+
+    // The same monitor: where it was, whatever the scale is.
+    try eq(.{ 100, 50, 1300, 850 }, restoredRect(.{ 100, 50, 1300, 850 }, 144, 144, work));
+    try eq(.{ 0, 0, 1920, 1040 }, restoredRect(.{ 0, 0, 1920, 1040 }, 96, 96, work));
+
+    // A scale that changed keeps the corner and scales the size, up and
+    // down, to the nearest pixel.
+    try eq(.{ 100, 50, 700, 500 }, restoredRect(.{ 100, 50, 500, 350 }, 96, 144, work));
+    try eq(.{ 100, 50, 500, 350 }, restoredRect(.{ 100, 50, 700, 500 }, 144, 96, work));
+    try eq(.{ 10, 10, 14, 13 }, restoredRect(.{ 10, 10, 13, 12 }, 96, 120, work));
+
+    // Off the monitors there are now: moved in, at its size.
+    try eq(.{ 720, 240, 1920, 1040 }, restoredRect(.{ 3000, 2000, 4200, 2800 }, 96, 96, work));
+    try eq(.{ 0, 0, 1200, 800 }, restoredRect(.{ -2500, -900, -1300, -100 }, 96, 96, work));
+    // Larger than the work area, as it is once scaled: made to fit.
+    try eq(.{ 0, 0, 1920, 1040 }, restoredRect(.{ 100, 50, 1700, 1050 }, 96, 144, work));
+
+    // The widest rect a state holds, at the largest scale, overflows
+    // nothing.
+    try eq(.{ 0, 0, 1920, 1040 }, restoredRect(.{ -32767, -32767, 32767, 32767 }, 48, 960, work));
+}
 
 test "win32: an initial size is kept inside the monitor work area" {
     const testing = std.testing;
