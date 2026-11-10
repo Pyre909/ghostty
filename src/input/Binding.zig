@@ -946,7 +946,10 @@ pub const Action = union(enum) {
     /// in the background indefinitely, and the keybinds become available
     /// for terminal applications to use.
     ///
-    /// Only implemented on macOS.
+    /// Implemented on macOS and on Windows. On Windows, only the close of
+    /// a split or a tab can be undone, not that of a window, and no key
+    /// is bound to this by default: a closed split or tab is kept for
+    /// undo only once one is.
     undo,
 
     /// Redo the last undoable action for the focused surface or terminal,
