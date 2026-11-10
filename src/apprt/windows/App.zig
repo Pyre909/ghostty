@@ -6510,6 +6510,22 @@ test "win32: a new window shows at window-position-x and window-position-y" {
     try std.testing.expectEqual(60, sized_visible.left);
     try std.testing.expectEqual(40, sized_visible.top);
 
+    // Sized past the work area's far corner, it is brought back inside
+    // from the size it has then.
+    app.config.@"window-position-x" = 32767;
+    app.config.@"window-position-y" = 32767;
+    const cornered = try testFrame(&app);
+    const corner_pane = try testPane(&app, cornered);
+    cornered.tab().tree = try .init(alloc, corner_pane);
+    cornered.tab().focused = corner_pane;
+    corner_pane.initial_size = .{ .width = 500, .height = 400 };
+    cornered.show(.configured);
+    const cornered_visible = TabBar.visibleBounds(cornered.hwnd) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(monitor.rcWork.right, cornered_visible.right);
+    try std.testing.expectEqual(monitor.rcWork.bottom, cornered_visible.bottom);
+    app.config.@"window-position-x" = 60;
+    app.config.@"window-position-y" = 40;
+
     // As `new_window` makes one.
     const Panes = struct {
         fn create(w: *Window, _: Surface.Options) anyerror!*Surface {

@@ -1244,15 +1244,11 @@ pub fn showForToggle(self: *Window) void {
         return;
     }
     // Without the activation, which is the window's that comes forward:
-    // its terminals would be told of a focus they lose at once. One that
-    // comes back maximized takes it all the same, as nothing restores
-    // that state without it. The BOOL is the previous visibility, not
-    // success. WM_SIZE forgets that the toggle hid it.
-    var placement = std.mem.zeroes(win32.WINDOWPLACEMENT);
-    placement.length = @sizeOf(win32.WINDOWPLACEMENT);
-    const maximized = win32.GetWindowPlacement(self.hwnd, &placement).toBool() and
-        placement.flags & win32.WPF_RESTORETOMAXIMIZED != 0;
-    _ = win32.ShowWindow(self.hwnd, if (maximized) win32.SW_RESTORE else win32.SW_SHOWNOACTIVATE);
+    // its terminals would be told of a focus they lose at once. A
+    // minimized window comes back as it was, maximized if it was. The
+    // BOOL is the previous visibility, not success. WM_SIZE forgets that
+    // the toggle hid it.
+    _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNOACTIVATE);
 }
 
 /// `toggle_quick_terminal` with the quick terminal shown, or autohide
