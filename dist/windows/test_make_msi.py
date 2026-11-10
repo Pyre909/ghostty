@@ -15,11 +15,13 @@ import contextlib
 import io
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -204,6 +206,10 @@ class TestReadApp(Temp):
         for name, why in [
             ("share/a:b", "'a:b' has a character Windows does not allow"),
             ("share/tab\there", "has a character Windows does not allow"),
+            # A zip made elsewhere can hold a backslash in a name, and
+            # Windows would read it as a path, here one out of the folder.
+            ("share/..\\x", "'..\\\\x' has a character Windows does not allow"),
+            ("share/a\\b", "'a\\\\b' has a character Windows does not allow"),
             ("share/dot./x", "'dot.' ends with a dot or a space"),
             ("share/space ", "'space ' ends with a dot or a space"),
             ("share/NUL", "'NUL' is a device's name"),
@@ -211,14 +217,83 @@ class TestReadApp(Temp):
             ("share/aux .d/x", "'aux .d' is a device's name"),
             ("share//x", "'' is not a name"),
             ("share/../x", "'..' is not a name"),
+            # What the package cannot hold: a name that is not ASCII (a
+            # device's name with a superscript digit among them), and a
+            # bracket in a folder's name.
+            (
+                "share/Ros\u00e9 Pine",
+                "'Ros\u00e9 Pine' has a character that is not ASCII",
+            ),
+            (
+                "share/\u65e5\u672c/x",
+                "'\u65e5\u672c' has a character that is not ASCII",
+            ),
+            ("share/COM\u00b9", "'COM\u00b9' has a character that is not ASCII"),
+            ("share/a[b]/x", "folder 'a[b]' has a bracket"),
+            ("share/a]/x", "folder 'a]' has a bracket"),
         ]:
             with self.subTest(name):
                 self.assertIn(why, self.refused(app_files() | {name: b"x"}))
         # Not devices: a longer name, and a device's name as an extension.
+        # And a file's name may have brackets.
         self.read(
             app_files()
-            | {"share/console": b"x", "share/x.nul": b"x", "share/com10": b"x"}
+            | {
+                "share/console": b"x",
+                "share/x.nul": b"x",
+                "share/com10": b"x",
+                "share/x[1].txt": b"x",
+            }
         )
+
+    def written(self, entries: list[tuple[zipfile.ZipInfo | str, bytes]]) -> str:
+        """What read_app says of the app's files and `entries`, written
+        as they are given."""
+        top = "ghostty-1.4.1-windows-x86_64"
+        dest = self.tmp / f"{top}.zip"
+        with zipfile.ZipFile(dest, "w") as zf, warnings.catch_warnings():
+            # zipfile warns of a name it has written before.
+            warnings.simplefilter("ignore", UserWarning)
+            for name, data in app_files().items():
+                zf.writestr(zipfile.ZipInfo(f"{top}/{name}", WHEN), data)
+            for entry, data in entries:
+                if isinstance(entry, str):
+                    entry = zipfile.ZipInfo(f"{top}/{entry}", WHEN)
+                zf.writestr(entry, data)
+        with zipfile.ZipFile(dest) as zf, self.assertRaises(mm.Error) as e:
+            mm.read_app(zf)
+        return str(e.exception)
+
+    def test_a_name_twice(self) -> None:
+        # The second would be the one installed, and another program
+        # may unpack the first.
+        self.assertEqual(
+            self.written([("README.txt", b"another\n"), ("share/x", b"x")]),
+            "the zip is not an app zip:\n  'README.txt' is in the zip twice",
+        )
+
+    def test_a_symbolic_link(self) -> None:
+        link = zipfile.ZipInfo("ghostty-1.4.1-windows-x86_64/share/link", WHEN)
+        link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        self.assertEqual(
+            self.written([(link, b"ghostty/themes")]),
+            "the zip is not an app zip:\n  'share/link' is a symbolic link",
+        )
+
+    def test_a_time_that_is_no_date(self) -> None:
+        # All zeros is how some programs write "no time": 1980, month 0.
+        for when in [
+            (1980, 0, 0, 0, 0, 0),
+            (2026, 1, 0, 0, 0, 0),
+            (2026, 13, 1, 0, 0, 0),
+        ]:
+            with self.subTest(when):
+                entry = zipfile.ZipInfo("ghostty-1.4.1-windows-x86_64/share/x", when)
+                self.assertEqual(
+                    self.written([(entry, b"x")]),
+                    "the zip is not an app zip:\n"
+                    f"  'share/x' has a time that is no date: {when}",
+                )
 
     def test_names_that_differ_only_in_case(self) -> None:
         for extra, why in [
@@ -943,6 +1018,12 @@ class TestRefusals(Temp):
             "make_msi: the zip is not an app zip:\n  LICENSE.txt is missing\n",
         )
         self.assertIn("is not a file", fails(self.tmp / "none.zip", self.tmp / "out"))
+        text = self.tmp / "text.zip"
+        text.write_text("not a zip\n")
+        self.assertEqual(
+            fails(text, self.tmp / "out"),
+            f"make_msi: {text}: File is not a zip file\n",
+        )
 
     def test_version_a_package_cannot_hold(self) -> None:
         z = app_zip(self.tmp, version="1.300.0")

@@ -93,13 +93,14 @@ The package is not signed.
 from __future__ import annotations
 
 import argparse
-import calendar
 import collections
+import datetime
 import hashlib
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -174,6 +175,14 @@ REQUIRED = (EXE, "bin/ghostty.com", TOAST_ICON, "README.txt", "LICENSE.txt")
 WIX = "http://schemas.microsoft.com/wix/2006/wi"
 
 
+def seconds(info: zipfile.ZipInfo) -> int:
+    """An entry's time, which a zip holds without a zone and make_zip.py
+    writes in UTC. A ValueError if it is no date: a zip can hold a month
+    or a day of 0."""
+    when = datetime.datetime(*info.date_time, tzinfo=datetime.UTC)
+    return int(when.timestamp())
+
+
 @dataclass(frozen=True)
 class App:
     """What an app zip holds."""
@@ -185,11 +194,8 @@ class App:
     files: dict[str, zipfile.ZipInfo]
 
     def when(self) -> int:
-        """The latest of the files' times, which a zip holds without a
-        zone and make_zip.py writes in UTC."""
-        return max(
-            calendar.timegm((*i.date_time, 0, 0, 0)) for i in self.files.values()
-        )
+        """The latest of the files' times."""
+        return max(seconds(i) for i in self.files.values())
 
     def dirs(self) -> list[str]:
         """Every folder to install, "" for the top one, parents first."""
@@ -201,9 +207,16 @@ class App:
 
 
 def bad_name(part: str) -> str | None:
-    """Why Windows would not take `part` as a file's or a folder's name."""
+    """Why Windows would not take `part` as a file's or a folder's name,
+    or the package could not hold it."""
     if not part or part in (".", ".."):
         return "is not a name"
+    # wixl writes a database that names no code page, which is to hold
+    # ASCII alone, and a name outside Windows-1252 ends wixl without a
+    # word.
+    # https://learn.microsoft.com/en-us/windows/win32/msi/creating-a-database-with-a-neutral-code-page
+    if not part.isascii():
+        return "has a character that is not ASCII, which the package cannot hold"
     if any(c in '<>:"\\|?*' or ord(c) < 32 for c in part):
         return "has a character Windows does not allow"
     if part[-1] in ". ":
@@ -215,7 +228,7 @@ def bad_name(part: str) -> str | None:
 
 def read_app(zf: zipfile.ZipFile) -> App:
     """The app in a zip, or an Error for a zip make_zip.py would not have
-    made or Windows could not hold."""
+    made, or one whose names Windows or the package could not hold."""
     infos = zf.infolist()
     if not infos:
         raise Error("the zip is empty")
@@ -237,6 +250,15 @@ def read_app(zf: zipfile.ZipFile) -> App:
             problems.append(f"{full!r} is not a file in {name}")
             continue
         rel = full[len(name) + 1 :]
+        if rel in files:
+            problems.append(f"{rel!r} is in the zip twice")
+            continue
+        if stat.S_ISLNK(info.external_attr >> 16):
+            problems.append(f"{rel!r} is a symbolic link")
+        try:
+            seconds(info)
+        except ValueError:
+            problems.append(f"{rel!r} has a time that is no date: {info.date_time}")
         parts = rel.split("/")
         for part in parts:
             why = bad_name(part)
@@ -248,6 +270,14 @@ def read_app(zf: zipfile.ZipFile) -> App:
             was = seen.setdefault(path.lower(), f"{kind} {path}")
             if was != f"{kind} {path}":
                 problems.append(f"{kind} {path} and {was} are one name on Windows")
+            # A folder's path names its component's key path, a registry
+            # value, and Windows Installer reads a name in brackets
+            # there as a property's.
+            if kind == "folder" and ("[" in parts[i - 1] or "]" in parts[i - 1]):
+                problems.append(
+                    f"{rel!r}: folder {parts[i - 1]!r} has a bracket, "
+                    "which the package cannot hold"
+                )
         files[rel] = info
     problems += [f"{f} is missing" for f in REQUIRED if f not in files]
     if problems:
@@ -640,8 +670,7 @@ def extract(zf: zipfile.ZipFile, app: App, tree: Path) -> None:
         dest = tree / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(zf.read(info))
-        when = calendar.timegm((*info.date_time, 0, 0, 0))
-        os.utime(dest, (when, when))
+        os.utime(dest, (seconds(info), seconds(info)))
 
 
 def make(args: argparse.Namespace) -> None:
@@ -696,8 +725,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("zip", type=Path, help="an app zip that make_zip.py made")
     parser.add_argument("--out", type=Path, help="where to write (beside the zip)")
+    args = parser.parse_args(argv)
     try:
-        make(parser.parse_args(argv))
+        make(args)
+    except zipfile.BadZipFile as e:
+        print(f"make_msi: {args.zip}: {e}", file=sys.stderr)
+        return 1
     except Error as e:
         print(f"make_msi: {e}", file=sys.stderr)
         return 1
