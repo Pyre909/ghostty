@@ -2293,9 +2293,14 @@ keybind: Keybinds = .{},
 /// the visible screen area. This means that if the menu bar is visible, the
 /// window will be placed below the menu bar.
 ///
-/// Note: this is only supported on macOS. The GTK runtime does not support
-/// setting the window position, as windows are only allowed position
-/// themselves in X11 and not Wayland.
+/// On Windows, the position is that of what shows of the window: the
+/// borders it is resized by, which do not show, may lie beyond it. The
+/// window is kept inside the work area of the monitor nearest to the
+/// position.
+///
+/// Note: this is only supported on macOS and Windows. The GTK runtime does
+/// not support setting the window position, as windows are only allowed
+/// position themselves in X11 and not Wayland.
 @"window-position-x": ?i16 = null,
 @"window-position-y": ?i16 = null,
 

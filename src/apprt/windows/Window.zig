@@ -789,6 +789,75 @@ pub fn dropRect(frame: win32.RECT, client: win32.POINT, drop: Drop, work: win32.
     return constrainToWorkArea(left, top, frame.right - frame.left, frame.bottom - frame.top, work);
 }
 
+/// `window-position-x` and `window-position-y`, when both are set: move
+/// the still-hidden frame, at the size it has, so that what shows of it
+/// has its top-left corner there, counted in pixels from the primary
+/// monitor's top-left corner as the screen's coordinates are, and kept
+/// inside the work area of the monitor nearest to that point
+/// (`positionRect`). Every new window goes there, as on macOS, which
+/// places each at the position (`setInitialWindowPosition` in
+/// TerminalWindow.swift). Logged, and left where Windows put it, if it
+/// cannot be placed.
+///
+/// On a monitor with another DPI the frame gets WM_DPICHANGED as it
+/// arrives, whose suggested rect is scaled and moved: it is placed
+/// again from the size it has then, as a dropped tab's window is
+/// (`placeForDrop`).
+fn applyInitialPosition(self: *Window) void {
+    const x = self.app.config.@"window-position-x" orelse return;
+    const y = self.app.config.@"window-position-y" orelse return;
+    const at: win32.POINT = .{ .x = x, .y = y };
+    const dpi = dpiOf(self.app, self.hwnd);
+    self.placeAtPosition(at);
+    if (dpiOf(self.app, self.hwnd) != dpi) self.placeAtPosition(at);
+}
+
+/// One placing of `applyInitialPosition`, from the frame as it is now.
+fn placeAtPosition(self: *Window, at: win32.POINT) void {
+    var frame: win32.RECT = undefined;
+    if (!win32.GetWindowRect(self.hwnd, &frame).toBool()) {
+        log.warn("unable to read the new window's frame, not placed at its position err={}", .{win32.GetLastError()});
+        return;
+    }
+    const visible = TabBar.visibleBounds(self.hwnd) orelse frame;
+    const monitor = monitorInfo(win32.MonitorFromPoint(at, win32.MONITOR_DEFAULTTONEAREST)) orelse return;
+    const rect = positionRect(frame, visible, at, monitor.rcWork);
+    if (!win32.SetWindowPos(
+        self.hwnd,
+        null,
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        win32.SWP_NOZORDER | win32.SWP_NOACTIVATE,
+    ).toBool()) {
+        log.warn("unable to place the new window at its position err={}", .{win32.GetLastError()});
+    }
+}
+
+/// The rect for a frame now at `frame`, of which `visible` shows (a
+/// resize border Windows draws nothing of is part of the frame, and
+/// outside it: `TabBar.visibleBounds`), moved so that what shows has its
+/// top-left corner at `at`, then what shows kept inside the work area
+/// `work` as `constrainToWorkArea` keeps a window: a window asked for at
+/// the work area's corner shows flush with it, its unseen border past
+/// the edge, as a window snapped there by Windows has it.
+pub fn positionRect(frame: win32.RECT, visible: win32.RECT, at: win32.POINT, work: win32.RECT) win32.RECT {
+    const shown = constrainToWorkArea(
+        at.x,
+        at.y,
+        visible.right - visible.left,
+        visible.bottom - visible.top,
+        work,
+    );
+    return .{
+        .left = shown.left - (visible.left - frame.left),
+        .top = shown.top - (visible.top - frame.top),
+        .right = shown.right + (frame.right - visible.right),
+        .bottom = shown.bottom + (frame.bottom - visible.bottom),
+    };
+}
+
 /// The index `goto_tab` goes to from the shown tab, as GTK selects it
 /// (`Window.selectTab`): previous and next wrap round, an index counts
 /// from 1 and stops at the last tab; null for 0, or for the shown tab, so
@@ -1021,15 +1090,29 @@ pub fn makeTransparent(self: *Window) void {
     self.transparent = Transparency.frameMade(self.hwnd);
 }
 
-/// Size the still-hidden frame to `window-width`/`window-height`, maximize
-/// it if `maximize` asks, cover its monitor if `fullscreen` asks, and show
-/// it. The first WM_SETFOCUS and WM_PAINT (and the first WM_SIZE, unless
-/// the size already sent one) reach the terminal from here; its core is
-/// live by now.
-pub fn show(self: *Window) void {
+/// Where `show` leaves the frame it shows.
+pub const Placing = enum {
+    /// A new window: at `window-position-x` and `window-position-y`, when
+    /// both are set (`applyInitialPosition`).
+    configured,
+    /// Where it is: where its maker put it (`placeForDrop`), or Windows.
+    as_is,
+};
+
+/// Size the still-hidden frame to `window-width`/`window-height`, place it
+/// as `placing` says, maximize it if `maximize` asks, cover its monitor if
+/// `fullscreen` asks, and show it. The first WM_SETFOCUS and WM_PAINT (and
+/// the first WM_SIZE, unless the size already sent one) reach the terminal
+/// from here; its core is live by now.
+pub fn show(self: *Window, placing: Placing) void {
     if (self.tab().focused) |surface| {
         if (surface.initial_size) |size| self.applyInitialSize(surface, size);
     }
+
+    // After the size, which the placing keeps inside a work area, and
+    // before `maximize` and `fullscreen`, which leave the placed rect as
+    // the one the window comes back to.
+    if (placing == .configured) self.applyInitialPosition();
 
     // `maximize` starts every window maximized, as on GTK, which applies it
     // before `fullscreen`, so that a window that starts covering its
@@ -5029,6 +5112,57 @@ test "win32: a stepped rect moves only its dragged edges" {
         try std.testing.expectEqual(start.top + @as(i32, if (drags(edges, 't')) 8 else 0), rect.top);
         try std.testing.expectEqual(start.bottom - @as(i32, if (drags(edges, 'b')) 8 else 0), rect.bottom);
     }
+}
+
+test "win32: a window's position is where what shows of it starts, kept on its monitor" {
+    const work: win32.RECT = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1040 };
+    // An 11 px border that does not show on three sides, none on top.
+    const frame: win32.RECT = .{ .left = 300, .top = 200, .right = 1122, .bottom = 811 };
+    const visible: win32.RECT = .{ .left = 311, .top = 200, .right = 1111, .bottom = 800 };
+    const Case = struct { at: win32.POINT, shown: win32.POINT };
+    for ([_]Case{
+        // Where it is asked for, the corner included.
+        .{ .at = .{ .x = 100, .y = 50 }, .shown = .{ .x = 100, .y = 50 } },
+        .{ .at = .{ .x = 0, .y = 0 }, .shown = .{ .x = 0, .y = 0 } },
+        // Past the right or the bottom: moved back until all of it shows.
+        .{ .at = .{ .x = 1500, .y = 50 }, .shown = .{ .x = 1120, .y = 50 } },
+        .{ .at = .{ .x = 100, .y = 900 }, .shown = .{ .x = 100, .y = 440 } },
+        // Before the left or the top.
+        .{ .at = .{ .x = -500, .y = -1 }, .shown = .{ .x = 0, .y = 0 } },
+        .{ .at = .{ .x = 32767, .y = -32768 }, .shown = .{ .x = 1120, .y = 0 } },
+    }) |case| {
+        const rect = positionRect(frame, visible, case.at, work);
+        // The part that shows is where it should be, and the frame keeps
+        // its size and its borders around it.
+        try std.testing.expectEqual(case.shown.x, rect.left + 11);
+        try std.testing.expectEqual(case.shown.y, rect.top);
+        try std.testing.expectEqual(frame.right - frame.left, rect.right - rect.left);
+        try std.testing.expectEqual(frame.bottom - frame.top, rect.bottom - rect.top);
+    }
+
+    // A work area that does not start at the origin (a monitor to the
+    // left of the primary one, a taskbar at its top).
+    const left: win32.RECT = .{ .left = -2560, .top = 48, .right = 0, .bottom = 1440 };
+    const there = positionRect(frame, visible, .{ .x = -2560, .y = 0 }, left);
+    try std.testing.expectEqual(-2560 - 11, there.left);
+    try std.testing.expectEqual(48, there.top);
+
+    // Borders that do not show on all four sides, each of its own width.
+    const odd: win32.RECT = .{ .left = 311 - 7, .top = 200 - 5, .right = 1111 + 9, .bottom = 800 + 13 };
+    try std.testing.expectEqual(
+        win32.RECT{ .left = 40 - 7, .top = 30 - 5, .right = 40 + 800 + 9, .bottom = 30 + 600 + 13 },
+        positionRect(odd, visible, .{ .x = 40, .y = 30 }, work),
+    );
+
+    // A window whose bounds could not be told from its frame: the frame
+    // itself is placed.
+    const whole = positionRect(frame, frame, .{ .x = 10, .y = 20 }, work);
+    try std.testing.expectEqual(win32.RECT{ .left = 10, .top = 20, .right = 832, .bottom = 631 }, whole);
+
+    // Larger than the work area: its corner, and no larger than it.
+    const big: win32.RECT = .{ .left = 0, .top = 0, .right = 3000, .bottom = 2000 };
+    const fit = positionRect(big, big, .{ .x = 500, .y = 500 }, work);
+    try std.testing.expectEqual(work, fit);
 }
 
 test "win32: modal loops are counted per window and returned on destroy" {

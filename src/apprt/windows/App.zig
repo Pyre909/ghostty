@@ -4006,7 +4006,7 @@ pub const App = struct {
 
         // Shown once both are owned, so that its first messages find them.
         switch (kind) {
-            .normal => window.show(),
+            .normal => window.show(.configured),
             .quick => {
                 self.quick = window;
                 _ = window.showQuick();
@@ -4077,8 +4077,9 @@ pub const App = struct {
         // shown in its place (`CommandPalette.focusMoved`).
         TitleDialog.followMove(old);
 
-        // Shown once it is owned, as a new window is.
-        window.show();
+        // Shown once it is owned, as a new window is, where the drop put
+        // it or Windows did: `window-position-x` is a new window's.
+        window.show(.as_is);
         return moved;
     }
 
@@ -6313,6 +6314,78 @@ fn testStepFrame(app: *App) !struct { *Window, *Surface, win32.RECT } {
     var frame: win32.RECT = undefined;
     if (!win32.GetWindowRect(window.hwnd, &frame).toBool()) return error.TestUnexpectedResult;
     return .{ window, a, frame };
+}
+
+test "win32: a new window shows at window-position-x and window-position-y" {
+    // What shows of a new window's frame has its corner at the position
+    // when both are set, at the size it had. With one alone, or for a
+    // window its maker placed (a tab's new one), the frame stays where
+    // it was.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const Case = struct { x: ?i16, y: ?i16, placing: Window.Placing, placed: bool };
+    for ([_]Case{
+        .{ .x = 120, .y = 90, .placing = .configured, .placed = true },
+        .{ .x = 120, .y = null, .placing = .configured, .placed = false },
+        .{ .x = null, .y = 90, .placing = .configured, .placed = false },
+        .{ .x = 120, .y = 90, .placing = .as_is, .placed = false },
+    }) |case| {
+        app.config.@"window-position-x" = case.x;
+        app.config.@"window-position-y" = case.y;
+        const window = try testFrame(&app);
+        var before: win32.RECT = undefined;
+        try std.testing.expect(win32.GetWindowRect(window.hwnd, &before).toBool());
+        window.show(case.placing);
+        var after: win32.RECT = undefined;
+        try std.testing.expect(win32.GetWindowRect(window.hwnd, &after).toBool());
+        if (!case.placed) {
+            try std.testing.expectEqual(before, after);
+            continue;
+        }
+        const visible = TabBar.visibleBounds(window.hwnd) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(120, visible.left);
+        try std.testing.expectEqual(90, visible.top);
+        try std.testing.expectEqual(before.right - before.left, after.right - after.left);
+        try std.testing.expectEqual(before.bottom - before.top, after.bottom - after.top);
+    }
+
+    // Past the monitor's far corner: what shows ends at the work area's.
+    app.config.@"window-position-x" = 32767;
+    app.config.@"window-position-y" = 32767;
+    const far = try testFrame(&app);
+    far.show(.configured);
+    const visible = TabBar.visibleBounds(far.hwnd) orelse return error.TestUnexpectedResult;
+    const monitor = Window.monitorInfo(win32.MonitorFromPoint(
+        .{ .x = 32767, .y = 32767 },
+        win32.MONITOR_DEFAULTTONEAREST,
+    )) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(monitor.rcWork.right, visible.right);
+    try std.testing.expectEqual(monitor.rcWork.bottom, visible.bottom);
+
+    // A tab moved into a window of its own: that one is no new window,
+    // and stays where Windows put it, which is never there.
+    app.config.@"window-position-x" = 7;
+    app.config.@"window-position-y" = 3;
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const b = try testTab(&app, window);
+    try std.testing.expect((try app.moveTabToNewWindow(&b.core_surface, null)).? == .whole);
+    const to = app.windows.getLast();
+    try std.testing.expect(to != window);
+    const moved = TabBar.visibleBounds(to.hwnd) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(moved.left != 7 or moved.top != 3);
 }
 
 test "win32: a drag of the border sizes the frame by the focused terminal's cells" {
@@ -11526,13 +11599,13 @@ test "win32: maximize starts a window maximized, and under fullscreen too" {
     app.config.maximize = true;
 
     const window = try testFrame(&app);
-    window.show();
+    window.show(.as_is);
     try std.testing.expect(shown(window.hwnd));
     try std.testing.expect(win32.IsZoomed(window.hwnd).toBool());
 
     app.config.fullscreen = .true;
     const covering = try testFrame(&app);
-    covering.show();
+    covering.show(.as_is);
     try std.testing.expect(shown(covering.hwnd));
     try std.testing.expect(covering.fullscreen != null);
     covering.toggleFullscreen();
@@ -13593,7 +13666,7 @@ test "win32: a title prompt opened over a window not shown yet shows with it" {
     try std.testing.expect(!shown(dialog));
     try std.testing.expect(!win32.IsWindowEnabled(window.hwnd).toBool());
 
-    window.show();
+    window.show(.as_is);
     try std.testing.expect(shown(window.hwnd));
     try std.testing.expect(shown(dialog));
     try std.testing.expect(!win32.IsWindowEnabled(window.hwnd).toBool());

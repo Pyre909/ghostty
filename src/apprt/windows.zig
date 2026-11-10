@@ -35,7 +35,10 @@
 //! ## Windows
 //!
 //! A window holds tabs, each with its terminals in a split tree, and shows
-//! one, laid out over its client area (`Window`, `Tab`).
+//! one, laid out over its client area (`Window`, `Tab`). A new window
+//! shows where `window-position-x` and `window-position-y` say when both
+//! are set, what shows of its frame kept inside the work area of the
+//! nearest monitor (`Window.applyInitialPosition`).
 //! `.move_tab_to_new_window` moves a tab whole into a new window: its
 //! terminals keep their windows and cores and only change frames
 //! (`Window.moveTabTo`). A tab dragged in the tab bar moves among the
