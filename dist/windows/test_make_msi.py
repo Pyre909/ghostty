@@ -1070,6 +1070,7 @@ class TestRefusals(Temp):
         self.assertRegex(
             said, r"^make_msi: \S*false \S+\.msi -q 'INSERT INTO `Environment`"
         )
+        self.assertIn("' failed with exit status 1:\n", said)
         self.assertEqual(list((self.tmp / "out").iterdir()), [], "nothing is published")
 
 

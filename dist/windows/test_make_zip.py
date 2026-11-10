@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import struct
 import subprocess
 import sys
@@ -1159,7 +1160,26 @@ class TestEcho(unittest.TestCase):
         cmd = [sys.executable, "-I", "-c", "import sys; sys.exit(1)", "a b"]
         with self.assertRaises(mz.Error) as e:
             mz.run(cmd)
-        self.assertEqual(shlex.split(str(e.exception).split(" failed:")[0]), cmd)
+        said, _, how = str(e.exception).partition(" failed ")
+        self.assertEqual(shlex.split(said), cmd)
+        self.assertEqual(how, "with exit status 1:\n")
+
+    def test_failed_command_says_what_it_printed_and_how_it_ended(self) -> None:
+        code = "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"
+        with self.assertRaises(mz.Error) as e:
+            mz.run([sys.executable, "-I", "-c", code])
+        self.assertTrue(
+            str(e.exception).endswith(" failed with exit status 3:\nout\nerr\n"),
+            str(e.exception),
+        )
+        # A signal leaves no word of the program's own.
+        code = "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"
+        with self.assertRaises(mz.Error) as e:
+            mz.run([sys.executable, "-I", "-c", code])
+        self.assertTrue(
+            str(e.exception).endswith(f" failed on signal {int(signal.SIGTERM)}:\n"),
+            str(e.exception),
+        )
 
     def test_build(self) -> None:
         err = io.StringIO()

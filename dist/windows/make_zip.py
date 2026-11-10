@@ -635,15 +635,28 @@ def git(*args: str) -> str:
     return run(["git", *args]).strip()
 
 
-def run(cmd: list[str]) -> str:
+def run(
+    cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None
+) -> str:
+    """What `cmd` prints, run in the repository unless `cwd` is given,
+    and with this environment unless `env` is."""
     # zig and git print UTF-8; without UTF-8 mode, as on Windows before
     # Python 3.15, text=True would decode with the ANSI code page.
     try:
         return subprocess.run(
-            cmd, cwd=REPO, check=True, capture_output=True, encoding="utf-8"
+            cmd,
+            cwd=cwd or REPO,
+            env=env,
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
         ).stdout
     except subprocess.CalledProcessError as e:
-        raise Error(f"{shlex.join(cmd)} failed:\n{e.stderr}") from None
+        # How it ended: a program that a signal ended may have said
+        # nothing.
+        code = e.returncode
+        how = f"with exit status {code}" if code > 0 else f"on signal {-code}"
+        raise Error(f"{shlex.join(cmd)} failed {how}:\n{e.stdout}{e.stderr}") from None
 
 
 def zig_build(zig: str, args: list[str], prefix: Path) -> None:

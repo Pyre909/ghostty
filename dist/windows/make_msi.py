@@ -100,10 +100,8 @@ import datetime
 import hashlib
 import os
 import re
-import shlex
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 import time
@@ -454,13 +452,7 @@ def source(app: App, product_code: str) -> str:
 
 def run(cmd: list[str], cwd: Path) -> str:
     # TZ: the cabinet records each file's time as local time.
-    env = dict(os.environ, TZ="UTC")
-    try:
-        return subprocess.run(
-            cmd, cwd=cwd, env=env, check=True, capture_output=True, encoding="utf-8"
-        ).stdout
-    except subprocess.CalledProcessError as e:
-        raise Error(f"{shlex.join(cmd)} failed:\n{e.stdout}{e.stderr}") from None
+    return make_zip.run(cmd, cwd, dict(os.environ, TZ="UTC"))
 
 
 def table(tools: dict[str, str], msi: Path, name: str) -> list[dict[str, str]]:
