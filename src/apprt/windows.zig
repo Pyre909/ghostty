@@ -238,7 +238,8 @@
 //! ticks (`Surface.Mouse.Notches`). A precision touchpad's pan, which
 //! Windows sends as wheel turns of less than a notch, and a
 //! high-resolution wheel scroll line by line, as GTK's and macOS's
-//! precision scrolling does, a notch's worth as many lines as a notch
+//! precision scrolling does, a notch's worth as many lines as a notch;
+//! sideways, as many columns as a notch, which is one
 //! (`Surface.Mouse.Lines`).
 //!
 //! ## Dropped files

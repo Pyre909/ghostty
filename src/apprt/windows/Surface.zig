@@ -507,7 +507,7 @@ pub const Surface = struct {
                 .leave_owed = false,
                 .tracking = false,
                 .left_press_pos = outside,
-                .wheel_x = .{},
+                .wheel_x = .horizontal,
                 .wheel_y = .{},
                 // The core starts at `.text` and never sends that first
                 // shape (`Terminal.mouse_shape`); the GTK runtime
@@ -663,16 +663,19 @@ pub const Surface = struct {
         /// high-resolution wheel. As whole ticks (`Notches`) these would
         /// wait for a notch's worth and then scroll its lines at once;
         /// counted in lines they scroll line by line, as a touchpad does
-        /// on GTK and macOS. A notch's worth of them is as many lines as a
-        /// notch is. Only whole lines are passed on, for the reason only
-        /// whole ticks are, and a change of direction drops the remainder
-        /// as there.
+        /// on GTK and macOS. A notch's worth of them scrolls what a notch
+        /// does with the default multipliers: on the vertical wheel as
+        /// many lines as a notch is, and on the horizontal one, whose
+        /// ticks the core takes as a column each with no multiplier, a
+        /// column for each of a tick's characters (`unit`). Only whole
+        /// lines are passed on, for the reason only whole ticks are, and
+        /// a change of direction drops the remainder as there.
         const Lines = struct {
             /// In 1/WHEEL_DELTA of a line (or character).
             rem: i64 = 0,
 
-            fn add(self: *Lines, delta: i32, per_notch: u32) ?i64 {
-                return wholeOf(&self.rem, delta, per_notch, win32.WHEEL_DELTA);
+            fn add(self: *Lines, delta: i32, per_notch: u32, unit: i32) ?i64 {
+                return wholeOf(&self.rem, delta, per_notch, unit);
             }
         };
 
@@ -698,6 +701,14 @@ pub const Surface = struct {
         const Wheel = struct {
             notches: Notches = .{},
             lines: Lines = .{},
+            /// What one of `Lines`' lines is, in 1/WHEEL_DELTA of a line.
+            line_unit: i32 = win32.WHEEL_DELTA,
+
+            /// The horizontal wheel: the core scrolls a column for a
+            /// tick, which is `Notches.per_tick` characters, so a line
+            /// here is as many, and a notch's worth of small turns
+            /// scrolls what a notch does.
+            const horizontal: Wheel = .{ .line_unit = win32.WHEEL_DELTA * Notches.per_tick };
 
             const Turn = union(enum) {
                 /// Ticks, for `Surface.scrollCallback` as they are.
@@ -714,15 +725,18 @@ pub const Surface = struct {
                     return .{ .ticks = self.notches.add(delta, per_notch) orelse return null };
                 }
                 self.notches.rem = 0;
-                return .{ .lines = self.lines.add(delta, per_notch) orelse return null };
+                return .{ .lines = self.lines.add(delta, per_notch, self.line_unit) orelse return null };
             }
 
             /// What the core is given for `turn` along an axis whose cells
             /// are `cell` pixels: the ticks, or the lines' pixels with
-            /// `precision`, of which the core scrolls a row for each
-            /// cell's worth, times `mouse-scroll-multiplier`'s precision
-            /// value. A whole number of cells, so that with the default
-            /// of 1 the core has no remainder to drop.
+            /// `precision`, of which the core scrolls a row or a column
+            /// for each cell's worth, the rows times
+            /// `mouse-scroll-multiplier`'s precision value. A whole
+            /// number of cells, so that with a whole precision value, as
+            /// the default of 1 is, the core has no remainder to drop;
+            /// with any other it drops part of a row whenever an event
+            /// crosses one, as it does for every runtime.
             fn scrollBy(turn: Turn, cell: u32) struct { f64, input.ScrollMods } {
                 return switch (turn) {
                     .ticks => |n| .{ @floatFromInt(n), .{} },
@@ -3824,6 +3838,20 @@ test "win32: a wheel's sum of small turns is the lines of their sum" {
         try std.testing.expectEqual(@rem(sum, 120), w.lines.rem);
         try std.testing.expectEqual(0, w.notches.rem);
     }
+}
+
+test "win32: a horizontal wheel's small turns scroll what its notch does" {
+    // A notch is a tick, which the core scrolls a column for; a notch's
+    // worth of small turns is one line, a column's pixels.
+    const Wheel = Surface.Mouse.Wheel;
+    const Turn = Wheel.Turn;
+    var notch: Wheel = .horizontal;
+    try std.testing.expectEqual(Turn{ .ticks = 1 }, notch.add(120, 3).?);
+    var small: Wheel = .horizontal;
+    try std.testing.expect(small.add(40, 3) == null);
+    try std.testing.expect(small.add(40, 3) == null);
+    try std.testing.expectEqual(Turn{ .lines = 1 }, small.add(40, 3).?);
+    try std.testing.expectEqual(0, small.lines.rem);
 }
 
 test "win32: a wheel's ticks go to the core as they are, its lines in pixels" {

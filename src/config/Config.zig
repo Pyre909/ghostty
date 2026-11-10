@@ -1011,7 +1011,8 @@ palette: Palette = .{},
 /// discrete value, so a setting of 1 scrolls 3 rows every third notch. A
 /// touchpad, or a wheel that turns by less than a notch, scrolls row by row
 /// instead, as many rows for a notch's worth as the system's setting, times
-/// the precision value.
+/// the precision value when that is a whole number; with a fraction, part
+/// of a row is lost at times.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
 /// The opacity level (opposite of transparency) of the background. A value of
