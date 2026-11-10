@@ -311,7 +311,8 @@ def source(app: App, product_code: str) -> str:
     dirs = app.dirs()
     dir_id = {d: f"dir{i}" for i, d in enumerate(dirs)}
     wix = ElementTree.Element("Wix", xmlns=WIX)
-    product = ElementTree.SubElement(
+    sub = ElementTree.SubElement
+    product = sub(
         wix,
         "Product",
         Id=product_code,
@@ -321,7 +322,6 @@ def source(app: App, product_code: str) -> str:
         Manufacturer=MANUFACTURER,
         UpgradeCode=UPGRADE_CODE,
     )
-    sub = ElementTree.SubElement
     # Schema 500 is the first with Arm64 packages; perUser sets the
     # summary's bit for a package that needs no elevation and leaves
     # ALLUSERS unset.
