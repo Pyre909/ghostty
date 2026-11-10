@@ -396,11 +396,16 @@ pub const End = enum {
 /// Whether the windows open at `end` are saved, to come back at the next
 /// launch. Never those of a window the user closed: closing the last one
 /// leaves none open to save.
+///
+/// By default a session's end saves them and a quit does not: the user
+/// who quits chose to close them, and the one whose machine restarts
+/// did not. macOS's default draws the same line, saving only where the
+/// app was ended and not quit.
 pub fn saves(mode: configpkg.Config.WindowSaveState, end: End) bool {
-    _ = end;
     return switch (mode) {
         .always => true,
-        .default, .never => false,
+        .default => end == .session,
+        .never => false,
     };
 }
 
@@ -639,6 +644,7 @@ test "win32: the windows are saved at the ends the option names" {
     try testing.expect(!saves(.never, .quit));
     try testing.expect(!saves(.never, .session));
     try testing.expect(!saves(.default, .quit));
+    try testing.expect(saves(.default, .session));
 }
 
 test "win32: only the instances that share a class share their saved windows" {

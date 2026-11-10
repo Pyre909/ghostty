@@ -2323,7 +2323,9 @@ keybind: Keybinds = .{},
 ///
 ///   * `default` will use the default system behavior. On macOS, this
 ///     will only save state if the application is forcibly terminated
-///     or if it is configured systemwide via Settings.app.
+///     or if it is configured systemwide via Settings.app. On Windows,
+///     this will only save state when the Windows session ends: at a
+///     shutdown, a restart or a sign-out.
 ///
 ///   * `never` will never save window state.
 ///
@@ -2343,7 +2345,17 @@ keybind: Keybinds = .{},
 ///
 /// The default value is `default`.
 ///
-/// This is currently only supported on macOS. This has no effect on Linux.
+/// On Windows, the saved state is each window's position, size, tabs and
+/// splits, with each terminal's working directory and the titles you set.
+/// A terminal comes back as a new shell in that directory: its screen
+/// contents and running program are not restored, and a tab running a
+/// command given to Ghostty (such as with `-e`) is not saved. Closing the
+/// last window by hand saves nothing. A launch that is given a command, a
+/// working directory or a title opens that window and leaves the saved
+/// state for a later launch.
+///
+/// This is currently only supported on macOS and Windows. This has no effect
+/// on Linux.
 @"window-save-state": WindowSaveState = .default,
 
 /// Resize the window in discrete increments of the focused surface's cell size.

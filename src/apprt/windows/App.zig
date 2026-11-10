@@ -29883,7 +29883,7 @@ test "win32: a session's end inside a handler saves the windows once, though the
     try t.expectSaved(open);
 }
 
-test "win32: a quit saves the windows under window-save-state = always, and only there" {
+test "win32: a quit saves the windows only under window-save-state = always, a session's end by default" {
     for ([_]configpkg.Config.WindowSaveState{ .always, .default, .never }) |mode| {
         var t: TestSave = undefined;
         try t.init(mode);
@@ -29893,14 +29893,18 @@ test "win32: a quit saves the windows under window-save-state = always, and only
         t.terminate();
         try t.expectSaved(if (mode == .always) open else null);
     }
-    // Nor does a session's end save them where the option says never.
-    var t: TestSave = undefined;
-    try t.init(.never);
-    defer t.deinit();
-    try t.open();
-    t.app.endSession(0x1);
-    t.terminate();
-    try t.expectSaved(null);
+    // A session's end saves them by default too, and never where the
+    // option says never.
+    for ([_]configpkg.Config.WindowSaveState{ .always, .default, .never }) |mode| {
+        var t: TestSave = undefined;
+        try t.init(mode);
+        defer t.deinit();
+        try t.open();
+        const open = try t.snapshot();
+        t.app.endSession(0x1);
+        t.terminate();
+        try t.expectSaved(if (mode == .never) null else open);
+    }
 }
 
 test "win32: an app with no window to save leaves the saved windows as they are" {
