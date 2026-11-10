@@ -43,7 +43,9 @@ enabled: bool = false,
 /// `undo-timeout`, in milliseconds.
 timeout: u64 = 0,
 
-/// The closes that can be taken back, the last one last.
+/// The closes that can be taken back, the last one last. In the order
+/// they end in, too: each is added with the time of its close and the
+/// one timeout (`configure` empties the list before that changes).
 entries: std.ArrayList(Entry) = .empty,
 
 /// What `undo` brought back and `redo` closes again, the last one last.
@@ -154,7 +156,7 @@ pub fn newGroup(self: *Undo) u64 {
 /// with `undo` unbound nothing could bring them back.
 pub fn configure(self: *Undo, app: *App, config: *const configpkg.Config) void {
     self.enabled = reachable(config);
-    self.timeout = config.@"undo-timeout".duration / std.time.ns_per_ms;
+    self.timeout = config.@"undo-timeout".asMilliseconds();
     while (self.entries.items.len > 0) self.expire(app, self.entries.items.len - 1);
     self.redos.clearRetainingCapacity();
     self.arm(app);
@@ -233,16 +235,13 @@ fn push(self: *Undo, app: *App, window: *Window, group: u64, what: Entry.What) v
 /// A timer that cannot be set only delays the end of what is parked to
 /// the next close or `undo`, which both look at the time (`expireDue`).
 fn arm(self: *Undo, app: *App) void {
-    var first: ?u64 = null;
-    for (self.entries.items) |entry| {
-        if (first == null or entry.expires < first.?) first = entry.expires;
-    }
-    const due = first orelse {
+    if (self.entries.items.len == 0) {
         _ = win32.KillTimer(app.msg_hwnd, timer_id);
         return;
-    };
-    // SetTimer's bounds (USER_TIMER_MINIMUM, USER_TIMER_MAXIMUM).
-    const wait = std.math.clamp(due -| now(), win32.USER_TIMER_MINIMUM, 0x7FFFFFFF);
+    }
+    // The first is due first (`entries`). Within SetTimer's bounds.
+    const due = self.entries.items[0].expires;
+    const wait = std.math.clamp(due -| now(), win32.USER_TIMER_MINIMUM, win32.USER_TIMER_MAXIMUM);
     if (win32.SetTimer(app.msg_hwnd, timer_id, @intCast(wait), null) == 0) {
         log.warn("cannot set the undo timer err={}", .{win32.GetLastError()});
     }
@@ -252,7 +251,9 @@ fn arm(self: *Undo, app: *App) void {
 /// teardowns posted, as its close would have posted them. Only posted,
 /// so this is safe in any message loop; each teardown waits its turn
 /// (`Surface.destroyPosted`). A tab's entry takes with it those of the
-/// terminals closed in the tab before it, which lie under it.
+/// terminals closed in the tab before it (`forgetTab`), so that no entry
+/// names a tab that is gone. By time they have ended already, being
+/// older.
 fn expire(self: *Undo, app: *App, index: usize) void {
     var entry = self.entries.orderedRemove(index);
     self.end(app, &entry, null);
@@ -291,14 +292,8 @@ fn unpark(surface: *Surface) void {
 /// End every entry whose time is up, and set the timer for the next.
 pub fn expireDue(self: *Undo, app: *App) void {
     const t = now();
-    // From the start again after each: a tab's entry takes others with it.
-    var i: usize = 0;
-    while (i < self.entries.items.len) {
-        if (self.entries.items[i].expires <= t) {
-            self.expire(app, i);
-            i = 0;
-        } else i += 1;
-    }
+    // From the front, where the oldest is (`entries`).
+    while (self.entries.items.len > 0 and self.entries.items[0].expires <= t) self.expire(app, 0);
     self.arm(app);
 }
 
@@ -449,11 +444,16 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
                 self.end(app, entry, null);
                 return false;
             }
+            self.redos.ensureUnusedCapacity(alloc, 1) catch |err| {
+                log.warn("a closed terminal cannot be put back err={}", .{err});
+                self.end(app, entry, null);
+                return false;
+            };
             surface.parked = false;
             surface.closing = false;
             // The tab has the tree from here on.
             window.setTree(pane.tab, pane.tree);
-            if (dpi != entry.dpi) surface.scaleChanged(@intCast(dpi));
+            if (dpi != entry.dpi) surface.scaleChanged(std.math.lossyCast(u16, dpi));
             if (pane.tab == window.tab()) {
                 window.showPane(surface);
             } else {
@@ -462,12 +462,12 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
                 pane.tab.focused = surface;
                 window.selectTab(window.tabIndex(pane.tab).?);
             }
-            self.redos.append(alloc, .{
+            self.redos.appendAssumeCapacity(.{
                 .window = window,
                 .what = .{ .pane = surface },
                 .expires = expires,
                 .group = entry.group,
-            }) catch {};
+            });
             return true;
         },
         .tab => |parked| {
@@ -476,7 +476,11 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
                 self.end(app, entry, null);
                 return false;
             }
-            window.tabs.ensureUnusedCapacity(alloc, 1) catch |err| {
+            const room = if (window.tabs.ensureUnusedCapacity(alloc, 1)) |_|
+                self.redos.ensureUnusedCapacity(alloc, 1)
+            else |err|
+                err;
+            room catch |err| {
                 log.warn("a closed tab cannot be put back err={}", .{err});
                 self.end(app, entry, null);
                 return false;
@@ -487,16 +491,16 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
             while (it.next()) |leaf| {
                 leaf.view.parked = false;
                 leaf.view.closing = false;
-                if (dpi != entry.dpi) leaf.view.scaleChanged(@intCast(dpi));
+                if (dpi != entry.dpi) leaf.view.scaleChanged(std.math.lossyCast(u16, dpi));
             }
             // The window has the tab from here on.
             window.relinkTab(tab, parked.index);
-            self.redos.append(alloc, .{
+            self.redos.appendAssumeCapacity(.{
                 .window = window,
                 .what = .{ .tab = tab },
                 .expires = expires,
                 .group = entry.group,
-            }) catch {};
+            });
             return true;
         },
     }

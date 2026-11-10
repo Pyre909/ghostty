@@ -256,6 +256,8 @@ pub fn deinitTabs(self: *Window, alloc: Allocator) void {
     self.tabs.deinit(alloc);
 }
 
+/// Free `t`, its tree and its title. The terminals its tree names are not
+/// touched: they are the app's (`App.surfaces`), and go with their frame.
 pub fn freeTab(alloc: Allocator, t: *Tab) void {
     t.tree.deinit();
     if (t.title_override) |title| alloc.free(title);

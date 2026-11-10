@@ -1167,6 +1167,9 @@ pub extern "user32" fn ToUnicodeEx(
 ) callconv(.winapi) c_int;
 /// The shortest a timer runs; SetTimer takes any shorter time as this.
 pub const USER_TIMER_MINIMUM: UINT = 0x0000000A;
+/// The longest a timer runs; SetTimer takes any longer time as one
+/// millisecond.
+pub const USER_TIMER_MAXIMUM: UINT = 0x7FFFFFFF;
 pub extern "user32" fn SetTimer(
     hwnd: ?HWND,
     id: UINT_PTR,

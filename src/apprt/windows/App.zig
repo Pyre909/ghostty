@@ -3062,8 +3062,9 @@ pub const App = struct {
 
     /// `.undo`: the last close is taken back from `run`, as a split is
     /// made there, since the tab is laid out and the focus moves. `true`
-    /// once recorded; `false`, for the key to reach the terminal, when
-    /// there is no close to take back, as on macOS.
+    /// once recorded; `false`, not performed, when there is no close to
+    /// take back, as on macOS: the key of a `performable:` binding then
+    /// reaches the terminal.
     fn requestUndo(self: *App) bool {
         if (!self.undo.pending()) return false;
         self.requests.append(self.core_app.alloc, .undo) catch |err| {
@@ -11419,7 +11420,8 @@ test "win32: a split closed where undo is bound is parked, and undo puts it back
     testPump();
     try std.testing.expect(TestUndo.has(&app, t.b));
 
-    // Nothing more to take back: the key is the terminal's.
+    // Nothing more to take back: not performed, so that a `performable:`
+    // binding leaves the key to the terminal.
     try std.testing.expect(!try app.performAction(.app, .undo, {}));
     try std.testing.expectEqual(0, app.requests.items.len);
 }
@@ -11437,6 +11439,9 @@ test "win32: a parked split is torn down when its time is up, after any prompt" 
     const t = try TestUndo.init(&app);
     TestUndo.close(t.b);
     try std.testing.expect(t.b.parked);
+    // The close set the timer; asked by ending it, and the early tick
+    // below sets it again.
+    try std.testing.expect(win32.KillTimer(app.msg_hwnd, Undo.timer_id).toBool());
 
     // A timer that fires early ends nothing.
     Undo.test_now = TestUndo.due - 1;
@@ -11449,6 +11454,8 @@ test "win32: a parked split is torn down when its time is up, after any prompt" 
     app.prompt_depth = 1;
     TestUndo.tick(&app);
     try std.testing.expectEqual(0, app.undo.entries.items.len);
+    // With nothing left to end, the timer is stopped.
+    try std.testing.expect(!win32.KillTimer(app.msg_hwnd, Undo.timer_id).toBool());
     try std.testing.expect(!try app.performAction(.app, .undo, {}));
     testPump();
     try std.testing.expect(TestUndo.has(&app, t.b));
@@ -11576,7 +11583,7 @@ test "win32: a parked split goes with its window, its tab, and the terminals it 
         try std.testing.expectEqual(0, app.surfaces.items.len);
         try std.testing.expectEqual(0, app.windows.items.len);
     }
-    // The frame destroyed outright.
+    // The frame destroyed outright: nothing is left, nor leaked.
     {
         const t = try TestUndo.init(&app);
         TestUndo.close(t.b);
@@ -11830,7 +11837,7 @@ test "win32: tabs closed by one action come back by one undo, and go again by on
     try std.testing.expectEqual(t1, window.tab());
 }
 
-test "win32: a split closed in a tab that then closes comes back after the tab, or ends with it" {
+test "win32: a split closed in a tab that then closes comes back after the tab, or ends as it does" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -11865,9 +11872,8 @@ test "win32: a split closed in a tab that then closes comes back after the tab, 
         try std.testing.expect(shown(t.b.hwnd));
         try std.testing.expect(win32.DestroyWindow(window.hwnd).toBool());
     }
-    // The tab's time is up: its terminals are torn down, and so is the
-    // one closed in it before, which had nowhere left to go back to. A
-    // leak of the tab or of the tree fails the test.
+    // Both run out of time, the split first: every terminal of the tab
+    // is torn down. A leak of the tab or of the tree fails the test.
     {
         const t = try TestUndo.init(&app);
         const p1 = try testTab(&app, t.window);
@@ -12096,6 +12102,88 @@ test "win32: a split taken back into a tab that is not shown shows that tab" {
     try std.testing.expect(!shown(p1.hwnd));
     try std.testing.expectEqual(before[0], try paneRect(window, t.a));
     try std.testing.expectEqual(before[1], try paneRect(window, t.b));
+}
+
+test "win32: what undo brings back is told the scale its window took on meanwhile" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const Scales = struct {
+        var calls: usize = 0;
+        var last: u16 = 0;
+        fn seen(_: *Surface, dpi: u16) void {
+            calls += 1;
+            last = dpi;
+        }
+    };
+    Scales.calls = 0;
+    Surface.test_scale_changed = &Scales.seen;
+    defer Surface.test_scale_changed = null;
+    TestDpi.dpi = 96;
+    defer TestDpi.dpi = 96;
+    app.get_dpi_for_window = &TestDpi.of;
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    _ = try testTab(&app, window);
+
+    // A split: told nothing when nothing changed, and the new scale once
+    // when it did.
+    TestUndo.close(t.b);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(0, Scales.calls);
+    TestUndo.close(t.b);
+    TestDpi.dpi = 144;
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(1, Scales.calls);
+    try std.testing.expectEqual(144, Scales.last);
+
+    // A tab: each of its terminals.
+    Scales.calls = 0;
+    try std.testing.expect(window.closeTabs(0, .this));
+    testPump();
+    try std.testing.expect(t.a.parked and t.b.parked);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(0, Scales.calls);
+    try std.testing.expect(window.closeTabs(0, .this));
+    testPump();
+    TestDpi.dpi = 96;
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, Scales.calls);
+    try std.testing.expectEqual(96, Scales.last);
+}
+
+test "win32: what undo brought back is not closed again once its window is gone" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    _ = try testTab(&app, t.window);
+    try std.testing.expect(t.window.closeTabs(0, .this));
+    testPump();
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expect(app.undo.pendingRedo());
+
+    try std.testing.expect(win32.DestroyWindow(t.window.hwnd).toBool());
+    try std.testing.expectEqual(0, app.undo.redos.items.len);
+    try std.testing.expect(!try app.performAction(.app, .redo, {}));
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {

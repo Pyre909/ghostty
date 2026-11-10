@@ -1045,13 +1045,18 @@ pub const Surface = struct {
 
     /// Stop the core surface and destroy its window. The last terminal in a
     /// window takes the window with it (`Window.destroy`); any other leaves
-    /// the window first (`Window.removePane`). Returns whether it was
+    /// the window first (`Window.takePane`). Returns whether it was
     /// destroyed; **when it was, `self` has been freed** (WM_DESTROY ->
     /// App.surfaceDestroyed), and so has a window that went with it
     /// (WM_NCDESTROY -> App.windowDestroyed), and nothing may touch either.
     ///
-    /// When it cannot leave the window (out of memory), nothing is done and
-    /// the close can be asked for again.
+    /// Where `undo` can take the close back (`Undo.parks`), the terminal,
+    /// or its whole tab, is parked instead (`park`, `Window.parkTab`):
+    /// `false` is returned with `self` alive, its core running, and
+    /// `closing` and `parked` set.
+    ///
+    /// When it cannot leave its tab (`Window.takePane`, out of memory),
+    /// nothing is done and the close can be asked for again.
     pub fn destroy(self: *Surface) bool {
         const window = self.window;
         if (window.find(self)) |at| {
@@ -1245,36 +1250,6 @@ pub const Surface = struct {
     /// on the main thread, is exactly the unpumped wait steps 2-4 exist to
     /// avoid. If those fields are renamed this stops compiling, which is the
     /// desired failure.
-    /// End what the mouse and the IME have under way in this terminal, as
-    /// it stops taking input: its core stops (`stopCore`), or it is hidden
-    /// away for `undo` (`park`).
-    fn releaseInput(self: *Surface) void {
-        // A drag in progress ends. Button messages for a `.stopping`
-        // surface are not handled, so nothing else would release the
-        // capture while a teardown pumps messages (App.waitForThread).
-        if (self.mouse.held.count() != 0) {
-            self.mouse.held = .empty;
-            if (self.hasCapture()) _ = win32.ReleaseCapture();
-        }
-        self.mouse.owed = .empty;
-        self.mouse.leave_owed = false;
-
-        // No mouse event reaches the core from here on, so the core cannot
-        // show a pointer it hid while typing; WM_SETCURSOR would keep it
-        // hidden over the window for the rest of a teardown.
-        self.mouse.hidden = false;
-        self.applyCursor();
-
-        // A composition ends too: nothing is left to draw its preedit or
-        // to take its result. The IME is not told; in a teardown the window
-        // is about to be destroyed, and ImmNotifyIME would send its
-        // messages back into it.
-        self.ime.pending.clearAndFree(self.app.core_app.alloc);
-        self.ime.composing = false;
-        self.ime.form = null;
-        self.preedit = .none;
-    }
-
     pub fn stopCore(self: *Surface) void {
         if (self.core_state != .live) return;
 
@@ -1318,6 +1293,36 @@ pub const Surface = struct {
 
         cs.deinit();
         self.core_state = .none;
+    }
+
+    /// End what the mouse and the IME have under way in this terminal, as
+    /// it stops taking input: its core stops (`stopCore`), or it is hidden
+    /// away for `undo` (`park`).
+    fn releaseInput(self: *Surface) void {
+        // A drag in progress ends. Button messages for a `.stopping`
+        // surface are not handled, so nothing else would release the
+        // capture while a teardown pumps messages (App.waitForThread).
+        if (self.mouse.held.count() != 0) {
+            self.mouse.held = .empty;
+            if (self.hasCapture()) _ = win32.ReleaseCapture();
+        }
+        self.mouse.owed = .empty;
+        self.mouse.leave_owed = false;
+
+        // No mouse event reaches the core from here on, so the core cannot
+        // show a pointer it hid while typing; WM_SETCURSOR would keep it
+        // hidden over the window for the rest of a teardown.
+        self.mouse.hidden = false;
+        self.applyCursor();
+
+        // A composition ends too: nothing is left to draw its preedit or
+        // to take its result. The IME is not told; in a teardown the window
+        // is about to be destroyed, and ImmNotifyIME would send its
+        // messages back into it.
+        self.ime.pending.clearAndFree(self.app.core_app.alloc);
+        self.ime.composing = false;
+        self.ime.form = null;
+        self.preedit = .none;
     }
 
     /// The first step of `stopCore`, apart so that it can be tested: the
@@ -4711,6 +4716,7 @@ test "win32: a teardown dispatched inside another waits for it" {
     surface.window = &s.window;
     surface.core_state = .none;
     surface.closing = true;
+    surface.parked = false;
     s.window.tabs = .fromOwnedSlice(&s.tabs);
     s.window.selected = 0;
     // The window's only terminal, so a teardown that runs takes the window.
@@ -4787,6 +4793,7 @@ test "win32: a finished teardown posts the ones it deferred again" {
         surface.window = window;
         surface.core_state = .none;
         surface.closing = true;
+        surface.parked = false;
         surface.hwnd = win32.CreateWindowExW(
             0,
             L("STATIC"),
