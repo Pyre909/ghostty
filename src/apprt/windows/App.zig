@@ -48,6 +48,7 @@ const input_pane = @import("input_pane.zig");
 const toast = @import("toast.zig");
 const media = @import("media.zig");
 const confirm = @import("dialog.zig").confirm;
+const Question = @import("dialog.zig").Question;
 const fatalNotice = @import("dialog.zig").fatalNotice;
 const notice = @import("dialog.zig").notice;
 const retry = @import("dialog.zig").retry;
@@ -1959,10 +1960,11 @@ pub const App = struct {
         // No owner of its own: promptOwner gives the prompt the window the
         // user was last in.
         if (self.core_app.needsConfirmQuit()) {
+            var question: Question = .{};
             if (!confirm(
                 self,
                 null,
-                L("All terminal sessions will be terminated. Quit Ghostty?"),
+                question.text("Quit Ghostty?", "All terminal sessions will be terminated."),
                 .ok,
             )) return true;
         }
@@ -23801,7 +23803,7 @@ test "win32: a read-only terminal whose command has exited asks to close as read
     window.tab().tree = try testRow(alloc, &.{ a, b });
     window.tab().focused = a;
     window.relayout();
-    const running = "A process is still running in this terminal. Close it anyway?";
+    const running = "Close Split?\n\nThe currently running process in this split will be terminated.";
     const read_only = "This terminal is read-only. Close it anyway?";
     PromptSeen.answer = win32.IDCANCEL;
 

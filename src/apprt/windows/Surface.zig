@@ -52,6 +52,7 @@ const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 const clipboardPrompt = @import("clipboard.zig").clipboardPrompt;
 const ClipboardDialog = @import("ClipboardDialog.zig");
 const confirm = @import("dialog.zig").confirm;
+const Question = @import("dialog.zig").Question;
 const drop = @import("drop.zig");
 const Shell = @import("../../termio/shell_integration.zig").Shell;
 const notice = @import("dialog.zig").notice;
@@ -1328,7 +1329,8 @@ pub const Surface = struct {
         if (self.closing) return;
         self.closing = true;
 
-        if (process_alive and !confirm(self.app, self.hwnd, self.closePrompt(), .ok)) {
+        var question: Question = .{};
+        if (process_alive and !confirm(self.app, self.hwnd, self.closePrompt(&question), .ok)) {
             // `self` is still valid: `confirm` raises `prompt_depth`, so no
             // teardown can run inside its modal loop: destroyPosted defers,
             // and so does the session's end (`App.endSession`), the only
@@ -1347,10 +1349,12 @@ pub const Surface = struct {
     /// says the terminal is read-only; otherwise it says a process is still
     /// running in it. The core's actions tell this runtime both
     /// (`readonly`, `show_child_exited`).
-    fn closePrompt(self: *const Surface) win32.LPCWSTR {
+    fn closePrompt(self: *const Surface, question: *Question) win32.LPCWSTR {
+        // GTK has no prompt of this kind to take the words from, so it is
+        // in the source's only.
         if (self.overlays.readonly.on and self.overlays.child_exited.exited)
             return L("This terminal is read-only. Close it anyway?");
-        return L("A process is still running in this terminal. Close it anyway?");
+        return question.text("Close Split?", "The currently running process in this split will be terminated.");
     }
 
     /// The Direct3D 11 device has no options: each renderer creates its

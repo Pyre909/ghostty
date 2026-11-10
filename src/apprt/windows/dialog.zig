@@ -4,8 +4,41 @@ const builtin = @import("builtin");
 const win32 = @import("win32.zig");
 const L = win32.L;
 const App = @import("App.zig").App;
+const i18n = @import("../../os/main.zig").i18n;
 
 const log = std.log.scoped(.win32);
+
+/// A prompt's text in the user's language: a question, and under it what
+/// OK then does, in the words GTK's dialogs head and say it with, which
+/// are the ones translated. In a buffer of the caller's, for the prompt's
+/// time.
+pub const Question = struct {
+    buf: [max:0]u16 = undefined,
+
+    const max = 600;
+
+    /// The source's own words if the translation does not fit.
+    pub fn text(
+        self: *Question,
+        comptime heading: [:0]const u8,
+        comptime body: [:0]const u8,
+    ) win32.LPCWSTR {
+        const source = L(heading ++ "\n\n" ++ body);
+        var len: usize = 0;
+        const parts = [_][]const u8{
+            std.mem.span(i18n._(heading)),
+            "\n\n",
+            std.mem.span(i18n._(body)),
+        };
+        for (parts) |part| {
+            // UTF-8 has no fewer bytes than UTF-16 has units.
+            if (len + part.len > max) return source;
+            len += std.unicode.utf8ToUtf16Le(self.buf[len..], part) catch return source;
+        }
+        self.buf[len] = 0;
+        return &self.buf;
+    }
+};
 
 /// The button of a `confirm` prompt that Enter and Space press.
 ///
@@ -128,4 +161,31 @@ pub fn fatalNotice(err: anyerror) void {
         return;
     }
     _ = win32.MessageBoxW(null, wide[0..n :0], L("Ghostty"), win32.MB_OK | win32.MB_ICONERROR);
+}
+
+test "win32: a question is asked in the user's language, or as written" {
+    if (comptime !i18n.windows.embedded) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var q: Question = .{};
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    // With no catalog, and for what a catalog has nothing for.
+    try testing.expectEqualSlices(u16, W("Close Tab?\n\nIt goes."), std.mem.span(q.text("Close Tab?", "It goes.")));
+
+    const long: [Question.max]u8 = @splat('x');
+    const catalog = try @import("../../os/i18n_catalog.zig").write(alloc, &.{
+        .{ "Close Tab?", "Tab schlie\u{df}en?" },
+        .{ "Too long", &long },
+    });
+    defer alloc.free(catalog);
+    try i18n.windows.testUse(catalog);
+    defer i18n.windows.testUse(null) catch unreachable;
+    try testing.expectEqualSlices(
+        u16,
+        W("Tab schlie\u{df}en?\n\nIt goes."),
+        std.mem.span(q.text("Close Tab?", "It goes.")),
+    );
+    // One that does not fit is asked as written, whole.
+    try testing.expectEqualSlices(u16, W("Too long\n\nIt goes."), std.mem.span(q.text("Too long", "It goes.")));
 }

@@ -47,6 +47,7 @@ const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
 const WM_GHOSTTY_QUICK_HIDE = @import("App.zig").WM_GHOSTTY_QUICK_HIDE;
 const postTeardown = @import("App.zig").postTeardown;
 const confirm = @import("dialog.zig").confirm;
+const Question = @import("dialog.zig").Question;
 
 const log = std.log.scoped(.win32);
 
@@ -2150,10 +2151,11 @@ pub fn requestClose(self: *Window) void {
         // closes is in view, and the question is its own
         // (`App.promptOwner`). Cancelled, it stays shown.
         if (self.quick and !self.quickShown()) _ = self.showQuick();
+        var question: Question = .{};
         if (!confirm(
             self.app,
             self.hwnd,
-            L("A process is still running in this window. Close it anyway?"),
+            question.text("Close Window?", "All terminal sessions in this window will be terminated."),
             .ok,
         )) {
             self.closing = false;
@@ -2220,10 +2222,11 @@ pub fn requestCloseTabs(self: *Window, at: usize, mode: apprt.action.CloseTabMod
     }
     if (!any) return false;
     if (self.app.terminating or self.closing) return true;
+    var question: Question = .{};
     if (ask and !confirm(
         self.app,
         self.hwnd,
-        L("A process is still running in a tab. Close it anyway?"),
+        question.text("Close Tab?", "All terminal sessions in this tab will be terminated."),
         .ok,
     )) return true;
 
