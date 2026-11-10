@@ -46,7 +46,8 @@ def pe(machine: int) -> bytes:
 def app_files(arch: str = "x86_64") -> dict[str, bytes]:
     """The shapes of the real app: the files the package points at, a
     name with a space, a name longer than 8.3, and folders that hold only
-    folders (share, share/ghostty, share/terminfo)."""
+    folders (share, share/ghostty, share/terminfo and those above the
+    icon)."""
     return {
         "bin/ghostty.exe": pe(mz.ARCHES[arch]),
         "bin/ghostty.com": pe(mz.ARCHES[arch]),
@@ -54,8 +55,25 @@ def app_files(arch: str = "x86_64") -> dict[str, bytes]:
         "LICENSE.txt": b"license\n",
         "THIRD-PARTY-NOTICES.txt": b"notices\n",
         "share/ghostty/themes/3024 Day": b"background = #f7f7f7\n",
+        mm.TOAST_ICON: b"\x89PNG\r\n\x1a\n",
         "share/terminfo/x/xterm-ghostty": b"\x1a\x01",
     }
+
+
+# The folders of `app_files`, as paths under the top one (".").
+FOLDERS = [
+    ".",
+    "bin",
+    "share",
+    r"share\ghostty",
+    r"share\ghostty\themes",
+    r"share\icons",
+    r"share\icons\hicolor",
+    r"share\icons\hicolor\256x256",
+    r"share\icons\hicolor\256x256\apps",
+    r"share\terminfo",
+    r"share\terminfo\x",
+]
 
 
 def app_zip(
@@ -127,18 +145,7 @@ class TestReadApp(Temp):
         self.assertEqual((app.version, app.arch), ("1.4.1-dev+abc", "aarch64"))
         self.assertEqual(sorted(app.files), sorted(app_files()))
         # Parents first, and the folders that hold no file of their own.
-        self.assertEqual(
-            app.dirs(),
-            [
-                "",
-                "bin",
-                "share",
-                "share/ghostty",
-                "share/ghostty/themes",
-                "share/terminfo",
-                "share/terminfo/x",
-            ],
-        )
+        self.assertEqual(app.dirs(), ["", *[f.replace("\\", "/") for f in FOLDERS[1:]]])
 
     def test_names_as_make_zip_writes_them(self) -> None:
         # make_zip.make names the folder ghostty-<version>-windows-<arch>
@@ -160,8 +167,8 @@ class TestReadApp(Temp):
                 zf.writestr(zipfile.ZipInfo(f"{dest.stem}/{name}", when), data)
         with zipfile.ZipFile(dest) as zf:
             app = mm.read_app(zf)
-        # 2026-01-02T03:04:12Z: the seventh file's time, read as UTC.
-        self.assertEqual(app.when(), 1767323052)
+        # 2026-01-02T03:04:14Z: the eighth file's time, read as UTC.
+        self.assertEqual(app.when(), 1767323054)
 
     def test_folder_name(self) -> None:
         for top, why in [
@@ -224,7 +231,13 @@ class TestReadApp(Temp):
 
     def test_missing_files(self) -> None:
         # Spelled out: what the package points at, and the two texts.
-        for f in ("bin/ghostty.exe", "bin/ghostty.com", "README.txt", "LICENSE.txt"):
+        for f in (
+            "bin/ghostty.exe",
+            "bin/ghostty.com",
+            "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png",
+            "README.txt",
+            "LICENSE.txt",
+        ):
             with self.subTest(f):
                 files = app_files()
                 del files[f]
@@ -297,7 +310,7 @@ class TestSource(Temp):
         """Each component by the name of its key path's value."""
         out = {}
         for c in root.iter(f"{WIX}Component"):
-            values = c.findall(f"{WIX}RegistryValue")
+            values = [v for v in c.findall(f"{WIX}RegistryValue") if v.get("KeyPath")]
             self.assertEqual(len(values), 1)
             self.assertEqual(
                 (values[0].get("Root"), values[0].get("Key"), values[0].get("KeyPath")),
@@ -309,21 +322,7 @@ class TestSource(Temp):
     def test_one_component_a_folder(self) -> None:
         root = self.source(app_files())
         components = self.components(root)
-        self.assertEqual(
-            sorted(components),
-            sorted(
-                [
-                    ".",
-                    "bin",
-                    "share",
-                    r"share\ghostty",
-                    r"share\ghostty\themes",
-                    r"share\terminfo",
-                    r"share\terminfo\x",
-                    "Start menu",
-                ]
-            ),
-        )
+        self.assertEqual(sorted(components), sorted([*FOLDERS, "Start menu"]))
         for name, c in components.items():
             with self.subTest(name):
                 # A folder in a profile goes only when the package says.
@@ -658,26 +657,24 @@ class TestPackage(unittest.TestCase):
         rows = self.table(self.x64, "Registry")
         self.assertEqual({r["Root"] for r in rows}, {"1"}, "the user's hive only")
         own = sorted(r["Name"] for r in rows if r["Key"] == mm.KEY)
+        self.assertEqual(own, sorted([*FOLDERS, "Start menu"]))
+        toast = {r["Name"]: r for r in rows if r["Key"] != mm.KEY}
         self.assertEqual(
-            own,
-            sorted(
-                [
-                    ".",
-                    "bin",
-                    "share",
-                    r"share\ghostty",
-                    r"share\ghostty\themes",
-                    r"share\terminfo",
-                    r"share\terminfo\x",
-                    "Start menu",
-                ]
-            ),
+            {r["Key"] for r in toast.values()},
+            {r"Software\Classes\AppUserModelId\com.mitchellh.ghostty"},
         )
-        (toast,) = [r for r in rows if r["Key"] != mm.KEY]
-        # A name of "-" without a value deletes the key on uninstall.
+        # What Ghostty registers there itself: the name its notifications
+        # show and their icon, by the path the file is installed at. And
+        # a name of "-" without a value, which deletes the key on
+        # uninstall.
+        (icon,) = [
+            r["File"]
+            for r in self.table(self.x64, "File")
+            if r["FileName"].rpartition("|")[2] == "com.mitchellh.ghostty.png"
+        ]
         self.assertEqual(
-            (toast["Key"], toast["Name"], toast["Value"]),
-            (r"Software\Classes\AppUserModelId\com.mitchellh.ghostty", "-", ""),
+            {name: r["Value"] for name, r in toast.items()},
+            {"DisplayName": "Ghostty", "IconUri": f"[#{icon}]", "-": ""},
         )
         top = {
             r["Directory_"]: r["Component"] for r in self.table(self.x64, "Component")
@@ -687,7 +684,7 @@ class TestPackage(unittest.TestCase):
             for r in self.table(self.x64, "Directory")
             if r["DefaultDir"].rpartition("|")[2] == "Ghostty"
         ]
-        self.assertEqual(toast["Component_"], top[ghostty[0]])
+        self.assertEqual({r["Component_"] for r in toast.values()}, {top[ghostty[0]]})
 
     def test_files(self) -> None:
         names = sorted(
@@ -703,7 +700,7 @@ class TestPackage(unittest.TestCase):
         )
         # One folder to remove per folder installed.
         removes = self.table(self.x64, "RemoveFile")
-        self.assertEqual(len(removes), 7)
+        self.assertEqual(len(removes), len(FOLDERS))
         self.assertEqual({r["FileName"] for r in removes}, {""})
         self.assertEqual({r["InstallMode"] for r in removes}, {"2"})
 
@@ -749,7 +746,7 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(got, expected)
         # And the package says it was made at the latest of them.
         self.assertEqual(
-            mm.summary(self.tools, msi)["Created"], "Fri Jan  2 03:04:12 2026"
+            mm.summary(self.tools, msi)["Created"], "Fri Jan  2 03:04:14 2026"
         )
 
     def test_shortcut(self) -> None:
@@ -774,7 +771,8 @@ class TestPackage(unittest.TestCase):
             "the environment is [], not",
             "RemoveEnvironmentStrings's place is None, not 3300",
             "WriteEnvironmentStrings's place is None, not 5200",
-            "the notification key's row is [], not",
+            # The two values are in the source; the key's removal is not.
+            "the notification key's rows is [('DisplayName', 'Ghostty', 'cmp0'), ('IconUri', ",
         ]:
             with self.subTest(what):
                 self.assertIn(what, said)
@@ -876,11 +874,21 @@ class TestCheck(Temp):
                 ),
                 (
                     "UPDATE `Registry` SET `Name` = '+' WHERE `Registry` = 'regToast'",
-                    "the notification key's row is [('+', '', ",
+                    "the notification key's rows is [('+', '', ",
                 ),
                 (
                     f"UPDATE `Registry` SET `Component_` = '{components[bin_dir]}' WHERE `Registry` = 'regToast'",
-                    f"the notification key's row is [('-', '', '{components[bin_dir]}')]",
+                    f"the notification key's rows is [('-', '', '{components[bin_dir]}'), ",
+                ),
+                # And what it registers there: another name, and an icon
+                # that is another file.
+                (
+                    "UPDATE `Registry` SET `Value` = 'Other' WHERE `Name` = 'DisplayName'",
+                    "the notification key's rows is [('-', '', 'cmp0'), ('DisplayName', 'Other', ",
+                ),
+                (
+                    f"UPDATE `Registry` SET `Value` = '[#{files['README.txt']}]' WHERE `Name` = 'IconUri'",
+                    f"('IconUri', '[#{files['README.txt']}]', 'cmp0')], not ",
                 ),
             ]
         ):
@@ -979,6 +987,26 @@ class TestRepository(unittest.TestCase):
         toast = (REPO / "src/apprt/windows/toast.zig").read_text("utf-8")
         self.assertIn("    .fast, .small => build_config.bundle_id,\n", toast)
         self.assertIn(r'"Software\\Classes\\AppUserModelId\\{s}"', toast)
+
+    def test_registers_what_ghostty_registers(self) -> None:
+        # The two values `register` writes, the name a release build
+        # gives the first, and the icon's path under share, which
+        # `iconPath` ends with the bundle id.
+        toast = (REPO / "src/apprt/windows/toast.zig").read_text("utf-8")
+        register = toast[toast.index("\npub fn register(") :]
+        register = register[: register.index("\n}\n")]
+        values = re.findall(r'utf8ToUtf16LeStringLiteral\("(\w+)"\)', register)
+        self.assertEqual(sorted(set(values)), ["DisplayName", "IconUri"])
+        self.assertIn(f'    .fast, .small => "{mm.TOAST_NAME}",\n', toast)
+        (under_share,) = re.findall(r'"\{s\}((?:\\\\\w+)+)\\\\\{s\}\.png"', toast)
+        config = (REPO / "src/build_config.zig").read_text("utf-8")
+        (bundle_id,) = re.findall(
+            r'^pub const bundle_id = "([^"]+)";$', config, re.MULTILINE
+        )
+        self.assertEqual(
+            mm.TOAST_ICON,
+            "share" + under_share.replace("\\\\", "/") + f"/{bundle_id}.png",
+        )
 
     def test_icon(self) -> None:
         self.assertEqual(mm.ICON.read_bytes()[:4], b"\0\0\1\0", "an .ico file")

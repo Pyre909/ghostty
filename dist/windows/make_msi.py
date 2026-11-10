@@ -21,6 +21,13 @@ The package:
     adds a Ghostty shortcut to the user's Start menu and the bin folder to
     the end of the user's PATH;
 
+    registers the app ID of Ghostty's notifications, with the name and
+    the icon they show, as Ghostty does itself the first time it shows
+    one (src/apprt/windows/toast.zig). Ghostty does that once in a
+    process, and an upgrade removes the old version's registration with
+    the old version, so with Ghostty's own alone a Ghostty left open
+    through an upgrade (see below) would go on without one;
+
     is listed among the installed apps as Ghostty, by Pyre909, with the
     version's first three numbers, all a package's version can hold: a
     pre-release such as 1.4.1-dev is listed as 1.4.1;
@@ -43,10 +50,12 @@ The package:
     critical application, and Windows Installer then installs around
     the open Ghostty whatever window it has;
 
-    when uninstalled, removes what it installed, and the app ID that
-    Ghostty registers for its notifications the first time it shows one
-    (src/apprt/windows/toast.zig). It leaves what Ghostty wrote in
-    %LOCALAPPDATA%\\ghostty: the configuration, the crash dumps.
+    when uninstalled, removes what it installed and the whole of that
+    app ID's key. A Ghostty that the uninstall leaves open, and that has
+    shown no notification yet, registers the app ID again with its
+    first one, and that registration stays. The uninstall leaves what
+    Ghostty wrote in %LOCALAPPDATA%\\ghostty: the configuration, the
+    crash dumps.
 
 Each folder is one component, with a value under
 HKCU\\Software\\Pyre909\\Ghostty\\Installed as its key path, as Windows
@@ -127,9 +136,12 @@ NAMESPACE = uuid.UUID("4241E612-9EB3-4A6F-BC2E-B4700A596477")
 # The key whose values are the components' key paths, one per folder.
 KEY = rf"Software\{MANUFACTURER}\{PRODUCT}\Installed"
 
-# What Ghostty registers for its notifications: `app_id` in
-# src/apprt/windows/toast.zig, of a release build.
+# What a release build of Ghostty registers for its notifications
+# (src/apprt/windows/toast.zig): the key of its `app_id`, and in it its
+# `app_name` and the icon where `iconPath` looks for it.
 TOAST_KEY = r"Software\Classes\AppUserModelId\com.mitchellh.ghostty"
+TOAST_NAME = "Ghostty"
+TOAST_ICON = "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png"
 
 # Where the two actions that read the Environment table go in the install
 # sequence: the numbers Windows Installer's documentation suggests, which
@@ -157,7 +169,7 @@ DEVICES = frozenset(
 
 # The files the package itself points at.
 EXE = "bin/ghostty.exe"
-REQUIRED = (EXE, "bin/ghostty.com", "README.txt", "LICENSE.txt")
+REQUIRED = (EXE, "bin/ghostty.com", TOAST_ICON, "README.txt", "LICENSE.txt")
 
 WIX = "http://schemas.microsoft.com/wix/2006/wi"
 
@@ -355,14 +367,25 @@ def source(app: App, product_code: str) -> str:
         # the folders went without these rows as well.
         # https://learn.microsoft.com/en-us/windows/win32/msi/ice64
         sub(component, "RemoveFolder", Id=f"rm{dir_id[d][3:]}", On="uninstall")
-    for n, f in enumerate(sorted(app.files)):
+    file_id = {f: f"file{n}" for n, f in enumerate(sorted(app.files))}
+    for f, i in file_id.items():
         d, _, base = f.rpartition("/")
+        sub(components[dirs.index(d)], "File", Id=i, Name=base, Source=f"tree/{f}")
+    # The notifications' app ID, in the top folder's component: what
+    # Ghostty writes there itself, so that it is there again after an
+    # upgrade has removed the old version and its registration.
+    for name, value in (
+        ("DisplayName", TOAST_NAME),
+        ("IconUri", f"[#{file_id[TOAST_ICON]}]"),
+    ):
         sub(
-            components[dirs.index(d)],
-            "File",
-            Id=f"file{n}",
-            Name=base,
-            Source=f"tree/{f}",
+            components[0],
+            "RegistryValue",
+            Root="HKCU",
+            Key=TOAST_KEY,
+            Name=name,
+            Type="string",
+            Value=value,
         )
     bin_dir = dir_id[EXE.rpartition("/")[0]]
     menu_dir = sub(target, "Directory", Id="ProgramMenuFolder")
@@ -475,9 +498,9 @@ def finish(
             "INSERT INTO `InstallExecuteSequence` (`Action`, `Sequence`) "
             f"VALUES ('{action}', {sequence})"
         )
-    # A name of "-" and no value: the key is deleted, with what is in it,
-    # when the component is removed, and nothing is written when it is
-    # installed.
+    # A name of "-" and no value: the notifications' key is deleted, with
+    # what is in it, when the component is removed. Removing the two
+    # values the source has there would leave what else is in the key.
     sql(
         "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Component_`) "
         f"VALUES ('regToast', 1, '{TOAST_KEY}', '-', 'cmp0')"
@@ -573,32 +596,39 @@ def check(
     }
     for action, at in ENVIRONMENT_ACTIONS.items():
         want(f"{action}'s place", sequence.get(action), at)
-    registry = table(tools, msi, "Registry")
-    want("the registry roots", {r["Root"] for r in registry}, {"1"})
-    want(
-        "the notification key's row",
-        [
-            (r["Name"], r["Value"], r["Component_"])
-            for r in registry
-            if r["Key"] == TOAST_KEY
-        ],
-        [("-", "", component_of.get(folders.get("")))],
-    )
     # Every file where the zip has it and of the size it has there: the
     # ones that are not, the package's first and then the zip's.
     path_of = {d: path for path, d in folders.items()}
     folder_of = {r["Component"]: path_of.get(r["Directory_"]) for r in components}
-    got = collections.Counter(
-        (
+    files = {
+        r["File"]: (
             f"{folder_of.get(r['Component_'])}/{long(r['FileName'])}".lstrip("/"),
             int(r["FileSize"]),
         )
         for r in table(tools, msi, "File")
-    )
+    }
+    got = collections.Counter(files.values())
     expected = collections.Counter((f, i.file_size) for f, i in app.files.items())
     differ = sorted((got - expected).elements()) + sorted((expected - got).elements())
     if differ:
         problems.append(f"the package's files and the zip's differ in {differ!r}")
+    registry = table(tools, msi, "Registry")
+    want("the registry roots", {r["Root"] for r in registry}, {"1"})
+    top = component_of.get(folders.get(""))
+    icon = [key for key, (path, _) in files.items() if path == TOAST_ICON]
+    want(
+        "the notification key's rows",
+        sorted(
+            (r["Name"], r["Value"], r["Component_"])
+            for r in registry
+            if r["Key"] == TOAST_KEY
+        ),
+        [
+            ("-", "", top),
+            ("DisplayName", TOAST_NAME, top),
+            ("IconUri", f"[#{icon[0] if icon else None}]", top),
+        ],
+    )
     if problems:
         raise Error("the package is not as meant:\n  " + "\n  ".join(problems))
 
