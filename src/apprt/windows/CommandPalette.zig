@@ -1014,16 +1014,56 @@ fn toolInfo(list: win32.HWND) win32.TOOLINFOW {
 }
 
 /// The pointer is over the list's `row`, or off its rows (null): the
-/// tooltip takes that row's description (`Entry.tooltip`), or nothing,
-/// which it does not show, once the pointer moves to another row.
+/// tooltip takes what that row's tip is (`tipFor`), or nothing, which it
+/// does not show, once the pointer moves to another row.
 fn hover(window: *Window, row: ?usize) void {
     const p = &window.palette;
     if (row == p.hover_row) return;
     redrawRow(window, p.hover_row);
     redrawRow(window, row);
     p.hover_row = row;
-    const entry = if (row) |r| rowEntry(window, r) else null;
-    setTip(window, if (entry) |e| e.tooltip() orelse "" else "");
+    setTip(window, if (row) |r| tipFor(window, r) else "");
+}
+
+/// The tooltip for the list's `row`: its description (`Entry.tooltip`)
+/// when the row's second line cuts it short, as a tooltip that repeated
+/// the line just above it would only cover the next row; else nothing.
+pub fn tipFor(window: *Window, row: usize) []const u8 {
+    const entry = rowEntry(window, row) orelse return "";
+    const text = entry.tooltip() orelse return "";
+    return if (cutShort(window, row, entry)) text else "";
+}
+
+/// Whether the list's `row` draws `entry`'s second line cut short
+/// (`drawRow`).
+fn cutShort(window: *Window, row: usize, entry: *const Entry) bool {
+    const p = &window.palette;
+    const list = p.list orelse return false;
+    const font = p.fonts.small orelse return false;
+    var item: RECT = undefined;
+    if (win32.SendMessageW(list, win32.LB_GETITEMRECT, row, @bitCast(@intFromPtr(&item))) < 0) return false;
+    const hdc = win32.GetDC(list) orelse return false;
+    defer _ = win32.ReleaseDC(list, hdc);
+    const old = win32.SelectObject(hdc, font);
+    defer if (old) |o| {
+        _ = win32.SelectObject(hdc, o);
+    };
+    const alloc = window.app.core_app.alloc;
+    const shortcut_w = textWidth(hdc, alloc, entry.shortcut);
+    const m = Metrics.init(Window.dpiOf(window.app, list));
+    const r = Row.init(m, item, p.heights, shortcut_w);
+    return textWidth(hdc, alloc, entry.subtitle()) > r.subtitle.right - r.subtitle.left;
+}
+
+/// The width of `text` in `hdc`'s font, on one line; 0 for none, or
+/// what cannot be measured.
+fn textWidth(hdc: win32.HDC, alloc: Allocator, text: []const u8) i32 {
+    if (text.len == 0) return 0;
+    const wide = wideFromUtf8(alloc, text) catch return 0;
+    defer alloc.free(wide);
+    var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = win32.DrawTextW(hdc, wide.ptr, @intCast(wide.len), &r, win32.DT_SINGLELINE | win32.DT_NOPREFIX | win32.DT_CALCRECT);
+    return r.right - r.left;
 }
 
 /// Forget the row under the pointer and hide the tooltip: the rows under
@@ -1811,15 +1851,9 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
     const flags = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
 
     // The shortcut's width first, as the title gives way to it.
-    var shortcut_w: i32 = 0;
     const shortcut = wideFromUtf8(alloc, entry.shortcut) catch null;
     defer if (shortcut) |s| alloc.free(s);
-    if (shortcut) |s| if (s.len > 0) {
-        var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
-        _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_CALCRECT);
-        shortcut_w = r.right - r.left;
-    };
-    const row = Row.init(m, dis.rcItem, p.heights, shortcut_w);
+    const row = Row.init(m, dis.rcItem, p.heights, textWidth(hdc, alloc, entry.shortcut));
     if (selected or hovered) roundFill(hdc, row.fill, m.row_corner, if (selected) look.selected else look.hover);
     _ = win32.SetTextColor(hdc, look.dim);
     if (shortcut) |s| if (s.len > 0) {

@@ -23143,7 +23143,8 @@ test "win32: the wheel over the command palette scrolls its list, and a modified
 }
 
 test "win32: the command palette's tooltip follows the row under the pointer, and goes with the palette" {
-    // The pointer over a row puts that row's description in the tooltip;
+    // The pointer over a row puts that row's description in the tooltip,
+    // if the row cuts it short;
     // a refill, a scroll or the pointer leaving the list forgets the row.
     // Without a tooltip, which a process with no Common Controls v6
     // manifest may not get, all of it works the same. The tooltip, owned
@@ -23203,6 +23204,23 @@ test "win32: the command palette's tooltip follows the row under the pointer, an
     try std.testing.expectEqual(@as(?usize, 1), p.hover_row);
     _ = win32.SendMessageW(list, win32.WM_MOUSEWHEEL, testWheel(-120), 0);
     try std.testing.expect(p.hover_row == null);
+
+    // A description its row shows whole has no tooltip, which would only
+    // repeat it; one the row cuts short, in a narrow palette, has.
+    _ = win32.SendMessageW(list, win32.LB_SETTOPINDEX, 0, 0);
+    try std.testing.expect(paletteEntry(window, 0).tooltip() != null);
+    try std.testing.expectEqualStrings("", CommandPalette.tipFor(window, 0));
+    // The frame sized so that the palette is as narrow as it goes.
+    const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
+    var frame: win32.RECT = undefined;
+    try std.testing.expect(win32.GetWindowRect(window.hwnd, &frame).toBool());
+    const client = try clientRect(window.hwnd);
+    const bar = (try paneRect(window, a)).right - (try paneClient(window, a)).right;
+    testResize(window, m.min_width + 2 * m.margin + bar + (frame.right - frame.left) - client.right, 700);
+    try std.testing.expect(p.hwnd != null);
+    const narrow = try childRect(window, p.hwnd.?);
+    try std.testing.expectEqual(m.min_width, narrow.right - narrow.left);
+    try std.testing.expectEqualStrings(paletteEntry(window, 0).tooltip().?, CommandPalette.tipFor(window, 0));
 
     // Closed, the palette takes its tooltip with it.
     CommandPalette.close(window);
