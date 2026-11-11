@@ -15,11 +15,14 @@
 //! Error with the call and the HRESULT in the log, an out pointer becomes
 //! the result, and a BOOL becomes a bool.
 //!
-//! The tests check every vtable's slot count and every struct's layout
-//! against the header, so a dropped or shuffled slot fails on any host
-//! instead of calling the wrong function in a Windows run. No extern
-//! function lives here so that those tests link everywhere; directwrite/
-//! main.zig declares DWriteCreateFactory.
+//! The tests here pin slot counts, the typed slots' indices and struct
+//! sizes on any host, which catches a dropped slot but not two swapped.
+//! The Windows test build also compares every vtable and struct with
+//! translate-c's reading of the headers, slot by slot and field by field
+//! (src/apprt/windows/com_abi_test.zig), so a shuffled slot or a wrong
+//! signature fails to compile instead of calling the wrong function in a
+//! Windows run. No extern function lives here so that the host tests link
+//! everywhere; directwrite/main.zig declares DWriteCreateFactory.
 //!
 //! This mirrors src/renderer/d3d11/api.zig; the handful of helpers below
 //! are duplicated from it rather than imported, so the font package does

@@ -10,12 +10,16 @@
 //! A derived interface embeds its parent's vtable as its first field, which
 //! is how COM lays them out.
 //!
-//! The tests check every vtable's slot count and every struct's layout
-//! against the header, so a dropped or shuffled slot fails on any host
-//! instead of calling the wrong function in a Windows run. No extern
-//! function lives here so that those tests link everywhere; D3D11.zig
-//! declares D3D11CreateDevice and loads D3DCompile and
-//! DCompositionCreateDevice at runtime.
+//! The tests here pin slot counts, some typed slots' indices and struct
+//! layouts on any host, which catches a dropped slot but not two swapped.
+//! The Windows test build also compares every vtable and struct with
+//! translate-c's reading of the headers, slot by slot and field by field
+//! (src/apprt/windows/com_abi_test.zig), so a shuffled slot or a wrong
+//! signature fails to compile instead of calling the wrong function in a
+//! Windows run; dcomp.h's interfaces, declared for C++ only, are not
+//! compared. No extern function lives here so that the host tests link
+//! everywhere; D3D11.zig declares D3D11CreateDevice and loads D3DCompile
+//! and DCompositionCreateDevice at runtime.
 
 const std = @import("std");
 const builtin = @import("builtin");
