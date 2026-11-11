@@ -15594,9 +15594,11 @@ test "win32: a session's end inside a prompt only quits, and the windows close a
     try std.testing.expect(!app.terminating);
     try std.testing.expect(testTakeQuit());
 
+    // The frame is freed with its window: its handle read first.
+    const frame = f.hwnd;
     terminated = true;
     app.terminate();
-    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindow(frame).toBool());
 }
 
 test "win32: a session's end inside another handler only quits, and the windows close after it" {
@@ -15655,9 +15657,11 @@ test "win32: a session's end inside another handler only quits, and the windows 
     try std.testing.expect(!app.terminating);
     try std.testing.expect(testTakeQuit());
 
+    // The frame is freed with its window: its handle read first.
+    const frame = f.hwnd;
     terminated = true;
     app.terminate();
-    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindow(frame).toBool());
 }
 
 test "win32: a session's end inside a system control's procedure only quits" {
@@ -15734,9 +15738,11 @@ test "win32: a session's end inside a system control's procedure only quits" {
     try std.testing.expect(!app.terminating);
     try std.testing.expect(testTakeQuit());
 
+    // The frame is freed with its window: its handle read first.
+    const frame = f.hwnd;
     terminated = true;
     app.terminate();
-    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindow(frame).toBool());
 }
 
 test "win32: a session's end inside a terminal's loop only quits, and leaves the toasts to the quit" {
@@ -15779,9 +15785,11 @@ test "win32: a session's end inside a terminal's loop only quits, and leaves the
     try std.testing.expect(app.quit);
     try std.testing.expect(testTakeQuit());
 
+    // The frame is freed with its window: its handle read first.
+    const frame = f.hwnd;
     terminated = true;
     app.terminate();
-    try std.testing.expect(!win32.IsWindow(f.hwnd).toBool());
+    try std.testing.expect(!win32.IsWindow(frame).toBool());
     try std.testing.expectEqual(1, fake.removed_groups_len);
 }
 
