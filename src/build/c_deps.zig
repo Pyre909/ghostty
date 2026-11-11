@@ -6,6 +6,22 @@ const Config = @import("Config.zig");
 pub const CDeps = enum {
     @"ghostty-h",
     @"ghostty-vt-h",
+    @"windows-com-h",
+};
+
+/// The mingw headers whose COM interfaces and structs the Windows code
+/// declares by hand, which `src/os/com_abi.zig` checks against them. dcomp.h
+/// is missing: it declares its interfaces for C++ only.
+const windows_com_headers: []const translate_c.Options.IncludeFile = &.{
+    .{ .path = "windows.h" },
+    .{ .path = "d3d11.h" },
+    .{ .path = "dxgi1_5.h" },
+    .{ .path = "d3d11sdklayers.h" },
+    .{ .path = "d3dcompiler.h" },
+    .{ .path = "dwrite_3.h" },
+    .{ .path = "mfmediaengine.h" },
+    .{ .path = "shobjidl.h" },
+    .{ .path = "inputpaneinterop.h" },
 };
 
 const Key = struct {
@@ -76,6 +92,14 @@ pub fn add(b: *std.Build, dep: CDeps, module: *std.Build.Module, config: *const 
         // itself. On wasm32-wasi, for example, it switches `std.posix` to
         // the libc definitions and breaks the build.
         .@"ghostty-vt-h" => module.link_libc orelse false,
+
+        // The Windows SDK headers, from the libc Zig ships for Windows.
+        // A translation for any other target would lay the types out
+        // differently (a C long is 64 bits there), so there is none.
+        .@"windows-com-h" => link_libc: {
+            if (target.result.os.tag != .windows) return;
+            break :link_libc true;
+        },
     };
 
     const key: Key = .{
@@ -90,14 +114,14 @@ pub fn add(b: *std.Build, dep: CDeps, module: *std.Build.Module, config: *const 
             .source = .{
                 .includes = .{
                     .generated_name = b.fmt("{s}.h", .{@tagName(dep)}),
-                    .files = &.{.{
-                        .path = switch (dep) {
-                            // Verify our internal libghostty header.
-                            .@"ghostty-h" => "ghostty.h",
-                            // Verify our libghostty-vt header.
-                            .@"ghostty-vt-h" => "ghostty/vt.h",
-                        },
-                    }},
+                    .files = switch (dep) {
+                        // Verify our internal libghostty header.
+                        .@"ghostty-h" => &.{.{ .path = "ghostty.h" }},
+                        // Verify our libghostty-vt header.
+                        .@"ghostty-vt-h" => &.{.{ .path = "ghostty/vt.h" }},
+                        // Verify our COM declarations.
+                        .@"windows-com-h" => windows_com_headers,
+                    },
                 },
             },
             .target = target,

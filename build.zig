@@ -539,6 +539,10 @@ pub fn build(b: *std.Build) !void {
             .target = config.baselineTarget(b.graph.io),
             .optimize = .Debug,
         });
+        try c_deps.add(b, .@"windows-com-h", test_exe.root_module, &config, .{
+            .target = config.baselineTarget(b.graph.io),
+            .optimize = .Debug,
+        });
 
         // Normal test running
         const test_run = b.addRunArtifact(test_exe);
