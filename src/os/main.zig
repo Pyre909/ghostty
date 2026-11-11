@@ -59,6 +59,7 @@ pub const getKernelInfo = kernel_info.getKernelInfo;
 pub const getConfigEditCommand = edit.getConfigEditCommand;
 
 test {
+    _ = @import("com_abi.zig");
     _ = file;
     _ = stderr;
     _ = edit;
