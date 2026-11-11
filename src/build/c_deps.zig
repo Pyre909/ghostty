@@ -17,7 +17,6 @@ const windows_com_headers: []const translate_c.Options.IncludeFile = &.{
     .{ .path = "d3d11.h" },
     .{ .path = "dxgi1_5.h" },
     .{ .path = "d3d11sdklayers.h" },
-    .{ .path = "d3dcompiler.h" },
     .{ .path = "dwrite_3.h" },
     .{ .path = "mfmediaengine.h" },
     .{ .path = "shobjidl.h" },
@@ -97,7 +96,8 @@ pub fn add(b: *std.Build, dep: CDeps, module: *std.Build.Module, config: *const 
         // A translation for any other target would lay the types out
         // differently (a C long is 64 bits there), so there is none.
         .@"windows-com-h" => link_libc: {
-            if (target.result.os.tag != .windows) return;
+            // The mingw headers Zig ships; an MSVC target has none.
+            if (!target.result.isMinGW()) return;
             break :link_libc true;
         },
     };

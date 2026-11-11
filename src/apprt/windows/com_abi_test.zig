@@ -16,7 +16,7 @@ const builtin = @import("builtin");
 const com_abi = @import("../../os/com_abi.zig");
 
 test "win32: COM declarations match the Windows headers" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime !builtin.target.isMinGW()) return error.SkipZigTest;
     comptime {
         const found = com_abi.mismatches(@import("windows-com-h"), entries());
         if (found.len != 0) @compileError("COM declarations differ from the headers:\n" ++ found);
