@@ -30,13 +30,13 @@ const Slot = *const anyopaque;
 
 /// The InputPane class's activation factory, as a desktop program uses
 /// it.
-const IInputPaneInterop = extern struct {
+pub const IInputPaneInterop = extern struct {
     vtable: *const VTable,
 
     const IID: GUID = GUID.parse("{75cf2c57-9195-4931-8332-f0b409e916af}");
 
     /// IUnknown, IInspectable and IInputPaneInterop, flattened.
-    const VTable = extern struct {
+    pub const VTable = extern struct {
         QueryInterface: Slot,
         AddRef: Slot,
         Release: *const fn (*IInputPaneInterop) callconv(.winapi) ULONG,

@@ -45,9 +45,8 @@ const IID_IShellItem: GUID = GUID.parse("{43826d1e-e718-42ee-bc55-a1e261c37bfe}"
 const cancelled_hr: HRESULT = @bitCast(@as(u32, 0x800704C7));
 
 /// SIGDN_FILESYSPATH (shobjidl.h): an item's path in the file system. The
-/// header's SIGDN is an enum of int; this one does not fit an i32 as a
-/// positive number, and only its 32 bits matter.
-const SIGDN_FILESYSPATH: u32 = 0x80058000;
+/// header's SIGDN is an enum of int, in which this one is negative.
+const SIGDN_FILESYSPATH: i32 = @bitCast(@as(u32, 0x80058000));
 
 /// What the dialog shows.
 pub const Spec = struct {
@@ -130,17 +129,17 @@ fn create() error{SaveDialogFailed}!*IFileSaveDialog {
     return @ptrCast(@alignCast(out orelse return error.SaveDialogFailed));
 }
 
-/// COMDLG_FILTERSPEC (shtypes.h): a file type the dialog offers.
-const FilterSpec = extern struct {
-    name: LPCWSTR,
-    spec: LPCWSTR,
+/// shtypes.h: a file type the dialog offers.
+pub const COMDLG_FILTERSPEC = extern struct {
+    pszName: LPCWSTR,
+    pszSpec: LPCWSTR,
 };
 
 /// Plain text first, the type the macOS app allows; all files second, for
 /// a name with another extension.
-const file_types = [_]FilterSpec{
-    .{ .name = L("Text files"), .spec = L("*.txt") },
-    .{ .name = L("All files"), .spec = L("*.*") },
+const file_types = [_]COMDLG_FILTERSPEC{
+    .{ .pszName = L("Text files"), .pszSpec = L("*.txt") },
+    .{ .pszName = L("All files"), .pszSpec = L("*.*") },
 };
 
 /// An untyped vtable slot, there so that the slots after it keep their
@@ -156,7 +155,7 @@ pub const IFileSaveDialog = extern struct {
         AddRef: Slot,
         Release: *const fn (*IFileSaveDialog) callconv(.winapi) windows.ULONG,
         Show: *const fn (*IFileSaveDialog, ?HWND) callconv(.winapi) HRESULT,
-        SetFileTypes: *const fn (*IFileSaveDialog, windows.UINT, [*]const FilterSpec) callconv(.winapi) HRESULT,
+        SetFileTypes: *const fn (*IFileSaveDialog, windows.UINT, [*]const COMDLG_FILTERSPEC) callconv(.winapi) HRESULT,
         SetFileTypeIndex: *const fn (*IFileSaveDialog, windows.UINT) callconv(.winapi) HRESULT,
         GetFileTypeIndex: *const fn (*IFileSaveDialog, *windows.UINT) callconv(.winapi) HRESULT,
         Advise: Slot,
@@ -228,7 +227,7 @@ pub const IShellItem = extern struct {
         BindToHandler: Slot,
         GetParent: Slot,
         /// The name is the caller's to free (CoTaskMemFree).
-        GetDisplayName: *const fn (*IShellItem, u32, *?[*:0]u16) callconv(.winapi) HRESULT,
+        GetDisplayName: *const fn (*IShellItem, i32, *?[*:0]u16) callconv(.winapi) HRESULT,
         GetAttributes: Slot,
         Compare: Slot,
     };
@@ -274,7 +273,7 @@ test "win32: IFileSaveDialog and IShellItem have the header's slots" {
     try testing.expectEqual(5 * p, @offsetOf(IShellItem.VTable, "GetDisplayName"));
 
     // COMDLG_FILTERSPEC in shtypes.h: two strings.
-    try testing.expectEqual(2 * p, @sizeOf(FilterSpec));
+    try testing.expectEqual(2 * p, @sizeOf(COMDLG_FILTERSPEC));
 }
 
 test "win32: the Save dialog's class and interface ids" {
