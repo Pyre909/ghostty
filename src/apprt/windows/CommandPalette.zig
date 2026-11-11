@@ -896,8 +896,9 @@ pub fn open(surface: *Surface) bool {
     p.edit = edit;
     const old_edit = win32.SetWindowLongPtrW(edit, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
     if (edit_proc == null) edit_proc = @ptrFromInt(@as(usize, @bitCast(old_edit)));
-    // GTK's placeholder.
-    _ = win32.SendMessageW(edit, win32.EM_SETCUEBANNER, 0, @bitCast(@intFromPtr(placeholder.one("Execute a command\u{2026}"))));
+    // GTK's and macOS's placeholder, shown while the field has the focus,
+    // as it always has.
+    _ = win32.SendMessageW(edit, win32.EM_SETCUEBANNER, 1, @bitCast(@intFromPtr(placeholder.one("Execute a command\u{2026}"))));
     // Before the list, whose WM_MEASUREITEM reads the line's height.
     p.applyFont(Window.dpiOf(app, window.hwnd));
     const list = win32.CreateWindowExW(
