@@ -22586,19 +22586,20 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     window.relayout();
     try std.testing.expect(shown(hwnd));
     try std.testing.expect(p.surface == b);
-    try std.testing.expect(p.text_height > 0);
+    try std.testing.expect(p.heights.field > p.heights.title and p.heights.title > p.heights.small and p.heights.small > 0);
     const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
     // In the area under the tab bar, less the scroll bar of b, the
     // terminal along its right edge.
     var area = window.layoutArea().?;
     area.right = (try paneClient(window, b)).right;
     try std.testing.expect(area.right < window.layoutArea().?.right);
-    const want = CommandPalette.paletteRect(m, area, p.text_height).?;
+    const want = CommandPalette.paletteRect(m, area, p.heights, p.shown.items.len).?;
     try std.testing.expectEqual(want, try childRect(window, hwnd));
     try std.testing.expectEqual(m.width, want.right - want.left);
-    // Centred, under the top of the area.
+    // Centred, near the top of the area; as tall as its most rows.
     try std.testing.expectEqual(@divTrunc(area.right - m.width, 2), want.left);
-    try std.testing.expectEqual(window.layoutArea().?.top + m.margin, want.top);
+    try std.testing.expectEqual(area.top + @divTrunc(area.bottom - area.top, 20) + m.margin, want.top);
+    try std.testing.expectEqual(m.head(p.heights) + 2 * m.list_pad + m.rows * m.rowHeight(p.heights), want.bottom - want.top);
     try std.testing.expect(FocusSeen.last == p.edit.?);
     // Every entry, the first selected, its rows two lines tall.
     try std.testing.expectEqual(@as(isize, @intCast(p.entries.?.items.len)), paletteRows(window));
@@ -22606,7 +22607,7 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     try std.testing.expectEqual(0, paletteSelected(window));
     // Shown from its top, the selected row in view.
     try std.testing.expectEqual(0, win32.SendMessageW(p.list.?, win32.LB_GETTOPINDEX, 0, 0));
-    try std.testing.expectEqual(m.rowHeight(p.text_height), win32.SendMessageW(p.list.?, win32.LB_GETITEMHEIGHT, 0, 0));
+    try std.testing.expectEqual(m.rowHeight(p.heights), win32.SendMessageW(p.list.?, win32.LB_GETITEMHEIGHT, 0, 0));
     try std.testing.expect(win32.SendMessageW(p.edit.?, win32.WM_GETFONT, 0, 0) != 0);
 
     // The frame's focus goes to the field while it is open, once the
@@ -22732,13 +22733,27 @@ test "win32: the command palette's field filters its list, moves the selection a
     try std.testing.expectEqual(last - page, paletteSelected(window));
     for (0..10) |_| paletteKey(window, win32.VK_PRIOR);
     try std.testing.expectEqual(0, paletteSelected(window));
-    // Nothing matches: no rows, and Enter does nothing.
+    // Nothing matches: no rows, and Enter does nothing. The list hides,
+    // and the palette shrinks to "No matches"; its rows bring both back,
+    // as many as there are up to its most.
+    const pm = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
+    const full = try childRect(window, p.hwnd.?);
     paletteQuery(window, L("zzzzzz"));
     try std.testing.expectEqual(0, paletteRows(window));
+    try std.testing.expect(!shown(p.list.?));
+    const empty = try childRect(window, p.hwnd.?);
+    try std.testing.expectEqual(full.top, empty.top);
+    try std.testing.expectEqual(pm.head(p.heights) + pm.noneHeight(p.heights), empty.bottom - empty.top);
     paletteKey(window, win32.VK_DOWN);
     paletteKey(window, win32.VK_RETURN);
     try std.testing.expect(p.hwnd != null);
     try std.testing.expectEqualStrings("", PaletteSeen.take());
+    paletteQuery(window, L("split right"));
+    try std.testing.expect(shown(p.list.?));
+    const few = paletteRows(window);
+    try std.testing.expect(few > 0 and few < pm.rows);
+    const fewer = try childRect(window, p.hwnd.?);
+    try std.testing.expectEqual(pm.head(p.heights) + 2 * pm.list_pad + @as(i32, @intCast(few)) * pm.rowHeight(p.heights), fewer.bottom - fewer.top);
 
     // Enter, Ctrl+Enter, Tab and Escape's WM_CHARs dropped; others typed.
     var buf: [64]u16 = undefined;

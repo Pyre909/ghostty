@@ -140,13 +140,13 @@ pub const Entry = struct {
     /// The first line.
     title: []const u8,
     /// The action, as the configuration writes it (`new_split:right`),
-    /// GTK's `action-key`, shown on the second line and searched; empty
-    /// for a jump.
+    /// GTK's `action-key`, searched, and shown on the second line when
+    /// there is no description; empty for a jump.
     action_key: []const u8 = "",
     /// The command's description; a jump's terminal's working directory,
     /// unless its title shows it already, as GTK and macOS describe a
-    /// jump, escaped (`escaped`). Shown on the second line when there is
-    /// no action key, else as the row's tooltip (`tooltip`).
+    /// jump, escaped (`escaped`). Shown on the second line, as macOS
+    /// shows it, and as a command's tooltip (`tooltip`).
     description: []const u8 = "",
     /// The shortcut the action is bound to (`shortcutLabel`), or empty.
     shortcut: []const u8 = "",
@@ -170,15 +170,16 @@ pub const Entry = struct {
         jump: *Surface,
     };
 
-    /// The second line: the action key, else the description.
+    /// The second line: the description, as macOS's row shows it, else the
+    /// action key.
     pub fn subtitle(self: *const Entry) []const u8 {
-        return if (self.action_key.len > 0) self.action_key else self.description;
+        return if (self.description.len > 0) self.description else self.action_key;
     }
 
-    /// The row's tooltip: the description, as GTK's row binds it to its
-    /// tooltip and macOS's to its help; null when there is none, or when
-    /// the second line shows it already (`subtitle`), as a jump's
-    /// working directory.
+    /// The row's tooltip: a command's description, as GTK's row binds it
+    /// to its tooltip and macOS's to its help, which shows all of a
+    /// description the second line cuts short; null when there is none,
+    /// or for a jump, whose working directory is all of its second line.
     pub fn tooltip(self: *const Entry) ?[]const u8 {
         if (self.description.len == 0 or self.action_key.len == 0) return null;
         return self.description;
@@ -493,12 +494,14 @@ fn writeKey(w: *std.Io.Writer, key: input.Key) std.Io.Writer.Error!void {
 // child. Being its own window, it takes the activation while it is open;
 // the frame's caption is kept active meanwhile (`Palette.activating`), as
 // a menu keeps its window's, and it follows the frame as it moves
-// (`frameMoved`). An EDIT takes the
-// query and a LISTBOX, owner-drawn, shows the entries, two lines each (the
-// title, then the action key or the description) with the shortcut on the
-// right, as GTK's rows show them (command-palette.blp). The LISTBOX keeps
-// each title as its item's text, for accessibility, and the entry's index
-// as its data. The keyboard stays in the field: Up, Down, PgUp and PgDn
+// (`frameMoved`). It looks as macOS's does, in colours from its
+// terminal's background (`Look`): an EDIT across the top takes the query
+// in a large light font (`Fonts`), over a divider, and a LISTBOX,
+// owner-drawn, shows the entries, two lines each (the title, then the
+// description or the action key) with the shortcut on the right, the
+// selected row on a rounded tint; the palette is as tall as its rows, up
+// to five, or says "No matches". The LISTBOX keeps each title as its
+// item's text, for accessibility, and the entry's index as its data. The keyboard stays in the field: Up, Down, PgUp and PgDn
 // move the selection, Enter runs it, Escape closes; a click on a row runs
 // it.
 //
@@ -520,7 +523,8 @@ const SearchBar = @import("SearchBar.zig");
 const TabOverview = @import("TabOverview.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
-const messageFont = @import("TabBar.zig").messageFont;
+const messageLogFont = @import("TabBar.zig").messageLogFont;
+const Overlays = @import("Overlays.zig");
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 
@@ -584,11 +588,11 @@ pub const Palette = struct {
     /// Whether the list has the dark theme class, null before it has had
     /// either (`applyListTheme`).
     list_dark: ?bool = null,
-    /// The system's message font at `font_dpi`, and the height of a line
-    /// of it, as the search bar's (`applyFont`).
-    font: ?win32.HGDIOBJ = null,
+    /// The palette's fonts at `font_dpi`, and the height of a line of
+    /// each (`applyFont`).
+    fonts: Fonts = .{},
     font_dpi: u32 = 0,
-    text_height: i32 = 0,
+    heights: Heights = .{},
     /// The brush the field and the list are painted with, of
     /// `brush_color`.
     brush: ?win32.HGDIOBJ = null,
@@ -610,20 +614,32 @@ pub const Palette = struct {
         return focus == hwnd or win32.IsChild(hwnd, focus).toBool();
     }
 
-    /// Give the field and the list the message font at `dpi`, made once
-    /// for each DPI, measure a line of it, and size the rows for it.
+    /// Make the palette's fonts at `dpi`, once for each DPI, give the
+    /// field its own and the list the titles', measure a line of each,
+    /// and size the rows for them.
     fn applyFont(self: *Palette, dpi: u32) void {
-        if (self.font != null and self.font_dpi == dpi) return;
+        if (self.fonts.field != null and self.font_dpi == dpi) return;
         const edit = self.edit orelse return;
-        const font = messageFont(dpi) orelse return;
-        _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(font), 1);
-        if (self.list) |list| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(font), 0);
-        if (self.font) |old| _ = win32.DeleteObject(old);
-        self.font = font;
+        const fonts = Fonts.init(dpi);
+        const field = fonts.field orelse {
+            var f = fonts;
+            f.deinit();
+            return;
+        };
+        _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(field), 1);
+        if (self.list) |list| if (fonts.title) |t| {
+            _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(t), 0);
+        };
+        self.fonts.deinit();
+        self.fonts = fonts;
         self.font_dpi = dpi;
-        self.text_height = SearchBar.textHeight(edit, font);
+        self.heights = .{
+            .field = SearchBar.textHeight(edit, field),
+            .title = if (fonts.title) |t| SearchBar.textHeight(edit, t) else 0,
+            .small = if (fonts.small) |t| SearchBar.textHeight(edit, t) else 0,
+        };
         if (self.list) |list| {
-            const row: win32.LPARAM = Metrics.init(dpi).rowHeight(self.text_height);
+            const row: win32.LPARAM = Metrics.init(dpi).rowHeight(self.heights);
             _ = win32.SendMessageW(list, win32.LB_SETITEMHEIGHT, 0, row);
         }
     }
@@ -647,11 +663,139 @@ pub const Palette = struct {
         };
         if (self.entries) |*e| e.deinit();
         self.shown.deinit(alloc);
-        if (self.font) |f| _ = win32.DeleteObject(f);
+        self.fonts.deinit();
         if (self.brush) |b| _ = win32.DeleteObject(b);
         self.* = .{};
     }
 };
+
+/// The palette's fonts at a DPI, from the system's message font, so that
+/// a larger text size in Settings, which grows that font, grows them all:
+/// the field's larger and light, as macOS's query is 20 points light; the
+/// titles' and the small one's (the second lines, the shortcuts) at
+/// Windows 11's body and caption sizes, 14 and 12 pixels to the message
+/// font's 12 at 96 DPI. Any one the system will not make is null.
+pub const Fonts = struct {
+    field: ?win32.HGDIOBJ = null,
+    title: ?win32.HGDIOBJ = null,
+    small: ?win32.HGDIOBJ = null,
+
+    pub fn init(dpi: u32) Fonts {
+        const base = messageLogFont(dpi) orelse fallback: {
+            var lf = std.mem.zeroes(win32.LOGFONTW);
+            lf.lfHeight = -SearchBar.Metrics.scale(12, dpi);
+            lf.lfWeight = win32.FW_NORMAL;
+            lf.lfCharSet = win32.DEFAULT_CHARSET;
+            lf.lfQuality = win32.CLEARTYPE_QUALITY;
+            const face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
+            @memcpy(lf.lfFaceName[0..face.len], face);
+            break :fallback lf;
+        };
+        return .{
+            .field = make(base, 20, win32.FW_LIGHT),
+            .title = make(base, 14, base.lfWeight),
+            .small = make(base, 12, base.lfWeight),
+        };
+    }
+
+    /// `base` at `px` of its 12, of `weight`.
+    fn make(base: win32.LOGFONTW, px: i32, weight: win32.LONG) ?win32.HGDIOBJ {
+        var lf = base;
+        lf.lfHeight = scaleHeight(base.lfHeight, px);
+        lf.lfWidth = 0;
+        lf.lfWeight = weight;
+        const font = win32.CreateFontIndirectW(&lf);
+        if (font == null) log.warn("cannot make a command palette font err={}", .{win32.GetLastError()});
+        return font;
+    }
+
+    pub fn deinit(self: *Fonts) void {
+        inline for (.{ self.field, self.title, self.small }) |f| if (f) |font| {
+            _ = win32.DeleteObject(font);
+        };
+        self.* = .{};
+    }
+};
+
+/// A LOGFONTW height, `height`, scaled by `px` / 12, rounded half away
+/// from zero; its sign kept, as a negative height is the characters'
+/// and a positive one the cells'. Never zero, which would ask for the
+/// system's default size.
+pub fn scaleHeight(height: i32, px: i32) i32 {
+    const mag: i32 = @intCast(@abs(height));
+    const scaled: i32 = @max(1, @divTrunc(mag * px + 6, 12));
+    return if (height < 0) -scaled else scaled;
+}
+
+/// The height of a line of each of `Fonts`.
+pub const Heights = struct {
+    field: i32 = 0,
+    title: i32 = 0,
+    small: i32 = 0,
+};
+
+/// The palette's colours, from its terminal's background, as macOS tints
+/// its palette with the terminal's background and picks its light or
+/// dark look by that background's luminance. A Win32 window has no
+/// material behind GDI's drawing, so the tint is a solid colour: the
+/// background lifted towards white on a dark one, towards black on a
+/// light one. The selection is tinted with the system's highlight, as
+/// macOS's is with the accent.
+pub const Look = struct {
+    dark: bool,
+    back: win32.COLORREF,
+    border: win32.COLORREF,
+    text: win32.COLORREF,
+    dim: win32.COLORREF,
+    selected: win32.COLORREF,
+    hover: win32.COLORREF,
+
+    pub fn of(background: win32.COLORREF, accent: win32.COLORREF) Look {
+        const white = win32.rgb(0xff, 0xff, 0xff);
+        const black = win32.rgb(0, 0, 0);
+        const dark = !isLight(background);
+        const back = if (dark) lerp(background, white, 80) else lerp(background, black, 30);
+        const text = if (dark) win32.rgb(0xf2, 0xf2, 0xf2) else win32.rgb(0x1a, 0x1a, 0x1a);
+        return .{
+            .dark = dark,
+            .back = back,
+            .border = if (dark) lerp(background, white, 240) else lerp(background, black, 180),
+            .text = text,
+            .dim = lerp(text, back, 400),
+            .selected = lerp(back, accent, if (dark) 300 else 220),
+            .hover = lerp(back, text, 100),
+        };
+    }
+};
+
+/// Whether `c` is light, by macOS's measure of a terminal background's
+/// luminance (`0.299 r + 0.587 g + 0.114 b > 0.5`), in thousandths.
+pub fn isLight(c: win32.COLORREF) bool {
+    const r: u32 = c & 0xff;
+    const g: u32 = (c >> 8) & 0xff;
+    const b: u32 = (c >> 16) & 0xff;
+    return 299 * r + 587 * g + 114 * b > 500 * 255;
+}
+
+/// `a` moved `t` thousandths of the way to `b`, rounded to nearest.
+pub fn lerp(a: win32.COLORREF, b: win32.COLORREF, t: u32) win32.COLORREF {
+    var out: win32.COLORREF = 0;
+    for (0..3) |i| {
+        const shift: u5 = @intCast(8 * i);
+        const x: u32 = (a >> shift) & 0xff;
+        const y: u32 = (b >> shift) & 0xff;
+        const v = (x * (1000 - t) + y * t + 500) / 1000;
+        out |= v << shift;
+    }
+    return out;
+}
+
+/// `window`'s palette's look, for its terminal's background.
+fn lookOf(window: *const Window) Look {
+    const p = &window.palette;
+    const background = if (p.surface) |s| Overlays.terminalBackground(s) else if (window.dark_frame) win32.rgb(0x1c, 0x1c, 0x1c) else win32.rgb(0xff, 0xff, 0xff);
+    return .of(background, win32.GetSysColor(win32.COLOR_HIGHLIGHT));
+}
 
 /// An entry chosen while the core could not be re-entered, with the
 /// entries it is one of, for `run` to carry out (`App.Request.palette_run`).
@@ -733,8 +877,8 @@ pub fn open(surface: *Surface) bool {
     // counting those in hidden tabs.
     p.hwnd = hwnd;
     p.entries = entries;
-    applyFrame(window);
     p.surface = window.tab().focused orelse surface;
+    applyFrame(window);
     const edit = win32.CreateWindowExW(
         0,
         L("EDIT"),
@@ -774,7 +918,7 @@ pub fn open(surface: *Surface) bool {
     p.list = list;
     const old_list = win32.SetWindowLongPtrW(list, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&listProc)));
     if (list_proc == null) list_proc = @ptrFromInt(@as(usize, @bitCast(old_list)));
-    if (p.font) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
+    if (p.fonts.title) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
     applyListTheme(window);
     p.tip = makeTip(hwnd, list, app.hinstance);
     refill(window, "");
@@ -785,14 +929,20 @@ pub fn open(surface: *Surface) bool {
 }
 
 /// The palette's frame in Windows 11's look: rounded corners, which bring
-/// DWM's shadow, and a border of `SearchBar.Colors`'. A Windows that
-/// refuses either keeps a square frame.
+/// DWM's shadow, as macOS's palette has, and its border (`applyBorder`).
+/// A Windows that refuses either keeps a square frame.
 fn applyFrame(window: *Window) void {
     const hwnd = window.palette.hwnd orelse return;
     const round: win32.DWORD = win32.DWMWCP_ROUND;
     const hr = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_WINDOW_CORNER_PREFERENCE, &round, @sizeOf(win32.DWORD));
     if (hr < 0) log.info("cannot round the command palette's corners hr=0x{x}", .{@as(u32, @bitCast(hr))});
-    const border: win32.COLORREF = SearchBar.Colors.of(window.dark_frame).border;
+    applyBorder(window);
+}
+
+/// The frame's border in the palette's look (`Look.border`).
+fn applyBorder(window: *Window) void {
+    const hwnd = window.palette.hwnd orelse return;
+    const border: win32.COLORREF = lookOf(window).border;
     _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_BORDER_COLOR, &border, @sizeOf(win32.COLORREF));
 }
 
@@ -869,6 +1019,8 @@ fn toolInfo(list: win32.HWND) win32.TOOLINFOW {
 fn hover(window: *Window, row: ?usize) void {
     const p = &window.palette;
     if (row == p.hover_row) return;
+    redrawRow(window, p.hover_row);
+    redrawRow(window, row);
     p.hover_row = row;
     const entry = if (row) |r| rowEntry(window, r) else null;
     setTip(window, if (entry) |e| e.tooltip() orelse "" else "");
@@ -877,8 +1029,18 @@ fn hover(window: *Window, row: ?usize) void {
 /// Forget the row under the pointer and hide the tooltip: the rows under
 /// it changed (`refill`, a scroll), or it left the list.
 fn unhover(window: *Window) void {
+    redrawRow(window, window.palette.hover_row);
     window.palette.hover_row = null;
     setTip(window, "");
+}
+
+/// Draw the list's `row` again, as the pointer came onto it or left it.
+fn redrawRow(window: *Window, row: ?usize) void {
+    const r = row orelse return;
+    const list = window.palette.list orelse return;
+    var rect: RECT = undefined;
+    if (win32.SendMessageW(list, win32.LB_GETITEMRECT, r, @bitCast(@intFromPtr(&rect))) < 0) return;
+    _ = win32.InvalidateRect(list, &rect, .FALSE);
 }
 
 /// The tooltip, hidden, with `text`, shown again after the pointer rests.
@@ -1064,30 +1226,32 @@ pub fn focusMoved(window: *Window, surface: *Surface) void {
     p.surface = surface;
 }
 
-/// Draw the palette again, as the theme changed.
+/// Draw the palette again, as the theme or the configuration changed.
 pub fn invalidate(window: *Window) void {
     const p = &window.palette;
     applyListTheme(window);
+    applyBorder(window);
     if (p.hwnd) |h| _ = win32.InvalidateRect(h, null, .TRUE);
     if (p.edit) |h| _ = win32.InvalidateRect(h, null, .TRUE);
     if (p.list) |h| _ = win32.InvalidateRect(h, null, .TRUE);
 }
 
-/// The list's scrollbar in the frame's mode. The list is a system LISTBOX:
-/// WM_CTLCOLORLISTBOX colours its rows' background, but Windows draws its
-/// scrollbar with the window's visual style, light by default, a white
-/// track beside the dark rows. So in a dark frame the list takes the
-/// "DarkMode_Explorer" theme class, which gives it the dark scrollbar, as
-/// Explorer, Notepad++ and Windows Terminal give their controls; and
-/// "Explorer" back in a light frame. The class name is not documented: a
+/// The list's scrollbar in the palette's mode (`Look.dark`). The list is
+/// a system LISTBOX: WM_CTLCOLORLISTBOX colours its rows' background, but
+/// Windows draws its scrollbar with the window's visual style, light by
+/// default, a white track beside the dark rows. So in a dark palette the
+/// list takes the "DarkMode_Explorer" theme class, which gives it the
+/// dark scrollbar, as Explorer, Notepad++ and Windows Terminal give their
+/// controls; and "Explorer" back in a light one. The class name is not documented: a
 /// Windows without it keeps the light scrollbar. Only when the mode
 /// changes, as each call sends the list WM_THEMECHANGED.
 fn applyListTheme(window: *Window) void {
     const p = &window.palette;
     const list = p.list orelse return;
-    if (p.list_dark) |dark| if (dark == window.dark_frame) return;
-    p.list_dark = window.dark_frame;
-    const class = if (window.dark_frame) L("DarkMode_Explorer") else L("Explorer");
+    const want = lookOf(window).dark;
+    if (p.list_dark) |dark| if (dark == want) return;
+    p.list_dark = want;
+    const class = if (want) L("DarkMode_Explorer") else L("Explorer");
     const hr = win32.SetWindowTheme(list, class, null);
     if (hr < 0) log.info("cannot set the command palette list's theme hr=0x{x}", .{@as(u32, @bitCast(hr))});
 }
@@ -1099,13 +1263,26 @@ pub fn fontChanged(window: *Window) void {
     _ = place(window);
 }
 
-/// Place `window`'s open palette at the top centre of the area under the
-/// tab bar (`area`), over the terminals and their search bars; whether it
-/// is open there. It shows while its frame does: a hidden owner does not
-/// hide what it owns. One that no longer fits there (`paletteRect`)
-/// closes. Called by every layout (`Window.relayout`), which never runs
-/// inside a core frame, and as the frame moves (`frameMoved`).
+/// Place `window`'s open palette near the top centre of the area under
+/// the tab bar (`area`), over the terminals and their search bars, as
+/// tall as its rows (`paletteRect`); whether it is open there. It shows
+/// while its frame does: a hidden owner does not hide what it owns. One
+/// that no longer fits there closes. Called by every layout
+/// (`Window.relayout`), which never runs inside a core frame, and as the
+/// frame moves (`frameMoved`).
 pub fn place(window: *Window) bool {
+    return position(window, .close);
+}
+
+/// The query changed what the list shows: the palette grows or shrinks
+/// to its rows, where it is. Whether a palette fits does not depend on
+/// its rows (`paletteRect`), so this never closes it: only a layout
+/// changes that.
+fn refit(window: *Window) void {
+    _ = position(window, .keep);
+}
+
+fn position(window: *Window, no_room: enum { close, keep }) bool {
     const p = &window.palette;
     const hwnd = p.hwnd orelse return false;
     if (!p.open) return false;
@@ -1113,7 +1290,9 @@ pub fn place(window: *Window) bool {
     p.applyFont(dpi);
     const m = Metrics.init(dpi);
     const area = paletteArea(window) orelse return false;
-    const at = paletteRect(m, area, p.text_height) orelse {
+    const count = p.shown.items.len;
+    const at = paletteRect(m, area, p.heights, count) orelse {
+        if (no_room == .keep) return false;
         log.info("no room for the command palette", .{});
         close(window);
         return false;
@@ -1128,9 +1307,13 @@ pub fn place(window: *Window) bool {
     else
         win32.SWP_HIDEWINDOW;
     _ = win32.SetWindowPos(hwnd, null, origin.x, origin.y, width, height, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | show);
-    const l = Layout.init(m, width, height, p.text_height);
+    const l = Layout.init(m, width, height, p.heights);
     if (p.edit) |edit| _ = win32.SetWindowPos(edit, null, l.edit.left, l.edit.top, l.edit.right - l.edit.left, l.edit.bottom - l.edit.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
-    if (p.list) |list| _ = win32.SetWindowPos(list, null, l.list.left, l.list.top, l.list.right - l.list.left, l.list.bottom - l.list.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    // With no rows, "No matches" in its place (`paint`).
+    if (p.list) |list| {
+        const list_show: win32.UINT = if (count > 0) win32.SWP_SHOWWINDOW else win32.SWP_HIDEWINDOW;
+        _ = win32.SetWindowPos(list, null, l.list.left, l.list.top, l.list.right - l.list.left, l.list.bottom - l.list.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | list_show);
+    }
     invalidate(window);
     return true;
 }
@@ -1148,6 +1331,7 @@ fn textChanged(window: *Window) void {
     const query = utf8FromWide(alloc, wide[0..n]) catch |err| return log.warn("cannot read the command palette's field err={}", .{err});
     defer alloc.free(query);
     refill(window, query);
+    refit(window);
 }
 
 /// Fill the list with the entries that match `query` (`filter`), the
@@ -1338,11 +1522,11 @@ pub fn wndProc(
 
         // The field and the list in the palette's colours.
         win32.WM_CTLCOLOREDIT, win32.WM_CTLCOLORLISTBOX => {
-            const colors = SearchBar.Colors.of(window.dark_frame);
+            const look = lookOf(window);
             const hdc: win32.HDC = @ptrFromInt(wparam);
-            _ = win32.SetTextColor(hdc, colors.text);
-            _ = win32.SetBkColor(hdc, colors.field);
-            const brush = p.brushOf(colors.field) orelse return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            _ = win32.SetTextColor(hdc, look.text);
+            _ = win32.SetBkColor(hdc, look.back);
+            const brush = p.brushOf(look.back) orelse return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
             return @bitCast(@intFromPtr(brush));
         },
 
@@ -1354,7 +1538,7 @@ pub fn wndProc(
 
         win32.WM_MEASUREITEM => {
             const measure: *win32.MEASUREITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            measure.itemHeight = @intCast(Metrics.init(Window.dpiOf(window.app, hwnd)).rowHeight(p.text_height));
+            measure.itemHeight = @intCast(Metrics.init(Window.dpiOf(window.app, hwnd)).rowHeight(p.heights));
             return 1;
         },
 
@@ -1571,6 +1755,9 @@ fn rowAt(list: win32.HWND, lparam: win32.LPARAM) ?usize {
     return at & 0xFFFF;
 }
 
+/// The palette behind its field and list: its background, the divider
+/// under the field, as macOS draws one, and "No matches" where the list
+/// would be when nothing matches, as macOS says it.
 fn paint(window: *Window, hwnd: win32.HWND) void {
     const p = &window.palette;
     var ps: win32.PAINTSTRUCT = undefined;
@@ -1578,40 +1765,49 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     defer _ = win32.EndPaint(hwnd, &ps);
     var client: RECT = undefined;
     if (!win32.GetClientRect(hwnd, &client).toBool()) return;
-    const dpi = Window.dpiOf(window.app, hwnd);
-    const colors = SearchBar.Colors.of(window.dark_frame);
-    const m = Metrics.init(dpi);
-    const l = Layout.init(m, client.right, client.bottom, p.text_height);
-    const line = @max(1, SearchBar.Metrics.scale(1, dpi));
-    // The palette, framed; the field's box, framed, behind the EDIT.
-    SearchBar.fill(hdc, client, colors.border);
-    SearchBar.fill(hdc, SearchBar.inset(client, line), colors.bar);
-    SearchBar.fill(hdc, l.field, colors.border);
-    SearchBar.fill(hdc, SearchBar.inset(l.field, line), colors.field);
+    const look = lookOf(window);
+    const m = Metrics.init(Window.dpiOf(window.app, hwnd));
+    const l = Layout.init(m, client.right, client.bottom, p.heights);
+    SearchBar.fill(hdc, client, look.back);
+    SearchBar.fill(hdc, l.divider, look.border);
+    if (p.shown.items.len > 0) return;
+    const font = p.fonts.title orelse return;
+    const old_font = win32.SelectObject(hdc, font);
+    defer if (old_font) |f| {
+        _ = win32.SelectObject(hdc, f);
+    };
+    _ = win32.SetBkMode(hdc, win32.TRANSPARENT);
+    _ = win32.SetTextColor(hdc, look.dim);
+    var none: Question = .{};
+    const text = none.one("No matches");
+    var r = l.none;
+    _ = win32.DrawTextW(hdc, text, -1, &r, win32.DT_SINGLELINE | win32.DT_NOPREFIX | win32.DT_VCENTER | win32.DT_END_ELLIPSIS);
 }
 
-/// One of the list's rows: its background, selected or not, the title and
-/// under it the action key or the description, and the shortcut on the
-/// right, centred down the row, as GTK's row shows them.
+/// One of the list's rows, as macOS's: the selected one, or the one under
+/// the pointer, on a rounded tint; the title, under it the description or
+/// the action key, smaller and dimmer, and the shortcut on the right,
+/// centred down the row.
 fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
     const p = &window.palette;
-    const colors = SearchBar.Colors.of(window.dark_frame);
+    const look = lookOf(window);
     const hdc = dis.hDC;
-    const selected = dis.itemState & win32.ODS_SELECTED != 0;
-    SearchBar.fill(hdc, dis.rcItem, if (selected) colors.hover else colors.field);
+    SearchBar.fill(hdc, dis.rcItem, look.back);
     // An empty list's focus rect has no item.
     if (dis.itemID == std.math.maxInt(win32.UINT)) return;
     const entries = p.entries orelse return;
     if (dis.itemData >= entries.items.len) return;
     const entry = &entries.items[dis.itemData];
     const alloc = window.app.core_app.alloc;
+    const m = Metrics.init(Window.dpiOf(window.app, dis.hwndItem orelse window.hwnd));
 
-    _ = win32.SetBkMode(hdc, win32.TRANSPARENT);
-    const old_font = if (p.font) |f| win32.SelectObject(hdc, f) else null;
+    const selected = dis.itemState & win32.ODS_SELECTED != 0;
+    const hovered = p.hover_row != null and p.hover_row.? == dis.itemID;
+    const old_font = win32.SelectObject(hdc, p.fonts.small orelse return);
     defer if (old_font) |f| {
         _ = win32.SelectObject(hdc, f);
     };
-    const m = Metrics.init(Window.dpiOf(window.app, dis.hwndItem orelse window.hwnd));
+    _ = win32.SetBkMode(hdc, win32.TRANSPARENT);
     const flags = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
 
     // The shortcut's width first, as the title gives way to it.
@@ -1623,76 +1819,111 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
         _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_CALCRECT);
         shortcut_w = r.right - r.left;
     };
-    const row = Row.init(m, dis.rcItem, p.text_height, shortcut_w);
+    const row = Row.init(m, dis.rcItem, p.heights, shortcut_w);
+    if (selected or hovered) roundFill(hdc, row.fill, m.row_corner, if (selected) look.selected else look.hover);
+    _ = win32.SetTextColor(hdc, look.dim);
     if (shortcut) |s| if (s.len > 0) {
         var r = row.shortcut;
-        _ = win32.SetTextColor(hdc, colors.dim);
         _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_RIGHT | win32.DT_VCENTER);
     };
-    if (wideFromUtf8(alloc, entry.title)) |title| {
-        defer alloc.free(title);
-        var r = row.title;
-        _ = win32.SetTextColor(hdc, colors.text);
-        _ = win32.DrawTextW(hdc, title.ptr, @intCast(title.len), &r, flags | win32.DT_END_ELLIPSIS);
-    } else |_| {}
     const sub = entry.subtitle();
     if (sub.len > 0) if (wideFromUtf8(alloc, sub)) |text| {
         defer alloc.free(text);
         var r = row.subtitle;
-        _ = win32.SetTextColor(hdc, colors.dim);
         _ = win32.DrawTextW(hdc, text.ptr, @intCast(text.len), &r, flags | win32.DT_END_ELLIPSIS);
     } else |_| {};
+    if (p.fonts.title) |f| _ = win32.SelectObject(hdc, f);
+    if (wideFromUtf8(alloc, entry.title)) |title| {
+        defer alloc.free(title);
+        var r = row.title;
+        _ = win32.SetTextColor(hdc, look.text);
+        _ = win32.DrawTextW(hdc, title.ptr, @intCast(title.len), &r, flags | win32.DT_END_ELLIPSIS);
+    } else |_| {}
 }
 
-/// The palette's sizes at a DPI, from their values at 96 DPI: GTK's
-/// dialog is 700 wide (command-palette.blp's `content-width`) and its list
-/// at least 300 tall (`min-content-height`), eight rows here.
+/// Fill `r` in `color` with corners of `radius`.
+fn roundFill(hdc: win32.HDC, r: RECT, radius: i32, color: win32.COLORREF) void {
+    const brush = win32.CreateSolidBrush(color) orelse return;
+    defer _ = win32.DeleteObject(brush);
+    const pen = win32.GetStockObject(win32.NULL_PEN) orelse return;
+    const old_brush = win32.SelectObject(hdc, brush);
+    const old_pen = win32.SelectObject(hdc, pen);
+    defer {
+        if (old_pen) |o| _ = win32.SelectObject(hdc, o);
+        if (old_brush) |o| _ = win32.SelectObject(hdc, o);
+    }
+    // The null pen leaves the right and bottom edges out: one more.
+    _ = win32.RoundRect(hdc, r.left, r.top, r.right + 1, r.bottom + 1, 2 * radius, 2 * radius);
+}
+
+/// The palette's sizes at a DPI, from their values at 96 DPI, macOS's
+/// (CommandPalette.swift): 500 wide, a field 48 tall with its text 16 in,
+/// a divider, then the list, 10 in from the edges, its rows 4 apart and
+/// 8 in, with corners of 5. macOS's list is at most 200 points tall,
+/// about four rows: five here.
 pub const Metrics = struct {
-    /// Between the palette and the top and sides of the area under the
-    /// tab bar.
+    /// Between the palette and the sides of the area under the tab bar,
+    /// and its top, after a twentieth of the area's height, as macOS's
+    /// palette is a twentieth of its view's height down.
     margin: i32,
     /// Its width, and the least it narrows to before it no longer fits.
     width: i32,
     min_width: i32,
-    /// Inside its edges, and between the field and the list.
-    pad: i32,
-    gap: i32,
-    /// Between the field's box and its text.
-    inset: i32,
-    /// Above and below a row's two lines, and either side of them.
+    /// The field, at least, and between the palette's sides and its text.
+    field_height: i32,
+    field_inset: i32,
+    /// The divider under the field.
+    line: i32,
+    /// Between the list and the palette's edges.
+    list_pad: i32,
+    /// Between rows; inside a row, around its text; between its lines.
+    row_gap: i32,
     row_pad: i32,
-    row_inset: i32,
-    /// The rows the list shows when there is room.
+    title_gap: i32,
+    /// The corners of the selected row's tint.
+    row_corner: i32,
+    /// Above and below "No matches".
+    none_pad: i32,
+    /// The rows the list shows at most.
     rows: i32,
 
     pub fn init(dpi: u32) Metrics {
         const s = SearchBar.Metrics.scale;
         return .{
             .margin = s(8, dpi),
-            .width = s(700, dpi),
+            .width = s(500, dpi),
             .min_width = s(240, dpi),
-            .pad = s(8, dpi),
-            .gap = s(6, dpi),
-            .inset = s(4, dpi),
-            .row_pad = s(4, dpi),
-            .row_inset = s(8, dpi),
-            .rows = 8,
+            .field_height = s(48, dpi),
+            .field_inset = s(16, dpi),
+            .line = @max(1, s(1, dpi)),
+            .list_pad = s(10, dpi),
+            .row_gap = s(4, dpi),
+            .row_pad = s(8, dpi),
+            .title_gap = s(2, dpi),
+            .row_corner = s(5, dpi),
+            .none_pad = s(16, dpi),
+            .rows = 5,
         };
     }
 
-    /// The field's box, for a line of text `text_height` tall.
-    pub fn boxHeight(self: Metrics, text_height: i32) i32 {
-        return @max(0, text_height) + 2 * self.inset;
+    /// The field: `field_height`, or taller for a large font.
+    pub fn fieldHeight(self: Metrics, h: Heights) i32 {
+        return @max(self.field_height, @max(0, h.field) + 2 * self.row_pad);
     }
 
-    /// A row: two lines of text.
-    pub fn rowHeight(self: Metrics, text_height: i32) i32 {
-        return 2 * @max(0, text_height) + 2 * self.row_pad;
+    /// A row: the gap, the padding, the title and the second line.
+    pub fn rowHeight(self: Metrics, h: Heights) i32 {
+        return self.row_gap + 2 * self.row_pad + @max(0, h.title) + self.title_gap + @max(0, h.small);
     }
 
-    /// Above the list: the edge and the field.
-    fn head(self: Metrics, text_height: i32) i32 {
-        return self.pad + self.boxHeight(text_height) + self.gap;
+    /// Above the list: the field and the divider.
+    pub fn head(self: Metrics, h: Heights) i32 {
+        return self.fieldHeight(h) + self.line;
+    }
+
+    /// "No matches", in place of the list.
+    pub fn noneHeight(self: Metrics, h: Heights) i32 {
+        return 2 * self.none_pad + @max(0, h.title);
     }
 };
 
@@ -1711,64 +1942,94 @@ pub fn paletteArea(window: *const Window) ?RECT {
 }
 
 /// Where the palette goes in `area`, the terminals' part of the frame's
-/// client area (`paletteArea`): `margin` below its top, centred across it,
-/// `width` wide or as wide as the area leaves, with as many rows up to
-/// `rows` as its height leaves; null when it leaves less than `min_width`
-/// or one row.
-pub fn paletteRect(m: Metrics, area: RECT, text_height: i32) ?RECT {
+/// client area (`paletteArea`), listing `count` rows: a twentieth of the
+/// area's height and `margin` below its top, centred across it, `width`
+/// wide or as wide as the area leaves, as tall as up to `rows` of the
+/// rows, as many as its height leaves, or "No matches" with none. Null
+/// when it leaves less than `min_width`, or less than one row, whatever
+/// `count`: that a palette fits never depends on the query.
+pub fn paletteRect(m: Metrics, area: RECT, h: Heights, count: usize) ?RECT {
     const room_w = area.right - area.left - 2 * m.margin;
     const width = @min(m.width, room_w);
     if (width < m.min_width) return null;
-    const row = m.rowHeight(text_height);
-    const room_h = area.bottom - area.top - 2 * m.margin - m.head(text_height) - m.pad;
+    const top = area.top + @divTrunc(area.bottom - area.top, 20) + m.margin;
+    const row = m.rowHeight(h);
+    const room_h = area.bottom - m.margin - top - m.head(h) - 2 * m.list_pad;
     if (row <= 0 or room_h < row) return null;
-    const rows = @min(m.rows, @divTrunc(room_h, row));
+    const fit: usize = @intCast(@divTrunc(room_h, row));
+    const rows: i32 = @intCast(@min(@as(usize, @intCast(m.rows)), fit, count));
+    const body = if (count == 0)
+        @min(m.noneHeight(h), room_h + 2 * m.list_pad)
+    else
+        2 * m.list_pad + rows * row;
     const left = area.left + @divTrunc(area.right - area.left - width, 2);
-    const top = area.top + m.margin;
-    return .{ .left = left, .top = top, .right = left + width, .bottom = top + m.head(text_height) + rows * row + m.pad };
+    return .{ .left = left, .top = top, .right = left + width, .bottom = top + m.head(h) + body };
 }
 
 /// What a palette `width` by `height` holds, in its own client
-/// coordinates: the field's box at the top (the EDIT inside it, as tall
-/// as a line of text), and the list under it to the bottom edge.
+/// coordinates: the field across the top (the EDIT in it, as tall as a
+/// line of its text, centred down it), the divider under it, and the list
+/// under that to the bottom, or "No matches" in its place.
 pub const Layout = struct {
-    field: RECT,
     edit: RECT,
+    divider: RECT,
     list: RECT,
+    none: RECT,
 
-    pub fn init(m: Metrics, width: i32, height: i32, text_height: i32) Layout {
-        const right = @max(m.pad, width - m.pad);
-        const field: RECT = .{ .left = m.pad, .top = m.pad, .right = right, .bottom = m.pad + m.boxHeight(text_height) };
+    pub fn init(m: Metrics, width: i32, height: i32, h: Heights) Layout {
+        const field_h = m.fieldHeight(h);
+        const text_h = @max(0, h.field);
+        const edit_top = @divTrunc(field_h - text_h, 2);
         const edit: RECT = .{
-            .left = field.left + m.inset,
-            .top = field.top + m.inset,
-            .right = @max(field.left + m.inset, field.right - m.inset),
-            .bottom = field.top + m.inset + @max(0, text_height),
+            .left = m.field_inset,
+            .top = edit_top,
+            .right = @max(m.field_inset, width - m.field_inset),
+            .bottom = edit_top + text_h,
         };
-        const top = m.head(text_height);
-        const list: RECT = .{ .left = m.pad, .top = top, .right = right, .bottom = @max(top, height - m.pad) };
-        return .{ .field = field, .edit = edit, .list = list };
+        const head = m.head(h);
+        const divider: RECT = .{ .left = 0, .top = field_h, .right = @max(0, width), .bottom = head };
+        const list_top = head + m.list_pad;
+        const list: RECT = .{
+            .left = m.list_pad,
+            .top = list_top,
+            .right = @max(m.list_pad, width - m.list_pad),
+            .bottom = @max(list_top, height - m.list_pad),
+        };
+        const none: RECT = .{ .left = edit.left, .top = head, .right = edit.right, .bottom = @max(head, height) };
+        return .{ .edit = edit, .divider = divider, .list = list, .none = none };
     }
 };
 
-/// A row of the list at `item`: the title on the first line and the
-/// subtitle on the second, `row_inset` in from either side, leaving the
-/// shortcut, `shortcut_w` wide, on the right, centred down the row.
+/// A row of the list at `item`: its tint, `row_gap` shorter, then inside
+/// that, `row_pad` in, the title on the first line and the second line
+/// under it, leaving the shortcut, `shortcut_w` wide, on the right,
+/// centred down the row.
 pub const Row = struct {
+    fill: RECT,
     title: RECT,
     subtitle: RECT,
     shortcut: RECT,
 
-    pub fn init(m: Metrics, item: RECT, text_height: i32, shortcut_w: i32) Row {
-        const right = @max(item.left + m.row_inset, item.right - m.row_inset);
-        const shortcut_left = @max(item.left + m.row_inset, right - @max(0, shortcut_w));
-        const text_right = if (shortcut_w > 0) @max(item.left + m.row_inset, shortcut_left - m.row_inset) else right;
-        const h = @max(0, text_height);
-        const top = item.top + m.row_pad;
+    pub fn init(m: Metrics, item: RECT, h: Heights, shortcut_w: i32) Row {
+        const half = @divTrunc(m.row_gap, 2);
+        const fill: RECT = .{
+            .left = item.left,
+            .top = item.top + half,
+            .right = item.right,
+            .bottom = @max(item.top + half, item.bottom - (m.row_gap - half)),
+        };
+        const left = fill.left + m.row_pad;
+        const right = @max(left, fill.right - m.row_pad);
+        const shortcut_left = @max(left, right - @max(0, shortcut_w));
+        const text_right = if (shortcut_w > 0) @max(left, shortcut_left - m.row_pad) else right;
+        const title_top = fill.top + m.row_pad;
+        const title_bottom = title_top + @max(0, h.title);
+        const sub_top = title_bottom + m.title_gap;
         return .{
-            .title = .{ .left = item.left + m.row_inset, .top = top, .right = text_right, .bottom = top + h },
-            .subtitle = .{ .left = item.left + m.row_inset, .top = top + h, .right = text_right, .bottom = top + 2 * h },
-            .shortcut = .{ .left = shortcut_left, .top = item.top, .right = right, .bottom = item.bottom },
+            .fill = fill,
+            .title = .{ .left = left, .top = title_top, .right = text_right, .bottom = title_bottom },
+            .subtitle = .{ .left = left, .top = sub_top, .right = text_right, .bottom = sub_top + @max(0, h.small) },
+            .shortcut = .{ .left = shortcut_left, .top = fill.top, .right = right, .bottom = fill.bottom },
         };
     }
 };
@@ -1776,45 +2037,122 @@ pub const Row = struct {
 const testing = std.testing;
 const Config = @import("../../config.zig").Config;
 
-test "win32: the command palette sits at the top centre of the area under the tab bar, or not at all" {
+test "win32: the command palette sits near the top centre of the area under the tab bar, as tall as its rows, or not at all" {
     const m = Metrics.init(96);
-    try testing.expectEqual(16 + 8, m.boxHeight(16));
-    try testing.expectEqual(32 + 8, m.rowHeight(16));
-    try testing.expectEqual(1050, Metrics.init(144).width);
-    // A wide area: 700 wide, centred, 8 below its top, with eight rows.
+    const h: Heights = .{ .field = 27, .title = 19, .small = 16 };
+    try testing.expectEqual(48, m.fieldHeight(h));
+    // A large font makes the field taller.
+    try testing.expectEqual(40 + 16, m.fieldHeight(.{ .field = 40, .title = 19, .small = 16 }));
+    try testing.expectEqual(4 + 16 + 19 + 2 + 16, m.rowHeight(h));
+    try testing.expectEqual(750, Metrics.init(144).width);
+    const head = 48 + 1;
+    const row = 57;
+    // A wide area: 500 wide, centred, a twentieth of its height and 8
+    // below its top, with five rows, or as many as it lists.
     const area: RECT = .{ .left = 0, .top = 30, .right = 1000, .bottom = 800 };
-    const head = 8 + 24 + 6;
-    try testing.expectEqual(RECT{ .left = 150, .top = 38, .right = 850, .bottom = 38 + head + 8 * 40 + 8 }, paletteRect(m, area, 16).?);
+    const top = 30 + 770 / 20 + 8;
+    try testing.expectEqual(RECT{ .left = 250, .top = top, .right = 750, .bottom = top + head + 10 + 5 * row + 10 }, paletteRect(m, area, h, 60).?);
+    try testing.expectEqual(RECT{ .left = 250, .top = top, .right = 750, .bottom = top + head + 10 + 2 * row + 10 }, paletteRect(m, area, h, 2).?);
+    // None: "No matches", 16 above and below it.
+    try testing.expectEqual(RECT{ .left = 250, .top = top, .right = 750, .bottom = top + head + 16 + 19 + 16 }, paletteRect(m, area, h, 0).?);
     // A narrower one: the palette narrows to it, down to 240.
-    const narrow = paletteRect(m, .{ .left = 100, .top = 0, .right = 500, .bottom = 800 }, 16).?;
-    try testing.expectEqual(RECT{ .left = 108, .top = 8, .right = 492, .bottom = 8 + head + 8 * 40 + 8 }, narrow);
-    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 256, .bottom = 800 }, 16) != null);
-    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 255, .bottom = 800 }, 16) == null);
+    const narrow = paletteRect(m, .{ .left = 100, .top = 0, .right = 500, .bottom = 800 }, h, 60).?;
+    try testing.expectEqual(RECT{ .left = 108, .top = 48, .right = 492, .bottom = 48 + head + 10 + 5 * row + 10 }, narrow);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 256, .bottom = 800 }, h, 60) != null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 255, .bottom = 800 }, h, 60) == null);
     // A short one: fewer rows, down to one.
-    const short = paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 8 + head + 3 * 40 + 39 + 8 + 8 }, 16).?;
-    try testing.expectEqual(head + 3 * 40 + 8, short.bottom - short.top);
-    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 8 + head + 40 + 8 + 8 }, 16) != null);
-    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 8 + head + 40 + 8 + 7 }, 16) == null);
-    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, 16) == null);
+    const short = paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 328 }, h, 60).?;
+    try testing.expectEqual(head + 10 + 3 * row + 10, short.bottom - short.top);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 149 }, h, 60) != null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 148 }, h, 60) == null);
+    // Whether it fits does not depend on what it lists.
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 149 }, h, 0) != null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 1000, .bottom = 148 }, h, 0) == null);
+    try testing.expect(paletteRect(m, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 }, h, 60) == null);
 }
 
-test "win32: the command palette's field and list, and a row's parts" {
+test "win32: the command palette's field, divider and list, and a row's parts" {
     const m = Metrics.init(96);
-    const l = Layout.init(m, 700, 400, 16);
-    try testing.expectEqual(RECT{ .left = 8, .top = 8, .right = 692, .bottom = 32 }, l.field);
-    try testing.expectEqual(RECT{ .left = 12, .top = 12, .right = 688, .bottom = 28 }, l.edit);
-    try testing.expectEqual(RECT{ .left = 8, .top = 38, .right = 692, .bottom = 392 }, l.list);
+    const h: Heights = .{ .field = 27, .title = 19, .small = 16 };
+    const l = Layout.init(m, 500, 300, h);
+    try testing.expectEqual(RECT{ .left = 16, .top = 10, .right = 484, .bottom = 37 }, l.edit);
+    try testing.expectEqual(RECT{ .left = 0, .top = 48, .right = 500, .bottom = 49 }, l.divider);
+    try testing.expectEqual(RECT{ .left = 10, .top = 59, .right = 490, .bottom = 290 }, l.list);
+    try testing.expectEqual(RECT{ .left = 16, .top = 49, .right = 484, .bottom = 300 }, l.none);
     // No room: nothing negative.
-    const none = Layout.init(m, 0, 0, 0);
+    const none = Layout.init(m, 0, 0, .{});
     try testing.expect(none.edit.right >= none.edit.left and none.list.bottom >= none.list.top);
+    try testing.expect(none.none.right >= none.none.left and none.divider.right >= none.divider.left);
 
-    const item: RECT = .{ .left = 0, .top = 40, .right = 600, .bottom = 80 };
-    const r = Row.init(m, item, 16, 100);
-    try testing.expectEqual(RECT{ .left = 492, .top = 40, .right = 592, .bottom = 80 }, r.shortcut);
-    try testing.expectEqual(RECT{ .left = 8, .top = 44, .right = 484, .bottom = 60 }, r.title);
-    try testing.expectEqual(RECT{ .left = 8, .top = 60, .right = 484, .bottom = 76 }, r.subtitle);
+    const item: RECT = .{ .left = 0, .top = 40, .right = 480, .bottom = 97 };
+    const r = Row.init(m, item, h, 100);
+    try testing.expectEqual(RECT{ .left = 0, .top = 42, .right = 480, .bottom = 95 }, r.fill);
+    try testing.expectEqual(RECT{ .left = 372, .top = 42, .right = 472, .bottom = 95 }, r.shortcut);
+    try testing.expectEqual(RECT{ .left = 8, .top = 50, .right = 364, .bottom = 69 }, r.title);
+    try testing.expectEqual(RECT{ .left = 8, .top = 71, .right = 364, .bottom = 87 }, r.subtitle);
     // No shortcut: the text goes to the right edge.
-    try testing.expectEqual(592, Row.init(m, item, 16, 0).title.right);
+    try testing.expectEqual(472, Row.init(m, item, h, 0).title.right);
+}
+
+test "win32: the command palette's colours follow its terminal's background" {
+    const white = win32.rgb(0xff, 0xff, 0xff);
+    const black = win32.rgb(0, 0, 0);
+    // macOS's measure: Ghostty's default background is dark, a pale one
+    // light, and mid-grey on either side of a half.
+    try testing.expect(!isLight(win32.rgb(0x28, 0x2c, 0x34)));
+    try testing.expect(isLight(win32.rgb(0xfd, 0xf6, 0xe3)));
+    try testing.expect(isLight(win32.rgb(0x80, 0x80, 0x80)));
+    try testing.expect(!isLight(win32.rgb(0x7f, 0x7f, 0x7f)));
+    // Green weighs most, blue least.
+    try testing.expect(isLight(win32.rgb(0, 0xdb, 0)));
+    try testing.expect(!isLight(win32.rgb(0, 0, 0xff)));
+    try testing.expectEqual(black, lerp(black, white, 0));
+    try testing.expectEqual(white, lerp(black, white, 1000));
+    try testing.expectEqual(win32.rgb(0x80, 0x80, 0x80), lerp(black, white, 500));
+    // Each channel apart.
+    try testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), lerp(win32.rgb(0x10, 0x20, 0x30), win32.rgb(0x10, 0x20, 0x30), 300));
+    try testing.expectEqual(win32.rgb(0x33, 0, 0), lerp(black, win32.rgb(0xff, 0, 0), 200));
+
+    const accent = win32.rgb(0x00, 0x78, 0xd7);
+    for ([_]win32.COLORREF{ black, win32.rgb(0x28, 0x2c, 0x34), white, win32.rgb(0xfd, 0xf6, 0xe3) }) |bg| {
+        const look = Look.of(bg, accent);
+        try testing.expectEqual(!isLight(bg), look.dark);
+        // Lifted off the terminal, the border further, the text readable
+        // on it: lighter on a dark one, darker on a light one.
+        try testing.expect(look.back != bg);
+        try testing.expectEqual(look.dark, !isLight(look.back));
+        try testing.expectEqual(look.dark, isLight(look.text));
+        try testing.expect(distance(look.border, bg) > distance(look.back, bg));
+        // The selection's tint, and the hover's, set apart from the back.
+        try testing.expect(look.selected != look.back and look.hover != look.back and look.selected != look.hover);
+    }
+}
+
+/// The largest of the channels' differences between `a` and `b`.
+fn distance(a: win32.COLORREF, b: win32.COLORREF) u32 {
+    var most: u32 = 0;
+    for (0..3) |i| {
+        const shift: u5 = @intCast(8 * i);
+        const x: i32 = @intCast((a >> shift) & 0xff);
+        const y: i32 = @intCast((b >> shift) & 0xff);
+        most = @max(most, @abs(x - y));
+    }
+    return most;
+}
+
+test "win32: the command palette's fonts scale the message font's height" {
+    // The message font's 12 at 96 DPI: 20, 14 and 12.
+    try testing.expectEqual(-20, scaleHeight(-12, 20));
+    try testing.expectEqual(-14, scaleHeight(-12, 14));
+    try testing.expectEqual(-12, scaleHeight(-12, 12));
+    // At 150%, or a larger text size: in proportion, rounded.
+    try testing.expectEqual(-30, scaleHeight(-18, 20));
+    try testing.expectEqual(-27, scaleHeight(-16, 20));
+    // A cell height stays one.
+    try testing.expectEqual(14, scaleHeight(12, 14));
+    // Never zero, the system's default.
+    try testing.expectEqual(-1, scaleHeight(-1, 1));
+    try testing.expectEqual(1, scaleHeight(0, 12));
 }
 
 test "win32: the command palette's selection moves within its rows" {
@@ -1911,7 +2249,9 @@ test "win32: the palette's entries are the supported commands and a jump per ter
                 saw_split = true;
                 try testing.expectEqualStrings("Split Right", e.title);
                 try testing.expectEqualStrings("Ctrl+Shift+O", e.shortcut);
-                try testing.expectEqualStrings(e.action_key, e.subtitle());
+                // Its description, as macOS's second line.
+                try testing.expect(e.description.len > 0);
+                try testing.expectEqualStrings(e.description, e.subtitle());
             }
             if (std.mem.eql(u8, e.action_key, "new_tab")) {
                 saw_tab = true;
@@ -2031,15 +2371,17 @@ test "win32: a jump's working directory cannot reorder or hide the palette's tex
     }
 }
 
-test "win32: a palette row's tooltip is its description, unless the row shows it already" {
+test "win32: a palette row's second line is its description, which a command's tooltip shows whole" {
     const jump: Entry.Run = .{ .jump = @ptrFromInt(0x10000) };
     const action: Entry.Run = .{ .action = .new_tab };
-    // A command's description, which its second line (the action) does
-    // not show.
+    // A command's description, as macOS's second line and help, which
+    // shows all of one the line cuts short.
     const described: Entry = .{ .title = "New Tab", .action_key = "new_tab", .description = "Open a new tab.", .run = action };
+    try testing.expectEqualStrings("Open a new tab.", described.subtitle());
     try testing.expectEqualStrings("Open a new tab.", described.tooltip().?);
-    // A command with none.
+    // A command with none: its action on the second line, no tooltip.
     const bare: Entry = .{ .title = "New Tab", .action_key = "new_tab", .run = action };
+    try testing.expectEqualStrings("new_tab", bare.subtitle());
     try testing.expect(bare.tooltip() == null);
     // A jump's working directory is its second line already; a jump with
     // none has nothing.

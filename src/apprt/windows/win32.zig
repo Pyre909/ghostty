@@ -1258,6 +1258,12 @@ pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(.winapi) ?HBRUS
 pub extern "gdi32" fn GetStockObject(index: c_int) callconv(.winapi) ?HGDIOBJ;
 /// wingdi.h's stock black brush, for GetStockObject.
 pub const BLACK_BRUSH = 4;
+/// wingdi.h's stock pen that draws nothing, for GetStockObject: a shape
+/// filled with the brush alone.
+pub const NULL_PEN = 8;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-roundrect
+/// With the null pen it fills one pixel short of `right` and `bottom`.
+pub extern "gdi32" fn RoundRect(hdc: HDC, left: c_int, top: c_int, right: c_int, bottom: c_int, width: c_int, height: c_int) callconv(.winapi) BOOL;
 /// A brush, font, bitmap or other GDI object.
 pub const HGDIOBJ = *anyopaque;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-deleteobject
@@ -1326,7 +1332,9 @@ pub const DT_NOPREFIX: UINT = 0x0800;
 pub const DT_END_ELLIPSIS: UINT = 0x8000;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-drawtextw
 pub extern "user32" fn DrawTextW(hdc: HDC, text: [*]const u16, len: c_int, rect: *RECT, format: UINT) callconv(.winapi) c_int;
+pub const FW_LIGHT: c_int = 300;
 pub const FW_NORMAL: c_int = 400;
+pub const FW_BOLD: c_int = 700;
 pub const DEFAULT_CHARSET: DWORD = 1;
 pub const OUT_DEFAULT_PRECIS: DWORD = 0;
 pub const CLIP_DEFAULT_PRECIS: DWORD = 0;
@@ -1666,6 +1674,7 @@ pub const LB_GETITEMDATA: UINT = 0x0199;
 pub const LB_SETITEMDATA: UINT = 0x019A;
 pub const LB_SETITEMHEIGHT: UINT = 0x01A0;
 pub const LB_GETITEMHEIGHT: UINT = 0x01A1;
+pub const LB_GETITEMRECT: UINT = 0x0198;
 pub const LB_ITEMFROMPOINT: UINT = 0x01A9;
 pub const LB_ERR: LRESULT = -1;
 /// DRAWITEMSTRUCT's itemState: the item is selected.
