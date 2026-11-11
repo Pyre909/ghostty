@@ -104,13 +104,17 @@ fn checkVTable(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
     if (!@hasDecl(c, vtbl_name)) return lineFor(Z, c_name, "the header has no " ++ vtbl_name);
     const zs = flatten(Z.VTable);
     const cs = flatten(@field(c, vtbl_name));
-    if (zs.len != cs.len) return lineFor(Z, c_name, std.fmt.comptimePrint(
+    comptime var out: []const u8 = "";
+    if (zs.len != cs.len) out = out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
         "{d} slots, the header has {d}",
         .{ zs.len, cs.len },
     ));
 
-    comptime var out: []const u8 = "";
-    inline for (zs, cs, 0..) |z, h, i| {
+    // Over the slots both sides have, so that a dropped or added slot is
+    // named by the first one it displaces.
+    inline for (0..@min(zs.len, cs.len)) |i| {
+        const z = zs[i];
+        const h = cs[i];
         if (!sameSlotName(z.name, h.name)) {
             out = out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
                 "slot {d} is {s}, the header's is {s}",
@@ -201,11 +205,13 @@ fn checkStruct(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
     }
     const zi = @typeInfo(Z).@"struct";
     const ci = @typeInfo(C).@"struct";
-    if (zi.field_names.len != ci.field_names.len) return out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
+    if (zi.field_names.len != ci.field_names.len) out = out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
         "{d} fields, the header has {d}",
         .{ zi.field_names.len, ci.field_names.len },
     ));
-    inline for (zi.field_names, ci.field_names) |zn, cn| {
+    inline for (0..@min(zi.field_names.len, ci.field_names.len)) |i| {
+        const zn = zi.field_names[i];
+        const cn = ci.field_names[i];
         // translate-c names an anonymous union `unnamed_N`; the Zig side
         // must name it, so only its place is compared.
         if (!std.mem.eql(u8, zn, cn) and !std.mem.startsWith(u8, cn, "unnamed_")) {
@@ -477,6 +483,7 @@ test "com abi: a faithful vtable and struct have no mismatches" {
 test "com abi: each seeded vtable defect is caught" {
     try expectCaught(&.{.{ .zig = ZigThing(.swapped), .c = "IThing" }}, "slot 4 is SetMode, the header's is GetCount");
     try expectCaught(&.{.{ .zig = ZigThing(.dropped), .c = "IThing" }}, "8 slots, the header has 9");
+    try expectCaught(&.{.{ .zig = ZigThing(.dropped), .c = "IThing" }}, "slot 5 is Fill, the header's is SetMode");
     try expectCaught(&.{.{ .zig = ZigThing(.param_count), .c = "IThing" }}, "Create: 2 parameters, the header has 3");
     try expectCaught(&.{.{ .zig = ZigThing(.param_width), .c = "IThing" }}, "SetMode: parameter 1 is i16, the header's is i32");
     try expectCaught(&.{.{ .zig = ZigThing(.param_sign), .c = "IThing" }}, "SetMode: parameter 1 is u32, the header's is i32");
@@ -506,4 +513,6 @@ test "com abi: each seeded struct defect is caught" {
     try expectCaught(&.{.{ .zig = Reordered, .c = "THING_DESC" }}, "field Height stands where the header has Width");
     try expectCaught(&.{.{ .zig = Wider, .c = "THING_DESC" }}, "field Height at 8 size 8, the header's at 4 size 4");
     try expectCaught(&.{.{ .zig = Shorter, .c = "THING_DESC" }}, "2 fields, the header has 3");
+    const NoHeight = extern struct { Width: u32, Flags: u8 };
+    try expectCaught(&.{.{ .zig = NoHeight, .c = "THING_DESC" }}, "field Flags stands where the header has Height");
 }
