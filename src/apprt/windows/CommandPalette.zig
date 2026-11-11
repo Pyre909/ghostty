@@ -345,30 +345,72 @@ pub fn fold(alloc: Allocator, text: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = try .initCapacity(alloc, text.len);
     errdefer out.deinit(alloc);
     var i: usize = 0;
+    var buf: [max_fold]u8 = undefined;
     while (i < text.len) {
-        const len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
-        const cp: ?u21 = if (len > 0 and i + len <= text.len)
-            std.unicode.utf8Decode(text[i..][0..len]) catch null
-        else
-            null;
-        const c = cp orelse {
-            try out.append(alloc, text[i]);
-            i += 1;
-            continue;
-        };
-        i += len;
-        if (c < 0x80) {
-            try out.append(alloc, std.ascii.toLower(@intCast(c)));
-            continue;
-        }
-        var single: [1]u21 = undefined;
-        for (uucode.get(.case_folding_full, c).with(&single, c)) |f| {
-            var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(f, &buf) catch continue;
-            try out.appendSlice(alloc, buf[0..n]);
-        }
+        const one = foldStep(text[i..], &buf);
+        try out.appendSlice(alloc, one.folded);
+        i += one.source;
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// The most bytes one code point folds to: Unicode's full case folding
+/// gives at most three code points, each at most four bytes.
+const max_fold = 3 * 4;
+
+/// One step of `fold` at the start of `rest`, not empty: the bytes it
+/// reads, one code point or a byte that is not UTF-8, and what they fold
+/// to, in `buf`. `matchSpan` walks a text by the same steps.
+fn foldStep(rest: []const u8, buf: *[max_fold]u8) struct { source: usize, folded: []const u8 } {
+    const len: usize = std.unicode.utf8ByteSequenceLength(rest[0]) catch 0;
+    const cp: ?u21 = if (len > 0 and len <= rest.len)
+        std.unicode.utf8Decode(rest[0..len]) catch null
+    else
+        null;
+    const c = cp orelse {
+        buf[0] = rest[0];
+        return .{ .source = 1, .folded = buf[0..1] };
+    };
+    if (c < 0x80) {
+        buf[0] = std.ascii.toLower(@intCast(c));
+        return .{ .source = len, .folded = buf[0..1] };
+    }
+    var single: [1]u21 = undefined;
+    var n: usize = 0;
+    for (uucode.get(.case_folding_full, c).with(&single, c)) |f| {
+        n += std.unicode.utf8Encode(f, buf[n..]) catch continue;
+    }
+    return .{ .source = len, .folded = buf[0..n] };
+}
+
+/// A range of a text's bytes.
+pub const Span = struct { start: usize, end: usize };
+
+/// The bytes of `text` whose folded form, `folded_text` (`fold`), holds
+/// the first occurrence of `folded`, a folded query, as the filter found
+/// it (`match`): every code point whose folding overlaps it, so that a
+/// match beginning or ending inside one code point's folding ("ß" for
+/// "s") takes all of it. Null for an empty query, or none. As macOS bolds
+/// the letters a query matched.
+pub fn matchSpan(text: []const u8, folded_text: []const u8, folded: []const u8) ?Span {
+    if (folded.len == 0) return null;
+    const at = std.mem.indexOf(u8, folded_text, folded) orelse return null;
+    const end = at + folded.len;
+    var span: ?Span = null;
+    var src: usize = 0;
+    var out: usize = 0;
+    var buf: [max_fold]u8 = undefined;
+    while (src < text.len and out < end) {
+        const one = foldStep(text[src..], &buf);
+        const next = out + one.folded.len;
+        if (next > at) {
+            if (span == null) span = .{ .start = src, .end = src };
+            span.?.end = src + one.source;
+        }
+        src += one.source;
+        out = next;
+    }
+    return span;
 }
 
 /// `entry` with its title and action key folded (`fold`) for the filter.
@@ -570,6 +612,9 @@ pub const Palette = struct {
     entries: ?Entries = null,
     /// The filter's result, reused for each query.
     shown: std.ArrayList(u32) = .empty,
+    /// The query, folded (`fold`), whose matches the rows show
+    /// (`matchSpan`); owned.
+    query: []const u8 = &.{},
     /// The row the left button went down on; it runs if the button comes
     /// up on it too.
     pressed: ?usize = null,
@@ -663,6 +708,7 @@ pub const Palette = struct {
         };
         if (self.entries) |*e| e.deinit();
         self.shown.deinit(alloc);
+        alloc.free(self.query);
         self.fonts.deinit();
         if (self.brush) |b| _ = win32.DeleteObject(b);
         self.* = .{};
@@ -674,11 +720,14 @@ pub const Palette = struct {
 /// the field's larger and light, as macOS's query is 20 points light; the
 /// titles' and the small one's (the second lines, the shortcuts) at
 /// Windows 11's body and caption sizes, 14 and 12 pixels to the message
-/// font's 12 at 96 DPI. Any one the system will not make is null.
+/// font's 12 at 96 DPI, and each of those bold, for the letters a query
+/// matched. Any one the system will not make is null.
 pub const Fonts = struct {
     field: ?win32.HGDIOBJ = null,
     title: ?win32.HGDIOBJ = null,
     small: ?win32.HGDIOBJ = null,
+    title_bold: ?win32.HGDIOBJ = null,
+    small_bold: ?win32.HGDIOBJ = null,
 
     pub fn init(dpi: u32) Fonts {
         const base = messageLogFont(dpi) orelse fallback: {
@@ -695,6 +744,8 @@ pub const Fonts = struct {
             .field = make(base, 20, win32.FW_LIGHT),
             .title = make(base, 14, base.lfWeight),
             .small = make(base, 12, base.lfWeight),
+            .title_bold = make(base, 14, win32.FW_BOLD),
+            .small_bold = make(base, 12, win32.FW_BOLD),
         };
     }
 
@@ -710,7 +761,7 @@ pub const Fonts = struct {
     }
 
     pub fn deinit(self: *Fonts) void {
-        inline for (.{ self.field, self.title, self.small }) |f| if (f) |font| {
+        inline for (.{ self.field, self.title, self.small, self.title_bold, self.small_bold }) |f| if (f) |font| {
             _ = win32.DeleteObject(font);
         };
         self.* = .{};
@@ -740,7 +791,8 @@ pub const Heights = struct {
 /// material behind GDI's drawing, so the tint is a solid colour: the
 /// background lifted towards white on a dark one, towards black on a
 /// light one. The selection is tinted with the system's highlight, as
-/// macOS's is with the accent.
+/// macOS's is with the accent, and the letters a query matched are drawn
+/// in it, lightened on a dark background to stand out from the tint.
 pub const Look = struct {
     dark: bool,
     back: win32.COLORREF,
@@ -749,6 +801,7 @@ pub const Look = struct {
     dim: win32.COLORREF,
     selected: win32.COLORREF,
     hover: win32.COLORREF,
+    match: win32.COLORREF,
 
     pub fn of(background: win32.COLORREF, accent: win32.COLORREF) Look {
         const white = win32.rgb(0xff, 0xff, 0xff);
@@ -764,6 +817,7 @@ pub const Look = struct {
             .dim = lerp(text, back, 400),
             .selected = lerp(back, accent, if (dark) 300 else 220),
             .hover = lerp(back, text, 100),
+            .match = if (dark) lerp(accent, white, 450) else lerp(accent, black, 150),
         };
     }
 };
@@ -1386,6 +1440,10 @@ fn refill(window: *Window, query: []const u8) void {
         log.warn("cannot filter the command palette err={}", .{err});
         p.shown.clearRetainingCapacity();
     };
+    // No query to show matches of, rather than the last one's.
+    const folded: []const u8 = fold(alloc, query) catch &.{};
+    alloc.free(p.query);
+    p.query = folded;
     unhover(window);
     _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 0, 0);
     _ = win32.SendMessageW(list, win32.LB_RESETCONTENT, 0, 0);
@@ -1861,19 +1919,54 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
         var r = row.shortcut;
         _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_RIGHT | win32.DT_VCENTER);
     };
+    // The letters the query matched: in the title, else in the action
+    // key, when the second line shows it, as macOS bolds the subtitle's
+    // only when the title has none.
+    const title_span = matchSpan(entry.title, entry.folded_title, p.query);
     const sub = entry.subtitle();
-    if (sub.len > 0) if (wideFromUtf8(alloc, sub)) |text| {
-        defer alloc.free(text);
-        var r = row.subtitle;
-        _ = win32.DrawTextW(hdc, text.ptr, @intCast(text.len), &r, flags | win32.DT_END_ELLIPSIS);
-    } else |_| {};
-    if (p.fonts.title) |f| _ = win32.SelectObject(hdc, f);
-    if (wideFromUtf8(alloc, entry.title)) |title| {
-        defer alloc.free(title);
-        var r = row.title;
-        _ = win32.SetTextColor(hdc, look.text);
-        _ = win32.DrawTextW(hdc, title.ptr, @intCast(title.len), &r, flags | win32.DT_END_ELLIPSIS);
-    } else |_| {}
+    const sub_span = if (title_span == null and entry.description.len == 0)
+        matchSpan(entry.action_key, entry.folded_key, p.query)
+    else
+        null;
+    drawSpanned(hdc, alloc, sub, sub_span, row.subtitle, .{ .normal = p.fonts.small, .bold = p.fonts.small_bold }, look.dim, look.match);
+    drawSpanned(hdc, alloc, entry.title, title_span, row.title, .{ .normal = p.fonts.title, .bold = p.fonts.title_bold }, look.text, look.match);
+}
+
+/// Draw `text` on one line in `r`, in `fonts.normal` and `color`, but
+/// for its `span`, in `fonts.bold` and `match_color`; cut short with an
+/// ellipsis where it does not fit.
+fn drawSpanned(
+    hdc: win32.HDC,
+    alloc: Allocator,
+    text: []const u8,
+    span: ?Span,
+    r: RECT,
+    fonts: struct { normal: ?win32.HGDIOBJ, bold: ?win32.HGDIOBJ },
+    color: win32.COLORREF,
+    match_color: win32.COLORREF,
+) void {
+    if (text.len == 0) return;
+    const flags = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
+    const s = span orelse Span{ .start = text.len, .end = text.len };
+    const parts = [_]struct { []const u8, bool }{
+        .{ text[0..s.start], false },
+        .{ text[s.start..s.end], true },
+        .{ text[s.end..], false },
+    };
+    var x = r.left;
+    for (parts) |part| {
+        const piece, const bold = part;
+        if (piece.len == 0) continue;
+        if (x >= r.right) return;
+        const font = (if (bold) fonts.bold orelse fonts.normal else fonts.normal) orelse return;
+        _ = win32.SelectObject(hdc, font);
+        _ = win32.SetTextColor(hdc, if (bold) match_color else color);
+        const wide = wideFromUtf8(alloc, piece) catch return;
+        defer alloc.free(wide);
+        var at: RECT = .{ .left = x, .top = r.top, .right = r.right, .bottom = r.bottom };
+        _ = win32.DrawTextW(hdc, wide.ptr, @intCast(wide.len), &at, flags | win32.DT_END_ELLIPSIS);
+        x += textWidth(hdc, alloc, piece);
+    }
 }
 
 /// Fill `r` in `color` with corners of `radius`.
@@ -2158,8 +2251,10 @@ test "win32: the command palette's colours follow its terminal's background" {
         try testing.expectEqual(look.dark, !isLight(look.back));
         try testing.expectEqual(look.dark, isLight(look.text));
         try testing.expect(distance(look.border, bg) > distance(look.back, bg));
-        // The selection's tint, and the hover's, set apart from the back.
+        // The selection's tint, and the hover's, set apart from the back;
+        // a match's letters, from the selection's tint and the text.
         try testing.expect(look.selected != look.back and look.hover != look.back and look.selected != look.hover);
+        try testing.expect(look.match != look.selected and look.match != look.text and look.match != look.back);
     }
 }
 
@@ -2441,6 +2536,52 @@ test "win32: a palette row's second line is its description, which a command's t
         },
         .jump => try testing.expect(e.tooltip() == null),
     };
+}
+
+test "win32: the palette shows the letters a query matched, by the code points they fold from" {
+    const alloc = testing.allocator;
+    const Case = struct { text: []const u8, query: []const u8, span: ?Span };
+    const cases = [_]Case{
+        .{ .text = "Split Right", .query = "right", .span = .{ .start = 6, .end = 11 } },
+        .{ .text = "Split Right", .query = "SPLIT R", .span = .{ .start = 0, .end = 7 } },
+        // The first occurrence, as the filter finds it.
+        .{ .text = "Close Other Tabs", .query = "o", .span = .{ .start = 2, .end = 3 } },
+        // "ß" folds to "ss": a match of either "s", or both, takes it.
+        .{ .text = "Straße", .query = "asse", .span = .{ .start = 3, .end = 7 } },
+        .{ .text = "Straße", .query = "as", .span = .{ .start = 3, .end = 6 } },
+        .{ .text = "Straße", .query = "se", .span = .{ .start = 4, .end = 7 } },
+        // Code points of two and three bytes, and a byte that is not UTF-8.
+        .{ .text = "Über", .query = "üb", .span = .{ .start = 0, .end = 3 } },
+        .{ .text = "a\xffb", .query = "\xffb", .span = .{ .start = 1, .end = 3 } },
+        .{ .text = "x\u{2026}y", .query = "y", .span = .{ .start = 4, .end = 5 } },
+        // None: an empty query, or no match.
+        .{ .text = "Split Right", .query = "", .span = null },
+        .{ .text = "Split Right", .query = "left", .span = null },
+    };
+    for (cases) |c| {
+        const folded_text = try fold(alloc, c.text);
+        defer alloc.free(folded_text);
+        const folded = try fold(alloc, c.query);
+        defer alloc.free(folded);
+        try testing.expectEqual(c.span, matchSpan(c.text, folded_text, folded));
+    }
+
+    // Whatever the text and query, the span's own folding holds the
+    // query, and it starts and ends on a code point.
+    const texts = [_][]const u8{ "New Split: Right", "ΣΊΣΥΦΟΣ straße", "İstanbul ǅ ﬁle", "a\xffΣ\xfe" };
+    for (texts) |text| {
+        const folded_text = try fold(alloc, text);
+        defer alloc.free(folded_text);
+        for (0..folded_text.len) |from| for (from + 1..@min(folded_text.len, from + 4) + 1) |to| {
+            const query = folded_text[from..to];
+            const span = matchSpan(text, folded_text, query).?;
+            const again = try fold(alloc, text[span.start..span.end]);
+            defer alloc.free(again);
+            try testing.expect(std.mem.indexOf(u8, again, query) != null);
+            try testing.expect(text[span.start] & 0xc0 != 0x80);
+            try testing.expect(span.end == text.len or text[span.end] & 0xc0 != 0x80);
+        };
+    }
 }
 
 test "win32: the palette sorts as GTK's does" {
