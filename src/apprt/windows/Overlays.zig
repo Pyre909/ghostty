@@ -263,11 +263,11 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// terminal's next change of size (`ResizeOverlay.resized`); the
 /// child-exited banner, asked for once, is not.
 ///
-/// The terminals tile their area, and the search bars and the command
-/// palette are placed above all of them (`SearchBar.place`,
-/// `CommandPalette.place`), so just above its own terminal an overlay
-/// covers nothing but that terminal, under its search bar and the
-/// palette, wherever it is placed from.
+/// The terminals tile their area, and the search bars are placed above
+/// all of them (`SearchBar.place`), so just above its own terminal an
+/// overlay covers nothing but that terminal, under its search bar,
+/// wherever it is placed from; the command palette, a pop-up, is over
+/// them all.
 pub fn place(surface: *Surface) void {
     const self = &surface.overlays;
     const window = surface.window;

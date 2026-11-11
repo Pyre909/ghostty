@@ -9304,12 +9304,12 @@ test "win32: a tab moved to a new window keeps its window's transparency, or sta
 test "win32: what is drawn over a transparent window's terminals is layered as it is made" {
     // GDI writes alpha 0, which DWM shows added to the desktop behind a
     // transparent frame (Transparency.zig): its bar, each terminal's
-    // overlays, made with the terminal or later, a search bar and the
-    // command palette are each layered as it is made
-    // (`Transparency.chrome`). Not their fields and the palette's list,
-    // drawn into their surfaces, nor the terminals, whose renderers
-    // present with alpha, nor the palette's tip, a pop-up of its own. In
-    // an opaque window none is.
+    // overlays, made with the terminal or later, and a search bar are
+    // each layered as it is made (`Transparency.chrome`). Not their
+    // fields, drawn into their surfaces, nor the terminals, whose
+    // renderers present with alpha, nor the command palette, an opaque
+    // pop-up of its own, its field, list and tip. In an opaque window
+    // none is.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -9349,13 +9349,12 @@ test "win32: what is drawn over a transparent window's terminals is layered as i
             a.overlays.link_preview.hwnd,
             a.overlays.readonly.hwnd,
             a.search_bar.hwnd,
-            p.hwnd,
         }) |hwnd| {
             try std.testing.expect(hwnd != null);
             try std.testing.expectEqual(transparent, TestClear.isLayered(hwnd));
         }
-        try std.testing.expect(a.search_bar.edit != null and p.edit != null and p.list != null);
-        for ([_]?win32.HWND{ a.search_bar.edit, p.edit, p.list, a.hwnd, p.tip }) |hwnd| {
+        try std.testing.expect(p.hwnd != null and a.search_bar.edit != null and p.edit != null and p.list != null);
+        for ([_]?win32.HWND{ p.hwnd, a.search_bar.edit, p.edit, p.list, a.hwnd, p.tip }) |hwnd| {
             try std.testing.expect(!TestClear.isLayered(hwnd));
         }
 
@@ -9366,7 +9365,7 @@ test "win32: what is drawn over a transparent window's terminals is layered as i
         app.applyPendingFocus();
     }
     try std.testing.expectEqual(1, TestClear.asked);
-    try std.testing.expectEqual(5, TestClear.layered_count);
+    try std.testing.expectEqual(4, TestClear.layered_count);
 }
 
 test "win32: a tab whose terminal cannot change frames stays where it was" {
@@ -19486,6 +19485,16 @@ fn childRect(window: *const Window, hwnd: win32.HWND) !win32.RECT {
     return rect;
 }
 
+/// For tests: whether `hwnd` is a pop-up `window`'s frame owns, so over
+/// every child of the frame, as the command palette is.
+fn ownedPopup(window: *const Window, hwnd: win32.HWND) bool {
+    const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_STYLE);
+    const popup: isize = @bitCast(@as(usize, win32.WS_POPUP));
+    const child: isize = win32.WS_CHILD;
+    if (style & popup == 0 or style & child != 0) return false;
+    return win32.GetWindow(hwnd, win32.GW_OWNER) == window.hwnd;
+}
+
 /// For tests: whether `upper` is above `lower` among `parent`'s children.
 fn above(parent: win32.HWND, upper: win32.HWND, lower: win32.HWND) bool {
     var it = win32.GetWindow(parent, win32.GW_CHILD);
@@ -22530,9 +22539,10 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     // GTK's toggle: the palette opens over the window, at the top centre
     // of the area under the tab bar, above every terminal, its field with
     // the focus, every entry listed and the first selected; again, it
-    // closes and the terminal gets the focus back. It is the frame's
-    // child, as the search bar is, and runs on the window's focused
-    // terminal; opened and closed by `run`, after the core's key callback.
+    // closes and the terminal gets the focus back. It is a pop-up the
+    // frame owns, as macOS floats its own, shown while the frame is, and
+    // runs on the window's focused terminal; opened and closed by `run`,
+    // after the core's key callback.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -22569,10 +22579,12 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     app.createRequested();
     try std.testing.expect(p.open);
     const hwnd = p.hwnd.?;
+    // Hidden with its hidden frame, shown with it.
+    try std.testing.expect(!shown(window.hwnd) and !shown(hwnd));
+    try std.testing.expect(ownedPopup(window, hwnd));
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
     try std.testing.expect(shown(hwnd));
-    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
-    try std.testing.expect(above(window.hwnd, hwnd, a.hwnd));
-    try std.testing.expect(above(window.hwnd, hwnd, b.hwnd));
     try std.testing.expect(p.surface == b);
     try std.testing.expect(p.text_height > 0);
     const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
@@ -22597,15 +22609,23 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     try std.testing.expectEqual(m.rowHeight(p.text_height), win32.SendMessageW(p.list.?, win32.LB_GETITEMHEIGHT, 0, 0));
     try std.testing.expect(win32.SendMessageW(p.edit.?, win32.WM_GETFONT, 0, 0) != 0);
 
-    // The frame's focus goes to the field while it is open.
+    // The frame's focus goes to the field while it is open, once the
+    // frame's activation is over, by a message to the palette.
     FocusSeen.last = null;
     _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(FocusSeen.last == null);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_ACTIVATE, CommandPalette.WM_PALETTE_ACTIVATE, win32.PM_REMOVE).toBool());
+    _ = win32.DispatchMessageW(&msg);
     try std.testing.expect(FocusSeen.last == p.edit.?);
 
-    // Laid out again, it stays above the terminals.
-    _ = win32.SetWindowPos(a.hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
-    window.relayout();
-    try std.testing.expect(above(window.hwnd, hwnd, a.hwnd));
+    // The frame moved: the palette with it.
+    var frame_rect: win32.RECT = undefined;
+    try std.testing.expect(win32.GetWindowRect(window.hwnd, &frame_rect).toBool());
+    _ = win32.SetWindowPos(window.hwnd, null, frame_rect.left + 37, frame_rect.top + 23, 0, 0, win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    try std.testing.expectEqual(want, try childRect(window, hwnd));
+    _ = win32.SetWindowPos(window.hwnd, null, frame_rect.left, frame_rect.top, 0, 0, win32.SWP_NOSIZE | win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
+    try std.testing.expectEqual(want, try childRect(window, hwnd));
 
     // Again: closed, the terminal with the focus.
     try togglePalette(&app, b);
@@ -22962,7 +22982,7 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     // Deactivated: closed once the deactivation is over, by a message to
     // itself, and the terminal gets the focus it had.
     try togglePalette(&app, a);
-    const hwnd = p.hwnd.?;
+    var hwnd = p.hwnd.?;
     _ = Window.wndProc(window.hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, 0);
     try std.testing.expect(p.hwnd != null);
     var msg: win32.MSG = undefined;
@@ -22970,6 +22990,23 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     _ = win32.DispatchMessageW(&msg);
     try std.testing.expect(p.hwnd == null);
     try std.testing.expect(FocusSeen.last == a.hwnd);
+    // Not when the frame's activation goes to the palette itself.
+    try togglePalette(&app, a);
+    hwnd = p.hwnd.?;
+    _ = Window.wndProc(window.hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, @bitCast(@intFromPtr(hwnd)));
+    try std.testing.expect(!win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
+    try std.testing.expect(p.open);
+    // The palette deactivated, as a click on the frame does: the frame's
+    // focus goes to the terminal from then, and it closes once the
+    // deactivation is over, though its frame is the active window then.
+    _ = win32.SendMessageW(hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, @bitCast(@intFromPtr(window.hwnd)));
+    try std.testing.expect(!p.open and p.hwnd != null);
+    FocusSeen.last = null;
+    _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(FocusSeen.last == a.hwnd);
+    try std.testing.expect(win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expect(p.hwnd == null);
     // Escape: closed, the focus back to the terminal; its release withheld
     // from the terminal, which never saw it pressed.
     try togglePalette(&app, a);
@@ -23255,9 +23292,10 @@ test "win32: a terminal closing while the command palette is open leaves its sel
 }
 
 test "win32: a search bar opened while the command palette is open stays under it" {
-    // The palette is above the terminals and their search bars. A bar
-    // opened from the palette's field, Ctrl+Shift+F as `start_search`,
-    // is placed outside a layout: under the palette, not over it.
+    // The palette is above the terminals and their search bars, a pop-up
+    // over its frame's children. A bar opened from the palette's field,
+    // Ctrl+Shift+F as `start_search`, is placed outside a layout: under
+    // the palette, not over it, and over its terminal.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -23286,7 +23324,7 @@ test "win32: a search bar opened while the command palette is open stays under i
     try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
     const bar = b.search_bar.hwnd.?;
     try std.testing.expect(shown(bar));
-    try std.testing.expect(above(window.hwnd, palette, bar));
+    try std.testing.expect(ownedPopup(window, palette));
     // Over its terminal still.
     try std.testing.expect(above(window.hwnd, bar, b.hwnd));
     // The two overlap: the bar at the right terminal's top right, the
@@ -23297,10 +23335,9 @@ test "win32: a search bar opened while the command palette is open stays under i
     // The focus move it asks for keeps the keyboard in the palette.
     app.applyPendingFocus();
     try std.testing.expect(FocusSeen.last == p.edit.?);
-    try std.testing.expect(above(window.hwnd, palette, bar));
     // And again from the other terminal, whose bar is made now.
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .start_search, .{ .needle = "x" }));
-    try std.testing.expect(above(window.hwnd, palette, a.search_bar.hwnd.?));
+    try std.testing.expect(above(window.hwnd, a.search_bar.hwnd.?, a.hwnd));
     // Once the palette has closed, a bar placed goes to the top.
     try togglePalette(&app, b);
     try std.testing.expect(p.hwnd == null);
@@ -23674,16 +23711,13 @@ test "win32: a link preview follows its terminal through layouts, zooms and tabs
     try std.testing.expect(shown(bar));
     try std.testing.expect(above(window.hwnd, bar, hwnd));
     try togglePalette(&app, a);
-    const palette = window.palette.hwnd.?;
-    try std.testing.expect(above(window.hwnd, palette, hwnd));
+    try std.testing.expect(ownedPopup(window, window.palette.hwnd.?));
     try std.testing.expect(try testLink(&app, a, "https://example.com/another"));
     try expectPreviewAt(window, a, .left);
     try std.testing.expect(above(window.hwnd, bar, hwnd));
-    try std.testing.expect(above(window.hwnd, palette, hwnd));
     window.relayout();
     try expectPreviewAt(window, a, .left);
     try std.testing.expect(above(window.hwnd, bar, hwnd));
-    try std.testing.expect(above(window.hwnd, palette, hwnd));
     try togglePalette(&app, a);
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .end_search, {}));
     app.applyPendingFocus();
@@ -27905,7 +27939,8 @@ test "win32: a terminal's overlays, its search bar and the command palette stay 
         window.palette.hwnd.?,
     };
     for (right) |hwnd| {
-        try std.testing.expect(shown(hwnd));
+        // The palette, a pop-up, shows with its frame, hidden here.
+        try std.testing.expect(shown(hwnd) or hwnd == window.palette.hwnd.?);
         const at = try childRect(window, hwnd);
         try std.testing.expect(at.right <= pane.right);
         try std.testing.expect(at.left >= pane.left);

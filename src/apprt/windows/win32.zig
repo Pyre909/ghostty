@@ -197,6 +197,7 @@ pub const GWLP_USERDATA: c_int = -21;
 /// No message: a window procedure does nothing with it.
 pub const WM_NULL: UINT = 0x0000;
 pub const WM_DESTROY: UINT = 0x0002;
+pub const WM_MOVE: UINT = 0x0003;
 pub const WM_SIZE: UINT = 0x0005;
 pub const WM_ACTIVATE: UINT = 0x0006;
 pub const WM_SETFOCUS: UINT = 0x0007;
@@ -229,6 +230,8 @@ pub const WM_DISPLAYCHANGE: UINT = 0x007E;
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_NCCREATE: UINT = 0x0081;
 pub const WM_NCDESTROY: UINT = 0x0082;
+/// Sent as a window's caption is drawn active (wParam TRUE) or inactive.
+pub const WM_NCACTIVATE: UINT = 0x0086;
 pub const WM_KEYFIRST: UINT = 0x0100;
 pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_KEYUP: UINT = 0x0101;
@@ -933,6 +936,13 @@ pub const DWMWA_SYSTEMBACKDROP_TYPE: DWORD = 38;
 /// transient window's (Learn: "Desktop Acrylic").
 pub const DWMSBT_AUTO: DWORD = 0;
 pub const DWMSBT_TRANSIENTWINDOW: DWORD = 3;
+/// dwmapi.h, from Windows 11 (build 22000): a DWORD, one of
+/// DWM_WINDOW_CORNER_PREFERENCE's; and a COLORREF for the window's
+/// border. Both take on a borderless pop-up too.
+pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
+pub const DWMWA_BORDER_COLOR: DWORD = 34;
+/// DWM_WINDOW_CORNER_PREFERENCE: rounded, as a top-level window's.
+pub const DWMWCP_ROUND: DWORD = 2;
 /// DWM_BLURBEHIND's `flags`: `enable` and `region` apply.
 pub const DWM_BB_ENABLE: DWORD = 0x1;
 pub const DWM_BB_BLURREGION: DWORD = 0x2;

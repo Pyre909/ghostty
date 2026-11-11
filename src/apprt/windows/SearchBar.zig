@@ -592,13 +592,14 @@ pub fn place(surface: *Surface) void {
     const p = placement(surface) orelse return hide(surface);
     const width = p.at.right - p.at.left;
     const height = p.at.bottom - p.at.top;
-    // Above the terminals, but just under the window's command palette
-    // or tab overview while one is open: a bar placed outside a layout, as
-    // `start` places one, would otherwise cover it, which only a layout
-    // raises (`CommandPalette.place`).
+    // Above the terminals, but just under the window's tab overview while
+    // it is open: a bar placed outside a layout, as `start` places one,
+    // would otherwise cover it, which only a layout raises
+    // (`TabOverview.place`). The command palette, a pop-up, is over every
+    // child of the frame.
     _ = win32.SetWindowPos(
         hwnd,
-        window.palette.hwnd orelse window.overview.hwnd orelse win32.HWND_TOP,
+        window.overview.hwnd orelse win32.HWND_TOP,
         p.at.left,
         p.at.top,
         width,

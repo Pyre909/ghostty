@@ -1496,7 +1496,7 @@ fn giveBackClosing(self: *Window) void {
 /// can come straight back, and its command palette is not destroyed
 /// inside the change (`CommandPalette.deactivated`). Hidden, or on its
 /// way out (`quickShown`), it has nothing to hide, and posts nothing.
-fn quickDeactivated(self: *Window, to: ?win32.HWND) void {
+pub fn quickDeactivated(self: *Window, to: ?win32.HWND) void {
     assert(self.quick);
     if (to) |hwnd| {
         if (win32.GetAncestor(hwnd, win32.GA_ROOTOWNER) == self.hwnd) return;
@@ -2137,16 +2137,34 @@ fn handleMessage(
 
         // Deactivated: an open command palette closes, as GTK's dialog
         // does, once the deactivation is over (`CommandPalette.deactivated`),
-        // and the quick terminal may hide (`quickDeactivated`); lParam is
-        // the window being activated. DefWindowProcW below as well.
+        // unless the palette itself is being activated, and the quick
+        // terminal may hide (`quickDeactivated`); lParam is the window
+        // being activated. DefWindowProcW below as well.
         win32.WM_ACTIVATE => if (@as(u16, @truncate(wparam)) == win32.WA_INACTIVE) {
-            CommandPalette.deactivated(self);
-            if (self.quick) self.quickDeactivated(@ptrFromInt(@as(usize, @bitCast(lparam))));
+            const to: ?win32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            CommandPalette.deactivated(self, to);
+            if (self.quick) self.quickDeactivated(to);
         },
 
+        // The caption stays active while the command palette, a pop-up
+        // of the frame's, is activated, as a menu keeps it: the palette
+        // is part of the window to the user.
+        win32.WM_NCACTIVATE => if (wparam == 0 and self.palette.activating) {
+            return win32.DefWindowProcW(hwnd, msg, 1, lparam);
+        },
+
+        // The command palette moves with the frame.
+        win32.WM_MOVE => CommandPalette.frameMoved(self),
+
         // Keyboard focus belongs to a terminal: the frame gets it on
-        // activation (DefWindowProcW's WM_ACTIVATE), and passes it on.
+        // activation (DefWindowProcW's WM_ACTIVATE), and passes it on; or
+        // to an open command palette, which is activated once this
+        // activation is over (`CommandPalette.activateLater`).
         win32.WM_SETFOCUS => {
+            if (self.palette.focusTarget() != null) {
+                CommandPalette.activateLater(self);
+                return 0;
+            }
             if (self.tab().focused) |surface| self.setKeyboardFocus(focusTarget(surface), false);
             return 0;
         },
@@ -3221,13 +3239,21 @@ pub fn keyboardFocus() ?win32.HWND {
     return win32.GetFocus();
 }
 
-/// SetFocus(`hwnd`), a window of this frame; with `active_only`, only
-/// while the frame is the active window, as another would be activated by
-/// it.
+/// SetFocus(`hwnd`), a window of this frame or of its command palette;
+/// with `active_only`, only while the frame or its palette is the active
+/// window, as another would be activated by it.
 pub fn setKeyboardFocus(self: *const Window, hwnd: win32.HWND, active_only: bool) void {
     if (builtin.is_test) if (test_set_focus) |seen| return seen(hwnd);
-    if (active_only and win32.GetActiveWindow() != self.hwnd) return;
+    if (active_only and !self.holdsActivation()) return;
     _ = win32.SetFocus(hwnd);
+}
+
+/// Whether the frame or its command palette, a pop-up of its own, is the
+/// active window.
+fn holdsActivation(self: *const Window) bool {
+    const active = win32.GetActiveWindow() orelse return false;
+    if (active == self.hwnd) return true;
+    return self.palette.hwnd != null and active == self.palette.hwnd.?;
 }
 
 /// The focus move `start_search` or `end_search` asked for

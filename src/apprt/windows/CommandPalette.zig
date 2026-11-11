@@ -486,10 +486,14 @@ fn writeKey(w: *std.Io.Writer, key: input.Key) std.Io.Writer.Error!void {
 
 // The palette on screen.
 //
-// A child window of the frame, as the search bars are (SearchBar.zig), at
-// the top centre of the area under the tab bar, above the terminals: GDI in
-// a child of a terminal's window would never be composed over its
-// flip-model swap chain, while a sibling above it draws. An EDIT takes the
+// A pop-up window the frame owns, over the top centre of the area under
+// the tab bar, as macOS floats its palette over the terminals with rounded
+// corners, a border and a shadow: Windows 11 gives a top-level window
+// those (DWMWA_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR), never a
+// child. Being its own window, it takes the activation while it is open;
+// the frame's caption is kept active meanwhile (`Palette.activating`), as
+// a menu keeps its window's, and it follows the frame as it moves
+// (`frameMoved`). An EDIT takes the
 // query and a LISTBOX, owner-drawn, shows the entries, two lines each (the
 // title, then the action key or the description) with the shortcut on the
 // right, as GTK's rows show them (command-palette.blp). The LISTBOX keeps
@@ -500,7 +504,7 @@ fn writeKey(w: *std.Io.Writer, key: input.Key) std.Io.Writer.Error!void {
 //
 // One per window (`Window.palette`), for the terminal with the focus in
 // its shown tab (`focusMoved`), which gets the focus back when it closes.
-// It closes on Escape, when it runs an entry, when its frame is
+// It closes on Escape, when it runs an entry, when it or its frame is
 // deactivated, when the layout leaves no room for it, and with its window
 // or its terminal; it is made anew each time it opens, with the entries
 // as they are then. An entry runs after the palette has closed, as GTK
@@ -515,7 +519,6 @@ const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const TabOverview = @import("TabOverview.zig");
 const ScrollBar = @import("ScrollBar.zig");
-const Transparency = @import("Transparency.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -532,22 +535,29 @@ const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttyCommandPaletteClass";
 
-/// Posted to the palette's window when its frame is deactivated
+/// Posted to the palette's window when it or its frame is deactivated
 /// (`deactivated`).
 pub const WM_PALETTE_CLOSE: win32.UINT = win32.WM_USER + 1;
+/// Posted to the palette's window when its frame takes the keyboard focus
+/// while it is open (`activateLater`).
+pub const WM_PALETTE_ACTIVATE: win32.UINT = win32.WM_USER + 2;
 
 /// A window's palette (`Window.palette`): its windows while it is open,
 /// none while it is closed.
 pub const Palette = struct {
-    /// The palette's window, a child of the frame; null while closed.
+    /// The palette's window, a pop-up the frame owns; null while closed.
     hwnd: ?win32.HWND = null,
     /// The query, an EDIT child of `hwnd`.
     edit: ?win32.HWND = null,
     /// The entries, an owner-drawn LISTBOX child of `hwnd`.
     list: ?win32.HWND = null,
-    /// From `open` until `close` starts: the keyboard focus the window
-    /// gives goes to the field (`focusTarget`).
+    /// From `open` until `close` starts, or it is deactivated: the
+    /// keyboard focus the window gives goes to the field (`focusTarget`).
     open: bool = false,
+    /// While the palette is being activated (`activate`): the frame's
+    /// caption stays active (`Window`'s WM_NCACTIVATE), as the palette is
+    /// part of it.
+    activating: bool = false,
     /// The terminal entries run on, live while open: the one it was
     /// opened for, then the one with the focus in the shown tab
     /// (`focusMoved`).
@@ -585,11 +595,11 @@ pub const Palette = struct {
     brush_color: win32.COLORREF = 0,
 
     /// Where the keyboard focus the window gives goes: the field while
-    /// the palette is open and shows; else null.
+    /// the palette is open; else null. Hidden with its hidden frame, it
+    /// still holds the frame's focus, which it gets when that shows.
     pub fn focusTarget(self: *const Palette) ?win32.HWND {
         if (!self.open) return null;
-        const hwnd = self.hwnd orelse return null;
-        if (!SearchBar.visibleStyle(hwnd)) return null;
+        if (self.hwnd == null) return null;
         return self.edit;
     }
 
@@ -630,12 +640,8 @@ pub const Palette = struct {
 
     /// Free everything, as its window is destroyed.
     fn free(self: *Palette, alloc: Allocator) void {
-        // The palette is a child, so the tooltip's owner is its top-level
-        // ancestor, the frame (an owned window's owner cannot be a child),
-        // which would keep it until the frame goes: it is destroyed here.
-        // When the frame itself is being destroyed, DestroyWindow may have
-        // destroyed its owned windows, the tooltip among them, before its
-        // children, the palette among them: hence IsWindow.
+        // The tooltip is the palette's own, which DestroyWindow destroys
+        // before the palette (its owned windows first): hence IsWindow.
         if (self.tip) |t| if (win32.IsWindow(t).toBool()) {
             _ = win32.DestroyWindow(t);
         };
@@ -704,7 +710,7 @@ pub fn open(surface: *Surface) bool {
         0,
         L(class_name),
         null,
-        win32.WS_CHILD | win32.WS_CLIPSIBLINGS | win32.WS_CLIPCHILDREN,
+        win32.WS_POPUP | win32.WS_CLIPCHILDREN,
         0,
         0,
         0,
@@ -727,9 +733,7 @@ pub fn open(surface: *Surface) bool {
     // counting those in hidden tabs.
     p.hwnd = hwnd;
     p.entries = entries;
-    // Layered in a transparent window, as made, and with it its field and
-    // list, drawn into its surface.
-    Transparency.chrome(window, hwnd);
+    applyFrame(window);
     p.surface = window.tab().focused orelse surface;
     const edit = win32.CreateWindowExW(
         0,
@@ -776,8 +780,40 @@ pub fn open(surface: *Surface) bool {
     refill(window, "");
     p.open = true;
     if (!place(window)) return false;
-    window.setKeyboardFocus(edit, true);
+    activate(window);
     return true;
+}
+
+/// The palette's frame in Windows 11's look: rounded corners, which bring
+/// DWM's shadow, and a border of `SearchBar.Colors`'. A Windows that
+/// refuses either keeps a square frame.
+fn applyFrame(window: *Window) void {
+    const hwnd = window.palette.hwnd orelse return;
+    const round: win32.DWORD = win32.DWMWCP_ROUND;
+    const hr = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_WINDOW_CORNER_PREFERENCE, &round, @sizeOf(win32.DWORD));
+    if (hr < 0) log.info("cannot round the command palette's corners hr=0x{x}", .{@as(u32, @bitCast(hr))});
+    const border: win32.COLORREF = SearchBar.Colors.of(window.dark_frame).border;
+    _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_BORDER_COLOR, &border, @sizeOf(win32.COLORREF));
+}
+
+/// Give the open palette's field the keyboard focus, which activates the
+/// palette, while the frame or the palette is the active window: the
+/// frame's caption stays active through it (`Palette.activating`).
+fn activate(window: *Window) void {
+    const p = &window.palette;
+    const edit = p.edit orelse return;
+    p.activating = true;
+    defer p.activating = false;
+    window.setKeyboardFocus(edit, true);
+}
+
+/// The frame took the keyboard focus (its WM_SETFOCUS) while its palette
+/// is open, as when it is activated with a palette opened while it was
+/// not: the palette is activated once the frame's activation is over, by
+/// a message to itself, rather than inside it.
+pub fn activateLater(window: *Window) void {
+    const hwnd = window.palette.hwnd orelse return;
+    _ = win32.PostMessageW(hwnd, WM_PALETTE_ACTIVATE, 0, 0);
 }
 
 /// Whether `makeTip` has said once that there is no tooltip.
@@ -928,15 +964,23 @@ pub fn closedByKey(app: *App, lparam: win32.LPARAM) void {
     }
 }
 
-/// `window` was deactivated (its WM_ACTIVATE): its palette closes, as GTK's
-/// dialog does, once the deactivation is over, by a message to itself:
+/// `window` was deactivated (its WM_ACTIVATE), for `to`: its palette
+/// closes, as GTK's dialog does, unless `to` is the palette itself, once
+/// the deactivation is over, by a message to itself:
 /// inside WM_ACTIVATE the focus is still in the field, and destroying it
 /// there would hand the focus to the frame, and from there to a terminal,
 /// in a window that is losing it, perhaps to a confirmation prompt whose
 /// core frame is on the stack.
-pub fn deactivated(window: *Window) void {
+pub fn deactivated(window: *Window, to: ?win32.HWND) void {
     const hwnd = window.palette.hwnd orelse return;
+    if (to == hwnd) return;
     _ = win32.PostMessageW(hwnd, WM_PALETTE_CLOSE, 0, 0);
+}
+
+/// `window` moved (its WM_MOVE): its open palette moves with it.
+pub fn frameMoved(window: *Window) void {
+    if (window.palette.hwnd == null or !window.palette.open) return;
+    _ = place(window);
 }
 
 /// `surface` is beginning to close, or is freed: the palette open for it
@@ -1056,9 +1100,11 @@ pub fn fontChanged(window: *Window) void {
 }
 
 /// Place `window`'s open palette at the top centre of the area under the
-/// tab bar (`area`), above the terminals and their search bars; whether it
-/// shows. One that no longer fits there (`paletteRect`) closes. Called by
-/// every layout (`Window.relayout`), which never runs inside a core frame.
+/// tab bar (`area`), over the terminals and their search bars; whether it
+/// is open there. It shows while its frame does: a hidden owner does not
+/// hide what it owns. One that no longer fits there (`paletteRect`)
+/// closes. Called by every layout (`Window.relayout`), which never runs
+/// inside a core frame, and as the frame moves (`frameMoved`).
 pub fn place(window: *Window) bool {
     const p = &window.palette;
     const hwnd = p.hwnd orelse return false;
@@ -1074,7 +1120,14 @@ pub fn place(window: *Window) bool {
     };
     const width = at.right - at.left;
     const height = at.bottom - at.top;
-    _ = win32.SetWindowPos(hwnd, win32.HWND_TOP, at.left, at.top, width, height, win32.SWP_NOACTIVATE | win32.SWP_SHOWWINDOW);
+    // In the screen's coordinates, a pop-up's.
+    var origin: win32.POINT = .{ .x = at.left, .y = at.top };
+    _ = win32.ClientToScreen(window.hwnd, &origin);
+    const show: win32.UINT = if (win32.IsWindowVisible(window.hwnd).toBool() and !win32.IsIconic(window.hwnd).toBool())
+        win32.SWP_SHOWWINDOW
+    else
+        win32.SWP_HIDEWINDOW;
+    _ = win32.SetWindowPos(hwnd, null, origin.x, origin.y, width, height, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | show);
     const l = Layout.init(m, width, height, p.text_height);
     if (p.edit) |edit| _ = win32.SetWindowPos(edit, null, l.edit.left, l.edit.top, l.edit.right - l.edit.left, l.edit.bottom - l.edit.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
     if (p.list) |list| _ = win32.SetWindowPos(list, null, l.list.left, l.list.top, l.list.right - l.list.left, l.list.bottom - l.list.top, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE);
@@ -1330,9 +1383,33 @@ pub fn wndProc(
             return win32.SendMessageW(list, msg, wparam, lparam);
         },
 
+        // Deactivated, for the window lParam names, or none: it closes
+        // once the deactivation is over (WM_PALETTE_CLOSE), and the
+        // keyboard focus the frame gives goes to its terminal from now
+        // (`focusTarget`), as a click on the frame activates it. To
+        // another window, the frame's caption, kept active while the
+        // palette was (`activating`), is drawn inactive, and a quick
+        // terminal may hide, as its frame would on losing the activation.
+        win32.WM_ACTIVATE => if (@as(u16, @truncate(wparam)) == win32.WA_INACTIVE) {
+            const to: ?win32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
+            p.open = false;
+            if (to != window.hwnd) {
+                _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 0, 0);
+                if (window.quick) window.quickDeactivated(to);
+            }
+            _ = win32.PostMessageW(hwnd, WM_PALETTE_CLOSE, 0, 0);
+        },
+
         WM_PALETTE_CLOSE => {
-            // Unless the frame was activated again meanwhile.
-            if (win32.GetActiveWindow() != window.hwnd) close(window);
+            // Deactivated itself; or its frame was, unless the frame or
+            // the palette was activated meanwhile.
+            const active = win32.GetActiveWindow();
+            if (!p.open or (active != window.hwnd and active != hwnd)) close(window);
+            return 0;
+        },
+
+        WM_PALETTE_ACTIVATE => {
+            if (p.open) activate(window);
             return 0;
         },
 
