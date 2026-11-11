@@ -64,9 +64,11 @@ pub fn mismatches(comptime c: type, comptime entries: []const Entry) []const u8 
 }
 
 /// An entry for every public declaration of `M` that the headers could
-/// declare: each interface (a struct with a `VTable`) and each other extern
-/// struct, under its own name, less the names in `skip`. Listing a module
-/// this way means a declaration added to it later is checked too.
+/// declare: each interface (a struct with a `VTable`, extern or not, so
+/// that one declared without `extern` is reported rather than skipped) and
+/// each other extern struct, under its own name, less the names in `skip`.
+/// Listing a module this way means a declaration added to it later is
+/// checked too. Private declarations are not seen.
 pub fn entriesOf(comptime M: type, comptime skip: []const []const u8) []const Entry {
     @setEvalBranchQuota(200_000);
     comptime var out: []const Entry = &.{};
@@ -75,7 +77,7 @@ pub fn entriesOf(comptime M: type, comptime skip: []const []const u8) []const En
         if (@TypeOf(@field(M, name)) != type) continue;
         const T = @field(M, name);
         if (@typeInfo(T) != .@"struct") continue;
-        if (@typeInfo(T).@"struct".layout != .@"extern") continue;
+        if (@typeInfo(T).@"struct".layout != .@"extern" and !@hasDecl(T, "VTable")) continue;
         out = out ++ [_]Entry{.{ .zig = T, .c = name }};
     }
     return out;
@@ -108,6 +110,12 @@ fn checkVTable(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
     const zs = flatten(Z.VTable);
     const cs = flatten(@field(c, vtbl_name));
     comptime var out: []const u8 = "";
+    // Without extern layout, Zig may reorder the fields, and the vtable
+    // pointer need not come first nor the slots in their written order.
+    if (@typeInfo(Z).@"struct".layout != .@"extern")
+        out = out ++ lineFor(Z, c_name, "the interface is not extern");
+    if (@typeInfo(Z.VTable).@"struct".layout != .@"extern")
+        out = out ++ lineFor(Z, c_name, "the vtable is not extern");
     if (zs.len != cs.len) out = out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
         "{d} slots, the header has {d}",
         .{ zs.len, cs.len },
@@ -627,6 +635,47 @@ test "com abi: what the headers' habits allow stays narrow" {
     // An anonymous union is compared by place and size.
     const WideView = extern struct { Kind: u32, u: extern union { a: u64, b: f32 } };
     try expectCaught(&.{.{ .zig = WideView, .c = "VIEW" }}, "field u at 8 size 8, the header's at 4 size 4");
+}
+
+/// A faithful IThing but for the layout of the interface or its vtable.
+fn LooseThing(comptime extern_interface: bool) type {
+    const S = *const anyopaque;
+    const V = struct {
+        QueryInterface: S,
+        AddRef: S,
+        Release: S,
+        Create: S,
+        GetCount: S,
+        SetMode: S,
+        Fill: S,
+        Draw: S,
+        GetText: S,
+    };
+    return if (extern_interface)
+        extern struct {
+            vtable: *const V,
+            pub const VTable = V;
+        }
+    else
+        struct {
+            vtable: *const ZigThing(.faithful).VTable,
+            pub const VTable = ZigThing(.faithful).VTable;
+        };
+}
+
+test "com abi: an interface or vtable without extern layout is caught" {
+    try expectCaught(&.{.{ .zig = LooseThing(true), .c = "IThing" }}, "the vtable is not extern");
+    try expectCaught(&.{.{ .zig = LooseThing(false), .c = "IThing" }}, "the interface is not extern");
+
+    // Listing a module finds them; a plain struct with no vtable is left out.
+    const listed = comptime entriesOf(struct {
+        pub const IThing = LooseThing(false);
+        pub const Helper = struct { x: u32 };
+        pub const THING_DESC = zig_side.THING_DESC;
+    }, &.{});
+    try std.testing.expectEqual(2, listed.len);
+    try std.testing.expectEqualStrings("IThing", listed[0].c);
+    try std.testing.expectEqualStrings("THING_DESC", listed[1].c);
 }
 
 test "com abi: each seeded struct defect is caught" {
