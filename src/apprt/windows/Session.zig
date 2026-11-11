@@ -486,7 +486,7 @@ pub const Store = struct {
     }
 
     /// The store of this process's kind, its directory made if there
-    /// was none.
+    /// was none. None where the state directory is not an absolute path.
     pub fn open(alloc: Allocator, class: ?[]const u8, elevated: bool) !Store {
         const io = global.io();
         var key_buf: KeyBuf = undefined;
@@ -497,6 +497,10 @@ pub const Store = struct {
         defer environ_map.deinit();
         const path = try internal_os.xdg.state(io, alloc, &environ_map, .{ .subdir = subdir });
         defer alloc.free(path);
+        // A relative XDG_STATE_HOME names no one directory: another
+        // after every change of directory. Nothing is made under it, as
+        // for the crash reports (src/crash/windows.zig).
+        if (!std.fs.path.isAbsolute(path)) return error.StateDirNotAbsolute;
         return .{ .dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{ .open_options = .{ .iterate = true } }) };
     }
 
