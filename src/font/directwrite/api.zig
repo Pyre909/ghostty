@@ -17,11 +17,11 @@
 //!
 //! The tests here pin slot counts, the typed slots' indices and struct
 //! sizes on any host, which catches a dropped slot but not two swapped.
-//! The Windows test build also compares every vtable and struct with
+//! A MinGW Windows test build also compares every vtable and struct with
 //! translate-c's reading of the headers, slot by slot and field by field
-//! (src/apprt/windows/com_abi_test.zig), so a shuffled slot or a wrong
-//! signature fails to compile instead of calling the wrong function in a
-//! Windows run. No extern function lives here so that the host tests link
+//! (the last test here, and src/os/com_abi.zig), so a shuffled slot or a
+//! wrong signature fails to compile instead of calling the wrong function
+//! in a Windows run. No extern function lives here so that the host tests link
 //! everywhere; directwrite/main.zig declares DWriteCreateFactory.
 //!
 //! This mirrors src/renderer/d3d11/api.zig; the handful of helpers below
@@ -2521,4 +2521,10 @@ test "directwrite api: rasterization iids" {
         &.{ 0x81, 0xe3, 0x6a, 0x88, 0x3b, 0xde, 0xd1, 0x18 },
         &IID_IDWriteGlyphRunAnalysis.Data4,
     );
+}
+
+test "directwrite api: declarations match the Windows headers" {
+    if (comptime !builtin.target.isMinGW()) return error.SkipZigTest;
+    const com_abi = @import("../../os/com_abi.zig");
+    com_abi.expectMatch(com_abi.entriesOf(@This(), &.{}));
 }

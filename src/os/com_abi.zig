@@ -37,7 +37,16 @@
 //!
 //! `mismatches` only reads types, so it runs for any target; the self tests
 //! below check it on hand-made "C" declarations. Against the real headers it
-//! must run for a Windows target, since a C `long` is 64 bits elsewhere.
+//! must run for a Windows target, since a C `long` is 64 bits elsewhere:
+//! `expectMatch` runs it from tests that a MinGW Windows test build
+//! compiles, and a mismatch fails that build. A test filter that leaves
+//! those tests out skips the check; to run only it:
+//!
+//!     zig build test -Dtarget=x86_64-windows-gnu -Dapp-runtime=windows \
+//!       -Demit-test-exe=true -Dtest-filter="the Windows headers"
+//!
+//! On a host other than Windows the build then stops at running the tests,
+//! once they have compiled.
 const std = @import("std");
 
 /// A Zig declaration and the name of its C counterpart: for an interface,
@@ -63,6 +72,17 @@ pub fn mismatches(comptime c: type, comptime entries: []const Entry) []const u8 
     return out;
 }
 
+/// Fails compilation, naming each mismatch, if `entries` differ from the
+/// translated headers. Only a MinGW Windows test build has the headers, as
+/// the `windows-com-h` module, so a test calls this after skipping other
+/// targets.
+pub fn expectMatch(comptime entries: []const Entry) void {
+    comptime {
+        const found = mismatches(@import("windows-com-h"), entries);
+        if (found.len != 0) @compileError("COM declarations differ from the headers:\n" ++ found);
+    }
+}
+
 /// An entry for every public declaration of `M` that the headers could
 /// declare: each interface (a struct with a `VTable`, extern or not, so
 /// that one declared without `extern` is reported rather than skipped) and
@@ -80,6 +100,9 @@ pub fn entriesOf(comptime M: type, comptime skip: []const []const u8) []const En
         if (@typeInfo(T).@"struct".layout != .@"extern" and !@hasDecl(T, "VTable")) continue;
         out = out ++ [_]Entry{.{ .zig = T, .c = name }};
     }
+    // A module listed by mistake, or whose declarations went private,
+    // would otherwise be checked by nobody.
+    if (out.len == 0) @compileError(@typeName(M) ++ " has no public interface or extern struct to check");
     return out;
 }
 

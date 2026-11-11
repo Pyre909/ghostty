@@ -12,11 +12,11 @@
 //!
 //! The tests here pin slot counts, some typed slots' indices and struct
 //! layouts on any host, which catches a dropped slot but not two swapped.
-//! The Windows test build also compares every vtable and struct with
+//! A MinGW Windows test build also compares every vtable and struct with
 //! translate-c's reading of the headers, slot by slot and field by field
-//! (src/apprt/windows/com_abi_test.zig), so a shuffled slot or a wrong
-//! signature fails to compile instead of calling the wrong function in a
-//! Windows run; dcomp.h's interfaces, declared for C++ only, are not
+//! (the last test here, and src/os/com_abi.zig), so a shuffled slot or a
+//! wrong signature fails to compile instead of calling the wrong function
+//! in a Windows run; dcomp.h's interfaces, declared for C++ only, are not
 //! compared. No extern function lives here so that the host tests link
 //! everywhere; D3D11.zig declares D3D11CreateDevice and loads D3DCompile
 //! and DCompositionCreateDevice at runtime.
@@ -1398,4 +1398,17 @@ test "d3d11 api: iids and hresults" {
     try testing.expect(succeeded(S_OK));
     try testing.expect(succeeded(S_FALSE));
     try testing.expect(succeeded(DXGI_STATUS_OCCLUDED));
+}
+
+test "d3d11 api: declarations match the Windows headers" {
+    if (comptime !builtin.target.isMinGW()) return error.SkipZigTest;
+    const com_abi = @import("../../os/com_abi.zig");
+    com_abi.expectMatch(com_abi.entriesOf(@This(), &.{
+        // d3dcommon.h names the interface ID3D10Blob; ID3DBlob is its
+        // typedef.
+        "ID3DBlob",
+        "IDCompositionDevice",
+        "IDCompositionTarget",
+        "IDCompositionVisual",
+    }) ++ &[_]com_abi.Entry{.{ .zig = ID3DBlob, .c = "ID3D10Blob" }});
 }
