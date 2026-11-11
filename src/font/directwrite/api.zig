@@ -2222,7 +2222,7 @@ pub const DWRITE_COLOR_F = extern struct {
 /// palette index is 0xFFFF where the layer takes the text's color.
 pub const DWRITE_COLOR_GLYPH_RUN = extern struct {
     glyphRun: DWRITE_GLYPH_RUN,
-    glyphRunDescription: ?*const anyopaque,
+    glyphRunDescription: ?*anyopaque,
     baselineOriginX: FLOAT,
     baselineOriginY: FLOAT,
     runColor: DWRITE_COLOR_F,

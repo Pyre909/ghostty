@@ -25,8 +25,10 @@
 //! implementation names its own type there. An untyped slot is checked by
 //! name and index only.
 //!
-//! For a struct the check requires the same size and alignment and the same
-//! field names at the same offsets.
+//! For a struct the check requires the same size and alignment, and the
+//! same fields in order: the same names, offsets and sizes, and types of the
+//! same shape. Where the header has an anonymous union, each member the Zig
+//! side declares in its place must be one of the union's.
 //!
 //! What it cannot see: two parameters of the same shape swapped, enum
 //! values (translate-c keeps no enum types), interface ids, and mistakes in
@@ -212,9 +214,8 @@ fn checkStruct(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
     inline for (0..@min(zi.field_names.len, ci.field_names.len)) |i| {
         const zn = zi.field_names[i];
         const cn = ci.field_names[i];
-        // translate-c names an anonymous union `unnamed_N`; the Zig side
-        // must name it, so only its place is compared.
-        if (!std.mem.eql(u8, zn, cn) and !std.mem.startsWith(u8, cn, "unnamed_")) {
+        const anonymous = std.mem.startsWith(u8, cn, "unnamed_");
+        if (!std.mem.eql(u8, zn, cn) and !anonymous) {
             out = out ++ lineFor(Z, c_name, "field " ++ zn ++ " stands where the header has " ++ cn);
         } else if (@offsetOf(Z, zn) != @offsetOf(C, cn) or
             @sizeOf(@FieldType(Z, zn)) != @sizeOf(@FieldType(C, cn)))
@@ -223,6 +224,62 @@ fn checkStruct(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
                 "field {s} at {d} size {d}, the header's at {d} size {d}",
                 .{ zn, @offsetOf(Z, zn), @sizeOf(@FieldType(Z, zn)), @offsetOf(C, cn), @sizeOf(@FieldType(C, cn)) },
             ));
+        } else if (anonymous) {
+            out = out ++ checkAnonymous(c, Z, c_name, zn, @FieldType(Z, zn), @FieldType(C, cn));
+        } else {
+            out = out ++ checkFieldType(c, Z, c_name, zn, @FieldType(Z, zn), @FieldType(C, cn));
+        }
+    }
+    return out;
+}
+
+fn checkFieldType(
+    comptime c: type,
+    comptime Z: type,
+    comptime c_name: []const u8,
+    comptime field: []const u8,
+    comptime ZT: type,
+    comptime CT: type,
+) []const u8 {
+    const zs = shape(c, ZT);
+    const cs = shape(c, CT);
+    if (fieldShapesMatch(zs, cs)) return "";
+    return lineFor(Z, c_name, "field " ++ field ++ " is " ++ zs ++ ", the header's is " ++ cs);
+}
+
+/// A field that stands on one of the header's anonymous unions, which
+/// translate-c names `unnamed_N`. The Zig side either names the union and
+/// declares some of its members (D3D11_RENDER_TARGET_VIEW_DESC's `u`), or
+/// declares one member in its place (D3D11_BUFFER_SRV's FirstElement).
+/// Either way each member it declares must be one of the union's, of the
+/// same type. A member whose name starts with `_` only pads the union to
+/// the header's size, which the caller has compared.
+fn checkAnonymous(
+    comptime c: type,
+    comptime Z: type,
+    comptime c_name: []const u8,
+    comptime field: []const u8,
+    comptime ZT: type,
+    comptime CT: type,
+) []const u8 {
+    if (@typeInfo(CT) != .@"union") return lineFor(Z, c_name, "field " ++ field ++ " stands on an anonymous field that is not a union");
+    const cu = @typeInfo(CT).@"union";
+    const members: []const []const u8 = switch (@typeInfo(ZT)) {
+        .@"union" => |u| u.field_names,
+        else => &.{field},
+    };
+    comptime var out: []const u8 = "";
+    inline for (members) |m| {
+        if (comptime std.mem.startsWith(u8, m, "_")) continue;
+        const MT = if (@typeInfo(ZT) == .@"union") @FieldType(ZT, m) else ZT;
+        const label = if (@typeInfo(ZT) == .@"union") field ++ "." ++ m else field;
+        const found = comptime for (cu.field_names) |n| {
+            if (std.mem.eql(u8, n, m)) break true;
+        } else false;
+        if (!found) {
+            out = out ++ lineFor(Z, c_name, "field " ++ label ++ " is not a member of the header's anonymous union");
+        } else {
+            out = out ++ checkFieldType(c, Z, c_name, label, MT, @FieldType(CT, m));
         }
     }
     return out;
@@ -247,6 +304,18 @@ fn shapesMatch(comptime a: []const u8, comptime b: []const u8, comptime pointee:
         std.mem.indexOfScalar(u8, "eiu", b[0]) != null and
         isNumber(a[1..]) and std.mem.eql(u8, a[1..], b[1..])) return true;
     return false;
+}
+
+/// `shapesMatch` for a field: equal array lengths are peeled first, so
+/// that an array of enums matches an array of integers.
+fn fieldShapesMatch(comptime a: []const u8, comptime b: []const u8) bool {
+    if (a[0] == '[' and b[0] == '[') {
+        const ai = std.mem.indexOfScalar(u8, a, ']').?;
+        const bi = std.mem.indexOfScalar(u8, b, ']').?;
+        if (!std.mem.eql(u8, a[0..ai], b[0..bi])) return false;
+        return fieldShapesMatch(a[ai + 1 ..], b[bi + 1 ..]);
+    }
+    return shapesMatch(a, b, false);
 }
 
 fn isNumber(comptime s: []const u8) bool {
@@ -356,6 +425,12 @@ const FakeHeaders = struct {
         Kind: c_uint,
         unnamed_0: extern union { a: c_uint, b: f32 },
     };
+    pub const struct__RANGE = extern struct {
+        unnamed_0: extern union { First: c_uint, Offset: c_uint },
+        unnamed_1: extern union { Count: c_uint, Width: c_uint },
+        Owner: [*c]IOther,
+    };
+    pub const RANGE = struct__RANGE;
     pub const VIEW = struct__VIEW;
 };
 
@@ -452,6 +527,7 @@ const zig_side = struct {
     const THING_DESC = extern struct { Width: u32, Height: u32, Flags: u8 };
     const LABEL = extern struct { r: f32, g: f32 };
     const VIEW = extern struct { Kind: u32, u: extern union { a: u32, b: f32 } };
+    const RANGE = extern struct { First: u32, Count: u32, Owner: ?*IOther };
     const IOther = opaque {};
     const IWrong = opaque {};
 };
@@ -477,6 +553,7 @@ test "com abi: a faithful vtable and struct have no mismatches" {
         .{ .zig = ZigThing(.faithful), .c = "IThing" },
         .{ .zig = zig_side.THING_DESC, .c = "THING_DESC" },
         .{ .zig = zig_side.VIEW, .c = "VIEW" },
+        .{ .zig = zig_side.RANGE, .c = "RANGE" },
     });
 }
 
@@ -514,5 +591,17 @@ test "com abi: each seeded struct defect is caught" {
     try expectCaught(&.{.{ .zig = Wider, .c = "THING_DESC" }}, "field Height at 8 size 8, the header's at 4 size 4");
     try expectCaught(&.{.{ .zig = Shorter, .c = "THING_DESC" }}, "2 fields, the header has 3");
     const NoHeight = extern struct { Width: u32, Flags: u8 };
+    // Field types, not only sizes.
+    const FloatWidth = extern struct { Width: f32, Height: u32, Flags: u8 };
+    try expectCaught(&.{.{ .zig = FloatWidth, .c = "THING_DESC" }}, "field Width is f32, the header's is u32");
+    const WrongOwner = extern struct { First: u32, Count: u32, Owner: ?*zig_side.IWrong };
+    try expectCaught(&.{.{ .zig = WrongOwner, .c = "RANGE" }}, "field Owner is *IWrong, the header's is *IOther");
+    // A member standing on an anonymous union must be one of its own.
+    const Swapped = extern struct { Count: u32, First: u32, Owner: ?*zig_side.IOther };
+    try expectCaught(&.{.{ .zig = Swapped, .c = "RANGE" }}, "field Count is not a member of the header's anonymous union");
+    const WrongMember = extern struct { Kind: u32, u: extern union { a: u32, c: f32 } };
+    try expectCaught(&.{.{ .zig = WrongMember, .c = "VIEW" }}, "field u.c is not a member of the header's anonymous union");
+    const WrongMemberType = extern struct { Kind: u32, u: extern union { a: f32, b: f32 } };
+    try expectCaught(&.{.{ .zig = WrongMemberType, .c = "VIEW" }}, "field u.a is f32, the header's is u32");
     try expectCaught(&.{.{ .zig = NoHeight, .c = "THING_DESC" }}, "field Flags stands where the header has Height");
 }
