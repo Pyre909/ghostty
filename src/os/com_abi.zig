@@ -691,14 +691,16 @@ test "com abi: an interface or vtable without extern layout is caught" {
     try expectCaught(&.{.{ .zig = LooseThing(false), .c = "IThing" }}, "the interface is not extern");
 
     // Listing a module finds them; a plain struct with no vtable is left out.
-    const listed = comptime entriesOf(struct {
-        pub const IThing = LooseThing(false);
-        pub const Helper = struct { x: u32 };
-        pub const THING_DESC = zig_side.THING_DESC;
-    }, &.{});
-    try std.testing.expectEqual(2, listed.len);
-    try std.testing.expectEqualStrings("IThing", listed[0].c);
-    try std.testing.expectEqualStrings("THING_DESC", listed[1].c);
+    const names = comptime names: {
+        var out: []const u8 = "";
+        for (entriesOf(struct {
+            pub const IThing = LooseThing(false);
+            pub const Helper = struct { x: u32 };
+            pub const THING_DESC = zig_side.THING_DESC;
+        }, &.{})) |e| out = out ++ e.c ++ " ";
+        break :names out;
+    };
+    try std.testing.expectEqualStrings("IThing THING_DESC ", names);
 }
 
 test "com abi: each seeded struct defect is caught" {
