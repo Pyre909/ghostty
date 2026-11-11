@@ -14,16 +14,17 @@
 //! side types must also take the same parameters and return the same type,
 //! compared by shape:
 //!
-//!   - integers and enums by width and signedness (translate-c makes every
-//!     C enum a plain integer),
-//!   - pointers by constness and by what they point at, named structs and
-//!     interfaces by name, so a pointer to the wrong interface or struct
-//!     fails; a `void` pointer on either side matches any pointer,
+//!   - integers by width and signedness, and an enum by width only
+//!     (translate-c makes every C enum a plain integer, signed or not),
+//!   - pointers by depth, constness and what they point at, named structs
+//!     and interfaces by name, so a pointer to the wrong interface or
+//!     struct fails; a `void` pointer on either side matches a pointer to
+//!     anything but another pointer,
 //!   - structs passed by value by name.
 //!
-//! The first parameter, the object itself, need only be a pointer: an
-//! implementation names its own type there. An untyped slot is checked by
-//! name and index only.
+//! The first parameter, the object itself, must be a single pointer, to any
+//! type: an implementation names its own type there. An untyped slot is
+//! checked by name and index only.
 //!
 //! For a struct the check requires the same size and alignment, and the
 //! same fields in order: the same names, offsets and sizes, and types of the
@@ -117,7 +118,7 @@ fn checkVTable(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
     inline for (0..@min(zs.len, cs.len)) |i| {
         const z = zs[i];
         const h = cs[i];
-        if (!sameSlotName(z.name, h.name)) {
+        if (!sameSlotName(c, z.name, h.name)) {
             out = out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
                 "slot {d} is {s}, the header's is {s}",
                 .{ i, z.name, h.name },
@@ -134,12 +135,26 @@ fn checkVTable(comptime c: type, comptime Z: type, comptime c_name: []const u8) 
 /// interface (`IDWriteFactory1_CreateCustomRenderingParams`), and a method
 /// that shares a Win32 function's name gets windows.h's ANSI rename
 /// (`GetMessage` is `GetMessageA`), as the translation leaves UNICODE
-/// undefined.
-fn sameSlotName(comptime z: []const u8, comptime h: []const u8) bool {
+/// undefined. The prefix must name an interface the headers declare.
+fn sameSlotName(comptime c: type, comptime z: []const u8, comptime h: []const u8) bool {
     if (std.mem.eql(u8, z, h)) return true;
     if (h.len == z.len + 1 and std.mem.startsWith(u8, h, z) and h[z.len] == 'A') return true;
-    if (h[0] == 'I') if (std.mem.indexOfScalar(u8, h, '_')) |i| return std.mem.eql(u8, h[i + 1 ..], z);
+    if (h[0] == 'I') if (std.mem.indexOfScalar(u8, h, '_')) |i| {
+        return std.mem.eql(u8, h[i + 1 ..], z) and @hasDecl(c, h[0..i] ++ "Vtbl");
+    };
     return false;
+}
+
+/// Whether a shape is exactly one pointer, to anything that is not itself
+/// a pointer.
+fn onePointer(comptime s: []const u8) bool {
+    const rest = if (std.mem.startsWith(u8, s, "*const "))
+        s["*const ".len..]
+    else if (s[0] == '*')
+        s[1..]
+    else
+        return false;
+    return rest.len == 0 or rest[0] != '*';
 }
 
 /// The function type behind a slot: `*const fn` on the Zig side,
@@ -177,8 +192,10 @@ fn checkSlot(
     inline for (zf.param_types, cf.param_types, 0..) |zp, cp, i| {
         const zs = shape(c, zp.?);
         const cs = shape(c, cp.?);
+        // The object itself: an implementation names its own type, so
+        // only the single pointer is compared.
         const same = if (i == 0)
-            zs[0] == '*' and cs[0] == '*'
+            onePointer(zs) and onePointer(cs)
         else
             shapesMatch(zs, cs, false);
         if (!same) out = out ++ lineFor(Z, c_name, std.fmt.comptimePrint(
@@ -287,8 +304,8 @@ fn checkAnonymous(
 
 /// Whether two shapes match: equal, except that an enum (`e32`) matches an
 /// integer of its width (translate-c has no enum types, and makes some
-/// unsigned), and that past a pointer, `void` matches anything. Pointer
-/// levels must agree in number and constness.
+/// unsigned), and that past a pointer, `void` matches anything but another
+/// pointer. Pointer levels must agree in number and constness.
 fn shapesMatch(comptime a: []const u8, comptime b: []const u8, comptime pointee: bool) bool {
     if (std.mem.eql(u8, a, b)) return true;
     if (a[0] == '*' and b[0] == '*') {
@@ -298,7 +315,8 @@ fn shapesMatch(comptime a: []const u8, comptime b: []const u8, comptime pointee:
         const n = if (ac) "*const ".len else 1;
         return shapesMatch(a[n..], b[n..], true);
     }
-    if (pointee and (std.mem.eql(u8, a, "void") or std.mem.eql(u8, b, "void"))) return true;
+    if (pointee and ((std.mem.eql(u8, a, "void") and b[0] != '*') or
+        (std.mem.eql(u8, b, "void") and a[0] != '*'))) return true;
     if ((a[0] == 'e') != (b[0] == 'e') and
         std.mem.indexOfScalar(u8, "eiu", a[0]) != null and
         std.mem.indexOfScalar(u8, "eiu", b[0]) != null and
@@ -449,6 +467,10 @@ fn ZigThing(comptime variant: enum {
     unicode_name,
     enum_width,
     array_element,
+    overload_name,
+    self_by_value,
+    self_depth,
+    void_depth,
 }) type {
     return extern struct {
         vtable: *const VTable,
@@ -478,6 +500,15 @@ fn ZigThing(comptime variant: enum {
                 Draw: Slot,
                 GetText: Slot,
             },
+            .overload_name => extern struct {
+                base: Base,
+                Create: Slot,
+                GetCount: Slot,
+                SetMode: Slot,
+                Fill: Slot,
+                Paint: Slot,
+                GetText: Slot,
+            },
             .unicode_name => extern struct {
                 base: Base,
                 Create: Slot,
@@ -501,16 +532,21 @@ fn ZigThing(comptime variant: enum {
                     *const fn (*Self, DescPtr) callconv(cc) i32
                 else
                     *const fn (*Self, DescPtr, *?*Out) callconv(cc) i32,
-                GetCount: if (variant == .returns)
-                    *const fn (*Self) callconv(cc) u64
-                else
-                    *const fn (*Self) callconv(cc) u32,
+                GetCount: switch (variant) {
+                    .returns => *const fn (*Self) callconv(cc) u64,
+                    .self_by_value => *const fn (Self) callconv(cc) u32,
+                    .self_depth => *const fn (*?*Self) callconv(cc) u32,
+                    else => *const fn (*Self) callconv(cc) u32,
+                },
                 SetMode: switch (variant) {
                     .param_width => *const fn (*Self, i16, u32) callconv(cc) void,
                     .param_sign => *const fn (*Self, u32, u32) callconv(cc) void,
                     else => *const fn (*Self, Mode, u32) callconv(cc) void,
                 },
-                Fill: *const fn (*Self, *anyopaque, usize) callconv(cc) i32,
+                Fill: if (variant == .void_depth)
+                    *const fn (*Self, *?*anyopaque, usize) callconv(cc) i32
+                else
+                    *const fn (*Self, *anyopaque, usize) callconv(cc) i32,
                 Draw: DrawFn,
                 GetText: TextFn,
             },
@@ -578,6 +614,16 @@ test "com abi: what the headers' habits allow stays narrow" {
     try expectCaught(&.{.{ .zig = ZigThing(.enum_width), .c = "IThing" }}, "Draw: parameter 2 is e16, the header's is u32");
     // A pointer to an array is a pointer to its element, of its type.
     try expectCaught(&.{.{ .zig = ZigThing(.array_element), .c = "IThing" }}, "Draw: parameter 1 is *const f64, the header's is *const f32");
+    // The overload prefix is accepted for the same method name only, and
+    // only when it names an interface the headers declare.
+    try std.testing.expect(comptime sameSlotName(FakeHeaders, "Draw", "IThing_Draw"));
+    try std.testing.expect(comptime !sameSlotName(FakeHeaders, "Draw", "INothing_Draw"));
+    try expectCaught(&.{.{ .zig = ZigThing(.overload_name), .c = "IThing" }}, "slot 7 is Paint, the header's is IThing_Draw");
+    // The object parameter may name any type, but must be one pointer.
+    try expectCaught(&.{.{ .zig = ZigThing(.self_by_value), .c = "IThing" }}, "GetCount: parameter 0 is");
+    try expectCaught(&.{.{ .zig = ZigThing(.self_depth), .c = "IThing" }}, "GetCount: parameter 0 is **");
+    // A void pointer matches a pointer to anything but a pointer.
+    try expectCaught(&.{.{ .zig = ZigThing(.void_depth), .c = "IThing" }}, "Fill: parameter 1 is **void, the header's is *void");
     // An anonymous union is compared by place and size.
     const WideView = extern struct { Kind: u32, u: extern union { a: u64, b: f32 } };
     try expectCaught(&.{.{ .zig = WideView, .c = "VIEW" }}, "field u at 8 size 8, the header's at 4 size 4");
