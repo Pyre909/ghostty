@@ -3233,6 +3233,17 @@ pub var test_set_focus: if (builtin.is_test) ?*const fn (win32.HWND) void else v
 pub var test_get_focus: if (builtin.is_test) ?*const fn () ?win32.HWND else void =
     if (builtin.is_test) null else {};
 
+/// For tests: answers in place of GetActiveWindow (`activeWindow`), as
+/// `test_get_focus` does for GetFocus.
+pub var test_get_active: if (builtin.is_test) ?*const fn () ?win32.HWND else void =
+    if (builtin.is_test) null else {};
+
+/// The active window on this thread, GetActiveWindow's answer.
+pub fn activeWindow() ?win32.HWND {
+    if (builtin.is_test) if (test_get_active) |get| return get();
+    return win32.GetActiveWindow();
+}
+
 /// The window with the keyboard focus on this thread, GetFocus's answer.
 pub fn keyboardFocus() ?win32.HWND {
     if (builtin.is_test) if (test_get_focus) |get| return get();
@@ -3251,7 +3262,7 @@ pub fn setKeyboardFocus(self: *const Window, hwnd: win32.HWND, active_only: bool
 /// Whether the frame or its command palette, a pop-up of its own, is the
 /// active window.
 fn holdsActivation(self: *const Window) bool {
-    const active = win32.GetActiveWindow() orelse return false;
+    const active = activeWindow() orelse return false;
     return active == self.hwnd or active == self.palette.hwnd;
 }
 

@@ -23057,6 +23057,23 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     _ = Window.wndProc(window.hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, @bitCast(@intFromPtr(hwnd)));
     try std.testing.expect(!win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
     try std.testing.expect(p.open);
+    // Nor when the frame, deactivated, or the palette, is the active
+    // window again by the time the deactivation is over.
+    const Active = struct {
+        var answer: ?win32.HWND = null;
+        fn get() ?win32.HWND {
+            return answer;
+        }
+    };
+    Window.test_get_active = &Active.get;
+    defer Window.test_get_active = null;
+    for ([_]win32.HWND{ window.hwnd, hwnd }) |again| {
+        _ = Window.wndProc(window.hwnd, win32.WM_ACTIVATE, win32.WA_INACTIVE, 0);
+        Active.answer = again;
+        try std.testing.expect(win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
+        _ = win32.DispatchMessageW(&msg);
+        try std.testing.expect(p.hwnd == hwnd and p.open);
+    }
     // The palette deactivated, as a click on the frame does: the frame's
     // focus goes to the terminal from then, and it closes once the
     // deactivation is over, though its frame is the active window then.
@@ -23065,9 +23082,11 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     FocusSeen.last = null;
     _ = Window.wndProc(window.hwnd, win32.WM_SETFOCUS, 0, 0);
     try std.testing.expect(FocusSeen.last == a.hwnd);
+    Active.answer = window.hwnd;
     try std.testing.expect(win32.PeekMessageW(&msg, hwnd, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
     _ = win32.DispatchMessageW(&msg);
     try std.testing.expect(p.hwnd == null);
+    Window.test_get_active = null;
     // Escape: closed, the focus back to the terminal; its release withheld
     // from the terminal, which never saw it pressed.
     try togglePalette(&app, a);

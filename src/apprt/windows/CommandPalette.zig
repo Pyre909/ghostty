@@ -1848,7 +1848,7 @@ pub fn wndProc(
         WM_PALETTE_CLOSE => {
             // Deactivated itself; or its frame was, unless the frame or
             // the palette was activated meanwhile.
-            const active = win32.GetActiveWindow();
+            const active = Window.activeWindow();
             if (!p.open or (active != window.hwnd and active != hwnd)) close(window);
             return 0;
         },
