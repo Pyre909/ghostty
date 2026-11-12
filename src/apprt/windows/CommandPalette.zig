@@ -1576,13 +1576,20 @@ fn refill(window: *Window, query: []const u8) bool {
     unhover(window);
     _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 0, 0);
     _ = win32.SendMessageW(list, win32.LB_RESETCONTENT, 0, 0);
+    // An entry that gets no row leaves `shown` as well: its rows and the
+    // list's stay one for one, which the selection kept on a relisting,
+    // the list's size and "No matches" read.
+    var kept: usize = 0;
     for (p.shown.items) |index| {
         const wide = wideFromUtf8(alloc, entries.items[index].title) catch continue;
         defer alloc.free(wide);
         const row = win32.SendMessageW(list, win32.LB_ADDSTRING, 0, @bitCast(@intFromPtr(wide.ptr)));
         if (row < 0) continue;
         _ = win32.SendMessageW(list, win32.LB_SETITEMDATA, @intCast(row), index);
+        p.shown.items[kept] = index;
+        kept += 1;
     }
+    p.shown.shrinkRetainingCapacity(kept);
     if (win32.SendMessageW(list, win32.LB_GETCOUNT, 0, 0) > 0) {
         _ = win32.SendMessageW(list, win32.LB_SETCURSEL, 0, 0);
         // A list with no room for a row, as this one is until `place`
