@@ -10530,6 +10530,49 @@ test "win32: a right click on a tab opens its menu, whose items act on that tab"
     try std.testing.expectEqual(2, window.tabs.items.len);
 }
 
+test "win32: a tab that is closing is not shown in place of the shown one" {
+    // Close Other Tabs from the last tab, the first shown: the first's
+    // teardown takes it out first, and the second, closing as well, is
+    // neither shown nor given the focus; the last is.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const Seen = struct {
+        var closing: ?win32.HWND = null;
+        var given: bool = false;
+        fn seen(hwnd: win32.HWND) void {
+            if (hwnd == closing) given = true;
+        }
+    };
+    Seen.given = false;
+    Window.test_set_focus = &Seen.seen;
+    defer Window.test_set_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = try testTab(&app, window);
+    _ = try testTab(&app, window);
+    window.selectTab(0);
+    window.relayout();
+    const last = window.tabs.items[2];
+    Seen.closing = window.tabs.items[1].focused.?.hwnd;
+
+    try std.testing.expect(window.closeTabs(2, .other));
+    testTeardowns();
+    try std.testing.expect(!Seen.given);
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expect(window.tabs.items[0] == last);
+    try std.testing.expectEqual(0, window.selected);
+}
+
 /// For tests: the label of the tab at `index` of `window`'s bar, in its
 /// client area, as the bar draws it.
 fn testLabel(window: *Window, index: usize) win32.RECT {

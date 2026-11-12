@@ -528,17 +528,36 @@ pub fn relinkTab(self: *Window, t: *Tab, index: usize) void {
 }
 
 /// Take the tab at `index` out of `tabs`, for `removeTab` and `takeTab`,
-/// and return whether it was the one shown, whose place then goes to the
-/// tab after it, or else the one before; the caller shows that one. The
-/// bar's press is cancelled, as its indexes now name other tabs, and so is
-/// a divider's drag in the tab.
+/// and return whether it was the one shown, whose place then goes to
+/// another (`nextShown`); the caller shows that one. The bar's press is
+/// cancelled, as its indexes now name other tabs, and so is a divider's
+/// drag in the tab.
 fn unlinkTab(self: *Window, index: usize) bool {
     assert(self.tabs.items.len > 1);
     Dividers.tabChanged(self, self.tabs.orderedRemove(index));
     const shown = index == self.selected;
-    if (index < self.selected or (shown and index == self.tabs.items.len)) self.selected -= 1;
+    if (shown) {
+        self.selected = nextShown(self.tabs.items, index);
+    } else if (index < self.selected) self.selected -= 1;
     self.bar.tabsChanged(self);
     return shown;
+}
+
+/// The tab to show in place of the shown one, which left `tabs` from
+/// `index`: the nearest not closing whole, the one after it first, then
+/// the one before, as a browser's; else the one after it, or the last.
+/// Several tabs close at once (Close Other Tabs, a tab's menu on another
+/// tab, close glyphs clicked before a teardown), one teardown at a time:
+/// a tab about to go would otherwise be shown and given the focus.
+fn nextShown(tabs: []const *Tab, index: usize) usize {
+    assert(tabs.len > 0);
+    for (index..tabs.len) |i| if (!tabs[i].closingWhole()) return i;
+    var i = @min(index, tabs.len);
+    while (i > 0) {
+        i -= 1;
+        if (!tabs[i].closingWhole()) return i;
+    }
+    return @min(index, tabs.len - 1);
 }
 
 /// `move_tab_to_new_window`: move the tab at `index`, whole, into `to`, a
