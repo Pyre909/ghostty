@@ -27,7 +27,7 @@ const Window = @import("Window.zig");
 const Surface = @import("Surface.zig").Surface;
 const SearchBar = @import("SearchBar.zig");
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
-const utf8FromWide = @import("clipboard.zig").utf8FromWide;
+const editText = @import("clipboard.zig").editText;
 
 const L = win32.L;
 const log = std.log.scoped(.win32);
@@ -157,7 +157,7 @@ pub fn finish(window: *Window, end: End) void {
         if (std.mem.indexOfScalar(*Window.Tab, window.tabs.items, tab) == null) break :commit;
         const surface = tab.focused orelse break :commit;
         const alloc = window.app.core_app.alloc;
-        const text = fieldText(alloc, edit) catch |err| {
+        const text = editText(alloc, edit) catch |err| {
             log.warn("cannot read a tab title field err={}", .{err});
             break :commit;
         };
@@ -165,17 +165,6 @@ pub fn finish(window: *Window, end: End) void {
         _ = window.setTabTitle(surface, text);
     }
     _ = win32.DestroyWindow(edit);
-}
-
-/// The field's text, as UTF-8; the caller frees it.
-fn fieldText(alloc: std.mem.Allocator, edit: win32.HWND) ![:0]u8 {
-    const len: usize = @intCast(@max(0, win32.GetWindowTextLengthW(edit)));
-    const wide = try alloc.alloc(u16, len + 1);
-    defer alloc.free(wide);
-    const n: usize = @intCast(@max(0, win32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len))));
-    const utf8 = try utf8FromWide(alloc, wide[0..n]);
-    defer alloc.free(utf8);
-    return alloc.dupeSentinel(u8, utf8, 0);
 }
 
 /// Keep the field over its tab's label, `label` (`TabBar.paint`), or end

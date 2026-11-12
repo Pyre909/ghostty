@@ -1359,6 +1359,19 @@ pub fn utf8FromWide(alloc: Allocator, units: []const u16) Allocator.Error![]u8 {
     return buf;
 }
 
+/// An EDIT's text, as UTF-8 (`utf8FromWide`), NUL-terminated: converted
+/// once, into the buffer returned. The caller frees it.
+pub fn editText(alloc: Allocator, edit: win32.HWND) Allocator.Error![:0]u8 {
+    const len: usize = @intCast(@max(0, win32.GetWindowTextLengthW(edit)));
+    const wide = try alloc.alloc(u16, len + 1);
+    defer alloc.free(wide);
+    const n: usize = @intCast(@max(0, win32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len))));
+    const buf = try std.unicode.wtf16LeToWtf8AllocZ(alloc, wide[0..n]);
+    // In place, as in `utf8FromWide`.
+    std.unicode.wtf8ToUtf8Lossy(buf, buf) catch unreachable;
+    return buf;
+}
+
 /// NUL-terminated UTF-16 for `text`: each invalid UTF-8 sequence becomes
 /// U+FFFD instead of failing, as the clipboard's text does. The caller frees
 /// the result.
@@ -1833,6 +1846,22 @@ const TestBmp = struct {
         return if (self.header == 40) win32.CF_DIB else win32.CF_DIBV5;
     }
 };
+
+test "win32: an EDIT's text comes as UTF-8, NUL-terminated, a lone surrogate as U+FFFD" {
+    const edit = win32.CreateWindowExW(0, L("EDIT"), L(""), 0, 0, 0, 10, 10, null, null, null, null) orelse
+        return error.SkipZigTest;
+    defer _ = win32.DestroyWindow(edit);
+    const wide = [_:0]u16{ 'a', 0xD800, 'b' };
+    _ = win32.SetWindowTextW(edit, &wide);
+    const text = try editText(std.testing.allocator, edit);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("a\u{FFFD}b", text);
+    try std.testing.expectEqual(0, text.ptr[text.len]);
+    _ = win32.SetWindowTextW(edit, L(""));
+    const empty = try editText(std.testing.allocator, edit);
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqualStrings("", empty);
+}
 
 test "win32: clipboard writes read back, with invalid UTF-8 replaced" {
     const alloc = std.testing.allocator;

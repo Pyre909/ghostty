@@ -63,7 +63,7 @@ const App = @import("App.zig").App;
 const label = @import("dialog.zig").label;
 const i18n = @import("../../os/main.zig").i18n;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
-const utf8FromWide = @import("clipboard.zig").utf8FromWide;
+const editText = @import("clipboard.zig").editText;
 
 const W = std.unicode.utf8ToUtf16LeStringLiteral;
 const log = std.log.scoped(.win32);
@@ -352,13 +352,7 @@ pub fn commit(window: *Window) void {
 /// The field's text, as UTF-8; the caller frees it.
 fn fieldText(alloc: std.mem.Allocator, hwnd: win32.HWND) ![:0]u8 {
     const edit = win32.GetDlgItem(hwnd, edit_id) orelse return alloc.dupeSentinel(u8, "", 0);
-    const len: usize = @intCast(@max(0, win32.GetWindowTextLengthW(edit)));
-    const wide = try alloc.alloc(u16, len + 1);
-    defer alloc.free(wide);
-    const n: usize = @intCast(@max(0, win32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len))));
-    const utf8 = try utf8FromWide(alloc, wide[0..n]);
-    defer alloc.free(utf8);
-    return alloc.dupeSentinel(u8, utf8, 0);
+    return editText(alloc, edit);
 }
 
 /// Give the prompt's title bar the frame's mode (`Window.applyTheme`): the
