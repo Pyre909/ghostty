@@ -200,6 +200,11 @@ test "win32: a tab title field is centred on its label, a line high" {
     try std.testing.expectEqual(label, fieldRect(label, 40));
 }
 
+/// For tests: how many WM_CHARs and WM_SYSCHARs the subclass passed on to
+/// the EDIT. A single-line EDIT puts no Tab in its text either, only
+/// beeps, so a dropped Tab shows only here.
+pub var test_forwarded: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
 /// The field's subclass: its keys as the other fields' (`SearchBar.editKey`).
 /// Enter commits and Escape cancels, each giving the shown tab's terminal
 /// the focus back; the WM_CHARs a single-line EDIT beeps at or would put
@@ -234,6 +239,9 @@ fn editProc(
             return 0;
         },
     }
+    if (builtin.is_test) if (msg == win32.WM_CHAR or msg == win32.WM_SYSCHAR) {
+        test_forwarded += 1;
+    };
     return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
 }
 
