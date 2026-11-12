@@ -1705,6 +1705,10 @@ pub fn wndProc(
         // another window, the frame's caption, kept active while the
         // palette was (`activating`), is drawn inactive, and a quick
         // terminal may hide, as its frame would on losing the activation.
+        //
+        // Activated other than by `activate`, by a click on its padding:
+        // the frame's caption, drawn inactive as the frame lost the
+        // activation, is drawn active again, as `activating` keeps it.
         win32.WM_ACTIVATE => if (@as(u16, @truncate(wparam)) == win32.WA_INACTIVE) {
             const to: ?win32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
             p.open = false;
@@ -1713,6 +1717,16 @@ pub fn wndProc(
                 if (window.quick) window.quickDeactivated(to);
             }
             _ = win32.PostMessageW(hwnd, WM_PALETTE_CLOSE, 0, 0);
+        } else if (!p.activating) {
+            _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 1, 0);
+        },
+
+        // The keyboard focus the palette's own window gets, as it is
+        // activated by a click on its padding, goes to the field, as the
+        // list's does (`listProc`): typing there would reach nothing.
+        win32.WM_SETFOCUS => {
+            if (p.focusTarget()) |edit| window.setKeyboardFocus(edit, true);
+            return 0;
         },
 
         WM_PALETTE_CLOSE => {

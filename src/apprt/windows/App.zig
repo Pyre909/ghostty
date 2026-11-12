@@ -23119,6 +23119,37 @@ test "win32: the command palette closes when its frame is deactivated, has no ro
     try std.testing.expectEqual(0, app.windows.items.len);
 }
 
+test "win32: the command palette gives the focus its own window gets to its field" {
+    // A click on the palette's padding activates its window, which
+    // DefWindowProcW gives the keyboard focus: it goes to the field,
+    // where typing, Enter and Escape do what they should.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    const p = &window.palette;
+    try togglePalette(&app, a);
+
+    FocusSeen.last = null;
+    _ = win32.SendMessageW(p.hwnd.?, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expectEqual(p.edit.?, FocusSeen.last.?);
+}
+
 test "win32: the wheel over the command palette scrolls its list, and a modified one returns" {
     // A plain notch over the list or the field scrolls the list. The system
     // list hands a wheel it does not take (one with Ctrl or Shift) to its
