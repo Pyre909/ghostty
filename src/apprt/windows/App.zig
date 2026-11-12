@@ -23366,6 +23366,10 @@ test "win32: the command palette's tooltip follows the row under the pointer, an
     _ = win32.SendMessageW(list, win32.LB_SETTOPINDEX, 0, 0);
     try std.testing.expect(paletteEntry(window, 0).tooltip() != null);
     try std.testing.expectEqualStrings("", CommandPalette.tipFor(window, 0));
+    CommandPalette.test_tip = "unset";
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, paletteRowPoint(window, 0));
+    try std.testing.expectEqual(@as(?usize, 0), p.hover_row);
+    try std.testing.expectEqualStrings("", CommandPalette.test_tip);
     // The frame sized so that the palette is as narrow as it goes.
     const m = CommandPalette.Metrics.init(Window.dpiOf(&app, window.hwnd));
     var frame: win32.RECT = undefined;
@@ -23377,6 +23381,11 @@ test "win32: the command palette's tooltip follows the row under the pointer, an
     const narrow = try childRect(window, p.hwnd.?);
     try std.testing.expectEqual(m.min_width, narrow.right - narrow.left);
     try std.testing.expectEqualStrings(paletteEntry(window, 0).tooltip().?, CommandPalette.tipFor(window, 0));
+    // As the pointer comes onto the row, off it first.
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, testPoint(20, -5));
+    try std.testing.expectEqualStrings("", CommandPalette.test_tip);
+    _ = win32.SendMessageW(list, win32.WM_MOUSEMOVE, 0, paletteRowPoint(window, 0));
+    try std.testing.expectEqualStrings(paletteEntry(window, 0).tooltip().?, CommandPalette.test_tip);
 
     // Closed, the palette takes its tooltip with it.
     CommandPalette.close(window);

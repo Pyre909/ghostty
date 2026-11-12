@@ -1247,6 +1247,7 @@ fn redrawRow(window: *Window, row: ?usize) void {
 
 /// The tooltip, hidden, with `text`, shown again after the pointer rests.
 fn setTip(window: *Window, text: []const u8) void {
+    if (builtin.is_test) test_tip = text;
     const p = &window.palette;
     const tip = p.tip orelse return;
     const list = p.list orelse return;
@@ -1704,6 +1705,10 @@ var list_proc: ?win32.WNDPROC = null;
 
 /// For tests: how many WM_CHARs the field's subclass passed on to the EDIT.
 pub var test_forwarded: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
+/// For tests: the text the tooltip was last given (`setTip`), whether or
+/// not the process could make one; read at once, as it is the entry's.
+pub var test_tip: if (builtin.is_test) []const u8 else void = if (builtin.is_test) "" else {};
 
 /// The window whose palette the window `hwnd` is, null once it is
 /// destroyed.
