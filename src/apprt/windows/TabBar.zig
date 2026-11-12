@@ -271,8 +271,16 @@ pub const Bar = struct {
         self.invalidate();
     }
 
-    /// Delete the font. Also from `App.windowDestroyed`, for a frame that
-    /// `terminate` could not destroy, whose bar has no WM_DESTROY.
+    /// Free what the bar drew with, its font and its title field's brush,
+    /// as its window goes: from its WM_DESTROY, and from
+    /// `App.windowDestroyed` for a frame that `terminate` could not
+    /// destroy, whose bar has no WM_DESTROY.
+    pub fn release(self: *Bar) void {
+        self.editor.deinit();
+        self.freeFont();
+    }
+
+    /// Delete the font.
     pub fn freeFont(self: *Bar) void {
         if (self.font) |f| _ = win32.DeleteObject(f);
         self.font = null;
@@ -698,8 +706,7 @@ pub fn wndProc(
 
         win32.WM_DESTROY => {
             bar.endDrag();
-            bar.editor.deinit();
-            bar.freeFont();
+            bar.release();
             // Nothing draws into, or places, a destroyed window.
             bar.hwnd = null;
             return 0;
@@ -1209,4 +1216,18 @@ test "win32: the tab bar scrolls to show a tab" {
     // Before the left, scrolled to the end: its left edge at 0.
     const end = Layout.init(m, 20, 1000, 10_000);
     try testing.expectEqual(2 * 72, end.scrollToShow(2));
+}
+
+test "win32: a tab bar's release frees its font and its title field's brush" {
+    // Released, the bar holds neither: freed, not left for a later paint.
+    // GDI keeps freed solid brushes in a cache that its object count
+    // still counts, so what is held is checked, not that count.
+    var bar: Bar = .{};
+    _ = bar.editor.brushOf(0x00332211) orelse return error.TestUnexpectedResult;
+    _ = bar.fontFor(96) orelse return error.TestUnexpectedResult;
+    bar.release();
+    try std.testing.expect(bar.editor.brush == null);
+    try std.testing.expect(bar.font == null);
+    // Twice is nothing.
+    bar.release();
 }

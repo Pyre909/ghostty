@@ -4662,11 +4662,12 @@ pub const App = struct {
         // window `terminate` gives up on still exists.
         _ = win32.SetWindowLongPtrW(window.hwnd, win32.GWLP_USERDATA, 0);
         // The bar is a child of the frame, which it outlives with the same
-        // back-pointer; and its WM_DESTROY, which frees its font, never
-        // comes. Not DestroyWindow: it would fail as the frame's did, and on
-        // the normal path the bar is gone already (`hwnd` null).
+        // back-pointer; and its WM_DESTROY, which frees what it drew with,
+        // never comes (`TabBar.Bar.release`). Not DestroyWindow: it would
+        // fail as the frame's did, and on the normal path the bar is gone
+        // already (`hwnd` null).
         if (window.bar.hwnd) |bar| _ = win32.SetWindowLongPtrW(bar, win32.GWLP_USERDATA, 0);
-        window.bar.freeFont();
+        window.bar.release();
 
         // Gone at the frame's WM_DESTROY already, unless `terminate` gave
         // up on the frame.
