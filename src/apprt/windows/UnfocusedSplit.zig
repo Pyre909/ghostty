@@ -2,10 +2,11 @@
 //! (`unfocused-split-opacity`, `unfocused-split-fill`): its fill colour,
 //! the terminal's configured background unless set, over all of it at one
 //! less the opacity, as macOS puts a rectangle of that colour at that
-//! opacity over an unfocused split (macos/Sources/Ghostty/Surface
-//! View/SurfaceView.swift:151-161) and GTK a revealer styled
-//! `unfocused-split` (src/apprt/gtk/ui/1.0/surface.blp:203,
-//! src/apprt/gtk/class/application.zig:1041). It shows as GTK's does
+//! opacity over an unfocused split (the `isSplit && !focused` rectangle in
+//! macos/Sources/Ghostty/Surface View/SurfaceView.swift) and GTK a
+//! revealer styled `unfocused-split` (src/apprt/gtk/ui/1.0/surface.blp,
+//! coloured by `loadRuntimeCss` in src/apprt/gtk/class/application.zig).
+//! It shows as GTK's does
 //! (`closureShouldUnfocusedSplitBeShown`): over a terminal in a tab of
 //! more than one, not its tab's focused one, whose search bar is not open.
 //!

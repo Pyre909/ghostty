@@ -266,8 +266,9 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// show (`KeyState.update`), the read-only badge the next time the
 /// terminal is made read-only (`ReadOnly.set`), the bell border the next
 /// time it shows (`BellBorder.set`), and the resize overlay at its
-/// terminal's next change of size (`ResizeOverlay.resized`); the
-/// child-exited banner, asked for once, is not.
+/// terminal's next change of size (`ResizeOverlay.resized`), and the dim
+/// of an unfocused split the next time it is placed (`UnfocusedSplit.sync`,
+/// from here); the child-exited banner, asked for once, is not.
 ///
 /// The terminals tile their area, and the search bars are placed above
 /// all of them (`SearchBar.place`), so just above its own terminal an
