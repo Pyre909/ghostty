@@ -20,6 +20,7 @@ const Binding = input.Binding;
 const i18n = @import("../../os/main.zig").i18n;
 const uucode = @import("uucode");
 const unicode = @import("../../unicode/main.zig");
+const terminal = @import("../../terminal/main.zig");
 
 /// Whether this runtime carries out `key`, and so lists a command with
 /// it. An exhaustive switch, as `actionCommands` in src/input/command.zig
@@ -669,6 +670,7 @@ const utf8FromWide = @import("clipboard.zig").utf8FromWide;
 
 const RECT = win32.RECT;
 const L = win32.L;
+const lerp = win32.lerp;
 const Question = @import("dialog.zig").Question;
 /// The field's placeholder in the user's language, for the program's
 /// time: nothing documents that the field copies it.
@@ -914,26 +916,15 @@ pub const Look = struct {
     }
 };
 
-/// Whether `c` is light, by macOS's measure of a terminal background's
-/// luminance (`0.299 r + 0.587 g + 0.114 b > 0.5`), in thousandths.
+/// Whether `c` is light, by the measure macOS and GTK take of a terminal
+/// background's luminance (`RGB.perceivedLuminance`).
 pub fn isLight(c: win32.COLORREF) bool {
-    const r: u32 = c & 0xff;
-    const g: u32 = (c >> 8) & 0xff;
-    const b: u32 = (c >> 16) & 0xff;
-    return 299 * r + 587 * g + 114 * b > 500 * 255;
-}
-
-/// `a` moved `t` thousandths of the way to `b`, rounded to nearest.
-pub fn lerp(a: win32.COLORREF, b: win32.COLORREF, t: u32) win32.COLORREF {
-    var out: win32.COLORREF = 0;
-    for (0..3) |i| {
-        const shift: u5 = @intCast(8 * i);
-        const x: u32 = (a >> shift) & 0xff;
-        const y: u32 = (b >> shift) & 0xff;
-        const v = (x * (1000 - t) + y * t + 500) / 1000;
-        out |= v << shift;
-    }
-    return out;
+    const bg: terminal.color.RGB = .{
+        .r = @truncate(c),
+        .g = @truncate(c >> 8),
+        .b = @truncate(c >> 16),
+    };
+    return bg.perceivedLuminance() > 0.5;
 }
 
 /// The DPI `window`'s palette is measured and drawn at: its frame's, at

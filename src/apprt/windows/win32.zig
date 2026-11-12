@@ -2164,6 +2164,20 @@ pub fn rgb(r: u8, g: u8, b: u8) COLORREF {
     return @as(COLORREF, r) | (@as(COLORREF, g) << 8) | (@as(COLORREF, b) << 16);
 }
 
+/// `a` moved `t` thousandths of the way to `b`, each channel rounded to
+/// nearest, a half up.
+pub fn lerp(a: COLORREF, b: COLORREF, t: u32) COLORREF {
+    var out: COLORREF = 0;
+    for (0..3) |i| {
+        const shift: u5 = @intCast(8 * i);
+        const x: u32 = (a >> shift) & 0xff;
+        const y: u32 = (b >> shift) & 0xff;
+        const v = (x * (1000 - t) + y * t + 500) / 1000;
+        out |= v << shift;
+    }
+    return out;
+}
+
 pub fn loword(v: LPARAM) u16 {
     return @truncate(@as(usize, @bitCast(v)));
 }

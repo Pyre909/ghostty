@@ -312,13 +312,7 @@ pub fn tint(is_failed: bool, dark: bool) win32.COLORREF {
 
 /// `a` and `b` half and half, each channel rounded up.
 pub fn mix(a: win32.COLORREF, b: win32.COLORREF) win32.COLORREF {
-    var out: win32.COLORREF = 0;
-    for (0..3) |i| {
-        const shift: u5 = @intCast(8 * i);
-        const sum = ((a >> shift) & 0xff) + ((b >> shift) & 0xff) + 1;
-        out |= (sum / 2) << shift;
-    }
-    return out;
+    return win32.lerp(a, b, 500);
 }
 
 /// The banner's sizes at a DPI, from their values at 96: as short as its
