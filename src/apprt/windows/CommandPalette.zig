@@ -19,6 +19,7 @@ const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const Binding = input.Binding;
 const i18n = @import("../../os/main.zig").i18n;
 const uucode = @import("uucode");
+const unicode = @import("../../unicode/main.zig");
 
 /// Whether this runtime carries out `key`, and so lists a command with
 /// it. An exhaustive switch, as `actionCommands` in src/input/command.zig
@@ -410,8 +411,10 @@ pub const Spans = struct { title: ?Span = null, subtitle: ?Span = null };
 /// the first occurrence of `folded`, a folded query, as the filter found
 /// it (`match`): every code point whose folding overlaps it, so that a
 /// match beginning or ending inside one code point's folding ("ß" for
-/// "s") takes all of it. Null for an empty query, or none. As macOS bolds
-/// the letters a query matched.
+/// "s") takes all of it, widened to whole grapheme clusters
+/// (`clusters`), so that a mark or a modifier is never drawn apart from
+/// its base. Null for an empty query, or none. As macOS bolds the letters
+/// a query matched.
 pub fn matchSpan(text: []const u8, folded_text: []const u8, folded: []const u8) ?Span {
     if (folded.len == 0) return null;
     const at = std.mem.indexOf(u8, folded_text, folded) orelse return null;
@@ -430,7 +433,82 @@ pub fn matchSpan(text: []const u8, folded_text: []const u8, folded: []const u8) 
         src += one.source;
         out = next;
     }
-    return span;
+    return clusters(text, span orelse return null);
+}
+
+/// `span`, which starts and ends on a code point of `text`, widened to
+/// the grapheme clusters it touches, by the terminal's segmentation
+/// (`unicode.graphemeBreak`), stepping through `text` as `foldStep`
+/// does. A control character, or a byte that is not UTF-8, is a cluster
+/// of its own, as the segmentation is not for them.
+fn clusters(text: []const u8, span: Span) Span {
+    var out = span;
+    var state: uucode.grapheme.BreakState = .default;
+    var prev: ?u21 = null;
+    var cluster: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        const cp: ?u21 = if (len > 0 and len <= text.len - i)
+            std.unicode.utf8Decode(text[i..][0..len]) catch null
+        else
+            null;
+        const usable = if (cp) |c| c >= 0x20 and c != 0x7f else false;
+        const breaks = if (prev) |a| if (usable)
+            unicode.graphemeBreak(unicode.table.get(a).grapheme_break, unicode.table.get(cp.?).grapheme_break, &state)
+        else
+            true else true;
+        if (breaks) {
+            if (i >= span.end) {
+                out.end = i;
+                return out;
+            }
+            cluster = i;
+            state = .default;
+        }
+        if (i == span.start) out.start = cluster;
+        prev = if (usable) cp else null;
+        i += if (cp == null) 1 else len;
+    }
+    out.end = text.len;
+    return out;
+}
+
+/// Whether `text` holds a right-to-left letter: Hebrew, Arabic and the
+/// scripts near them, and their presentation forms. Such a line is drawn
+/// whole, in one run, which lays it out from right to left: cut at a
+/// match into runs drawn left to right, its pieces would come out in the
+/// wrong order.
+pub fn holdsRtl(text: []const u8) bool {
+    const view = std.unicode.Utf8View.init(text) catch return holdsRtlLossy(text);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |c| if (isRtl(c)) return true;
+    return false;
+}
+
+/// `holdsRtl` for a text that is not all UTF-8: its code points that are.
+fn holdsRtlLossy(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (len > 0 and len <= text.len - i) {
+            if (std.unicode.utf8Decode(text[i..][0..len])) |c| {
+                if (isRtl(c)) return true;
+                i += len;
+                continue;
+            } else |_| {}
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn isRtl(c: u21) bool {
+    return (c >= 0x0590 and c <= 0x08ff) or
+        (c >= 0xfb1d and c <= 0xfdff) or
+        (c >= 0xfe70 and c <= 0xfeff) or
+        (c >= 0x10800 and c <= 0x10fff) or
+        (c >= 0x1e800 and c <= 0x1efff);
 }
 
 /// `entry` with its title and action key folded (`fold`) for the filter.
@@ -2017,7 +2095,9 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
 
 /// Draw `text` on one line in `r`, in `fonts.normal` and `color`, but
 /// for its `span`, in `fonts.bold` and `match_color`; cut short with an
-/// ellipsis where it does not fit.
+/// ellipsis where it does not fit. A right-to-left line is drawn whole,
+/// with no span (`holdsRtl`): DrawTextW lays out each run on its own, so
+/// the pieces of one cut at the span would come out in the wrong order.
 fn drawSpanned(
     hdc: win32.HDC,
     alloc: Allocator,
@@ -2030,7 +2110,8 @@ fn drawSpanned(
 ) void {
     if (text.len == 0) return;
     const flags = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
-    const s = span orelse Span{ .start = text.len, .end = text.len };
+    const whole: Span = .{ .start = text.len, .end = text.len };
+    const s = if (holdsRtl(text)) whole else span orelse whole;
     std.debug.assert(s.start <= s.end and s.end <= text.len);
     const parts = [_]struct { []const u8, bool }{
         .{ text[0..s.start], false },
@@ -2638,6 +2719,13 @@ test "win32: the palette shows the letters a query matched, by the code points t
         .{ .text = "Über", .query = "üb", .span = .{ .start = 0, .end = 3 } },
         .{ .text = "a\xffb", .query = "\xffb", .span = .{ .start = 1, .end = 3 } },
         .{ .text = "x\u{2026}y", .query = "y", .span = .{ .start = 4, .end = 5 } },
+        // Whole grapheme clusters: a combining mark, a skin tone, a
+        // joined emoji; but a control character stands alone.
+        .{ .text = "Cafe\u{301} x", .query = "cafe", .span = .{ .start = 0, .end = 6 } },
+        .{ .text = "Cafe\u{301} x", .query = "\u{301}", .span = .{ .start = 3, .end = 6 } },
+        .{ .text = "x\u{1F44D}\u{1F3FD}y", .query = "x\u{1F44D}", .span = .{ .start = 0, .end = 9 } },
+        .{ .text = "a\u{1F468}\u{200D}\u{1F469}b", .query = "\u{1F469}b", .span = .{ .start = 1, .end = 13 } },
+        .{ .text = "a\x01\u{301}", .query = "a", .span = .{ .start = 0, .end = 1 } },
         // None: an empty query, or no match.
         .{ .text = "Split Right", .query = "", .span = null },
         .{ .text = "Split Right", .query = "left", .span = null },
@@ -2649,6 +2737,14 @@ test "win32: the palette shows the letters a query matched, by the code points t
         defer alloc.free(folded);
         try testing.expectEqual(c.span, matchSpan(c.text, folded_text, folded));
     }
+
+    // A right-to-left line is drawn whole: Ghostty's Hebrew titles, an
+    // Arabic letter in a jump's directory; not a left-to-right one.
+    try testing.expect(holdsRtl("\u{05e4}\u{05d9}\u{05e6}\u{05d5}\u{05dc} \u{05d9}\u{05de}\u{05d9}\u{05e0}\u{05d4}"));
+    try testing.expect(holdsRtl("C:\\\u{0627}"));
+    try testing.expect(holdsRtl("\xff\u{05d0}"));
+    try testing.expect(!holdsRtl("Split Right"));
+    try testing.expect(!holdsRtl("Stra\u{00df}e \u{1F44D}\xff"));
 
     // Whatever the text and query, the span's own folding holds the
     // query, and it starts and ends on a code point.
