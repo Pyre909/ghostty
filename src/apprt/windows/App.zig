@@ -18539,6 +18539,27 @@ fn testQuickAutohide() !void {
     TestQuick.in_front = owned;
     try std.testing.expect(TestQuick.autohide(quick));
     try std.testing.expect(win32.IsWindowVisible(quick.hwnd).toBool());
+
+    // With its command palette open, which holds the activation then,
+    // the quick terminal never loses it itself: the palette losing it to
+    // another program hides it, and closes the palette; losing it to the
+    // quick terminal does neither but close the palette. Made as large
+    // as the palette's own test makes its window, for it to fit.
+    testResize(quick, 1000, 700);
+    const pane = quick.tab().focused orelse return error.TestUnexpectedResult;
+    var msg: win32.MSG = undefined;
+    for ([_]win32.HWND{ quick.hwnd, other }) |to| {
+        try std.testing.expect(try app.performAction(.{ .surface = &pane.core_surface }, .toggle_command_palette, {}));
+        app.createRequested();
+        const palette = quick.palette.hwnd orelse return error.TestUnexpectedResult;
+        TestQuick.in_front = to;
+        _ = win32.SendMessageW(palette, win32.WM_ACTIVATE, win32.WA_INACTIVE, @bitCast(@intFromPtr(to)));
+        try std.testing.expect(win32.PeekMessageW(&msg, palette, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
+        _ = win32.DispatchMessageW(&msg);
+        try std.testing.expect(quick.palette.hwnd == null);
+        try std.testing.expectEqual(to == other, TestQuick.autohide(quick));
+        try std.testing.expectEqual(to != other, win32.IsWindowVisible(quick.hwnd).toBool());
+    }
 }
 
 test "win32: the quick terminal is uncovered from its edge as it shows, and covered back as it hides" {
