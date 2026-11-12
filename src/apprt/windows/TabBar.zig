@@ -21,6 +21,7 @@ const App = @import("App.zig").App;
 const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const Transparency = @import("Transparency.zig");
+const ContextMenu = @import("ContextMenu.zig");
 
 const RECT = win32.RECT;
 const L = win32.L;
@@ -49,6 +50,9 @@ pub const Bar = struct {
     /// The tab the middle button went down on, which a middle click
     /// closes only if it comes up on the same; cancelled as `pressed` is.
     middle: ?usize = null,
+    /// The tab the right button went down on, whose menu opens only if it
+    /// comes up on the same; cancelled as `pressed` is.
+    right: ?usize = null,
     /// A left press on a tab's label, which becomes a drag once the
     /// pointer moves far enough with the button down; null without one.
     /// Ended by the release, and cancelled as `pressed` is.
@@ -111,6 +115,7 @@ pub const Bar = struct {
     pub fn tabsChanged(self: *Bar, window: *Window) void {
         self.pressed = .none;
         self.middle = null;
+        self.right = null;
         self.endDrag();
         self.rehover(window);
         self.invalidate();
@@ -530,7 +535,7 @@ pub fn wndProc(
             const drag = bar.drag;
             bar.pressed = .none;
             bar.endDrag();
-            if (win32.GetCapture() == hwnd and bar.middle == null) _ = win32.ReleaseCapture();
+            if (win32.GetCapture() == hwnd and bar.middle == null and bar.right == null) _ = win32.ReleaseCapture();
             // A drag is no click: its press already showed the tab.
             if (drag) |d| if (d.active) {
                 Bar.drop(window, hwnd, d, pointAt(lparam));
@@ -560,10 +565,36 @@ pub fn wndProc(
         win32.WM_MBUTTONUP => {
             const pressed = bar.middle;
             bar.middle = null;
-            if (win32.GetCapture() == hwnd and bar.pressed == .none) _ = win32.ReleaseCapture();
+            if (win32.GetCapture() == hwnd and bar.pressed == .none and bar.right == null) _ = win32.ReleaseCapture();
             const index = tabAt(hitAt(window, hwnd, lparam)) orelse return 0;
             if (pressed == null or pressed.? != index) return 0;
             _ = window.closeTabs(index, .this);
+            return 0;
+        },
+
+        // A right click on a tab opens its menu (`ContextMenu.showTab`):
+        // pressed and released on the same tab, its close glyph included,
+        // the menu opening on the release, as a terminal's does, so that
+        // its loop never takes the capture in the middle of a click. The
+        // bar's empty part and its "+" have none.
+        win32.WM_RBUTTONDOWN, win32.WM_RBUTTONDBLCLK => {
+            const index = tabAt(hitAt(window, hwnd, lparam)) orelse return 0;
+            if (win32.GetCapture() != hwnd) _ = win32.SetCapture(hwnd);
+            bar.right = index;
+            return 0;
+        },
+
+        // Handled, not passed on: DefWindowProcW would answer it with a
+        // WM_CONTEXTMENU for the frame.
+        win32.WM_RBUTTONUP => {
+            const pressed = bar.right;
+            bar.right = null;
+            if (win32.GetCapture() == hwnd and bar.pressed == .none and bar.middle == null) _ = win32.ReleaseCapture();
+            const index = tabAt(hitAt(window, hwnd, lparam)) orelse return 0;
+            if (pressed == null or pressed.? != index) return 0;
+            var at = pointAt(lparam);
+            _ = win32.ClientToScreen(hwnd, &at);
+            ContextMenu.showTab(window, index, at);
             return 0;
         },
 
@@ -572,6 +603,7 @@ pub fn wndProc(
         win32.WM_CAPTURECHANGED => {
             bar.pressed = .none;
             bar.middle = null;
+            bar.right = null;
             bar.cancelDrag(window);
             return 0;
         },

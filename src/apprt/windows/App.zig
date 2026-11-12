@@ -10397,6 +10397,138 @@ test "win32: the tab bar holds the mouse capture while a button is down on it" {
     _ = win32.ReleaseCapture();
 }
 
+/// For tests: what a tab's menu does while it is open (`MenuSeen.during`).
+const TabMenuDuring = struct {
+    var window: ?*Window = null;
+    var close: usize = 0;
+    /// Close the tab at `close`, as a close from elsewhere would while the
+    /// menu's loop runs.
+    fn closeTab() void {
+        _ = window.?.closeTabs(close, .this);
+    }
+};
+
+test "win32: a right click on a tab opens its menu, whose items act on that tab" {
+    // Pressed and released on one tab, its close glyph included, the menu
+    // opens on the release, at its point on the screen, owned by the frame,
+    // and holds the bar's capture no more. Its items are performed on the
+    // tab clicked, which need not be the one shown and is not shown by it;
+    // a greyed one is not. The empty part and the "+" have no menu, nor
+    // has a release on another tab, nor one with no press. None opens
+    // while the core may not be re-entered, and an item chosen once its
+    // tab began to close is not performed.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    PaletteSeen.reset(null);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = try testTab(&app, window);
+    _ = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.selectTab(0);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    defer _ = win32.ReleaseCapture();
+    const first = window.tabs.items[0].focused.?;
+    const second = window.tabs.items[1].focused.?;
+    const last = window.tabs.items[2].focused.?;
+    try std.testing.expect(first == a);
+
+    const layout = testBarLayout(window);
+    const on_second = testMid(layout.tabRect(1));
+    const on_last = testMid(layout.tabRect(2));
+    const right = struct {
+        fn click(hwnd: win32.HWND, down: win32.LPARAM, up: win32.LPARAM) void {
+            _ = win32.SendMessageW(hwnd, win32.WM_RBUTTONDOWN, win32.MK_RBUTTON, down);
+            _ = win32.SendMessageW(hwnd, win32.WM_RBUTTONUP, 0, up);
+        }
+    };
+
+    // The second tab, not the one shown: Close Other Tabs on it.
+    MenuSeen.choose = "Close Other Tabs";
+    right.click(bar, on_second, on_second);
+    try std.testing.expectEqual(1, MenuSeen.count);
+    try std.testing.expect(MenuSeen.owner == window.hwnd);
+    try std.testing.expect(MenuSeen.capture == null);
+    var at: win32.POINT = .{ .x = @divTrunc(layout.tabRect(1).left + layout.tabRect(1).right, 2), .y = @divTrunc(layout.tabRect(1).top + layout.tabRect(1).bottom, 2) };
+    _ = win32.ClientToScreen(bar, &at);
+    try std.testing.expectEqual(at, MenuSeen.at);
+    try std.testing.expect(PaletteSeen.on == second);
+    try std.testing.expectEqualStrings("close_tab:other;", PaletteSeen.take());
+    try std.testing.expectEqual(0, window.selected);
+
+    // Each item, on the first tab's close glyph.
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "Close Tab", "close_tab:this;" },
+        .{ "Close Tabs to the Right", "close_tab:right;" },
+        .{ "Move Tab to New Window", "move_tab_to_new_window;" },
+        .{ "Change Tab Title\u{2026}", "prompt_tab_title;" },
+    }) |item| {
+        MenuSeen.choose = item[0];
+        PaletteSeen.on = null;
+        const close = testMid(layout.closeRect(0));
+        right.click(bar, close, close);
+        try std.testing.expect(PaletteSeen.on == first);
+        try std.testing.expectEqualStrings(item[1], PaletteSeen.take());
+    }
+    try std.testing.expectEqual(5, MenuSeen.count);
+
+    // Close Tabs to the Right is greyed on the last tab: not performed.
+    MenuSeen.choose = "Close Tabs to the Right";
+    right.click(bar, on_last, on_last);
+    try std.testing.expectEqual(6, MenuSeen.count);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    MenuSeen.choose = "Close Tab";
+    right.click(bar, on_last, on_last);
+    try std.testing.expect(PaletteSeen.on == last);
+    try std.testing.expectEqualStrings("close_tab:this;", PaletteSeen.take());
+
+    // No menu: off a tab, from one tab to another, a release alone.
+    const plus = testMid(layout.plusRect());
+    const empty = testPoint(layout.plusRect().right + 20, 4);
+    right.click(bar, plus, plus);
+    right.click(bar, empty, empty);
+    right.click(bar, on_second, on_last);
+    _ = win32.SendMessageW(bar, win32.WM_RBUTTONUP, 0, on_second);
+    try std.testing.expectEqual(7, MenuSeen.count);
+    try std.testing.expect(win32.GetCapture() == null);
+
+    // Under a prompt: none.
+    app.prompt_depth = 1;
+    right.click(bar, on_second, on_second);
+    app.prompt_depth = 0;
+    try std.testing.expectEqual(7, MenuSeen.count);
+
+    // Its tab closed from elsewhere while it is open: the item is not
+    // performed, and the terminal is torn down only once it has closed.
+    TabMenuDuring.window = window;
+    TabMenuDuring.close = 1;
+    MenuSeen.during = &TabMenuDuring.closeTab;
+    MenuSeen.choose = "Close Other Tabs";
+    right.click(bar, on_second, on_second);
+    try std.testing.expectEqual(8, MenuSeen.count);
+    try std.testing.expect(second.closing);
+    try std.testing.expectEqualStrings("", PaletteSeen.take());
+    testTeardowns();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+}
+
 test "win32: a click on a tab waits for run under a prompt, from a live terminal" {
     // Under a prompt, which may have a core frame beneath it, the tab is
     // shown from `run`, as goto_tab is; the request names the shown tab's

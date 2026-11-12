@@ -39,6 +39,7 @@ const win32 = @import("win32.zig");
 const App = @import("App.zig").App;
 const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 const Surface = @import("Surface.zig").Surface;
+const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const i18n = @import("../../os/main.zig").i18n;
@@ -109,12 +110,33 @@ const layout = [_]Entry{
     .{ .label = "Reload Configuration", .action = .{ .binding = .reload_config }, .section = 3, .submenu = .config },
 };
 
+/// A tab's menu, shown for a right click on its label in the tab bar
+/// (`showTab`): the items macOS adds to its tab's menu
+/// (`configureTabContextMenuIfNeeded` in TerminalWindow.swift), Close Tab,
+/// Close Other Tabs and Close Tabs to the Right; GTK's Move Tab to New
+/// Window, which the tab's drag out of the bar also does; and, as GTK's
+/// tab menu has it (`tab_context_menu` in src/apprt/gtk/ui/1.4/window.blp),
+/// Change Tab Title…, in place of macOS's Rename Tab…, whose title
+/// editor this runtime has on a double click instead (`TabBar`).
+const tab_layout = [_]Entry{
+    .{ .label = "Close Tab", .action = .{ .binding = .{ .close_tab = .this } }, .section = 0 },
+    .{ .label = "Close Other Tabs", .action = .{ .binding = .{ .close_tab = .other } }, .section = 0 },
+    .{ .label = "Close Tabs to the Right", .action = .{ .binding = .{ .close_tab = .right } }, .section = 0 },
+    .{ .label = "Move Tab to New Window", .action = .{ .binding = .move_tab_to_new_window }, .section = 1 },
+    .{ .label = "Change Tab Title\u{2026}", .action = .{ .binding = .prompt_tab_title }, .section = 2 },
+};
+
 comptime {
+    check(&layout);
+    check(&tab_layout);
+}
+
+fn check(comptime entries: []const Entry) void {
     // Only what this runtime carries out, as the command palette lists
     // only that (`CommandPalette.supported`); `open_config:new_window` is
     // refused by `App.openConfig`. A submenu's items are next to one
     // another, all in one section.
-    for (layout, 0..) |entry, i| {
+    for (entries, 0..) |entry, i| {
         switch (entry.action) {
             .binding => |action| {
                 if (!CommandPalette.supported(action)) @compileError("not carried out: " ++ entry.label);
@@ -123,10 +145,10 @@ comptime {
             .notify_next_command => {},
         }
         if (i == 0) continue;
-        const prev = layout[i - 1];
+        const prev = entries[i - 1];
         if (entry.section < prev.section) @compileError("out of order: " ++ entry.label);
         const sub = entry.submenu orelse continue;
-        for (layout[0 .. i - 1]) |earlier| {
+        for (entries[0 .. i - 1]) |earlier| {
             if (earlier.submenu == sub and prev.submenu != sub) @compileError("apart from its submenu: " ++ entry.label);
         }
         if (prev.submenu == sub and prev.section != entry.section) @compileError("across sections: " ++ entry.label);
@@ -135,6 +157,9 @@ comptime {
 
 /// How many items the menu has.
 pub const count = layout.len;
+
+/// How many items a tab's menu has.
+pub const tab_count = tab_layout.len;
 
 /// The most bytes of a shortcut's label (`CommandPalette.shortcutLabel`)
 /// an item keeps; a longer one is not shown. "Win+Ctrl+Alt+Shift+" and the
@@ -181,22 +206,67 @@ pub const State = struct {
 /// (`Binding.Set.getTrigger`). Items keep what they show: nothing points
 /// into `set`, which a reload frees.
 pub fn menuItems(state: State, set: *const Binding.Set) [count]Item {
-    var items: [count]Item = undefined;
-    for (layout, &items, 0..) |entry, *item, i| {
+    var items = itemsOf(&layout, set);
+    for (&items) |*item| {
+        item.enabled = switch (item.action) {
+            .binding => |action| action != .copy_to_clipboard or state.selection,
+            .notify_next_command => true,
+        };
+        item.checked = switch (item.action) {
+            .binding => |action| action == .toggle_readonly and state.readonly,
+            .notify_next_command => state.notify_next_command,
+        };
+    }
+    return items;
+}
+
+/// Where the tab a tab's menu is for is in its window.
+pub const TabState = struct {
+    /// Its place, from 0.
+    index: usize,
+    /// How many tabs the window has.
+    tabs: usize,
+};
+
+/// A tab's menu's items for the tab at `state`, with their shortcuts, as
+/// `menuItems`. Close Tabs to the Right is greyed for the last tab, as
+/// macOS disables it (`validateMenuItem` in TerminalController.swift);
+/// so are Close Other Tabs and Move Tab to New Window for a window's only
+/// tab, where neither would do anything (`Window.moveTabTo` moves none of
+/// a window's only tab).
+pub fn tabMenuItems(state: TabState, set: *const Binding.Set) [tab_count]Item {
+    var items = itemsOf(&tab_layout, set);
+    for (&items) |*item| {
+        const action = switch (item.action) {
+            .binding => |action| action,
+            .notify_next_command => continue,
+        };
+        item.enabled = switch (action) {
+            .close_tab => |mode| switch (mode) {
+                .this => true,
+                .other => state.tabs > 1,
+                .right => state.index + 1 < state.tabs,
+            },
+            .move_tab_to_new_window => state.tabs > 1,
+            else => true,
+        };
+    }
+    return items;
+}
+
+/// The items of `entries`, enabled and unchecked, each with the shortcut
+/// `set` binds its action to.
+fn itemsOf(comptime entries: []const Entry, set: *const Binding.Set) [entries.len]Item {
+    var items: [entries.len]Item = undefined;
+    for (entries, &items, 0..) |entry, *item, i| {
         item.* = .{
             .id = @intCast(i + 1),
             .label = entry.label,
             .action = entry.action,
             .section = entry.section,
             .submenu = entry.submenu,
-            .enabled = switch (entry.action) {
-                .binding => |action| action != .copy_to_clipboard or state.selection,
-                .notify_next_command => true,
-            },
-            .checked = switch (entry.action) {
-                .binding => |action| action == .toggle_readonly and state.readonly,
-                .notify_next_command => state.notify_next_command,
-            },
+            .enabled = true,
+            .checked = false,
             .shortcut_buf = undefined,
             .shortcut_len = 0,
         };
@@ -336,6 +406,43 @@ pub fn show(surface: *Surface, at: win32.POINT) void {
     perform(surface, item);
 }
 
+/// Show the menu of the tab at `index` of `window` at `at`, a point on
+/// the screen, where the right button came up on its label in the tab
+/// bar (`TabBar`), owned by the frame, as `show` shows a terminal's; then
+/// perform the chosen item on the tab's focused terminal, as its binding
+/// would be performed there: on that tab, which need not be the one
+/// shown (`App.closeTab` closes around the tab its terminal is in), as
+/// macOS's tab menu acts on the tab clicked. The focus stays where it
+/// was; the menu shows no tab.
+///
+/// Not while the core may not be re-entered (`App.canReenterCore`): the
+/// bar's release can come under a prompt's loop or a core frame, unlike a
+/// terminal's, whose menu opens only for a release the core had, and an
+/// item could then not be performed. Nor for a tab with no terminal, or
+/// one that, or whose window, began to close. As in `show`, its terminal
+/// is alive when the menu returns (`App.terminal_loops`), and an item
+/// chosen once it or its window began to close is not performed.
+pub fn showTab(window: *Window, index: usize, at: win32.POINT) void {
+    const app = window.app;
+    if (!app.canReenterCore() or window.closing) return;
+    if (index >= window.tabs.items.len) return;
+    const surface = window.tabs.items[index].focused orelse return;
+    if (surface.closing) return;
+    const items = tabMenuItems(.{ .index = index, .tabs = window.tabs.items.len }, &app.config.keybind.set);
+    const menu = build(&items) orelse return;
+
+    app.beginTerminalLoop();
+    const id = track(menu, window.hwnd, at);
+    app.endTerminalLoop();
+    _ = win32.DestroyMenu(menu);
+
+    if (surface.closing or window.closing) return;
+    if (id == 0 or id > items.len) return;
+    const item = &items[id - 1];
+    if (!item.enabled) return;
+    perform(surface, item);
+}
+
 /// For tests: stands in for TrackPopupMenuEx (`track`), given the menu,
 /// its owner and the point on the screen it opens at, and answering the
 /// id of the item chosen, or 0, as `Window.test_set_focus` stands for
@@ -368,7 +475,8 @@ fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
 /// chose, as the command palette performs an entry
 /// (`CommandPalette.perform`).
 ///
-/// The core may always be re-entered here: the menu opens only for a
+/// The core may always be re-entered here: a tab's menu opens only
+/// while it may be (`showTab`), and a terminal's only for a
 /// release that reached the core (`consumed` in `Surface.handleMessage`),
 /// which `Surface.syncMouse` lets through only while
 /// `App.canReenterCore`. Nothing between that and here changes it:
@@ -378,11 +486,11 @@ fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
 /// `ticking` as it returns. Were it ever not so, the item is dropped with
 /// a warning rather than performed under a core frame or a prompt.
 ///
-/// Copy, Paste, Clear, Reset, Read-only, Close Split, Close Tab, Close
-/// Window and Open Configuration take effect at once, a close posting its
-/// teardown or asking first (`Surface.close`, `Window.requestClose`). The
-/// splits, New Tab, New Window, the two title prompts and Reload
-/// Configuration are recorded by `App.performAction` itself, as they are
+/// Copy, Paste, Clear, Reset, Read-only, Close Split, the tab closes,
+/// Close Window and Open Configuration take effect at once, a close
+/// posting its teardown or asking first (`Surface.close`,
+/// `Window.requestClose`). The splits, New Tab, New Window, Move Tab to
+/// New Window, the title prompts and Reload Configuration are recorded by `App.performAction` itself, as they are
 /// from a key's binding (`App.requests`), and made by `run` once the
 /// terminal's handler has returned.
 fn perform(surface: *Surface, item: *const Item) void {
@@ -429,7 +537,7 @@ fn append(menu: win32.HMENU, flags: win32.UINT, id: win32.UINT_PTR, text: ?win32
 /// The menu of `items`: their sections divided by lines, each submenu a
 /// popup in the section of its items. Null, with nothing left of what
 /// was made, if Windows cannot make it.
-fn build(items: *const [count]Item) ?win32.HMENU {
+fn build(items: []const Item) ?win32.HMENU {
     const menu = createMenu() orelse {
         log.warn("cannot make a context menu err={}", .{win32.GetLastError()});
         return null;
@@ -443,7 +551,7 @@ fn build(items: *const [count]Item) ?win32.HMENU {
 
 /// Put `items` in `menu`: null, or the error the call that failed left,
 /// read before anything is destroyed.
-fn fill(menu: win32.HMENU, items: *const [count]Item) ?win32.Win32Error {
+fn fill(menu: win32.HMENU, items: []const Item) ?win32.Win32Error {
     var i: usize = 0;
     while (i < items.len) {
         const first = &items[i];
@@ -517,6 +625,40 @@ test "win32: the context menu greys Copy without a selection and checks Read-onl
                 try testing.expect(!item.checked);
             }
         }
+    }
+}
+
+test "win32: a tab's menu greys what would do nothing where the tab is" {
+    var set: Binding.Set = .{};
+    defer set.deinit(testing.allocator);
+    // Label, then enabled for: the only tab; the first of three; the
+    // middle one; the last one.
+    const want = [_]struct { []const u8, [4]bool }{
+        .{ "Close Tab", .{ true, true, true, true } },
+        .{ "Close Other Tabs", .{ false, true, true, true } },
+        .{ "Close Tabs to the Right", .{ false, true, true, false } },
+        .{ "Move Tab to New Window", .{ false, true, true, true } },
+        .{ "Change Tab Title\u{2026}", .{ true, true, true, true } },
+    };
+    const states = [4]TabState{
+        .{ .index = 0, .tabs = 1 },
+        .{ .index = 0, .tabs = 3 },
+        .{ .index = 1, .tabs = 3 },
+        .{ .index = 2, .tabs = 3 },
+    };
+    for (states, 0..) |state, s| {
+        const items = tabMenuItems(state, &set);
+        try testing.expectEqual(want.len, items.len);
+        for (want, &items, 1..) |w, *item, id| {
+            try testing.expectEqualStrings(w[0], item.label);
+            try testing.expectEqual(w[1][s], item.enabled);
+            try testing.expectEqual(id, item.id);
+            try testing.expect(!item.checked);
+            try testing.expect(item.submenu == null);
+        }
+        // Lines after the closes and after the move.
+        try testing.expectEqual(items[2].section + 1, items[3].section);
+        try testing.expectEqual(items[3].section + 1, items[4].section);
     }
 }
 
