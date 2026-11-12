@@ -1229,6 +1229,12 @@ fn textWidth(hdc: win32.HDC, alloc: Allocator, text: []const u8) i32 {
     if (text.len == 0) return 0;
     const wide = wideFromUtf8(alloc, text) catch return 0;
     defer alloc.free(wide);
+    return wideWidth(hdc, wide);
+}
+
+/// `textWidth` of text already in UTF-16, as it is drawn.
+fn wideWidth(hdc: win32.HDC, wide: []const u16) i32 {
+    if (wide.len == 0) return 0;
     var r: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
     _ = win32.DrawTextW(hdc, wide.ptr, @intCast(wide.len), &r, win32.DT_SINGLELINE | win32.DT_NOPREFIX | win32.DT_CALCRECT);
     return r.right - r.left;
@@ -2080,7 +2086,7 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
     // The shortcut's width first, as the title gives way to it.
     const shortcut = wideFromUtf8(alloc, entry.shortcut) catch null;
     defer if (shortcut) |s| alloc.free(s);
-    const row = Row.init(m, dis.rcItem, p.heights, textWidth(hdc, alloc, entry.shortcut));
+    const row = Row.init(m, dis.rcItem, p.heights, if (shortcut) |s| wideWidth(hdc, s) else 0);
     if (selected or hovered) roundFill(hdc, row.fill, m.row_corner, if (selected) look.selected else look.hover);
     _ = win32.SetTextColor(hdc, look.dim);
     if (shortcut) |s| if (s.len > 0) {
@@ -2130,7 +2136,7 @@ fn drawSpanned(
         defer alloc.free(wide);
         var at: RECT = .{ .left = x, .top = r.top, .right = r.right, .bottom = r.bottom };
         _ = win32.DrawTextW(hdc, wide.ptr, @intCast(wide.len), &at, flags | win32.DT_END_ELLIPSIS);
-        x += textWidth(hdc, alloc, piece);
+        x += wideWidth(hdc, wide);
     }
 }
 
