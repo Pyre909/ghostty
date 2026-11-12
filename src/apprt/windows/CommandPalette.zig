@@ -421,20 +421,19 @@ fn withFolded(a: Allocator, entry: Entry) Allocator.Error!Entry {
     return e;
 }
 
-/// The indices into `entries` of those that match `query`, into `out`
-/// (cleared first): those whose title matches, then those whose action
-/// key alone does, as macOS ranks a title match over the rest; each kind
-/// in the entries' order. The query is folded here, once (`match`).
+/// The indices into `entries` of those that match `folded`, a query
+/// the caller folded (`fold`), as the rows show its matches with the same
+/// folding (`Entry.spans`), into `out` (cleared first): those whose title
+/// matches, then those whose action key alone does, as macOS ranks a
+/// title match over the rest; each kind in the entries' order.
 pub fn filter(
     alloc: Allocator,
     entries: []const Entry,
-    query: []const u8,
+    folded: []const u8,
     out: *std.ArrayList(u32),
 ) Allocator.Error!void {
     out.clearRetainingCapacity();
     try out.ensureTotalCapacity(alloc, entries.len);
-    const folded = try fold(alloc, query);
-    defer alloc.free(folded);
     for (entries, 0..) |*entry, i| {
         if (match(entry, folded) == .title) out.appendAssumeCapacity(@intCast(i));
     }
@@ -1467,14 +1466,20 @@ fn refill(window: *Window, query: []const u8) bool {
     const list = p.list orelse return false;
     const entries = p.entries orelse return false;
     const alloc = window.app.core_app.alloc;
-    filter(alloc, entries.items, query, &p.shown) catch |err| {
+    // Folded once, for the filter and for the matches the rows show; with
+    // no memory, no rows, and no query to show matches of.
+    alloc.free(p.query);
+    p.query = &.{};
+    if (fold(alloc, query)) |folded| {
+        p.query = folded;
+        filter(alloc, entries.items, folded, &p.shown) catch |err| {
+            log.warn("cannot filter the command palette err={}", .{err});
+            p.shown.clearRetainingCapacity();
+        };
+    } else |err| {
         log.warn("cannot filter the command palette err={}", .{err});
         p.shown.clearRetainingCapacity();
-    };
-    // No query to show matches of, rather than the last one's.
-    const folded: []const u8 = fold(alloc, query) catch &.{};
-    alloc.free(p.query);
-    p.query = folded;
+    }
     unhover(window);
     _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 0, 0);
     _ = win32.SendMessageW(list, win32.LB_RESETCONTENT, 0, 0);
@@ -2674,7 +2679,9 @@ test "win32: the palette sorts as GTK's does" {
 fn testFiltered(buf: []u8, entries: []const Entry, query: []const u8) ![]const u8 {
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(testing.allocator);
-    try filter(testing.allocator, entries, query, &out);
+    const folded = try fold(testing.allocator, query);
+    defer testing.allocator.free(folded);
+    try filter(testing.allocator, entries, folded, &out);
     var w: std.Io.Writer = .fixed(buf);
     for (out.items, 0..) |i, n| {
         if (n > 0) try w.writeByte('|');
@@ -2849,7 +2856,7 @@ test "win32: the palette's filter narrows as the query grows, and keeps the orde
             const query = query_buf[0..n];
             const folded = try fold(alloc, query);
             defer alloc.free(folded);
-            try filter(alloc, items, query, &next);
+            try filter(alloc, items, folded, &next);
             // Narrower: everything in `next` was in `prev`.
             for (next.items) |i| try testing.expect(std.mem.indexOfScalar(u32, prev.items, i) != null);
             // Exactly the matches, title matches first, each kind in order.
