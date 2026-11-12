@@ -10651,6 +10651,16 @@ test "win32: a double click on a tab's label edits its title in place" {
     try std.testing.expectEqual(@intFromPtr(back), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
     try std.testing.expectEqual(line, window.bar.editor.line);
 
+    // Ctrl+Backspace deletes a word, and puts no U+007F in the title; Tab
+    // puts nothing in it.
+    _ = win32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("New word"));
+    _ = win32.SendMessageW(edit, win32.EM_SETSEL, 8, 8);
+    _ = win32.SendMessageW(edit, win32.WM_CHAR, 0x7F, 0);
+    _ = win32.SendMessageW(edit, win32.WM_CHAR, '\t', 0);
+    const kept: usize = @intCast(win32.GetWindowTextW(edit, &text, text.len));
+    try std.testing.expect(kept < 8);
+    try std.testing.expect(std.mem.indexOfAny(u16, text[0..kept], &.{ 0x7F, '\t' }) == null);
+
     // Enter commits it.
     _ = win32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("New"));
     _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);

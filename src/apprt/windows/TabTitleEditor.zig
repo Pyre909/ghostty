@@ -212,10 +212,12 @@ test "win32: a tab title field is centred on its label, a line high" {
     try std.testing.expectEqual(label, fieldRect(label, 40));
 }
 
-/// The field's subclass: Enter commits and Escape cancels, each giving
-/// the shown tab's terminal the focus back; their WM_CHARs, which a
-/// single-line EDIT beeps at, are dropped. The focus leaving it otherwise
-/// commits it, the focus left where it went.
+/// The field's subclass: its keys as the other fields' (`SearchBar.editKey`).
+/// Enter commits and Escape cancels, each giving the shown tab's terminal
+/// the focus back; the WM_CHARs a single-line EDIT beeps at or would put
+/// in the title (Tab, Ctrl+Backspace's U+007F) are dropped, and
+/// Ctrl+Backspace deletes a word. The focus leaving it otherwise commits
+/// it, the focus left where it went.
 fn editProc(
     hwnd: win32.HWND,
     msg: win32.UINT,
@@ -226,19 +228,23 @@ fn editProc(
     defer App.handler_depth -= 1;
     const proc = edit_proc.?;
     const window = windowOf(hwnd) orelse return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
-    switch (msg) {
-        win32.WM_KEYDOWN => if (wparam == win32.VK_RETURN or wparam == win32.VK_ESCAPE) {
-            finish(window, if (wparam == win32.VK_RETURN) .commit else .cancel);
+    if (msg == win32.WM_KILLFOCUS) {
+        const result = win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
+        if (window.bar.editor.edit == hwnd) finish(window, .commit);
+        return result;
+    }
+    switch (SearchBar.editKey(msg, wparam, false)) {
+        .pass => {},
+        .swallow => return 0,
+        .next, .previous, .close => |key| {
+            finish(window, if (key == .close) .cancel else .commit);
             if (window.tab().focused) |s| window.setKeyboardFocus(s.hwnd, true);
             return 0;
         },
-        win32.WM_CHAR => if (wparam == '\r' or wparam == 0x1B) return 0,
-        win32.WM_KILLFOCUS => {
-            const result = win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
-            if (window.bar.editor.edit == hwnd) finish(window, .commit);
-            return result;
+        .delete_word => {
+            SearchBar.deleteWord(window.app.core_app.alloc, hwnd);
+            return 0;
         },
-        else => {},
     }
     return win32.CallWindowProcW(proc, hwnd, msg, wparam, lparam);
 }
