@@ -17038,6 +17038,9 @@ test "win32: an unfocused split is dimmed by its fill at one less its opacity, o
     try std.testing.expect(win32.GetWindow(b.hwnd, win32.GW_HWNDPREV) == dim);
     try std.testing.expectEqual(try paneClient(window, b), try childRect(window, dim));
     try std.testing.expectEqual(77, Alpha.last);
+    // Passed over by every hit test, another process's too.
+    const see_through: isize = win32.WS_EX_TRANSPARENT;
+    try std.testing.expect(win32.GetWindowLongPtrW(dim, win32.GWL_EXSTYLE) & see_through != 0);
     {
         const printed = try Printed.of(dim);
         defer printed.deinit();

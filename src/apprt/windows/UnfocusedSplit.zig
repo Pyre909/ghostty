@@ -14,8 +14,12 @@
 //! handle. Unlike the others it is see-through: a layered window, at the
 //! alpha the opacity gives (`alphaOf`), which DWM blends with the
 //! terminal's swap chain under it. One that cannot be layered is not
-//! shown, as it would hide the terminal. The pointer and clicks over it go
-//! to the terminal, as macOS's takes none (`allowsHitTesting(false)`).
+//! shown, as it would hide the terminal. The pointer, clicks and drops
+//! over it go to the terminal, as macOS's takes none
+//! (`allowsHitTesting(false)`): it is WS_EX_TRANSPARENT, which every hit
+//! test passes over in a layered window, another process's too, such as
+//! Explorer's as it drags files; the HTTRANSPARENT all overlays answer
+//! counts only on Ghostty's own thread.
 //! Its window is made the first time it shows (`sync`).
 
 const std = @import("std");
@@ -128,6 +132,10 @@ pub fn sync(surface: *Surface, config: *const Config) void {
             self.on = false;
             return;
         };
+        // Passed over by every hit test once layered (the file's doc).
+        const style = win32.GetWindowLongPtrW(made, win32.GWL_EXSTYLE);
+        const see_through: isize = win32.WS_EX_TRANSPARENT;
+        _ = win32.SetWindowLongPtrW(made, win32.GWL_EXSTYLE, style | see_through);
         self.hwnd = made;
         self.alpha = 0;
         break :made made;

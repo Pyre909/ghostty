@@ -172,6 +172,7 @@ pub const WS_EX_TOPMOST: DWORD = 0x00000008;
 /// The window takes files dropped on it (WM_DROPFILES), as
 /// DragAcceptFiles sets.
 pub const WS_EX_ACCEPTFILES: DWORD = 0x00000010;
+pub const WS_EX_TRANSPARENT: DWORD = 0x00000020;
 /// Not in the taskbar or in the Alt+Tab switcher.
 /// https://learn.microsoft.com/en-us/windows/win32/winmsg/extended-window-styles
 pub const WS_EX_TOOLWINDOW: DWORD = 0x00000080;
