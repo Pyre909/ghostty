@@ -23150,6 +23150,46 @@ test "win32: the command palette gives the focus its own window gets to its fiel
     try std.testing.expectEqual(p.edit.?, FocusSeen.last.?);
 }
 
+test "win32: the command palette gives its frame's system keys to its frame" {
+    // The field's Alt+Space and an Alt+F4 no binding took reach the
+    // palette, its top-level window, as WM_SYSCOMMAND: the palette closes
+    // and the frame carries them out; a bare Alt does nothing.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    const p = &window.palette;
+    try togglePalette(&app, a);
+
+    // A bare Alt: nothing, the palette open.
+    try std.testing.expectEqual(0, win32.SendMessageW(p.hwnd.?, win32.WM_SYSCOMMAND, win32.SC_KEYMENU, 0));
+    try std.testing.expect(p.hwnd != null and p.open);
+
+    // Alt+F4: the palette closes, and the frame closes, with nothing to
+    // ask, rather than the palette alone.
+    try std.testing.expect(!window.closing);
+    _ = win32.SendMessageW(p.hwnd.?, win32.WM_SYSCOMMAND, win32.SC_CLOSE, 0);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(window.closing);
+    TestQuick.tearDown();
+    try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, window) == null);
+}
+
 test "win32: the wheel over the command palette scrolls its list, and a modified one returns" {
     // A plain notch over the list or the field scrolls the list. The system
     // list hands a wheel it does not take (one with Ctrl or Shift) to its

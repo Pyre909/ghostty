@@ -340,6 +340,7 @@ pub const MA_NOACTIVATE: LRESULT = 3;
 /// them before comparing.
 pub const SC_MASK: WPARAM = 0xFFF0;
 pub const SC_MAXIMIZE: WPARAM = 0xF030;
+pub const SC_CLOSE: WPARAM = 0xF060;
 pub const SC_KEYMENU: WPARAM = 0xF100;
 pub const SC_RESTORE: WPARAM = 0xF120;
 

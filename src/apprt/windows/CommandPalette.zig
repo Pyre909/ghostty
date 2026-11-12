@@ -1729,6 +1729,25 @@ pub fn wndProc(
             return 0;
         },
 
+        // The field's Alt+Space, for the window menu, and an Alt+F4 that
+        // no binding took (SC_CLOSE), come here, the field's top-level
+        // window: they are the frame's, as with the focus in a terminal.
+        // The palette, which has no window menu, closes, and the frame
+        // carries them out. A bare Alt or F10 does nothing, as on the
+        // frame (`Window.isBareKeyMenu`).
+        win32.WM_SYSCOMMAND => {
+            if (Window.isBareKeyMenu(wparam, lparam)) return 0;
+            switch (wparam & win32.SC_MASK) {
+                win32.SC_KEYMENU, win32.SC_CLOSE => {
+                    const frame = window.hwnd;
+                    // Frees the palette: nothing of it is read after.
+                    close(window);
+                    return win32.SendMessageW(frame, msg, wparam, lparam);
+                },
+                else => {},
+            }
+        },
+
         WM_PALETTE_CLOSE => {
             // Deactivated itself; or its frame was, unless the frame or
             // the palette was activated meanwhile.
