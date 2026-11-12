@@ -1671,11 +1671,11 @@ pub const LB_GETCURSEL: UINT = 0x0188;
 pub const LB_GETCOUNT: UINT = 0x018B;
 pub const LB_GETTOPINDEX: UINT = 0x018E;
 pub const LB_SETTOPINDEX: UINT = 0x0197;
+pub const LB_GETITEMRECT: UINT = 0x0198;
 pub const LB_GETITEMDATA: UINT = 0x0199;
 pub const LB_SETITEMDATA: UINT = 0x019A;
 pub const LB_SETITEMHEIGHT: UINT = 0x01A0;
 pub const LB_GETITEMHEIGHT: UINT = 0x01A1;
-pub const LB_GETITEMRECT: UINT = 0x0198;
 pub const LB_ITEMFROMPOINT: UINT = 0x01A9;
 pub const LB_ERR: LRESULT = -1;
 /// DRAWITEMSTRUCT's itemState: the item is selected.

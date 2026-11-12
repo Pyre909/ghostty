@@ -3252,8 +3252,7 @@ pub fn setKeyboardFocus(self: *const Window, hwnd: win32.HWND, active_only: bool
 /// active window.
 fn holdsActivation(self: *const Window) bool {
     const active = win32.GetActiveWindow() orelse return false;
-    if (active == self.hwnd) return true;
-    return self.palette.hwnd != null and active == self.palette.hwnd.?;
+    return active == self.hwnd or active == self.palette.hwnd;
 }
 
 /// The focus move `start_search` or `end_search` asked for

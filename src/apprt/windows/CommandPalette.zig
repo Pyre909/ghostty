@@ -641,9 +641,9 @@ fn writeKey(w: *std.Io.Writer, key: input.Key) std.Io.Writer.Error!void {
 // description or the action key) with the shortcut on the right, the
 // selected row on a rounded tint; the palette is as tall as its rows, up
 // to five, or says "No matches". The LISTBOX keeps each title as its
-// item's text, for accessibility, and the entry's index as its data. The keyboard stays in the field: Up, Down, PgUp and PgDn
-// move the selection, Enter runs it, Escape closes; a click on a row runs
-// it.
+// item's text, for accessibility, and the entry's index as its data.
+// The keyboard stays in the field: Up, Down, PgUp and PgDn move the
+// selection, Enter runs it, Escape closes; a click on a row runs it.
 //
 // One per window (`Window.palette`), for the terminal with the focus in
 // its shown tab (`focusMoved`), which gets the focus back when it closes.
@@ -1097,6 +1097,8 @@ fn applyFrame(window: *Window) void {
 fn applyBorder(window: *Window) void {
     const hwnd = window.palette.hwnd orelse return;
     const border: win32.COLORREF = lookOf(window).border;
+    // Not logged: a Windows that has no border colour refuses it each
+    // time, and this runs as the palette moves and refits.
     _ = win32.DwmSetWindowAttribute(hwnd, win32.DWMWA_BORDER_COLOR, &border, @sizeOf(win32.COLORREF));
 }
 

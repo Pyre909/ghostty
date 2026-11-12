@@ -23261,11 +23261,10 @@ test "win32: the wheel over the command palette scrolls its list, and a modified
 
 test "win32: the command palette's tooltip follows the row under the pointer, and goes with the palette" {
     // The pointer over a row puts that row's description in the tooltip,
-    // if the row cuts it short;
-    // a refill, a scroll or the pointer leaving the list forgets the row.
-    // Without a tooltip, which a process with no Common Controls v6
-    // manifest may not get, all of it works the same. The tooltip, owned
-    // by the frame, is destroyed with the palette.
+    // if the row cuts it short; a refill, a scroll or the pointer leaving
+    // the list forgets the row. Without a tooltip, which a process with no
+    // Common Controls v6 manifest may not get, all of it works the same.
+    // The tooltip, owned by the palette's window, is destroyed with it.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
