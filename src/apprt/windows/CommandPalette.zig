@@ -2787,7 +2787,7 @@ test "win32: a palette row bolds a match in its title, else in its action key wh
     // The title's match, and none on the second line.
     try testing.expectEqual(Spans{ .title = .{ .start = 0, .end = 5 } }, entries[0].spans(folded));
     // A match in the action key alone, its second line: there.
-    try testing.expectEqual(Spans{ .subtitle = .{ .start = 0, .end = 6 } }, entries[1].spans(try fold(a, "RELOAD_")));
+    try testing.expectEqual(Spans{ .subtitle = .{ .start = 0, .end = 7 } }, entries[1].spans(try fold(a, "RELOAD_")));
     try testing.expectEqualStrings("reload_config", entries[1].subtitle());
     // A match in the action key alone under a description, which the
     // second line shows: none.
