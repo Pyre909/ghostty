@@ -22,6 +22,7 @@ const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
+const TabTitleEditor = @import("TabTitleEditor.zig");
 
 const RECT = win32.RECT;
 const L = win32.L;
@@ -71,6 +72,8 @@ pub const Bar = struct {
     /// The window's tab overview while it is open (TabOverview.zig),
     /// which shows the same labels: drawn again whenever the bar is.
     overview: ?win32.HWND = null,
+    /// A tab's title edited in place on its label (TabTitleEditor.zig).
+    editor: TabTitleEditor.Editor = .{},
     font: ?win32.HGDIOBJ = null,
     font_dpi: u32 = 0,
 
@@ -82,7 +85,9 @@ pub const Bar = struct {
             0,
             L(class_name),
             null,
-            win32.WS_CHILD | win32.WS_CLIPSIBLINGS,
+            // Clipping its children: the title field (`editor`) shows over
+            // what the bar paints.
+            win32.WS_CHILD | win32.WS_CLIPSIBLINGS | win32.WS_CLIPCHILDREN,
             0,
             0,
             0,
@@ -118,7 +123,19 @@ pub const Bar = struct {
         self.right = null;
         self.endDrag();
         self.rehover(window);
+        self.placeEditor(window);
         self.invalidate();
+    }
+
+    /// Keep the title field over its tab's label, wherever the tab now
+    /// is, or end it if the tab left (`TabTitleEditor.place`).
+    pub fn placeEditor(self: *Bar, window: *Window) void {
+        const t = self.editor.tab orelse return;
+        const hwnd = self.hwnd orelse return;
+        const index = std.mem.indexOfScalar(*Window.Tab, window.tabs.items, t) orelse
+            return TabTitleEditor.place(window, null);
+        const l = layoutOf(window, hwnd);
+        TabTitleEditor.place(window, labelIn(l.m, l.tabRect(index)));
     }
 
     /// A left press at `at` on the label of tab `index`, once the click
@@ -257,7 +274,7 @@ pub const Bar = struct {
     /// The font for `dpi` (`messageFont`), made once for each DPI. The new
     /// one is made before the old one goes, which is kept if it cannot be:
     /// the next paint tries again.
-    fn fontFor(self: *Bar, dpi: u32) ?win32.HGDIOBJ {
+    pub fn fontFor(self: *Bar, dpi: u32) ?win32.HGDIOBJ {
         if (self.font != null and self.font_dpi == dpi) return self.font;
         const font = messageFont(dpi) orelse return self.font;
         self.freeFont();
@@ -512,6 +529,20 @@ pub fn wndProc(
                 window.clickNewTab();
                 return 0;
             }
+            // On a tab's label, its title is edited in place, as macOS's
+            // double click on a tab's title edits it. The first press
+            // showed the tab, and its press, which no drag followed, has
+            // come up.
+            if (msg == win32.WM_LBUTTONDBLCLK) switch (at) {
+                .tab => |index| {
+                    bar.pressed = .none;
+                    bar.endDrag();
+                    const l = layoutOf(window, hwnd);
+                    TabTitleEditor.begin(window, index, labelIn(l.m, l.tabRect(index)));
+                    return 0;
+                },
+                else => {},
+            };
             // Captured first: SetCapture sends WM_CAPTURECHANGED to the
             // window that loses it, which cancels a press.
             if (at != .none and win32.GetCapture() != hwnd) _ = win32.SetCapture(hwnd);
@@ -629,8 +660,19 @@ pub fn wndProc(
             return 0;
         },
 
+        // The title field in the shown tab's colours, as its label is drawn.
+        win32.WM_CTLCOLOREDIT => {
+            const colors = Colors.of(window.dark_frame);
+            const hdc: win32.HDC = @ptrFromInt(wparam);
+            _ = win32.SetTextColor(hdc, colors.text);
+            _ = win32.SetBkColor(hdc, colors.shown);
+            const brush = bar.editor.brushOf(colors.shown) orelse return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
+            return @bitCast(@intFromPtr(brush));
+        },
+
         win32.WM_DESTROY => {
             bar.endDrag();
+            bar.editor.deinit();
             bar.freeFont();
             // Nothing draws into, or places, a destroyed window.
             bar.hwnd = null;
@@ -668,6 +710,8 @@ fn tabAt(at: Hit) ?usize {
 }
 
 fn paint(window: *Window, hwnd: win32.HWND) void {
+    // Before painting: a move of the field invalidates what it uncovers.
+    window.bar.placeEditor(window);
     var ps: win32.PAINTSTRUCT = undefined;
     const hdc = win32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = win32.EndPaint(hwnd, &ps);
@@ -748,12 +792,7 @@ fn drawTab(
 
     // The title, cut short with an ellipsis where it does not fit.
     var close = closeIn(l.m, r);
-    var text_rect: RECT = .{
-        .left = r.left + l.m.pad,
-        .top = r.top,
-        .right = close.left - @divTrunc(l.m.pad, 2),
-        .bottom = r.bottom,
-    };
+    var text_rect = labelIn(l.m, r);
     _ = win32.SetTextColor(hdc, if (shown) colors.text else colors.dim);
     const alloc = window.app.core_app.alloc;
     const title = window.shownTitle(alloc, t) catch null;
@@ -921,6 +960,18 @@ pub const Layout = struct {
 
 /// The close glyph's box in a tab at `r`: `m.close` square, inset `m.pad`
 /// from its right edge, centred down the bar.
+/// Where a tab at `r` draws its title: from its padding to its close
+/// glyph, all of its height. Its title field goes there
+/// (`TabTitleEditor`).
+fn labelIn(m: Metrics, r: RECT) RECT {
+    return .{
+        .left = r.left + m.pad,
+        .top = r.top,
+        .right = closeIn(m, r).left - @divTrunc(m.pad, 2),
+        .bottom = r.bottom,
+    };
+}
+
 fn closeIn(m: Metrics, r: RECT) RECT {
     const top = @divTrunc(m.height - m.close, 2);
     return .{

@@ -46,6 +46,7 @@ const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
 const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
+const TabTitleEditor = @import("TabTitleEditor.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const input_pane = @import("input_pane.zig");
@@ -10527,6 +10528,166 @@ test "win32: a right click on a tab opens its menu, whose items act on that tab"
     try std.testing.expectEqualStrings("", PaletteSeen.take());
     testTeardowns();
     try std.testing.expectEqual(2, window.tabs.items.len);
+}
+
+/// For tests: the label of the tab at `index` of `window`'s bar, in its
+/// client area, as the bar draws it.
+fn testLabel(window: *Window, index: usize) win32.RECT {
+    const layout = testBarLayout(window);
+    const r = layout.tabRect(index);
+    const close = layout.closeRect(index);
+    return .{ .left = r.left + layout.m.pad, .top = r.top, .right = close.left - @divTrunc(layout.m.pad, 2), .bottom = r.bottom };
+}
+
+/// For tests: a double click on the bar of `window` at `at`.
+fn testDoubleClick(window: *Window, at: win32.LPARAM) void {
+    const bar = window.bar.hwnd.?;
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, win32.MK_LBUTTON, at);
+    _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, at);
+}
+
+/// For tests: the tab title field's place in its bar's client area.
+fn testFieldRect(window: *Window) !win32.RECT {
+    const edit = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    var r: win32.RECT = undefined;
+    if (!win32.GetWindowRect(edit, &r).toBool()) return error.TestUnexpectedResult;
+    var at: win32.POINT = .{ .x = r.left, .y = r.top };
+    _ = win32.ScreenToClient(window.bar.hwnd.?, &at);
+    return .{ .left = at.x, .top = at.y, .right = at.x + r.right - r.left, .bottom = at.y + r.bottom - r.top };
+}
+
+test "win32: a double click on a tab's label edits its title in place" {
+    // The field opens over the label, centred on it, with the tab's own
+    // title all selected and the focus. Enter commits it, Escape cancels,
+    // the focus leaving commits it, an empty one ends the tab's own title;
+    // Enter and Escape give the shown tab's terminal the focus back. It
+    // follows its tab as the tabs change, and goes, committing nothing,
+    // with its tab. A second one commits the first. A field Windows cannot
+    // make opens the title prompt instead.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    SearchBar.test_perform = &PaletteSeen.seen;
+    defer SearchBar.test_perform = null;
+    PaletteSeen.reset(null);
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = try testTab(&app, window);
+    _ = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.selectTab(0);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    const second = window.tabs.items[1];
+    const third = window.tabs.items[2];
+    try std.testing.expect(window.setTabTitle(second.focused.?, "Old"));
+
+    // The second tab: shown by the first press, then edited.
+    testDoubleClick(window, testMid(testLabel(window, 1)));
+    try std.testing.expectEqual(1, window.selected);
+    const edit = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    try std.testing.expect(window.bar.editor.tab == second);
+    try std.testing.expect(win32.GetAncestor(edit, win32.GA_PARENT) == bar);
+    try std.testing.expect(FocusSeen.last == edit);
+    try std.testing.expect(win32.GetCapture() == null);
+    const label = testLabel(window, 1);
+    const field = try testFieldRect(window);
+    try std.testing.expectEqual(label.left, field.left);
+    try std.testing.expectEqual(label.right, field.right);
+    try std.testing.expect(field.top >= label.top and field.bottom <= label.bottom);
+    try std.testing.expect(field.bottom - field.top > 0);
+    // Centred, to a pixel.
+    try std.testing.expect(@abs((field.top - label.top) - (label.bottom - field.bottom)) <= 1);
+    var text: [64]u16 = undefined;
+    const n: usize = @intCast(win32.GetWindowTextW(edit, &text, text.len));
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("Old"), text[0..n]);
+    var from: u32 = 9;
+    var to: u32 = 9;
+    _ = win32.SendMessageW(edit, win32.EM_GETSEL, @intFromPtr(&from), @bitCast(@intFromPtr(&to)));
+    try std.testing.expectEqual(0, from);
+    try std.testing.expectEqual(3, to);
+
+    // Enter commits it.
+    _ = win32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("New"));
+    _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);
+    try std.testing.expect(window.bar.editor.edit == null);
+    try std.testing.expect(!win32.IsWindow(edit).toBool());
+    try std.testing.expectEqualStrings("New", second.title_override.?);
+    try std.testing.expect(FocusSeen.last == second.focused.?.hwnd);
+
+    // Escape cancels it.
+    testDoubleClick(window, testMid(testLabel(window, 1)));
+    var e = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    _ = win32.SetWindowTextW(e, std.unicode.utf8ToUtf16LeStringLiteral("Dropped"));
+    _ = win32.SendMessageW(e, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0);
+    try std.testing.expect(window.bar.editor.edit == null);
+    try std.testing.expectEqualStrings("New", second.title_override.?);
+    try std.testing.expect(FocusSeen.last == second.focused.?.hwnd);
+
+    // The focus leaving commits it; empty, the tab's own title ends.
+    testDoubleClick(window, testMid(testLabel(window, 1)));
+    e = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    _ = win32.SetWindowTextW(e, std.unicode.utf8ToUtf16LeStringLiteral(""));
+    FocusSeen.last = null;
+    _ = win32.SendMessageW(e, win32.WM_KILLFOCUS, 0, 0);
+    try std.testing.expect(window.bar.editor.edit == null);
+    try std.testing.expect(second.title_override == null);
+    try std.testing.expect(FocusSeen.last == null);
+
+    // A second edit commits the first.
+    testDoubleClick(window, testMid(testLabel(window, 1)));
+    e = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    _ = win32.SetWindowTextW(e, std.unicode.utf8ToUtf16LeStringLiteral("Kept"));
+    testDoubleClick(window, testMid(testLabel(window, 2)));
+    try std.testing.expectEqualStrings("Kept", second.title_override.?);
+    try std.testing.expect(window.bar.editor.tab == third);
+
+    // The first tab closes: the third's field follows it to its place.
+    try std.testing.expect(window.closeTabs(0, .this));
+    testTeardowns();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(window.bar.editor.tab == third);
+    const moved = try testFieldRect(window);
+    try std.testing.expectEqual(testLabel(window, 1).left, moved.left);
+
+    // Its own tab closes: it goes, committing nothing.
+    e = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    _ = win32.SetWindowTextW(e, std.unicode.utf8ToUtf16LeStringLiteral("Gone"));
+    const third_surface = third.focused.?;
+    const fourth = try testTab(&app, window);
+    window.relayout();
+    try std.testing.expect(window.closeTabs(1, .this));
+    try std.testing.expect(third_surface.closing);
+    // Until the tab leaves, at its teardown.
+    try std.testing.expect(window.bar.editor.edit == e);
+    testTeardowns();
+    try std.testing.expect(window.bar.editor.edit == null);
+    try std.testing.expect(!win32.IsWindow(e).toBool());
+    try std.testing.expect(fourth.window == window);
+    try std.testing.expectEqual(2, window.tabs.items.len);
+
+    // No field: the title prompt instead.
+    TabTitleEditor.test_fail_create = true;
+    defer TabTitleEditor.test_fail_create = false;
+    PaletteSeen.reset(null);
+    testDoubleClick(window, testMid(testLabel(window, 0)));
+    try std.testing.expect(window.bar.editor.edit == null);
+    try std.testing.expect(PaletteSeen.on == window.tabs.items[0].focused.?);
+    try std.testing.expectEqualStrings("prompt_tab_title;", PaletteSeen.take());
 }
 
 test "win32: a click on a tab waits for run under a prompt, from a live terminal" {

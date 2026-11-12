@@ -220,6 +220,13 @@
 //! click on a terminal's scroll bar shows the bar's own menu instead, and
 //! none while the bar is disabled (see Scrollbar).
 //!
+//! A right click on a tab's label in the tab bar shows that tab's menu
+//! (`ContextMenu.showTab`): macOS's Close Tab, Close Other Tabs and Close
+//! Tabs to the Right, GTK's Move Tab to New Window and Change Tab Title…,
+//! each performed on the tab clicked, which stays where it was. A double
+//! click on a tab's label edits its title in place, as macOS's does
+//! (`TabTitleEditor`).
+//!
 //! ## Scrollbar
 //!
 //! With `scrollbar = system`, the default, each terminal's window has its
@@ -420,6 +427,7 @@ test {
     _ = @import("windows/Tab.zig");
     _ = @import("windows/TabBar.zig");
     _ = @import("windows/TabOverview.zig");
+    _ = @import("windows/TabTitleEditor.zig");
     _ = @import("windows/TitleDialog.zig");
     _ = @import("windows/Transparency.zig");
     _ = @import("windows/Undo.zig");
