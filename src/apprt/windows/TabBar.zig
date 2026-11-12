@@ -994,6 +994,16 @@ pub const Layout = struct {
 
 /// The close glyph's box in a tab at `r`: `m.close` square, inset `m.pad`
 /// from its right edge, centred down the bar.
+fn closeIn(m: Metrics, r: RECT) RECT {
+    const top = @divTrunc(m.height - m.close, 2);
+    return .{
+        .left = r.right - m.pad - m.close,
+        .top = top,
+        .right = r.right - m.pad,
+        .bottom = top + m.close,
+    };
+}
+
 /// Where a tab at `r` draws its title: from its padding to its close
 /// glyph, all of its height. Its title field goes there
 /// (`TabTitleEditor`).
@@ -1003,16 +1013,6 @@ fn labelIn(m: Metrics, r: RECT) RECT {
         .top = r.top,
         .right = closeIn(m, r).left - @divTrunc(m.pad, 2),
         .bottom = r.bottom,
-    };
-}
-
-fn closeIn(m: Metrics, r: RECT) RECT {
-    const top = @divTrunc(m.height - m.close, 2);
-    return .{
-        .left = r.right - m.pad - m.close,
-        .top = top,
-        .right = r.right - m.pad,
-        .bottom = top + m.close,
     };
 }
 

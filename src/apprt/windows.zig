@@ -221,11 +221,11 @@
 //! none while the bar is disabled (see Scrollbar).
 //!
 //! A right click on a tab's label in the tab bar shows that tab's menu
-//! (`ContextMenu.showTab`): macOS's Close Tab, Close Other Tabs and Close
-//! Tabs to the Right, GTK's Move Tab to New Window and Change Tab Title…,
-//! each performed on the tab clicked, which stays where it was. A double
-//! click on a tab's label edits its title in place, as macOS's does
-//! (`TabTitleEditor`).
+//! (`ContextMenu.showTab`): macOS's Close Tab, Close Other Tabs, Close
+//! Tabs to the Right and Move Tab to New Window, and GTK's Change Tab
+//! Title…, each performed on the tab clicked, which stays where it was.
+//! A double click on a tab's label edits its title in place, as macOS's
+//! does (`TabTitleEditor`).
 //!
 //! ## Scrollbar
 //!

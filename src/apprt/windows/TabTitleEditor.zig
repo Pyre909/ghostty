@@ -24,7 +24,6 @@ const builtin = @import("builtin");
 const win32 = @import("win32.zig");
 const App = @import("App.zig").App;
 const Window = @import("Window.zig");
-const Surface = @import("Surface.zig").Surface;
 const SearchBar = @import("SearchBar.zig");
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const editText = @import("clipboard.zig").editText;

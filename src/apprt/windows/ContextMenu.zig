@@ -30,6 +30,10 @@
 //! closes, and its chosen item's action is then performed on it, as the
 //! command palette performs an entry (`perform`), unless the terminal or
 //! its window began to close meanwhile.
+//!
+//! A tab has a menu of its own, for a right click on its label in the tab
+//! bar (`showTab`, `tab_layout`, `tabMenuItems`): built, shown and
+//! performed as the terminal's is, on the clicked tab's focused terminal.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -111,13 +115,14 @@ const layout = [_]Entry{
 };
 
 /// A tab's menu, shown for a right click on its label in the tab bar
-/// (`showTab`): the items macOS adds to its tab's menu
-/// (`configureTabContextMenuIfNeeded` in TerminalWindow.swift), Close Tab,
-/// Close Other Tabs and Close Tabs to the Right; GTK's Move Tab to New
-/// Window, which the tab's drag out of the bar also does; and, as GTK's
-/// tab menu has it (`tab_context_menu` in src/apprt/gtk/ui/1.4/window.blp),
-/// Change Tab Title…, in place of macOS's Rename Tab…, whose title
-/// editor this runtime has on a double click instead (`TabBar`).
+/// (`showTab`): the items of macOS's tab menu, AppKit's own Close Tab,
+/// Close Other Tabs and Move Tab to New Window (which the tab's drag out
+/// of the bar also does), and the Close Tabs to the Right that Ghostty
+/// adds to it (`configureTabContextMenuIfNeeded` in TerminalWindow.swift);
+/// and GTK's only tab menu item, Change Tab Title… (`tab_context_menu` in
+/// src/apprt/gtk/ui/1.4/window.blp), in place of macOS's Rename Tab…,
+/// whose title editor this runtime has on a double click instead
+/// (`TabBar`).
 const tab_layout = [_]Entry{
     .{ .label = "Close Tab", .action = .{ .binding = .{ .close_tab = .this } }, .section = 0 },
     .{ .label = "Close Other Tabs", .action = .{ .binding = .{ .close_tab = .other } }, .section = 0 },
@@ -166,7 +171,7 @@ pub const tab_count = tab_layout.len;
 /// longest key name take less than half of it.
 const shortcut_max = 64;
 
-/// An item of the menu for one terminal (`menuItems`).
+/// An item of a terminal's menu (`menuItems`) or a tab's (`tabMenuItems`).
 pub const Item = struct {
     /// Its command id: its place in the list, from 1, since
     /// TrackPopupMenuEx returns 0 when nothing is chosen.
@@ -177,7 +182,10 @@ pub const Item = struct {
     action: Command,
     section: u8,
     submenu: ?Submenu,
-    /// False for Copy without a selection, shown greyed.
+    /// False where the item would do nothing, shown greyed: Copy without a
+    /// selection; a tab's Close Other Tabs and Move Tab to New Window with
+    /// no other tab, and its Close Tabs to the Right with none to its
+    /// right.
     enabled: bool,
     /// Shown with a check: Read-only, while the terminal is, and Notify on
     /// Next Command Finish, while it is set.
@@ -490,9 +498,10 @@ fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
 /// Close Window and Open Configuration take effect at once, a close
 /// posting its teardown or asking first (`Surface.close`,
 /// `Window.requestClose`). The splits, New Tab, New Window, Move Tab to
-/// New Window, the title prompts and Reload Configuration are recorded by `App.performAction` itself, as they are
-/// from a key's binding (`App.requests`), and made by `run` once the
-/// terminal's handler has returned.
+/// New Window, the title prompts and Reload Configuration are recorded
+/// by `App.performAction` itself, as they are from a key's binding
+/// (`App.requests`), and made by `run` once the terminal's handler has
+/// returned.
 fn perform(surface: *Surface, item: *const Item) void {
     const action = switch (item.action) {
         .binding => |action| action,
