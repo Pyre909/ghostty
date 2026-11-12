@@ -720,8 +720,8 @@ pub const Palette = struct {
     /// While a wheel message is being forwarded to the list (`wndProc`).
     wheeling: bool = false,
     /// The tooltip showing the description of the row under the pointer
-    /// (`hover`), owned by the frame; null where the system could not
-    /// make one.
+    /// (`hover`), owned by the palette's window, which destroys it; null
+    /// where the system could not make one.
     tip: ?win32.HWND = null,
     /// The list's row under the pointer, whose description the tooltip
     /// holds; null while the pointer is off the rows.
@@ -805,11 +805,6 @@ pub const Palette = struct {
 
     /// Free everything, as its window is destroyed.
     fn free(self: *Palette, alloc: Allocator) void {
-        // The tooltip is the palette's own, which DestroyWindow destroys
-        // before the palette (its owned windows first): hence IsWindow.
-        if (self.tip) |t| if (win32.IsWindow(t).toBool()) {
-            _ = win32.DestroyWindow(t);
-        };
         if (self.entries) |*e| e.deinit();
         self.shown.deinit(alloc);
         alloc.free(self.query);
