@@ -937,7 +937,7 @@ pub fn isLight(c: win32.COLORREF) bool {
 /// window's: a pop-up has its own DPI, of the monitor it is on, which for
 /// one just made at the screen's origin is the primary monitor's, and the
 /// palette is drawn for its frame's.
-fn dpiOf(window: *const Window) u32 {
+pub fn dpiOf(window: *const Window) u32 {
     const p = &window.palette;
     return if (p.font_dpi != 0) p.font_dpi else Window.dpiOf(window.app, window.hwnd);
 }

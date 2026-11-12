@@ -3261,7 +3261,7 @@ pub fn setKeyboardFocus(self: *const Window, hwnd: win32.HWND, active_only: bool
 
 /// Whether the frame or its command palette, a pop-up of its own, is the
 /// active window.
-fn holdsActivation(self: *const Window) bool {
+pub fn holdsActivation(self: *const Window) bool {
     const active = activeWindow() orelse return false;
     return active == self.hwnd or active == self.palette.hwnd;
 }

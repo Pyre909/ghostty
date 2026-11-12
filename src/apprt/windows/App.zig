@@ -22722,6 +22722,49 @@ test "win32: the command palette's rows are measured at its frame's DPI, not its
     const row = CommandPalette.Metrics.init(144).rowHeight(p.heights);
     try std.testing.expect(row != CommandPalette.Metrics.init(96).rowHeight(p.heights));
     try std.testing.expectEqual(row, win32.SendMessageW(p.list.?, win32.LB_GETITEMHEIGHT, 0, 0));
+    // And the rest it draws, its padding and the room a row's text has,
+    // at the frame's DPI too, not its own window's.
+    try std.testing.expectEqual(96, Window.dpiOf(&app, p.hwnd.?));
+    try std.testing.expectEqual(144, CommandPalette.dpiOf(window));
+}
+
+test "win32: a frame holds the activation while it or its command palette is the active window" {
+    // A focus moved within the frame (`Window.setKeyboardFocus` with
+    // `active_only`) is moved while the frame or its palette, a pop-up of
+    // its own that is the active window while open, is active: not while
+    // another window is, as SetFocus would activate the frame.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    const Active = struct {
+        var answer: ?win32.HWND = null;
+        fn get() ?win32.HWND {
+            return answer;
+        }
+    };
+    Window.test_get_active = &Active.get;
+    defer Window.test_get_active = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    const other = try testFrame(&app);
+
+    try togglePalette(&app, a);
+    for ([_]?win32.HWND{ window.hwnd, window.palette.hwnd.?, other.hwnd, null }, [_]bool{ true, true, false, false }) |active, holds| {
+        Active.answer = active;
+        try std.testing.expectEqual(holds, window.holdsActivation());
+    }
 }
 
 test "win32: the command palette's field filters its list, moves the selection and takes its own keys" {
