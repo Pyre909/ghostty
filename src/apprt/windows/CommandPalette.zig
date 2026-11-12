@@ -683,10 +683,15 @@ pub const Palette = struct {
             .title = if (fonts.title) |t| SearchBar.textHeight(edit, t) else 0,
             .small = if (fonts.small) |t| SearchBar.textHeight(edit, t) else 0,
         };
-        if (self.list) |list| {
-            const row: win32.LPARAM = Metrics.init(dpi).rowHeight(self.heights);
-            _ = win32.SendMessageW(list, win32.LB_SETITEMHEIGHT, 0, row);
-        }
+        self.sizeRows();
+    }
+
+    /// The list's rows as tall as `rowHeight` at `font_dpi`, the DPI
+    /// every part of the palette is measured at (`dpiOf`).
+    fn sizeRows(self: *const Palette) void {
+        const list = self.list orelse return;
+        const row: win32.LPARAM = Metrics.init(self.font_dpi).rowHeight(self.heights);
+        _ = win32.SendMessageW(list, win32.LB_SETITEMHEIGHT, 0, row);
     }
 
     /// The brush for the field and the list, of `color`.
@@ -844,6 +849,16 @@ pub fn lerp(a: win32.COLORREF, b: win32.COLORREF, t: u32) win32.COLORREF {
     return out;
 }
 
+/// The DPI `window`'s palette is measured and drawn at: its frame's, at
+/// which its fonts were made (`Palette.applyFont`). Not the palette's own
+/// window's: a pop-up has its own DPI, of the monitor it is on, which for
+/// one just made at the screen's origin is the primary monitor's, and the
+/// palette is drawn for its frame's.
+fn dpiOf(window: *const Window) u32 {
+    const p = &window.palette;
+    return if (p.font_dpi != 0) p.font_dpi else Window.dpiOf(window.app, window.hwnd);
+}
+
 /// `window`'s palette's look, for its terminal's background.
 fn lookOf(window: *const Window) Look {
     const p = &window.palette;
@@ -974,6 +989,7 @@ pub fn open(surface: *Surface) bool {
     const old_list = win32.SetWindowLongPtrW(list, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&listProc)));
     if (list_proc == null) list_proc = @ptrFromInt(@as(usize, @bitCast(old_list)));
     if (p.fonts.title) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
+    p.sizeRows();
     applyListTheme(window);
     p.tip = makeTip(hwnd, list, app.hinstance);
     _ = refill(window, "");
@@ -1105,7 +1121,7 @@ fn cutShort(window: *Window, row: usize, entry: *const Entry) bool {
     };
     const alloc = window.app.core_app.alloc;
     const shortcut_w = textWidth(hdc, alloc, entry.shortcut);
-    const m = Metrics.init(Window.dpiOf(window.app, list));
+    const m = Metrics.init(dpiOf(window));
     const r = Row.init(m, item, p.heights, shortcut_w);
     return textWidth(hdc, alloc, entry.subtitle()) > r.subtitle.right - r.subtitle.left;
 }
@@ -1653,7 +1669,7 @@ pub fn wndProc(
 
         win32.WM_MEASUREITEM => {
             const measure: *win32.MEASUREITEMSTRUCT = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            measure.itemHeight = @intCast(Metrics.init(Window.dpiOf(window.app, hwnd)).rowHeight(p.heights));
+            measure.itemHeight = @intCast(Metrics.init(dpiOf(window)).rowHeight(p.heights));
             return 1;
         },
 
@@ -1881,7 +1897,7 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     var client: RECT = undefined;
     if (!win32.GetClientRect(hwnd, &client).toBool()) return;
     const look = lookOf(window);
-    const m = Metrics.init(Window.dpiOf(window.app, hwnd));
+    const m = Metrics.init(dpiOf(window));
     const l = Layout.init(m, client.right, client.bottom, p.heights);
     SearchBar.fill(hdc, client, look.back);
     SearchBar.fill(hdc, l.divider, look.border);
@@ -1914,7 +1930,7 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
     if (dis.itemData >= entries.items.len) return;
     const entry = &entries.items[dis.itemData];
     const alloc = window.app.core_app.alloc;
-    const m = Metrics.init(Window.dpiOf(window.app, dis.hwndItem orelse window.hwnd));
+    const m = Metrics.init(dpiOf(window));
 
     const selected = dis.itemState & win32.ODS_SELECTED != 0;
     const hovered = p.hover_row != null and p.hover_row.? == dis.itemID;

@@ -22661,6 +22661,48 @@ test "win32: toggle_command_palette opens the command palette over its window, a
     try std.testing.expect(p.hwnd != null);
 }
 
+test "win32: the command palette's rows are measured at its frame's DPI, not its own window's" {
+    // The palette is a pop-up, with its own DPI, of the monitor it is
+    // made on, which is not always its frame's: its rows are as tall as
+    // its fonts, which are made for its frame's.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    const FrameDpi = struct {
+        var frame: ?win32.HWND = null;
+        fn of(hwnd: win32.HWND) callconv(.winapi) win32.UINT {
+            return if (hwnd == frame) 144 else 96;
+        }
+    };
+    FrameDpi.frame = window.hwnd;
+    const saved = app.get_dpi_for_window;
+    app.get_dpi_for_window = &FrameDpi.of;
+    defer app.get_dpi_for_window = saved;
+
+    try togglePalette(&app, a);
+    const p = &window.palette;
+    try std.testing.expectEqual(144, p.font_dpi);
+    const row = CommandPalette.Metrics.init(144).rowHeight(p.heights);
+    try std.testing.expect(row != CommandPalette.Metrics.init(96).rowHeight(p.heights));
+    try std.testing.expectEqual(row, win32.SendMessageW(p.list.?, win32.LB_GETITEMHEIGHT, 0, 0));
+}
+
 test "win32: the command palette's field filters its list, moves the selection and takes its own keys" {
     // GTK's filter on the title or the action key, title matches first;
     // Up, Down, PgUp and PgDn move the list's selection from the field,
