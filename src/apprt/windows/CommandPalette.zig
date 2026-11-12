@@ -901,7 +901,17 @@ pub const Look = struct {
         const white = win32.rgb(0xff, 0xff, 0xff);
         const black = win32.rgb(0, 0, 0);
         const dark = !isLight(background);
-        const back = if (dark) lerp(background, white, 80) else lerp(background, black, 30);
+        // Lifted towards white, or darkened, unless that crosses the line
+        // between light and dark, as it does for a background near it:
+        // then the other way, so the back stays on the side the text was
+        // chosen for, as macOS's tint keeps its material's luminance.
+        const lifted = if (dark) lerp(background, white, 80) else lerp(background, black, 30);
+        const back = if (isLight(lifted) != dark)
+            lifted
+        else if (dark)
+            lerp(background, black, 30)
+        else
+            lerp(background, white, 80);
         const text = if (dark) win32.rgb(0xf2, 0xf2, 0xf2) else win32.rgb(0x1a, 0x1a, 0x1a);
         return .{
             .dark = dark,
@@ -2408,6 +2418,17 @@ test "win32: the command palette's colours follow its terminal's background" {
         try testing.expect(look.selected != look.back and look.hover != look.back and look.selected != look.hover);
         try testing.expect(look.match != look.selected and look.match != look.text and look.match != look.back);
     }
+    // Near the line between light and dark too, the back stays on the
+    // side of its look, under text of the other: every grey, and greys
+    // tinted each way.
+    for (0..256) |v| for ([_][3]u8{ .{ 0, 0, 0 }, .{ 12, 0, 0 }, .{ 0, 12, 0 }, .{ 0, 0, 12 } }) |tint| {
+        const c: u8 = @intCast(v);
+        const bg = win32.rgb(c -| tint[0], c -| tint[1], c -| tint[2]);
+        const look = Look.of(bg, accent);
+        try testing.expect(look.back != bg);
+        try testing.expectEqual(look.dark, !isLight(look.back));
+        try testing.expectEqual(look.dark, isLight(look.text));
+    };
 }
 
 /// The largest of the channels' differences between `a` and `b`.
