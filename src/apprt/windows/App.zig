@@ -22751,6 +22751,10 @@ test "win32: the command palette's field filters its list, moves the selection a
     paletteQuery(window, L("SPLIT RIGHT"));
     try std.testing.expectEqualStrings("Split Right", paletteEntry(window, 0).title);
     try std.testing.expectEqual(0, paletteSelected(window));
+    // The rows show the matches of the query folded as the filter folded
+    // it, all of "Split Right"'s title.
+    try std.testing.expectEqualStrings("split right", p.query);
+    try std.testing.expectEqual(CommandPalette.Span{ .start = 0, .end = 11 }, paletteEntry(window, 0).spans(p.query).title.?);
 
     // The selection moves, within the rows.
     paletteQuery(window, L("split"));

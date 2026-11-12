@@ -171,9 +171,26 @@ pub const Entry = struct {
     };
 
     /// The second line: the description, as macOS's row shows it, else the
-    /// action key.
+    /// action key (`subtitleIsKey`).
     pub fn subtitle(self: *const Entry) []const u8 {
-        return if (self.description.len > 0) self.description else self.action_key;
+        return if (self.subtitleIsKey()) self.action_key else self.description;
+    }
+
+    /// Whether the second line is the action key, there being no
+    /// description.
+    fn subtitleIsKey(self: *const Entry) bool {
+        return self.description.len == 0;
+    }
+
+    /// The letters `folded`, a folded query (`fold`), matched in the row's
+    /// lines (`matchSpan`), each a span of its line: in the title; else in
+    /// the second line when it is the action key, which the filter also
+    /// matches, as macOS bolds the subtitle's only when the title has
+    /// none. A description, which the filter does not search, has none.
+    pub fn spans(self: *const Entry, folded: []const u8) Spans {
+        if (matchSpan(self.title, self.folded_title, folded)) |t| return .{ .title = t };
+        if (!self.subtitleIsKey()) return .{};
+        return .{ .subtitle = matchSpan(self.action_key, self.folded_key, folded) };
     }
 
     /// The row's tooltip: a command's description, as GTK's row binds it
@@ -385,6 +402,9 @@ fn foldStep(rest: []const u8, buf: *[max_fold]u8) struct { source: usize, folded
 
 /// A range of a text's bytes.
 pub const Span = struct { start: usize, end: usize };
+
+/// The letters a query matched in a row's two lines (`Entry.spans`).
+pub const Spans = struct { title: ?Span = null, subtitle: ?Span = null };
 
 /// The bytes of `text` whose folded form, `folded_text` (`fold`), holds
 /// the first occurrence of `folded`, a folded query, as the filter found
@@ -1989,17 +2009,10 @@ fn drawRow(window: *Window, dis: *const win32.DRAWITEMSTRUCT) void {
         var r = row.shortcut;
         _ = win32.DrawTextW(hdc, s.ptr, @intCast(s.len), &r, flags | win32.DT_RIGHT | win32.DT_VCENTER);
     };
-    // The letters the query matched: in the title, else in the action
-    // key, when the second line shows it, as macOS bolds the subtitle's
-    // only when the title has none.
-    const title_span = matchSpan(entry.title, entry.folded_title, p.query);
-    const sub = entry.subtitle();
-    const sub_span = if (title_span == null and entry.description.len == 0)
-        matchSpan(entry.action_key, entry.folded_key, p.query)
-    else
-        null;
-    drawSpanned(hdc, alloc, sub, sub_span, row.subtitle, .{ .normal = p.fonts.small, .bold = p.fonts.small_bold }, look.dim, look.match);
-    drawSpanned(hdc, alloc, entry.title, title_span, row.title, .{ .normal = p.fonts.title, .bold = p.fonts.title_bold }, look.text, look.match);
+    // The letters the query matched (`Entry.spans`).
+    const spans = entry.spans(p.query);
+    drawSpanned(hdc, alloc, entry.subtitle(), spans.subtitle, row.subtitle, .{ .normal = p.fonts.small, .bold = p.fonts.small_bold }, look.dim, look.match);
+    drawSpanned(hdc, alloc, entry.title, spans.title, row.title, .{ .normal = p.fonts.title, .bold = p.fonts.title_bold }, look.text, look.match);
 }
 
 /// Draw `text` on one line in `r`, in `fonts.normal` and `color`, but
@@ -2018,6 +2031,7 @@ fn drawSpanned(
     if (text.len == 0) return;
     const flags = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
     const s = span orelse Span{ .start = text.len, .end = text.len };
+    std.debug.assert(s.start <= s.end and s.end <= text.len);
     const parts = [_]struct { []const u8, bool }{
         .{ text[0..s.start], false },
         .{ text[s.start..s.end], true },
@@ -2652,6 +2666,32 @@ test "win32: the palette shows the letters a query matched, by the code points t
             try testing.expect(span.end == text.len or text[span.end] & 0xc0 != 0x80);
         };
     }
+}
+
+test "win32: a palette row bolds a match in its title, else in its action key when that is its second line" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try testFolded(a, &.{
+        .{ .title = "Split Right", .action_key = "new_split:right", .description = "Split the terminal to the right.", .run = .{ .action = .ignore } },
+        .{ .title = "Reload", .action_key = "reload_config", .run = .{ .action = .ignore } },
+        .{ .title = "Copy", .action_key = "copy_to_clipboard", .description = "Copy the selection.", .run = .{ .action = .ignore } },
+    });
+    const folded = try fold(a, "Split");
+    // The title's match, and none on the second line.
+    try testing.expectEqual(Spans{ .title = .{ .start = 0, .end = 5 } }, entries[0].spans(folded));
+    // A match in the action key alone, its second line: there.
+    try testing.expectEqual(Spans{ .subtitle = .{ .start = 0, .end = 6 } }, entries[1].spans(try fold(a, "RELOAD_")));
+    try testing.expectEqualStrings("reload_config", entries[1].subtitle());
+    // A match in the action key alone under a description, which the
+    // second line shows: none.
+    try testing.expectEqual(Spans{}, entries[2].spans(try fold(a, "clipboard")));
+    // Each span lies in the line it is drawn on.
+    for (&entries) |*e| for ([_][]const u8{ "s", "re", "co", "_", "p" }) |q| {
+        const s = e.spans(try fold(a, q));
+        if (s.title) |t| try testing.expect(t.end <= e.title.len);
+        if (s.subtitle) |t| try testing.expect(t.end <= e.subtitle().len);
+    };
 }
 
 test "win32: the palette sorts as GTK's does" {
