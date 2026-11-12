@@ -323,8 +323,8 @@ pub fn show(surface: *Surface, at: win32.POINT) void {
     // To the terminal itself, not to whatever its window gives the focus
     // to (`Window.focusTarget`): the menu opened only with the focus on the
     // terminal, as a click that moves it there is eaten
-    // (WM_MOUSEACTIVATE), and an open command palette's field would take
-    // the keys meant for the shell. GTK's popover gives its surface the
+    // (WM_MOUSEACTIVATE), and its search bar's field would take the keys
+    // meant for the shell. GTK's popover gives its surface the
     // focus back in the same way. First, so that it comes back whether the
     // item is then performed or not.
     window.setKeyboardFocus(surface.hwnd, true);

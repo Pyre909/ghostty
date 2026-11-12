@@ -26716,15 +26716,15 @@ test "win32: the context menu's choice is performed on its terminal" {
     try std.testing.expect(FocusSeen.last == b.hwnd);
 }
 
-test "win32: the context menu gives the focus back to its terminal, not to an open command palette" {
+test "win32: the context menu gives the focus back to its terminal, not to the field its window gives it to" {
     // The menu opens only on the terminal with the focus (a click that
-    // moves the focus there is eaten, WM_MOUSEACTIVATE), and an open
-    // command palette stays open when a terminal of its frame takes the
-    // focus. When the menu closes, chosen or not, that terminal gets the
-    // focus back, as GTK's popover gives it to its surface; not the
-    // palette's field, which the window's focus goes to while it is open
-    // (`Window.focusTarget`) and which would take the keys typed for the
-    // shell.
+    // moves the focus there is eaten, WM_MOUSEACTIVATE). When the menu
+    // closes, chosen or not, that terminal gets the focus back, as GTK's
+    // popover gives it to its surface; not the field the window's focus
+    // goes to (`Window.focusTarget`), its search bar's, which would take
+    // the keys typed for the shell. An open command palette is closed by
+    // the click before the menu opens: the click activates the frame,
+    // which deactivates the palette.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -26756,19 +26756,26 @@ test "win32: the context menu gives the focus back to its terminal, not to an op
     window.relayout();
     const p = &window.palette;
 
-    // Opened on a, its field with the focus; then b takes the focus, as
-    // the SetFocus of a click on it gives it (WM_SETFOCUS): the palette
-    // stays open, now on b, and the window's focus still goes to its field.
+    // Opened on a; a click on b activates the frame, which deactivates
+    // the palette, and gives b the focus (WM_SETFOCUS): the palette closes
+    // once the deactivation is over.
     try togglePalette(&app, a);
-    const edit = p.edit.?;
-    try std.testing.expect(FocusSeen.last == edit);
+    const palette = p.hwnd.?;
+    _ = win32.SendMessageW(palette, win32.WM_ACTIVATE, win32.WA_INACTIVE, @bitCast(@intFromPtr(window.hwnd)));
     _ = win32.SendMessageW(b.hwnd, win32.WM_SETFOCUS, 0, 0);
-    try std.testing.expect(p.open);
-    try std.testing.expect(p.surface == b);
-    try std.testing.expect(Window.focusTarget(b) == edit);
+    var msg: win32.MSG = undefined;
+    try std.testing.expect(win32.PeekMessageW(&msg, palette, CommandPalette.WM_PALETTE_CLOSE, CommandPalette.WM_PALETTE_CLOSE, win32.PM_REMOVE).toBool());
+    _ = win32.DispatchMessageW(&msg);
+    try std.testing.expect(p.hwnd == null);
+    try std.testing.expect(window.tab().focused == b);
 
-    // Dismissed, then Paste chosen: each time the focus back on b, and the
-    // palette still open.
+    // b's search bar open, its field where the window's focus goes.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    try std.testing.expect(Window.focusTarget(b) == b.search_bar.edit.?);
+    _ = PaletteSeen.take();
+
+    // Dismissed, then Paste chosen: each time the focus back on b.
     for ([_]?[]const u8{ null, "Paste" }, [_][]const u8{ "", "paste_from_clipboard;" }, 1..) |choose, performed, n| {
         MenuSeen.choose = choose;
         FocusSeen.last = null;
@@ -26776,7 +26783,6 @@ test "win32: the context menu gives the focus back to its terminal, not to an op
         try std.testing.expectEqual(n, MenuSeen.count);
         try std.testing.expectEqualStrings(performed, PaletteSeen.take());
         try std.testing.expect(FocusSeen.last == b.hwnd);
-        try std.testing.expect(p.open and p.hwnd != null);
     }
 }
 
