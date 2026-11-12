@@ -3,7 +3,8 @@
 //! (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge (ReadOnly.zig),
 //! the bell border (BellBorder.zig), the child-exited banner
 //! (ChildExited.zig), the resize overlay (ResizeOverlay.zig), the link
-//! preview (LinkPreview.zig) and the key-state indicator (KeyState.zig).
+//! preview (LinkPreview.zig), the key-state indicator (KeyState.zig) and
+//! the dim of an unfocused split (UnfocusedSplit.zig).
 //! This file does for each what they all need: their window class and
 //! procedure, their place in the Z order, their font, colours and frame,
 //! and their teardown; each overlay's own file says what it shows and where
@@ -47,6 +48,7 @@ const BellBorder = @import("BellBorder.zig");
 const ChildExited = @import("ChildExited.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const KeyState = @import("KeyState.zig");
+const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
 const RECT = win32.RECT;
@@ -76,6 +78,10 @@ link_preview: LinkPreview.Preview = .{},
 /// (`KeyState.sequence`, `KeyState.table`).
 key_state: KeyState.Indicator = .{},
 
+/// The dim of a split without the focus, made the first time it shows
+/// (`UnfocusedSplit.sync`, from `place`).
+dim: UnfocusedSplit.Dim = .{},
+
 /// The system's message font at `font_dpi`, which every overlay draws
 /// in, made as the first of them is placed with something to show
 /// (`applyFont`).
@@ -90,11 +96,11 @@ font_dpi: u32 = 0,
 /// its text to measure), `shape` (its window's region), `handle`
 /// (messages of its own) and `hidden` (what it does as its window is
 /// hidden).
-pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "resize_overlay", "link_preview", "key_state" };
+pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "resize_overlay", "link_preview", "key_state", "dim" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, KeyState.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, KeyState.class_name, UnfocusedSplit.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -271,6 +277,9 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 pub fn place(surface: *Surface) void {
     const self = &surface.overlays;
     const window = surface.window;
+    // Whether it is dimmed changes with its tab's focus, its search bar
+    // and the configuration, each of which places it again.
+    UnfocusedSplit.sync(surface, &surface.app.config);
     inline for (stack) |name| {
         if (@field(self, name).hwnd) |hwnd| reparent(hwnd, window, name);
     }

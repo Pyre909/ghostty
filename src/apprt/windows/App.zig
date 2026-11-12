@@ -40,6 +40,7 @@ const SaveDialog = @import("SaveDialog.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
+const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
@@ -3058,6 +3059,9 @@ pub const App = struct {
         }
         self.applyInspectorThemes();
         for (self.surfaces.items) |surface| surface.overlays.invalidate();
+        // `unfocused-split-opacity` and `unfocused-split-fill` may have
+        // changed.
+        for (self.windows.items) |window| window.placeOverlays();
         // `bell-features` may show a ringing bell otherwise now.
         for (self.surfaces.items) |surface| {
             if (surface.bell_ringing) surface.showBell();
@@ -16965,6 +16969,149 @@ test "win32: the bell border shows around a ringing terminal, under its other ov
     // It goes with its terminal.
     try std.testing.expect(a.destroy());
     try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: an unfocused split is dimmed by its fill at one less its opacity, over its other overlays" {
+    // GTK's and macOS's dim, over a terminal in a tab of more than one
+    // that is not the tab's focused one and whose search bar is not
+    // open: all of it, the configured background unless
+    // `unfocused-split-fill` says otherwise, at one less
+    // `unfocused-split-opacity`, the top of its overlays. It follows the
+    // focus, goes with a zoom or an opacity of 1, comes back with the
+    // configuration, and takes no clicks.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    // The test runner cannot layer a child window: the alpha each dim is
+    // given is recorded, and refused when `refuse` says so.
+    const Alpha = struct {
+        var last: ?u8 = null;
+        var refuse = false;
+        fn set(_: win32.HWND, alpha: u8) bool {
+            if (refuse) return false;
+            last = alpha;
+            return true;
+        }
+    };
+    Alpha.last = null;
+    Alpha.refuse = false;
+    UnfocusedSplit.test_set_alpha = &Alpha.set;
+    defer UnfocusedSplit.test_set_alpha = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // Alone in its tab: none.
+    try std.testing.expect(a.overlays.dim.hwnd == null);
+
+    // Beside another, focused: b dimmed, just above it, all of it, in the
+    // background, at 77 (one less the default 0.7, of 255); a not.
+    const b = try testPane(&app, window);
+    window.tab().tree.deinit();
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.relayout();
+    try std.testing.expect(a.overlays.dim.hwnd == null);
+    const dim = b.overlays.dim.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(dim));
+    try std.testing.expect(win32.GetWindow(b.hwnd, win32.GW_HWNDPREV) == dim);
+    try std.testing.expectEqual(try paneClient(window, b), try childRect(window, dim));
+    try std.testing.expectEqual(77, Alpha.last);
+    {
+        const printed = try Printed.of(dim);
+        defer printed.deinit();
+        const bg = app.config.background;
+        try std.testing.expectEqual(win32.rgb(bg.r, bg.g, bg.b), printed.at(0, 0));
+        try std.testing.expectEqual(win32.rgb(bg.r, bg.g, bg.b), printed.at(printed.width - 1, printed.height - 1));
+    }
+    // Clicks over it are b's.
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(dim, win32.WM_NCHITTEST, 0, 0));
+
+    // Over b's other overlays: its key-state indicator.
+    try std.testing.expect(try testKeyTable(&app, b, .{ .activate = "nav" }));
+    const key_state = b.overlays.key_state.hwnd.?;
+    try std.testing.expect(above(window.hwnd, dim, key_state));
+    try std.testing.expect(try testKeyTable(&app, b, .deactivate));
+
+    // Its search bar opened while it is dimmed: undimmed at once; closed,
+    // dimmed again.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
+    try std.testing.expect(!shown(dim));
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .end_search, {}));
+    try std.testing.expect(shown(dim));
+    app.applyPendingFocus();
+
+    // The focus to b: a dimmed, b no longer.
+    _ = Surface.wndProc(b.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(window.tab().focused == b);
+    try std.testing.expect(!shown(dim));
+    const a_dim = a.overlays.dim.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(a_dim));
+    try std.testing.expectEqual(try paneClient(window, a), try childRect(window, a_dim));
+
+    // b's search bar open, and the focus back to a: b not dimmed while
+    // its bar is open, as on GTK; dimmed once it closes.
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .start_search, .{ .needle = "" }));
+    app.applyPendingFocus();
+    _ = Surface.wndProc(a.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expect(!shown(a_dim));
+    try std.testing.expect(!shown(dim));
+    try std.testing.expect(try app.performAction(.{ .surface = &b.core_surface }, .end_search, {}));
+    app.applyPendingFocus();
+    try std.testing.expect(shown(dim));
+
+    // Zoomed on a: b hidden, and its dim with it.
+    window.toggleZoom(a);
+    try std.testing.expect(!shown(dim));
+    window.toggleZoom(a);
+    try std.testing.expect(shown(dim));
+
+    // A fill, and an opacity of 0.15: in that colour, at 217.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"unfocused-split-fill" = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+    changed.@"unfocused-split-opacity" = 0.15;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(shown(dim));
+    try std.testing.expectEqual(217, Alpha.last);
+    {
+        const printed = try Printed.of(dim);
+        defer printed.deinit();
+        try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), printed.at(0, 0));
+    }
+
+    // An opacity of 1: none.
+    changed.@"unfocused-split-opacity" = 1;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(!shown(dim));
+
+    // One that cannot be layered is not shown, as it would hide its
+    // terminal: its window is destroyed.
+    Alpha.refuse = true;
+    changed.@"unfocused-split-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(b.overlays.dim.hwnd == null);
+    try std.testing.expect(!b.overlays.dim.on);
+    // Layered again: made again.
+    Alpha.refuse = false;
+    window.placeOverlays();
+    try std.testing.expect(shown(b.overlays.dim.hwnd orelse return error.TestUnexpectedResult));
+    try std.testing.expectEqual(128, Alpha.last);
 }
 
 test "win32: a bell border whose window cannot be made, or was destroyed, or shaped, is made the next time it shows" {

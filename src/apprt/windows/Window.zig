@@ -3056,10 +3056,13 @@ pub fn giveFocus(self: *Window, surface: *Surface) void {
 /// split. A terminal in no tab yet, still being made, is not recorded.
 pub fn setFocused(self: *Window, surface: *Surface) void {
     const t = self.tabOf(surface) orelse return;
+    const was = t.focused;
     t.focused = surface;
     // Its label is its focused terminal's title, shown or not.
     self.bar.invalidate();
     if (t != self.tab()) return;
+    // The terminal that had the focus is dimmed, and this one no longer.
+    if (was != surface) self.placeOverlays();
     // An open command palette runs on the terminal with the focus.
     CommandPalette.focusMoved(self, surface);
     _ = self.showTitle();

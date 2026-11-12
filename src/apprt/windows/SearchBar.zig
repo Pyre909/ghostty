@@ -402,6 +402,8 @@ pub fn start(surface: *Surface, needle: [:0]const u8) bool {
     bar.field_focus = true;
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 0, -1);
     place(surface);
+    // An open search bar takes away its terminal's dim, as on GTK.
+    Overlays.place(surface);
     surface.app.search_focus = surface;
     return true;
 }
@@ -436,6 +438,8 @@ pub fn finish(surface: *Surface) void {
         bar.hideWindow();
     }
     if (had_focus) surface.app.search_focus = surface;
+    // And a closed one gives it back.
+    Overlays.place(surface);
 }
 
 /// `search_total` and `search_selected`: the count the bar shows
