@@ -976,7 +976,7 @@ pub fn open(surface: *Surface) bool {
     if (p.fonts.title) |f| _ = win32.SendMessageW(list, win32.WM_SETFONT, @intFromPtr(f), 0);
     applyListTheme(window);
     p.tip = makeTip(hwnd, list, app.hinstance);
-    refill(window, "");
+    _ = refill(window, "");
     p.open = true;
     if (!place(window)) return false;
     activate(window);
@@ -1284,7 +1284,13 @@ fn relist(window: *Window, gone: *const Surface) void {
     };
     const top = win32.SendMessageW(list, win32.LB_GETTOPINDEX, 0, 0);
     p.entries = fresh;
-    textChanged(window);
+    // The rows hold indices into the old entries until they are filled
+    // again: a palette that could not be refilled closes, rather than
+    // run, or read past the end of, the wrong entry.
+    if (!textChanged(window)) {
+        log.warn("cannot list the command palette's entries again", .{});
+        return close(window);
+    }
     const was = selected orelse return;
     for (p.shown.items, 0..) |index, row| {
         if (!sameEntry(&fresh.items[index], &was)) continue;
@@ -1414,27 +1420,36 @@ fn position(window: *Window, no_room: enum { close, keep }) bool {
 }
 
 /// The field's text changed (EN_CHANGE): the list shows what matches it,
-/// the first selected, as GTK's list selects its first item.
-fn textChanged(window: *Window) void {
+/// the first selected, as GTK's list selects its first item. Whether the
+/// list was filled again; if not, it is as it was.
+fn textChanged(window: *Window) bool {
     const p = &window.palette;
-    const edit = p.edit orelse return;
+    const edit = p.edit orelse return false;
     const alloc = window.app.core_app.alloc;
     const len: usize = @intCast(@max(win32.GetWindowTextLengthW(edit), 0));
-    const wide = alloc.alloc(u16, len + 1) catch |err| return log.warn("cannot read the command palette's field err={}", .{err});
+    const wide = alloc.alloc(u16, len + 1) catch |err| {
+        log.warn("cannot read the command palette's field err={}", .{err});
+        return false;
+    };
     defer alloc.free(wide);
     const n: usize = @intCast(@max(win32.GetWindowTextW(edit, wide.ptr, @intCast(wide.len)), 0));
-    const query = utf8FromWide(alloc, wide[0..n]) catch |err| return log.warn("cannot read the command palette's field err={}", .{err});
+    const query = utf8FromWide(alloc, wide[0..n]) catch |err| {
+        log.warn("cannot read the command palette's field err={}", .{err});
+        return false;
+    };
     defer alloc.free(query);
-    refill(window, query);
+    if (!refill(window, query)) return false;
     refit(window);
+    return true;
 }
 
 /// Fill the list with the entries that match `query` (`filter`), the
-/// first selected.
-fn refill(window: *Window, query: []const u8) void {
+/// first selected; whether it was, which it is, with no rows, when the
+/// filter has no memory.
+fn refill(window: *Window, query: []const u8) bool {
     const p = &window.palette;
-    const list = p.list orelse return;
-    const entries = p.entries orelse return;
+    const list = p.list orelse return false;
+    const entries = p.entries orelse return false;
     const alloc = window.app.core_app.alloc;
     filter(alloc, entries.items, query, &p.shown) catch |err| {
         log.warn("cannot filter the command palette err={}", .{err});
@@ -1463,6 +1478,7 @@ fn refill(window: *Window, query: []const u8) void {
     }
     _ = win32.SendMessageW(list, win32.WM_SETREDRAW, 1, 0);
     _ = win32.InvalidateRect(list, null, .TRUE);
+    return true;
 }
 
 /// Up, Down, PgUp or PgDn in the field: the selection moves by `by` rows,
@@ -1631,7 +1647,7 @@ pub fn wndProc(
 
         win32.WM_COMMAND => {
             if (win32.hiword(wparam) == win32.EN_CHANGE and p.edit != null and
-                lparam == @as(win32.LPARAM, @bitCast(@intFromPtr(p.edit.?)))) textChanged(window);
+                lparam == @as(win32.LPARAM, @bitCast(@intFromPtr(p.edit.?)))) _ = textChanged(window);
             return 0;
         },
 

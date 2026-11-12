@@ -23324,6 +23324,71 @@ test "win32: a terminal closing while the command palette is open leaves its sel
     try std.testing.expectEqual(0, list_top(window));
 }
 
+test "win32: a palette that cannot be listed again as a terminal goes closes, rather than keep rows for the old entries" {
+    // Each terminal that goes lists the palette's entries again, one jump
+    // fewer, and fills its rows from them. Out of memory at any step of
+    // that, the palette either closes or shows rows that are all entries
+    // of the new listing: never a row still holding an index into the old
+    // one, which can be one past the new one's end.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer core_app.alloc = alloc;
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+    const other = try testFrame(&app);
+    const x = try testPane(&app, other);
+    const y = try testPane(&app, other);
+    other.tab().tree = try testRow(alloc, &.{ x, y });
+    other.tab().focused = x;
+    const p = &window.palette;
+
+    // Two terminals that stay, each forgotten in turn: the palette lists
+    // the other's jump again and drops this one's, so each turn relists.
+    var closed: usize = 0;
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        if (p.hwnd == null) try togglePalette(&app, a);
+        try std.testing.expect(p.hwnd != null);
+        // A row further down selected, which the new listing is searched for.
+        paletteKey(window, win32.VK_NEXT);
+        var failing: std.testing.FailingAllocator = .init(alloc, .{ .fail_index = fail_index });
+        core_app.alloc = failing.allocator();
+        CommandPalette.forget(&app, if (fail_index % 2 == 0) x else y);
+        core_app.alloc = alloc;
+        if (p.hwnd == null) {
+            closed += 1;
+        } else {
+            const entries = p.entries.?.items;
+            const rows: usize = @intCast(paletteRows(window));
+            try std.testing.expectEqual(p.shown.items.len, rows);
+            for (0..rows) |row| {
+                const data = win32.SendMessageW(p.list.?, win32.LB_GETITEMDATA, row, 0);
+                try std.testing.expect(data >= 0 and @as(usize, @intCast(data)) < entries.len);
+                try std.testing.expectEqual(p.shown.items[row], @as(u32, @intCast(data)));
+            }
+        }
+        if (!failing.has_induced_failure) break;
+    }
+    // Some failure closed it, and the last turn, with none, did not.
+    try std.testing.expect(closed > 0);
+    try std.testing.expect(p.hwnd != null);
+}
+
 test "win32: a search bar opened while the command palette is open stays under it" {
     // The palette is above the terminals and their search bars, a pop-up
     // over its frame's children. A bar opened from the palette's field,
