@@ -10307,8 +10307,8 @@ test "win32: a double click on the tab bar is two clicks, but on its empty part"
 test "win32: the tab bar holds the mouse capture while a button is down on it" {
     // Taken by a press on a tab, its close glyph or the "+", so that the
     // bar sees the button come up wherever it does, and let go once no
-    // button is down on it, the left and middle ones held together too. A
-    // capture another window takes cancels the press.
+    // button is down on it, any two of the left, middle and right ones held
+    // together too. A capture another window takes cancels the press.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -10397,18 +10397,42 @@ test "win32: the tab bar holds the mouse capture while a button is down on it" {
     _ = win32.SendMessageW(bar, win32.WM_MBUTTONUP, 0, on_b);
     try std.testing.expect(!b.closing);
     _ = win32.ReleaseCapture();
-}
 
-/// For tests: what a tab's menu does while it is open (`MenuSeen.during`).
-const TabMenuDuring = struct {
-    var window: ?*Window = null;
-    var close: usize = 0;
-    /// Close the tab at `close`, as a close from elsewhere would while the
-    /// menu's loop runs.
-    fn closeTab() void {
-        _ = window.?.closeTabs(close, .this);
+    // The right button with another held: its menu opens on its release
+    // on the tab it went down on, and the capture stays while either is
+    // down.
+    ContextMenu.test_track = &MenuSeen.track;
+    defer ContextMenu.test_track = null;
+    MenuSeen.reset();
+    defer MenuSeen.reset();
+    for ([_]struct { win32.UINT, win32.UINT }{
+        .{ win32.WM_LBUTTONDOWN, win32.WM_LBUTTONUP },
+        .{ win32.WM_MBUTTONDOWN, win32.WM_MBUTTONUP },
+    }) |other| {
+        // Right held on b, the other pressed and released: still held;
+        // then right up on b: its menu, and let go.
+        _ = win32.SendMessageW(bar, win32.WM_RBUTTONDOWN, 0, on_b);
+        try std.testing.expect(win32.GetCapture() == bar);
+        _ = win32.SendMessageW(bar, other[0], 0, on_a);
+        _ = win32.SendMessageW(bar, other[1], 0, on_c);
+        try std.testing.expect(win32.GetCapture() == bar);
+        const menus = MenuSeen.count;
+        _ = win32.SendMessageW(bar, win32.WM_RBUTTONUP, 0, on_b);
+        try std.testing.expectEqual(menus + 1, MenuSeen.count);
+        try std.testing.expect(win32.GetCapture() == null);
+
+        // The other held on a, right pressed and released on b: the menu,
+        // and the capture kept until the other comes up.
+        _ = win32.SendMessageW(bar, other[0], 0, on_a);
+        _ = win32.SendMessageW(bar, win32.WM_RBUTTONDOWN, 0, on_b);
+        _ = win32.SendMessageW(bar, win32.WM_RBUTTONUP, 0, on_b);
+        try std.testing.expectEqual(menus + 2, MenuSeen.count);
+        try std.testing.expect(win32.GetCapture() == bar);
+        _ = win32.SendMessageW(bar, other[1], 0, on_c);
+        try std.testing.expect(win32.GetCapture() == null);
     }
-};
+    try std.testing.expect(!a.closing and !b.closing and !c.closing);
+}
 
 test "win32: a right click on a tab opens its menu, whose items act on that tab" {
     // Pressed and released on one tab, its close glyph included, the menu
@@ -10517,17 +10541,28 @@ test "win32: a right click on a tab opens its menu, whose items act on that tab"
     app.prompt_depth = 0;
     try std.testing.expectEqual(7, MenuSeen.count);
 
-    // Its tab closed from elsewhere while it is open: the item is not
-    // performed, and the terminal is torn down only once it has closed.
-    TabMenuDuring.window = window;
-    TabMenuDuring.close = 1;
-    MenuSeen.during = &TabMenuDuring.closeTab;
+    // Its tab closed from elsewhere while it is open, and the teardown
+    // that posts dispatched by the menu's loop: the item is not performed,
+    // and the terminal is torn down only once the menu has closed, as its
+    // loop is counted (`App.terminal_loops`).
+    const Closing = struct {
+        var frame: *Window = undefined;
+        fn start() void {
+            _ = frame.closeTabs(1, .this);
+            testPump();
+        }
+    };
+    Closing.frame = window;
+    MenuSeen.during = &Closing.start;
     MenuSeen.choose = "Close Other Tabs";
     right.click(bar, on_second, on_second);
     try std.testing.expectEqual(8, MenuSeen.count);
     try std.testing.expect(second.closing);
+    try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, second) != null);
+    try std.testing.expectEqual(0, app.terminal_loops);
     try std.testing.expectEqualStrings("", PaletteSeen.take());
     testTeardowns();
+    try std.testing.expect(std.mem.indexOfScalar(*Surface, app.surfaces.items, second) == null);
     try std.testing.expectEqual(2, window.tabs.items.len);
 }
 
@@ -10672,7 +10707,11 @@ test "win32: a double click on a tab's label edits its title in place" {
     try std.testing.expectEqual(label.left, field.left);
     try std.testing.expectEqual(label.right, field.right);
     try std.testing.expect(field.top >= label.top and field.bottom <= label.bottom);
-    try std.testing.expect(field.bottom - field.top > 0);
+    // A line of the bar's font high, not the label's whole height.
+    try std.testing.expect(window.bar.editor.line > 0);
+    try std.testing.expectEqual(window.bar.editor.line, field.bottom - field.top);
+    const bar_font = window.bar.fontFor(Window.dpiOf(&app, bar)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(bar_font), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
     // Centred, to a pixel.
     try std.testing.expect(@abs((field.top - label.top) - (label.bottom - field.bottom)) <= 1);
     var text: [64]u16 = undefined;
@@ -10713,11 +10752,16 @@ test "win32: a double click on a tab's label edits its title in place" {
     try std.testing.expectEqualStrings("New", second.title_override.?);
     try std.testing.expect(FocusSeen.last == second.focused.?.hwnd);
 
-    // Escape cancels it.
+    // Escape cancels it. The field has the real focus here, not the test's
+    // (`Window.test_set_focus`): destroyed with it, it loses the focus,
+    // which must not commit what was cancelled.
     testDoubleClick(window, testMid(testLabel(window, 1)));
     var e = window.bar.editor.edit orelse return error.TestUnexpectedResult;
     _ = win32.SetWindowTextW(e, std.unicode.utf8ToUtf16LeStringLiteral("Dropped"));
+    _ = win32.SetFocus(e);
+    try std.testing.expect(win32.GetFocus() == e);
     _ = win32.SendMessageW(e, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0);
+    _ = win32.SetFocus(null);
     try std.testing.expect(window.bar.editor.edit == null);
     try std.testing.expectEqualStrings("New", second.title_override.?);
     try std.testing.expect(FocusSeen.last == second.focused.?.hwnd);
