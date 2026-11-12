@@ -10596,6 +10596,25 @@ test "win32: a double click on a tab's label edits its title in place" {
     const third = window.tabs.items[2];
     try std.testing.expect(window.setTabTitle(second.focused.?, "Old"));
 
+    // Not when the first press was elsewhere: another tab's label, or the
+    // bar's empty part. A first press on "+" or a close glyph may have
+    // put another tab's label under the second.
+    const layout = testBarLayout(window);
+    for ([_]win32.LPARAM{
+        testMid(testLabel(window, 2)),
+        testPoint(layout.plusRect().right + 20, 4),
+    }) |first| {
+        const on = testMid(testLabel(window, 1));
+        _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, first);
+        _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, first);
+        _ = win32.SendMessageW(bar, win32.WM_LBUTTONDBLCLK, win32.MK_LBUTTON, on);
+        _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, on);
+        try std.testing.expect(window.bar.editor.edit == null);
+        // The second press was a press: it showed its tab.
+        try std.testing.expectEqual(1, window.selected);
+    }
+    window.selectTab(0);
+
     // The second tab: shown by the first press, then edited.
     testDoubleClick(window, testMid(testLabel(window, 1)));
     try std.testing.expectEqual(1, window.selected);

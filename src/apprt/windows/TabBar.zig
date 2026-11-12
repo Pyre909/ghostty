@@ -65,6 +65,13 @@ pub const Bar = struct {
     /// Kept when the tabs change, which moves what an index names but not
     /// where that press was.
     down_on_empty: bool = false,
+    /// The tab whose label the last left press was on, null if it was
+    /// elsewhere. A double click edits a tab's title only if both of its
+    /// presses were on that tab's label: a first press on "+" or a close
+    /// glyph may have put another tab's label under the second. Kept by
+    /// its pointer, as the tabs' indexes move when they change; only
+    /// compared, never followed.
+    down_on_label: ?*const Window.Tab = null,
     /// Wheel movement not yet scrolled, in pixels times WHEEL_DELTA: a
     /// high-resolution wheel sends fractions of a notch, as `Notches` in
     /// Surface.zig keeps them.
@@ -515,34 +522,39 @@ pub fn wndProc(
         },
 
         // With CS_DBLCLKS the second press of a double click comes as
-        // WM_LBUTTONDBLCLK. It is a press like any other, so that closing
-        // tabs one after another at one place, or a quick second "+",
-        // takes every click; but with both of its presses on the bar's
-        // empty part it opens a tab, as a double click there does on GTK's
-        // tab bar and in Windows Terminal.
+        // WM_LBUTTONDBLCLK. On a close glyph and on "+" it is a press like
+        // any other, so that closing tabs one after another at one place,
+        // or a quick second "+", takes every click. With both of its
+        // presses on the bar's empty part it opens a tab, as a double
+        // click there does on GTK's tab bar and in Windows Terminal; with
+        // both on one tab (outside its close glyph) it edits that tab's
+        // title in place.
         win32.WM_LBUTTONDOWN, win32.WM_LBUTTONDBLCLK => {
             const at = hitAt(window, hwnd, lparam);
             const on_empty = at == .none;
             const first_on_empty = bar.down_on_empty;
             bar.down_on_empty = msg == win32.WM_LBUTTONDOWN and on_empty;
+            const label: ?*const Window.Tab = switch (at) {
+                .tab => |index| window.tabs.items[index],
+                else => null,
+            };
+            const first_on_label = bar.down_on_label;
+            bar.down_on_label = if (msg == win32.WM_LBUTTONDOWN) label else null;
             if (msg == win32.WM_LBUTTONDBLCLK and on_empty and first_on_empty) {
                 window.clickNewTab();
                 return 0;
             }
-            // On a tab's label, its title is edited in place, as macOS's
-            // double click on a tab's title edits it. The first press
-            // showed the tab, and its press, which no drag followed, has
-            // come up.
-            if (msg == win32.WM_LBUTTONDBLCLK) switch (at) {
-                .tab => |index| {
-                    bar.pressed = .none;
-                    bar.endDrag();
-                    const l = layoutOf(window, hwnd);
-                    TabTitleEditor.begin(window, index, labelIn(l.m, l.tabRect(index)));
-                    return 0;
-                },
-                else => {},
-            };
+            // As macOS's double click on a tab's title edits it. The first
+            // press showed the tab, and its press, which no drag followed,
+            // has come up.
+            if (msg == win32.WM_LBUTTONDBLCLK and label != null and label == first_on_label) {
+                const index = tabAt(at).?;
+                bar.pressed = .none;
+                bar.endDrag();
+                const l = layoutOf(window, hwnd);
+                TabTitleEditor.begin(window, index, labelIn(l.m, l.tabRect(index)));
+                return 0;
+            }
             // Captured first: SetCapture sends WM_CAPTURECHANGED to the
             // window that loses it, which cancels a press.
             if (at != .none and win32.GetCapture() != hwnd) _ = win32.SetCapture(hwnd);
