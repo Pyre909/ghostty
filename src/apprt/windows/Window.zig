@@ -34,6 +34,7 @@ const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 pub const Tab = @import("Tab.zig");
 const TabBar = @import("TabBar.zig");
+const TabTitleEditor = @import("TabTitleEditor.zig");
 const SearchBar = @import("SearchBar.zig");
 const Overlays = @import("Overlays.zig");
 const Dividers = @import("Dividers.zig");
@@ -2458,12 +2459,21 @@ fn barHeightFor(self: *const Window, count: usize) i32 {
 }
 
 /// Show the bar along the top of the client area, or hide it, scrolled
-/// to show the shown tab at its new width.
+/// to show the shown tab at its new width. A title field open in it ends
+/// as the bar hides (one tab left, fullscreen, or the config), committed
+/// as the focus leaving it commits it: hidden, it would go on taking the
+/// keys. The focus it held goes to the shown tab's terminal, as a hidden
+/// search field gives it back.
 fn placeBar(self: *Window) void {
     const hwnd = self.bar.hwnd orelse return;
+    const height = self.barHeight();
+    if (height == 0) if (self.bar.editor.edit) |edit| {
+        const held = keyboardFocus() == edit;
+        TabTitleEditor.finish(self, .commit);
+        if (held) if (self.tab().focused) |s| self.setKeyboardFocus(s.hwnd, true);
+    };
     var client: win32.RECT = undefined;
     if (!win32.GetClientRect(self.hwnd, &client).toBool()) return;
-    const height = self.barHeight();
     const flags: win32.UINT = win32.SWP_NOZORDER | win32.SWP_NOACTIVATE |
         if (height > 0) win32.SWP_SHOWWINDOW else win32.SWP_HIDEWINDOW;
     _ = win32.SetWindowPos(hwnd, null, 0, 0, client.right, height, flags);

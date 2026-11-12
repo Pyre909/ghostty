@@ -10720,6 +10720,33 @@ test "win32: a double click on a tab's label edits its title in place" {
     try std.testing.expect(fourth.window == window);
     try std.testing.expectEqual(2, window.tabs.items.len);
 
+    // The bar hides, one tab left: the field goes with it, committed, and
+    // the focus it had goes to the terminal shown.
+    testDoubleClick(window, testMid(testLabel(window, 1)));
+    e = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    _ = win32.SetWindowTextW(e, std.unicode.utf8ToUtf16LeStringLiteral("Last"));
+    const FieldFocus = struct {
+        var held: ?win32.HWND = null;
+        fn get() ?win32.HWND {
+            return held;
+        }
+    };
+    FieldFocus.held = e;
+    Window.test_get_focus = &FieldFocus.get;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    const left = window.tabs.items[1];
+    try std.testing.expect(window.closeTabs(0, .this));
+    testTeardowns();
+    Window.test_get_focus = null;
+    try std.testing.expect(!window.barShown());
+    try std.testing.expect(window.bar.editor.edit == null);
+    try std.testing.expect(!win32.IsWindow(e).toBool());
+    try std.testing.expectEqualStrings("Last", left.title_override.?);
+    try std.testing.expect(FocusSeen.last == left.focused.?.hwnd);
+    _ = try testTab(&app, window);
+    window.relayout();
+
     // No field: the title prompt instead.
     TabTitleEditor.test_fail_create = true;
     defer TabTitleEditor.test_fail_create = false;
