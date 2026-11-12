@@ -662,7 +662,7 @@ const SearchBar = @import("SearchBar.zig");
 const TabOverview = @import("TabOverview.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
-const messageLogFont = @import("TabBar.zig").messageLogFont;
+const TabBar = @import("TabBar.zig");
 const Overlays = @import("Overlays.zig");
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const utf8FromWide = @import("clipboard.zig").utf8FromWide;
@@ -832,16 +832,7 @@ pub const Fonts = struct {
     small_bold: ?win32.HGDIOBJ = null,
 
     pub fn init(dpi: u32) Fonts {
-        const base = messageLogFont(dpi) orelse fallback: {
-            var lf = std.mem.zeroes(win32.LOGFONTW);
-            lf.lfHeight = -SearchBar.Metrics.scale(12, dpi);
-            lf.lfWeight = win32.FW_NORMAL;
-            lf.lfCharSet = win32.DEFAULT_CHARSET;
-            lf.lfQuality = win32.CLEARTYPE_QUALITY;
-            const face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
-            @memcpy(lf.lfFaceName[0..face.len], face);
-            break :fallback lf;
-        };
+        const base = TabBar.messageLogFont(dpi) orelse TabBar.fallbackLogFont(dpi);
         return .{
             .field = make(base, 20, win32.FW_LIGHT),
             .title = make(base, 14, base.lfWeight),
@@ -875,9 +866,8 @@ pub const Fonts = struct {
 /// and a positive one the cells'. Never zero, which would ask for the
 /// system's default size.
 pub fn scaleHeight(height: i32, px: i32) i32 {
-    const mag: i32 = @intCast(@abs(height));
-    const scaled: i32 = @max(1, @divTrunc(mag * px + 6, 12));
-    return if (height < 0) -scaled else scaled;
+    const scaled = TabBar.scaleDpi(height, @intCast(px), 12);
+    return if (scaled != 0) scaled else if (height < 0) -1 else 1;
 }
 
 /// The height of a line of each of `Fonts`.

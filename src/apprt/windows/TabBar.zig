@@ -350,22 +350,22 @@ pub fn messageFont(dpi: u32) ?win32.HGDIOBJ {
         if (win32.CreateFontIndirectW(&lf)) |font| return font;
         log.warn("cannot make the message font err={}", .{win32.GetLastError()});
     }
-    return win32.CreateFontW(
-        -scaleDpi(12, dpi, win32.USER_DEFAULT_SCREEN_DPI),
-        0,
-        0,
-        0,
-        win32.FW_NORMAL,
-        0,
-        0,
-        0,
-        win32.DEFAULT_CHARSET,
-        win32.OUT_DEFAULT_PRECIS,
-        win32.CLIP_DEFAULT_PRECIS,
-        win32.CLEARTYPE_QUALITY,
-        win32.DEFAULT_PITCH,
-        L("Segoe UI"),
-    );
+    const lf = fallbackLogFont(dpi);
+    return win32.CreateFontIndirectW(&lf);
+}
+
+/// The font `messageFont` falls back on where the system's cannot be
+/// read or made: Segoe UI, 12 pixels at 96 DPI, scaled to `dpi`; its
+/// precisions and pitch zero, the defaults.
+pub fn fallbackLogFont(dpi: u32) win32.LOGFONTW {
+    var lf = std.mem.zeroes(win32.LOGFONTW);
+    lf.lfHeight = -scaleDpi(12, dpi, win32.USER_DEFAULT_SCREEN_DPI);
+    lf.lfWeight = win32.FW_NORMAL;
+    lf.lfCharSet = win32.DEFAULT_CHARSET;
+    lf.lfQuality = win32.CLEARTYPE_QUALITY;
+    const face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
+    @memcpy(lf.lfFaceName[0..face.len], face);
+    return lf;
 }
 
 /// The system's message font as `messageFont` makes it, scaled to `dpi`.
