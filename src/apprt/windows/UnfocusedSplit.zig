@@ -19,12 +19,12 @@
 //! Its window is made the first time it shows (`sync`).
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Overlays = @import("Overlays.zig");
 const SearchBar = @import("SearchBar.zig");
+const Transparency = @import("Transparency.zig");
 const Config = @import("../../config.zig").Config;
 
 const RECT = win32.RECT;
@@ -93,41 +93,21 @@ pub fn wanted(surface: *const Surface, alpha: u8) bool {
     return t.tree.isSplit() and t.focused != surface;
 }
 
-/// For tests: answers in place of SetLayeredWindowAttributes in `layer`,
-/// as the test runner has no manifest, and so cannot layer a child window
-/// (`Transparency.test_set_alpha`).
-pub var test_set_alpha: if (builtin.is_test) ?*const fn (win32.HWND, u8) bool else void =
-    if (builtin.is_test) null else {};
-
 /// Whether a dim could not be layered: then none is made again in this
-/// process. A child window is layered only in a process whose manifest
+/// process, rather than one made, refused and destroyed at every
+/// placement. A child window is layered only in a process whose manifest
 /// declares Windows 8 or later, and without one every child fails (error
 /// 87), as in the test runner; the app has one.
-var cannot_layer = false;
+pub var cannot_layer = false;
 
 /// Make `hwnd` layered with `alpha`. A layered window shows nothing until
 /// its attributes are set; if they cannot be, it is not to be shown, and
 /// that is said once for the process (`cannot_layer`).
 fn layer(hwnd: win32.HWND, alpha: u8) bool {
-    const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE);
-    const layered: isize = win32.WS_EX_LAYERED;
-    if (style & layered == 0) _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE, style | layered);
-    if (setAlpha(hwnd, alpha)) return true;
+    if (Transparency.layerAt(hwnd, alpha)) return true;
     log.warn("unfocused splits cannot be dimmed: their dim cannot be layered err={}", .{win32.GetLastError()});
     cannot_layer = true;
     return false;
-}
-
-/// Whether a dim can be layered, as far as this process knows: for a
-/// test, whenever it stands in for SetLayeredWindowAttributes.
-fn canLayer() bool {
-    if (builtin.is_test) if (test_set_alpha != null) return true;
-    return !cannot_layer;
-}
-
-fn setAlpha(hwnd: win32.HWND, alpha: u8) bool {
-    if (builtin.is_test) if (test_set_alpha) |answer| return answer(hwnd, alpha);
-    return win32.SetLayeredWindowAttributes(hwnd, 0, alpha, win32.LWA_ALPHA).toBool();
 }
 
 /// Find whether `surface`'s dim shows, from `config`, for
@@ -140,7 +120,7 @@ pub fn sync(surface: *Surface, config: *const Config) void {
     const self = &surface.overlays.dim;
     const alpha = alphaOf(config.@"unfocused-split-opacity");
     self.fill = if (config.@"unfocused-split-fill") |c| win32.rgb(c.r, c.g, c.b) else null;
-    self.on = canLayer() and wanted(surface, alpha);
+    self.on = !cannot_layer and wanted(surface, alpha);
     if (!self.on) return;
     const hwnd = self.hwnd orelse made: {
         const made = Overlays.make(surface, class_name) orelse {

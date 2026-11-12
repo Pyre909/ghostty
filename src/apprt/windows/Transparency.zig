@@ -217,9 +217,10 @@ pub fn chrome(window: *const Window, hwnd: win32.HWND) void {
     if (window.transparent) _ = layer(hwnd);
 }
 
-/// For tests: answers in place of SetLayeredWindowAttributes in `layer`,
-/// as the test runner has no manifest, and so cannot layer a child window.
-pub var test_set_alpha: if (builtin.is_test) ?*const fn (win32.HWND) bool else void =
+/// For tests: answers in place of SetLayeredWindowAttributes in `layerAt`,
+/// with the alpha asked for, as the test runner has no manifest, and so
+/// cannot layer a child window.
+pub var test_set_alpha: if (builtin.is_test) ?*const fn (win32.HWND, u8) bool else void =
     if (builtin.is_test) null else {};
 
 /// Whether `layer` has said once that a window could not be layered.
@@ -233,9 +234,7 @@ var layer_failed_logged = false;
 /// manifest declaring Windows 8 or later every child fails, error 87).
 pub fn layer(hwnd: win32.HWND) bool {
     const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE);
-    const layered: isize = win32.WS_EX_LAYERED;
-    _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE, style | layered);
-    if (setAlpha(hwnd)) return true;
+    if (layerAt(hwnd, 255)) return true;
     const err = win32.GetLastError();
     _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE, style);
     if (!layer_failed_logged) {
@@ -245,9 +244,20 @@ pub fn layer(hwnd: win32.HWND) bool {
     return false;
 }
 
-fn setAlpha(hwnd: win32.HWND) bool {
-    if (builtin.is_test) if (test_set_alpha) |answer| return answer(hwnd);
-    return win32.SetLayeredWindowAttributes(hwnd, 0, 255, win32.LWA_ALPHA).toBool();
+/// Make `hwnd` layered at `alpha`; whether it is. One that cannot be may
+/// keep WS_EX_LAYERED and show nothing, and GetLastError says why: its
+/// caller takes the style off again (`layer`) or destroys it
+/// (`UnfocusedSplit.sync`).
+pub fn layerAt(hwnd: win32.HWND, alpha: u8) bool {
+    const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE);
+    const layered: isize = win32.WS_EX_LAYERED;
+    _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE, style | layered);
+    return setAlpha(hwnd, alpha);
+}
+
+fn setAlpha(hwnd: win32.HWND, alpha: u8) bool {
+    if (builtin.is_test) if (test_set_alpha) |answer| return answer(hwnd, alpha);
+    return win32.SetLayeredWindowAttributes(hwnd, 0, alpha, win32.LWA_ALPHA).toBool();
 }
 
 /// A terminal's WM_PAINT in a transparent frame: its update region filled
@@ -350,7 +360,7 @@ test "win32: a window layered over a transparent frame is opaque, and one that c
     const before = win32.GetWindowLongPtrW(refused, win32.GWL_EXSTYLE);
     try testing.expect(before & layered == 0);
     const Refuse = struct {
-        fn setAlpha(_: win32.HWND) bool {
+        fn setAlpha(_: win32.HWND, _: u8) bool {
             return false;
         }
     };

@@ -5795,7 +5795,7 @@ const TestClear = struct {
         return true;
     }
 
-    fn alpha(hwnd: win32.HWND) bool {
+    fn alpha(hwnd: win32.HWND, _: u8) bool {
         if (layered_count == layered.len) @panic("TestClear: more windows layered than it records");
         layered[layered_count] = hwnd;
         layered_count += 1;
@@ -16993,20 +16993,27 @@ test "win32: an unfocused split is dimmed by its fill at one less its opacity, o
     defer Window.test_get_focus = null;
     FocusSeen.last = null;
     // The test runner cannot layer a child window: the alpha each dim is
-    // given is recorded, and refused when `refuse` says so.
+    // given is recorded, and refused when `refuse` says so. Another test's
+    // split may have found that out already (`cannot_layer`).
     const Alpha = struct {
         var last: ?u8 = null;
+        var calls: usize = 0;
         var refuse = false;
         fn set(_: win32.HWND, alpha: u8) bool {
+            calls += 1;
             if (refuse) return false;
             last = alpha;
             return true;
         }
     };
     Alpha.last = null;
+    Alpha.calls = 0;
     Alpha.refuse = false;
-    UnfocusedSplit.test_set_alpha = &Alpha.set;
-    defer UnfocusedSplit.test_set_alpha = null;
+    Transparency.test_set_alpha = &Alpha.set;
+    defer Transparency.test_set_alpha = null;
+    const latched = UnfocusedSplit.cannot_layer;
+    UnfocusedSplit.cannot_layer = false;
+    defer UnfocusedSplit.cannot_layer = latched;
 
     const window = try testFrame(&app);
     testResize(window, 900, 500);
@@ -17101,14 +17108,24 @@ test "win32: an unfocused split is dimmed by its fill at one less its opacity, o
     try std.testing.expect(!shown(dim));
 
     // One that cannot be layered is not shown, as it would hide its
-    // terminal: its window is destroyed.
+    // terminal: its window is destroyed, and none is made again in the
+    // process, not even once layering would work.
     Alpha.refuse = true;
     changed.@"unfocused-split-opacity" = 0.5;
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expect(b.overlays.dim.hwnd == null);
     try std.testing.expect(!b.overlays.dim.on);
-    // Layered again: made again.
+    try std.testing.expect(UnfocusedSplit.cannot_layer);
     Alpha.refuse = false;
+    const calls = Alpha.calls;
+    window.placeOverlays();
+    _ = Surface.wndProc(b.hwnd, win32.WM_SETFOCUS, 0, 0);
+    _ = Surface.wndProc(a.hwnd, win32.WM_SETFOCUS, 0, 0);
+    try std.testing.expect(b.overlays.dim.hwnd == null);
+    try std.testing.expect(a.overlays.dim.hwnd == null or !shown(a.overlays.dim.hwnd.?));
+    try std.testing.expectEqual(calls, Alpha.calls);
+    // A process that could layer it: made again.
+    UnfocusedSplit.cannot_layer = false;
     window.placeOverlays();
     try std.testing.expect(shown(b.overlays.dim.hwnd orelse return error.TestUnexpectedResult));
     try std.testing.expectEqual(128, Alpha.last);
