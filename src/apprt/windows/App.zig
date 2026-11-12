@@ -10640,6 +10640,17 @@ test "win32: a double click on a tab's label edits its title in place" {
     try std.testing.expectEqual(0, from);
     try std.testing.expectEqual(3, to);
 
+    // The bar's font made again, as at a DPI or system font change: the
+    // field has the new one, measured, before the old one is deleted.
+    const dpi = Window.dpiOf(&app, bar);
+    const line = window.bar.editor.line;
+    const big = window.bar.fontFor(dpi * 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(big), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
+    try std.testing.expect(window.bar.editor.line > line);
+    const back = window.bar.fontFor(dpi) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromPtr(back), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
+    try std.testing.expectEqual(line, window.bar.editor.line);
+
     // Enter commits it.
     _ = win32.SetWindowTextW(edit, std.unicode.utf8ToUtf16LeStringLiteral("New"));
     _ = win32.SendMessageW(edit, win32.WM_KEYDOWN, win32.VK_RETURN, 0);

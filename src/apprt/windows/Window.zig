@@ -2105,7 +2105,7 @@ fn handleMessage(
             if (isColorSetChange(lparam)) self.app.systemSchemeChanged();
             // The bar's font is the system's message font (`TabBar.messageFont`).
             if (wparam == win32.SPI_SETNONCLIENTMETRICS) {
-                self.bar.freeFont();
+                self.bar.fontChanged();
                 self.bar.invalidate();
                 // And the search bars' and overlays', made again as they
                 // are placed.

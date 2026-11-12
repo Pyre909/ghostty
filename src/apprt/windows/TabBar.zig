@@ -22,6 +22,7 @@ const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
+const SearchBar = @import("SearchBar.zig");
 const TabTitleEditor = @import("TabTitleEditor.zig");
 
 const RECT = win32.RECT;
@@ -278,12 +279,25 @@ pub const Bar = struct {
         self.font_dpi = 0;
     }
 
+    /// The system's message font changed: made again at the next paint
+    /// (`fontFor`). Not deleted now, as the title field still draws with
+    /// it until it has the new one.
+    pub fn fontChanged(self: *Bar) void {
+        self.font_dpi = 0;
+    }
+
     /// The font for `dpi` (`messageFont`), made once for each DPI. The new
     /// one is made before the old one goes, which is kept if it cannot be:
-    /// the next paint tries again.
+    /// the next paint tries again. The title field, which shares it, is
+    /// given the new one before the old one is deleted, as WM_SETFONT
+    /// leaves deleting a font to its owner, and its line measured again.
     pub fn fontFor(self: *Bar, dpi: u32) ?win32.HGDIOBJ {
         if (self.font != null and self.font_dpi == dpi) return self.font;
         const font = messageFont(dpi) orelse return self.font;
+        if (self.editor.edit) |edit| {
+            _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(font), 1);
+            self.editor.line = SearchBar.textHeight(edit, font);
+        }
         self.freeFont();
         self.font = font;
         self.font_dpi = dpi;
@@ -722,7 +736,10 @@ fn tabAt(at: Hit) ?usize {
 }
 
 fn paint(window: *Window, hwnd: win32.HWND) void {
-    // Before painting: a move of the field invalidates what it uncovers.
+    // Before painting: the font, which the field's height follows, then
+    // the field's place, whose move invalidates what it uncovers.
+    const dpi = Window.dpiOf(window.app, hwnd);
+    const font = window.bar.fontFor(dpi);
     window.bar.placeEditor(window);
     var ps: win32.PAINTSTRUCT = undefined;
     const hdc = win32.BeginPaint(hwnd, &ps) orelse return;
@@ -742,12 +759,10 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
         _ = win32.SelectObject(mem, b);
     };
 
-    const dpi = Window.dpiOf(window.app, hwnd);
     const colors = Colors.of(window.dark_frame);
     const l = layoutOf(window, hwnd);
     fill(mem, client, colors.bar);
 
-    const font = window.bar.fontFor(dpi);
     const old_font = if (font) |f| win32.SelectObject(mem, f) else null;
     defer if (old_font) |f| {
         _ = win32.SelectObject(mem, f);
