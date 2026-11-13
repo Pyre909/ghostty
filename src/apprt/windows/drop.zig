@@ -55,11 +55,11 @@ pub fn shellOf(
     };
     if (try shell_integration.detectShell(alloc, command)) |shell| return shell;
 
-    // detectShell ignores case and an `.exe` suffix only for cmd and
-    // PowerShell, so it names no shell started as `bash.exe` (System32's
-    // is WSL's), `C:\msys64\usr\bin\zsh.exe` or `Nu.EXE`, and the
-    // integration leaves those alone. Their quoting is still their shell's,
-    // so the name is asked again in lower case without the suffix.
+    // detectShell ignores case and an `.exe` suffix only for cmd,
+    // PowerShell, bash and nu, so it names no shell started as
+    // `C:\msys64\usr\bin\zsh.exe` or `Fish.EXE`, and the integration
+    // leaves those alone. Their quoting is still their shell's, so the name
+    // is asked again in lower case without the suffix.
     var args = try command.argIterator(alloc);
     defer args.deinit();
     const exe = std.fs.path.basename(args.next() orelse return null);
