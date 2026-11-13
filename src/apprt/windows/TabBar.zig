@@ -83,6 +83,11 @@ pub const Bar = struct {
     /// A tab's title edited in place on its label (TabTitleEditor.zig).
     editor: TabTitleEditor.Editor = .{},
     font: ?win32.HGDIOBJ = null,
+    /// The message font, for the close glyph and the "+" button, made
+    /// with `font` where `window-title-font-family` sets a family: those
+    /// are icons on GTK and macOS, which no title font changes. Null with
+    /// no family, `font` then being the message font (`glyphFont`).
+    glyph_font: ?win32.HGDIOBJ = null,
     font_dpi: u32 = 0,
 
     /// Make the bar's window in `window`'s frame, hidden, layered if the
@@ -280,11 +285,18 @@ pub const Bar = struct {
         self.freeFont();
     }
 
-    /// Delete the font.
+    /// Delete the fonts.
     pub fn freeFont(self: *Bar) void {
         if (self.font) |f| _ = win32.DeleteObject(f);
+        if (self.glyph_font) |f| _ = win32.DeleteObject(f);
         self.font = null;
+        self.glyph_font = null;
         self.font_dpi = 0;
+    }
+
+    /// The font of the close glyph and the "+" button (`glyph_font`).
+    pub fn glyphFont(self: *const Bar) ?win32.HGDIOBJ {
+        return self.glyph_font orelse self.font;
     }
 
     /// The system's message font or `window-title-font-family` changed:
@@ -303,12 +315,16 @@ pub const Bar = struct {
     pub fn fontFor(self: *Bar, dpi: u32, family: ?[:0]const u8) ?win32.HGDIOBJ {
         if (self.font != null and self.font_dpi == dpi) return self.font;
         const font = titleFont(dpi, family) orelse return self.font;
+        // With no glyph font the glyphs take the title font, as they do
+        // with no family.
+        const glyphs: ?win32.HGDIOBJ = if (family != null) messageFont(dpi) else null;
         if (self.editor.edit) |edit| {
             _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(font), 1);
             self.editor.line = SearchBar.textHeight(edit, font);
         }
         self.freeFont();
         self.font = font;
+        self.glyph_font = glyphs;
         self.font_dpi = dpi;
         return font;
     }
@@ -888,7 +904,7 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     var plus = l.plusRect();
     fill(mem, plus, if (window.bar.hover == .plus) colors.hover else colors.bar);
     _ = win32.SetTextColor(mem, colors.text);
-    _ = win32.DrawTextW(mem, L("+"), 1, &plus, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_CENTER | win32.DT_NOPREFIX);
+    drawGlyph(window, mem, L("+"), &plus);
 
     _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
 }
@@ -922,7 +938,17 @@ fn drawTab(
 
     if (hover == .close) fill(hdc, close, colors.shown);
     _ = win32.SetTextColor(hdc, colors.dim);
-    _ = win32.DrawTextW(hdc, L("\u{00D7}"), 1, &close, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_CENTER | win32.DT_NOPREFIX);
+    drawGlyph(window, hdc, L("\u{00D7}"), &close);
+}
+
+/// Draw the one character `glyph` centred in `r` in the bar's glyph font
+/// (`Bar.glyphFont`), the title font selected again after.
+fn drawGlyph(window: *Window, hdc: win32.HDC, glyph: [*:0]const u16, r: *RECT) void {
+    const old = if (window.bar.glyphFont()) |f| win32.SelectObject(hdc, f) else null;
+    defer if (old) |f| {
+        _ = win32.SelectObject(hdc, f);
+    };
+    _ = win32.DrawTextW(hdc, glyph, 1, r, win32.DT_SINGLELINE | win32.DT_VCENTER | win32.DT_CENTER | win32.DT_NOPREFIX);
 }
 
 fn fill(hdc: win32.HDC, r: RECT, color: win32.COLORREF) void {

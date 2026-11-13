@@ -11831,7 +11831,13 @@ test "win32: window-title-font-family draws the tab titles and follows a reload"
     const Face = struct {
         fn of(w: *Window, b: win32.HWND) ![32]u16 {
             _ = win32.UpdateWindow(b);
-            const font = w.bar.font orelse return error.BarNotPainted;
+            return faceOf(w.bar.font orelse return error.BarNotPainted);
+        }
+        /// The close glyph's and the "+" button's, as last painted.
+        fn glyphs(w: *Window) ![32]u16 {
+            return faceOf(w.bar.glyphFont() orelse return error.BarNotPainted);
+        }
+        fn faceOf(font: win32.HGDIOBJ) ![32]u16 {
             var lf: win32.LOGFONTW = undefined;
             try std.testing.expectEqual(
                 @sizeOf(win32.LOGFONTW),
@@ -11854,6 +11860,9 @@ test "win32: window-title-font-family draws the tab titles and follows a reload"
     changed.@"window-title-font-family" = "Consolas";
     if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload1;
     try std.testing.expectEqualSlices(u16, &Face.named("Consolas"), &(try Face.of(window, bar)));
+    // The close glyph and "+" stay in the message font, as GTK's and
+    // macOS's icons do.
+    try std.testing.expectEqualSlices(u16, &message, &(try Face.glyphs(window)));
 
     changed.@"window-title-font-family" = "No Such Family Anywhere";
     if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload2;
@@ -11867,6 +11876,8 @@ test "win32: window-title-font-family draws the tab titles and follows a reload"
     changed.@"window-title-font-family" = null;
     if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload4;
     try std.testing.expectEqualSlices(u16, &message, &(try Face.of(window, bar)));
+    // Unset, the glyphs share the one font.
+    try std.testing.expect(window.bar.glyph_font == null);
 }
 
 test "win32: only a title a tab's label shows repaints the tab bar" {
