@@ -1270,6 +1270,45 @@ test "xdg: missing resources" {
 ///
 /// We then add `--execute 'use ghostty ...'` to the nu command line to
 /// automatically enable our shelll features.
+/// nushell's command that defines our module from the file at `path` and
+/// uses it: `source r#'<path>'#; use ghostty *`, the path a raw string
+/// with as many `#` as it needs for none of its own `'#...` to end it.
+fn nuSourceAndUse(alloc: Allocator, path: []const u8) Allocator.Error![]const u8 {
+    var hashes: usize = 1;
+    while (true) : (hashes += 1) {
+        const end = try alloc.alloc(u8, hashes + 1);
+        defer alloc.free(end);
+        end[0] = '\'';
+        @memset(end[1..], '#');
+        if (std.mem.indexOf(u8, path, end) == null) break;
+    }
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    w.writeAll("source r") catch return error.OutOfMemory;
+    w.splatByteAll('#', hashes) catch return error.OutOfMemory;
+    w.print("'{s}'", .{path}) catch return error.OutOfMemory;
+    w.splatByteAll('#', hashes) catch return error.OutOfMemory;
+    w.writeAll("; use ghostty *") catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+test nuSourceAndUse {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "C:\\a b\\ghostty.nu", "source r#'C:\\a b\\ghostty.nu'#; use ghostty *" },
+        .{ "C:\\it's\\g.nu", "source r#'C:\\it's\\g.nu'#; use ghostty *" },
+        .{ "C:\\a'#b\\g.nu", "source r##'C:\\a'#b\\g.nu'##; use ghostty *" },
+        .{ "C:\\a'#b'##c\\g.nu", "source r###'C:\\a'#b'##c\\g.nu'###; use ghostty *" },
+    };
+    for (cases) |c| {
+        const got = try nuSourceAndUse(alloc, c[0]);
+        defer alloc.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
+}
+
 fn setupNushell(
     alloc: Allocator,
     command: config.Command,
@@ -1279,7 +1318,28 @@ fn setupNushell(
     // Add our XDG_DATA_DIRS entry (for nushell/vendor/autoload/). This
     // makes our 'ghostty' module automatically available, even if any
     // of the later checks abort the rest of our automatic integration.
-    if (!try setupXdgDataDirs(alloc, resource_dir, env)) return null;
+    //
+    // Not on Windows, where nushell takes its vendor autoload directories
+    // from %ProgramData% and %APPDATA% only, reading no XDG_DATA_DIRS:
+    // there the module's file is named in the command below instead.
+    var module_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const module = if (comptime builtin.target.os.tag == .windows) module: {
+        const path = try std.mem.print(
+            &module_buf,
+            "{s}/shell-integration/nushell/vendor/autoload/ghostty.nu",
+            .{resource_dir},
+        );
+        if (std.Io.Dir.openFileAbsolute(global.io(), path, .{})) |file| {
+            file.close(global.io());
+        } else |err| {
+            log.warn("unable to open {s}: {}", .{ path, err });
+            return null;
+        }
+        break :module path;
+    } else module: {
+        if (!try setupXdgDataDirs(alloc, resource_dir, env)) return null;
+        break :module "";
+    };
 
     var stack_fallback_buf: [4096]u8 = undefined;
     var stack_fallback: std.heap.BufferFirstAllocator = .init(&stack_fallback_buf, alloc);
@@ -1303,8 +1363,10 @@ fn setupNushell(
     // enabled shell features (e.g. `use ghostty sudo`). At the moment,
     // shell features are all runtime-guarded in the nushell script.
     if (comptime builtin.target.os.tag == .windows) {
+        // `source` runs as nushell parses the command, so the module it
+        // defines is there for `use`; the path is a raw string.
         try cmd.appendArg("--execute");
-        try cmd.appendArg("use ghostty *");
+        try cmd.appendArg(try nuSourceAndUse(alloc, module));
     } else try cmd.appendArg("--execute 'use ghostty *'");
 
     // Walk through the rest of the given arguments. If we see an option that
@@ -1353,12 +1415,20 @@ test "nushell" {
     defer env.deinit();
 
     const command = try setupNushell(alloc, .{ .shell = "nu" }, res.path, &env);
-    if (comptime builtin.target.os.tag == .windows)
-        try expectCommand(&.{ "nu", "--execute", "use ghostty *" }, command)
-    else
-        try testing.expectEqualStrings("nu --execute 'use ghostty *'", command.?.shell);
-
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (comptime builtin.target.os.tag == .windows) {
+        // The module's file named, and no XDG_DATA_DIRS, which Windows'
+        // nushell does not read.
+        try expectCommand(&.{ "nu", "--execute", try std.mem.print(
+            &path_buf,
+            "source r#'{s}/shell-integration/nushell/vendor/autoload/ghostty.nu'#; use ghostty *",
+            .{res.path},
+        ) }, command);
+        try testing.expectEqual(0, env.count());
+        return;
+    }
+    try testing.expectEqualStrings("nu --execute 'use ghostty *'", command.?.shell);
+
     try testing.expectEqualStrings(
         try std.mem.print(&path_buf, "{s}/shell-integration", .{res.path}),
         env.get("GHOSTTY_SHELL_INTEGRATION_XDG_DIR").?,
@@ -1390,6 +1460,10 @@ test "nushell: unsupported options" {
         defer env.deinit();
 
         try testing.expect(try setupNushell(alloc, .{ .shell = cmdline }, res.path, &env) == null);
+        if (comptime builtin.target.os.tag == .windows) {
+            try testing.expectEqual(0, env.count());
+            continue;
+        }
         try testing.expect(env.get("XDG_DATA_DIRS") != null);
         try testing.expect(env.get("GHOSTTY_SHELL_INTEGRATION_XDG_DIR") != null);
     }
@@ -1886,6 +1960,13 @@ const TmpResourcesDir = struct {
                 .sub_path = "shell-integration/powershell/ghostty.ps1",
                 .data = "",
             }),
+            .nushell => {
+                try tmp_dir.dir.createDirPath(std.testing.io, "shell-integration/nushell/vendor/autoload");
+                try tmp_dir.dir.writeFile(std.testing.io, .{
+                    .sub_path = "shell-integration/nushell/vendor/autoload/ghostty.nu",
+                    .data = "",
+                });
+            },
             else => {},
         }
 
