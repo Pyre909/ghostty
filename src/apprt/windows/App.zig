@@ -8309,17 +8309,28 @@ test "win32: focus-follows-mouse focuses the split the pointer moves over" {
         }
     };
 
-    // Off, the default: nothing follows, though the point is recorded.
+    // Off, the default: a move follows nothing, though its point is
+    // recorded.
     testPointer(right, 10, 10);
+    testPointer(right, 12, 10);
     try std.testing.expect(window.tab().focused == left);
-    // On after a reload, the pointer still: the point the move had while
-    // off is the one compared, so the move Win32 repeats there is no move.
+    // On after a reload: the first move follows, measured from the point
+    // recorded while off.
     app.config.@"focus-follows-mouse" = true;
-    testPointer(right, 10, 10);
+    testPointer(right, 13, 10);
+    try std.testing.expect(window.tab().focused == right);
+
+    // On after a reload with the pointer still: the move Win32 repeats at
+    // the point recorded while off is no move.
+    window.tab().focused = left;
+    app.config.@"focus-follows-mouse" = false;
+    testPointer(right, 20, 10);
+    app.config.@"focus-follows-mouse" = true;
+    testPointer(right, 20, 10);
     try std.testing.expect(window.tab().focused == left);
 
     FocusSeen.last = null;
-    testPointer(right, 11, 10);
+    testPointer(right, 21, 10);
     try std.testing.expect(window.tab().focused == right);
     try std.testing.expectEqual(right.hwnd, FocusSeen.last.?);
 
