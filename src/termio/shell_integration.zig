@@ -60,7 +60,7 @@ pub fn setup(
                 var iter = try command.argIterator(alloc_arena);
                 defer iter.deinit();
                 const arg0 = iter.next() orelse return null;
-                if (isWslBash(arg0, systemDirectory(alloc_arena), &fileExists)) {
+                if (isWslBash(arg0, try systemDirectory(alloc_arena), &fileExists)) {
                     log.info("{s} is WSL's bash, no shell integration", .{arg0});
                     return null;
                 }
@@ -173,13 +173,13 @@ test "shell integration failure" {
 /// (after Ghostty's own directory and the current one), so `bash` is
 /// WSL's wherever Git's comes on PATH. A path is the launcher if its
 /// directory is the system directory. `exists` tells whether a file is
-/// there; a null `system_dir`, not known, takes nothing for the launcher.
+/// there.
 fn isWslBash(
     arg0: []const u8,
-    system_dir: ?[]const u8,
+    system_dir: []const u8,
     exists: *const fn ([]const u8) bool,
 ) bool {
-    const dir = std.mem.trimEnd(u8, system_dir orelse return false, "/\\");
+    const dir = std.mem.trimEnd(u8, system_dir, "/\\");
     if (std.mem.indexOfAny(u8, arg0, "/\\:") == null) {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const ext: []const u8 = if (std.fs.path.extension(arg0).len == 0) ".exe" else "";
@@ -204,15 +204,9 @@ fn samePath(a: []const u8, b: []const u8) bool {
 }
 
 /// The system directory, as GetSystemDirectoryW reports it (not from
-/// %SystemRoot%, which the environment can change); null if it cannot be
-/// read.
-fn systemDirectory(alloc: Allocator) ?[]const u8 {
-    if (comptime builtin.target.os.tag != .windows) return null;
-    const kernel32 = internal_os.windows.exp.kernel32;
-    var buf: [internal_os.windows.MAX_PATH]u16 = undefined;
-    const len = kernel32.GetSystemDirectoryW(&buf, buf.len);
-    if (len == 0 or len >= buf.len) return null;
-    return std.unicode.wtf16LeToWtf8Alloc(alloc, buf[0..len]) catch null;
+/// %SystemRoot%, which the environment can change).
+fn systemDirectory(alloc: Allocator) Allocator.Error![]const u8 {
+    return std.unicode.wtf16LeToWtf8Alloc(alloc, std.os.windows.getSystemDirectoryWtf16Le());
 }
 
 fn fileExists(path: []const u8) bool {
@@ -244,9 +238,6 @@ test isWslBash {
     try testing.expect(!isWslBash("C:\\Program Files\\Git\\bin\\bash.exe", system, &Fake.exists));
     try testing.expect(!isWslBash("C:\\Windows\\System32\\Git\\bash.exe", system, &Fake.exists));
     try testing.expect(!isWslBash("C:bash.exe", system, &Fake.exists));
-
-    // The system directory not known.
-    try testing.expect(!isWslBash("bash", null, &Fake.exists));
 }
 
 test "setup: WSL's bash gets no integration, Git Bash's does" {
@@ -259,9 +250,9 @@ test "setup: WSL's bash gets no integration, Git Bash's does" {
     var res: TmpResourcesDir = try .init(.bash);
     defer res.deinit();
 
-    // Windows always has a system directory; only where WSL's launcher is
-    // installed, as on the test machine, does the rest run.
-    const system = systemDirectory(alloc) orelse return error.TestNoSystemDirectory;
+    // Only where WSL's launcher is installed, as on the test machine, does
+    // the rest run.
+    const system = try systemDirectory(alloc);
     const launcher = try std.fs.path.joinZ(alloc, &.{ system, "bash.exe" });
     if (!fileExists(launcher)) return error.SkipZigTest;
 
