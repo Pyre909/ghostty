@@ -259,8 +259,9 @@ test "setup: WSL's bash gets no integration, Git Bash's does" {
     var res: TmpResourcesDir = try .init(.bash);
     defer res.deinit();
 
-    // Only where WSL's launcher is installed, as on the test machine.
-    const system = systemDirectory(alloc) orelse return error.SkipZigTest;
+    // Windows always has a system directory; only where WSL's launcher is
+    // installed, as on the test machine, does the rest run.
+    const system = systemDirectory(alloc) orelse return error.TestNoSystemDirectory;
     const launcher = try std.fs.path.joinZ(alloc, &.{ system, "bash.exe" });
     if (!fileExists(launcher)) return error.SkipZigTest;
 
@@ -545,7 +546,9 @@ const NewCommand = struct {
         self.args.deinit(self.alloc);
     }
 
-    /// An empty `arg` is left out, as ShellCommandBuilder leaves it out.
+    /// An empty `arg` is left out, as ShellCommandBuilder leaves it out,
+    /// and as Windows' command line would (Command.windowsCreateCommandLine
+    /// writes an empty argument as nothing).
     fn appendArg(self: *NewCommand, arg: []const u8) !void {
         if (comptime builtin.target.os.tag == .windows) {
             if (arg.len == 0) return;
@@ -878,6 +881,22 @@ test "bash: additional arguments" {
         const command = try setupBash(alloc, .{ .shell = "bash -- --arg file1 file2" }, res.path, &env);
         try expectCommand(&.{ "bash", "--posix", "--", "--arg", "file1", "file2" }, command);
     }
+}
+
+test "bash: an empty argument is left out" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.bash);
+    defer res.deinit();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    const command = try setupBash(alloc, .{ .direct = &.{ "bash", "", "-l" } }, res.path, &env);
+    try expectCommand(&.{ "bash", "--posix", "-l" }, command);
 }
 
 test "bash: missing resources" {
