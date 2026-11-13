@@ -521,33 +521,35 @@ test "setup features" {
 /// `C:\\Program Files` or nushell's `--execute` command; elsewhere a
 /// `.shell` string, as before.
 const NewCommand = struct {
+    const windows = builtin.target.os.tag == .windows;
+
     alloc: Allocator,
-    shell: internal_os.shell.ShellCommandBuilder,
-    args: std.ArrayList([:0]const u8) = .empty,
+    shell: if (windows) void else internal_os.shell.ShellCommandBuilder,
+    args: if (windows) std.ArrayList([:0]const u8) else void,
 
     /// `alloc` holds the result; `scratch` the `.shell` string as it is
-    /// built.
+    /// built (not on Windows).
     fn init(alloc: Allocator, scratch: Allocator) NewCommand {
-        return .{ .alloc = alloc, .shell = .init(scratch) };
+        if (comptime windows) return .{ .alloc = alloc, .shell = {}, .args = .empty };
+        return .{ .alloc = alloc, .shell = .init(scratch), .args = {} };
     }
 
     fn deinit(self: *NewCommand) void {
-        self.shell.deinit();
-        self.args.deinit(self.alloc);
+        if (comptime windows) self.args.deinit(self.alloc) else self.shell.deinit();
     }
 
     /// An empty `arg` is left out, as ShellCommandBuilder leaves it out,
     /// and as Windows' command line would (Command.windowsCreateCommandLine
     /// writes an empty argument as nothing).
     fn appendArg(self: *NewCommand, arg: []const u8) !void {
-        if (comptime builtin.target.os.tag == .windows) {
+        if (comptime windows) {
             if (arg.len == 0) return;
             try self.args.append(self.alloc, try self.alloc.dupeSentinel(u8, arg, 0));
         } else try self.shell.appendArg(arg);
     }
 
     fn finish(self: *NewCommand) Allocator.Error!config.Command {
-        if (comptime builtin.target.os.tag == .windows)
+        if (comptime windows)
             return .{ .direct = try self.args.toOwnedSlice(self.alloc) };
         return .{ .shell = try self.alloc.dupeSentinel(u8, self.shell.buffer.written(), 0) };
     }
