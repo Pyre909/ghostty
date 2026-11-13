@@ -515,15 +515,6 @@ test "setup features" {
     }
 }
 
-/// Setup the bash automatic shell integration. This works by
-/// starting bash in POSIX mode and using the ENV environment
-/// variable to load our bash integration script. This prevents
-/// bash from loading its normal startup files, which becomes
-/// our script's responsibility (along with disabling POSIX
-/// mode).
-///
-/// This returns a new (allocated) shell command string that
-/// enables the integration or null if integration failed.
 /// A setup's new command, built an argument at a time: on Windows an
 /// argument list (`.direct`), as Exec splits a `.shell` value there on
 /// whitespace, honoring no quotes, which would split a Git Bash under
@@ -580,6 +571,16 @@ fn expectCommand(args: []const []const u8, command: ?config.Command) !void {
     }
 }
 
+/// Setup the bash automatic shell integration. This works by
+/// starting bash in POSIX mode and using the ENV environment
+/// variable to load our bash integration script. This prevents
+/// bash from loading its normal startup files, which becomes
+/// our script's responsibility (along with disabling POSIX
+/// mode).
+///
+/// This returns a new (allocated) shell command string that
+/// enables the integration or null if integration failed.
+/// On Windows the new command is an argument list (see `NewCommand`).
 fn setupBash(
     alloc: Allocator,
     command: config.Command,
@@ -1263,12 +1264,6 @@ test "xdg: missing resources" {
     try testing.expectEqual(0, env.count());
 }
 
-/// Set up automatic Nushell shell integration. This works by adding our
-/// shell resource directory to the `XDG_DATA_DIRS` environment variable,
-/// which Nushell will use to load `nushell/vendor/autoload/ghostty.nu`.
-///
-/// We then add `--execute 'use ghostty ...'` to the nu command line to
-/// automatically enable our shelll features.
 /// nushell's command that defines our module from the file at `path` and
 /// uses it: `source r#'<path>'#; use ghostty *`, the path a raw string
 /// with as many `#` as it needs for none of its own `'#...` to end it.
@@ -1308,6 +1303,15 @@ test nuSourceAndUse {
     }
 }
 
+/// Set up automatic Nushell shell integration. This works by adding our
+/// shell resource directory to the `XDG_DATA_DIRS` environment variable,
+/// which Nushell will use to load `nushell/vendor/autoload/ghostty.nu`.
+///
+/// We then add `--execute 'use ghostty ...'` to the nu command line to
+/// automatically enable our shelll features.
+///
+/// On Windows, whose nushell reads no `XDG_DATA_DIRS`, the command
+/// sources that file by its path instead (see `nuSourceAndUse`).
 fn setupNushell(
     alloc: Allocator,
     command: config.Command,
