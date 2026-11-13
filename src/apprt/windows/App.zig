@@ -11861,6 +11861,9 @@ test "win32: window-title-font-family draws the tab titles and follows a reload"
 
     changed.@"window-title-font-family" = "Consolas";
     if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload3;
+    // Drawn in the family before it is unset, so that the unset has a
+    // font to undo.
+    try std.testing.expectEqualSlices(u16, &Face.named("Consolas"), &(try Face.of(window, bar)));
     changed.@"window-title-font-family" = null;
     if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload4;
     try std.testing.expectEqualSlices(u16, &message, &(try Face.of(window, bar)));
