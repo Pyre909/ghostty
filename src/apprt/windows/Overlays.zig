@@ -181,9 +181,14 @@ pub fn invalidate(self: *const Overlays) void {
     }
 }
 
-/// The system's message font changed: made again at the next placement.
+/// The system's message font changed: made again at the next placement,
+/// and every overlay drawn again. One whose place does not change with it
+/// (the renderer error view, which makes its fonts as it paints, or text
+/// whose new size happens to be the old one) is not moved, so placing it
+/// alone would leave it drawn in the old font.
 pub fn fontChanged(self: *Overlays) void {
     self.font_dpi = 0;
+    self.invalidate();
 }
 
 /// The message font at `dpi`, made once for each DPI, the new one before

@@ -26788,6 +26788,33 @@ test "win32: a renderer error view whose window cannot be made returns false, an
     try expectHealthViewAt(window, a);
 }
 
+test "win32: a shown renderer error view is drawn again when the system's message font changes" {
+    // It makes its fonts from the system's message font as it paints, and
+    // its place does not change with that font.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    try std.testing.expect(try testHealth(&app, a, .unhealthy));
+    const hwnd = a.overlays.renderer_health.hwnd.?;
+    _ = win32.ValidateRect(hwnd, null);
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETNONCLIENTMETRICS, 0);
+    try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+}
+
 test "win32: the child-exited banner is between the read-only badge and the link preview, under the search bar, and hides with its terminal" {
     // GTK stacks its banner over the read-only badge and under its URL
     // labels, its search overlay and its key-state overlay.
