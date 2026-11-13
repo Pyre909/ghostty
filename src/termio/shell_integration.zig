@@ -280,6 +280,8 @@ test "setup: WSL's bash gets no integration, Git Bash's does" {
     } }, &env, null);
     try testing.expectEqual(.bash, git.?.shell);
     try testing.expect(env.get("ENV") != null);
+    // The path under Program Files stays one argument (`NewCommand`).
+    try expectArgs(&.{ "C:\\Program Files\\Git\\bin\\bash.exe", "--posix" }, git.?.command.direct);
 }
 
 /// The shell `command` runs, from its first argument's name; null for
@@ -519,6 +521,60 @@ test "setup features" {
 ///
 /// This returns a new (allocated) shell command string that
 /// enables the integration or null if integration failed.
+/// A setup's new command, built an argument at a time: on Windows an
+/// argument list (`.direct`), as Exec splits a `.shell` value there on
+/// whitespace, honoring no quotes, which would split a Git Bash under
+/// `C:\\Program Files` or nushell's `--execute` command; elsewhere a
+/// `.shell` string, as before.
+const NewCommand = struct {
+    alloc: Allocator,
+    shell: internal_os.shell.ShellCommandBuilder,
+    args: std.ArrayList([:0]const u8) = .empty,
+
+    /// `alloc` holds the result; `scratch` the `.shell` string as it is
+    /// built.
+    fn init(alloc: Allocator, scratch: Allocator) NewCommand {
+        return .{ .alloc = alloc, .shell = .init(scratch) };
+    }
+
+    fn deinit(self: *NewCommand) void {
+        self.shell.deinit();
+        self.args.deinit(self.alloc);
+    }
+
+    /// An empty `arg` is left out, as ShellCommandBuilder leaves it out.
+    fn appendArg(self: *NewCommand, arg: []const u8) !void {
+        if (comptime builtin.target.os.tag == .windows) {
+            if (arg.len == 0) return;
+            try self.args.append(self.alloc, try self.alloc.dupeSentinel(u8, arg, 0));
+        } else try self.shell.appendArg(arg);
+    }
+
+    fn finish(self: *NewCommand) Allocator.Error!config.Command {
+        if (comptime builtin.target.os.tag == .windows)
+            return .{ .direct = try self.args.toOwnedSlice(self.alloc) };
+        return .{ .shell = try self.alloc.dupeSentinel(u8, self.shell.buffer.written(), 0) };
+    }
+};
+
+/// For tests: `command` is `args`, as an argument list on Windows and as
+/// a `.shell` string of them joined by spaces elsewhere (`NewCommand`).
+fn expectCommand(args: []const []const u8, command: ?config.Command) !void {
+    const testing = std.testing;
+    const c = command orelse return error.TestExpectedCommand;
+    if (comptime builtin.target.os.tag == .windows) {
+        try expectArgs(args, c.direct);
+    } else {
+        var buf: [256]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        for (args, 0..) |a, i| {
+            if (i > 0) try w.writeByte(' ');
+            try w.writeAll(a);
+        }
+        try testing.expectEqualStrings(w.buffered(), c.shell);
+    }
+}
+
 fn setupBash(
     alloc: Allocator,
     command: config.Command,
@@ -527,7 +583,7 @@ fn setupBash(
 ) !?config.Command {
     var stack_fallback_buf: [4096]u8 = undefined;
     var stack_fallback: std.heap.BufferFirstAllocator = .init(&stack_fallback_buf, alloc);
-    var cmd = internal_os.shell.ShellCommandBuilder.init(stack_fallback.allocator());
+    var cmd: NewCommand = .init(alloc, stack_fallback.allocator());
     defer cmd.deinit();
 
     // Iterator that yields each argument in the original command line.
@@ -631,7 +687,7 @@ fn setupBash(
     }
 
     // Return a copy of our modified command line to use as the shell command.
-    return .{ .shell = try alloc.dupeSentinel(u8, cmd.buffer.written(), 0) };
+    return try cmd.finish();
 }
 
 test "bash" {
@@ -647,7 +703,7 @@ test "bash" {
     defer env.deinit();
 
     const command = try setupBash(alloc, .{ .shell = "bash" }, res.path, &env);
-    try testing.expectEqualStrings("bash --posix", command.?.shell);
+    try expectCommand(&.{ "bash", "--posix" }, command);
     try testing.expectEqualStrings("1", env.get("GHOSTTY_BASH_INJECT").?);
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -698,7 +754,7 @@ test "bash: inject flags" {
         defer env.deinit();
 
         const command = try setupBash(alloc, .{ .shell = "bash --norc" }, res.path, &env);
-        try testing.expectEqualStrings("bash --posix", command.?.shell);
+        try expectCommand(&.{ "bash", "--posix" }, command);
         try testing.expectEqualStrings("1 --norc", env.get("GHOSTTY_BASH_INJECT").?);
     }
 
@@ -708,7 +764,7 @@ test "bash: inject flags" {
         defer env.deinit();
 
         const command = try setupBash(alloc, .{ .shell = "bash --noprofile" }, res.path, &env);
-        try testing.expectEqualStrings("bash --posix", command.?.shell);
+        try expectCommand(&.{ "bash", "--posix" }, command);
         try testing.expectEqualStrings("1 --noprofile", env.get("GHOSTTY_BASH_INJECT").?);
     }
 }
@@ -728,14 +784,14 @@ test "bash: rcfile" {
     // bash --rcfile
     {
         const command = try setupBash(alloc, .{ .shell = "bash --rcfile profile.sh" }, res.path, &env);
-        try testing.expectEqualStrings("bash --posix", command.?.shell);
+        try expectCommand(&.{ "bash", "--posix" }, command);
         try testing.expectEqualStrings("profile.sh", env.get("GHOSTTY_BASH_RCFILE").?);
     }
 
     // bash --init-file
     {
         const command = try setupBash(alloc, .{ .shell = "bash --init-file profile.sh" }, res.path, &env);
-        try testing.expectEqualStrings("bash --posix", command.?.shell);
+        try expectCommand(&.{ "bash", "--posix" }, command);
         try testing.expectEqualStrings("profile.sh", env.get("GHOSTTY_BASH_RCFILE").?);
     }
 }
@@ -811,13 +867,13 @@ test "bash: additional arguments" {
     // "-" argument separator
     {
         const command = try setupBash(alloc, .{ .shell = "bash - --arg file1 file2" }, res.path, &env);
-        try testing.expectEqualStrings("bash --posix - --arg file1 file2", command.?.shell);
+        try expectCommand(&.{ "bash", "--posix", "-", "--arg", "file1", "file2" }, command);
     }
 
     // "--" argument separator
     {
         const command = try setupBash(alloc, .{ .shell = "bash -- --arg file1 file2" }, res.path, &env);
-        try testing.expectEqualStrings("bash --posix -- --arg file1 file2", command.?.shell);
+        try expectCommand(&.{ "bash", "--posix", "--", "--arg", "file1", "file2" }, command);
     }
 }
 
@@ -1205,7 +1261,7 @@ fn setupNushell(
 
     var stack_fallback_buf: [4096]u8 = undefined;
     var stack_fallback: std.heap.BufferFirstAllocator = .init(&stack_fallback_buf, alloc);
-    var cmd = internal_os.shell.ShellCommandBuilder.init(stack_fallback.allocator());
+    var cmd: NewCommand = .init(alloc, stack_fallback.allocator());
     defer cmd.deinit();
 
     // Iterator that yields each argument in the original command line.
@@ -1224,7 +1280,10 @@ fn setupNushell(
     // We can consider making this more specific based on the set of
     // enabled shell features (e.g. `use ghostty sudo`). At the moment,
     // shell features are all runtime-guarded in the nushell script.
-    try cmd.appendArg("--execute 'use ghostty *'");
+    if (comptime builtin.target.os.tag == .windows) {
+        try cmd.appendArg("--execute");
+        try cmd.appendArg("use ghostty *");
+    } else try cmd.appendArg("--execute 'use ghostty *'");
 
     // Walk through the rest of the given arguments. If we see an option that
     // would require complex or unsupported integration behavior, we bail out
@@ -1256,7 +1315,7 @@ fn setupNushell(
     }
 
     // Return a copy of our modified command line to use as the shell command.
-    return .{ .shell = try alloc.dupeSentinel(u8, cmd.buffer.written(), 0) };
+    return try cmd.finish();
 }
 
 test "nushell" {
@@ -1272,7 +1331,10 @@ test "nushell" {
     defer env.deinit();
 
     const command = try setupNushell(alloc, .{ .shell = "nu" }, res.path, &env);
-    try testing.expectEqualStrings("nu --execute 'use ghostty *'", command.?.shell);
+    if (comptime builtin.target.os.tag == .windows)
+        try expectCommand(&.{ "nu", "--execute", "use ghostty *" }, command)
+    else
+        try testing.expectEqualStrings("nu --execute 'use ghostty *'", command.?.shell);
 
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try testing.expectEqualStrings(
