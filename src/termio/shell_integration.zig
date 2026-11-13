@@ -678,7 +678,14 @@ fn setupBash(
 
     // In POSIX mode, HISTFILE defaults to ~/.sh_history, so unless we're
     // staying in POSIX mode (--posix), change it back to ~/.bash_history.
-    if (env.get("HISTFILE") == null) {
+    //
+    // On Windows the `~` is the HOME that Git's, MSYS2's or Cygwin's
+    // runtime gives bash (MSYS2's /home/<user>, say), which we cannot
+    // know, so our script sets it from bash's own $HOME.
+    if (comptime builtin.target.os.tag == .windows) {
+        if (env.get("HISTFILE") == null)
+            try env.put("GHOSTTY_BASH_HISTFILE_DEFAULT", "1");
+    } else if (env.get("HISTFILE") == null) {
         var environ_map = try global.environMap();
         defer environ_map.deinit();
         var home_buf: [1024]u8 = undefined;
@@ -819,8 +826,16 @@ test "bash: HISTFILE" {
         defer env.deinit();
 
         _ = try setupBash(alloc, .{ .shell = "bash" }, res.path, &env);
-        try testing.expect(std.mem.endsWith(u8, env.get("HISTFILE").?, ".bash_history"));
-        try testing.expectEqualStrings("1", env.get("GHOSTTY_BASH_UNEXPORT_HISTFILE").?);
+        if (comptime builtin.target.os.tag == .windows) {
+            // Left to our script, from bash's $HOME.
+            try testing.expect(env.get("HISTFILE") == null);
+            try testing.expect(env.get("GHOSTTY_BASH_UNEXPORT_HISTFILE") == null);
+            try testing.expectEqualStrings("1", env.get("GHOSTTY_BASH_HISTFILE_DEFAULT").?);
+        } else {
+            try testing.expect(std.mem.endsWith(u8, env.get("HISTFILE").?, ".bash_history"));
+            try testing.expectEqualStrings("1", env.get("GHOSTTY_BASH_UNEXPORT_HISTFILE").?);
+            try testing.expect(env.get("GHOSTTY_BASH_HISTFILE_DEFAULT") == null);
+        }
     }
 
     // HISTFILE set
@@ -833,6 +848,7 @@ test "bash: HISTFILE" {
         _ = try setupBash(alloc, .{ .shell = "bash" }, res.path, &env);
         try testing.expectEqualStrings("my_history", env.get("HISTFILE").?);
         try testing.expect(env.get("GHOSTTY_BASH_UNEXPORT_HISTFILE") == null);
+        try testing.expect(env.get("GHOSTTY_BASH_HISTFILE_DEFAULT") == null);
     }
 }
 

@@ -43,6 +43,13 @@ if [ -n "$GHOSTTY_BASH_INJECT" ]; then
     builtin unset GHOSTTY_BASH_UNEXPORT_HISTFILE
   fi
 
+  # On Windows, Ghostty cannot know the HOME that Git's, MSYS2's or
+  # Cygwin's runtime gives bash, so it leaves the default HISTFILE to us.
+  if [[ -n "$GHOSTTY_BASH_HISTFILE_DEFAULT" ]]; then
+    HISTFILE="$HOME/.bash_history"
+    builtin unset GHOSTTY_BASH_HISTFILE_DEFAULT
+  fi
+
   # Manually source the startup files. See INVOCATION in bash(1) and
   # run_startup_files() in shell.c in the Bash source code.
   if builtin shopt -q login_shell; then
