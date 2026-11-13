@@ -11,9 +11,10 @@
 //! next frame, and again each `D3D11.recovery_retry_ms` after a failure,
 //! and the first frame it presents then is healthy, which hides the view.
 //!
-//! It is one of the terminal's overlays (Overlays.zig), just above the
-//! bell border, as macOS stacks it over its bell border and under the dim
-//! of an unfocused split. Its window covers the whole terminal; the
+//! It is one of the terminal's overlays (Overlays.zig), over the bell
+//! border, the child-exited banner, the resize overlay and the link
+//! preview and under the key-state indicator and the dim of an unfocused
+//! split, as macOS stacks it. Its window covers the whole terminal; the
 //! pointer and clicks over it go to the terminal under it, as macOS's
 //! view takes none of the terminal's input. The window is made the first
 //! time the renderer is unhealthy (`set`).

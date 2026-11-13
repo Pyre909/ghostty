@@ -195,9 +195,10 @@
 //! as macOS's error view does (`RendererHealth`), and hides it once the
 //! renderer is healthy again. Direct3D 11 reports a frame unhealthy when
 //! its device was lost, and healthy once it has made a new one, which it
-//! tries again each second. The view is passive, above the bell border
-//! and under the child-exited banner; its window is made the first time
-//! the renderer is unhealthy.
+//! tries again each second. The view is passive, above the terminal's
+//! other overlays but the key-state indicator and the dim, as macOS
+//! stacks it; its window is made the first time the renderer is
+//! unhealthy.
 //!
 //! ## Command finished
 //!

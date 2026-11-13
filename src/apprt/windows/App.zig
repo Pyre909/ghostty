@@ -26654,9 +26654,9 @@ fn expectHealthViewAt(window: *const Window, surface: *const Surface) !void {
 test "win32: renderer_health covers its terminal with the error view while unhealthy, and hides it once healthy" {
     // macOS's view: the terminal's background over all of it, and on it
     // the icon, the title and a line, while the renderer is unhealthy.
-    // Stacked over the bell border and under the child-exited banner, as
-    // macOS stacks it over its bell border; a resize, a zoom and a hidden
-    // tab take it with its terminal; passive.
+    // Stacked over the bell border and the child-exited banner, as macOS
+    // stacks it; a resize, a zoom and a hidden tab take it with its
+    // terminal; passive.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -26709,7 +26709,7 @@ test "win32: renderer_health covers its terminal with the error view while unhea
     testResize(window, 1000, 600);
     try expectHealthViewAt(window, a);
 
-    // Over the bell border, under the banner.
+    // Over the bell border and the banner.
     var changed: Config = try .default(alloc);
     defer changed.deinit();
     changed.@"bell-features".border = true;
@@ -26719,8 +26719,8 @@ test "win32: renderer_health covers its terminal with the error view while unhea
     const border = a.overlays.bell_border.hwnd orelse return error.TestUnexpectedResult;
     const banner = a.overlays.child_exited.hwnd orelse return error.TestUnexpectedResult;
     try std.testing.expect(shown(border));
-    try std.testing.expect(win32.GetWindow(border, win32.GW_HWNDPREV) == hwnd);
-    try std.testing.expect(win32.GetWindow(hwnd, win32.GW_HWNDPREV) == banner);
+    try std.testing.expect(win32.GetWindow(border, win32.GW_HWNDPREV) == banner);
+    try std.testing.expect(win32.GetWindow(banner, win32.GW_HWNDPREV) == hwnd);
     try expectHealthViewAt(window, a);
 
     // A zoom on the other terminal hides it with its own; back, shown.

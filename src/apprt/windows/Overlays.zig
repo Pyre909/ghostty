@@ -1,11 +1,12 @@
 //! A terminal's overlays: windows that show something about the terminal
 //! over it, as GTK stacks overlays over its surface
 //! (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge (ReadOnly.zig),
-//! the bell border (BellBorder.zig), the renderer error view
-//! (RendererHealth.zig, as macOS shows), the child-exited banner
+//! the bell border (BellBorder.zig), the child-exited banner
 //! (ChildExited.zig), the resize overlay (ResizeOverlay.zig), the link
-//! preview (LinkPreview.zig), the key-state indicator (KeyState.zig) and
-//! the dim of an unfocused split (UnfocusedSplit.zig).
+//! preview (LinkPreview.zig), the renderer error view (RendererHealth.zig,
+//! which GTK lacks, over those as macOS stacks it), the key-state
+//! indicator (KeyState.zig) and the dim of an unfocused split
+//! (UnfocusedSplit.zig).
 //! This file does for each what they all need: their window class and
 //! procedure, their place in the Z order, their font, colours and frame,
 //! and their teardown; each overlay's own file says what it shows and where
@@ -102,11 +103,11 @@ font_dpi: u32 = 0,
 /// its text to measure), `shape` (its window's region), `handle`
 /// (messages of its own) and `hidden` (what it does as its window is
 /// hidden).
-pub const stack = [_][]const u8{ "readonly", "bell_border", "renderer_health", "child_exited", "resize_overlay", "link_preview", "key_state", "dim" };
+pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, RendererHealth.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, KeyState.class_name, UnfocusedSplit.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
