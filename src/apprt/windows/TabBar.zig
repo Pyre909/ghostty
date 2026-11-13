@@ -453,6 +453,14 @@ pub fn titleLogFont(dpi: u32, family: []const u8) ?win32.LOGFONTW {
 /// (SHIFTJIS_CHARSET, say) would have it make that script's face instead
 /// of the family.
 fn titleLogFontFrom(base: win32.LOGFONTW, family: []const u8) ?win32.LOGFONTW {
+    // GDI lists a CJK family's vertical variant, its glyphs turned for
+    // text drawn down the page, as a family of its own named with an "@"
+    // ("@Yu Gothic"): across the bar every title would lie on its side.
+    // macOS's NSFont(name:) has no such name either.
+    if (family.len > 0 and family[0] == '@') {
+        log.warn("window-title-font-family names a vertical face, which tab titles cannot take: {s}", .{family});
+        return null;
+    }
     var lf = base;
     lf.lfCharSet = win32.DEFAULT_CHARSET;
     if (!setFaceName(&lf, family)) {
@@ -1233,6 +1241,10 @@ test "win32: window-title-font-family names the tab titles' face" {
     try testing.expect(titleLogFont(dpi, "consolas") != null);
 
     try testing.expect(titleLogFont(dpi, "No Such Family Anywhere") == null);
+    // A vertical face, though installed: Yu Gothic ships with Windows 11,
+    // and GDI lists "@Yu Gothic" beside it.
+    try testing.expect(titleLogFont(dpi, "Yu Gothic") != null);
+    try testing.expect(titleLogFont(dpi, "@Yu Gothic") == null);
     try testing.expect(titleLogFont(dpi, "") == null);
     try testing.expect(titleLogFont(dpi, "Consolas\xff") == null);
     // Ending partway through a character, of three bytes and of four.
