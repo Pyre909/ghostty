@@ -441,6 +441,12 @@ pub fn titleLogFont(dpi: u32, family: []const u8) ?win32.LOGFONTW {
 
 /// `lf`'s face `family`, NUL-terminated, if it fits.
 fn setFaceName(lf: *win32.LOGFONTW, family: []const u8) bool {
+    // First: calcUtf16LeLen slices a sequence its lead byte announces
+    // without checking that the input holds it, so a value that ends
+    // partway through a character would read past its end (Zig 0.17.0,
+    // std/unicode.zig calcUtf16LeLenImpl). The config keeps the value's
+    // bytes as written, as upstream's own config strings check with this.
+    if (!std.unicode.utf8ValidateSlice(family)) return false;
     const len = std.unicode.calcUtf16LeLen(family) catch return false;
     if (len == 0 or len >= lf.lfFaceName.len) return false;
     @memset(&lf.lfFaceName, 0);
@@ -1192,6 +1198,9 @@ test "win32: window-title-font-family names the tab titles' face" {
     try testing.expect(titleLogFont(dpi, "No Such Family Anywhere") == null);
     try testing.expect(titleLogFont(dpi, "") == null);
     try testing.expect(titleLogFont(dpi, "Consolas\xff") == null);
+    // Ending partway through a character, of three bytes and of four.
+    try testing.expect(titleLogFont(dpi, "Consolas\xe2\x80") == null);
+    try testing.expect(titleLogFont(dpi, "Consolas\xf0\x9f") == null);
     // 31 characters fit with the NUL, 32 do not; neither is installed, so
     // the length is seen through `setFaceName`.
     const a31: [31]u8 = @splat('a');
