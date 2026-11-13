@@ -141,17 +141,18 @@ pub fn set(surface: *Surface, health: renderer.Health) bool {
 }
 
 /// The view's two fonts at a DPI: the system's message font for the line
-/// (`TabBar.messageLogFont`), and the title in it at twice its size, as
-/// macOS's title font is about twice its body's.
+/// (`TabBar.messageLogFont`, or its fallback), and the title in it at
+/// twice its size, as macOS's title font is about twice its body's. One
+/// the system will not make is null.
 const Fonts = struct {
     title: ?win32.HGDIOBJ,
     body: ?win32.HGDIOBJ,
 
     fn init(dpi: u32) Fonts {
-        const message = TabBar.messageFont(dpi);
-        var lf = TabBar.messageLogFont(dpi) orelse return .{ .title = null, .body = message };
-        lf.lfHeight *|= 2;
-        return .{ .title = win32.CreateFontIndirectW(&lf), .body = message };
+        const base = TabBar.messageLogFont(dpi) orelse TabBar.fallbackLogFont(dpi);
+        var big = base;
+        big.lfHeight *|= 2;
+        return .{ .title = win32.CreateFontIndirectW(&big), .body = win32.CreateFontIndirectW(&base) };
     }
 
     fn deinit(self: Fonts) void {
