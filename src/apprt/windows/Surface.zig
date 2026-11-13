@@ -3350,16 +3350,21 @@ pub const Surface = struct {
     /// or a layout change does, and that must not take the focus from the
     /// terminal a binding just gave it, as GTK guards against (its motion
     /// handler drops a still cursor). So the screen position is compared
-    /// with the last one any terminal saw.
+    /// with `App.pointer`: where the last terminal move was, whatever the
+    /// option is (as GTK records its cursor), or where the pointer was when
+    /// the terminals were last laid out (`Window.relayout`), wherever it
+    /// rested then, over a divider or the tab bar included. With neither
+    /// yet, as when a window is first shown, the pointer counts as still.
     fn followMouse(self: *Surface, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
         const window = self.window;
         const app = window.app;
-        if (!app.config.@"focus-follows-mouse") return;
         var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
         if (!win32.ClientToScreen(self.hwnd, &pt).toBool()) return;
         const last = app.pointer;
         app.pointer = pt;
-        if (last) |l| if (l.x == pt.x and l.y == pt.y) return;
+        if (!app.config.@"focus-follows-mouse") return;
+        const l = last orelse return;
+        if (l.x == pt.x and l.y == pt.y) return;
         if (Mouse.Button.downIn(wparam).count() != 0) return;
         if (Window.activeWindow() != window.hwnd) return;
         const t = window.tabOf(self) orelse return;

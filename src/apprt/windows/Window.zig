@@ -3212,6 +3212,23 @@ pub fn relayout(self: *Window) void {
     // covers them, and the bar.
     _ = CommandPalette.place(self);
     _ = TabOverview.place(self);
+    // The terminals moved, and Win32 tells the one now under a still
+    // pointer with a WM_MOUSEMOVE that is no move (`Surface.followMouse`).
+    if (cursorScreenPos()) |pt| self.app.pointer = pt;
+}
+
+/// For tests: answers in place of GetCursorPos (`cursorScreenPos`); null,
+/// the default, stands for a pointer that cannot be read.
+pub var test_cursor: if (builtin.is_test) ?win32.POINT else void =
+    if (builtin.is_test) null else {};
+
+/// Where the pointer is on the screen, GetCursorPos's answer; null if it
+/// cannot be read (on a secure desktop).
+pub fn cursorScreenPos() ?win32.POINT {
+    if (builtin.is_test) return test_cursor;
+    var pt: win32.POINT = undefined;
+    if (!win32.GetCursorPos(&pt).toBool()) return null;
+    return pt;
 }
 
 /// Tell every terminal of every tab its new DPI, `dpi`: a child window
