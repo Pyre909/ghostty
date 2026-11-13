@@ -1404,6 +1404,12 @@ comptime {
 }
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createfontindirectw
 pub extern "gdi32" fn CreateFontIndirectW(font: *const LOGFONTW) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-gettextfacew
+/// The face of the font selected into `hdc`, the one GDI realized, which
+/// may not be the one asked for.
+pub extern "gdi32" fn GetTextFaceW(hdc: HDC, count: c_int, face: [*]u16) callconv(.winapi) c_int;
+/// wingdi.h's character set of Japanese (code page 932), for LOGFONTW.
+pub const SHIFTJIS_CHARSET: u8 = 128;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nc-wingdi-fontenumprocw
 /// Its second argument is a TEXTMETRICW or NEWTEXTMETRICEXW by font type,
 /// read by none of ours.

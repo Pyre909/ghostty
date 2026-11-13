@@ -427,7 +427,18 @@ pub fn titleFont(dpi: u32, family: ?[:0]const u8) ?win32.HGDIOBJ {
 /// `NSFont(name:)` gives none and its title bar keeps the system font, as
 /// here.
 pub fn titleLogFont(dpi: u32, family: []const u8) ?win32.LOGFONTW {
-    var lf = messageLogFont(dpi) orelse fallbackLogFont(dpi);
+    return titleLogFontFrom(messageLogFont(dpi) orelse fallbackLogFont(dpi), family);
+}
+
+/// `titleLogFont` from `base`, the message font. Its character set
+/// becomes DEFAULT_CHARSET, as `familyInstalled` asks with: a LOGFONT's
+/// character set should be its face's, and GDI ranks a match of it above
+/// one of the face, so a message font of a CJK script's character set
+/// (SHIFTJIS_CHARSET, say) would have it make that script's face instead
+/// of the family.
+fn titleLogFontFrom(base: win32.LOGFONTW, family: []const u8) ?win32.LOGFONTW {
+    var lf = base;
+    lf.lfCharSet = win32.DEFAULT_CHARSET;
     if (!setFaceName(&lf, family)) {
         log.warn("window-title-font-family is not a font family name GDI takes: {s}", .{family});
         return null;
@@ -1213,6 +1224,26 @@ test "win32: window-title-font-family names the tab titles' face" {
     try testing.expect(setFaceName(&face, "Consolas"));
     try testing.expectEqualSlices(u16, W("Consolas"), std.mem.sliceTo(&face.lfFaceName, 0));
     try testing.expectEqual(0, face.lfFaceName[9]);
+
+    // From a message font of Japanese's character set, GDI still makes
+    // the family, not a Japanese face (MS PGothic, without the reset).
+    // GetObjectW gives back what was asked for; GetTextFaceW what GDI
+    // made.
+    var japanese = message;
+    japanese.lfCharSet = win32.SHIFTJIS_CHARSET;
+    const jlf = titleLogFontFrom(japanese, "Consolas") orelse return error.TestUnexpectedResult;
+    const jfont = win32.CreateFontIndirectW(&jlf) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteObject(jfont);
+    const screen = win32.GetDC(null) orelse return error.TestUnexpectedResult;
+    defer _ = win32.ReleaseDC(null, screen);
+    const old_font = win32.SelectObject(screen, jfont);
+    defer if (old_font) |f| {
+        _ = win32.SelectObject(screen, f);
+    };
+    var realized: [32]u16 = undefined;
+    const n = win32.GetTextFaceW(screen, realized.len, &realized);
+    try testing.expect(n > 0);
+    try testing.expectEqualSlices(u16, W("Consolas"), std.mem.sliceTo(realized[0..@intCast(n)], 0));
 
     const font = titleFont(dpi, "Consolas") orelse return error.TestUnexpectedResult;
     defer _ = win32.DeleteObject(font);
