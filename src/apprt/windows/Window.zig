@@ -2123,7 +2123,8 @@ fn handleMessage(
         // DefWindowProcW below as well.
         win32.WM_SETTINGCHANGE => {
             if (isColorSetChange(lparam)) self.app.systemSchemeChanged();
-            // The bar's font is the system's message font (`TabBar.messageFont`).
+            // The bar's fonts are made from the system's message font
+            // (`TabBar.titleFont`, `TabBar.messageFont`).
             if (wparam == win32.SPI_SETNONCLIENTMETRICS) {
                 self.bar.fontChanged();
                 self.bar.invalidate();
