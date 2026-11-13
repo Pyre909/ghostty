@@ -4861,8 +4861,9 @@ pub fn postTeardown(hwnd: win32.HWND, closing: *bool) void {
 pub var test_post_fails: if (builtin.is_test) ?*const fn (win32.HWND) bool else void =
     if (builtin.is_test) null else {};
 
-/// ID_ICON_GHOSTTY in dist/windows/ghostty.rc, which the exe links.
-const icon_resource_id = 1;
+/// ID_ICON_GHOSTTY in dist/windows/ghostty.rc, which the exe links and
+/// the test exe does not.
+pub const icon_resource_id = 1;
 
 fn registerClasses(hinstance: win32.HINSTANCE) !void {
     const arrow = win32.LoadCursorW(null, win32.IDC_ARROW);

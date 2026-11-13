@@ -34,6 +34,7 @@ const Surface = @import("Surface.zig").Surface;
 const Overlays = @import("Overlays.zig");
 const SearchBar = @import("SearchBar.zig");
 const TabBar = @import("TabBar.zig");
+const icon_resource_id = @import("App.zig").icon_resource_id;
 
 const RECT = win32.RECT;
 const Size = Overlays.Size;
@@ -56,10 +57,6 @@ const name_text: [:0]const u16 = blk: {
     @setEvalBranchQuota(10_000);
     break :blk std.unicode.utf8ToUtf16LeStringLiteral(title ++ " " ++ body);
 };
-
-/// ID_ICON_GHOSTTY in dist/windows/ghostty.rc, which the exe links and
-/// the test exe does not.
-pub const icon_resource_id = 1;
 
 const title_format = win32.DT_SINGLELINE | win32.DT_NOPREFIX;
 const body_format = win32.DT_WORDBREAK | win32.DT_NOPREFIX;
