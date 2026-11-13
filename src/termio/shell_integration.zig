@@ -60,7 +60,10 @@ pub fn setup(
                 var iter = try command.argIterator(alloc_arena);
                 defer iter.deinit();
                 const arg0 = iter.next() orelse return null;
-                if (isWslBash(arg0, systemDirectory(alloc_arena), &fileExists)) return null;
+                if (isWslBash(arg0, systemDirectory(alloc_arena), &fileExists)) {
+                    log.info("{s} is WSL's bash, no shell integration", .{arg0});
+                    return null;
+                }
             };
             break :bash try setupBash(alloc_arena, command, resource_dir, env);
         },
