@@ -267,6 +267,14 @@ test "setup: WSL's bash gets no integration, Git Bash's does" {
         defer env.deinit();
         try testing.expect(try setup(alloc, res.path, .{ .direct = &.{launcher} }, &env, null) == null);
     }
+    {
+        // `shell-integration = bash` integrates whichever bash it is told.
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        const forced = try setup(alloc, res.path, .{ .shell = "bash" }, &env, .bash);
+        try testing.expectEqual(.bash, forced.?.shell);
+        try testing.expect(env.get("ENV") != null);
+    }
 
     var env = EnvMap.init(alloc);
     defer env.deinit();
