@@ -2498,6 +2498,7 @@ pub const Surface = struct {
                 // the pointer is over its place, which the preview passes
                 // through to here (`LinkPreview.pointerAt`).
                 LinkPreview.pointerAt(self, .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) });
+                self.followMouse(wparam, lparam);
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
                 if (!self.syncMouse(core_surface, Mouse.Button.downIn(wparam))) return 0;
@@ -3335,6 +3336,35 @@ pub const Surface = struct {
             .pos = .{ .x = @floatFromInt(in.x), .y = @floatFromInt(in.y) },
             .over = in.x == pt.x and in.y == pt.y and under == self.hwnd,
         };
+    }
+
+    /// `focus-follows-mouse`: the pointer moved over this terminal gives it
+    /// the focus, as GTK's motion handler and macOS's `mouseMoved` give it,
+    /// but only in the active window (the option's own rule), never while
+    /// the command palette or a dialog is (macOS skips an open palette), and
+    /// not during a drag, whose moves Win32 sends to the terminal where it
+    /// began anyway.
+    ///
+    /// Only a move of the pointer counts. Win32 also sends WM_MOUSEMOVE when
+    /// a window appears, goes or moves under a still pointer, as a new split
+    /// or a layout change does, and that must not take the focus from the
+    /// terminal a binding just gave it, as GTK guards against (its motion
+    /// handler drops a still cursor). So the screen position is compared
+    /// with the last one any terminal saw.
+    fn followMouse(self: *Surface, wparam: win32.WPARAM, lparam: win32.LPARAM) void {
+        const window = self.window;
+        const app = window.app;
+        if (!app.config.@"focus-follows-mouse") return;
+        var pt: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
+        if (!win32.ClientToScreen(self.hwnd, &pt).toBool()) return;
+        const last = app.pointer;
+        app.pointer = pt;
+        if (last) |l| if (l.x == pt.x and l.y == pt.y) return;
+        if (Mouse.Button.downIn(wparam).count() != 0) return;
+        if (Window.activeWindow() != window.hwnd) return;
+        const t = window.tabOf(self) orelse return;
+        if (t != window.tab() or t.focused == self) return;
+        window.giveFocus(self);
     }
 
     /// Give the core a real pointer position, unless it already has it.

@@ -137,6 +137,10 @@ pub const App = struct {
     /// exists (`taskbarList`); null before, or while it cannot be made.
     taskbar_list: ?*taskbar.ITaskbarList3,
 
+    /// Where on the screen the pointer last moved over a terminal, for
+    /// `focus-follows-mouse` (`Surface.followMouse`); null before it has.
+    pointer: ?win32.POINT = null,
+
     /// The system's notifications, made for the first desktop notification
     /// (`notifierFor`); null before, or when they could not be made.
     toasts: ?*toast.Toasts,
@@ -8261,6 +8265,82 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
         Surface.wndProc(right.hwnd, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), lparam),
     );
     try std.testing.expect(window.tab().focused == right);
+}
+
+test "win32: focus-follows-mouse focuses the split the pointer moves over" {
+    // Only with the option, in the active window, with no button held, and
+    // only for a move: a WM_MOUSEMOVE at the screen point the last one had,
+    // as Win32 sends when a split appears under a still pointer, leaves
+    // the focus where it is.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    const Active = struct {
+        var answer: ?win32.HWND = null;
+        fn get() ?win32.HWND {
+            return answer;
+        }
+    };
+    Window.test_get_active = &Active.get;
+    defer Window.test_get_active = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 1000, 700);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
+    window.relayout();
+    Active.answer = window.hwnd;
+
+    const Move = struct {
+        fn to(s: *Surface, x: i16, y: i16, wparam: win32.WPARAM) void {
+            const lparam: win32.LPARAM = (@as(win32.LPARAM, @as(u16, @bitCast(y))) << 16) | @as(u16, @bitCast(x));
+            _ = Surface.wndProc(s.hwnd, win32.WM_MOUSEMOVE, wparam, lparam);
+        }
+    };
+
+    // Off, the default: nothing follows.
+    Move.to(right, 10, 10, 0);
+    try std.testing.expect(window.tab().focused == left);
+
+    app.config.@"focus-follows-mouse" = true;
+    FocusSeen.last = null;
+    Move.to(right, 11, 10, 0);
+    try std.testing.expect(window.tab().focused == right);
+    try std.testing.expectEqual(right.hwnd, FocusSeen.last.?);
+
+    // The pointer still, as when the focus moved by a binding.
+    window.tab().focused = left;
+    Move.to(right, 11, 10, 0);
+    try std.testing.expect(window.tab().focused == left);
+
+    // A drag from the left one.
+    Move.to(right, 12, 10, win32.MK_LBUTTON);
+    try std.testing.expect(window.tab().focused == left);
+
+    // Another window active: another frame (or this one's palette, a
+    // pop-up of its own), or another program's.
+    const other = try testFrame(&app);
+    for ([_]?win32.HWND{ other.hwnd, null }, 0..) |active, i| {
+        Active.answer = active;
+        Move.to(right, 13 + @as(i16, @intCast(i)), 10, 0);
+        try std.testing.expect(window.tab().focused == left);
+    }
+
+    // Back over the left one, the focused one: nothing to do.
+    Active.answer = window.hwnd;
+    FocusSeen.last = null;
+    Move.to(left, 20, 10, 0);
+    try std.testing.expect(window.tab().focused == left);
+    try std.testing.expect(FocusSeen.last == null);
 }
 
 /// For tests: a tab of its own in `window` for a new terminal, as
