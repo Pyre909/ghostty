@@ -27,6 +27,7 @@ const std = @import("std");
 
 const apprt = @import("../../apprt.zig");
 const renderer = @import("../../renderer.zig");
+const terminal = @import("../../terminal/main.zig");
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Overlays = @import("Overlays.zig");
@@ -182,25 +183,18 @@ fn measure(hdc: win32.HDC, font: ?win32.HGDIOBJ, text: [:0]const u16, format: wi
     return .{ .width = r.right - r.left, .height = r.bottom - r.top };
 }
 
-/// Black or white, whichever reads better on `background`: black where
-/// its WCAG 2 relative luminance is above 0.179, where the two contrast
-/// ratios cross.
+/// Black or white, whichever has the higher WCAG 2 contrast ratio with
+/// `background` (`RGB.contrast`); black on a tie.
 pub fn textOn(background: win32.COLORREF) win32.COLORREF {
-    return if (luminance(background) > 0.179) win32.rgb(0, 0, 0) else win32.rgb(255, 255, 255);
-}
-
-/// WCAG 2's relative luminance of the sRGB colour `c`.
-fn luminance(c: win32.COLORREF) f64 {
     // A COLORREF is 0x00BBGGRR.
-    const shifts = [_]u5{ 0, 8, 16 };
-    const weights = [_]f64{ 0.2126, 0.7152, 0.0722 };
-    var sum: f64 = 0;
-    for (shifts, weights) |shift, w| {
-        const s = @as(f64, @floatFromInt((c >> shift) & 0xff)) / 255;
-        const l = if (s <= 0.04045) s / 12.92 else std.math.pow(f64, (s + 0.055) / 1.055, 2.4);
-        sum += w * l;
-    }
-    return sum;
+    const bg: terminal.color.RGB = .{
+        .r = @truncate(background),
+        .g = @truncate(background >> 8),
+        .b = @truncate(background >> 16),
+    };
+    const black = bg.contrast(.{ .r = 0, .g = 0, .b = 0 });
+    const white = bg.contrast(.{ .r = 255, .g = 255, .b = 255 });
+    return if (black >= white) win32.rgb(0, 0, 0) else win32.rgb(255, 255, 255);
 }
 
 /// The view's sizes at a DPI, from macOS's at 96: the icon's 128, the
@@ -344,7 +338,8 @@ test "win32: the renderer error view's text is black or white, whichever reads b
     // Ghostty's default background, #282c34, and a light theme's.
     try testing.expectEqual(white, textOn(win32.rgb(0x28, 0x2c, 0x34)));
     try testing.expectEqual(black, textOn(win32.rgb(0xfd, 0xf6, 0xe3)));
-    // Either side of the crossing: #757575 is 0.178, #767676 0.181.
+    // Either side of where the two ratios cross: #757575's luminance is
+    // 0.178, #767676's 0.181.
     try testing.expectEqual(white, textOn(win32.rgb(0x75, 0x75, 0x75)));
     try testing.expectEqual(black, textOn(win32.rgb(0x76, 0x76, 0x76)));
 }
