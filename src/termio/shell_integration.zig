@@ -1270,23 +1270,19 @@ test "xdg: missing resources" {
 /// uses it: `source r#'<path>'#; use ghostty *`, the path a raw string
 /// with as many `#` as it needs for none of its own `'#...` to end it.
 fn nuSourceAndUse(alloc: Allocator, path: []const u8) Allocator.Error![]const u8 {
-    var hashes: usize = 1;
-    while (true) : (hashes += 1) {
-        const end = try alloc.alloc(u8, hashes + 1);
-        defer alloc.free(end);
-        end[0] = '\'';
-        @memset(end[1..], '#');
-        if (std.mem.indexOf(u8, path, end) == null) break;
+    // One `#` more than the longest run of them after a `'` in the path.
+    var longest: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, path, i, '\'')) |q| {
+        var j = q + 1;
+        while (j < path.len and path[j] == '#') j += 1;
+        longest = @max(longest, j - q - 1);
+        i = q + 1;
     }
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const w = &out.writer;
-    w.writeAll("source r") catch return error.OutOfMemory;
-    w.splatByteAll('#', hashes) catch return error.OutOfMemory;
-    w.print("'{s}'", .{path}) catch return error.OutOfMemory;
-    w.splatByteAll('#', hashes) catch return error.OutOfMemory;
-    w.writeAll("; use ghostty *") catch return error.OutOfMemory;
-    return out.toOwnedSlice();
+    const hashes = try alloc.alloc(u8, longest + 1);
+    defer alloc.free(hashes);
+    @memset(hashes, '#');
+    return std.fmt.allocPrint(alloc, "source r{0s}'{1s}'{0s}; use ghostty *", .{ hashes, path });
 }
 
 test nuSourceAndUse {
@@ -1297,6 +1293,8 @@ test nuSourceAndUse {
         .{ "C:\\it's\\g.nu", "source r#'C:\\it's\\g.nu'#; use ghostty *" },
         .{ "C:\\a'#b\\g.nu", "source r##'C:\\a'#b\\g.nu'##; use ghostty *" },
         .{ "C:\\a'#b'##c\\g.nu", "source r###'C:\\a'#b'##c\\g.nu'###; use ghostty *" },
+        .{ "C:\\a'##b'#c\\g.nu", "source r###'C:\\a'##b'#c\\g.nu'###; use ghostty *" },
+        .{ "C:\\a#'b\\g.nu'", "source r#'C:\\a#'b\\g.nu''#; use ghostty *" },
     };
     for (cases) |c| {
         const got = try nuSourceAndUse(alloc, c[0]);
