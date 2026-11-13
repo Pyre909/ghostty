@@ -54,12 +54,16 @@ pub fn setup(
         return null;
 
     const new_command: config.Command = switch (shell) {
-        .bash => try setupBash(
-            alloc_arena,
-            command,
-            resource_dir,
-            env,
-        ),
+        .bash => bash: {
+            // WSL's launcher is no bash of ours: see `isWslBash`.
+            if (comptime builtin.target.os.tag == .windows) if (force_shell == null) {
+                var iter = try command.argIterator(alloc_arena);
+                defer iter.deinit();
+                const arg0 = iter.next() orelse return null;
+                if (isWslBash(arg0, systemDirectory(alloc_arena), &fileExists)) return null;
+            };
+            break :bash try setupBash(alloc_arena, command, resource_dir, env);
+        },
 
         // Only on Windows: elsewhere `PROMPT` is some other shell's (zsh
         // reads it as its prompt).
@@ -155,6 +159,129 @@ test "shell integration failure" {
     try testing.expectEqual(0, env.count());
 }
 
+/// Whether `arg0`, a bash that `command` names, is WSL's launcher,
+/// `bash.exe` in the system directory `system_dir`, rather than a bash we
+/// can integrate with (Git Bash's, MSYS2's, Cygwin's). The launcher starts
+/// the distribution's bash, which sees none of our environment: given our
+/// `--posix` it would stay in POSIX mode, reading no `.bashrc`.
+///
+/// A bare name is the launcher if the system directory has it: with no
+/// directory, CreateProcessW looks in the system directory before PATH
+/// (after Ghostty's own directory and the current one), so `bash` is
+/// WSL's wherever Git's comes on PATH. A path is the launcher if its
+/// directory is the system directory. `exists` tells whether a file is
+/// there; a null `system_dir`, not known, takes nothing for the launcher.
+fn isWslBash(
+    arg0: []const u8,
+    system_dir: ?[]const u8,
+    exists: *const fn ([]const u8) bool,
+) bool {
+    const dir = std.mem.trimEnd(u8, system_dir orelse return false, "/\\");
+    if (std.mem.indexOfAny(u8, arg0, "/\\:") == null) {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const ext: []const u8 = if (std.fs.path.extension(arg0).len == 0) ".exe" else "";
+        const path = std.fmt.bufPrint(&buf, "{s}\\{s}{s}", .{ dir, arg0, ext }) catch return false;
+        return exists(path);
+    }
+    const parent = std.fs.path.dirnameWindows(arg0) orelse return false;
+    return samePath(std.mem.trimEnd(u8, parent, "/\\"), dir);
+}
+
+/// Two Windows paths spelt the same, ignoring the case of ASCII letters,
+/// with `/` and `\\` the same separator.
+fn samePath(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const sx = x == '/' or x == '\\';
+        const sy = y == '/' or y == '\\';
+        if (sx != sy) return false;
+        if (!sx and std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
+}
+
+/// The system directory, as GetSystemDirectoryW reports it (not from
+/// %SystemRoot%, which the environment can change); null if it cannot be
+/// read.
+fn systemDirectory(alloc: Allocator) ?[]const u8 {
+    if (comptime builtin.target.os.tag != .windows) return null;
+    const kernel32 = internal_os.windows.exp.kernel32;
+    var buf: [internal_os.windows.MAX_PATH]u16 = undefined;
+    const len = kernel32.GetSystemDirectoryW(&buf, buf.len);
+    if (len == 0 or len >= buf.len) return null;
+    return std.unicode.wtf16LeToWtf8Alloc(alloc, buf[0..len]) catch null;
+}
+
+fn fileExists(path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(global.io(), path, .{}) catch return false;
+    return true;
+}
+
+test isWslBash {
+    const testing = std.testing;
+    const Fake = struct {
+        fn exists(path: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(path, "C:\\WINDOWS\\system32\\bash.exe");
+        }
+        fn none(_: []const u8) bool {
+            return false;
+        }
+    };
+    const system = "C:\\WINDOWS\\system32";
+
+    // A bare name: the system directory's, if it has one.
+    try testing.expect(isWslBash("bash", system, &Fake.exists));
+    try testing.expect(isWslBash("bash.exe", system, &Fake.exists));
+    try testing.expect(isWslBash("BASH", system ++ "\\", &Fake.exists));
+    try testing.expect(!isWslBash("bash", system, &Fake.none));
+
+    // A path: the launcher only in the system directory.
+    try testing.expect(isWslBash("C:\\Windows\\System32\\bash.exe", system, &Fake.none));
+    try testing.expect(isWslBash("c:/windows/system32/bash", system, &Fake.none));
+    try testing.expect(!isWslBash("C:\\Program Files\\Git\\bin\\bash.exe", system, &Fake.exists));
+    try testing.expect(!isWslBash("C:\\Windows\\System32\\Git\\bash.exe", system, &Fake.exists));
+    try testing.expect(!isWslBash("C:bash.exe", system, &Fake.exists));
+
+    // The system directory not known.
+    try testing.expect(!isWslBash("bash", null, &Fake.exists));
+}
+
+test "setup: WSL's bash gets no integration, Git Bash's does" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var res: TmpResourcesDir = try .init(.bash);
+    defer res.deinit();
+
+    // Only where WSL's launcher is installed, as on the test machine.
+    const system = systemDirectory(alloc) orelse return error.SkipZigTest;
+    const launcher = try std.fs.path.joinZ(alloc, &.{ system, "bash.exe" });
+    if (!fileExists(launcher)) return error.SkipZigTest;
+
+    for ([_][:0]const u8{ "bash", "bash.exe -l" }) |v| {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        try testing.expect(try setup(alloc, res.path, .{ .shell = v }, &env, null) == null);
+        try testing.expectEqual(0, env.count());
+    }
+    {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        try testing.expect(try setup(alloc, res.path, .{ .direct = &.{launcher} }, &env, null) == null);
+    }
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    const git = try setup(alloc, res.path, .{ .direct = &.{
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+    } }, &env, null);
+    try testing.expectEqual(.bash, git.?.shell);
+    try testing.expect(env.get("ENV") != null);
+}
+
 /// The shell `command` runs, from its first argument's name; null for
 /// one we do not integrate with. Also how the Windows runtime quotes
 /// files dropped on a terminal (src/apprt/windows/drop.zig).
@@ -165,7 +292,18 @@ pub fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     const arg0 = arg_iter.next() orelse return null;
     const exe = std.fs.path.basename(arg0);
 
-    if (std.mem.eql(u8, "bash", exe)) {
+    // On Windows a name ignores case, as Windows file names do
+    // (`PowerShell.EXE`), and an `.exe` suffix: Git Bash is `bash.exe`
+    // and nushell `nu.exe`. Elsewhere a `pwsh.exe` is the Windows one run
+    // through WSL's interop, which sees neither our environment nor our
+    // paths, so there names are compared as they are.
+    const windows = builtin.target.os.tag == .windows;
+    const name = if (windows and std.ascii.endsWithIgnoreCase(exe, ".exe"))
+        exe[0 .. exe.len - ".exe".len]
+    else
+        exe;
+
+    if (std.mem.eql(u8, "bash", exe) or (windows and std.ascii.eqlIgnoreCase(name, "bash"))) {
         // Apple distributes their own patched version of Bash 3.2
         // on macOS that disables the ENV-based POSIX startup path.
         // This means we're unable to perform our automatic shell
@@ -184,27 +322,18 @@ pub fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
 
     if (std.mem.eql(u8, "elvish", exe)) return .elvish;
     if (std.mem.eql(u8, "fish", exe)) return .fish;
-    if (std.mem.eql(u8, "nu", exe)) return .nushell;
+    if (std.mem.eql(u8, "nu", exe) or (windows and std.ascii.eqlIgnoreCase(name, "nu"))) return .nushell;
     if (std.mem.eql(u8, "zsh", exe)) return .zsh;
 
-    // PowerShell 7 is `pwsh` and Windows PowerShell 5.1 is `powershell`.
-    // Unlike the names above these ignore case, as Windows file names do
-    // (`PowerShell.EXE`), and on Windows an `.exe` suffix. Elsewhere a
-    // `pwsh.exe` is the Windows one run through WSL's interop, which sees
-    // neither our environment nor our paths.
-    const name = if (builtin.target.os.tag == .windows and
-        std.ascii.endsWithIgnoreCase(exe, ".exe"))
-        exe[0 .. exe.len - ".exe".len]
-    else
-        exe;
+    // PowerShell 7 is `pwsh` and Windows PowerShell 5.1 is `powershell`;
+    // these ignore case everywhere.
     if (std.ascii.eqlIgnoreCase(name, "pwsh") or
         std.ascii.eqlIgnoreCase(name, "powershell")) return .powershell;
 
     // cmd.exe, the default command on Windows (Exec), only there: elsewhere
     // a `cmd` is some other program, and a `cmd.exe` is the Windows one run
     // through WSL's interop, which sees none of our environment.
-    if (builtin.target.os.tag == .windows and
-        std.ascii.eqlIgnoreCase(name, "cmd")) return .cmd;
+    if (windows and std.ascii.eqlIgnoreCase(name, "cmd")) return .cmd;
 
     return null;
 }
@@ -246,7 +375,26 @@ test detectShell {
             "C:\\WINDOWS\\system32\\cmd.exe",
         } }));
         try testing.expect(try detectShell(alloc, .{ .shell = "cmdx.exe" }) == null);
+
+        // Git Bash and nushell, by their file names.
+        try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "bash.exe" }));
+        try testing.expectEqual(.bash, try detectShell(alloc, .{ .shell = "BASH.EXE -l" }));
+        try testing.expectEqual(.bash, try detectShell(alloc, .{ .direct = &.{
+            "C:\\Program Files\\Git\\bin\\bash.exe", "--login",
+        } }));
+        try testing.expectEqual(.nushell, try detectShell(alloc, .{ .shell = "nu.exe" }));
+        try testing.expectEqual(.nushell, try detectShell(alloc, .{ .shell = "Nu" }));
+        try testing.expectEqual(.nushell, try detectShell(alloc, .{ .direct = &.{
+            "C:\\Users\\me\\AppData\\Local\\Programs\\nu\\bin\\nu.exe",
+        } }));
+        try testing.expect(try detectShell(alloc, .{ .shell = "bashx.exe" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = "nu.exe.bak" }) == null);
     } else {
+        // Names are compared as they are, and a Windows program run
+        // through WSL's interop is not ours to integrate with.
+        try testing.expect(try detectShell(alloc, .{ .shell = "bash.exe" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = "nu.exe" }) == null);
+        try testing.expect(try detectShell(alloc, .{ .shell = "Bash" }) == null);
         // The Windows PowerShell and cmd run through WSL's interop.
         try testing.expect(try detectShell(alloc, .{ .shell = "pwsh.exe" }) == null);
         try testing.expect(try detectShell(alloc, .{ .shell = "cmd.exe" }) == null);
