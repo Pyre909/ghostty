@@ -107,9 +107,10 @@ pub const View = struct {
         defer if (icon) |i| {
             _ = win32.DestroyIcon(i);
         };
-        const text_size = measure(hdc, fonts.title, title_text, title_format, m.text);
-        const body_size = measure(hdc, fonts.body, body_text, body_format, m.text);
-        const l = Layout.init(m, .{ .width = client.right, .height = client.bottom }, icon != null, text_size, body_size);
+        const title_size = measure(hdc, fonts.title, title_text, title_format, m.text);
+        const fit = Layout.fit(m, client.right, icon != null, title_size.width);
+        const body_size = measure(hdc, fonts.body, body_text, body_format, fit.wrap);
+        const l = Layout.init(m, .{ .width = client.right, .height = client.bottom }, fit.icon, title_size, body_size);
         if (icon) |i| {
             if (l.icon) |at| _ = win32.DrawIconEx(hdc, at.left, at.top, i, at.right - at.left, at.bottom - at.top, 0, null, win32.DI_NORMAL);
         }
@@ -220,24 +221,38 @@ pub const Metrics = struct {
 };
 
 /// Where the view's parts go in a view `view` big, in its own client
-/// coordinates: as macOS's stacks them, the icon (if there is one) at the
+/// coordinates: as macOS's stacks them, the icon (if `with_icon`) at the
 /// left, `gap` before the title over the line, the title and the line
 /// left-aligned, the icon centred down the text; all of it centred in the
-/// view. A view too narrow for the icon, the text and the padding has no
-/// icon; text that does not fit is cut at the view's edges.
+/// view, and at least `pad` from its top and left edges. `fit` decides
+/// the icon and the width the line wraps at.
 pub const Layout = struct {
     icon: ?RECT,
     title: RECT,
     body: RECT,
 
-    pub fn init(m: Metrics, view: Size, has_icon: bool, title_size: Size, body_size: Size) Layout {
+    /// Whether the icon goes beside the text, and the width the line wraps
+    /// at, in a view `view_width` wide whose title is `title_width` wide
+    /// on one line. As macOS's stack, which gives the text what the icon
+    /// and the padding leave, up to its most width: the icon stays while
+    /// the title fits beside it, and the line wraps at what is left, so a
+    /// narrow terminal wraps it rather than cutting it off.
+    pub const Fit = struct { icon: bool, wrap: i32 };
+
+    pub fn fit(m: Metrics, view_width: i32, has_icon: bool, title_width: i32) Fit {
+        const avail = view_width - 2 * m.pad;
+        const icon = has_icon and avail - m.icon - m.gap >= title_width;
+        const room = if (icon) avail - m.icon - m.gap else avail;
+        return .{ .icon = icon, .wrap = @max(1, @min(m.text, room)) };
+    }
+
+    pub fn init(m: Metrics, view: Size, with_icon: bool, title_size: Size, body_size: Size) Layout {
         const text_w = @max(title_size.width, body_size.width);
         const text_h = title_size.height + body_size.height;
-        const with_icon = has_icon and view.width >= m.icon + m.gap + text_w + 2 * m.pad;
         const total_w = text_w + if (with_icon) m.icon + m.gap else 0;
         const total_h = if (with_icon) @max(m.icon, text_h) else text_h;
-        const left = @max(0, @divTrunc(view.width - total_w, 2));
-        const top = @max(0, @divTrunc(view.height - total_h, 2));
+        const left = @max(m.pad, @divTrunc(view.width - total_w, 2));
+        const top = @max(m.pad, @divTrunc(view.height - total_h, 2));
         const text_left = left + if (with_icon) m.icon + m.gap else 0;
         const text_top = top + @divTrunc(total_h - text_h, 2);
         return .{
@@ -270,7 +285,7 @@ test "win32: the renderer error view's sizes are macOS's at 96 DPI, scaled" {
     try testing.expectEqual(24, big.pad);
 }
 
-test "win32: the renderer error view centres the icon beside the title over the line, and drops the icon where it has no room" {
+test "win32: the renderer error view centres the icon beside the title over the line" {
     const testing = std.testing;
     const m = Metrics.init(96);
     const title_size: Size = .{ .width = 100, .height = 40 };
@@ -288,24 +303,35 @@ test "win32: the renderer error view centres the icon beside the title over the 
     try testing.expectEqual(@as(i32, (600 - 240) / 2), tall.title.top);
     try testing.expectEqual(@as(i32, (600 - 240) / 2 + (240 - 128) / 2), tall.icon.?.top);
 
-    // Just room for the icon, the text and the padding; one pixel less,
-    // no icon, the text centred alone.
-    try testing.expect(Layout.init(m, .{ .width = 468, .height = 600 }, true, title_size, body_size).icon != null);
-    const narrow = Layout.init(m, .{ .width = 467, .height = 600 }, true, title_size, body_size);
-    try testing.expect(narrow.icon == null);
-    try testing.expectEqual(@as(i32, (467 - 300) / 2), narrow.title.left);
-    try testing.expectEqual(@as(i32, (600 - 100) / 2), narrow.title.top);
-
     // No icon to draw: the text centred alone.
     const none = Layout.init(m, .{ .width = 800, .height = 600 }, false, title_size, body_size);
     try testing.expect(none.icon == null);
     try testing.expectEqual(RECT{ .left = 250, .top = 250, .right = 350, .bottom = 290 }, none.title);
     try testing.expectEqual(RECT{ .left = 250, .top = 290, .right = 550, .bottom = 350 }, none.body);
 
-    // Larger than the view: from its top-left corner, cut by its edges.
-    const small = Layout.init(m, .{ .width = 200, .height = 50 }, true, title_size, body_size);
-    try testing.expect(small.icon == null);
-    try testing.expectEqual(RECT{ .left = 0, .top = 0, .right = 100, .bottom = 40 }, small.title);
+    // Larger than the view: the padding from its top-left corner kept.
+    const small = Layout.init(m, .{ .width = 200, .height = 50 }, false, title_size, body_size);
+    try testing.expectEqual(RECT{ .left = 16, .top = 16, .right = 116, .bottom = 56 }, small.title);
+}
+
+test "win32: the renderer error view wraps its line at what the icon and the padding leave, and drops the icon where the title does not fit beside it" {
+    const testing = std.testing;
+    const m = Metrics.init(96);
+    // Wide: the icon, and the line at its most width, macOS's 350.
+    try testing.expectEqual(Layout.Fit{ .icon = true, .wrap = 350 }, Layout.fit(m, 800, true, 100));
+    // Just wide enough for it: 16 + 128 + 8 + 350 + 16.
+    try testing.expectEqual(Layout.Fit{ .icon = true, .wrap = 350 }, Layout.fit(m, 518, true, 100));
+    // Narrower: the line wraps at what is left beside the icon.
+    try testing.expectEqual(Layout.Fit{ .icon = true, .wrap = 299 }, Layout.fit(m, 467, true, 100));
+    // Just room for the title beside the icon; one pixel less, no icon,
+    // and the line wraps across the view less its padding.
+    try testing.expectEqual(Layout.Fit{ .icon = true, .wrap = 100 }, Layout.fit(m, 268, true, 100));
+    try testing.expectEqual(Layout.Fit{ .icon = false, .wrap = 235 }, Layout.fit(m, 267, true, 100));
+    // No icon to draw: the line takes the view less its padding.
+    try testing.expectEqual(Layout.Fit{ .icon = false, .wrap = 350 }, Layout.fit(m, 800, false, 100));
+    try testing.expectEqual(Layout.Fit{ .icon = false, .wrap = 268 }, Layout.fit(m, 300, false, 100));
+    // Narrower than the padding: still a width to wrap at.
+    try testing.expectEqual(Layout.Fit{ .icon = false, .wrap = 1 }, Layout.fit(m, 20, true, 100));
 }
 
 test "win32: the renderer error view's text is black or white, whichever reads better on the background" {
