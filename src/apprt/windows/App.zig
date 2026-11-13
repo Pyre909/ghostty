@@ -26833,11 +26833,22 @@ test "win32: a shown renderer error view is drawn again when the system's messag
     window.tab().focused = a;
     window.relayout();
 
+    // A hidden window keeps no region to draw again, so its frame shows.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
     try std.testing.expect(try testHealth(&app, a, .unhealthy));
     const hwnd = a.overlays.renderer_health.hwnd.?;
-    _ = win32.ValidateRect(hwnd, null);
+    try std.testing.expect(shown(hwnd));
+    _ = win32.UpdateWindow(hwnd);
     try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
-    _ = win32.SendMessageW(window.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETNONCLIENTMETRICS, 0);
+    // Placed again where it is, it is not drawn again, so the font
+    // change below is what draws it.
+    window.placeOverlays();
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    // The frame's own handler, called rather than sent: once a sent one
+    // returns, Windows draws the frame's children again by itself, which
+    // would hide a handler that does not.
+    _ = Window.wndProc(window.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETNONCLIENTMETRICS, 0);
     try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
 }
 
