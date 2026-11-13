@@ -26710,6 +26710,31 @@ test "win32: renderer_health covers its terminal with the error view while unhea
     testResize(window, 1000, 600);
     try expectHealthViewAt(window, a);
 
+    // Narrower than the line's most width: the line wraps to what is
+    // left, so its padding at both sides stays background, and the text
+    // still shows.
+    testResize(window, 400, 600);
+    try expectHealthViewAt(window, a);
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        const bg = Overlays.terminalBackground(a);
+        const pad = RendererHealth.Metrics.init(Window.dpiOf(&app, window.hwnd)).pad;
+        const w = printed.width;
+        const h = printed.height;
+        try std.testing.expect(w < RendererHealth.Metrics.init(Window.dpiOf(&app, window.hwnd)).text + 2 * pad);
+        var y: i32 = 0;
+        while (y < h) : (y += 1) {
+            var x: i32 = 0;
+            while (x < pad) : (x += 1) {
+                try std.testing.expectEqual(bg, printed.at(x, y));
+                try std.testing.expectEqual(bg, printed.at(w - 1 - x, y));
+            }
+        }
+        try printed.expectBetween(.{ .left = 0, .top = 0, .right = w, .bottom = h }, bg, RendererHealth.textOn(bg));
+    }
+    testResize(window, 1000, 600);
+
     // Over the bell border and the banner.
     var changed: Config = try .default(alloc);
     defer changed.deinit();
