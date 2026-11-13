@@ -287,21 +287,22 @@ pub const Bar = struct {
         self.font_dpi = 0;
     }
 
-    /// The system's message font changed: made again at the next paint
-    /// (`fontFor`). Not deleted now, as the title field still draws with
-    /// it until it has the new one.
+    /// The system's message font or `window-title-font-family` changed:
+    /// made again at the next paint (`fontFor`). Not deleted now, as the
+    /// title field still draws with it until it has the new one.
     pub fn fontChanged(self: *Bar) void {
         self.font_dpi = 0;
     }
 
-    /// The font for `dpi` (`messageFont`), made once for each DPI. The new
+    /// The font for `dpi` (`titleFont` for `family`), made once for each
+    /// DPI, and again after `fontChanged`. The new
     /// one is made before the old one goes, which is kept if it cannot be:
     /// the next paint tries again. The title field, which shares it, is
     /// given the new one before the old one is deleted, as WM_SETFONT
     /// leaves deleting a font to its owner, and its line measured again.
-    pub fn fontFor(self: *Bar, dpi: u32) ?win32.HGDIOBJ {
+    pub fn fontFor(self: *Bar, dpi: u32, family: ?[:0]const u8) ?win32.HGDIOBJ {
         if (self.font != null and self.font_dpi == dpi) return self.font;
-        const font = messageFont(dpi) orelse return self.font;
+        const font = titleFont(dpi, family) orelse return self.font;
         if (self.editor.edit) |edit| {
             _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(font), 1);
             self.editor.line = SearchBar.textHeight(edit, font);
@@ -403,6 +404,75 @@ pub fn messageFont(dpi: u32) ?win32.HGDIOBJ {
     }
     const lf = fallbackLogFont(dpi);
     return win32.CreateFontIndirectW(&lf);
+}
+
+/// The font the tab titles are drawn in, at `dpi`: `messageFont`, its
+/// face the family `window-title-font-family` names (`titleLogFont`), as
+/// macOS gives its title bar that family at the system font's size. The
+/// message font itself where the option is unset or its family cannot be
+/// had.
+pub fn titleFont(dpi: u32, family: ?[:0]const u8) ?win32.HGDIOBJ {
+    const name = family orelse return messageFont(dpi);
+    if (titleLogFont(dpi, name)) |lf| {
+        if (win32.CreateFontIndirectW(&lf)) |font| return font;
+        log.warn("cannot make the window title font err={}", .{win32.GetLastError()});
+    }
+    return messageFont(dpi);
+}
+
+/// The system's message font at `dpi` (or `fallbackLogFont`'s), its face
+/// `family`; null where `family` is not valid UTF-8, does not fit
+/// LOGFONT's 31 characters, or names no family installed. GDI would make
+/// some other family for a name it does not have, where macOS's
+/// `NSFont(name:)` gives none and its title bar keeps the system font, as
+/// here.
+pub fn titleLogFont(dpi: u32, family: []const u8) ?win32.LOGFONTW {
+    var lf = messageLogFont(dpi) orelse fallbackLogFont(dpi);
+    if (!setFaceName(&lf, family)) {
+        log.warn("window-title-font-family is not a font family name GDI takes: {s}", .{family});
+        return null;
+    }
+    if (!familyInstalled(&lf)) {
+        log.warn("window-title-font-family names no font family installed: {s}", .{family});
+        return null;
+    }
+    return lf;
+}
+
+/// `lf`'s face `family`, NUL-terminated, if it fits.
+fn setFaceName(lf: *win32.LOGFONTW, family: []const u8) bool {
+    const len = std.unicode.calcUtf16LeLen(family) catch return false;
+    if (len == 0 or len >= lf.lfFaceName.len) return false;
+    @memset(&lf.lfFaceName, 0);
+    _ = std.unicode.utf8ToUtf16Le(lf.lfFaceName[0..len], family) catch return false;
+    return true;
+}
+
+/// Whether a family is installed with `lf`'s face name, which GDI matches
+/// without regard to case, by its English or its localized name. True
+/// where the screen cannot be asked: GDI then makes what it makes.
+fn familyInstalled(lf: *const win32.LOGFONTW) bool {
+    const screen = win32.GetDC(null) orelse return true;
+    defer _ = win32.ReleaseDC(null, screen);
+    // Any character set, so every script of the family counts.
+    var probe = std.mem.zeroes(win32.LOGFONTW);
+    probe.lfCharSet = win32.DEFAULT_CHARSET;
+    probe.lfFaceName = lf.lfFaceName;
+    var found = false;
+    _ = win32.EnumFontFamiliesExW(screen, &probe, &foundOne, @bitCast(@intFromPtr(&found)), 0);
+    return found;
+}
+
+/// `familyInstalled`'s FONTENUMPROCW: the first font found is enough.
+fn foundOne(
+    _: *const win32.LOGFONTW,
+    _: *const anyopaque,
+    _: win32.DWORD,
+    lparam: win32.LPARAM,
+) callconv(.winapi) c_int {
+    const found: *bool = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    found.* = true;
+    return 0;
 }
 
 /// The font `messageFont` falls back on where the system's cannot be
@@ -746,7 +816,7 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     // Before painting: the font, which the field's height follows, then
     // the field's place, whose move invalidates what it uncovers.
     const dpi = Window.dpiOf(window.app, hwnd);
-    const font = window.bar.fontFor(dpi);
+    const font = window.bar.fontFor(dpi, window.app.config.@"window-title-font-family");
     window.bar.placeEditor(window);
     var ps: win32.PAINTSTRUCT = undefined;
     const hdc = win32.BeginPaint(hwnd, &ps) orelse return;
@@ -1102,6 +1172,50 @@ test "win32: the tab bar's font is the system's message font" {
     try testing.expectEqual(2 * ncm.lfMessageFont.lfHeight, made.lfHeight);
 }
 
+test "win32: window-title-font-family names the tab titles' face" {
+    // The message font's size and weight with the family's face, which GDI
+    // finds without regard to case; none for a family not installed, a
+    // name longer than LOGFONT's 31 characters, or one not UTF-8, so that
+    // the bar keeps the message font (`titleFont`). Consolas ships with
+    // Windows.
+    const testing = std.testing;
+    const dpi = 2 * systemDpi();
+    const message = messageLogFont(dpi) orelse fallbackLogFont(dpi);
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+
+    const lf = titleLogFont(dpi, "Consolas") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u16, W("Consolas"), std.mem.sliceTo(&lf.lfFaceName, 0));
+    try testing.expectEqual(message.lfHeight, lf.lfHeight);
+    try testing.expectEqual(message.lfWeight, lf.lfWeight);
+    try testing.expect(titleLogFont(dpi, "consolas") != null);
+
+    try testing.expect(titleLogFont(dpi, "No Such Family Anywhere") == null);
+    try testing.expect(titleLogFont(dpi, "") == null);
+    try testing.expect(titleLogFont(dpi, "Consolas\xff") == null);
+    // 31 characters fit with the NUL, 32 do not; neither is installed, so
+    // the length is seen through `setFaceName`.
+    const a31: [31]u8 = @splat('a');
+    const a32: [32]u8 = @splat('a');
+    var face = std.mem.zeroes(win32.LOGFONTW);
+    try testing.expect(setFaceName(&face, &a31));
+    try testing.expectEqual(0, face.lfFaceName[31]);
+    try testing.expect(!setFaceName(&face, &a32));
+    // A shorter name after a longer one leaves none of it behind.
+    try testing.expect(setFaceName(&face, "Consolas"));
+    try testing.expectEqualSlices(u16, W("Consolas"), std.mem.sliceTo(&face.lfFaceName, 0));
+    try testing.expectEqual(0, face.lfFaceName[9]);
+
+    const font = titleFont(dpi, "Consolas") orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteObject(font);
+    var made: win32.LOGFONTW = undefined;
+    try testing.expectEqual(@sizeOf(win32.LOGFONTW), win32.GetObjectW(font, @sizeOf(win32.LOGFONTW), &made));
+    try testing.expectEqualSlices(u16, W("Consolas"), std.mem.sliceTo(&made.lfFaceName, 0));
+    const none = titleFont(dpi, "No Such Family Anywhere") orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteObject(none);
+    try testing.expectEqual(@sizeOf(win32.LOGFONTW), win32.GetObjectW(none, @sizeOf(win32.LOGFONTW), &made));
+    try testing.expectEqualSlices(u16, &message.lfFaceName, &made.lfFaceName);
+}
+
 test "win32: a press on a tab drags it only past the system's threshold" {
     const testing = std.testing;
     const press: win32.POINT = .{ .x = 100, .y = 10 };
@@ -1224,7 +1338,7 @@ test "win32: a tab bar's release frees its font and its title field's brush" {
     // still counts, so what is held is checked, not that count.
     var bar: Bar = .{};
     _ = bar.editor.brushOf(0x00332211) orelse return error.TestUnexpectedResult;
-    _ = bar.fontFor(96) orelse return error.TestUnexpectedResult;
+    _ = bar.fontFor(96, null) orelse return error.TestUnexpectedResult;
     bar.release();
     try std.testing.expect(bar.editor.brush == null);
     try std.testing.expect(bar.font == null);

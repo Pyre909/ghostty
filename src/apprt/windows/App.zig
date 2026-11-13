@@ -3061,6 +3061,9 @@ pub const App = struct {
             _ = win32.InvalidateRect(window.hwnd, null, .FALSE);
             window.applyTheme();
             Transparency.applyBlur(window);
+            // `window-title-font-family` may have changed.
+            window.bar.fontChanged();
+            window.bar.invalidate();
         }
         self.applyInspectorThemes();
         for (self.surfaces.items) |surface| surface.overlays.invalidate();
@@ -10852,7 +10855,7 @@ test "win32: a double click on a tab's label edits its title in place" {
     // A line of the bar's font high, not the label's whole height.
     try std.testing.expect(window.bar.editor.line > 0);
     try std.testing.expectEqual(window.bar.editor.line, field.bottom - field.top);
-    const bar_font = window.bar.fontFor(Window.dpiOf(&app, bar)) orelse return error.TestUnexpectedResult;
+    const bar_font = window.bar.fontFor(Window.dpiOf(&app, bar), null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromPtr(bar_font), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
     // Centred, to a pixel.
     try std.testing.expect(@abs((field.top - label.top) - (label.bottom - field.bottom)) <= 1);
@@ -10869,10 +10872,10 @@ test "win32: a double click on a tab's label edits its title in place" {
     // field has the new one, measured, before the old one is deleted.
     const dpi = Window.dpiOf(&app, bar);
     const line = window.bar.editor.line;
-    const big = window.bar.fontFor(dpi * 2) orelse return error.TestUnexpectedResult;
+    const big = window.bar.fontFor(dpi * 2, null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromPtr(big), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
     try std.testing.expect(window.bar.editor.line > line);
-    const back = window.bar.fontFor(dpi) orelse return error.TestUnexpectedResult;
+    const back = window.bar.fontFor(dpi, null) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromPtr(back), @as(usize, @bitCast(win32.SendMessageW(edit, win32.WM_GETFONT, 0, 0))));
     try std.testing.expectEqual(line, window.bar.editor.line);
 
@@ -11798,6 +11801,69 @@ test "win32: the tab bar counts in every size it takes from the client area" {
     _ = win32.SendMessageW(bar, win32.WM_LBUTTONDOWN, 0, close);
     _ = win32.SendMessageW(bar, win32.WM_LBUTTONUP, 0, close);
     try std.testing.expect(window.closing);
+}
+
+test "win32: window-title-font-family draws the tab titles and follows a reload" {
+    // The bar's font has the family's face once a reload sets it, and the
+    // system's message font's once a reload unsets it; a family that is
+    // not installed keeps the message font. Consolas ships with Windows.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
+    _ = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const bar = window.bar.hwnd.?;
+    if (!shown(bar)) return error.BarHidden;
+
+    const Face = struct {
+        fn of(w: *Window, b: win32.HWND) ![32]u16 {
+            _ = win32.UpdateWindow(b);
+            const font = w.bar.font orelse return error.BarNotPainted;
+            var lf: win32.LOGFONTW = undefined;
+            try std.testing.expectEqual(
+                @sizeOf(win32.LOGFONTW),
+                win32.GetObjectW(font, @sizeOf(win32.LOGFONTW), &lf),
+            );
+            return lf.lfFaceName;
+        }
+        fn named(name: []const u8) [32]u16 {
+            var face = std.mem.zeroes([32]u16);
+            _ = std.unicode.utf8ToUtf16Le(&face, name) catch unreachable;
+            return face;
+        }
+    };
+    const message = (TabBar.messageLogFont(96) orelse TabBar.fallbackLogFont(96)).lfFaceName;
+    window.bar.invalidate();
+    try std.testing.expectEqualSlices(u16, &message, &(try Face.of(window, bar)));
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-title-font-family" = "Consolas";
+    if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload1;
+    try std.testing.expectEqualSlices(u16, &Face.named("Consolas"), &(try Face.of(window, bar)));
+
+    changed.@"window-title-font-family" = "No Such Family Anywhere";
+    if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload2;
+    try std.testing.expectEqualSlices(u16, &message, &(try Face.of(window, bar)));
+
+    changed.@"window-title-font-family" = "Consolas";
+    if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload3;
+    changed.@"window-title-font-family" = null;
+    if (!try app.performAction(.app, .config_change, .{ .config = &changed })) return error.Reload4;
+    try std.testing.expectEqualSlices(u16, &message, &(try Face.of(window, bar)));
 }
 
 test "win32: only a title a tab's label shows repaints the tab bar" {

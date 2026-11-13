@@ -2205,6 +2205,10 @@ keybind: Keybinds = .{},
 /// Note: any font available on the system may be used, this font is not
 /// required to be a fixed-width font.
 ///
+/// Windows: the tab titles only, at the system font's size; Windows draws
+///          the title bar itself, in the system's caption font. A family
+///          that is not installed leaves the system font.
+///
 /// Available since: 1.0.0 on macOS, 1.1.0 on GTK
 @"window-title-font-family": ?[:0]const u8 = null,
 

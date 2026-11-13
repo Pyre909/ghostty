@@ -130,7 +130,7 @@ fn create(window: *Window, bar: win32.HWND, label: win32.RECT, editor: *Editor) 
     if (edit_proc == null) edit_proc = @ptrFromInt(@as(usize, @bitCast(old)));
     // The bar's font, which the label is drawn in.
     editor.line = 0;
-    if (window.bar.fontFor(Window.dpiOf(window.app, bar))) |font| {
+    if (window.bar.fontFor(Window.dpiOf(window.app, bar), window.app.config.@"window-title-font-family")) |font| {
         _ = win32.SendMessageW(edit, win32.WM_SETFONT, @intFromPtr(font), 0);
         editor.line = SearchBar.textHeight(edit, font);
     }

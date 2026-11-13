@@ -1404,6 +1404,24 @@ comptime {
 }
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createfontindirectw
 pub extern "gdi32" fn CreateFontIndirectW(font: *const LOGFONTW) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nc-wingdi-fontenumprocw
+/// Its second argument is a TEXTMETRICW or NEWTEXTMETRICEXW by font type,
+/// read by none of ours.
+pub const FONTENUMPROCW = *const fn (
+    font: *const LOGFONTW,
+    metrics: *const anyopaque,
+    font_type: DWORD,
+    lparam: LPARAM,
+) callconv(.winapi) c_int;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-enumfontfamiliesexw
+/// `flags` must be zero.
+pub extern "gdi32" fn EnumFontFamiliesExW(
+    hdc: HDC,
+    font: *const LOGFONTW,
+    proc: FONTENUMPROCW,
+    lparam: LPARAM,
+    flags: DWORD,
+) callconv(.winapi) c_int;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-getobjectw
 pub extern "gdi32" fn GetObjectW(object: HGDIOBJ, size: c_int, out: ?*anyopaque) callconv(.winapi) c_int;
 /// GetDeviceCaps index for vertical DPI.
