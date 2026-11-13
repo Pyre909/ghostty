@@ -40,6 +40,7 @@ const SaveDialog = @import("SaveDialog.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
+const RendererHealth = @import("RendererHealth.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
@@ -2192,6 +2193,7 @@ pub const App = struct {
             .key_table => keyTable(target, value),
             .readonly => readOnly(target, value),
             .show_child_exited => childExited(target, value),
+            .renderer_health => rendererHealth(target, value),
             .scrollbar => scrollBar(target, value),
             .cell_size => self.cellSize(target),
             .size_limit => sizeLimit(target, value),
@@ -2302,6 +2304,18 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| ChildExited.show(v.rt_surface, value),
+        };
+    }
+
+    /// `.renderer_health`, from the core as its renderer's health changes:
+    /// the terminal's error view covers it while the renderer is
+    /// unhealthy, as macOS's does, and hides once it is healthy again
+    /// (`RendererHealth.set`). `false` for the app, and for a terminal
+    /// whose view could not be made.
+    fn rendererHealth(target: apprt.Target, value: renderer.Health) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| RendererHealth.set(v.rt_surface, value),
         };
     }
 
@@ -26619,6 +26633,159 @@ test "win32: show_child_exited shows a banner across the bottom of its terminal,
     // Its button takes the pointer, the rest of it is the terminal's.
     try expectBannerHits(a);
     try expectBannerHits(b);
+}
+
+fn testHealth(app: *App, surface: *Surface, value: renderer.Health) !bool {
+    return app.performAction(.{ .surface = &surface.core_surface }, .renderer_health, value);
+}
+
+/// For tests: `surface`'s renderer error view shows in `window` over all
+/// of its terminal, and its window's text names it.
+fn expectHealthViewAt(window: *const Window, surface: *const Surface) !void {
+    const hwnd = surface.overlays.renderer_health.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(hwnd));
+    // Its terminal's client area, as the other overlays: the scroll bar,
+    // which Windows draws, stays usable.
+    try std.testing.expectEqual(try paneClient(window, surface), try childRect(window, hwnd));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(RendererHealth.title ++ " " ++ RendererHealth.body, try windowText(hwnd, &buf));
+}
+
+test "win32: renderer_health covers its terminal with the error view while unhealthy, and hides it once healthy" {
+    // macOS's view: the terminal's background over all of it, and on it
+    // the icon, the title and a line, while the renderer is unhealthy.
+    // Stacked over the bell border and under the child-exited banner, as
+    // macOS stacks it over its bell border; a resize, a zoom and a hidden
+    // tab take it with its terminal; passive.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    // Not for the app; healthy with no view makes none.
+    try std.testing.expect(!try app.performAction(.app, .renderer_health, .unhealthy));
+    try std.testing.expect(try testHealth(&app, a, .healthy));
+    try std.testing.expect(a.overlays.renderer_health.hwnd == null);
+
+    // Unhealthy: over all of its own terminal, not b's.
+    try std.testing.expect(try testHealth(&app, a, .unhealthy));
+    try expectHealthViewAt(window, a);
+    const hwnd = a.overlays.renderer_health.hwnd.?;
+    try std.testing.expect(b.overlays.renderer_health.hwnd == null);
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(hwnd, win32.WM_NCHITTEST, 0, 0));
+
+    // Drawn: the terminal's background at its corners, and text on it in
+    // the colour that reads on it.
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        const bg = Overlays.terminalBackground(a);
+        const w = printed.width;
+        const h = printed.height;
+        try std.testing.expectEqual(bg, printed.at(0, 0));
+        try std.testing.expectEqual(bg, printed.at(w - 1, h - 1));
+        try printed.expectBetween(.{ .left = 0, .top = 0, .right = w, .bottom = h }, bg, RendererHealth.textOn(bg));
+    }
+
+    // The frame resized: still all of it.
+    testResize(window, 1000, 600);
+    try expectHealthViewAt(window, a);
+
+    // Over the bell border, under the banner.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features".border = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(try testBell(&app, a));
+    try std.testing.expect(try testChildExited(&app, a, 3));
+    const border = a.overlays.bell_border.hwnd orelse return error.TestUnexpectedResult;
+    const banner = a.overlays.child_exited.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(border));
+    try std.testing.expect(win32.GetWindow(border, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(win32.GetWindow(hwnd, win32.GW_HWNDPREV) == banner);
+    try expectHealthViewAt(window, a);
+
+    // A zoom on the other terminal hides it with its own; back, shown.
+    window.toggleZoom(b);
+    try std.testing.expect(!shown(hwnd));
+    window.toggleZoom(b);
+    try expectHealthViewAt(window, a);
+
+    // The other tab shown: hidden with its terminals; shown again.
+    _ = try testTab(&app, window);
+    window.relayout();
+    window.selectTab(1);
+    try std.testing.expect(!shown(hwnd));
+    window.selectTab(0);
+    try expectHealthViewAt(window, a);
+
+    // Healthy: hidden, the window kept, laid out again still hidden;
+    // unhealthy again, the same window.
+    try std.testing.expect(try testHealth(&app, a, .healthy));
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(a.overlays.renderer_health.hwnd.? == hwnd);
+    window.relayout();
+    try std.testing.expect(!shown(hwnd));
+    try std.testing.expect(try testHealth(&app, a, .unhealthy));
+    try expectHealthViewAt(window, a);
+    try std.testing.expect(a.overlays.renderer_health.hwnd.? == hwnd);
+
+    // b's, on its own.
+    try std.testing.expect(try testHealth(&app, b, .unhealthy));
+    try expectHealthViewAt(window, b);
+    try expectHealthViewAt(window, a);
+
+    // It goes with its terminal.
+    try std.testing.expect(a.destroy());
+    try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: a renderer error view whose window cannot be made returns false, and is made the next time" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    window.relayout();
+
+    const NoWindow = struct {
+        fn make(_: []const u8) ?win32.HWND {
+            return null;
+        }
+    };
+    Overlays.test_make = &NoWindow.make;
+    try std.testing.expect(!try testHealth(&app, a, .unhealthy));
+    Overlays.test_make = null;
+    try std.testing.expect(a.overlays.renderer_health.hwnd == null);
+    try std.testing.expect(try testHealth(&app, a, .unhealthy));
+    try expectHealthViewAt(window, a);
 }
 
 test "win32: the child-exited banner is between the read-only badge and the link preview, under the search bar, and hides with its terminal" {

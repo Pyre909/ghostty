@@ -795,6 +795,15 @@ pub extern "user32" fn EndDeferWindowPos(batch: HDWP) callconv(.winapi) BOOL;
 pub extern "user32" fn LoadCursorW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HCURSOR;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadiconw
 pub extern "user32" fn LoadIconW(inst: ?HINSTANCE, name: ResourceW) callconv(.winapi) ?HICON;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-loadimagew
+pub extern "user32" fn LoadImageW(inst: ?HINSTANCE, name: ResourceW, kind: UINT, cx: c_int, cy: c_int, flags: UINT) callconv(.winapi) ?HANDLE;
+pub const IMAGE_ICON: UINT = 1;
+pub const LR_DEFAULTCOLOR: UINT = 0x0000;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-drawiconex
+pub extern "user32" fn DrawIconEx(hdc: HDC, x: c_int, y: c_int, icon: HICON, cx: c_int, cy: c_int, step: UINT, brush: ?HBRUSH, flags: UINT) callconv(.winapi) BOOL;
+pub const DI_NORMAL: UINT = 0x0003;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-destroyicon
+pub extern "user32" fn DestroyIcon(icon: HICON) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/shlwapi/nf-shlwapi-assocquerystringw
 pub extern "shlwapi" fn AssocQueryStringW(
     flags: DWORD,
@@ -1707,6 +1716,8 @@ pub const LB_ERR: LRESULT = -1;
 pub const ODS_SELECTED: UINT = 0x0001;
 /// DrawTextW measures the text into the rect and draws nothing.
 pub const DT_CALCRECT: UINT = 0x0400;
+/// DrawTextW breaks lines between words to fit the rect's width.
+pub const DT_WORDBREAK: UINT = 0x0010;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-drawitemstruct
 pub const DRAWITEMSTRUCT = extern struct {
     CtlType: UINT,

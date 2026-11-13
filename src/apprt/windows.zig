@@ -188,6 +188,17 @@
 //! preview; it takes the pointer over its button alone, and never the
 //! activation or the focus. Its window is made when the core asks.
 //!
+//! ## Renderer health
+//!
+//! `.renderer_health` covers a terminal whose renderer is unhealthy with
+//! its background, the app's icon, "Oh, no." and a line on what happened,
+//! as macOS's error view does (`RendererHealth`), and hides it once the
+//! renderer is healthy again. Direct3D 11 reports a frame unhealthy when
+//! its device was lost, and healthy once it has made a new one, which it
+//! tries again each second. The view is passive, above the bell border
+//! and under the child-exited banner; its window is made the first time
+//! the renderer is unhealthy.
+//!
 //! ## Command finished
 //!
 //! `.command_finished`, which the core sends when a command the shell
@@ -417,6 +428,7 @@ test {
     _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/Overlays.zig");
     _ = @import("windows/ReadOnly.zig");
+    _ = @import("windows/RendererHealth.zig");
     _ = @import("windows/ResizeOverlay.zig");
     _ = @import("windows/SaveDialog.zig");
     _ = @import("windows/ScrollBar.zig");
