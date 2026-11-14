@@ -577,8 +577,10 @@ pub fn lookOf(o: anytype, colors: SearchBar.Colors, background: win32.COLORREF) 
     return .{ .line = colors.border, .fill = colors.bar, .text = colors.text };
 }
 
-/// The background `surface`'s terminal shows: the one a program gave it
-/// (`background`), else the configuration's.
+/// The background `surface`'s terminal shows, as far as the core has
+/// said: the one a program gave it (`background`), else the
+/// configuration's. The unfocused split's dim does not use it
+/// (`UnfocusedSplit.Dim.fill`).
 pub fn terminalBackground(surface: *const Surface) win32.COLORREF {
     const bg = surface.overlays.background orelse surface.app.config.background.toTerminalRGB();
     return win32.rgb(bg.r, bg.g, bg.b);
@@ -604,6 +606,17 @@ pub fn colorChanged(surface: *Surface, rgb: terminal.color.RGB) void {
 /// differs, for its title bar to follow a new theme; here the overlays
 /// follow the terminal under them. They are drawn again by the
 /// configuration change itself.
+///
+/// This decides before the terminal has the new configuration: the core
+/// queues it to the termio thread and then reports the change here
+/// (`Surface.updateConfig`). A reset parsed in between reports the old
+/// configuration's background, which arrives after this and is kept, so
+/// the overlays stay on it while the terminal shows the new one, until
+/// the program changes a colour again. macOS's cache takes that late
+/// report the same way. Reading the terminal's colour under the
+/// renderer's lock at paint time would close it only with a repaint
+/// once termio has applied the configuration, which the core does not
+/// send.
 pub fn configChanged(self: *Overlays, old: terminal.color.RGB) void {
     const bg = self.background orelse return;
     if (bg.eql(old)) self.background = null;
