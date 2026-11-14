@@ -26,6 +26,11 @@ and the bin folder to the user's PATH, which command prompts opened
 afterwards see. It is not signed, so Windows may warn that its
 publisher is unknown.
 
+It also adds New Ghostty Tab Here and New Ghostty Window Here to
+Explorer's menu for a folder, the inside of one and a drive: a tab or
+window of the running Ghostty, or a new Ghostty, starting in that
+folder. Windows 11 lists them under "Show more options".
+
 An installer of the same or a newer version replaces the installed
 Ghostty, and one of an older version is refused. Only a version's first
 three numbers count, so 1.4.1-dev and 1.4.1 replace each other. Remove

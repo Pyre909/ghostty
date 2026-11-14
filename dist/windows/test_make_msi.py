@@ -771,9 +771,12 @@ class TestPackage(unittest.TestCase):
         self.assertEqual({r["Root"] for r in rows}, {"1"}, "the user's hive only")
         own = sorted(r["Name"] for r in rows if r["Key"] == mm.KEY)
         self.assertEqual(own, sorted([*FOLDERS, "Start menu"]))
-        toast = {r["Name"]: r for r in rows if r["Key"] != mm.KEY}
+        # Besides its own key, the notifications' and Explorer's verbs'
+        # (test_explorer_verbs).
+        others = [r for r in rows if r["Key"] != mm.KEY and "\\shell\\" not in r["Key"]]
+        toast = {r["Name"]: r for r in others}
         self.assertEqual(
-            {r["Key"] for r in toast.values()},
+            {r["Key"] for r in others},
             {r"Software\Classes\AppUserModelId\com.mitchellh.ghostty"},
         )
         # What Ghostty registers there itself: the name its notifications
@@ -861,6 +864,47 @@ class TestPackage(unittest.TestCase):
             mm.summary(self.tools, msi)["Created"], "Fri Jan  2 03:04:12 2026"
         )
 
+    def test_explorer_verbs(self) -> None:
+        # macOS's two Finder services, on a folder, inside one and on a
+        # drive: the menu's name, ghostty.exe's icon, and its command with
+        # the folder (%V) as the working directory, then "\." so that a
+        # drive's "C:\" does not escape the closing quote.
+        rows = self.table(self.x64, "Registry")
+        (exe,) = [
+            r["File"]
+            for r in self.table(self.x64, "File")
+            if r["FileName"].rpartition("|")[2] == "ghostty.exe"
+        ]
+        top = {
+            r["Directory_"]: r["Component"] for r in self.table(self.x64, "Component")
+        }
+        (ghostty,) = [
+            r["Directory"]
+            for r in self.table(self.x64, "Directory")
+            if r["DefaultDir"].rpartition("|")[2] == "Ghostty"
+        ]
+        verbs = [r for r in rows if "\\shell\\" in r["Key"]]
+        self.assertEqual({r["Component_"] for r in verbs}, {top[ghostty]})
+        got = {(r["Key"], r["Name"]): r["Value"] for r in verbs}
+        expected = {}
+        for cls in ("Directory", r"Directory\Background", "Drive"):
+            for verb, label, action in (
+                ("GhosttyNewTab", "New Ghostty Tab Here", "+new-tab"),
+                ("GhosttyNewWindow", "New Ghostty Window Here", "+new-window"),
+            ):
+                key = rf"Software\Classes\{cls}\shell\{verb}"
+                expected |= {
+                    # Deleted with what is in it on uninstall.
+                    (key, "-"): "",
+                    (key, "MUIVerb"): label,
+                    (key, "Icon"): f"[#{exe}]",
+                    (
+                        key + r"\command",
+                        "",
+                    ): f'"[#{exe}]" {action} "--working-directory=%V\\."',
+                }
+        self.assertEqual(got, expected)
+
     def test_shortcut(self) -> None:
         (row,) = self.table(self.x64, "Shortcut")
         self.assertEqual(row["Directory_"], "ProgramMenuFolder")
@@ -885,6 +929,8 @@ class TestPackage(unittest.TestCase):
             "WriteEnvironmentStrings's place is None, not 5200",
             # The two values are in the source; the key's removal is not.
             "the notification key's rows is [('DisplayName', 'Ghostty', 'cmp0'), ('IconUri', ",
+            # The verbs' values are in the source; their keys' removal not.
+            "the Explorer verbs' rows is [(",
         ]:
             with self.subTest(what):
                 self.assertIn(what, said)
@@ -921,6 +967,11 @@ class TestCheck(Temp):
             r["Directory_"]: r["Component"] for r in mm.table(found, good, "Component")
         }
         top, bin_dir = folders["Ghostty"], folders["bin"]
+        registry = {
+            (r["Key"], r["Name"]): r["Registry"]
+            for r in mm.table(found, good, "Registry")
+        }
+        drive_tab = r"Software\Classes\Drive\shell\GhosttyNewTab"
         for n, (statement, problem) in enumerate(
             [
                 (
@@ -1001,6 +1052,20 @@ class TestCheck(Temp):
                 (
                     f"UPDATE `Registry` SET `Value` = '[#{files['README.txt']}]' WHERE `Name` = 'IconUri'",
                     f"('IconUri', '[#{files['README.txt']}]', 'cmp0')], not ",
+                ),
+                # An Explorer verb's key made, not deleted; its command
+                # without the folder; a verb gone.
+                (
+                    f"UPDATE `Registry` SET `Name` = '+' WHERE `Registry` = '{registry[(drive_tab, '-')]}'",
+                    "the Explorer verbs' rows is [",
+                ),
+                (
+                    f"UPDATE `Registry` SET `Value` = 'ghostty.exe +new-tab' WHERE `Registry` = '{registry[(drive_tab + chr(92) + 'command', '')]}'",
+                    "'ghostty.exe +new-tab', 'cmp0')",
+                ),
+                (
+                    f"DELETE FROM `Registry` WHERE `Registry` = '{registry[(drive_tab, 'MUIVerb')]}'",
+                    "the Explorer verbs' rows is [",
                 ),
             ]
         ):

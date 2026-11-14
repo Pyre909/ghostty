@@ -21,6 +21,15 @@ The package:
     adds a Ghostty shortcut to the user's Start menu and the bin folder to
     the end of the user's PATH;
 
+    adds New Ghostty Tab Here and New Ghostty Window Here to Explorer's
+    menu for a folder, the inside of one and a drive, as macOS's Finder
+    has them as services (macos/Ghostty-Info.plist). Each runs
+    `ghostty +new-tab` or `+new-window` with the folder as the working
+    directory, which the running Ghostty opens (a tab beside its focused
+    terminal), or a Ghostty started for it when none runs
+    (src/apprt/windows/IpcClient.zig). Windows 11 lists such verbs under
+    "Show more options": its first menu takes only a packaged app's;
+
     registers the app ID of Ghostty's notifications, with the name and
     the icon they show, as Ghostty does itself the first time it shows
     one (src/apprt/windows/toast.zig). Ghostty does that once in a
@@ -143,6 +152,43 @@ KEY = rf"Software\{MANUFACTURER}\{PRODUCT}\Installed"
 TOAST_KEY = r"Software\Classes\AppUserModelId\com.mitchellh.ghostty"
 TOAST_NAME = "Ghostty"
 TOAST_ICON = "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png"
+
+# Explorer's verbs for a folder, as macOS's Finder services
+# (macos/Ghostty-Info.plist, NSServices): the key under a class's shell
+# key, the name the menu shows, and the CLI action. Each is on a folder,
+# on the inside of an open one, and on a drive.
+EXPLORER_CLASSES = ("Directory", r"Directory\Background", "Drive")
+EXPLORER_VERBS = (
+    ("GhosttyNewTab", "New Ghostty Tab Here", "+new-tab"),
+    ("GhosttyNewWindow", "New Ghostty Window Here", "+new-window"),
+)
+
+
+def explorer_rows(exe: str, component: str) -> list[tuple[str, str, str, str]]:
+    """Every Registry row of the Explorer verbs, as (key, name, value,
+    component), sorted, with `exe` the File id of ghostty.exe: those the
+    source has and those `additions` adds to delete each verb's key on
+    uninstall. %V is the folder; Explorer gives a drive's as "C:\\", whose
+    backslash would escape the closing quote of a quoted argument
+    (CommandLineToArgvW's rules, which Zig's parser keeps), so "\\." follows
+    it, which names the same folder."""
+    rows = []
+    for cls in EXPLORER_CLASSES:
+        for verb, label, action in EXPLORER_VERBS:
+            key = rf"Software\Classes\{cls}\shell\{verb}"
+            rows += [
+                (key, "-", "", component),
+                (key, "MUIVerb", label, component),
+                (key, "Icon", f"[#{exe}]", component),
+                (
+                    rf"{key}\command",
+                    "",
+                    f'"[#{exe}]" {action} "--working-directory=%V\\."',
+                    component,
+                ),
+            ]
+    return sorted(rows)
+
 
 # Where the two actions that read the Environment table go in the install
 # sequence: the numbers Windows Installer's documentation suggests, which
@@ -417,6 +463,21 @@ def source(app: App, product_code: str) -> str:
             Type="string",
             Value=value,
         )
+    # Explorer's verbs, in the top folder's component too. The "-" rows,
+    # which delete their keys on uninstall, are added (`additions`).
+    for key, name, value, _ in explorer_rows(file_id[EXE], components[0].get("Id")):
+        if name == "-":
+            continue
+        attrs = {"Name": name} if name else {}
+        sub(
+            components[0],
+            "RegistryValue",
+            Root="HKCU",
+            Key=key,
+            Type="string",
+            Value=value,
+            **attrs,
+        )
     bin_dir = dir_id[EXE.rpartition("/")[0]]
     menu_dir = sub(target, "Directory", Id="ProgramMenuFolder")
     menu = sub(menu_dir, "Component", Id="cmpMenu", Guid=guid("start menu"))
@@ -524,7 +585,16 @@ def additions(app: App) -> list[str]:
         "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Component_`) "
         f"VALUES ('regToast', 1, '{TOAST_KEY}', '-', 'cmp0')"
     )
-    return [path, *actions, key]
+    # Each Explorer verb's key, deleted on uninstall in the same way.
+    exe = f"file{sorted(app.files).index(EXE)}"
+    verbs = [
+        "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Component_`) "
+        f"VALUES ('regExplorer{n}', 1, '{key}', '-', 'cmp0')"
+        for n, (key, name, _, _) in enumerate(
+            r for r in explorer_rows(exe, "cmp0") if r[1] == "-"
+        )
+    ]
+    return [path, *actions, key, *verbs]
 
 
 def finish(
@@ -656,6 +726,16 @@ def check(
             ("DisplayName", TOAST_NAME, top),
             ("IconUri", f"[#{icon[0] if icon else None}]", top),
         ],
+    )
+    exe = [key for key, (path, _) in files.items() if path == EXE]
+    want(
+        "the Explorer verbs' rows",
+        sorted(
+            (r["Key"], r["Name"], r["Value"], r["Component_"])
+            for r in registry
+            if r["Key"].startswith(r"Software\Classes") and r["Key"] != TOAST_KEY
+        ),
+        explorer_rows(exe[0] if exe else "None", top),
     )
     if problems:
         raise Error("the package is not as meant:\n  " + "\n  ".join(problems))
