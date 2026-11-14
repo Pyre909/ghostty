@@ -169,9 +169,9 @@ test "shell integration failure" {
 /// `--posix` it would stay in POSIX mode, reading no `.bashrc`.
 ///
 /// A bare name is the launcher if the system directory has it: with no
-/// directory, CreateProcessW looks in the system directory before PATH
-/// (after Ghostty's own directory and the current one), so `bash` is
-/// WSL's wherever Git's comes on PATH. A path is the launcher if its
+/// directory, Command looks in the system directory before PATH (after
+/// Ghostty's own directory), as CreateProcessW does, so `bash` is WSL's
+/// wherever Git's comes on PATH. A path is the launcher if its
 /// directory is the system directory. `exists` tells whether a file is
 /// there.
 fn isWslBash(

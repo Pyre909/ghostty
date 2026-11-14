@@ -306,16 +306,25 @@ fn startWindows(self: *Command, arena: Allocator) !void {
     const cwd_w = if (self.cwd) |cwd| try std.unicode.utf8ToUtf16LeAllocZ(arena, cwd) else null;
 
     // Pass null for lpApplicationName and put the program as the first
-    // token of lpCommandLine. This lets CreateProcessW perform the
-    // standard program search (parent-app dir, CWD, system dirs, PATH)
-    // and append ".exe" when the name has no extension, which is what
-    // users expect for bare commands like `wsl ~` or `pwsh.exe`.
-    // It also preserves the child's argv[0] as written by the caller
-    // rather than replacing it with the resolved absolute path.
-    const command_line = if (self.args.len > 0)
-        try windowsCreateCommandLine(arena, self.args)
-    else
-        try windowsCreateCommandLine(arena, &.{self.path});
+    // token of lpCommandLine, so that CreateProcessW starts it as it
+    // starts any command line (a .bat or .cmd through cmd.exe included).
+    // A bare name, as in `wsl ~` or `pwsh.exe`, is first replaced by
+    // the path windowsFindProgram finds for it: CreateProcessW's own
+    // search would look in the current directory, which Ghostty
+    // inherits from whatever started it (Explorer gives the folder the
+    // user right-clicked), so a program planted there would run in the
+    // shell's place. The child then sees that path as its argv[0].
+    const argv: []const []const u8 = if (self.args.len > 0) self.args else &.{self.path};
+    const command_line = if (try windowsFindProgram(
+        arena,
+        argv[0],
+        try windowsProgramDirs(arena),
+        &windowsIsFile,
+    )) |found| found: {
+        const resolved = try arena.dupe([]const u8, argv);
+        resolved[0] = found;
+        break :found try windowsCreateCommandLine(arena, resolved);
+    } else try windowsCreateCommandLine(arena, argv);
     const command_line_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, command_line);
     const env_w = if (self.env) |env_map| try createWindowsEnvBlock(arena, env_map) else null;
 
@@ -648,6 +657,151 @@ fn windowsCreateCommandLine(allocator: mem.Allocator, argv: []const []const u8) 
     }
 
     return buf.toOwnedSliceSentinel(0);
+}
+
+/// The path of the program that a bare `name` (one with no `\`, `/` or
+/// `:`) names, searched as CreateProcessW searches for it but never in
+/// the current directory: each of `dirs` in order, skipping any that is
+/// not a full path (`.`, `bin`, `C:bin`, `\bin`), with ".exe" appended
+/// when the name has no extension
+/// (https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw,
+/// lpCommandLine). Null for a name that is already a path, which is
+/// started as written. `exists` tells whether a file, not a directory,
+/// is there. The POSIX start likewise searches only PATH.
+fn windowsFindProgram(
+    arena: Allocator,
+    name: []const u8,
+    dirs: []const []const u8,
+    exists: *const fn ([]const u8) bool,
+) error{ OutOfMemory, FileNotFound }!?[]const u8 {
+    if (name.len == 0 or mem.indexOfAny(u8, name, "\\/:") != null) return null;
+    const ext: []const u8 = if (std.fs.path.extension(name).len == 0) ".exe" else "";
+    for (dirs) |dir| {
+        if (!windowsFullDir(dir)) continue;
+        const path = try std.fmt.allocPrint(
+            arena,
+            "{s}\\{s}{s}",
+            .{ mem.trimEnd(u8, dir, "\\/"), name, ext },
+        );
+        if (exists(path)) return path;
+    }
+    return error.FileNotFound;
+}
+
+/// Whether `dir` is a full path: `X:\...` or `\\server\share...`, not
+/// one that depends on the current directory or drive.
+fn windowsFullDir(dir: []const u8) bool {
+    const sep = struct {
+        fn f(c: u8) bool {
+            return c == '\\' or c == '/';
+        }
+    }.f;
+    if (dir.len >= 3 and std.ascii.isAlphabetic(dir[0]) and dir[1] == ':' and sep(dir[2])) return true;
+    return dir.len >= 3 and sep(dir[0]) and sep(dir[1]) and !sep(dir[2]);
+}
+
+/// Where CreateProcessW looks for a bare program name, less the current
+/// directory: the directory of this process's image, the system
+/// directory, the Windows directory (the system directory's parent),
+/// then each entry of this process's PATH, quotes around one removed.
+/// The 16-bit system directory that CreateProcessW also searches is
+/// left out: it holds no program for a 64-bit Windows to start.
+fn windowsProgramDirs(arena: Allocator) Allocator.Error![]const []const u8 {
+    var dirs: std.ArrayList([]const u8) = .empty;
+    const image = std.os.windows.peb().ProcessParameters.ImagePathName;
+    if (image.Buffer) |buf| {
+        const path = try std.unicode.wtf16LeToWtf8Alloc(arena, buf[0 .. image.Length / 2]);
+        if (std.fs.path.dirnameWindows(path)) |dir| try dirs.append(arena, dir);
+    }
+    const system = try std.unicode.wtf16LeToWtf8Alloc(arena, std.os.windows.getSystemDirectoryWtf16Le());
+    try dirs.append(arena, system);
+    if (std.fs.path.dirnameWindows(system)) |dir| try dirs.append(arena, dir);
+
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("PATH");
+    const size = windows.exp.kernel32.GetEnvironmentVariableW(name, null, 0);
+    if (size > 0) {
+        const buf = try arena.alloc(u16, size);
+        const len = windows.exp.kernel32.GetEnvironmentVariableW(name, buf.ptr, size);
+        if (len > 0 and len < size) {
+            const path = try std.unicode.wtf16LeToWtf8Alloc(arena, buf[0..len]);
+            var it = mem.tokenizeScalar(u8, path, ';');
+            while (it.next()) |entry| {
+                const dir = mem.trim(u8, entry, "\"");
+                if (dir.len > 0) try dirs.append(arena, dir);
+            }
+        }
+    }
+    return dirs.items;
+}
+
+fn windowsIsFile(path: []const u8) bool {
+    const stat = std.Io.Dir.cwd().statFile(global.io(), path, .{}) catch return false;
+    return stat.kind != .directory;
+}
+
+test windowsFindProgram {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const Fake = struct {
+        fn any(_: []const u8) bool {
+            return true;
+        }
+        fn second(path: []const u8) bool {
+            return mem.startsWith(u8, path, "D:\\b\\");
+        }
+        fn none(_: []const u8) bool {
+            return false;
+        }
+    };
+
+    // A bare name: ".exe" appended unless it has an extension, the first
+    // directory that has it.
+    try testing.expectEqualStrings("C:\\a\\wsl.exe", (try windowsFindProgram(alloc, "wsl", &.{ "C:\\a", "D:\\b" }, &Fake.any)).?);
+    try testing.expectEqualStrings("D:\\b\\wsl.exe", (try windowsFindProgram(alloc, "wsl", &.{ "C:\\a", "D:\\b\\" }, &Fake.second)).?);
+    try testing.expectEqualStrings("C:\\a\\pwsh.exe", (try windowsFindProgram(alloc, "pwsh.exe", &.{"C:\\a"}, &Fake.any)).?);
+    try testing.expectEqualStrings("C:\\a\\run.bat", (try windowsFindProgram(alloc, "run.bat", &.{"C:\\a"}, &Fake.any)).?);
+    try testing.expectEqualStrings("\\\\srv\\s\\wsl.exe", (try windowsFindProgram(alloc, "wsl", &.{"\\\\srv\\s"}, &Fake.any)).?);
+
+    // Never the current directory, nor a directory found from it or
+    // from the current drive.
+    try testing.expectEqualStrings("E:\\ok\\wsl.exe", (try windowsFindProgram(
+        alloc,
+        "wsl",
+        &.{ ".", "", "bin", ".\\bin", "C:bin", "\\bin", "/bin", "E:\\ok" },
+        &Fake.any,
+    )).?);
+    try testing.expectError(error.FileNotFound, windowsFindProgram(alloc, "wsl", &.{ ".", "bin" }, &Fake.any));
+    try testing.expectError(error.FileNotFound, windowsFindProgram(alloc, "wsl", &.{"C:\\a"}, &Fake.none));
+
+    // A path is started as written.
+    try testing.expect(try windowsFindProgram(alloc, "C:\\x\\y.exe", &.{"C:\\a"}, &Fake.any) == null);
+    try testing.expect(try windowsFindProgram(alloc, ".\\y.exe", &.{"C:\\a"}, &Fake.any) == null);
+    try testing.expect(try windowsFindProgram(alloc, "x/y", &.{"C:\\a"}, &Fake.any) == null);
+    try testing.expect(try windowsFindProgram(alloc, "C:y", &.{"C:\\a"}, &Fake.any) == null);
+}
+
+test "Command: windows starts a bare program name from the system directory" {
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+    var td = try TempDir.init();
+    defer td.deinit();
+    var stdout = try createTestStdout(testing.io, td.dir);
+    defer stdout.close(testing.io);
+
+    var cmd: Command = .{
+        .path = "whoami",
+        .args = &.{"whoami"},
+        .stdout = stdout,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try cmd.testingStart();
+    try testing.expect(cmd.pid != null);
+    const exit = try cmd.wait(true);
+    try testing.expectEqual(@as(u32, 0), exit.Exited);
 }
 
 test "createNullDelimitedEnvMap" {
