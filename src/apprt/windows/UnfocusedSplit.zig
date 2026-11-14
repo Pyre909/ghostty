@@ -49,9 +49,12 @@ pub const Dim = struct {
     /// The alpha its window was layered with, 0 for none yet: layered
     /// again only when the opacity changes.
     alpha: u8 = 0,
-    /// The colour it fills with, `unfocused-split-fill`; null for the
-    /// terminal's background.
-    fill: ?win32.COLORREF = null,
+    /// The colour it fills with, as `sync` last found it:
+    /// `unfocused-split-fill`, else the configured background, as GTK's
+    /// (`loadRuntimeCss`) and macOS's. Not a background a program set
+    /// (`Overlays.colorChanged`), which the other overlays draw on: the
+    /// dim is to darken the terminal, whatever colour it shows.
+    fill: win32.COLORREF = 0,
 
     pub fn deinit(self: *Dim, alloc: std.mem.Allocator) void {
         _ = alloc;
@@ -71,12 +74,14 @@ pub const Dim = struct {
         return .{ .in = .{ .left = 0, .top = 0, .right = pane.width, .bottom = pane.height }, .redraw = false };
     }
 
-    /// Its colour over all of the window, which its alpha blends.
+    /// Its colour over all of the window, which its alpha blends; not the
+    /// terminal's `background` (`fill`).
     pub fn draw(self: *const Dim, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, background: win32.COLORREF, font: ?win32.HGDIOBJ) void {
         _ = dpi;
         _ = dark;
+        _ = background;
         _ = font;
-        SearchBar.fill(hdc, client, self.fill orelse background);
+        SearchBar.fill(hdc, client, self.fill);
     }
 };
 
@@ -124,7 +129,8 @@ fn layer(hwnd: win32.HWND, alpha: u8) bool {
 pub fn sync(surface: *Surface, config: *const Config) void {
     const self = &surface.overlays.dim;
     const alpha = alphaOf(config.@"unfocused-split-opacity");
-    self.fill = if (config.@"unfocused-split-fill") |c| win32.rgb(c.r, c.g, c.b) else null;
+    const fill = config.@"unfocused-split-fill" orelse config.background;
+    self.fill = win32.rgb(fill.r, fill.g, fill.b);
     self.on = !cannot_layer and wanted(surface, alpha);
     if (!self.on) return;
     const hwnd = self.hwnd orelse made: {

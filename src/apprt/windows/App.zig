@@ -26892,6 +26892,18 @@ test "win32: color_change draws a terminal's overlays on the background a progra
 
     const window = try testFrame(&app);
     testResize(window, 900, 500);
+    // b, beside a without the focus, is dimmed. The test runner cannot
+    // layer a child window, so its alpha is taken as set.
+    const Layer = struct {
+        fn set(_: win32.HWND, _: u8) bool {
+            return true;
+        }
+    };
+    Transparency.test_set_alpha = &Layer.set;
+    defer Transparency.test_set_alpha = null;
+    const latched = UnfocusedSplit.cannot_layer;
+    UnfocusedSplit.cannot_layer = false;
+    defer UnfocusedSplit.cannot_layer = latched;
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     window.tab().tree = try testRow(alloc, &.{ a, b });
@@ -26964,6 +26976,17 @@ test "win32: color_change draws a terminal's overlays on the background a progra
     try std.testing.expect(win32.GetUpdateRect(palette, null, .FALSE).toBool());
     try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_command_palette, {}));
     app.createRequested();
+
+    // b's dim is not drawn on the colour a program set, as macOS's and
+    // GTK's are not, but on the configured background, or the configured
+    // fill once there is one.
+    const dim = b.overlays.dim.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(set_ref, Overlays.terminalBackground(b));
+    try std.testing.expectEqual(configured, try cornerOf(dim));
+    changed.@"unfocused-split-fill" = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(set_ref, Overlays.terminalBackground(b));
+    try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try cornerOf(dim));
 }
 
 /// For tests: the colour `hwnd` draws at its top-left corner.
