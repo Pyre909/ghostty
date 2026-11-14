@@ -171,7 +171,13 @@ def explorer_rows(exe: str, component: str) -> list[tuple[str, str, str, str]]:
     uninstall. %V is the folder; Explorer gives a drive's as "C:\\", whose
     backslash would escape the closing quote of a quoted argument
     (CommandLineToArgvW's rules, which Zig's parser keeps), so "\\." follows
-    it, which names the same folder."""
+    it, which names the same folder.
+
+    A folder's and a drive's verbs are for one item only
+    (MultiSelectModel "Single"): left to its default, a selection of
+    several runs one Ghostty per item, up to 15, and with none running
+    each would start its own, every one but the first left without the
+    pipe that later requests reach. The inside of a folder is always one."""
     rows = []
     for cls in EXPLORER_CLASSES:
         for verb, label, action in EXPLORER_VERBS:
@@ -187,6 +193,8 @@ def explorer_rows(exe: str, component: str) -> list[tuple[str, str, str, str]]:
                     component,
                 ),
             ]
+            if cls != r"Directory\Background":
+                rows.append((key, "MultiSelectModel", "Single", component))
     return sorted(rows)
 
 

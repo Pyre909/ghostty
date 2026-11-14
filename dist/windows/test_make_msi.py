@@ -903,6 +903,10 @@ class TestPackage(unittest.TestCase):
                         "",
                     ): f'"[#{exe}]" {action} "--working-directory=%V\\."',
                 }
+                # One item only where Explorer can select several: else
+                # each would start its own Ghostty.
+                if cls != r"Directory\Background":
+                    expected[(key, "MultiSelectModel")] = "Single"
         self.assertEqual(got, expected)
 
     def test_shortcut(self) -> None:
@@ -1065,6 +1069,11 @@ class TestCheck(Temp):
                 ),
                 (
                     f"DELETE FROM `Registry` WHERE `Registry` = '{registry[(drive_tab, 'MUIVerb')]}'",
+                    "the Explorer verbs' rows is [",
+                ),
+                # A selection of several drives allowed again.
+                (
+                    f"DELETE FROM `Registry` WHERE `Registry` = '{registry[(drive_tab, 'MultiSelectModel')]}'",
                     "the Explorer verbs' rows is [",
                 ),
             ]

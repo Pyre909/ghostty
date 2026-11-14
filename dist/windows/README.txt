@@ -29,7 +29,8 @@ publisher is unknown.
 It also adds New Ghostty Tab Here and New Ghostty Window Here to
 Explorer's menu for a folder, the inside of one and a drive: a tab or
 window of the running Ghostty, or a new Ghostty, starting in that
-folder. Windows 11 lists them under "Show more options".
+folder. They are offered for one selected item only. Windows 11
+lists them under "Show more options".
 
 An installer of the same or a newer version replaces the installed
 Ghostty, and one of an older version is refused. Only a version's first
