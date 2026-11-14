@@ -734,9 +734,19 @@ fn windowsProgramDirs(arena: Allocator) Allocator.Error![]const []const u8 {
     return dirs.items;
 }
 
+/// Whether something other than a directory is at `path`. This asks
+/// for the attributes, which does not open the file: an app execution
+/// alias (the zero-length reparse points in
+/// %LOCALAPPDATA%\Microsoft\WindowsApps, such as the pwsh.exe a Store
+/// install of PowerShell puts on PATH) cannot be opened as a file, so a
+/// stat of it fails, yet CreateProcessW starts it.
 fn windowsIsFile(path: []const u8) bool {
-    const stat = std.Io.Dir.cwd().statFile(global.io(), path, .{}) catch return false;
-    return stat.kind != .directory;
+    var buf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+    const len = std.unicode.utf8ToUtf16Le(buf[0 .. buf.len - 1], path) catch return false;
+    buf[len] = 0;
+    const attrs = windows.exp.kernel32.GetFileAttributesW(buf[0..len :0]);
+    if (attrs == windows.INVALID_FILE_ATTRIBUTES) return false;
+    return attrs & windows.FILE_ATTRIBUTE_DIRECTORY == 0;
 }
 
 test windowsFindProgram {
@@ -822,6 +832,34 @@ test "Command: windows never starts a bare program from the current directory" {
     var out: [512]u8 = undefined;
     const n = try stdout.readPositionalAll(io, &out, 0);
     try testing.expect(mem.indexOfScalar(u8, out[0..n], '\\') != null);
+}
+
+test "Command: windows finds an app execution alias" {
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Any .exe in WindowsApps is such an alias; skip on a system that
+    // has none.
+    const local = global.environ().getAlloc(alloc, "LOCALAPPDATA") catch return error.SkipZigTest;
+    const apps = try std.fmt.allocPrint(alloc, "{s}\\Microsoft\\WindowsApps", .{local});
+    var dir = std.Io.Dir.cwd().openDir(io, apps, .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close(io);
+    const name = name: {
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .directory and std.ascii.endsWithIgnoreCase(entry.name, ".exe"))
+                break :name try alloc.dupe(u8, entry.name[0 .. entry.name.len - 4]);
+        }
+        return error.SkipZigTest;
+    };
+
+    const found = (try windowsFindProgram(alloc, name, &.{apps}, &windowsIsFile)).?;
+    try testing.expect(std.ascii.endsWithIgnoreCase(found, ".exe"));
+    try testing.expect(!windowsIsFile(apps));
+    try testing.expect(!windowsIsFile(try std.fmt.allocPrint(alloc, "{s}\\no-such-program.exe", .{apps})));
 }
 
 test "createNullDelimitedEnvMap" {

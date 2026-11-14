@@ -101,7 +101,9 @@ pub const DUPLICATE_SAME_ACCESS = windows.DUPLICATE_SAME_ACCESS;
 pub const ENABLE_VIRTUAL_TERMINAL_PROCESSING = windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
 pub const ERROR_SUCCESS = 0;
 pub const EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+pub const FILE_ATTRIBUTE_DIRECTORY = 0x10;
 pub const FILE_ATTRIBUTE_NORMAL = 0x80;
+pub const INVALID_FILE_ATTRIBUTES = windows.INVALID_FILE_ATTRIBUTES;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000;
 pub const FILE_FLAG_OVERLAPPED = 0x40000000;
 /// GetFinalPathNameByHandleW dwFlags: normalized name with a DOS drive
@@ -290,6 +292,10 @@ pub const exp = struct {
         pub extern "kernel32" fn GetTempPathW(
             nBufferLength: DWORD,
             lpBuffer: LPWSTR,
+        ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw
+        pub extern "kernel32" fn GetFileAttributesW(
+            lpFileName: LPCWSTR,
         ) callconv(.winapi) DWORD;
         pub extern "kernel32" fn SetHandleInformation(
             hObject: HANDLE,
