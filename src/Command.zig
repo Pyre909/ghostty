@@ -781,13 +781,29 @@ test windowsFindProgram {
     try testing.expect(try windowsFindProgram(alloc, "C:y", &.{"C:\\a"}, &Fake.any) == null);
 }
 
-test "Command: windows starts a bare program name from the system directory" {
+test "Command: windows never starts a bare program from the current directory" {
     if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const io = testing.io;
     var td = try TempDir.init();
     defer td.deinit();
-    var stdout = try createTestStdout(testing.io, td.dir);
-    defer stdout.close(testing.io);
 
+    // A whoami.exe in the current directory that is another program:
+    // hostname prints the computer's name, whoami DOMAIN\user.
+    var system_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const system = system_buf[0..std.unicode.wtf16LeToWtf8(
+        &system_buf,
+        std.os.windows.getSystemDirectoryWtf16Le(),
+    )];
+    var hostname_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const hostname = try std.fmt.bufPrint(&hostname_buf, "{s}\\hostname.exe", .{system});
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), hostname, td.dir, "whoami.exe", io, .{});
+    var saved = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer saved.close(io);
+    try std.process.setCurrentDir(io, td.dir);
+    defer std.process.setCurrentDir(io, saved) catch {};
+
+    var stdout = try createTestStdout(io, td.dir);
+    defer stdout.close(io);
     var cmd: Command = .{
         .path = "whoami",
         .args = &.{"whoami"},
@@ -802,6 +818,10 @@ test "Command: windows starts a bare program name from the system directory" {
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expectEqual(@as(u32, 0), exit.Exited);
+
+    var out: [512]u8 = undefined;
+    const n = try stdout.readPositionalAll(io, &out, 0);
+    try testing.expect(mem.indexOfScalar(u8, out[0..n], '\\') != null);
 }
 
 test "createNullDelimitedEnvMap" {
