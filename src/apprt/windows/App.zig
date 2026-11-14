@@ -2194,6 +2194,7 @@ pub const App = struct {
             .readonly => readOnly(target, value),
             .show_child_exited => childExited(target, value),
             .renderer_health => rendererHealth(target, value),
+            .color_change => colorChange(target, value),
             .scrollbar => scrollBar(target, value),
             .cell_size => self.cellSize(target),
             .size_limit => sizeLimit(target, value),
@@ -2316,6 +2317,25 @@ pub const App = struct {
         return switch (target) {
             .app => false,
             .surface => |v| RendererHealth.set(v.rt_surface, value),
+        };
+    }
+
+    /// `.color_change`, from the core as a program sets or resets one of
+    /// the terminal's colours: its background is what the terminal's
+    /// overlays are drawn on (`Overlays.colorChanged`), as macOS keeps
+    /// only the background for its window. `false` for the app, which
+    /// macOS warns of, and for the foreground, the cursor and the
+    /// palette, which nothing in this runtime draws with.
+    fn colorChange(target: apprt.Target, value: apprt.action.ColorChange) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| switch (value.kind) {
+                .background => {
+                    Overlays.colorChanged(v.rt_surface, .{ .r = value.r, .g = value.g, .b = value.b });
+                    return true;
+                },
+                else => false,
+            },
         };
     }
 
@@ -3030,11 +3050,12 @@ pub const App = struct {
     /// `config` reads it when it needs it. The value only lives for the
     /// call, so it is copied, and every window repaints its dividers, and
     /// every terminal its overlays, which may be drawn on the
-    /// configuration's background (`Overlays.terminalBackground`). In a
-    /// soft reload the value comes from `config` itself, and is `config`
-    /// when the core could not apply the conditional state, so it is copied
-    /// before `config` is freed. `CoreApp.updateConfig` does not touch the
-    /// configuration it was given once the action returns.
+    /// configuration's background (`Overlays.terminalBackground`), as a
+    /// reset of the terminal's goes back to (`Overlays.configChanged`). In
+    /// a soft reload the value comes from `config` itself, and is
+    /// `config` when the core could not apply the conditional state, so it
+    /// is copied before `config` is freed. `CoreApp.updateConfig` does not
+    /// touch the configuration it was given once the action returns.
     ///
     /// Nothing in this runtime depends on a terminal's own configuration:
     /// `false` for a surface.
@@ -3049,6 +3070,7 @@ pub const App = struct {
         }
 
         const config = try value.config.clone(self.core_app.alloc);
+        const old_background = self.config.background.toTerminalRGB();
         self.config.deinit();
         self.config = config;
         self.hotkeys.refresh(self.core_app.alloc, self.msg_hwnd, &self.config) catch |err| {
@@ -3080,7 +3102,11 @@ pub const App = struct {
             window.bar.invalidate();
         }
         self.applyInspectorThemes();
-        for (self.surfaces.items) |surface| surface.overlays.invalidate();
+        for (self.surfaces.items) |surface| {
+            // A background a reset went back to gives way to the new one.
+            surface.overlays.configChanged(old_background);
+            surface.overlays.invalidate();
+        }
         // `unfocused-split-opacity` and `unfocused-split-fill` may have
         // changed.
         for (self.windows.items) |window| window.placeOverlays();
@@ -26850,6 +26876,101 @@ test "win32: a shown renderer error view is drawn again when the system's messag
     // would hide a handler that does not.
     _ = Window.wndProc(window.hwnd, win32.WM_SETTINGCHANGE, win32.SPI_SETNONCLIENTMETRICS, 0);
     try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+}
+
+test "win32: color_change draws a terminal's overlays on the background a program set, which a configuration change keeps, and a reset's gives way" {
+    // As the terminal under them: the core keeps a program's colour across
+    // a configuration change, and a reset goes back to the configured one.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    // A hidden window keeps no region to draw again.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    // The renderer error view, filled with its terminal's background.
+    try std.testing.expect(try testHealth(&app, a, .unhealthy));
+    const hwnd = a.overlays.renderer_health.hwnd.?;
+    const configured = Overlays.terminalBackground(a);
+    try std.testing.expectEqual(configured, try cornerOf(hwnd));
+
+    const Change = struct {
+        fn send(app_: *App, s: *Surface, kind: apprt.action.ColorKind, rgb: [3]u8) !bool {
+            return app_.performAction(.{ .surface = &s.core_surface }, .color_change, .{ .kind = kind, .r = rgb[0], .g = rgb[1], .b = rgb[2] });
+        }
+    };
+    const set = [3]u8{ 0x12, 0x34, 0x56 };
+    const set_ref = win32.rgb(set[0], set[1], set[2]);
+
+    // Not for the app, nor for the colours nothing here draws with.
+    try std.testing.expect(!try app.performAction(.app, .color_change, .{ .kind = .background, .r = set[0], .g = set[1], .b = set[2] }));
+    try std.testing.expect(!try Change.send(&app, a, .foreground, set));
+    try std.testing.expect(!try Change.send(&app, a, .cursor, set));
+    try std.testing.expect(!try Change.send(&app, a, @fromBackingInt(@intCast(4)), set));
+    try std.testing.expectEqual(configured, Overlays.terminalBackground(a));
+
+    // The background: a's overlays are drawn again on it, b's keep theirs.
+    _ = win32.UpdateWindow(hwnd);
+    try std.testing.expect(try Change.send(&app, a, .background, set));
+    try std.testing.expectEqual(set_ref, Overlays.terminalBackground(a));
+    try std.testing.expectEqual(configured, Overlays.terminalBackground(b));
+    try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    try std.testing.expectEqual(set_ref, try cornerOf(hwnd));
+
+    // The same one again draws nothing again.
+    _ = win32.UpdateWindow(hwnd);
+    try std.testing.expect(try Change.send(&app, a, .background, set));
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+
+    // The core keeps a program's colour across a configuration change, so
+    // the overlays do; a reset's, the old configuration's, gives way to
+    // the new one's.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    const before = app.config.background;
+    changed.background = .{ .r = 0xfe, .g = 0xdc, .b = 0xba };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(set_ref, Overlays.terminalBackground(a));
+    try std.testing.expectEqual(win32.rgb(0xfe, 0xdc, 0xba), Overlays.terminalBackground(b));
+    try std.testing.expectEqual(set_ref, try cornerOf(hwnd));
+    try std.testing.expect(try Change.send(&app, a, .background, .{ 0xfe, 0xdc, 0xba }));
+    changed.background = before;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(configured, Overlays.terminalBackground(a));
+    try std.testing.expectEqual(configured, try cornerOf(hwnd));
+    try std.testing.expect(try Change.send(&app, a, .background, set));
+    try std.testing.expectEqual(set_ref, try cornerOf(hwnd));
+
+    // The command palette over a, drawn on its background, is drawn again
+    // as a's changes, and not as b's does.
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_command_palette, {}));
+    app.createRequested();
+    const palette = window.palette.hwnd orelse return error.TestUnexpectedResult;
+    _ = win32.UpdateWindow(palette);
+    try std.testing.expect(try Change.send(&app, b, .background, set));
+    try std.testing.expect(!win32.GetUpdateRect(palette, null, .FALSE).toBool());
+    try std.testing.expect(try Change.send(&app, a, .background, .{ 0x65, 0x43, 0x21 }));
+    try std.testing.expect(win32.GetUpdateRect(palette, null, .FALSE).toBool());
+    try std.testing.expect(try app.performAction(.{ .surface = &a.core_surface }, .toggle_command_palette, {}));
+    app.createRequested();
+}
+
+/// For tests: the colour `hwnd` draws at its top-left corner.
+fn cornerOf(hwnd: win32.HWND) !win32.COLORREF {
+    const printed = try Printed.of(hwnd);
+    defer printed.deinit();
+    return printed.at(0, 0);
 }
 
 test "win32: the child-exited banner is between the read-only badge and the link preview, under the search bar, and hides with its terminal" {

@@ -54,6 +54,9 @@ const KeyState = @import("KeyState.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
+const terminal = @import("../../terminal/main.zig");
+const CommandPalette = @import("CommandPalette.zig");
+
 const RECT = win32.RECT;
 const L = win32.L;
 const log = std.log.scoped(.win32);
@@ -94,6 +97,14 @@ dim: UnfocusedSplit.Dim = .{},
 /// (`applyFont`).
 font: ?win32.HGDIOBJ = null,
 font_dpi: u32 = 0,
+
+/// The background the terminal shows as the core last reported it with
+/// `color_change` (`colorChanged`): one a program set (OSC 11), or the
+/// configuration's that a reset (OSC 111) went back to. None until the
+/// first, or once a configuration change leaves the terminal on the new
+/// configuration's (`configChanged`). The overlays are drawn on it
+/// (`terminalBackground`).
+background: ?terminal.color.RGB = null,
 
 /// The overlays, by their fields, bottom to top, as GTK stacks them over
 /// its surface (surface.blp). Each has a window `hwnd`, `placeIn`,
@@ -566,11 +577,34 @@ pub fn lookOf(o: anytype, colors: SearchBar.Colors, background: win32.COLORREF) 
     return .{ .line = colors.border, .fill = colors.bar, .text = colors.text };
 }
 
-/// The background `surface`'s terminal shows, as far as this runtime
-/// knows: the configuration's `background`. A program can change it (OSC
-/// 11), which the core reports with `color_change`, an action this runtime
-/// does not take, so an overlay drawn on it keeps the configured colour.
+/// The background `surface`'s terminal shows: the one a program gave it
+/// (`background`), else the configuration's.
 pub fn terminalBackground(surface: *const Surface) win32.COLORREF {
-    const bg = surface.app.config.background;
+    const bg = surface.overlays.background orelse surface.app.config.background.toTerminalRGB();
     return win32.rgb(bg.r, bg.g, bg.b);
+}
+
+/// A program changed `surface`'s background to `rgb` (`color_change`, as
+/// macOS keeps it for its window's colours): its overlays, and the
+/// command palette over it, drawn again on it if it is new.
+pub fn colorChanged(surface: *Surface, rgb: terminal.color.RGB) void {
+    const self = &surface.overlays;
+    if (self.background) |old| if (old.eql(rgb)) return;
+    self.background = rgb;
+    self.invalidate();
+    if (!surface.parked and surface.window.palette.surface == surface) CommandPalette.invalidate(surface.window);
+}
+
+/// The configuration changed from one whose background was `old`. The
+/// core keeps a colour a program set across it and changes only the one
+/// a reset goes back to (`Termio.changeConfig`), so the terminal keeps
+/// showing `background` unless that is `old`: a reset's, or a program's
+/// that happened to be `old`, which this cannot tell apart and takes as a
+/// reset. macOS forgets it instead whenever the new configuration's
+/// differs, for its title bar to follow a new theme; here the overlays
+/// follow the terminal under them. They are drawn again by the
+/// configuration change itself.
+pub fn configChanged(self: *Overlays, old: terminal.color.RGB) void {
+    const bg = self.background orelse return;
+    if (bg.eql(old)) self.background = null;
 }
