@@ -18,6 +18,7 @@ test "win32: COM declarations match the Windows headers" {
         com_abi.entriesOf(@import("SaveDialog.zig"), &.{}) ++
         com_abi.entriesOf(@import("taskbar.zig"), &.{}) ++
         com_abi.entriesOf(@import("input_pane.zig"), &.{}) ++
+        com_abi.entriesOf(@import("jumplist.zig"), &.{}) ++
         &[_]com_abi.Entry{
             // The bell's own implementation of the engine's callback.
             .{ .zig = media.Notify, .c = "IMFMediaEngineNotify" },

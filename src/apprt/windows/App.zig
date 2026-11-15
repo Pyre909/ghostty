@@ -31,6 +31,7 @@ const Hotkeys = @import("Hotkeys.zig");
 const Undo = @import("Undo.zig");
 const Session = @import("Session.zig");
 const IpcClient = @import("IpcClient.zig");
+const jumplist = @import("jumplist.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
 const ipc = @import("ipc.zig");
@@ -137,6 +138,11 @@ pub const App = struct {
     /// The taskbar buttons' progress bars, made when the first button
     /// exists (`taskbarList`); null before, or while it cannot be made.
     taskbar_list: ?*taskbar.ITaskbarList3,
+
+    /// The AppUserModelID whose jump list is still to be committed, when
+    /// the first taskbar button exists (`commitJumpList`); null once it
+    /// has been tried, and in tests, which give it an ID of their own.
+    jump_list_id: ?win32.LPCWSTR = null,
 
     /// Where on the screen the pointer last moved over a terminal, for
     /// `focus-follows-mouse` (`Surface.followMouse`); null before it has.
@@ -1018,6 +1024,7 @@ pub const App = struct {
             .bar_metric = bar_metric,
             .taskbar_created = taskbar_created,
             .taskbar_list = null,
+            .jump_list_id = L(toast.app_id),
             .toasts = null,
             .notifier = null,
             .toasts_failed = false,
@@ -1263,6 +1270,23 @@ pub const App = struct {
         // Logged by `create`.
         self.taskbar_list = taskbar.create() catch return null;
         return self.taskbar_list;
+    }
+
+    /// Commit the jump list (`jump_list_id`), once, when the first taskbar
+    /// button exists: Explorer has started by then, and the window has
+    /// shown before the list is built. A failure is logged and not tried
+    /// again; the list an earlier start committed stays.
+    pub fn commitJumpList(self: *App) void {
+        const id = self.jump_list_id orelse return;
+        self.jump_list_id = null;
+        const alloc = self.core_app.alloc;
+        const exe = IpcClient.imagePath(alloc) catch return;
+        defer alloc.free(exe);
+        jumplist.commit(alloc, id, exe, &jumplist.tasks) catch |err| {
+            log.warn("jump list not committed err={}", .{err});
+            return;
+        };
+        log.debug("jump list committed", .{});
     }
 
     /// Free `requests`, never carried out, and what they own.
@@ -5686,6 +5710,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.bar_metric = ScrollBar.Metric.resolve(win32.GetModuleHandleW(L("user32.dll")));
     app.taskbar_created = 0;
     app.taskbar_list = null;
+    app.jump_list_id = null;
     app.pointer = null;
     app.toasts = null;
     app.notifier = null;
@@ -16860,6 +16885,36 @@ const TestTaskbar = struct {
         return 0;
     }
 };
+
+test "win32: the first taskbar button commits the jump list, once" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const hr = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED | win32.COINIT_DISABLE_OLE1DDE);
+    defer if (hr >= 0) win32.CoUninitialize();
+
+    // An ID no install uses, and a number and a taskbar of the test's own,
+    // as the progress test has them.
+    const id = L("com.mitchellh.ghostty.test-jumplist");
+    defer jumplist.delete(id) catch {};
+    var fake: TestTaskbar = .{};
+    app.taskbar_list = &fake.list;
+    app.taskbar_created = win32.WM_APP + 0x100;
+    app.jump_list_id = id;
+
+    // Not before the button exists; then once, and not for a later one.
+    const window = try testFrame(&app);
+    try std.testing.expectEqual(@as(?win32.LPCWSTR, id), app.jump_list_id);
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try std.testing.expectEqual(@as(?win32.LPCWSTR, null), app.jump_list_id);
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try std.testing.expectEqual(@as(?win32.LPCWSTR, null), app.jump_list_id);
+}
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {
     // Only once Explorer says the button exists, as ITaskbarList3 asks, and

@@ -345,7 +345,7 @@ fn startGhostty(
 }
 
 /// This process's image, ghostty.exe, as Windows started it.
-fn imagePath(alloc: Allocator) Allocator.Error![:0]u16 {
+pub fn imagePath(alloc: Allocator) Allocator.Error![:0]u16 {
     const name = std.os.windows.peb().ProcessParameters.ImagePathName;
     const buf = name.Buffer orelse return alloc.dupeSentinel(u16, &.{}, 0);
     return alloc.dupeSentinel(u16, buf[0 .. name.Length / 2], 0);

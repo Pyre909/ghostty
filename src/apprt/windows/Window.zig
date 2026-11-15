@@ -1998,6 +1998,7 @@ fn handleMessage(
         self.taskbar_button = true;
         _ = self.app.taskbarList();
         self.showProgress();
+        self.app.commitJumpList();
         return 0;
     }
 
