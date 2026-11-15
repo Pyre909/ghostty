@@ -1509,7 +1509,7 @@ pub const DirectWrite = struct {
             } };
             var face = deferred.load(self.lib, .{ .size = .{ .points = 12 } }) catch |err| {
                 var buf: [directwrite.name_max]u8 = undefined;
-                log.info("font skipped, it does not load: {s} err={}", .{
+                log.info("font skipped, it does not load name={s} err={}", .{
                     deferred.name(&buf) catch "unknown",
                     err,
                 });
@@ -1526,7 +1526,17 @@ pub const DirectWrite = struct {
         /// those only when the face is made.
         fn opens(font: *api.IDWriteFont) bool {
             const face = font.createFontFace() catch |err| {
-                log.info("font skipped, its face does not open err={}", .{err});
+                // The font is borrowed for the length of the call.
+                const deferred: DeferredFace = .{ .dw = .{
+                    .font = font,
+                    .presentation = .text,
+                    .variations = &.{},
+                } };
+                var buf: [directwrite.name_max]u8 = undefined;
+                log.info("font skipped, its face does not open name={s} err={}", .{
+                    deferred.name(&buf) catch "unknown",
+                    err,
+                });
                 return false;
             };
             api.release(face);
@@ -2526,6 +2536,24 @@ test "directwrite: a font whose face does not open is not offered" {
             out.* = &self.face;
             return api.S_OK;
         }
+
+        // A skipped font is named in the log; this one has no names, so
+        // it is logged as "unknown".
+        fn noStrings(
+            _: *api.IDWriteFont,
+            _: api.DWRITE_INFORMATIONAL_STRING_ID,
+            out: *?*api.IDWriteLocalizedStrings,
+            exists: *api.BOOL,
+        ) callconv(api.cc) api.HRESULT {
+            out.* = null;
+            exists.* = 0;
+            return api.E_FAIL;
+        }
+
+        fn noFamily(_: *api.IDWriteFont, out: *?*api.IDWriteFontFamily) callconv(api.cc) api.HRESULT {
+            out.* = null;
+            return api.E_FAIL;
+        }
     };
 
     var font_vtable: api.IDWriteFont.VTable = undefined;
@@ -2535,6 +2563,8 @@ test "directwrite: a font whose face does not open is not offered" {
         .Release = &Fake.release,
     };
     font_vtable.CreateFontFace = &Fake.createFontFace;
+    font_vtable.GetInformationalStrings = &Fake.noStrings;
+    font_vtable.GetFontFamily = &Fake.noFamily;
     var face_vtable: api.IDWriteFontFace.VTable = undefined;
     face_vtable.base.Release = &Fake.releaseFace;
 
