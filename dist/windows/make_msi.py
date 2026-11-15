@@ -161,11 +161,11 @@ APP_ID = "com.mitchellh.ghostty"
 # `app_name` and the icon where `iconPath` looks for it.
 TOAST_KEY = rf"Software\Classes\AppUserModelId\{APP_ID}"
 TOAST_NAME = "Ghostty"
+TOAST_ICON = "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png"
 
 # The shortcut property that holds the ID (propkey.h's PKEY_AppUserModel_ID,
 # by its canonical name, as WiX's ShortcutProperty takes it).
 SHORTCUT_KEY = "System.AppUserModel.ID"
-TOAST_ICON = "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png"
 
 # Explorer's verbs for a folder, as macOS's Finder services
 # (macos/Ghostty-Info.plist, NSServices): the key under a class's shell
