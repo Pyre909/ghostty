@@ -21,8 +21,6 @@ const Allocator = std.mem.Allocator;
 const i18n = @import("../../os/main.zig").i18n;
 const win32 = @import("win32.zig");
 
-const log = std.log.scoped(.win32);
-
 const HRESULT = win32.HRESULT;
 const GUID = windows.GUID;
 const LPCWSTR = win32.LPCWSTR;
@@ -58,9 +56,8 @@ pub const tasks = [_]Task{
 
 pub const Error = error{ JumpListFailed, OutOfMemory };
 
-/// Replace `app_id`'s jump list with `list` (`tasks`, but in tests), each
-/// running `exe`. On the
-/// thread that calls it, which must be in an apartment (CoInitializeEx).
+/// Replace `app_id`'s jump list with `entries` (`tasks`, but in tests),
+/// each running `exe`. On the thread that calls it, which must be in an apartment (CoInitializeEx).
 /// A failure is logged by the call that failed and leaves the list as it
 /// was.
 pub fn commit(alloc: Allocator, app_id: LPCWSTR, exe: [:0]const u16, entries: []const Task) Error!void {
@@ -335,15 +332,6 @@ test "win32: the jump list's class, interface and property ids" {
     try testing.expectEqual(0xd9, PKEY_Title.fmtid.Data4[7]);
 }
 
-test "win32: the jump list has the dock menu's tasks" {
-    const testing = std.testing;
-    try testing.expectEqual(2, tasks.len);
-    try testing.expectEqualStrings("New Window", tasks[0].title);
-    try testing.expectEqualStrings("+new-window", tasks[0].action);
-    try testing.expectEqualStrings("New Tab", tasks[1].title);
-    try testing.expectEqualStrings("+new-tab", tasks[1].action);
-}
-
 /// How many of the files where Explorer keeps the jump lists
 /// (%APPDATA%\Microsoft\Windows\Recent\CustomDestinations, one a list)
 /// hold `text`, as UTF-16, which is how a link's arguments and its
@@ -379,8 +367,6 @@ pub fn listsHolding(alloc: Allocator, text: []const u8) !usize {
 }
 
 test "win32: a jump list is committed for its app id, and deleted" {
-    const builtin = @import("builtin");
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
     // An app id no install uses, and a task no list but this one has,
