@@ -14182,8 +14182,9 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
 
     // Put back whatever text the clipboard held, as the clipboard's own
     // tests do.
-    const readClipboardText = @import("clipboard.zig").readClipboardText;
-    const saved = try @import("clipboard.zig").TestSaved.save(pane.hwnd);
+    const clipboard = @import("clipboard.zig");
+    const readClipboardText = clipboard.readClipboardText;
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
     defer saved.restore(pane.hwnd);
     try writeClipboard(alloc, pane.hwnd, .text("before"));
 
@@ -21067,8 +21068,9 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
     // character queued, which the EDIT would act on by itself (U+0003,
     // U+0016, U+0001); then a paste with its U+0016, which must not paste
     // a second time. The clipboard's text is put back after.
-    const readClipboardText = @import("clipboard.zig").readClipboardText;
-    const saved = try @import("clipboard.zig").TestSaved.save(a.hwnd);
+    const clipboard = @import("clipboard.zig");
+    const readClipboardText = clipboard.readClipboardText;
+    const saved = try clipboard.TestSaved.save(a.hwnd);
     defer saved.restore(a.hwnd);
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 4);
     try fieldKey(edit, 'C', .{ .ctrl = true, .shift = true }, null);

@@ -1651,6 +1651,11 @@ pub fn expectClipboard(hwnd: win32.HWND, text: ?[]const u8, fragment: ?[]const u
 /// writes the clipboard and reads it back. A mutex whose owner died is
 /// abandoned, which still hands it over; one held for longer than
 /// `lock_ms` fails the test instead of hanging it.
+///
+/// A thread must not wait for the lock while a window of its own owns
+/// the clipboard: the next holder's EmptyClipboard sends that window
+/// WM_DESTROYCLIPBOARD, which a waiting thread does not answer. Each
+/// test destroys its owner window right after `restore`.
 pub const TestSaved = struct {
     text: ?[]u8,
     lock: win32.HANDLE,
@@ -1720,8 +1725,12 @@ test "win32: a saved clipboard keeps other tests from it until restored, and a d
     var got: anyerror!void = {};
 
     {
-        const saved = try TestSaved.save(hwnd);
-        defer saved.restore(hwnd);
+        // Its own window, destroyed right after the restore, so that no
+        // window of this thread owns the clipboard while it waits below.
+        const owner = try testOwner();
+        defer _ = win32.DestroyWindow(owner);
+        const saved = try TestSaved.save(owner);
+        defer saved.restore(owner);
         (try std.Thread.spawn(.{}, Rival.run, .{ @as(win32.DWORD, 0), false, &got })).join();
         try std.testing.expectError(error.TestClipboardBusy, got);
     }
