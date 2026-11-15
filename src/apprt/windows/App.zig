@@ -144,6 +144,10 @@ pub const App = struct {
     /// has been tried, and in tests, which give it an ID of their own.
     jump_list_id: ?win32.LPCWSTR = null,
 
+    /// The tasks `commitJumpList` puts in the list: `jumplist.tasks`, but
+    /// in a test, whose own it can find again.
+    jump_list_tasks: []const jumplist.Task = &jumplist.tasks,
+
     /// Where on the screen the pointer last moved over a terminal, for
     /// `focus-follows-mouse` (`Surface.followMouse`); null before it has.
     pointer: ?win32.POINT = null,
@@ -1285,7 +1289,7 @@ pub const App = struct {
             return;
         };
         defer alloc.free(exe);
-        jumplist.commit(alloc, id, exe, &jumplist.tasks) catch |err| switch (err) {
+        jumplist.commit(alloc, id, exe, self.jump_list_tasks) catch |err| switch (err) {
             // Logged by the call that failed.
             error.JumpListFailed => return,
             error.OutOfMemory => {
@@ -5718,6 +5722,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.taskbar_created = 0;
     app.taskbar_list = null;
     app.jump_list_id = null;
+    app.jump_list_tasks = &jumplist.tasks;
     app.pointer = null;
     app.toasts = null;
     app.notifier = null;
@@ -16905,22 +16910,29 @@ test "win32: the first taskbar button commits the jump list, once" {
     const hr = win32.CoInitializeEx(null, win32.COINIT_APARTMENTTHREADED | win32.COINIT_DISABLE_OLE1DDE);
     defer if (hr >= 0) win32.CoUninitialize();
 
-    // An ID no install uses, and a number and a taskbar of the test's own,
-    // as the progress test has them.
+    // An ID no install uses, a task no other list has, and a number and a
+    // taskbar of the test's own, as the progress test has them.
     const id = L("com.mitchellh.ghostty.test-jumplist");
+    const marker = "ghostty-test-app-jumplist";
+    try jumplist.delete(id);
     defer jumplist.delete(id) catch {};
     var fake: TestTaskbar = .{};
     app.taskbar_list = &fake.list;
     app.taskbar_created = win32.WM_APP + 0x100;
     app.jump_list_id = id;
+    app.jump_list_tasks = &.{.{ .title = "New Window", .action = "+new-window --title=" ++ marker }};
 
-    // Not before the button exists; then once, and not for a later one.
+    // Not before the button exists; then committed, once, and not again
+    // for a later one.
     const window = try testFrame(&app);
     try std.testing.expectEqual(@as(?win32.LPCWSTR, id), app.jump_list_id);
+    try std.testing.expectEqual(0, try jumplist.listsHolding(alloc, marker));
     _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
     try std.testing.expectEqual(@as(?win32.LPCWSTR, null), app.jump_list_id);
+    try std.testing.expectEqual(1, try jumplist.listsHolding(alloc, marker));
+    try jumplist.delete(id);
     _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
-    try std.testing.expectEqual(@as(?win32.LPCWSTR, null), app.jump_list_id);
+    try std.testing.expectEqual(0, try jumplist.listsHolding(alloc, marker));
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {

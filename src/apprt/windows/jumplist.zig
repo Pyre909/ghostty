@@ -347,8 +347,8 @@ test "win32: the jump list has the dock menu's tasks" {
 /// How many of the files where Explorer keeps the jump lists
 /// (%APPDATA%\Microsoft\Windows\Recent\CustomDestinations, one a list)
 /// hold `text`, as UTF-16, which is how a link's arguments and its
-/// title are stored there.
-fn listsHolding(alloc: Allocator, text: []const u8) !usize {
+/// title are stored there. For tests: it reads with `std.testing.io`.
+pub fn listsHolding(alloc: Allocator, text: []const u8) !usize {
     const io = std.testing.io;
     var buf: [win32.MAX_PATH]u16 = undefined;
     const len = win32.GetEnvironmentVariableW(win32.L("APPDATA"), &buf, buf.len);
