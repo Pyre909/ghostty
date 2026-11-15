@@ -433,7 +433,10 @@ fn addLinuxAppResources(
 /// them, which no Windows file can have, and Zig fails to fetch a package
 /// that has a file it cannot create. So a build on Windows, which unpacks
 /// the package whatever the target, or for Windows, which installs the
-/// files, takes the last release without such names.
+/// files, takes the last release without such names. Drop
+/// iterm2_themes_windows once Zig can fetch such names on Windows or the
+/// themes stop using them; until then, upstream's theme updates refresh
+/// only iterm2_themes, and Windows keeps that last release.
 fn themesPackage(b: *std.Build, cfg: *const Config) []const u8 {
     const windows = b.graph.host.result.os.tag == .windows or
         cfg.target.result.os.tag == .windows;
