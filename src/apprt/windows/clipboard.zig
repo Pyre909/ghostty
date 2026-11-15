@@ -1644,19 +1644,100 @@ pub fn expectClipboard(hwnd: win32.HWND, text: ?[]const u8, fragment: ?[]const u
 
 /// For tests: put back the text the clipboard held when `save` ran. Other
 /// formats are lost, which is acceptable for a test.
+///
+/// The clipboard is the session's, and the test runner can run its shards
+/// as processes at the same time (`--shard`), so `save` also waits for a
+/// mutex of the session's that `restore` gives back: one test at a time
+/// writes the clipboard and reads it back. A mutex whose owner died is
+/// abandoned, which still hands it over; one held for longer than
+/// `lock_ms` fails the test instead of hanging it.
 pub const TestSaved = struct {
     text: ?[]u8,
+    lock: win32.HANDLE,
+
+    const lock_ms: win32.DWORD = 30_000;
+    const lock_name = L("Local\\ghostty-test-clipboard");
 
     pub fn save(hwnd: win32.HWND) !TestSaved {
-        return .{ .text = try readClipboardText(std.testing.allocator, hwnd) };
+        const lock = try takeLock(lock_ms);
+        errdefer giveLock(lock);
+        return .{
+            .text = try readClipboardText(std.testing.allocator, hwnd),
+            .lock = lock,
+        };
     }
 
     pub fn restore(self: TestSaved, hwnd: win32.HWND) void {
+        defer giveLock(self.lock);
         const text = self.text orelse return;
         writeClipboard(std.testing.allocator, hwnd, .text(text)) catch {};
         std.testing.allocator.free(text);
     }
+
+    /// Waits up to `ms` for the session's clipboard mutex and returns a
+    /// handle that owns it. Ownership is the calling thread's.
+    fn takeLock(ms: win32.DWORD) !win32.HANDLE {
+        const lock = win32.CreateMutexW(null, .FALSE, lock_name) orelse
+            return error.TestUnexpectedResult;
+        errdefer _ = win32.CloseHandle(lock);
+        return switch (win32.WaitForSingleObject(lock, ms)) {
+            win32.WAIT_OBJECT_0, win32.WAIT_ABANDONED => lock,
+            else => error.TestClipboardBusy,
+        };
+    }
+
+    fn giveLock(lock: win32.HANDLE) void {
+        _ = win32.ReleaseMutex(lock);
+        _ = win32.CloseHandle(lock);
+    }
 };
+
+test "win32: a saved clipboard keeps other tests from it until restored, and a dead owner's lock passes on" {
+    const hwnd = try testOwner();
+    defer _ = win32.DestroyWindow(hwnd);
+
+    // A named mutex lasts only while a handle to it is open, and its
+    // ownership goes with it. Hold one throughout, so that a lock left
+    // owned, by a thread that ended or a restore that kept it, is seen.
+    const keep = win32.CreateMutexW(null, .FALSE, TestSaved.lock_name) orelse
+        return error.TestUnexpectedResult;
+    defer _ = win32.CloseHandle(keep);
+
+    // The mutex is recursive for the thread that owns it, so the rival
+    // runs in another thread, as a test in another shard's process would.
+    const Rival = struct {
+        /// Takes the lock within `ms` and gives it back, or, with
+        /// `die`, keeps it as its thread ends, abandoning it.
+        fn run(ms: win32.DWORD, die: bool, out: *anyerror!void) void {
+            const lock = TestSaved.takeLock(ms) catch |err| {
+                out.* = err;
+                return;
+            };
+            if (die) _ = win32.CloseHandle(lock) else TestSaved.giveLock(lock);
+            out.* = {};
+        }
+    };
+    var got: anyerror!void = {};
+
+    {
+        const saved = try TestSaved.save(hwnd);
+        defer saved.restore(hwnd);
+        (try std.Thread.spawn(.{}, Rival.run, .{ @as(win32.DWORD, 0), false, &got })).join();
+        try std.testing.expectError(error.TestClipboardBusy, got);
+    }
+
+    // Restored, the lock is free again. Another shard may hold it for a
+    // moment, so these wait as long as a test would.
+    got = error.TestUnexpectedResult;
+    (try std.Thread.spawn(.{}, Rival.run, .{ TestSaved.lock_ms, false, &got })).join();
+    try got;
+
+    got = error.TestUnexpectedResult;
+    (try std.Thread.spawn(.{}, Rival.run, .{ TestSaved.lock_ms, true, &got })).join();
+    try got;
+    const saved = try TestSaved.save(hwnd);
+    saved.restore(hwnd);
+}
 
 /// For tests: the formats on the clipboard, in the order
 /// EnumClipboardFormats gives them, synthesized ones included.

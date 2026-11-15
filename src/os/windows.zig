@@ -491,6 +491,16 @@ pub const exp = struct {
             bInheritHandle: BOOL,
             dwOptions: DWORD,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexw
+        pub extern "kernel32" fn CreateMutexW(
+            lpMutexAttributes: ?*SECURITY_ATTRIBUTES,
+            bInitialOwner: BOOL,
+            lpName: ?LPCWSTR,
+        ) callconv(.winapi) ?HANDLE;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-releasemutex
+        pub extern "kernel32" fn ReleaseMutex(
+            hMutex: HANDLE,
+        ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createeventw
         pub extern "kernel32" fn CreateEventW(
             lpEventAttributes: ?*SECURITY_ATTRIBUTES,

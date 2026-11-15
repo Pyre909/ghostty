@@ -1887,6 +1887,10 @@ pub const INFINITE: DWORD = 0xFFFF_FFFF;
 pub const WAIT_OBJECT_0: DWORD = 0x0000_0000;
 pub const WAIT_TIMEOUT: DWORD = 0x0000_0102;
 pub const WAIT_FAILED: DWORD = 0xFFFF_FFFF;
+/// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject
+pub const WAIT_ABANDONED: DWORD = 0x0000_0080;
+pub const CreateMutexW = internal_os.windows.exp.kernel32.CreateMutexW;
+pub const ReleaseMutex = internal_os.windows.exp.kernel32.ReleaseMutex;
 pub const CreateEventW = internal_os.windows.exp.kernel32.CreateEventW;
 pub const SetEvent = internal_os.windows.exp.kernel32.SetEvent;
 /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-resetevent

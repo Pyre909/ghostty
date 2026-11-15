@@ -14090,11 +14090,8 @@ test "win32: a terminal's copy writes its HTML and its text, the HTML alone, the
     window.tab().tree = try .init(alloc, pane);
 
     const clipboard = @import("clipboard.zig");
-    const saved = try clipboard.readClipboardText(alloc, pane.hwnd);
-    defer if (saved) |text| {
-        writeClipboard(alloc, pane.hwnd, .text(text)) catch {};
-        alloc.free(text);
-    };
+    const saved = try clipboard.TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
 
     // `copy_to_clipboard:mixed`, the default: the core's text, then its
     // HTML (Surface.zig `copySelectionToClipboards`).
@@ -14184,13 +14181,10 @@ test "win32: copy_title_to_clipboard copies the terminal's title, if it has one"
     const target: apprt.Target = .{ .surface = &pane.core_surface };
 
     // Put back whatever text the clipboard held, as the clipboard's own
-    // test does.
+    // tests do.
     const readClipboardText = @import("clipboard.zig").readClipboardText;
-    const saved = try readClipboardText(alloc, pane.hwnd);
-    defer if (saved) |text| {
-        writeClipboard(alloc, pane.hwnd, .text(text)) catch {};
-        alloc.free(text);
-    };
+    const saved = try @import("clipboard.zig").TestSaved.save(pane.hwnd);
+    defer saved.restore(pane.hwnd);
     try writeClipboard(alloc, pane.hwnd, .text("before"));
 
     // None yet, then an empty one: no effect.
@@ -21074,11 +21068,8 @@ test "win32: keys in a search field perform the terminal's bindings for its wind
     // U+0016, U+0001); then a paste with its U+0016, which must not paste
     // a second time. The clipboard's text is put back after.
     const readClipboardText = @import("clipboard.zig").readClipboardText;
-    const saved = try readClipboardText(alloc, a.hwnd);
-    defer if (saved) |text| {
-        writeClipboard(alloc, a.hwnd, .text(text)) catch {};
-        alloc.free(text);
-    };
+    const saved = try @import("clipboard.zig").TestSaved.save(a.hwnd);
+    defer saved.restore(a.hwnd);
     _ = win32.SendMessageW(edit, win32.EM_SETSEL, 1, 4);
     try fieldKey(edit, 'C', .{ .ctrl = true, .shift = true }, null);
     {
