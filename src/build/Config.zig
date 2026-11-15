@@ -662,9 +662,12 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
         "Install bundled iTerm2-Color-Schemes Ghostty themes",
     ) orelse switch (target.result.os.tag) {
         // Asking for the themes package downloads and unpacks it on every
-        // build, whichever steps were requested, so a Windows build that
-        // makes no app, such as `zig build -Demit-lib-vt`, leaves it out.
-        // The Windows app installs the themes like the others.
+        // build, whichever steps were requested. A Windows build that makes
+        // no app, such as the libghostty DLL's (`-Dapp-runtime=none
+        // -Demit-exe=false`), leaves it out; the Windows app installs the
+        // themes like the others. A plain `zig build test-lib-vt` makes the
+        // app too and asks for them, so it relies on the Windows themes
+        // package unpacking on Windows (GhosttyResources.zig).
         .windows => config.emit_exe,
         else => true,
     };

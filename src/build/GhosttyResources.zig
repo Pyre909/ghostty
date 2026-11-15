@@ -108,7 +108,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
 
     // Themes
     if (cfg.emit_themes) {
-        if (b.lazyDependency("iterm2_themes", .{})) |upstream| {
+        if (b.lazyDependency(themesPackage(b, cfg), .{})) |upstream| {
             const install_step = b.addInstallDirectory(.{
                 .source_dir = upstream.path(""),
                 .install_dir = .{ .custom = "share" },
@@ -427,6 +427,17 @@ fn addLinuxAppResources(
         b.path("images/gnome/512.png"),
         "share/icons/hicolor/256x256@2/apps/com.mitchellh.ghostty.png",
     ).step);
+}
+
+/// The package the themes come from. Some theme names have a colon in
+/// them, which no Windows file can have, and Zig fails to fetch a package
+/// that has a file it cannot create. So a build on Windows, which unpacks
+/// the package whatever the target, or for Windows, which installs the
+/// files, takes the last release without such names.
+fn themesPackage(b: *std.Build, cfg: *const Config) []const u8 {
+    const windows = b.graph.host.result.os.tag == .windows or
+        cfg.target.result.os.tag == .windows;
+    return if (windows) "iterm2_themes_windows" else "iterm2_themes";
 }
 
 pub fn install(self: *const GhosttyResources) void {
