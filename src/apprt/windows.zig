@@ -456,6 +456,7 @@ test {
     _ = @import("windows/IpcClient.zig");
     _ = @import("windows/IpcServer.zig");
     _ = @import("windows/jumplist.zig");
+    _ = @import("windows/About.zig");
     _ = @import("windows/Overrides.zig");
     _ = @import("windows/key.zig");
     _ = @import("windows/overlay_keys.zig");

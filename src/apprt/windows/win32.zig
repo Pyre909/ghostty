@@ -480,6 +480,7 @@ pub const MB_OK: UINT = 0x00000000;
 pub const MB_OKCANCEL: UINT = 0x00000001;
 pub const MB_RETRYCANCEL: UINT = 0x00000005;
 pub const MB_ICONWARNING: UINT = 0x00000030;
+pub const MB_ICONINFORMATION: UINT = 0x00000040;
 pub const MB_ICONERROR: UINT = 0x00000010;
 pub const MB_DEFBUTTON1: UINT = 0x00000000;
 pub const MB_DEFBUTTON2: UINT = 0x00000100;
@@ -1849,6 +1850,10 @@ pub extern "user32" fn GetMenuItemCount(menu: HMENU) callconv(.winapi) c_int;
 pub extern "user32" fn GetMenuItemID(menu: HMENU, pos: c_int) callconv(.winapi) UINT;
 pub extern "user32" fn GetSubMenu(menu: HMENU, pos: c_int) callconv(.winapi) ?HMENU;
 pub extern "user32" fn GetMenuState(menu: HMENU, item: UINT, flags: UINT) callconv(.winapi) UINT;
+/// The window menu's copy that `hwnd` may change; `revert` puts the
+/// system's own back.
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getsystemmenu
+pub extern "user32" fn GetSystemMenu(hwnd: HWND, revert: BOOL) callconv(.winapi) ?HMENU;
 pub extern "user32" fn GetMenuStringW(menu: HMENU, item: UINT, text: ?[*]u16, max: c_int, flags: UINT) callconv(.winapi) c_int;
 /// GetGuiResources' count of the process's USER objects, menus among them.
 pub const GR_USEROBJECTS: DWORD = 1;

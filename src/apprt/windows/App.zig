@@ -32,6 +32,7 @@ const Undo = @import("Undo.zig");
 const Session = @import("Session.zig");
 const IpcClient = @import("IpcClient.zig");
 const jumplist = @import("jumplist.zig");
+const About = @import("About.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
 const ipc = @import("ipc.zig");
@@ -5200,7 +5201,7 @@ const open_url_alloc = std.heap.smp_allocator;
 /// started, which can be a cold browser start or the shell's app picker,
 /// and may dispatch messages while it waits, so it never runs on the UI
 /// thread, as the core's opener does not either (src/os/open.zig).
-fn openLink(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
+pub fn openLink(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
     const wide = std.unicode.utf8ToUtf16LeAllocZ(open_url_alloc, url) catch |err| {
         log.warn("cannot convert the {t} link to open err={}", .{ kind, err });
         return false;
@@ -16933,6 +16934,107 @@ test "win32: the first taskbar button commits the jump list, once" {
     try jumplist.delete(id);
     _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
     try std.testing.expectEqual(0, try jumplist.listsHolding(alloc, marker));
+}
+
+test "win32: a window's menu ends with About Ghostty and Ghostty Help" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const menu = win32.GetSystemMenu(window.hwnd, .FALSE) orelse return error.NoWindowMenu;
+    const n = win32.GetMenuItemCount(menu);
+    try std.testing.expect(n > 3);
+    // A line, then the two items, once each.
+    try std.testing.expect(win32.GetMenuState(menu, @intCast(n - 3), win32.MF_BYPOSITION) & win32.MF_SEPARATOR != 0);
+    try std.testing.expectEqual(@as(win32.UINT, About.about_id), win32.GetMenuItemID(menu, n - 2));
+    try std.testing.expectEqual(@as(win32.UINT, About.help_id), win32.GetMenuItemID(menu, n - 1));
+    var buf: [64]u16 = undefined;
+    const len = win32.GetMenuStringW(menu, About.about_id, &buf, buf.len, 0);
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("About Ghostty"), buf[0..@intCast(len)]);
+}
+
+/// For tests: what TaskDialogIndirect was given (`About.test_record`).
+const TestAbout = struct {
+    var shown_count: usize = 0;
+    var owner: ?win32.HWND = null;
+    var flags: c_int = 0;
+    var title: [64]u16 = undefined;
+    var title_len: usize = 0;
+    var content: [256]u16 = undefined;
+    var content_len: usize = 0;
+    var callback: ?*const fn (?win32.HWND, win32.UINT, win32.WPARAM, win32.LPARAM, isize) callconv(.winapi) win32.HRESULT = null;
+
+    fn taskDialog(
+        config: *const About.TASKDIALOGCONFIG,
+        _: ?*c_int,
+        _: ?*c_int,
+        _: ?*win32.BOOL,
+    ) callconv(.winapi) win32.HRESULT {
+        shown_count += 1;
+        owner = config.hwndParent;
+        flags = config.dwFlags;
+        const t = std.mem.span(config.pszWindowTitle.?);
+        title_len = @min(t.len, title.len);
+        @memcpy(title[0..title_len], t[0..title_len]);
+        const c = std.mem.span(config.pszContent.?);
+        content_len = @min(c.len, content.len);
+        @memcpy(content[0..content_len], c[0..content_len]);
+        callback = config.pfCallback;
+        return win32.S_OK;
+    }
+
+    fn click(href: [*:0]const u16) void {
+        _ = callback.?(null, 3, 0, @bitCast(@intFromPtr(href)), 0);
+    }
+};
+
+test "win32: About Ghostty shows the dialog, and Ghostty Help opens the docs" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer About.test_record = .{};
+
+    const window = try testFrame(&app);
+    About.test_record = .{ .task_dialog = TestAbout.taskDialog };
+    TestAbout.shown_count = 0;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.about_id, 0);
+    try std.testing.expectEqual(1, TestAbout.shown_count);
+    try std.testing.expectEqual(@as(?win32.HWND, window.hwnd), TestAbout.owner);
+    try std.testing.expect(TestAbout.flags & 0x0001 != 0); // TDF_ENABLE_HYPERLINKS
+    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("About Ghostty"), TestAbout.title[0..TestAbout.title_len]);
+    const content = TestAbout.content[0..TestAbout.content_len];
+    const version = try std.unicode.utf8ToUtf16LeAlloc(alloc, @import("../../build_config.zig").version_string);
+    defer alloc.free(version);
+    try std.testing.expect(std.mem.startsWith(u16, content, version));
+    try std.testing.expect(std.mem.indexOf(u16, content, std.unicode.utf8ToUtf16LeStringLiteral("<a href=\"https://ghostty.org\">")) != null);
+    // The prompt is over once the dialog returns.
+    try std.testing.expectEqual(0, app.prompt_depth);
+
+    // Its link opens the website; any other target is refused.
+    TestAbout.click(L("https://example.com"));
+    try std.testing.expectEqual(@as(?[]const u8, null), About.test_record.opened);
+    TestAbout.click(L("https://ghostty.org"));
+    try std.testing.expectEqualStrings(About.website, About.test_record.opened.?);
+
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.help_id, 0);
+    try std.testing.expectEqualStrings(About.docs, About.test_record.opened.?);
+    try std.testing.expectEqual(1, TestAbout.shown_count);
+
+    // Without TaskDialogIndirect, a message box.
+    About.test_record = .{};
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.about_id, 0);
+    try std.testing.expect(About.test_record.message_box);
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {

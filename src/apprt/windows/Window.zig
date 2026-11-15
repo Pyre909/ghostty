@@ -43,6 +43,7 @@ const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
+const About = @import("About.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
@@ -1187,6 +1188,7 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
         return App.Error.Win32WindowCreationFailed;
     };
     self.applyDecorations();
+    if (!self.quick) About.addToWindowMenu(hwnd);
     // Explorer runs at medium integrity, so an elevated Ghostty would not
     // hear of its button otherwise.
     if (self.app.taskbar_created != 0) {
@@ -2212,6 +2214,7 @@ fn handleMessage(
         // Sent to the top-level window, not to the terminal with the focus.
         win32.WM_SYSCOMMAND => {
             if (isBareKeyMenu(wparam, lparam)) return 0;
+            if (About.command(self.app, hwnd, wparam)) return 0;
 
             // A window that covers its monitor keeps WS_MAXIMIZE if it had
             // it, so Win+Down's restore would put it back at its restore

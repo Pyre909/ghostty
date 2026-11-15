@@ -20,6 +20,7 @@ const windows_com_headers: []const translate_c.Options.IncludeFile = &.{
     .{ .path = "dwrite_3.h" },
     .{ .path = "mfmediaengine.h" },
     .{ .path = "shobjidl.h" },
+    .{ .path = "commctrl.h" },
     .{ .path = "inputpaneinterop.h" },
 };
 
