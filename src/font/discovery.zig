@@ -1470,16 +1470,20 @@ pub const DirectWrite = struct {
         /// or null for a font that cannot be loaded, whose reference is
         /// dropped.
         fn offer(self: *const DiscoverIterator, font: *api.IDWriteFont) ?DeferredFace {
-            // What DirectWrite finds, FreeType has to load. A font that
-            // it does not load is not offered: one that is offered and
-            // then fails to load is not a font that was not found, which
-            // has the fonts that are built in to fall back on, but a
-            // font grid that cannot be made.
-            if (comptime options.backend.hasFreetype()) {
-                if (!self.canLoad(font)) {
-                    api.release(font);
-                    return null;
-                }
+            // A font that does not load is not offered: one that is
+            // offered and then fails to load is not a font that was not
+            // found, which has the next candidate and the fonts that are
+            // built in to fall back on, but a face the grid cannot make,
+            // and a row that needs it is drawn blank on every rebuild.
+            // FreeType loads what DirectWrite finds, so it is asked; with
+            // DirectWrite alone, the font's face is what loading makes.
+            const loads = if (comptime options.backend.hasFreetype())
+                self.canLoad(font)
+            else
+                opens(font);
+            if (!loads) {
+                api.release(font);
+                return null;
             }
 
             return .{ .dw = .{
@@ -1512,6 +1516,20 @@ pub const DirectWrite = struct {
                 return false;
             };
             face.deinit();
+            return true;
+        }
+
+        /// Whether DirectWrite makes a face of a font. The system font
+        /// collection is a snapshot, which goes on listing a font that has
+        /// since been uninstalled, and a font's file can be on a drive that
+        /// is gone or be one this user cannot read; DirectWrite reports
+        /// those only when the face is made.
+        fn opens(font: *api.IDWriteFont) bool {
+            const face = font.createFontFace() catch |err| {
+                log.info("font skipped, its face does not open err={}", .{err});
+                return false;
+            };
+            api.release(face);
             return true;
         }
 
@@ -2443,6 +2461,115 @@ test "directwrite instance of a variable font" {
             found = true;
         }
         try testing.expect(found);
+    }
+}
+
+test "directwrite: a font whose face does not open is not offered" {
+    if (comptime !options.backend.hasDirectWrite()) return error.SkipZigTest;
+    // The FreeType backends ask FreeType, which needs a real font.
+    if (comptime options.backend.hasFreetype()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const api = directwrite.api;
+
+    // A font in memory, through the vtable slots that offering it calls:
+    // CreateFontFace fails as it does for a font whose file is gone, or
+    // hands out a face; QueryInterface finds no newer interface, so the
+    // font is text. Both count their references.
+    const Fake = struct {
+        font: api.IDWriteFont,
+        face: api.IDWriteFontFace,
+        hr: api.HRESULT,
+        font_refs: u32 = 1,
+        face_refs: u32 = 0,
+
+        fn fromFont(unk: *api.IUnknown) *@This() {
+            const font: *api.IDWriteFont = @ptrCast(@alignCast(unk));
+            return @fieldParentPtr("font", font);
+        }
+
+        fn fromFace(unk: *api.IUnknown) *@This() {
+            const face: *api.IDWriteFontFace = @ptrCast(@alignCast(unk));
+            return @fieldParentPtr("face", face);
+        }
+
+        fn queryInterface(_: *api.IUnknown, _: api.REFIID, out: *?*anyopaque) callconv(api.cc) api.HRESULT {
+            out.* = null;
+            return api.E_NOINTERFACE;
+        }
+
+        fn addRef(unk: *api.IUnknown) callconv(api.cc) api.ULONG {
+            const self = fromFont(unk);
+            self.font_refs += 1;
+            return self.font_refs;
+        }
+
+        fn release(unk: *api.IUnknown) callconv(api.cc) api.ULONG {
+            const self = fromFont(unk);
+            self.font_refs -= 1;
+            return self.font_refs;
+        }
+
+        fn releaseFace(unk: *api.IUnknown) callconv(api.cc) api.ULONG {
+            const self = fromFace(unk);
+            self.face_refs -= 1;
+            return self.face_refs;
+        }
+
+        fn createFontFace(font: *api.IDWriteFont, out: *?*api.IDWriteFontFace) callconv(api.cc) api.HRESULT {
+            const self: *@This() = @fieldParentPtr("font", font);
+            if (api.failed(self.hr)) {
+                out.* = null;
+                return self.hr;
+            }
+            self.face_refs += 1;
+            out.* = &self.face;
+            return api.S_OK;
+        }
+    };
+
+    var font_vtable: api.IDWriteFont.VTable = undefined;
+    font_vtable.base = .{
+        .QueryInterface = &Fake.queryInterface,
+        .AddRef = &Fake.addRef,
+        .Release = &Fake.release,
+    };
+    font_vtable.CreateFontFace = &Fake.createFontFace;
+    var face_vtable: api.IDWriteFontFace.VTable = undefined;
+    face_vtable.base.Release = &Fake.releaseFace;
+
+    for ([_]api.HRESULT{ api.DWRITE_E_FILENOTFOUND, api.S_OK }) |hr| {
+        var fake: Fake = .{
+            .font = .{ .vtable = &font_vtable },
+            .face = .{ .vtable = &face_vtable },
+            .hr = hr,
+        };
+        // Discovery's first answer, with nothing to search after it.
+        var it: DirectWrite.DiscoverIterator = .{
+            .alloc = testing.allocator,
+            .lib = undefined,
+            .list = &.{},
+            .variations = &.{},
+            .i = 0,
+            .first = &fake.font,
+        };
+        defer it.deinit();
+
+        const got = try it.next();
+        if (api.failed(hr)) {
+            // Not offered, and its reference is given back.
+            try testing.expect(got == null);
+            try testing.expectEqual(0, fake.font_refs);
+        } else {
+            // Offered with the reference, and the face that answered the
+            // question is given back.
+            var face = got orelse return error.TestUnexpectedResult;
+            try testing.expectEqual(&fake.font, face.dw.?.font);
+            try testing.expectEqual(1, fake.font_refs);
+            face.deinit();
+            try testing.expectEqual(0, fake.font_refs);
+        }
+        try testing.expectEqual(0, fake.face_refs);
     }
 }
 
