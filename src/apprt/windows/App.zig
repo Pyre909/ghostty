@@ -1280,11 +1280,18 @@ pub const App = struct {
         const id = self.jump_list_id orelse return;
         self.jump_list_id = null;
         const alloc = self.core_app.alloc;
-        const exe = IpcClient.imagePath(alloc) catch return;
-        defer alloc.free(exe);
-        jumplist.commit(alloc, id, exe, &jumplist.tasks) catch |err| {
+        const exe = IpcClient.imagePath(alloc) catch |err| {
             log.warn("jump list not committed err={}", .{err});
             return;
+        };
+        defer alloc.free(exe);
+        jumplist.commit(alloc, id, exe, &jumplist.tasks) catch |err| switch (err) {
+            // Logged by the call that failed.
+            error.JumpListFailed => return,
+            error.OutOfMemory => {
+                log.warn("jump list not committed err={}", .{err});
+                return;
+            },
         };
         log.debug("jump list committed", .{});
     }
