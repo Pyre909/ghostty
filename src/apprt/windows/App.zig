@@ -967,6 +967,14 @@ pub const App = struct {
         // Before anything shows text. Once: the option is not reloaded.
         internal_os.i18n.windows.use(config.language);
 
+        // Before the first window. One ID for the taskbar's grouping of the
+        // windows, their jump list, the toasts and the installer's Start
+        // menu shortcut, which carries it too; Windows would otherwise
+        // derive one from the exe's path, which a pin of that shortcut
+        // would not match.
+        const aumid_hr = win32.SetCurrentProcessExplicitAppUserModelID(L(toast.app_id));
+        if (aumid_hr < 0) log.warn("SetCurrentProcessExplicitAppUserModelID failed hr=0x{x}", .{@as(u32, @bitCast(aumid_hr))});
+
         registerClasses(hinstance) catch |err| {
             fatalNotice(err);
             return err;

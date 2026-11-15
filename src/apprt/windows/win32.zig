@@ -920,6 +920,11 @@ pub extern "shell32" fn SHCreateItemFromParsingName(
     out: *?*anyopaque,
 ) callconv(.winapi) HRESULT;
 
+/// The process's AppUserModelID, which groups its windows on the taskbar
+/// and names the jump list they show; set before the first window.
+/// https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-setcurrentprocessexplicitappusermodelid
+pub extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(id: LPCWSTR) callconv(.winapi) HRESULT;
+
 // DWM
 /// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmsetwindowattribute
 pub extern "dwmapi" fn DwmSetWindowAttribute(
