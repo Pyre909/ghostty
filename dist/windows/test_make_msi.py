@@ -915,6 +915,12 @@ class TestPackage(unittest.TestCase):
         self.assertEqual(row["Name"].rpartition("|")[2], "Ghostty")
         self.assertRegex(row["Target"], r"^\[dir\d+\]ghostty\.exe$")
         self.assertEqual(row["WkDir"], "")
+        # It carries the app's AppUserModelID, as the process sets it, so
+        # that a pin of it and the running windows are one button.
+        (prop,) = self.table(self.x64, "MsiShortcutProperty")
+        self.assertEqual(prop["Shortcut_"], row["Shortcut"])
+        self.assertEqual(prop["PropertyKey"], "System.AppUserModel.ID")
+        self.assertEqual(prop["PropVariantValue"], "com.mitchellh.ghostty")
 
     def test_package_wixl_compiled_is_not_enough(self) -> None:
         # Without make_msi.py's own edits the package fails its check on
@@ -935,6 +941,8 @@ class TestPackage(unittest.TestCase):
             "the notification key's rows is [('DisplayName', 'Ghostty', 'cmp0'), ('IconUri', ",
             # The verbs' values are in the source; their keys' removal not.
             "the Explorer verbs' rows is [(",
+            # wixl makes no table for the shortcut's app ID.
+            "the shortcut properties is [], not [(",
         ]:
             with self.subTest(what):
                 self.assertIn(what, said)
@@ -1076,6 +1084,15 @@ class TestCheck(Temp):
                     f"DELETE FROM `Registry` WHERE `Registry` = '{registry[(drive_tab, 'MultiSelectModel')]}'",
                     "the Explorer verbs' rows is [",
                 ),
+                # The shortcut's app ID: another one, or on no shortcut.
+                (
+                    "UPDATE `MsiShortcutProperty` SET `PropVariantValue` = 'com.mitchellh.ghostty-debug'",
+                    "the shortcut properties is [('StartMenu', 'System.AppUserModel.ID', 'com.mitchellh.ghostty-debug')], not ",
+                ),
+                (
+                    "UPDATE `MsiShortcutProperty` SET `Shortcut_` = 'Other'",
+                    "the shortcut properties is [('Other', ",
+                ),
             ]
         ):
             with self.subTest(problem):
@@ -1174,6 +1191,7 @@ class TestRepository(unittest.TestCase):
         (bundle_id,) = re.findall(
             r'^pub const bundle_id = "([^"]+)";$', config, re.MULTILINE
         )
+        self.assertEqual(mm.APP_ID, bundle_id)
         self.assertEqual(mm.TOAST_KEY, rf"Software\Classes\AppUserModelId\{bundle_id}")
         # A release build's app ID is that id, and that is where it is
         # registered.

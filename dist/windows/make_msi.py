@@ -96,6 +96,10 @@ wixl 0.106 cannot write all of that, so the package it compiles is edited
 
     it has no element for a registry key to delete on uninstall;
 
+    it rejects a shortcut's ShortcutProperty, so the table that holds
+    one, which it does not make, is made here with the Start menu
+    shortcut's AppUserModelID;
+
     it records the time it ran as the package's creation time.
 
 The package is not signed.
@@ -146,11 +150,21 @@ NAMESPACE = uuid.UUID("4241E612-9EB3-4A6F-BC2E-B4700A596477")
 # The key whose values are the components' key paths, one per folder.
 KEY = rf"Software\{MANUFACTURER}\{PRODUCT}\Installed"
 
+# A release build's AppUserModelID (src/apprt/windows/toast.zig's
+# `app_id`), which the process sets for its windows and their jump list,
+# and the Start menu shortcut carries, so that a pin of it and the
+# running windows are one taskbar button.
+APP_ID = "com.mitchellh.ghostty"
+
 # What a release build of Ghostty registers for its notifications
 # (src/apprt/windows/toast.zig): the key of its `app_id`, and in it its
 # `app_name` and the icon where `iconPath` looks for it.
-TOAST_KEY = r"Software\Classes\AppUserModelId\com.mitchellh.ghostty"
+TOAST_KEY = rf"Software\Classes\AppUserModelId\{APP_ID}"
 TOAST_NAME = "Ghostty"
+
+# The shortcut property that holds the ID (propkey.h's PKEY_AppUserModel_ID,
+# by its canonical name, as WiX's ShortcutProperty takes it).
+SHORTCUT_KEY = "System.AppUserModel.ID"
 TOAST_ICON = "share/icons/hicolor/256x256/apps/com.mitchellh.ghostty.png"
 
 # Explorer's verbs for a folder, as macOS's Finder services
@@ -602,7 +616,18 @@ def additions(app: App) -> list[str]:
             r for r in explorer_rows(exe, "cmp0") if r[1] == "-"
         )
     ]
-    return [path, *actions, key, *verbs]
+    # The Start menu shortcut's AppUserModelID: the table as Windows
+    # Installer 5 defines it (msi.chm, MsiShortcutProperty), and its row.
+    shortcut = [
+        "CREATE TABLE `MsiShortcutProperty` ("
+        "`MsiShortcutProperty` CHAR(72) NOT NULL, `Shortcut_` CHAR(72) NOT NULL, "
+        "`PropertyKey` CHAR(0) NOT NULL, `PropVariantValue` CHAR(0) NOT NULL, "
+        "`Sequence` SHORT PRIMARY KEY `MsiShortcutProperty`)",
+        "INSERT INTO `MsiShortcutProperty` "
+        "(`MsiShortcutProperty`, `Shortcut_`, `PropertyKey`, `PropVariantValue`) "
+        f"VALUES ('scAppId', 'StartMenu', '{SHORTCUT_KEY}', '{APP_ID}')",
+    ]
+    return [path, *actions, key, *verbs, *shortcut]
 
 
 def finish(
@@ -744,6 +769,19 @@ def check(
             if r["Key"].startswith(r"Software\Classes") and r["Key"] != TOAST_KEY
         ),
         explorer_rows(exe[0] if exe else "None", top),
+    )
+    # wixl makes no MsiShortcutProperty table, and one missing is no rows.
+    tables = run([tools["msiinfo"], "tables", str(msi)], msi.parent).split()
+    shortcuts = [r["Shortcut"] for r in table(tools, msi, "Shortcut")]
+    want(
+        "the shortcut properties",
+        [
+            (r["Shortcut_"], r["PropertyKey"], r["PropVariantValue"])
+            for r in table(tools, msi, "MsiShortcutProperty")
+        ]
+        if "MsiShortcutProperty" in tables
+        else [],
+        [(shortcuts[0] if len(shortcuts) == 1 else None, SHORTCUT_KEY, APP_ID)],
     )
     if problems:
         raise Error("the package is not as meant:\n  " + "\n  ".join(problems))
