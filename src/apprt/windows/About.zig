@@ -112,7 +112,7 @@ fn open(url: []const u8) void {
     }
     // A link of our own, not a program's, so `.html` rather than one of
     // the untrusted kinds.
-    if (!openLink(.html, url)) log.warn("cannot open {s}", .{url});
+    _ = openLink(.html, url); // logs its own failures
 }
 
 /// The dialog, modal to every window, as a prompt is (`App.beginPrompt`):

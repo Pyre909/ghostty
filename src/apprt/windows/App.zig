@@ -5201,14 +5201,17 @@ const open_url_alloc = std.heap.smp_allocator;
 /// started, which can be a cold browser start or the shell's app picker,
 /// and may dispatch messages while it waits, so it never runs on the UI
 /// thread, as the core's opener does not either (src/os/open.zig).
+///
+/// A failure is logged here, with the link escaped, as a program's link
+/// is the program's text.
 pub fn openLink(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
     const wide = std.unicode.utf8ToUtf16LeAllocZ(open_url_alloc, url) catch |err| {
-        log.warn("cannot convert the {t} link to open err={}", .{ kind, err });
+        log.warn("cannot convert the {t} link to open url={f} err={}", .{ kind, std.zig.fmtString(url), err });
         return false;
     };
     const thread = std.Thread.spawn(.{}, openUrlThread, .{ wide, kind == .text }) catch |err| {
         open_url_alloc.free(wide);
-        log.warn("cannot start the opener thread for a {t} link err={}", .{ kind, err });
+        log.warn("cannot start the opener thread for a {t} link url={f} err={}", .{ kind, std.zig.fmtString(url), err });
         return false;
     };
     thread.detach();
