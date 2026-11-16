@@ -463,5 +463,6 @@ test {
     _ = @import("windows/overlay_keys.zig");
     _ = @import("windows/taskbar.zig");
     _ = @import("windows/toast.zig");
+    _ = @import("windows/update_feed.zig");
     _ = @import("windows/win32.zig");
 }
