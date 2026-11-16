@@ -25,13 +25,18 @@
 const std = @import("std");
 
 const win32 = @import("win32.zig");
+const BellBorder = @import("BellBorder.zig");
 const Window = @import("Window.zig");
 
 const L = win32.L;
 const log = std.log.scoped(.win32);
 
-/// The bell border's amber, as BGR.
-const amber = [3]u8{ 0, 204, 255 };
+/// The bell border's amber, as BGR (a COLORREF is 0x00BBGGRR).
+const amber = [3]u8{
+    @truncate(BellBorder.amber >> 16),
+    @truncate(BellBorder.amber >> 8),
+    @truncate(BellBorder.amber),
+};
 /// The bell's grey, as BGR.
 const dark = [3]u8{ 32, 32, 32 };
 

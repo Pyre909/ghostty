@@ -33,8 +33,9 @@ const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttyBellBorderClass";
 
-/// macOS's amber, `Color(red: 1.0, green: 0.8, blue: 0.0)`, in sRGB.
-const amber = win32.rgb(255, 204, 0);
+/// macOS's amber, `Color(red: 1.0, green: 0.8, blue: 0.0)`, in sRGB; the
+/// taskbar's bell (BellBadge.zig) is drawn on it too.
+pub const amber = win32.rgb(255, 204, 0);
 
 /// A terminal's border (`Overlays.bell_border`).
 pub const Border = struct {
