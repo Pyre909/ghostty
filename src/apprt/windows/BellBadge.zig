@@ -1,11 +1,14 @@
 //! A bell on a window's taskbar button while a terminal in any of its
 //! tabs rings (`Surface.bell_ringing`) and `bell-features` has
 //! `attention`: Windows' counterpart of macOS's dock badge
-//! (`setDockBadge` in macos/Sources/App/macOS/AppDelegate.swift), which
-//! counts the windows with a ringing bell. A taskbar button is a
-//! window's, not the app's, so each window shows its own, and a fixed
-//! bell, not a count: the overlay is not meant to change often
-//! (ITaskbarList3::SetOverlayIcon).
+//! (`setDockBadge` in macos/Sources/App/AppDelegate.swift), which counts
+//! the windows with a ringing bell. Each window sets and clears its own
+//! overlay; with combined buttons the taskbar shows the most recent one
+//! still set, so the group shows the bell while any of its windows
+//! rings. It is a fixed bell, not a count: an overlay is not meant to
+//! change often.
+//!
+//! Ref: https://learn.microsoft.com/windows/win32/api/shobjidl_core/nf-shobjidl_core-itaskbarlist3-setoverlayicon
 //!
 //! The icon is drawn here, as no system icon is a bell: the bell of the
 //! system's icon font (Segoe Fluent Icons, else Segoe MDL2 Assets, both
@@ -37,7 +40,10 @@ const faces = [_][:0]const u16{
     std.unicode.utf8ToUtf16LeStringLiteral("Segoe Fluent Icons"),
     std.unicode.utf8ToUtf16LeStringLiteral("Segoe MDL2 Assets"),
 };
-/// The bell in both (Bell in Microsoft's lists of their glyphs).
+/// The bell in both, Ringer in Microsoft's lists of their glyphs.
+///
+/// Ref: https://learn.microsoft.com/windows/apps/design/style/segoe-fluent-icons-font
+/// Ref: https://learn.microsoft.com/windows/apps/design/style/segoe-ui-symbol-font
 const bell = [_]u16{0xEA8F};
 
 /// The largest icon drawn, within the pixels of the mask buffer.
