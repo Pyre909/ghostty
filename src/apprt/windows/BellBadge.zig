@@ -94,43 +94,22 @@ fn sizeOf(metric: c_int) i32 {
 /// null, logged, if it could not be made.
 fn make(size: i32) ?win32.HICON {
     std.debug.assert(size > 0 and size <= max_size);
-    const n: usize = @intCast(size * size);
 
     const dc = win32.CreateCompatibleDC(null) orelse return failed("CreateCompatibleDC");
     defer _ = win32.DeleteDC(dc);
-    const header: win32.BITMAPINFOHEADER = .{
-        .biSize = @sizeOf(win32.BITMAPINFOHEADER),
-        .biWidth = size,
-        .biHeight = -size,
-        .biPlanes = 1,
-        .biBitCount = 32,
-        .biCompression = win32.BI_RGB,
-        .biSizeImage = 0,
-        .biXPelsPerMeter = 0,
-        .biYPelsPerMeter = 0,
-        .biClrUsed = 0,
-        .biClrImportant = 0,
-    };
-    var bits: ?*anyopaque = null;
-    const color = win32.CreateDIBSection(dc, &header, win32.DIB_RGB_COLORS, &bits, null, 0) orelse
-        return failed("CreateDIBSection");
-    defer _ = win32.DeleteObject(color);
-    // BGRA, top row first: each row of 32-bit pixels is DWORD-aligned
-    // already.
-    const pixels = @as([*][4]u8, @ptrCast(@alignCast(bits orelse return failed("CreateDIBSection bits"))))[0..n];
-    @memset(pixels, .{ 0, 0, 0, 0 });
-
+    const color = Dib.init(dc, size) orelse return failed("CreateDIBSection");
+    defer color.deinit();
+    @memset(color.pixels, .{ 0, 0, 0, 0 });
     {
         // The glyph in white on black: any channel is then its coverage.
         // GDI leaves alpha at zero.
-        const old = win32.SelectObject(dc, color) orelse return failed("SelectObject");
+        const old = win32.SelectObject(dc, color.bitmap) orelse return failed("SelectObject");
         defer _ = win32.SelectObject(dc, old);
         if (!drawGlyph(dc, size, &faces)) log.warn("taskbar bell: no font with the bell, the disk alone", .{});
         _ = win32.GdiFlush();
     }
-
     const side: usize = @intCast(size);
-    for (pixels, 0..) |*p, i| {
+    for (color.pixels, 0..) |*p, i| {
         p.* = pixel(p[1], diskCoverage(size, @intCast(i % side), @intCast(i / side)));
     }
 
@@ -139,9 +118,40 @@ fn make(size: i32) ?win32.HICON {
     const mask_bits: [max_size * max_size / 8]u8 = @splat(0);
     const mask = win32.CreateBitmap(size, size, 1, 1, &mask_bits) orelse return failed("CreateBitmap");
     defer _ = win32.DeleteObject(mask);
-    return win32.CreateIconIndirect(&.{ .fIcon = .TRUE, .hbmMask = mask, .hbmColor = color }) orelse
+    return win32.CreateIconIndirect(&.{ .fIcon = .TRUE, .hbmMask = mask, .hbmColor = color.bitmap }) orelse
         failed("CreateIconIndirect");
 }
+
+/// A 32-bit DIB section `size` pixels square and its pixels, BGRA, top
+/// row first (each row of 32-bit pixels is DWORD-aligned already).
+const Dib = struct {
+    bitmap: win32.HGDIOBJ,
+    pixels: [][4]u8,
+
+    fn init(dc: win32.HDC, size: i32) ?Dib {
+        const header: win32.BITMAPINFOHEADER = .{
+            .biSize = @sizeOf(win32.BITMAPINFOHEADER),
+            .biWidth = size,
+            .biHeight = -size,
+            .biPlanes = 1,
+            .biBitCount = 32,
+            .biCompression = win32.BI_RGB,
+            .biSizeImage = 0,
+            .biXPelsPerMeter = 0,
+            .biYPelsPerMeter = 0,
+            .biClrUsed = 0,
+            .biClrImportant = 0,
+        };
+        var bits: ?*anyopaque = null;
+        const bitmap = win32.CreateDIBSection(dc, &header, win32.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
+        const n: usize = @intCast(size * size);
+        return .{ .bitmap = bitmap, .pixels = @as([*][4]u8, @ptrCast(@alignCast(bits.?)))[0..n] };
+    }
+
+    fn deinit(self: Dib) void {
+        _ = win32.DeleteObject(self.bitmap);
+    }
+};
 
 fn failed(comptime what: []const u8) ?win32.HICON {
     log.warn("taskbar bell: " ++ what ++ " failed err={}", .{win32.GetLastError()});
@@ -203,32 +213,65 @@ fn diskCoverage(size: i32, x: i32, y: i32) f32 {
     return std.math.clamp(r - @sqrt(dx * dx + dy * dy) + 0.5, 0, 1);
 }
 
-/// A pixel of the icon, premultiplied BGRA, from the glyph's coverage
+/// A pixel of the icon, BGRA with straight (not premultiplied) alpha, as
+/// a 32-bit icon's colour bitmap holds it, from the glyph's coverage
 /// `glyph` (0 to 255) and the disk's `disk`: the bell's grey over amber,
 /// as opaque as the disk covers it.
 fn pixel(glyph: u8, disk: f32) [4]u8 {
     const a: u16 = @intFromFloat(@round(std.math.clamp(disk, 0, 1) * 255));
     var out: [4]u8 = undefined;
     for (0..3) |c| {
-        const mixed = (@as(u16, amber[c]) * (255 - glyph) + @as(u16, dark[c]) * glyph + 127) / 255;
-        out[c] = @intCast((mixed * a + 127) / 255);
+        out[c] = @intCast((@as(u16, amber[c]) * (255 - glyph) + @as(u16, dark[c]) * glyph + 127) / 255);
     }
     out[3] = @intCast(a);
     return out;
 }
 
-test "win32: the bell's pixels are amber, the glyph grey, premultiplied" {
+test "win32: the bell's pixels are amber, the glyph grey, with straight alpha" {
     const t = std.testing;
     try t.expectEqual([4]u8{ 0, 204, 255, 255 }, pixel(0, 1));
     try t.expectEqual([4]u8{ 32, 32, 32, 255 }, pixel(255, 1));
-    try t.expectEqual([4]u8{ 0, 0, 0, 0 }, pixel(255, 0));
-    // Half covered: each channel halved with the alpha.
-    try t.expectEqual([4]u8{ 0, 102, 128, 128 }, pixel(0, 0.5));
-    // Every channel at most the alpha, as premultiplied colour must be.
-    for (0..256) |g| for (0..11) |d| {
+    try t.expectEqual([4]u8{ 32, 32, 32, 0 }, pixel(255, 0));
+    try t.expectEqual([4]u8{ 0, 204, 255, 128 }, pixel(0, 0.5));
+    // The colour does not depend on the disk's coverage, only the alpha.
+    for (0..256) |g| for (1..11) |d| {
         const p = pixel(@intCast(g), @as(f32, @floatFromInt(d)) / 10);
-        for (p[0..3]) |c| try t.expect(c <= p[3]);
+        try t.expectEqualSlices(u8, pixel(@intCast(g), 1)[0..3], p[0..3]);
     };
+}
+
+test "win32: the bell's icon blends its edge as straight alpha" {
+    // Drawn over white, a pixel the disk half covers is amber and white
+    // in proportion; a premultiplied bitmap would darken it.
+    const t = std.testing;
+    const size = 16;
+    const icon = make(size) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyIcon(icon);
+    const dc = win32.CreateCompatibleDC(null) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DeleteDC(dc);
+    const target = Dib.init(dc, size) orelse return error.TestUnexpectedResult;
+    defer target.deinit();
+    const pixels = target.pixels;
+    @memset(pixels, .{ 255, 255, 255, 255 });
+    const old = win32.SelectObject(dc, target.bitmap) orelse return error.TestUnexpectedResult;
+    defer _ = win32.SelectObject(dc, old);
+    try t.expect(win32.DrawIconEx(dc, 0, 0, icon, size, size, 0, null, win32.DI_NORMAL).toBool());
+    _ = win32.GdiFlush();
+
+    // The rim in the top left corner, away from the glyph.
+    var checked: usize = 0;
+    for (0..size / 4) |y| for (0..size / 4) |x| {
+        const d = diskCoverage(size, @intCast(x), @intCast(y));
+        if (d < 0.25 or d > 0.75) continue;
+        const got = pixels[y * size + x];
+        const a = @round(d * 255) / 255;
+        for (0..3) |c| {
+            const want = 255 * (1 - a) + @as(f32, @floatFromInt(amber[c])) * a;
+            try t.expectApproxEqAbs(want, @as(f32, @floatFromInt(got[c])), 4);
+        }
+        checked += 1;
+    };
+    try t.expect(checked > 0);
 }
 
 test "win32: the bell's disk fills its icon's circle, smoothly edged" {
