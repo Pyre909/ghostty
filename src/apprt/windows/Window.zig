@@ -43,6 +43,7 @@ const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
+const BellBadge = @import("BellBadge.zig");
 const About = @import("About.zig");
 const SplitTree = @import("../../datastruct/main.zig").SplitTree;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -206,6 +207,9 @@ system_track: TrackBounds,
 /// Explorer said the frame's taskbar button exists (`App.taskbar_created`),
 /// which ITaskbarList3 asks to wait for (`showProgress`).
 taskbar_button: bool,
+
+/// The button shows the bell (BellBadge.zig), as `BellBadge.sync` last set.
+bell_badge: bool,
 
 /// Disabled by `App.beginPrompt` for a prompt in another window, or left
 /// disabled by a title prompt that closed while a prompt was open
@@ -526,6 +530,7 @@ pub fn relinkTab(self: *Window, t: *Tab, index: usize) void {
     self.tabs.insertAssumeCapacity(at, t);
     self.bar.tabsChanged(self);
     self.selectTab(at);
+    BellBadge.sync(self);
 }
 
 /// Take the tab at `index` out of `tabs`, for `removeTab` and `takeTab`,
@@ -541,6 +546,7 @@ fn unlinkTab(self: *Window, index: usize) bool {
         self.selected = nextShown(self.tabs.items, index);
     } else if (index < self.selected) self.selected -= 1;
     self.bar.tabsChanged(self);
+    BellBadge.sync(self);
     return shown;
 }
 
@@ -779,6 +785,7 @@ fn adoptTab(self: *Window, t: *Tab, from_dpi: u32) void {
     self.bar.tabsChanged(self);
     self.relayout();
     if (t.focused) |surface| self.setFocused(surface);
+    BellBadge.sync(self);
 }
 
 /// Move the tab holding `surface` by `amount`, wrapping round, as GTK
@@ -1086,6 +1093,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .step_drag = null,
         .system_track = .{},
         .taskbar_button = false,
+        .bell_badge = false,
         .prompt_disabled = false,
         .prompt_lowered = false,
         .title_prompt = .{},
@@ -2000,6 +2008,7 @@ fn handleMessage(
         self.taskbar_button = true;
         _ = self.app.taskbarList();
         self.showProgress();
+        BellBadge.buttonCreated(self);
         self.app.commitJumpList();
         return 0;
     }
@@ -2719,6 +2728,7 @@ pub fn setTree(self: *Window, t: *Tab, tree: Tree) void {
     t.tree.deinit();
     t.tree = tree;
     Dividers.tabChanged(self, t);
+    BellBadge.sync(self);
 }
 
 /// Where `pane` is in the client area with no zoom, as `layout` tiles it.
@@ -3187,6 +3197,7 @@ pub fn takePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !Tree {
     t.tree = tree;
     Dividers.tabChanged(self, t);
     t.focused = focus;
+    BellBadge.sync(self);
 
     // A hidden tab's terminals are hidden already, and the focus and the
     // layout are the shown tab's.

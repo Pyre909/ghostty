@@ -25,6 +25,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const BellBorder = @import("BellBorder.zig");
+const BellBadge = @import("BellBadge.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const ScrollBar = @import("ScrollBar.zig");
@@ -1994,7 +1995,8 @@ pub const Surface = struct {
     /// Show `bell_ringing` as `bell-features` asks, which may have changed
     /// (`App.configChange`): in its tab's label and its window's caption,
     /// if it is its tab's focused terminal, which GTK's tab takes its
-    /// title from (`Window.shownTitle`); and its border.
+    /// title from (`Window.shownTitle`); its border; and on its window's
+    /// taskbar button (BellBadge.zig).
     pub fn showBell(self: *Surface) void {
         if (self.window.tabOf(self)) |t| {
             if (t.focused == self) {
@@ -2003,6 +2005,7 @@ pub const Surface = struct {
             }
         }
         BellBorder.set(self, self.bell_ringing and self.app.config.@"bell-features".border);
+        BellBadge.sync(self.window);
     }
 
     /// Remove the terminal's toasts, shown or kept in the notification

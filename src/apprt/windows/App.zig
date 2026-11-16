@@ -5828,6 +5828,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .step_drag = null,
         .system_track = .{},
         .taskbar_button = false,
+        .bell_badge = false,
         .prompt_disabled = false,
         .prompt_lowered = false,
         .title_prompt = .{},
@@ -16869,6 +16870,12 @@ const TestTaskbar = struct {
     /// Every state set, in order.
     states: [32]taskbar.State = undefined,
     states_len: usize = 0,
+    /// SetOverlayIcon's calls, and whether the last set an icon, and with
+    /// which description.
+    overlays: usize = 0,
+    overlay: bool = false,
+    overlay_description: [16]u16 = undefined,
+    overlay_description_len: usize = 0,
 
     const vtable = vtable: {
         var v: taskbar.ITaskbarList3.VTable = undefined;
@@ -16880,6 +16887,7 @@ const TestTaskbar = struct {
         v.HrInit = hrInit;
         v.SetProgressValue = setProgressValue;
         v.SetProgressState = setProgressState;
+        v.SetOverlayIcon = setOverlayIcon;
         break :vtable v;
     };
 
@@ -16892,6 +16900,17 @@ const TestTaskbar = struct {
     }
 
     fn hrInit(_: *taskbar.ITaskbarList3) callconv(.winapi) win32.HRESULT {
+        return 0;
+    }
+
+    fn setOverlayIcon(list: *taskbar.ITaskbarList3, hwnd: win32.HWND, icon: ?win32.HICON, description: ?win32.LPCWSTR) callconv(.winapi) win32.HRESULT {
+        const self: *TestTaskbar = @fieldParentPtr("list", list);
+        self.hwnd = hwnd;
+        self.overlays += 1;
+        self.overlay = icon != null;
+        const text = if (description) |d| std.mem.sliceTo(d, 0) else &.{};
+        self.overlay_description_len = @min(text.len, self.overlay_description.len);
+        @memcpy(self.overlay_description[0..self.overlay_description_len], text[0..self.overlay_description_len]);
         return 0;
     }
 
@@ -17987,6 +18006,88 @@ test "win32: the bell border shows around a ringing terminal, under its other ov
     // It goes with its terminal.
     try std.testing.expect(a.destroy());
     try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+}
+
+test "win32: a ringing terminal puts a bell on its window's taskbar button" {
+    // BellBadge.zig: while `bell-features` has `attention` and a terminal
+    // in any of the window's tabs rings, the button shows the bell, once
+    // Explorer made it, and again after Explorer restarts; it goes when
+    // the ringing stops or leaves the window, and follows a moved tab.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    var fake: TestTaskbar = .{};
+    app.taskbar_list = &fake.list;
+    app.taskbar_created = win32.WM_APP + 0x100;
+    const bellIs = struct {
+        fn f(taskbar_fake: *const TestTaskbar, hwnd: win32.HWND, calls: usize, on: bool) !void {
+            try std.testing.expectEqual(calls, taskbar_fake.overlays);
+            try std.testing.expectEqual(@as(?win32.HWND, hwnd), taskbar_fake.hwnd);
+            try std.testing.expectEqual(on, taskbar_fake.overlay);
+            const want: []const u16 = if (on) std.unicode.utf8ToUtf16LeStringLiteral("Bell") else &.{};
+            try std.testing.expectEqualSlices(u16, want, taskbar_fake.overlay_description[0..taskbar_fake.overlay_description_len]);
+        }
+    }.f;
+
+    const window = try testFrame(&app);
+    testResize(window, 400, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const b = try testTab(&app, window);
+
+    // A ring in the hidden tab, before the button exists: nothing yet;
+    // then shown when it does, once for any number of rings.
+    try std.testing.expect(try testBell(&app, b));
+    try std.testing.expect(b.bell_ringing);
+    try std.testing.expectEqual(0, fake.overlays);
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try bellIs(&fake, window.hwnd, 1, true);
+    try std.testing.expect(try testBell(&app, b));
+    try bellIs(&fake, window.hwnd, 1, true);
+
+    // Explorer restarted: its new button gets it again.
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try bellIs(&fake, window.hwnd, 2, true);
+
+    // A press over it stops it, and the bell goes.
+    _ = Surface.wndProc(b.hwnd, win32.WM_MBUTTONDOWN, 0, testPoint(20, 30));
+    _ = Surface.wndProc(b.hwnd, win32.WM_MBUTTONUP, 0, testPoint(20, 30));
+    try std.testing.expect(!b.bell_ringing);
+    try bellIs(&fake, window.hwnd, 3, false);
+
+    // Without `attention`, a ringing terminal shows none; with it again,
+    // it does.
+    try std.testing.expect(try testBell(&app, b));
+    try bellIs(&fake, window.hwnd, 4, true);
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features".attention = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(b.bell_ringing);
+    try bellIs(&fake, window.hwnd, 5, false);
+    changed.@"bell-features".attention = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try bellIs(&fake, window.hwnd, 6, true);
+
+    // Its tab moved to a window of its own whose button exists: the bell
+    // leaves this button for that one.
+    const to = try testFrame(&app);
+    _ = win32.SendMessageW(to.hwnd, app.taskbar_created, 0, 0);
+    try std.testing.expectEqual(6, fake.overlays);
+    const index = window.tabIndex(window.tabOf(b).?).?;
+    try std.testing.expect(try window.moveTabTo(index, to) == .whole);
+    try std.testing.expect(b.window == to);
+    try std.testing.expectEqual(8, fake.overlays);
+    try bellIs(&fake, to.hwnd, 8, true);
+    try std.testing.expect(!window.bell_badge);
 }
 
 test "win32: an unfocused split is dimmed by its fill at one less its opacity, over its other overlays" {

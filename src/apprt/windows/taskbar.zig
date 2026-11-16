@@ -94,7 +94,7 @@ pub const ITaskbarList3 = extern struct {
         ThumbBarAddButtons: Slot,
         ThumbBarUpdateButtons: Slot,
         ThumbBarSetImageList: Slot,
-        SetOverlayIcon: Slot,
+        SetOverlayIcon: *const fn (*ITaskbarList3, HWND, ?win32.HICON, ?win32.LPCWSTR) callconv(.winapi) HRESULT,
         SetThumbnailTooltip: Slot,
         SetThumbnailClip: Slot,
     };
@@ -117,6 +117,15 @@ pub const ITaskbarList3 = extern struct {
         win32.checkHr(self.vtable.SetProgressState(self, hwnd, progress.state), error.TaskbarListFailed, "taskbar: SetProgressState") catch {};
         if (!progress.state.filled()) return;
         win32.checkHr(self.vtable.SetProgressValue(self, hwnd, progress.shownValue(), 100), error.TaskbarListFailed, "taskbar: SetProgressValue") catch {};
+    }
+
+    /// Show `icon` over the button of the top-level window `hwnd`, described
+    /// by `description` for screen readers, or with null take this window's
+    /// away (`BellBadge`). The taskbar copies the icon, so the caller may
+    /// destroy it once this returns. False if the taskbar refused it.
+    pub fn setOverlay(self: *ITaskbarList3, hwnd: HWND, icon: ?win32.HICON, description: ?win32.LPCWSTR) bool {
+        win32.checkHr(self.vtable.SetOverlayIcon(self, hwnd, icon, description), error.TaskbarListFailed, "taskbar: SetOverlayIcon") catch return false;
+        return true;
     }
 };
 
@@ -160,6 +169,7 @@ test "win32: ITaskbarList3 has the header's slots" {
     try testing.expectEqual(3 * p, @offsetOf(ITaskbarList3.VTable, "HrInit"));
     try testing.expectEqual(9 * p, @offsetOf(ITaskbarList3.VTable, "SetProgressValue"));
     try testing.expectEqual(10 * p, @offsetOf(ITaskbarList3.VTable, "SetProgressState"));
+    try testing.expectEqual(18 * p, @offsetOf(ITaskbarList3.VTable, "SetOverlayIcon"));
 }
 
 test "win32: the taskbar's class and interface ids" {

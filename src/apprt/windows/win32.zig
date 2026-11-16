@@ -699,6 +699,8 @@ pub extern "user32" fn GetSystemMetrics(index: c_int) callconv(.winapi) c_int;
 /// The pixels on either side of a press the pointer may move before a
 /// drag begins, at the system DPI (GetSystemMetrics) or a given one.
 pub const SM_CXDRAG: c_int = 68;
+/// A small icon's width at the system DPI: the taskbar's overlay size.
+pub const SM_CXSMICON: c_int = 49;
 pub const SM_CYDRAG: c_int = 69;
 pub extern "user32" fn SystemParametersInfoW(
     action: UINT,
@@ -1649,6 +1651,40 @@ comptime {
     // biSize: the SDK's sizeof(BITMAPINFOHEADER).
     std.debug.assert(@sizeOf(BITMAPINFOHEADER) == 40);
 }
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createdibsection
+/// A bitmap whose pixels `bits` receives, in this process's memory.
+pub extern "gdi32" fn CreateDIBSection(
+    hdc: ?HDC,
+    info: *const BITMAPINFOHEADER,
+    usage: UINT,
+    bits: *?*anyopaque,
+    section: ?HANDLE,
+    offset: DWORD,
+) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createbitmap
+pub extern "gdi32" fn CreateBitmap(
+    width: c_int,
+    height: c_int,
+    planes: UINT,
+    bit_count: UINT,
+    bits: ?*const anyopaque,
+) callconv(.winapi) ?HGDIOBJ;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-gdiflush
+/// GDI's batched drawing done, before a DIB section's pixels are read.
+pub extern "gdi32" fn GdiFlush() callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-iconinfo
+pub const ICONINFO = extern struct {
+    fIcon: BOOL,
+    xHotspot: DWORD = 0,
+    yHotspot: DWORD = 0,
+    hbmMask: HGDIOBJ,
+    hbmColor: ?HGDIOBJ,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createiconindirect
+/// The icon has copies of the bitmaps, which the caller still owns.
+pub extern "user32" fn CreateIconIndirect(info: *const ICONINFO) callconv(.winapi) ?HICON;
+/// CreateFontW's quality: antialiased in grey, not ClearType's colours.
+pub const ANTIALIASED_QUALITY: DWORD = 4;
 /// https://learn.microsoft.com/en-us/windows/win32/controls/combo-box-styles
 pub const CBS_DROPDOWNLIST: DWORD = 0x0003;
 /// https://learn.microsoft.com/en-us/windows/win32/controls/bumper-combobox-control-reference-messages
