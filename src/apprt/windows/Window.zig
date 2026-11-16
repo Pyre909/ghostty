@@ -208,8 +208,9 @@ system_track: TrackBounds,
 /// which ITaskbarList3 asks to wait for (`showProgress`).
 taskbar_button: bool,
 
-/// The button shows the bell (BellBadge.zig), as `BellBadge.sync` last set.
-bell_badge: bool,
+/// The size in pixels of the bell the button shows (BellBadge.zig), null
+/// for none, as `BellBadge.sync` last set it.
+bell_badge: ?i32,
 
 /// Disabled by `App.beginPrompt` for a prompt in another window, or left
 /// disabled by a title prompt that closed while a prompt was open
@@ -1093,7 +1094,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .step_drag = null,
         .system_track = .{},
         .taskbar_button = false,
-        .bell_badge = false,
+        .bell_badge = null,
         .prompt_disabled = false,
         .prompt_lowered = false,
         .title_prompt = .{},
@@ -2110,6 +2111,8 @@ fn handleMessage(
             // changes the client size, but the divider width depends on the
             // DPI too. Terminals already in place get no second WM_SIZE.
             self.relayout();
+            // The bell on the taskbar button, at the new DPI's size.
+            BellBadge.sync(self);
             return 0;
         },
 

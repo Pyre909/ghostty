@@ -11,7 +11,9 @@
 //! system's icon font (Segoe Fluent Icons, else Segoe MDL2 Assets, both
 //! U+EA8F) in dark grey on an amber disk, the bell border's amber
 //! (BellBorder.zig). Without either font the disk shows alone. Its size
-//! is a small icon's at the system DPI, the taskbar's.
+//! is a small icon's at the window's DPI, which is the taskbar's when the
+//! window is on the taskbar's monitor, and it is drawn again when that
+//! DPI changes.
 //!
 //! The overlay is set only once Explorer said the button exists
 //! (`Window.taskbar_button`), and set again when it says so again, after
@@ -41,30 +43,30 @@ const bell = [_]u16{0xEA8F};
 /// The largest icon drawn, within the pixels of the mask buffer.
 const max_size = 64;
 
-/// Show the bell on the window's taskbar button, or remove it, as its
-/// terminals and `bell-features` now ask, if that changed
-/// (`Window.bell_badge`). Called wherever a terminal's bell starts or
-/// stops ringing, `bell-features` changes, or a terminal or a tab joins
-/// or leaves the window.
+/// Show the bell on the window's taskbar button, at the window's size,
+/// or remove it, as its terminals and `bell-features` now ask, if that
+/// changed (`Window.bell_badge`). Called wherever a terminal's bell starts
+/// or stops ringing, `bell-features` changes, a terminal or a tab joins
+/// or leaves the window, or its DPI changes.
 pub fn sync(window: *Window) void {
-    const want = wanted(window);
+    const want: ?i32 = if (wanted(window)) iconSize(window) else null;
     if (want == window.bell_badge) return;
     if (!window.taskbar_button) return;
     const list = window.app.taskbar_list orelse return;
 
-    const icon: ?win32.HICON = if (want) make(iconSize()) orelse return else null;
+    const icon: ?win32.HICON = if (want) |size| make(size) orelse return else null;
     // The taskbar keeps its own copy.
     defer if (icon) |i| {
         _ = win32.DestroyIcon(i);
     };
-    if (!list.setOverlay(window.hwnd, icon, if (want) L("Bell") else null)) return;
+    if (!list.setOverlay(window.hwnd, icon, if (want != null) L("Bell") else null)) return;
     window.bell_badge = want;
 }
 
 /// Explorer made the window's button, which has no overlay, again after
 /// it restarted: show the bell on it if it rings.
 pub fn buttonCreated(window: *Window) void {
-    window.bell_badge = false;
+    window.bell_badge = null;
     sync(window);
 }
 
@@ -78,12 +80,17 @@ fn wanted(window: *const Window) bool {
     return false;
 }
 
-/// A small icon's size at the system DPI, which the taskbar draws at.
-fn iconSize() i32 {
+/// A small icon's size at the window's DPI; at the system DPI before
+/// Windows 10 1607, which has no other (`App.bar_metric`).
+fn iconSize(window: *const Window) i32 {
+    if (window.app.bar_metric) |m| {
+        const dpi = m.dpi_of(window.hwnd);
+        if (dpi != 0) return sizeOf(m.metric_for(win32.SM_CXSMICON, dpi));
+    }
     return sizeOf(win32.GetSystemMetrics(win32.SM_CXSMICON));
 }
 
-/// `iconSize` from what GetSystemMetrics gave: 16, its size at 96 DPI,
+/// `iconSize` from what the system metric gave: 16, its size at 96 DPI,
 /// if it gave nothing, and never more than `max_size`.
 fn sizeOf(metric: c_int) i32 {
     if (metric <= 0) return 16;

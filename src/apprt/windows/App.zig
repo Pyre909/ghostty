@@ -5828,7 +5828,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .step_drag = null,
         .system_track = .{},
         .taskbar_button = false,
-        .bell_badge = false,
+        .bell_badge = null,
         .prompt_disabled = false,
         .prompt_lowered = false,
         .title_prompt = .{},
@@ -18011,8 +18011,9 @@ test "win32: the bell border shows around a ringing terminal, under its other ov
 test "win32: a ringing terminal puts a bell on its window's taskbar button" {
     // BellBadge.zig: while `bell-features` has `attention` and a terminal
     // in any of the window's tabs rings, the button shows the bell, once
-    // Explorer made it, and again after Explorer restarts; it goes when
-    // the ringing stops or leaves the window, and follows a moved tab.
+    // Explorer made it, and again after Explorer restarts, at a small
+    // icon's size at the window's DPI; it goes when the ringing stops or
+    // leaves the window, and follows a moved tab.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -18024,6 +18025,19 @@ test "win32: a ringing terminal puts a bell on its window's taskbar button" {
     var fake: TestTaskbar = .{};
     app.taskbar_list = &fake.list;
     app.taskbar_created = win32.WM_APP + 0x100;
+    // The window's DPI, and a small icon's size at it, as Windows gives
+    // them.
+    const Dpi = struct {
+        var dpi: win32.UINT = 96;
+        fn of(_: win32.HWND) callconv(.winapi) win32.UINT {
+            return dpi;
+        }
+        fn metric(index: c_int, at: win32.UINT) callconv(.winapi) c_int {
+            return if (index == win32.SM_CXSMICON) @intCast(16 * at / 96) else win32.GetSystemMetrics(index);
+        }
+    };
+    Dpi.dpi = 96;
+    app.bar_metric = .{ .dpi_of = &Dpi.of, .metric_for = &Dpi.metric };
     const bellIs = struct {
         fn f(taskbar_fake: *const TestTaskbar, hwnd: win32.HWND, calls: usize, on: bool) !void {
             try std.testing.expectEqual(calls, taskbar_fake.overlays);
@@ -18050,6 +18064,7 @@ test "win32: a ringing terminal puts a bell on its window's taskbar button" {
     try std.testing.expectEqual(0, fake.overlays);
     _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
     try bellIs(&fake, window.hwnd, 1, true);
+    try std.testing.expectEqual(@as(?i32, 16), window.bell_badge);
     try std.testing.expect(try testBell(&app, b));
     try bellIs(&fake, window.hwnd, 1, true);
 
@@ -18077,17 +18092,24 @@ test "win32: a ringing terminal puts a bell on its window's taskbar button" {
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try bellIs(&fake, window.hwnd, 6, true);
 
+    // The window's DPI changed: the bell is drawn again at its size.
+    Dpi.dpi = 144;
+    var suggested = try windowRect(window.hwnd);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_DPICHANGED, 144 << 16 | 144, @bitCast(@intFromPtr(&suggested)));
+    try bellIs(&fake, window.hwnd, 7, true);
+    try std.testing.expectEqual(@as(?i32, 24), window.bell_badge);
+
     // Its tab moved to a window of its own whose button exists: the bell
     // leaves this button for that one.
     const to = try testFrame(&app);
     _ = win32.SendMessageW(to.hwnd, app.taskbar_created, 0, 0);
-    try std.testing.expectEqual(6, fake.overlays);
+    try std.testing.expectEqual(7, fake.overlays);
     const index = window.tabIndex(window.tabOf(b).?).?;
     try std.testing.expect(try window.moveTabTo(index, to) == .whole);
     try std.testing.expect(b.window == to);
-    try std.testing.expectEqual(8, fake.overlays);
-    try bellIs(&fake, to.hwnd, 8, true);
-    try std.testing.expect(!window.bell_badge);
+    try std.testing.expectEqual(9, fake.overlays);
+    try bellIs(&fake, to.hwnd, 9, true);
+    try std.testing.expect(window.bell_badge == null);
 }
 
 test "win32: an unfocused split is dimmed by its fill at one less its opacity, over its other overlays" {
