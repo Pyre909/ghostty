@@ -114,19 +114,19 @@ fn sizeOf(metric: c_int) i32 {
 fn make(size: i32) ?win32.HICON {
     std.debug.assert(size > 0 and size <= max_size);
 
-    const dc = win32.CreateCompatibleDC(null) orelse return failed("CreateCompatibleDC");
+    const dc = win32.CreateCompatibleDC(null) orelse return failed("CreateCompatibleDC", false);
     defer _ = win32.DeleteDC(dc);
-    const color = Dib.init(dc, size) orelse return failed("CreateDIBSection");
+    const color = Dib.init(dc, size) orelse return failed("CreateDIBSection", true);
     defer color.deinit();
-    if (!paint(dc, color, size)) return failed("SelectObject");
+    if (!paint(dc, color, size)) return failed("SelectObject", false);
 
     // All zero: the colour bitmap's alpha alone decides what shows. Rows
     // of a monochrome bitmap are WORD-aligned.
     const mask_bits: [max_size * max_size / 8]u8 = @splat(0);
-    const mask = win32.CreateBitmap(size, size, 1, 1, &mask_bits) orelse return failed("CreateBitmap");
+    const mask = win32.CreateBitmap(size, size, 1, 1, &mask_bits) orelse return failed("CreateBitmap", true);
     defer _ = win32.DeleteObject(mask);
     return win32.CreateIconIndirect(&.{ .fIcon = .TRUE, .hbmMask = mask, .hbmColor = color.bitmap }) orelse
-        failed("CreateIconIndirect");
+        failed("CreateIconIndirect", true);
 }
 
 /// A 32-bit DIB section `size` pixels square and its pixels, BGRA, top
@@ -180,8 +180,14 @@ fn paint(dc: win32.HDC, dib: Dib, size: i32) bool {
     return true;
 }
 
-fn failed(comptime what: []const u8) ?win32.HICON {
-    log.warn("taskbar bell: " ++ what ++ " failed err={}", .{win32.GetLastError()});
+/// Log that `what` failed, with the last-error code only for a call
+/// that sets it: another's would be stale.
+fn failed(comptime what: []const u8, comptime sets_last_error: bool) ?win32.HICON {
+    if (sets_last_error) {
+        log.warn("taskbar bell: " ++ what ++ " failed err={}", .{win32.GetLastError()});
+    } else {
+        log.warn("taskbar bell: " ++ what ++ " failed", .{});
+    }
     return null;
 }
 
