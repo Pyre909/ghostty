@@ -293,7 +293,17 @@ fn itemsOf(comptime entries: []const Entry, set: *const Binding.Set) [entries.le
 /// The longest text `itemText` writes: the longest label in any
 /// language, a tab, and a shortcut whose every byte is a code point
 /// written as "U+XXXX".
-const text_max = 512;
+pub const text_max = 512;
+
+/// `msgid`, a menu item's label, as AppendMenuW takes it: in the user's
+/// language, each '&' doubled, as `itemText` writes one. For the items
+/// other menus add, as the window menu's About and Help.
+pub fn labelText(buf: *[text_max:0]u16, comptime msgid: [:0]const u8) [:0]const u16 {
+    var out: Wide = .{ .buf = buf };
+    out.label(msgid);
+    buf[out.len] = 0;
+    return buf[0..out.len :0];
+}
 
 /// `item`'s text as AppendMenuW takes it: its label in the user's
 /// language, then a tab and its shortcut, which the menu right-aligns.

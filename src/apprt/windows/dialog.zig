@@ -147,6 +147,20 @@ fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.
     const owner = app.promptOwner(hwnd);
     app.beginPrompt(owner);
     defer app.endPrompt();
+    return box(owner, L("Ghostty"), text, buttons, win32.MB_ICONWARNING);
+}
+
+/// MessageBoxW itself, for a caller inside a prompt of its own
+/// (`App.beginPrompt`), as `messageBox` is: `buttons` set in the user's
+/// reading order, and in tests answered by `test_message_box`, which is
+/// given them without `icon`.
+pub fn box(
+    owner: ?win32.HWND,
+    caption: win32.LPCWSTR,
+    text: win32.LPCWSTR,
+    buttons: win32.UINT,
+    icon: win32.UINT,
+) c_int {
     // A language written from the right is read and set from the right;
     // without these its punctuation lands at the wrong end of each line.
     const flags = buttons | if (i18n.windows.rightToLeft())
@@ -157,7 +171,7 @@ fn messageBox(app: *App, hwnd: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.
         answer(owner, text, flags)
     else
         unanswered();
-    return win32.MessageBoxW(owner, text, L("Ghostty"), flags | win32.MB_ICONWARNING);
+    return win32.MessageBoxW(owner, text, caption, flags | icon);
 }
 
 /// A failure that ends the process before any window exists. The
