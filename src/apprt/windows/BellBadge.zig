@@ -59,7 +59,8 @@ pub fn sync(window: *Window) void {
     defer if (icon) |i| {
         _ = win32.DestroyIcon(i);
     };
-    if (!list.setOverlay(window.hwnd, icon, if (want != null) L("Bell") else null)) return;
+    // Logged there; the state stays, so that the next sync tries again.
+    list.setOverlay(window.hwnd, icon, if (want != null) L("Bell") else null) catch return;
     window.bell_badge = want;
 }
 

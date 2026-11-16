@@ -1,7 +1,8 @@
-//! A terminal's progress report (ConEmu's OSC 9;4) on its window's taskbar
-//! button, through ITaskbarList3, as Windows Terminal shows it. GTK and
-//! macOS draw a bar over the terminal instead; Windows has a place for it
-//! that a minimized window keeps showing.
+//! A window's taskbar button, through ITaskbarList3: a terminal's progress
+//! report (ConEmu's OSC 9;4) on it, as Windows Terminal shows it, and an
+//! overlay icon over it (BellBadge.zig). GTK and macOS draw the progress
+//! as a bar over the terminal instead; Windows has a place for it that a
+//! minimized window keeps showing.
 //!
 //! ITaskbarList3 is a vtable struct in the order of the mingw header Zig
 //! ships (lib/libc/include/any-windows-any/shobjidl.h), as the renderer's
@@ -26,7 +27,7 @@ const GUID = windows.GUID;
 const CLSID_TaskbarList: GUID = GUID.parse("{56fdf344-fd6d-11d0-958a-006097c9a090}");
 const IID_ITaskbarList3: GUID = GUID.parse("{ea1afb91-9e28-4b86-90e9-9e9f8a5eefaf}");
 
-/// The taskbar buttons' progress bars, one reference, the caller's; on the
+/// The taskbar list, one reference, the caller's; on the
 /// thread that uses it, which must be in an apartment (CoInitializeEx).
 pub fn create() error{TaskbarListFailed}!*ITaskbarList3 {
     var out: ?*anyopaque = null;
@@ -122,10 +123,10 @@ pub const ITaskbarList3 = extern struct {
     /// Show `icon` over the button of the top-level window `hwnd`, described
     /// by `description` for screen readers, or with null take this window's
     /// away (`BellBadge`). The taskbar copies the icon, so the caller may
-    /// destroy it once this returns. False if the taskbar refused it.
-    pub fn setOverlay(self: *ITaskbarList3, hwnd: HWND, icon: ?win32.HICON, description: ?win32.LPCWSTR) bool {
-        win32.checkHr(self.vtable.SetOverlayIcon(self, hwnd, icon, description), error.TaskbarListFailed, "taskbar: SetOverlayIcon") catch return false;
-        return true;
+    /// destroy it once this returns. TaskbarListFailed, logged, if the
+    /// taskbar refused it.
+    pub fn setOverlay(self: *ITaskbarList3, hwnd: HWND, icon: ?win32.HICON, description: ?win32.LPCWSTR) error{TaskbarListFailed}!void {
+        try win32.checkHr(self.vtable.SetOverlayIcon(self, hwnd, icon, description), error.TaskbarListFailed, "taskbar: SetOverlayIcon");
     }
 };
 
