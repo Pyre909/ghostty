@@ -746,7 +746,7 @@ fn addWin32(
     self: *const SharedDeps,
     step: *std.Build.Step.Compile,
 ) !void {
-    for ([_][]const u8{ "user32", "gdi32", "imm32", "ole32", "shell32", "shlwapi", "advapi32", "oleaut32", "dwmapi", "d3d11", "dwrite" }) |lib| {
+    for ([_][]const u8{ "user32", "gdi32", "imm32", "ole32", "shell32", "shlwapi", "advapi32", "oleaut32", "dwmapi", "d3d11", "dwrite", "winhttp" }) |lib| {
         step.root_module.linkSystemLibrary(lib, .{ .use_pkg_config = .no });
     }
 

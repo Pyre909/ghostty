@@ -27,6 +27,7 @@ pub const UINT = w.UINT;
 pub const LONG = w.LONG;
 pub const WCHAR = w.WCHAR;
 pub const LPCWSTR = w.LPCWSTR;
+pub const LPWSTR = w.LPWSTR;
 pub const HANDLE = w.HANDLE;
 pub const HWND = w.HWND;
 pub const HDC = w.HDC;
@@ -1913,6 +1914,14 @@ pub const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;
 pub const FILE_FLAG_OVERLAPPED: DWORD = internal_os.windows.FILE_FLAG_OVERLAPPED;
 pub const FILE_FLAG_FIRST_PIPE_INSTANCE: DWORD = internal_os.windows.FILE_FLAG_FIRST_PIPE_INSTANCE;
 pub const OPEN_EXISTING: DWORD = internal_os.windows.OPEN_EXISTING;
+pub const DeleteFileW = internal_os.windows.exp.kernel32.DeleteFileW;
+pub const GetTempPathW = internal_os.windows.exp.kernel32.GetTempPathW;
+pub const GENERIC_READ: DWORD = internal_os.windows.GENERIC_READ;
+pub const GENERIC_WRITE: DWORD = internal_os.windows.GENERIC_WRITE;
+pub const FILE_SHARE_READ: DWORD = internal_os.windows.FILE_SHARE_READ;
+pub const FILE_ATTRIBUTE_NORMAL: DWORD = internal_os.windows.FILE_ATTRIBUTE_NORMAL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
+pub const CREATE_ALWAYS: DWORD = 2;
 /// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
 pub const PIPE_ACCESS_DUPLEX: DWORD = 0x00000003;
 pub const PIPE_TYPE_BYTE: DWORD = 0x00000000;
@@ -2299,3 +2308,68 @@ test "win32: wheel deltas are the signed high word" {
     try std.testing.expectEqual(-120, win32.wheelDelta(0xFF88_0008));
     try std.testing.expectEqual(120, win32.wheelDelta(0x0078_0000));
 }
+
+// WinHTTP, for the update check (http.zig).
+// https://learn.microsoft.com/en-us/windows/win32/winhttp/winhttp-functions
+
+pub const HINTERNET = *anyopaque;
+pub const WINHTTP_ACCESS_TYPE_NO_PROXY: DWORD = 1;
+/// The system's proxy, or the one its automatic discovery finds; Windows
+/// 8.1 and later.
+pub const WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: DWORD = 4;
+pub const WINHTTP_FLAG_SECURE: DWORD = 0x00800000;
+pub const WINHTTP_QUERY_STATUS_CODE: DWORD = 19;
+pub const WINHTTP_QUERY_FLAG_NUMBER: DWORD = 0x20000000;
+pub const INTERNET_SCHEME_HTTP: c_int = 1;
+pub const INTERNET_SCHEME_HTTPS: c_int = 2;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winhttp/ns-winhttp-url_components
+pub const URL_COMPONENTS = extern struct {
+    dwStructSize: DWORD = @sizeOf(URL_COMPONENTS),
+    lpszScheme: ?LPWSTR = null,
+    dwSchemeLength: DWORD = 0,
+    nScheme: c_int = 0,
+    lpszHostName: ?LPWSTR = null,
+    dwHostNameLength: DWORD = 0,
+    nPort: WORD = 0,
+    lpszUserName: ?LPWSTR = null,
+    dwUserNameLength: DWORD = 0,
+    lpszPassword: ?LPWSTR = null,
+    dwPasswordLength: DWORD = 0,
+    lpszUrlPath: ?LPWSTR = null,
+    dwUrlPathLength: DWORD = 0,
+    lpszExtraInfo: ?LPWSTR = null,
+    dwExtraInfoLength: DWORD = 0,
+};
+pub extern "winhttp" fn WinHttpOpen(agent: ?LPCWSTR, access_type: DWORD, proxy: ?LPCWSTR, bypass: ?LPCWSTR, flags: DWORD) callconv(.winapi) ?HINTERNET;
+pub extern "winhttp" fn WinHttpCloseHandle(handle: HINTERNET) callconv(.winapi) BOOL;
+pub extern "winhttp" fn WinHttpSetTimeouts(handle: HINTERNET, resolve: c_int, connect: c_int, send: c_int, receive: c_int) callconv(.winapi) BOOL;
+pub extern "winhttp" fn WinHttpCrackUrl(url: LPCWSTR, len: DWORD, flags: DWORD, components: *URL_COMPONENTS) callconv(.winapi) BOOL;
+pub extern "winhttp" fn WinHttpConnect(session: HINTERNET, server: LPCWSTR, port: WORD, reserved: DWORD) callconv(.winapi) ?HINTERNET;
+pub extern "winhttp" fn WinHttpOpenRequest(
+    connect: HINTERNET,
+    verb: ?LPCWSTR,
+    object: ?LPCWSTR,
+    version: ?LPCWSTR,
+    referrer: ?LPCWSTR,
+    accept_types: ?*const ?LPCWSTR,
+    flags: DWORD,
+) callconv(.winapi) ?HINTERNET;
+pub extern "winhttp" fn WinHttpSendRequest(
+    request: HINTERNET,
+    headers: ?LPCWSTR,
+    headers_len: DWORD,
+    optional: ?*anyopaque,
+    optional_len: DWORD,
+    total_len: DWORD,
+    context: usize,
+) callconv(.winapi) BOOL;
+pub extern "winhttp" fn WinHttpReceiveResponse(request: HINTERNET, reserved: ?*anyopaque) callconv(.winapi) BOOL;
+pub extern "winhttp" fn WinHttpQueryHeaders(
+    request: HINTERNET,
+    info_level: DWORD,
+    name: ?LPCWSTR,
+    buffer: ?*anyopaque,
+    buffer_len: *DWORD,
+    index: ?*DWORD,
+) callconv(.winapi) BOOL;
+pub extern "winhttp" fn WinHttpReadData(request: HINTERNET, buffer: *anyopaque, len: DWORD, read: *DWORD) callconv(.winapi) BOOL;
