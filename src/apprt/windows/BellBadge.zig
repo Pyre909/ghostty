@@ -99,19 +99,7 @@ fn make(size: i32) ?win32.HICON {
     defer _ = win32.DeleteDC(dc);
     const color = Dib.init(dc, size) orelse return failed("CreateDIBSection");
     defer color.deinit();
-    @memset(color.pixels, .{ 0, 0, 0, 0 });
-    {
-        // The glyph in white on black: any channel is then its coverage.
-        // GDI leaves alpha at zero.
-        const old = win32.SelectObject(dc, color.bitmap) orelse return failed("SelectObject");
-        defer _ = win32.SelectObject(dc, old);
-        if (!drawGlyph(dc, size, &faces)) log.warn("taskbar bell: no font with the bell, the disk alone", .{});
-        _ = win32.GdiFlush();
-    }
-    const side: usize = @intCast(size);
-    for (color.pixels, 0..) |*p, i| {
-        p.* = pixel(p[1], diskCoverage(size, @intCast(i % side), @intCast(i / side)));
-    }
+    if (!paint(dc, color, size)) return failed("SelectObject");
 
     // All zero: the colour bitmap's alpha alone decides what shows. Rows
     // of a monochrome bitmap are WORD-aligned.
@@ -152,6 +140,26 @@ const Dib = struct {
         _ = win32.DeleteObject(self.bitmap);
     }
 };
+
+/// Paint the bell into `dib`, `size` pixels square: the glyph is drawn in
+/// white on black, so that any channel is its coverage, and then each
+/// pixel made from it and the disk (`pixel`). False if `dib` could not be
+/// selected into `dc`.
+fn paint(dc: win32.HDC, dib: Dib, size: i32) bool {
+    @memset(dib.pixels, .{ 0, 0, 0, 0 });
+    {
+        const old = win32.SelectObject(dc, dib.bitmap) orelse return false;
+        defer _ = win32.SelectObject(dc, old);
+        if (!drawGlyph(dc, size, &faces)) log.warn("taskbar bell: no font with the bell, the disk alone", .{});
+        // GDI batches its drawing: done before the pixels are read.
+        _ = win32.GdiFlush();
+    }
+    const side: usize = @intCast(size);
+    for (dib.pixels, 0..) |*p, i| {
+        p.* = pixel(p[1], diskCoverage(size, @intCast(i % side), @intCast(i / side)));
+    }
+    return true;
+}
 
 fn failed(comptime what: []const u8) ?win32.HICON {
     log.warn("taskbar bell: " ++ what ++ " failed err={}", .{win32.GetLastError()});
@@ -318,6 +326,26 @@ test "win32: the bell's icon is made, its glyph drawn" {
     for ([_]i32{ 16, 24, 64 }) |size| {
         const icon = make(size) orelse return error.TestUnexpectedResult;
         try t.expect(win32.DestroyIcon(icon).toBool());
+    }
+    // Painted: clear outside the disk, amber on it, the bell's grey in
+    // its middle.
+    for ([_]i32{ 16, 32 }) |size| {
+        const dc = win32.CreateCompatibleDC(null) orelse return error.TestUnexpectedResult;
+        defer _ = win32.DeleteDC(dc);
+        const dib = Dib.init(dc, size) orelse return error.TestUnexpectedResult;
+        defer dib.deinit();
+        try t.expect(paint(dc, dib, size));
+        try t.expectEqual(@as(u8, 0), dib.pixels[0][3]);
+        const side: usize = @intCast(size);
+        var plain: usize = 0;
+        var grey: usize = 0;
+        for (side / 4..side * 3 / 4) |y| for (side / 4..side * 3 / 4) |x| {
+            const p = dib.pixels[y * side + x];
+            if (std.mem.eql(u8, &p, &.{ 0, 204, 255, 255 })) plain += 1;
+            if (p[3] == 255 and p[1] < 64) grey += 1;
+        };
+        try t.expect(plain > 0);
+        try t.expect(grey > 0);
     }
     // Windows 11 has Segoe Fluent Icons; a face it lacks is refused, not
     // drawn in whatever GDI gives instead.
