@@ -699,9 +699,9 @@ pub extern "user32" fn GetSystemMetrics(index: c_int) callconv(.winapi) c_int;
 /// The pixels on either side of a press the pointer may move before a
 /// drag begins, at the system DPI (GetSystemMetrics) or a given one.
 pub const SM_CXDRAG: c_int = 68;
+pub const SM_CYDRAG: c_int = 69;
 /// A small icon's width at the system DPI: the taskbar's overlay size.
 pub const SM_CXSMICON: c_int = 49;
-pub const SM_CYDRAG: c_int = 69;
 pub extern "user32" fn SystemParametersInfoW(
     action: UINT,
     param: UINT,
@@ -1357,6 +1357,8 @@ pub const FW_BOLD: c_int = 700;
 pub const DEFAULT_CHARSET: DWORD = 1;
 pub const OUT_DEFAULT_PRECIS: DWORD = 0;
 pub const CLIP_DEFAULT_PRECIS: DWORD = 0;
+/// CreateFontW's quality: antialiased in grey, not ClearType's colours.
+pub const ANTIALIASED_QUALITY: DWORD = 4;
 pub const CLEARTYPE_QUALITY: DWORD = 5;
 pub const DEFAULT_PITCH: DWORD = 0;
 /// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createfontw
@@ -1683,8 +1685,6 @@ pub const ICONINFO = extern struct {
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-createiconindirect
 /// The icon has copies of the bitmaps, which the caller still owns.
 pub extern "user32" fn CreateIconIndirect(info: *const ICONINFO) callconv(.winapi) ?HICON;
-/// CreateFontW's quality: antialiased in grey, not ClearType's colours.
-pub const ANTIALIASED_QUALITY: DWORD = 4;
 /// https://learn.microsoft.com/en-us/windows/win32/controls/combo-box-styles
 pub const CBS_DROPDOWNLIST: DWORD = 0x0003;
 /// https://learn.microsoft.com/en-us/windows/win32/controls/bumper-combobox-control-reference-messages
