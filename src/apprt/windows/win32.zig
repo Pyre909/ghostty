@@ -479,6 +479,7 @@ pub const CP_UTF8: UINT = internal_os.windows.CP_UTF8;
 
 pub const MB_OK: UINT = 0x00000000;
 pub const MB_OKCANCEL: UINT = 0x00000001;
+pub const MB_YESNO: UINT = 0x00000004;
 pub const MB_RETRYCANCEL: UINT = 0x00000005;
 pub const MB_ICONWARNING: UINT = 0x00000030;
 pub const MB_ICONINFORMATION: UINT = 0x00000040;
@@ -490,6 +491,7 @@ pub const MB_DEFMASK: UINT = 0x00000F00;
 pub const MB_RIGHT: UINT = 0x00080000;
 pub const MB_RTLREADING: UINT = 0x00100000;
 pub const IDOK: c_int = 1;
+pub const IDYES: c_int = 6;
 pub const IDRETRY: c_int = 4;
 
 pub const MB_ICONASTERISK: UINT = 0x00000040;
@@ -1908,6 +1910,17 @@ pub const ReadFile = internal_os.windows.exp.kernel32.ReadFile;
 pub const WriteFile = internal_os.windows.exp.kernel32.WriteFile;
 pub const CancelIoEx = internal_os.windows.exp.kernel32.CancelIoEx;
 pub const WaitForSingleObject = internal_os.windows.exp.kernel32.WaitForSingleObject;
+pub const GetExitCodeProcess = internal_os.windows.exp.kernel32.GetExitCodeProcess;
+pub const GetSystemDirectoryW = internal_os.windows.exp.kernel32.GetSystemDirectoryW;
+/// https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-comparestringordinal
+pub extern "kernel32" fn CompareStringOrdinal(
+    a: [*]const u16,
+    a_len: c_int,
+    b: [*]const u16,
+    b_len: c_int,
+    ignore_case: BOOL,
+) callconv(.winapi) c_int;
+pub const CSTR_EQUAL: c_int = 2;
 pub const OVERLAPPED = internal_os.windows.OVERLAPPED;
 pub const SECURITY_ATTRIBUTES = internal_os.windows.SECURITY_ATTRIBUTES;
 pub const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;

@@ -1084,6 +1084,7 @@ pub const App = struct {
                 .hwnd = msg_hwnd,
                 .msg = WM_GHOSTTY_UPDATE,
                 .source = .of(config.@"auto-update-channel" orelse build_config.release_channel),
+                .installed = Updater.isInstalledCopy(alloc),
             },
             .hotkey_up = .empty,
             .ipc = null,
@@ -3381,12 +3382,12 @@ pub const App = struct {
         return true;
     }
 
-    /// WM_GHOSTTY_UPDATE: a check is done. What it found is queued for
-    /// `run` to show if there is something to tell (`Updater.report`).
+    /// WM_GHOSTTY_UPDATE: a check or an install is done. What came of it
+    /// is queued for `run` to show if there is something to tell
+    /// (`Updater.Result.tells`, `Updater.report`).
     fn updateFinished(self: *App, lparam: win32.LPARAM) void {
         const job = self.updater.finished(lparam);
-        const tell = job.manual or job.result == .update;
-        if (!tell) return Updater.release(job);
+        if (!job.result.tells(job.manual)) return Updater.release(job);
         self.requests.append(self.core_app.alloc, .{ .update = job }) catch |err| {
             log.warn("update check result not shown err={}", .{err});
             return Updater.release(job);
@@ -17242,15 +17243,19 @@ test "win32: About Ghostty shows the dialog, and Ghostty Help opens the docs" {
 /// (`dialog.test_message_box`), and the check carried to its end.
 const TestUpdate = struct {
     var boxes: usize = 0;
+    var buttons: win32.UINT = 0;
+    /// What the box answers.
+    var answer: c_int = win32.IDOK;
     var text: [256]u16 = undefined;
     var len: usize = 0;
 
-    fn box(_: ?win32.HWND, t: win32.LPCWSTR, _: win32.UINT) c_int {
+    fn box(_: ?win32.HWND, t: win32.LPCWSTR, flags: win32.UINT) c_int {
         boxes += 1;
+        buttons = flags;
         const given = std.mem.span(t);
         len = @min(given.len, text.len);
         @memcpy(text[0..len], given[0..len]);
-        return win32.IDOK;
+        return answer;
     }
 
     fn says(comptime part: []const u8) bool {
@@ -17277,11 +17282,18 @@ const TestUpdate = struct {
     /// The feed's response: `version`, its package at `package` on
     /// `server` for both architectures, of SHA-256 `sha256`.
     fn feed(buf: []u8, server: *const http.TestServer, version: []const u8, package: []const u8, sha256: [32]u8) []const u8 {
-        var body_buf: [512]u8 = undefined;
+        return feedWithNotes(buf, server, version, package, sha256, "");
+    }
+
+    /// As `feed`, with release notes at `notes` on `server`, unless empty.
+    fn feedWithNotes(buf: []u8, server: *const http.TestServer, version: []const u8, package: []const u8, sha256: [32]u8, notes: []const u8) []const u8 {
+        var notes_buf: [128]u8 = undefined;
+        const notes_field = if (notes.len == 0) "" else std.fmt.bufPrint(&notes_buf, "\"notes\":\"http://127.0.0.1:{d}{s}\",", .{ server.port, notes }) catch unreachable;
+        var body_buf: [768]u8 = undefined;
         const hex = std.fmt.bytesToHex(sha256, .lower);
         const body = std.fmt.bufPrint(&body_buf,
-            \\{{"version":"{s}","packages":{{"x86_64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}},"aarch64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}}}}}}
-        , .{ version, server.port, package, &hex, server.port, package, &hex }) catch unreachable;
+            \\{{"version":"{s}",{s}"packages":{{"x86_64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}},"aarch64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}}}}}}
+        , .{ version, notes_field, server.port, package, &hex, server.port, package, &hex }) catch unreachable;
         return std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
     }
 };
@@ -17409,6 +17421,227 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     const got = (try http.testRead(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
+}
+
+/// For tests: the update offer's task dialog (`About.test_record`), and
+/// msiexec (`Updater.test_msiexec`).
+const TestOffer = struct {
+    var offers: usize = 0;
+    var ids: [4]c_int = undefined;
+    var labels: [4][]const u16 = undefined;
+    var count: usize = 0;
+    var default: c_int = 0;
+    var content: [512]u16 = undefined;
+    var content_len: usize = 0;
+    var callback: ?About.Callback = null;
+    var data: isize = 0;
+    /// The button the fake dialog answers.
+    var choose: c_int = win32.IDCANCEL;
+
+    var installs: usize = 0;
+    var installed: [512]u16 = undefined;
+    var installed_len: usize = 0;
+    /// What the fake msiexec exits with.
+    var exit_code: u32 = 0;
+
+    fn taskDialog(
+        config: *const About.TASKDIALOGCONFIG,
+        button: ?*c_int,
+        _: ?*c_int,
+        _: ?*win32.BOOL,
+    ) callconv(.winapi) win32.HRESULT {
+        offers += 1;
+        const given: [*]const About.TASKDIALOG_BUTTON = @ptrCast(config.pButtons.?);
+        count = @min(config.cButtons, ids.len);
+        for (given[0..count], 0..) |b, k| {
+            ids[k] = b.nButtonID;
+            labels[k] = std.mem.span(b.pszButtonText);
+        }
+        default = config.nDefaultButton;
+        const c = std.mem.span(config.pszContent.?);
+        content_len = @min(c.len, content.len);
+        @memcpy(content[0..content_len], c[0..content_len]);
+        callback = config.pfCallback;
+        data = config.lpCallbackData;
+        // The link works while the dialog is open, and only then.
+        if (link_to_click) |href| _ = callback.?(null, About.TDN_HYPERLINK_CLICKED, 0, @bitCast(@intFromPtr(href.ptr)), data);
+        button.?.* = choose;
+        return win32.S_OK;
+    }
+    var link_to_click: ?[:0]const u16 = null;
+
+    fn says(comptime part: []const u8) bool {
+        return std.mem.indexOf(u16, content[0..content_len], std.unicode.utf8ToUtf16LeStringLiteral(part)) != null;
+    }
+
+    fn msiexec(path: [:0]const u16) u32 {
+        installs += 1;
+        installed_len = @min(path.len, installed.len);
+        @memcpy(installed[0..installed_len], path[0..installed_len]);
+        return exit_code;
+    }
+};
+
+test "win32: an offered update installs its package with msiexec, or opens its release page where Ghostty is not the package's" {
+    const alloc = std.testing.allocator;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestUpdate.box;
+    defer message_box.* = null;
+    TestUpdate.boxes = 0;
+    TestUpdate.answer = win32.IDOK;
+    defer TestUpdate.answer = win32.IDOK;
+    About.test_record = .{ .task_dialog = TestOffer.taskDialog };
+    defer About.test_record = .{};
+    Updater.test_msiexec = &TestOffer.msiexec;
+    defer Updater.test_msiexec = null;
+    defer Updater.test_opened = null;
+    TestOffer.offers = 0;
+    TestOffer.installs = 0;
+    TestOffer.exit_code = 0;
+    TestOffer.choose = win32.IDCANCEL;
+    TestOffer.link_to_click = null;
+    defer TestOffer.link_to_click = null;
+
+    const releases = "/owner/repo/releases/";
+    const package_path = releases ++ "download/t/ghostty-updater-test.msi";
+    const package = "the package's bytes";
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(package, &sha256, .{});
+    var server: http.TestServer = undefined;
+    var routes = [_]http.TestServer.Route{
+        .{ .path = releases ++ "feed.json", .response = "" },
+        .{ .path = package_path, .response = http.okResponse(package) },
+    };
+    try server.start(&routes);
+    defer server.stop();
+    var releases_buf: [128]u8 = undefined;
+    var feed_url_buf: [128]u8 = undefined;
+    app.updater.source = .{
+        .releases = server.url(&releases_buf, releases),
+        .feed = server.url(&feed_url_buf, releases ++ "feed.json"),
+        .https_only = false,
+        .system_proxy = false,
+    };
+    var feed_buf: [1024]u8 = undefined;
+    routes[0].response = TestUpdate.feedWithNotes(&feed_buf, &server, "999.0.0", package_path, sha256, releases ++ "tag/v999");
+    var notes_buf: [128]u8 = undefined;
+    const notes = server.url(&notes_buf, releases ++ "tag/v999");
+    const notes_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, notes);
+    defer alloc.free(notes_wide);
+
+    const saved = try http.testPath(alloc, "");
+    defer alloc.free(saved);
+    const dir = saved[0 .. std.mem.lastIndexOfScalar(u16, saved, '\\').? + 1];
+    Updater.test_package_dir = dir;
+    defer Updater.test_package_dir = null;
+    const file = try std.mem.concatWithSentinel(alloc, u16, &.{ dir, W("ghostty-updater-test.msi") }, 0);
+    defer alloc.free(file);
+    _ = win32.DeleteFileW(file);
+    defer _ = win32.DeleteFileW(file);
+
+    // The package's own Ghostty is offered Install, the default, and
+    // Later; the release notes are a link, which opens them, and no other.
+    app.updater.installed = true;
+    TestOffer.link_to_click = W("https://example.com");
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(1, TestOffer.offers);
+    try std.testing.expectEqual(2, TestOffer.count);
+    try std.testing.expectEqual(Updater.install_id, TestOffer.ids[0]);
+    try std.testing.expectEqualSlices(u16, W("Install"), TestOffer.labels[0]);
+    try std.testing.expectEqual(win32.IDCANCEL, TestOffer.ids[1]);
+    try std.testing.expectEqual(Updater.install_id, TestOffer.default);
+    try std.testing.expect(TestOffer.says("999.0.0"));
+    try std.testing.expect(std.mem.indexOf(u16, TestOffer.content[0..TestOffer.content_len], notes_wide) != null);
+    try std.testing.expectEqual(null, Updater.test_opened);
+    // Later: nothing more.
+    try std.testing.expectEqual(null, app.updater.running);
+    try std.testing.expectEqual(0, TestOffer.installs);
+    try std.testing.expectEqual(0, TestUpdate.boxes);
+
+    TestOffer.link_to_click = notes_wide;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
+    TestOffer.link_to_click = null;
+
+    // Install: the package is downloaded, its hash checked, and handed to
+    // msiexec; then the user is told to restart.
+    TestOffer.choose = Updater.install_id;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(1, TestOffer.installs);
+    try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
+    const got = (try http.testRead(alloc, file)).?;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(package, got);
+    try std.testing.expectEqual(1, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("Ghostty 999.0.0 is installed. Restart Ghostty"));
+
+    // msiexec's failure is told with its code; the user's cancel is not.
+    TestOffer.exit_code = 1603;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(2, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("1603"));
+    TestOffer.exit_code = 1602;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(3, TestOffer.installs);
+    try std.testing.expectEqual(2, TestUpdate.boxes);
+    TestOffer.exit_code = 0;
+
+    // A package `download` saved already is installed as it is.
+    app.updater.configure(.download);
+    const before = server.requests.load(.monotonic);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(before + 2, server.requests.load(.monotonic));
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(before + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(4, TestOffer.installs);
+    try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
+    app.updater.configure(.off);
+
+    // A Ghostty that is not the package's (a zip, a build of one's own)
+    // is only offered the release page.
+    app.updater.installed = false;
+    Updater.test_opened = null;
+    TestOffer.choose = Updater.release_page_id;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(Updater.release_page_id, TestOffer.ids[0]);
+    try std.testing.expectEqualSlices(u16, W("Open Release Page"), TestOffer.labels[0]);
+    try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
+    try std.testing.expectEqual(null, app.updater.running);
+    try std.testing.expectEqual(4, TestOffer.installs);
+
+    // Without a task dialog, a message box asks, and Yes installs.
+    About.test_record.task_dialog = null;
+    app.updater.installed = true;
+    TestUpdate.answer = win32.IDYES;
+    const boxes = TestUpdate.boxes;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(boxes + 1, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.buttons & win32.MB_YESNO != 0);
+    try std.testing.expect(TestUpdate.says("Install it now?"));
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(5, TestOffer.installs);
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {

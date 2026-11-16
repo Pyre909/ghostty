@@ -235,9 +235,9 @@ fn callback(
 // https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-taskdialogindirect
 
 pub const TDF_ENABLE_HYPERLINKS: c_int = 0x0001;
-const TDF_ALLOW_DIALOG_CANCELLATION: c_int = 0x0008;
-const TDF_POSITION_RELATIVE_TO_WINDOW: c_int = 0x1000;
-const TDF_RTL_LAYOUT: c_int = 0x2000;
+pub const TDF_ALLOW_DIALOG_CANCELLATION: c_int = 0x0008;
+pub const TDF_POSITION_RELATIVE_TO_WINDOW: c_int = 0x1000;
+pub const TDF_RTL_LAYOUT: c_int = 0x2000;
 const TDCBF_OK_BUTTON: c_int = 0x0001;
 pub const TDN_HYPERLINK_CLICKED: UINT = 3;
 
@@ -274,6 +274,13 @@ pub const TASKDIALOGCONFIG = extern struct {
     cxWidth: UINT align(1) = 0,
 };
 
+/// A button of the dialog's own (`TASKDIALOGCONFIG.pButtons`), packed
+/// as the config is.
+pub const TASKDIALOG_BUTTON = extern struct {
+    nButtonID: c_int align(1),
+    pszButtonText: LPCWSTR align(1),
+};
+
 pub const TaskDialogIndirectFn = *const fn (
     config: *const TASKDIALOGCONFIG,
     button: ?*c_int,
@@ -294,7 +301,7 @@ pub var test_record: if (builtin.is_test) TestRecord else void =
     if (builtin.is_test) .{} else {};
 
 /// TaskDialogIndirect, looked up once (`lookUp`).
-fn taskDialog() ?TaskDialogIndirectFn {
+pub fn taskDialog() ?TaskDialogIndirectFn {
     if (builtin.is_test) return test_record.task_dialog;
     const State = struct {
         var looked_up = false;
