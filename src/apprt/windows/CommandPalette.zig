@@ -113,6 +113,7 @@ pub fn supported(key: Binding.Action.Key) bool {
         .toggle_tab_overview,
         .toggle_quick_terminal,
         .toggle_visibility,
+        .check_for_updates,
         .open_config,
         .reload_config,
         .quit,
@@ -128,9 +129,8 @@ pub fn supported(key: Binding.Action.Key) bool {
         // Windows has no selection clipboard (`Surface.supportsClipboard`).
         .paste_from_selection,
         // What these become, `App.performAction` does not handle: there is
-        // no GTK inspector, updater or secure input here.
+        // no GTK inspector or secure input here.
         .close_all_windows,
-        .check_for_updates,
         .show_gtk_inspector,
         .toggle_secure_input,
         => false,
@@ -2551,6 +2551,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
     var saw_split = false;
     var saw_tab = false;
     var saw_inspector = false;
+    var saw_updates = false;
     for (entries.items) |*e| switch (e.run) {
         .action => |action| {
             try testing.expect(supported(action));
@@ -2574,12 +2575,15 @@ test "win32: the palette's entries are the supported commands and a jump per ter
                 try testing.expectEqualStrings("Toggle Inspector", e.title);
                 try testing.expectEqualStrings("Ctrl+Shift+I", e.shortcut);
             }
+            if (std.mem.eql(u8, e.action_key, "check_for_updates")) {
+                saw_updates = true;
+                try testing.expectEqualStrings("Check for Updates", e.title);
+            }
             try testing.expect(!std.mem.eql(u8, e.action_key, "show_gtk_inspector"));
-            try testing.expect(!std.mem.eql(u8, e.action_key, "check_for_updates"));
         },
         .jump => {},
     };
-    try testing.expect(saw_split and saw_tab and saw_inspector);
+    try testing.expect(saw_split and saw_tab and saw_inspector and saw_updates);
 
     // The jumps: "Focus: <title>", "Untitled" for none, the directory as
     // the description unless the title shows it; two of the same title in

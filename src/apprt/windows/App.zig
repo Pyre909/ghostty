@@ -33,6 +33,9 @@ const Session = @import("Session.zig");
 const IpcClient = @import("IpcClient.zig");
 const jumplist = @import("jumplist.zig");
 const About = @import("About.zig");
+const Updater = @import("Updater.zig");
+const http = @import("http.zig");
+const build_config = @import("../../build_config.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
 const ipc = @import("ipc.zig");
@@ -97,6 +100,8 @@ pub const WM_GHOSTTY_QUICK_HIDE: win32.UINT = win32.WM_APP + 5;
 /// Posted to the message-only window by the IPC thread (`IpcServer`) for
 /// each request it reads, which `ipcRequests` answers.
 pub const WM_GHOSTTY_IPC: win32.UINT = win32.WM_APP + 6;
+/// An update check's thread is done; LPARAM is its `Updater.Job`.
+pub const WM_GHOSTTY_UPDATE: win32.UINT = win32.WM_APP + 7;
 
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
@@ -361,6 +366,10 @@ pub const App = struct {
     /// it at all (`Undo`): as the configuration says, from `init` and each
     /// `.config_change`.
     undo: Undo,
+
+    /// Update checks, `check_for_updates` and `auto-update`'s, on
+    /// `msg_hwnd`: from `init` and each `.config_change`.
+    updater: Updater,
 
     /// The virtual keys whose press a hotkey took (`hotkeyPressed`).
     /// Windows sends such a key's release to the window that has the
@@ -894,6 +903,10 @@ pub const App = struct {
         /// longer one of `windows`, and the dialog is not shown.
         about: win32.HWND,
 
+        /// What an update check found, to tell the user (`Updater.report`),
+        /// shown by `run` as About is. The request owns the job.
+        update: *Updater.Job,
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -1067,6 +1080,11 @@ pub const App = struct {
             .terminating = false,
             .hotkeys = .{},
             .undo = .{},
+            .updater = .{
+                .hwnd = msg_hwnd,
+                .msg = WM_GHOSTTY_UPDATE,
+                .source = .of(config.@"auto-update-channel" orelse build_config.release_channel),
+            },
             .hotkey_up = .empty,
             .ipc = null,
             .ipc_instance = null,
@@ -1093,6 +1111,7 @@ pub const App = struct {
             log.warn("cannot register the global keybinds err={}", .{err});
         };
         self.undo.configure(self, &self.config);
+        self.updater.configure(self.config.@"auto-update");
     }
 
     pub fn terminate(self: *App) void {
@@ -1126,6 +1145,7 @@ pub const App = struct {
         self.freeRequests();
 
         self.stopQuitTimer();
+        self.updater.deinit();
 
         if (self.session) |store| {
             self.session = null;
@@ -1324,6 +1344,7 @@ pub const App = struct {
             // now never does.
             .ipc => |ipc_request| ipc_request.destroy(self.core_app.alloc),
             .export_io => |export_io| self.core_app.alloc.free(export_io.contents),
+            .update => |job| Updater.release(job),
             else => {},
         }
         request.* = .dropped;
@@ -2212,6 +2233,7 @@ pub const App = struct {
             .new_window => self.requestWindow(target),
             .toggle_quick_terminal => self.requestQuickTerminal(),
             .toggle_visibility => self.requestVisibility(),
+            .check_for_updates => self.checkForUpdates(),
             .undo => self.requestUndo(),
             .redo => self.requestRedo(),
             .new_tab => self.requestTab(target),
@@ -3130,6 +3152,7 @@ pub const App = struct {
         // Only posts teardowns, so it is safe in the core frame a soft
         // reload comes in.
         self.undo.configure(self, &self.config);
+        self.updater.configure(self.config.@"auto-update");
         // With no window open (a global reload_config, or the soft reload
         // after a change of color scheme), decide again whether the app
         // stays open: a reload that registers a hotkey that opens a window
@@ -3352,6 +3375,25 @@ pub const App = struct {
     /// `.toggle_visibility`, which the core performs for the app wherever
     /// it is bound: recorded for `run`, as `requestQuickTerminal` records
     /// its toggle, since it moves the foreground. `true` once recorded.
+    /// `check_for_updates`: a check that reports whatever it finds.
+    fn checkForUpdates(self: *App) bool {
+        self.updater.start(true);
+        return true;
+    }
+
+    /// WM_GHOSTTY_UPDATE: a check is done. What it found is queued for
+    /// `run` to show if there is something to tell (`Updater.report`).
+    fn updateFinished(self: *App, lparam: win32.LPARAM) void {
+        const job = self.updater.finished(lparam);
+        const tell = job.manual or job.result == .update;
+        if (!tell) return Updater.release(job);
+        self.requests.append(self.core_app.alloc, .{ .update = job }) catch |err| {
+            log.warn("update check result not shown err={}", .{err});
+            return Updater.release(job);
+        };
+        self.wakeup();
+    }
+
     fn requestVisibility(self: *App) bool {
         self.requests.append(self.core_app.alloc, .visibility) catch |err| {
             log.warn("cannot record toggling the windows' visibility err={}", .{err});
@@ -3605,7 +3647,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .about, .dropped => {},
+            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .about, .update, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -4327,6 +4369,11 @@ pub const App = struct {
                     self.requests.items[i] = .dropped;
                     About.showQueued(self, hwnd);
                 },
+                .update => |job| {
+                    self.requests.items[i] = .dropped;
+                    defer Updater.release(job);
+                    Updater.report(self, job);
+                },
                 .dropped => {},
             }
         }
@@ -4876,6 +4923,11 @@ pub const App = struct {
                 return 0;
             },
 
+            WM_GHOSTTY_UPDATE => {
+                self.updateFinished(lparam);
+                return 0;
+            },
+
             // `run` quits once the timer has expired, the next time round
             // its loop.
             win32.WM_TIMER => if (wparam == quit_timer_id) {
@@ -4883,6 +4935,9 @@ pub const App = struct {
                 return 0;
             } else if (wparam == Undo.timer_id) {
                 self.undo.expireDue(self);
+                return 0;
+            } else if (wparam == Updater.timer_id) {
+                self.updater.timerFired();
                 return 0;
             },
 
@@ -5792,6 +5847,9 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
         null,
         null,
     ) orelse return error.TestUnexpectedResult;
+    // No test reaches the network: a check is refused on the discard
+    // port unless the test points it at its own server.
+    app.updater = .{ .hwnd = app.msg_hwnd, .msg = WM_GHOSTTY_UPDATE, .source = Updater.test_source };
 }
 
 /// For tests: a hidden frame made as `newWindow` makes one
@@ -6001,6 +6059,7 @@ pub fn testCleanup(app: *App) void {
     app.freeRequests();
     app.bell_audio.deinit(alloc);
     app.hotkeys.deinit(alloc, app.msg_hwnd);
+    app.updater.testDrop();
     app.config.deinit();
     _ = win32.DestroyWindow(app.msg_hwnd);
 }
@@ -17179,6 +17238,179 @@ test "win32: About Ghostty shows the dialog, and Ghostty Help opens the docs" {
     try std.testing.expect(std.mem.endsWith(u16, text, W(About.website)));
 }
 
+/// For tests: what an update check's report showed
+/// (`dialog.test_message_box`), and the check carried to its end.
+const TestUpdate = struct {
+    var boxes: usize = 0;
+    var text: [256]u16 = undefined;
+    var len: usize = 0;
+
+    fn box(_: ?win32.HWND, t: win32.LPCWSTR, _: win32.UINT) c_int {
+        boxes += 1;
+        const given = std.mem.span(t);
+        len = @min(given.len, text.len);
+        @memcpy(text[0..len], given[0..len]);
+        return win32.IDOK;
+    }
+
+    fn says(comptime part: []const u8) bool {
+        return std.mem.indexOf(u16, text[0..len], std.unicode.utf8ToUtf16LeStringLiteral(part)) != null;
+    }
+
+    /// Wait up to 20 s for the running check's message, dispatch it as
+    /// the loop would, and carry out what it queued as `run` does.
+    fn finish(app: *App) !void {
+        try std.testing.expect(app.updater.running != null);
+        var posted: win32.MSG = undefined;
+        var waited: usize = 0;
+        while (!win32.PeekMessageW(&posted, app.msg_hwnd, WM_GHOSTTY_UPDATE, WM_GHOSTTY_UPDATE, win32.PM_REMOVE).toBool()) {
+            if (waited >= 2000) return error.TestUnexpectedResult;
+            win32.Sleep(10);
+            waited += 1;
+        }
+        _ = App.wndProc(app.msg_hwnd, posted.message, posted.wParam, posted.lParam);
+        try std.testing.expectEqual(null, app.updater.running);
+        app.createRequested();
+        try std.testing.expectEqual(0, app.requests.items.len);
+    }
+
+    /// The feed's response: `version`, its package at `package` on
+    /// `server` for both architectures, of SHA-256 `sha256`.
+    fn feed(buf: []u8, server: *const http.TestServer, version: []const u8, package: []const u8, sha256: [32]u8) []const u8 {
+        var body_buf: [512]u8 = undefined;
+        const hex = std.fmt.bytesToHex(sha256, .lower);
+        const body = std.fmt.bufPrint(&body_buf,
+            \\{{"version":"{s}","packages":{{"x86_64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}},"aarch64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}}}}}}
+        , .{ version, server.port, package, &hex, server.port, package, &hex }) catch unreachable;
+        return std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
+    }
+};
+
+test "win32: check_for_updates reports an update, none or a failure; auto-update only an update, saved if it downloads" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    // A report with no window of its own asks the core for its focused
+    // terminal (`fallbackOwner`): none here.
+    core_app.surfaces = .empty;
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestUpdate.box;
+    defer message_box.* = null;
+    TestUpdate.boxes = 0;
+
+    const releases = "/owner/repo/releases/";
+    const package_path = releases ++ "download/t/ghostty-updater-test.msi";
+    const package = "the package's bytes";
+    var sha256: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(package, &sha256, .{});
+    const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    var server: http.TestServer = undefined;
+    var routes = [_]http.TestServer.Route{
+        .{ .path = releases ++ "feed.json", .response = not_found },
+        .{ .path = package_path, .response = http.okResponse(package) },
+    };
+    try server.start(&routes);
+    defer server.stop();
+    var releases_buf: [128]u8 = undefined;
+    var feed_url_buf: [128]u8 = undefined;
+    app.updater.source = .{
+        .releases = server.url(&releases_buf, releases),
+        .feed = server.url(&feed_url_buf, releases ++ "feed.json"),
+        .https_only = false,
+        .system_proxy = false,
+    };
+    var feed_buf: [1024]u8 = undefined;
+    const newer = TestUpdate.feed(&feed_buf, &server, "999.0.0", package_path, sha256);
+    var older_buf: [1024]u8 = undefined;
+    const older = TestUpdate.feed(&older_buf, &server, "0.0.1", package_path, sha256);
+    var bad_hash_buf: [1024]u8 = undefined;
+    const bad_hash = TestUpdate.feed(&bad_hash_buf, &server, "999.0.0", package_path, @splat(0));
+
+    // Asked for, a check tells whatever it finds; asked for again while
+    // it runs, it is the same check.
+    routes[0].response = newer;
+    try std.testing.expect(try app.performAction(.app, .check_for_updates, {}));
+    const job = app.updater.running;
+    try std.testing.expect(try app.performAction(.app, .check_for_updates, {}));
+    try std.testing.expectEqual(job, app.updater.running);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(1, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+    // Only the feed: `auto-update` is off, so nothing downloads.
+    try std.testing.expectEqual(1, server.requests.load(.monotonic));
+
+    routes[0].response = older;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(2, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("up to date"));
+
+    routes[0].response = not_found;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(3, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check"));
+
+    // `auto-update` checks at its timer and tells only of an update.
+    app.updater.configure(.check);
+    try std.testing.expect(app.updater.armed);
+    for ([_][]const u8{ not_found, older }) |response| {
+        routes[0].response = response;
+        _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+        try TestUpdate.finish(&app);
+    }
+    try std.testing.expectEqual(3, TestUpdate.boxes);
+    routes[0].response = newer;
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(4, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+    // A manual check while an automatic one runs makes it tell all.
+    routes[0].response = older;
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(5, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("up to date"));
+
+    // Off, a WM_TIMER already queued starts nothing.
+    app.updater.configure(.off);
+    try std.testing.expect(!app.updater.armed);
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try std.testing.expectEqual(null, app.updater.running);
+
+    // `download` saves the package, if its hash is the feed's, before
+    // telling of it; one that is not is removed, and nothing told.
+    const saved = try http.testPath(alloc, "");
+    defer alloc.free(saved);
+    const dir = saved[0 .. std.mem.lastIndexOfScalar(u16, saved, '\\').? + 1];
+    Updater.test_package_dir = dir;
+    defer Updater.test_package_dir = null;
+    const file = try std.mem.concatWithSentinel(alloc, u16, &.{ dir, std.unicode.utf8ToUtf16LeStringLiteral("ghostty-updater-test.msi") }, 0);
+    defer alloc.free(file);
+    defer _ = win32.DeleteFileW(file);
+    app.updater.configure(.download);
+    routes[0].response = bad_hash;
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(5, TestUpdate.boxes);
+    try std.testing.expectEqual(null, try http.testRead(alloc, file));
+    routes[0].response = newer;
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(6, TestUpdate.boxes);
+    const got = (try http.testRead(alloc, file)).?;
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(package, got);
+}
+
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {
     // Only once Explorer says the button exists, as ITaskbarList3 asks, and
     // only the focused terminal's, as Windows Terminal shows its focused
@@ -22014,7 +22246,6 @@ test "win32: the command palette lists only what performAction carries out" {
     const cases = [_]Case{
         // Left out.
         .{ .close_all_windows, .close_all_windows },
-        .{ .check_for_updates, .check_for_updates },
         .{ .show_gtk_inspector, .show_gtk_inspector },
         .{ .toggle_secure_input, .secure_input },
         // Listed.
@@ -22063,6 +22294,7 @@ test "win32: the command palette lists only what performAction carries out" {
         .{ .toggle_visibility, .toggle_visibility },
         .{ .reload_config, .reload_config },
         .{ .set_window_theme, .set_window_theme },
+        .{ .check_for_updates, .check_for_updates },
         .{ .quit, .quit },
     };
     var listed: usize = 0;
@@ -22125,7 +22357,7 @@ test "win32: the command palette lists only what performAction carries out" {
         }
         if (performed) listed += 1;
     }
-    try std.testing.expectEqual(41, listed);
+    try std.testing.expectEqual(42, listed);
     // What the listed ones recorded is not carried out here.
     app.requests.clearRetainingCapacity();
 }
@@ -30378,7 +30610,7 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         // Not performed by this runtime yet: every action the command
         // palette leaves out, alone or chained.
         "global:ctrl+c=toggle_secure_input",
-        "global:ctrl+d=check_for_updates",
+        "global:ctrl+d=show_gtk_inspector",
         "global:ctrl+e=close_all_windows",
         "global:ctrl+g=paste_from_selection",
         "global:ctrl+h=show_gtk_inspector",

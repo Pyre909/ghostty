@@ -13,8 +13,9 @@
 //!
 //! `parse` decides from it whether this build should update, and to what.
 //! What it accepts is narrow on purpose, as the URLs it returns are
-//! downloaded and run, and opened in the browser: both must be HTTPS
-//! under the releases page the build names (`releases`), the download a
+//! downloaded and run, and opened in the browser: both must be under
+//! the releases page the build names (`releases`, an HTTPS URL but in
+//! tests, which serve the feed on a loopback port), the download a
 //! `.msi` of plain path segments, and the version semantic (semver.org),
 //! newer than this build's by semver's precedence. Unknown fields are
 //! ignored, so that a later feed can add some.
@@ -87,7 +88,6 @@ pub fn parse(
     arch: Arch,
     releases: []const u8,
 ) Error!?Update {
-    std.debug.assert(std.mem.startsWith(u8, releases, "https://"));
     std.debug.assert(std.mem.endsWith(u8, releases, "/releases/"));
 
     const feed = std.json.parseFromSliceLeaky(Feed, arena, body, .{

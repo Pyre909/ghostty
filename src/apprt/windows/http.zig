@@ -234,10 +234,10 @@ fn failed(comptime what: []const u8) error{RequestFailed} {
     return error.RequestFailed;
 }
 
-/// For tests: an HTTP/1.1 server on a loopback port that answers each
+/// For tests, here and the updater's: an HTTP/1.1 server on a loopback port that answers each
 /// request by its path from `routes`, one connection at a time, until
 /// `stop`.
-const TestServer = struct {
+pub const TestServer = struct {
     const SOCKET = usize;
     const invalid: SOCKET = std.math.maxInt(usize);
     const SockaddrIn = extern struct {
@@ -260,7 +260,7 @@ const TestServer = struct {
         extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
     };
 
-    const Route = struct { path: []const u8, response: []const u8 };
+    pub const Route = struct { path: []const u8, response: []const u8 };
 
     listener: SOCKET,
     port: u16,
@@ -268,7 +268,7 @@ const TestServer = struct {
     thread: std.Thread,
     requests: std.atomic.Value(usize) = .init(0),
 
-    fn start(self: *TestServer, routes: []const Route) !void {
+    pub fn start(self: *TestServer, routes: []const Route) !void {
         var data: [512]u8 align(8) = undefined;
         if (ws.WSAStartup(0x0202, &data) != 0) return error.WSAStartup;
         const s = ws.socket(2, 1, 6); // AF_INET, SOCK_STREAM, IPPROTO_TCP
@@ -289,7 +289,7 @@ const TestServer = struct {
     }
 
     /// Close the listener, which ends the pending accept, and wait.
-    fn stop(self: *TestServer) void {
+    pub fn stop(self: *TestServer) void {
         _ = ws.closesocket(self.listener);
         self.thread.join();
         _ = ws.WSACleanup();
@@ -325,12 +325,12 @@ const TestServer = struct {
         }
     }
 
-    fn url(self: *const TestServer, buf: []u8, path: []const u8) []const u8 {
+    pub fn url(self: *const TestServer, buf: []u8, path: []const u8) []const u8 {
         return std.fmt.bufPrint(buf, "http://127.0.0.1:{}{s}", .{ self.port, path }) catch unreachable;
     }
 };
 
-fn okResponse(comptime body: []const u8) []const u8 {
+pub fn okResponse(comptime body: []const u8) []const u8 {
     return std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{body.len}) ++ body;
 }
 
@@ -343,7 +343,7 @@ const hundred_bytes: [100]u8 = blk: {
 };
 
 /// A temporary file's path, the caller's to free.
-fn testPath(alloc: Allocator, name: []const u8) ![:0]u16 {
+pub fn testPath(alloc: Allocator, name: []const u8) ![:0]u16 {
     var dir: [win32.MAX_PATH + 1]u16 = undefined;
     const n = win32.GetTempPathW(dir.len, @ptrCast(&dir));
     if (n == 0 or n >= dir.len) return error.TempPath;
@@ -355,7 +355,7 @@ fn testPath(alloc: Allocator, name: []const u8) ![:0]u16 {
 }
 
 /// The contents of `path`, or null if there is no such file.
-fn testRead(alloc: Allocator, path: [:0]const u16) !?[]u8 {
+pub fn testRead(alloc: Allocator, path: [:0]const u16) !?[]u8 {
     const file = win32.CreateFileW(path, win32.GENERIC_READ, win32.FILE_SHARE_READ, null, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, null);
     if (file == win32.INVALID_HANDLE_VALUE) return null;
     defer _ = win32.CloseHandle(file);

@@ -4074,8 +4074,8 @@ term: []const u8 = "xterm-ghostty",
 @"async-backend": AsyncBackend = .auto,
 
 /// Control the auto-update functionality of Ghostty. This is only supported
-/// on macOS currently, since Linux builds are distributed via package
-/// managers that are not centrally controlled by Ghostty.
+/// on macOS and Windows currently, since Linux builds are distributed via
+/// package managers that are not centrally controlled by Ghostty.
 ///
 /// Checking or downloading an update does not send any information to
 /// the project beyond standard network information mandated by the
@@ -4094,6 +4094,9 @@ term: []const u8 = "xterm-ghostty",
 ///
 /// If unset, we defer to Sparkle's default behavior, which respects the
 /// preference stored in the standard user defaults (`defaults(1)`).
+/// On Windows, unset is `off`. There, `check` looks shortly after start
+/// and then daily, and an update is offered from its installer package
+/// (`.msi`), which `download` fetches before telling of it.
 ///
 /// Changing this value at runtime works after a small delay.
 @"auto-update": ?AutoUpdate = null,
@@ -4117,7 +4120,8 @@ term: []const u8 = "xterm-ghostty",
 /// Changing this configuration requires a full restart of
 /// Ghostty to take effect.
 ///
-/// This only works on macOS since only macOS has an auto-update feature.
+/// This only works on macOS and Windows, the only platforms with an
+/// auto-update feature.
 @"auto-update-channel": ?build_config.ReleaseChannel = null,
 
 /// This is set by the CLI parser for deinit.
