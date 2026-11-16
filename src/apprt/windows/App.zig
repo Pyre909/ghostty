@@ -887,6 +887,13 @@ pub const App = struct {
         /// out (`carryOutIpc`) or dropped (`freeRequest`).
         ipc: *IpcRequest,
 
+        /// About Ghostty, chosen in this frame's window menu: `run` shows
+        /// the dialog (`About.showQueued`), outside any core frame, so
+        /// that its loop goes on ticking the core, as the Save dialog's
+        /// does (`beginUnframedPrompt`). A frame closed meanwhile is no
+        /// longer one of `windows`, and the dialog is not shown.
+        about: win32.HWND,
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -3598,7 +3605,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .dropped => {},
+            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .about, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -4313,6 +4320,12 @@ pub const App = struct {
                 .ipc => |request| {
                     self.requests.items[i] = .dropped;
                     self.carryOutIpc(request);
+                },
+                // Dropped first, as `export_io` is: the dialog's loop can
+                // add requests.
+                .about => |hwnd| {
+                    self.requests.items[i] = .dropped;
+                    About.showQueued(self, hwnd);
                 },
                 .dropped => {},
             }
@@ -16962,8 +16975,14 @@ test "win32: a window's menu ends with About Ghostty and Ghostty Help" {
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("About Ghostty"), buf[0..@intCast(len)]);
 }
 
-/// For tests: what TaskDialogIndirect was given (`About.test_record`).
+/// For tests: what TaskDialogIndirect was given (`About.test_record`),
+/// and what held while it was open, or what the message box was given
+/// in its place (`dialog.test_message_box`).
 const TestAbout = struct {
+    var app: *App = undefined;
+    /// A frame the dialog does not belong to.
+    var other: win32.HWND = undefined;
+
     var shown_count: usize = 0;
     var owner: ?win32.HWND = null;
     var flags: c_int = 0;
@@ -16971,7 +16990,39 @@ const TestAbout = struct {
     var title_len: usize = 0;
     var content: [256]u16 = undefined;
     var content_len: usize = 0;
-    var callback: ?*const fn (?win32.HWND, win32.UINT, win32.WPARAM, win32.LPARAM, isize) callconv(.winapi) win32.HRESULT = null;
+    var callback: ?About.Callback = null;
+    /// What the fake dialog answers.
+    var result: win32.HRESULT = win32.S_OK;
+
+    /// While it was open.
+    var depth_during: u32 = 0;
+    var other_enabled_during = true;
+    var ticked: usize = 0;
+    var ticks: usize = 0;
+
+    var boxes: usize = 0;
+    var box_flags: win32.UINT = 0;
+    var box_text: [256]u16 = undefined;
+    var box_len: usize = 0;
+
+    fn reset(to: *App, frame: win32.HWND) void {
+        app = to;
+        other = frame;
+        shown_count = 0;
+        owner = null;
+        flags = 0;
+        title_len = 0;
+        content_len = 0;
+        callback = null;
+        result = win32.S_OK;
+        depth_during = 0;
+        other_enabled_during = true;
+        ticked = 0;
+        ticks = 0;
+        boxes = 0;
+        box_flags = 0;
+        box_len = 0;
+    }
 
     fn taskDialog(
         config: *const About.TASKDIALOGCONFIG,
@@ -16989,16 +17040,45 @@ const TestAbout = struct {
         content_len = @min(c.len, content.len);
         @memcpy(content[0..content_len], c[0..content_len]);
         callback = config.pfCallback;
-        return win32.S_OK;
+        depth_during = app.prompt_depth;
+        other_enabled_during = win32.IsWindowEnabled(other).toBool();
+        ticked = wakeups();
+        return result;
+    }
+
+    fn box(_: ?win32.HWND, text: win32.LPCWSTR, buttons: win32.UINT) c_int {
+        boxes += 1;
+        box_flags = buttons;
+        const t = std.mem.span(text);
+        box_len = @min(t.len, box_text.len);
+        @memcpy(box_text[0..box_len], t[0..box_len]);
+        return win32.IDOK;
     }
 
     fn click(href: [*:0]const u16) void {
-        _ = callback.?(null, 3, 0, @bitCast(@intFromPtr(href)), 0);
+        _ = callback.?(null, About.TDN_HYPERLINK_CLICKED, 0, @bitCast(@intFromPtr(href)), 0);
+    }
+
+    fn tick(_: *App) void {
+        ticks += 1;
+    }
+
+    /// The ticks a wakeup posted now starts, dispatched as the dialog's
+    /// loop would dispatch it, with any posted before.
+    fn wakeups() usize {
+        const before = ticks;
+        app.wakeup();
+        var posted: win32.MSG = undefined;
+        while (win32.PeekMessageW(&posted, app.msg_hwnd, WM_GHOSTTY_WAKEUP, WM_GHOSTTY_WAKEUP, win32.PM_REMOVE).toBool()) {
+            _ = App.wndProc(app.msg_hwnd, posted.message, posted.wParam, posted.lParam);
+        }
+        return ticks - before;
     }
 };
 
 test "win32: About Ghostty shows the dialog, and Ghostty Help opens the docs" {
     const alloc = std.testing.allocator;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
     var app: App = undefined;
@@ -17006,38 +17086,78 @@ test "win32: About Ghostty shows the dialog, and Ghostty Help opens the docs" {
     try registerClasses(app.hinstance);
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    App.test_tick = &TestAbout.tick;
+    defer App.test_tick = null;
     defer About.test_record = .{};
+    const message_box = &@import("dialog.zig").test_message_box;
+    message_box.* = &TestAbout.box;
+    defer message_box.* = null;
 
     const window = try testFrame(&app);
+    const other = try testFrame(&app);
+    TestAbout.reset(&app, other.hwnd);
     About.test_record = .{ .task_dialog = TestAbout.taskDialog };
-    TestAbout.shown_count = 0;
+
+    // The window menu's loop queues it, once however often it is chosen,
+    // for `run`, which shows it outside any core frame.
     _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.about_id, 0);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.about_id, 0);
+    try std.testing.expectEqual(0, TestAbout.shown_count);
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .about);
+    // The wakeups the queue posted, taken now: none ticks outside a
+    // prompt or a modal loop, as `run` ticks after each.
+    try std.testing.expectEqual(0, TestAbout.wakeups());
+    app.createRequested();
     try std.testing.expectEqual(1, TestAbout.shown_count);
     try std.testing.expectEqual(@as(?win32.HWND, window.hwnd), TestAbout.owner);
-    try std.testing.expect(TestAbout.flags & 0x0001 != 0); // TDF_ENABLE_HYPERLINKS
-    try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("About Ghostty"), TestAbout.title[0..TestAbout.title_len]);
+    try std.testing.expect(TestAbout.flags & About.TDF_ENABLE_HYPERLINKS != 0);
+    try std.testing.expectEqualSlices(u16, W("About Ghostty"), TestAbout.title[0..TestAbout.title_len]);
     const content = TestAbout.content[0..TestAbout.content_len];
     const version = try std.unicode.utf8ToUtf16LeAlloc(alloc, @import("../../build_config.zig").version_string);
     defer alloc.free(version);
     try std.testing.expect(std.mem.startsWith(u16, content, version));
-    try std.testing.expect(std.mem.indexOf(u16, content, std.unicode.utf8ToUtf16LeStringLiteral("<a href=\"https://ghostty.org\">")) != null);
-    // The prompt is over once the dialog returns.
+    try std.testing.expect(std.mem.indexOf(u16, content, W("<a href=\"https://ghostty.org\">")) != null);
+    // Modal to every window while it is open, as a prompt is, and the
+    // core ticked by a wakeup in its loop; neither once it has closed.
+    try std.testing.expectEqual(1, TestAbout.depth_during);
+    try std.testing.expect(!TestAbout.other_enabled_during);
+    try std.testing.expectEqual(1, TestAbout.ticked);
     try std.testing.expectEqual(0, app.prompt_depth);
+    try std.testing.expect(win32.IsWindowEnabled(other.hwnd).toBool());
 
     // Its link opens the website; any other target is refused.
-    TestAbout.click(L("https://example.com"));
+    TestAbout.click(W("https://example.com"));
     try std.testing.expectEqual(@as(?[]const u8, null), About.test_record.opened);
-    TestAbout.click(L("https://ghostty.org"));
+    TestAbout.click(W("https://ghostty.org"));
     try std.testing.expectEqualStrings(About.website, About.test_record.opened.?);
 
     _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.help_id, 0);
     try std.testing.expectEqualStrings(About.docs, About.test_record.opened.?);
+    try std.testing.expectEqual(0, app.requests.items.len);
+
+    // Not for a window that is no longer a frame of the app's.
+    try app.requests.append(alloc, .{ .about = app.msg_hwnd });
+    app.createRequested();
     try std.testing.expectEqual(1, TestAbout.shown_count);
 
-    // Without TaskDialogIndirect, a message box.
-    About.test_record = .{};
+    // A message box if the task dialog fails, or without one, with the
+    // link as an address.
+    TestAbout.result = @bitCast(@as(u32, 0x80004005)); // E_FAIL
     _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.about_id, 0);
-    try std.testing.expect(About.test_record.message_box);
+    app.createRequested();
+    try std.testing.expectEqual(2, TestAbout.shown_count);
+    try std.testing.expectEqual(1, TestAbout.boxes);
+    About.test_record.task_dialog = null;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_SYSCOMMAND, About.about_id, 0);
+    app.createRequested();
+    try std.testing.expectEqual(2, TestAbout.shown_count);
+    try std.testing.expectEqual(2, TestAbout.boxes);
+    try std.testing.expectEqual(win32.MB_OK, TestAbout.box_flags);
+    const text = TestAbout.box_text[0..TestAbout.box_len];
+    try std.testing.expect(std.mem.startsWith(u16, text, W("Ghostty ")));
+    try std.testing.expect(std.mem.endsWith(u16, text, W(About.website)));
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {

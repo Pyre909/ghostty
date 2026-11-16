@@ -16,8 +16,14 @@
 //! looked up when the dialog is first shown, not imported: an executable
 //! without the manifest, such as the test runner, would get version 5,
 //! which lacks it, and the loader would then refuse to start the whole
-//! process. Without it the same text shows in a message box, links as
-//! plain addresses.
+//! process. Without it, or if the dialog fails, the same text shows in a
+//! message box, the link as a plain address.
+//!
+//! The item's command comes from the window menu's own loop, so the
+//! dialog is queued for `run` (`App.Request.about`), which shows it
+//! outside any core frame: its loop then goes on ticking the core, and
+//! the terminals' output goes on, as under the Save dialog
+//! (`App.beginUnframedPrompt`).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,8 +31,11 @@ const builtin = @import("builtin");
 const build_config = @import("../../build_config.zig");
 const i18n = @import("../../os/main.zig").i18n;
 const win32 = @import("win32.zig");
+const dialog = @import("dialog.zig");
+const ContextMenu = @import("ContextMenu.zig");
 const App = @import("App.zig").App;
 const openLink = @import("App.zig").openLink;
+const icon_resource_id = @import("App.zig").icon_resource_id;
 
 const L = std.unicode.utf8ToUtf16LeStringLiteral;
 const log = std.log.scoped(.win32);
@@ -59,50 +68,42 @@ pub fn addToWindowMenu(hwnd: HWND) void {
         log.warn("no window menu for About and Help err={}", .{win32.GetLastError()});
         return;
     };
-    var buf: [128]u16 = undefined;
+    var buf: [ContextMenu.text_max:0]u16 = undefined;
     const ok = win32.AppendMenuW(menu, win32.MF_SEPARATOR, 0, null).toBool() and
-        win32.AppendMenuW(menu, win32.MF_STRING, about_id, menuLabel(&buf, about_label)).toBool() and
-        win32.AppendMenuW(menu, win32.MF_STRING, help_id, menuLabel(&buf, help_label)).toBool();
+        win32.AppendMenuW(menu, win32.MF_STRING, about_id, ContextMenu.labelText(&buf, about_label).ptr).toBool() and
+        win32.AppendMenuW(menu, win32.MF_STRING, help_id, ContextMenu.labelText(&buf, help_label).ptr).toBool();
     if (!ok) log.warn("About and Help not added to the window menu err={}", .{win32.GetLastError()});
-}
-
-/// `msgid` in the language in use, in `buf`, with each '&' doubled: a
-/// menu takes a single one for the mnemonic that follows. The source's
-/// own text if the translation does not fit.
-fn menuLabel(buf: []u16, comptime msgid: [:0]const u8) LPCWSTR {
-    const text = std.mem.span(i18n._(msgid));
-    var n: usize = 0;
-    var it = (std.unicode.Utf8View.init(text) catch return L(msgid)).iterator();
-    while (it.nextCodepoint()) |cp| {
-        // Room for a surrogate pair, a doubled '&', and the NUL after.
-        if (n + 3 > buf.len) return L(msgid);
-        if (cp == '&') {
-            buf[n] = '&';
-            n += 1;
-        }
-        if (cp < 0x10000) {
-            buf[n] = @intCast(cp);
-            n += 1;
-        } else {
-            const v = cp - 0x10000;
-            buf[n] = @intCast(0xD800 + (v >> 10));
-            buf[n + 1] = @intCast(0xDC00 + (v & 0x3FF));
-            n += 2;
-        }
-    }
-    buf[n] = 0;
-    return @ptrCast(buf.ptr);
 }
 
 /// A WM_SYSCOMMAND for one of the items: carried out, and true. False for
 /// any other command, which the frame handles as before.
 pub fn command(app: *App, hwnd: HWND, wparam: win32.WPARAM) bool {
     switch (wparam & win32.SC_MASK) {
-        about_id => show(app, hwnd),
+        about_id => request(app, hwnd),
         help_id => open(docs),
         else => return false,
     }
     return true;
+}
+
+/// About Ghostty, queued for `run` (`App.Request.about`). Once: a second
+/// choice before `run` gets to the first would show the dialog again
+/// when the first closed.
+fn request(app: *App, hwnd: HWND) void {
+    for (app.requests.items) |queued| if (queued == .about) return;
+    app.requests.append(app.core_app.alloc, .{ .about = hwnd }) catch |err|
+        return log.warn("About Ghostty not shown err={}", .{err});
+    app.wakeup();
+}
+
+/// `App.Request.about`, carried out by `run`: the dialog over `hwnd`'s
+/// frame, if that is still one of the app's.
+pub fn showQueued(app: *App, hwnd: HWND) void {
+    const window = app.windowOf(hwnd) orelse {
+        log.debug("About Ghostty not shown: its window closed", .{});
+        return;
+    };
+    show(app, window.hwnd);
 }
 
 fn open(url: []const u8) void {
@@ -115,66 +116,86 @@ fn open(url: []const u8) void {
     _ = openLink(.html, url); // logs its own failures
 }
 
-/// The dialog, modal to every window, as a prompt is (`App.beginPrompt`):
-/// a task dialog, or a message box without TaskDialogIndirect. None once
-/// the windows are closing for good, as `dialog.messageBox` has none then.
-pub fn show(app: *App, hwnd: HWND) void {
-    if (app.terminating) return;
-    const alloc = app.core_app.alloc;
-    var title_buf: [128]u16 = undefined;
-    const title = text16(&title_buf, about_label);
+/// The dialog, modal to every window, as a prompt is: a task dialog, or a
+/// message box without TaskDialogIndirect or if that fails. An unframed
+/// prompt (`App.beginUnframedPrompt`), as `run` shows it outside any core
+/// frame (`showQueued`), so its loop ticks the core. None once the app
+/// quits or its windows close for good, as the Save dialog has none then
+/// (`SaveDialog.ask`): nothing would end its loop.
+fn show(app: *App, hwnd: HWND) void {
+    if (app.quit or app.terminating) {
+        log.warn("About Ghostty once the app quits is not shown", .{});
+        return;
+    }
+    var title: dialog.Question = .{};
+    const caption = title.one(about_label);
     const developers = std.mem.span(i18n._("Ghostty Developers"));
 
     const owner = app.promptOwner(hwnd);
-    app.beginPrompt(owner);
+    app.beginUnframedPrompt(owner);
     defer app.endPrompt();
 
     if (taskDialog()) |task_dialog| {
-        const content = std.fmt.allocPrintSentinel(alloc, "{s}\n{s}\n\n<a href=\"{s}\">{s}</a>", .{
-            build_config.version_string,
-            developers,
-            website,
-            website["https://".len..],
-        }, 0) catch return oom();
-        defer alloc.free(content);
-        const wide = wideZ(alloc, content) orelse return oom();
-        defer alloc.free(wide);
-        const config: TASKDIALOGCONFIG = .{
-            .cbSize = @sizeOf(TASKDIALOGCONFIG),
-            .hwndParent = owner,
-            .hInstance = app.hinstance,
-            .dwFlags = TDF_ENABLE_HYPERLINKS | TDF_ALLOW_DIALOG_CANCELLATION |
-                TDF_POSITION_RELATIVE_TO_WINDOW |
-                if (i18n.windows.rightToLeft()) TDF_RTL_LAYOUT else 0,
-            .dwCommonButtons = TDCBF_OK_BUTTON,
-            .pszWindowTitle = title,
-            .main_icon = .{ .pszMainIcon = @ptrFromInt(icon_resource_id) },
-            .pszMainInstruction = L("Ghostty"),
-            .pszContent = wide.ptr,
-            .pfCallback = callback,
-        };
-        const hr = task_dialog(&config, null, null, null);
-        if (hr < 0) log.warn("TaskDialogIndirect failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
-        return;
+        if (showTaskDialog(app, task_dialog, owner, caption, developers)) return;
     }
 
-    const content = std.fmt.allocPrintSentinel(alloc, "Ghostty {s}\n{s}\n\n{s}", .{
+    const content = std.fmt.allocPrintSentinel(app.core_app.alloc, "Ghostty {s}\n{s}\n\n{s}", .{
         build_config.version_string,
         developers,
         website,
     }, 0) catch return oom();
+    defer app.core_app.alloc.free(content);
+    const wide = wideZ(app.core_app.alloc, content) orelse return oom();
+    defer app.core_app.alloc.free(wide);
+    _ = dialog.box(owner, caption, wide.ptr, win32.MB_OK, win32.MB_ICONINFORMATION);
+}
+
+/// The task dialog; false if it failed, for the message box to show
+/// instead. True without the memory for it, as the message box needs
+/// memory too.
+fn showTaskDialog(
+    app: *App,
+    task_dialog: TaskDialogIndirectFn,
+    owner: ?HWND,
+    caption: LPCWSTR,
+    developers: []const u8,
+) bool {
+    const alloc = app.core_app.alloc;
+    const content = std.fmt.allocPrintSentinel(alloc, "{s}\n{s}\n\n<a href=\"{s}\">{s}</a>", .{
+        build_config.version_string,
+        developers,
+        website,
+        website["https://".len..],
+    }, 0) catch {
+        oom();
+        return true;
+    };
     defer alloc.free(content);
-    const wide = wideZ(alloc, content) orelse return oom();
+    const wide = wideZ(alloc, content) orelse {
+        oom();
+        return true;
+    };
     defer alloc.free(wide);
-    const flags = win32.MB_OK | win32.MB_ICONINFORMATION | if (i18n.windows.rightToLeft())
-        win32.MB_RTLREADING | win32.MB_RIGHT
-    else
-        0;
-    if (builtin.is_test) {
-        test_record.message_box = true;
-        return;
+    const config: TASKDIALOGCONFIG = .{
+        .cbSize = @sizeOf(TASKDIALOGCONFIG),
+        .hwndParent = owner,
+        .hInstance = app.hinstance,
+        .dwFlags = TDF_ENABLE_HYPERLINKS | TDF_ALLOW_DIALOG_CANCELLATION |
+            TDF_POSITION_RELATIVE_TO_WINDOW |
+            if (i18n.windows.rightToLeft()) TDF_RTL_LAYOUT else 0,
+        .dwCommonButtons = TDCBF_OK_BUTTON,
+        .pszWindowTitle = caption,
+        .main_icon = .{ .pszMainIcon = @ptrFromInt(icon_resource_id) },
+        .pszMainInstruction = L("Ghostty"),
+        .pszContent = wide.ptr,
+        .pfCallback = callback,
+    };
+    const hr = task_dialog(&config, null, null, null);
+    if (hr < 0) {
+        log.warn("TaskDialogIndirect failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+        return false;
     }
-    _ = win32.MessageBoxW(owner, wide.ptr, title, flags);
+    return true;
 }
 
 fn oom() void {
@@ -190,16 +211,6 @@ fn wideZ(alloc: std.mem.Allocator, text: []const u8) ?[:0]u16 {
     };
 }
 
-/// `msgid` in the language in use, in `buf`, or as written if that does
-/// not fit.
-fn text16(buf: []u16, comptime msgid: [:0]const u8) LPCWSTR {
-    const text = std.mem.span(i18n._(msgid));
-    if (text.len >= buf.len) return L(msgid);
-    const n = std.unicode.utf8ToUtf16Le(buf, text) catch return L(msgid);
-    buf[n] = 0;
-    return @ptrCast(buf.ptr);
-}
-
 /// The dialog's link, opened in the browser. Only the website's: the
 /// dialog's text is ours, and any other target is refused.
 fn callback(
@@ -210,31 +221,27 @@ fn callback(
     _: isize,
 ) callconv(.winapi) HRESULT {
     if (msg == TDN_HYPERLINK_CLICKED) {
-        const href: [*:0]const u16 = @ptrFromInt(@as(usize, @bitCast(lparam)));
-        if (std.mem.eql(u16, std.mem.span(href), L(website))) {
+        const href = std.mem.span(@as([*:0]const u16, @ptrFromInt(@as(usize, @bitCast(lparam)))));
+        if (std.mem.eql(u16, href, L(website))) {
             open(website);
         } else {
-            log.warn("the About dialog's link is not the website's", .{});
+            log.warn("the About dialog's link is not the website's len={}", .{href.len});
         }
     }
     return win32.S_OK;
 }
 
-/// The exe's icon (ID_ICON_GHOSTTY in dist/windows/ghostty.rc), which the
-/// dialog loads from `hInstance`.
-const icon_resource_id = 1;
-
 // commctrl.h's task dialog.
 // https://learn.microsoft.com/en-us/windows/win32/api/commctrl/nf-commctrl-taskdialogindirect
 
-const TDF_ENABLE_HYPERLINKS: c_int = 0x0001;
+pub const TDF_ENABLE_HYPERLINKS: c_int = 0x0001;
 const TDF_ALLOW_DIALOG_CANCELLATION: c_int = 0x0008;
 const TDF_POSITION_RELATIVE_TO_WINDOW: c_int = 0x1000;
 const TDF_RTL_LAYOUT: c_int = 0x2000;
 const TDCBF_OK_BUTTON: c_int = 0x0001;
-const TDN_HYPERLINK_CLICKED: UINT = 3;
+pub const TDN_HYPERLINK_CLICKED: UINT = 3;
 
-const Callback = *const fn (?HWND, UINT, win32.WPARAM, win32.LPARAM, isize) callconv(.winapi) HRESULT;
+pub const Callback = *const fn (?HWND, UINT, win32.WPARAM, win32.LPARAM, isize) callconv(.winapi) HRESULT;
 
 /// commctrl.h declares it between pshpack1.h and poppack.h, so it is
 /// packed: each field at byte alignment.
@@ -246,8 +253,8 @@ pub const TASKDIALOGCONFIG = extern struct {
     dwCommonButtons: c_int align(1) = 0,
     pszWindowTitle: ?LPCWSTR align(1) = null,
     /// A resource's id (MAKEINTRESOURCE) or a name: an id is an odd
-    /// address, so the pointer is byte aligned.
-    main_icon: extern union { pszMainIcon: ?[*:0]align(1) const u16 align(1) } align(1) = .{ .pszMainIcon = null },
+    /// address, so the pointer is byte aligned (`win32.ResourceW`).
+    main_icon: extern union { pszMainIcon: ?win32.ResourceW align(1) } align(1) = .{ .pszMainIcon = null },
     pszMainInstruction: ?LPCWSTR align(1) = null,
     pszContent: ?LPCWSTR align(1) = null,
     cButtons: UINT align(1) = 0,
@@ -267,7 +274,7 @@ pub const TASKDIALOGCONFIG = extern struct {
     cxWidth: UINT align(1) = 0,
 };
 
-const TaskDialogIndirectFn = *const fn (
+pub const TaskDialogIndirectFn = *const fn (
     config: *const TASKDIALOGCONFIG,
     button: ?*c_int,
     radio: ?*c_int,
@@ -275,20 +282,18 @@ const TaskDialogIndirectFn = *const fn (
 ) callconv(.winapi) HRESULT;
 
 /// For tests: what was shown, in place of the dialogs. A test that shows
-/// the dialog without setting `test_record.task_dialog` sees the message
-/// box's path.
+/// the dialog without setting `task_dialog` gets the message box, which
+/// `dialog.test_message_box` answers.
 pub const TestRecord = struct {
     /// Stands for TaskDialogIndirect when set; it is given the config.
     task_dialog: ?TaskDialogIndirectFn = null,
-    message_box: bool = false,
     /// The last link opened (`open`), in place of the browser.
     opened: ?[]const u8 = null,
 };
 pub var test_record: if (builtin.is_test) TestRecord else void =
     if (builtin.is_test) .{} else {};
 
-/// TaskDialogIndirect, looked up once, or null where comctl32 is not
-/// version 6.
+/// TaskDialogIndirect, looked up once (`lookUp`).
 fn taskDialog() ?TaskDialogIndirectFn {
     if (builtin.is_test) return test_record.task_dialog;
     const State = struct {
@@ -297,13 +302,23 @@ fn taskDialog() ?TaskDialogIndirectFn {
     };
     if (!State.looked_up) {
         State.looked_up = true;
-        if (win32.LoadLibraryExW(L("comctl32.dll"), null, win32.LOAD_LIBRARY_SEARCH_SYSTEM32)) |module| {
-            if (win32.GetProcAddress(module, "TaskDialogIndirect")) |proc| {
-                State.found = @ptrCast(@alignCast(proc));
-            } else log.warn("comctl32 has no TaskDialogIndirect: not version 6", .{});
-        } else log.warn("cannot load comctl32 err={}", .{win32.GetLastError()});
+        State.found = lookUp();
     }
     return State.found;
+}
+
+/// TaskDialogIndirect, or null where the comctl32 this process gets is
+/// not version 6.
+fn lookUp() ?TaskDialogIndirectFn {
+    const module = win32.LoadLibraryExW(L("comctl32.dll"), null, win32.LOAD_LIBRARY_SEARCH_SYSTEM32) orelse {
+        log.warn("cannot load comctl32 err={}", .{win32.GetLastError()});
+        return null;
+    };
+    const proc = win32.GetProcAddress(module, "TaskDialogIndirect") orelse {
+        log.warn("comctl32 has no TaskDialogIndirect: not version 6", .{});
+        return null;
+    };
+    return @ptrCast(@alignCast(proc));
 }
 
 test "win32: the task dialog's config is the header's size" {
@@ -315,9 +330,14 @@ test "win32: the task dialog's config is the header's size" {
 }
 
 test "win32: a menu label doubles its ampersands" {
-    var buf: [32]u16 = undefined;
-    const label = menuLabel(&buf, "Fish & Chips");
-    try std.testing.expectEqualSlices(u16, L("Fish && Chips"), std.mem.span(label));
+    var buf: [ContextMenu.text_max:0]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, L("Fish && Chips"), ContextMenu.labelText(&buf, "Fish & Chips"));
+}
+
+test "win32: the test runner, with no manifest, has no TaskDialogIndirect" {
+    // The message box's path, which `lookUp` takes for an executable
+    // without dist/windows/ghostty.manifest: comctl32 version 5.
+    try std.testing.expect(lookUp() == null);
 }
 
 test "win32: the items' ids are the app's, not the system's" {
