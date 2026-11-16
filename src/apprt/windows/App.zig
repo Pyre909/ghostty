@@ -18112,6 +18112,71 @@ test "win32: a ringing terminal puts a bell on its window's taskbar button" {
     try std.testing.expect(window.bell_badge == null);
 }
 
+test "win32: a ringing terminal's bell leaves the button as it is closed, and undo brings it back" {
+    // BellBadge.zig: a ringing split closed (`takePane`) or a ringing tab
+    // closed (`parkTab`) takes the bell off the button; undo, which puts
+    // the split back (`setTree`) or the tab (`relinkTab`), still ringing,
+    // shows it again.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    // No real focus, which would stop the bell of a terminal that comes
+    // back.
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    var fake: TestTaskbar = .{};
+    app.taskbar_list = &fake.list;
+    app.taskbar_created = win32.WM_APP + 0x100;
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+    try std.testing.expectEqual(0, fake.overlays);
+    try std.testing.expect(try testBell(&app, t.a));
+    try std.testing.expect(t.a.bell_ringing);
+    try std.testing.expectEqual(1, fake.overlays);
+    try std.testing.expect(fake.overlay);
+
+    // The ringing split closed, then back.
+    TestUndo.close(t.a);
+    try std.testing.expect(t.a.parked);
+    try std.testing.expectEqual(2, fake.overlays);
+    try std.testing.expect(!fake.overlay);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expect(!t.a.parked);
+    try std.testing.expect(t.a.bell_ringing);
+    try std.testing.expectEqual(3, fake.overlays);
+    try std.testing.expect(fake.overlay);
+
+    // Its whole tab closed, beside another, then back.
+    _ = try testTab(&app, window);
+    window.selectTab(0);
+    try std.testing.expectEqual(3, fake.overlays);
+    try std.testing.expect(window.closeTabs(0, .this));
+    testPump();
+    try std.testing.expect(t.a.parked);
+    try std.testing.expectEqual(4, fake.overlays);
+    try std.testing.expect(!fake.overlay);
+    try std.testing.expect(window.bell_badge == null);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expect(!t.a.parked);
+    try std.testing.expect(t.a.bell_ringing);
+    try std.testing.expectEqual(5, fake.overlays);
+    try std.testing.expect(fake.overlay);
+    try std.testing.expectEqual(fake.hwnd, window.hwnd);
+}
+
 test "win32: an unfocused split is dimmed by its fill at one less its opacity, over its other overlays" {
     // GTK's and macOS's dim, over a terminal in a tab of more than one
     // that is not the tab's focused one and whose search bar is not
