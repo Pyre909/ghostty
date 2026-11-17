@@ -21,7 +21,8 @@ pub const Options = struct {
     /// D3DCompile, resolved by the backend at init.
     compile: api.D3DCompileFn,
 
-    /// The bytecode of sources compiled before, the process's in the app.
+    /// Compiled bytecode shared by every surface: the process's
+    /// ShaderCache in the app.
     cache: *ShaderCache,
 
     /// The render target format the pipeline draws into.
