@@ -53,9 +53,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -257,12 +259,19 @@ def sign(tool: str, key: Path, feed_path: Path) -> Path:
 
 
 def write(dest: Path, content: dict, args: argparse.Namespace) -> None:
-    """Write the feed `content` to `dest`, and sign it unless --unsigned."""
+    """Write the feed `content` to `dest`, and sign it unless --unsigned.
+    Both are made in a stage beside `dest` and moved into place only once
+    signed, as make_zip.py stages its zips: a key or OpenSSL that fails
+    leaves the feed and signature that were there."""
     text = json.dumps(content, indent=2) + "\n"
-    dest.with_name(SIGNATURE).unlink(missing_ok=True)
-    dest.write_text(text, "utf-8")
-    if args.key is not None:
-        sign(args.openssl, args.key, dest)
+    with tempfile.TemporaryDirectory(dir=dest.parent, prefix=".stage-") as stage:
+        staged = Path(stage) / dest.name
+        staged.write_text(text, "utf-8")
+        if args.key is not None:
+            os.replace(sign(args.openssl, args.key, staged), dest.with_name(SIGNATURE))
+        else:
+            dest.with_name(SIGNATURE).unlink(missing_ok=True)
+        os.replace(staged, dest)
 
 
 def renew(args: argparse.Namespace) -> Path:

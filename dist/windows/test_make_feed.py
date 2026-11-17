@@ -372,6 +372,27 @@ class TestExpiry(Temp):
                     (self.dir / name).read_bytes(), (FIXTURE / name).read_bytes()
                 )
 
+    def test_a_failed_signature_changes_nothing(self) -> None:
+        # Signed once, then made again and renewed with signing failing:
+        # the first feed and signature stay, and no stage is left.
+        key = str(test_key(self.dir))
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            argv = self.packages() + ["--tag", TAG, "--key", key]
+            self.assertEqual(run(mf.main, argv)[0], 0)
+            before = {n: (self.dir / n).read_bytes() for n in (mf.FEED, mf.SIGNATURE)}
+            renew = ["--renew", str(self.dir / mf.FEED), "--key", key]
+            for args in (argv + ["--valid-days", "9"], renew):
+                with self.subTest(args=args):
+                    with mock.patch.object(
+                        mf, "sign", side_effect=mf.Error("no signature")
+                    ):
+                        code, out, err = run(mf.main, args)
+                    self.assertEqual((code, out), (1, ""))
+                    self.assertIn("no signature", err)
+                    after = {n: (self.dir / n).read_bytes() for n in before}
+                    self.assertEqual(after, before)
+                    self.assertEqual(list(self.dir.glob(".stage-*")), [])
+
     def test_renew_puts_expires_after_the_version(self) -> None:
         # A feed without one, as an older make_feed.py wrote.
         feed = self.dir / mf.FEED
