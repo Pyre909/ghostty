@@ -17680,6 +17680,8 @@ const TestOffer = struct {
 };
 
 test "win32: an offered update installs its package with msiexec, or opens its release page where Ghostty is not the package's" {
+    // Its many actions and wide literals, all evaluated at compile time.
+    @setEvalBranchQuota(10_000);
     const alloc = std.testing.allocator;
     const W = std.unicode.utf8ToUtf16LeStringLiteral;
     var core_app: CoreApp = undefined;
@@ -17802,6 +17804,14 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(3, TestOffer.installs);
     try std.testing.expectEqual(2, TestUpdate.boxes);
+    // A restart of Windows asked for: installed all the same.
+    TestOffer.exit_code = 3010;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(4, TestOffer.installs);
+    try std.testing.expectEqual(3, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("Ghostty 999.0.0 is installed. Restart Ghostty"));
     TestOffer.exit_code = 0;
 
     // A package saved already, which a check finds still the package, is
@@ -17813,7 +17823,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqual(before, server.hits(TestUpdate.package_route));
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(before, server.hits(TestUpdate.package_route));
-    try std.testing.expectEqual(4, TestOffer.installs);
+    try std.testing.expectEqual(5, TestOffer.installs);
     try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
     try std.testing.expect(TestOffer.package_read);
 
@@ -17826,7 +17836,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     TestOffer.tamper = null;
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(before + 1, server.hits(TestUpdate.package_route));
-    try std.testing.expectEqual(5, TestOffer.installs);
+    try std.testing.expectEqual(6, TestOffer.installs);
     try std.testing.expect(TestOffer.package_read);
     try std.testing.expect(!TestOffer.package_writable);
     app.updater.configure(.off);
@@ -17842,7 +17852,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqualSlices(u16, W("Open Release Page"), TestOffer.labels[0]);
     try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
     try std.testing.expectEqual(null, app.updater.running);
-    try std.testing.expectEqual(5, TestOffer.installs);
+    try std.testing.expectEqual(6, TestOffer.installs);
     // So is the package's own, built with no key to check a feed by.
     app.updater.installed = true;
     app.updater.source.public_key = null;
@@ -17852,7 +17862,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqual(Updater.release_page_id, TestOffer.ids[0]);
     try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
     try std.testing.expectEqual(null, app.updater.running);
-    try std.testing.expectEqual(5, TestOffer.installs);
+    try std.testing.expectEqual(6, TestOffer.installs);
     app.updater.source.public_key = TestUpdate.keyPair().public_key.toBytes();
 
     // Without a task dialog, a message box asks, and Yes installs.
@@ -17866,7 +17876,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expect(TestUpdate.buttons & win32.MB_YESNO != 0);
     try std.testing.expect(TestUpdate.says("Install it now?"));
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(6, TestOffer.installs);
+    try std.testing.expectEqual(7, TestOffer.installs);
 
     // The timer, firing under the offer, waits; and a check started
     // under it makes Install wait for that check, which tells what it
@@ -17883,7 +17893,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expect(!TestOffer.timer_started);
     try std.testing.expect(app.updater.armed);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(7, TestOffer.installs);
+    try std.testing.expectEqual(8, TestOffer.installs);
     TestOffer.check_app = &app;
     defer TestOffer.check_app = null;
     _ = try app.performAction(.app, .check_for_updates, {});
@@ -17892,7 +17902,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     TestOffer.choose = win32.IDCANCEL;
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(offers + 3, TestOffer.offers);
-    try std.testing.expectEqual(7, TestOffer.installs);
+    try std.testing.expectEqual(8, TestOffer.installs);
     app.updater.configure(.off);
     About.test_record.task_dialog = null;
 
@@ -17906,7 +17916,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(asked + 2, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not be installed (HttpStatus)"));
-    try std.testing.expectEqual(7, TestOffer.installs);
+    try std.testing.expectEqual(8, TestOffer.installs);
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {

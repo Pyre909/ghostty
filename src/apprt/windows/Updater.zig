@@ -221,13 +221,14 @@ pub const Job = struct {
             break :file try downloadVerified(arena, session, install.url, path, install.sha256);
         };
         defer _ = win32.CloseHandle(file);
+        const Code = win32.Win32Error;
         return switch (try msiexec(arena, path)) {
-            // ERROR_SUCCESS, ERROR_SUCCESS_REBOOT_REQUIRED: a file in use
-            // is replaced at the next start of Windows, which this
-            // Ghostty, still running, does not need.
-            0, 3010 => .{ .installed = install.version },
-            // ERROR_INSTALL_USEREXIT
-            1602 => .install_cancelled,
+            // Reboot required: a file in use is replaced at the next start
+            // of Windows, which this Ghostty, still running, does not need.
+            @backingInt(Code.SUCCESS),
+            @backingInt(Code.SUCCESS_REBOOT_REQUIRED),
+            => .{ .installed = install.version },
+            @backingInt(Code.INSTALL_USEREXIT) => .install_cancelled,
             else => |code| .{ .install_failed = code },
         };
     }
@@ -312,10 +313,7 @@ fn msiexec(arena: Allocator, path: [:0]const u16) !u32 {
     if (n == 0 or n >= system.len) return error.SystemDirectory;
     const W = std.unicode.utf8ToUtf16LeStringLiteral;
     const image = try std.mem.concatWithSentinel(arena, u16, &.{ system[0..n], W("\\msiexec.exe") }, 0);
-    // A path holds no quote, so quotes alone keep its spaces.
-    const line = try std.mem.concatWithSentinel(arena, u16, &.{
-        W("\""), image, W("\" /i \""), path, W("\" /passive /norestart"),
-    }, 0);
+    const line = try msiexecLine(arena, image, path);
     var si = std.mem.zeroes(win32.STARTUPINFOW);
     si.cb = @sizeOf(win32.STARTUPINFOW);
     var pi: win32.PROCESS_INFORMATION = undefined;
@@ -332,6 +330,16 @@ fn msiexec(arena: Allocator, path: [:0]const u16) !u32 {
         return error.MsiexecNotStarted;
     }
     return code;
+}
+
+/// msiexec's command line: `image` installing `path`, with its progress
+/// window and no restart of Windows. A path holds no quote, so quotes
+/// alone keep its spaces.
+fn msiexecLine(arena: Allocator, image: []const u16, path: []const u16) Allocator.Error![:0]u16 {
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    return std.mem.concatWithSentinel(arena, u16, &.{
+        W("\""), image, W("\" /i \""), path, W("\" /passive /norestart"),
+    }, 0);
 }
 
 hwnd: win32.HWND,
@@ -731,19 +739,29 @@ pub fn startInstall(self: *Updater, found: update_feed.Update, path: ?[:0]const 
 
 /// Whether this process's image is the package's: ghostty.exe in its
 /// fixed folder, %LOCALAPPDATA%\Programs\Ghostty\bin (dist/windows/
-/// make_msi.py). Compared without case, as the file system does, by
-/// CompareStringOrdinal.
+/// make_msi.py).
 pub fn isInstalledCopy(alloc: Allocator) bool {
     const image = IpcClient.imagePath(alloc) catch return false;
     defer alloc.free(image);
     var environ_map = global.environMap() catch return false;
     defer environ_map.deinit();
     const local = environ_map.get("LOCALAPPDATA") orelse return false;
-    const want = std.fmt.allocPrint(alloc, "{s}\\Programs\\Ghostty\\bin\\ghostty.exe", .{local}) catch return false;
+    return isInstalledPath(alloc, image, local) catch false;
+}
+
+/// Whether `image` is the package's ghostty.exe under `local_app_data`.
+/// Compared without case, as the file system does, by Windows' own
+/// upcasing (`eqlIgnoreCaseWtf16`, RtlEqualUnicodeString).
+fn isInstalledPath(alloc: Allocator, image: []const u16, local_app_data: []const u8) Allocator.Error!bool {
+    const want = try alloc.print("{s}\\Programs\\Ghostty\\bin\\ghostty.exe", .{local_app_data});
     defer alloc.free(want);
-    const wide = std.unicode.utf8ToUtf16LeAlloc(alloc, want) catch return false;
+    const wide = std.unicode.utf8ToUtf16LeAlloc(alloc, want) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // An environment variable not UTF-8 names no folder we made.
+        else => return false,
+    };
     defer alloc.free(wide);
-    return win32.CompareStringOrdinal(image.ptr, @intCast(image.len), wide.ptr, @intCast(wide.len), .TRUE) == win32.CSTR_EQUAL;
+    return std.os.windows.eqlIgnoreCaseWtf16(image, wide);
 }
 
 fn oom() void {
@@ -791,4 +809,35 @@ pub fn testDrop(self: *Updater) void {
     var posted: win32.MSG = undefined;
     while (win32.PeekMessageW(&posted, self.hwnd, self.msg, self.msg, win32.PM_REMOVE).toBool()) {}
     release(job);
+}
+
+test "win32: an update's msiexec line quotes the paths it is given" {
+    // Its wide literals, made at compile time.
+    @setEvalBranchQuota(10_000);
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const line = try msiexecLine(
+        arena.allocator(),
+        W("C:\\Windows\\System32\\msiexec.exe"),
+        W("C:\\Users\\A B\\AppData\\Local\\ghostty\\updates\\ghostty-1.4.1-windows-x86_64.msi"),
+    );
+    try std.testing.expectEqualSlices(u16, W(
+        \\"C:\Windows\System32\msiexec.exe" /i "C:\Users\A B\AppData\Local\ghostty\updates\ghostty-1.4.1-windows-x86_64.msi" /passive /norestart
+    ), line);
+}
+
+test "win32: an update installs only over the package's own ghostty.exe, by its path without case" {
+    // Its wide literals, made at compile time.
+    @setEvalBranchQuota(10_000);
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const alloc = std.testing.allocator;
+    const local = "C:\\Users\\a\\AppData\\Local";
+    try std.testing.expect(try isInstalledPath(alloc, W("C:\\Users\\a\\AppData\\Local\\Programs\\Ghostty\\bin\\ghostty.exe"), local));
+    try std.testing.expect(try isInstalledPath(alloc, W("c:\\USERS\\A\\appdata\\local\\programs\\ghostty\\BIN\\GHOSTTY.EXE"), local));
+    // Another folder, or a sibling's ghostty.exe: a copy of one's own.
+    try std.testing.expect(!try isInstalledPath(alloc, W("C:\\Users\\a\\Downloads\\ghostty\\bin\\ghostty.exe"), local));
+    try std.testing.expect(!try isInstalledPath(alloc, W("C:\\Users\\a\\AppData\\Local\\Programs\\Ghostty\\bin2\\ghostty.exe"), local));
+    try std.testing.expect(!try isInstalledPath(alloc, W("C:\\Users\\a\\AppData\\Local\\Programs\\Ghostty\\bin\\ghostty.exe.old"), local));
+    try std.testing.expect(!try isInstalledPath(alloc, W("C:\\Users\\a\\AppData\\Local\\Programs\\Ghostty\\bin\\ghostty.exe"), "C:\\Users\\b\\AppData\\Local"));
 }

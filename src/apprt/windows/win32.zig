@@ -1912,15 +1912,6 @@ pub const CancelIoEx = internal_os.windows.exp.kernel32.CancelIoEx;
 pub const WaitForSingleObject = internal_os.windows.exp.kernel32.WaitForSingleObject;
 pub const GetExitCodeProcess = internal_os.windows.exp.kernel32.GetExitCodeProcess;
 pub const GetSystemDirectoryW = internal_os.windows.exp.kernel32.GetSystemDirectoryW;
-/// https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-comparestringordinal
-pub extern "kernel32" fn CompareStringOrdinal(
-    a: [*]const u16,
-    a_len: c_int,
-    b: [*]const u16,
-    b_len: c_int,
-    ignore_case: BOOL,
-) callconv(.winapi) c_int;
-pub const CSTR_EQUAL: c_int = 2;
 pub const OVERLAPPED = internal_os.windows.OVERLAPPED;
 pub const SECURITY_ATTRIBUTES = internal_os.windows.SECURITY_ATTRIBUTES;
 pub const INVALID_HANDLE_VALUE = w.INVALID_HANDLE_VALUE;
