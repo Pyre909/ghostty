@@ -578,13 +578,7 @@ const Colors = struct {
     fn of(window: *const Window) Colors {
         if (window.shownColors()) |c| {
             const t = c.tabBar();
-            return .{
-                .bar = FrameColors.colorref(t.bar),
-                .shown = FrameColors.colorref(t.shown),
-                .hover = FrameColors.colorref(t.hover),
-                .text = FrameColors.colorref(t.text),
-                .dim = FrameColors.colorref(t.dim),
-            };
+            return .{ .bar = t.bar, .shown = t.shown, .hover = t.hover, .text = t.text, .dim = t.dim };
         }
         return if (window.dark_frame) .{
             .bar = win32.rgb(0x1f, 0x1f, 0x1f),

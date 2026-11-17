@@ -986,16 +986,13 @@ pub const Colors = struct {
     /// and tab overview the configured background), else by its mode.
     pub fn ofFrame(window: *const Window) Colors {
         const c = window.frame_colors orelse return of(window.dark_frame);
-        const bg = c.background;
-        const fg = c.foreground;
-        const ref = FrameColors.colorref;
         return .{
-            .bar = ref(FrameColors.mix(bg, fg, 0.05)),
-            .border = ref(FrameColors.mix(bg, fg, 0.25)),
-            .field = ref(bg),
-            .text = ref(fg),
-            .dim = ref(FrameColors.mix(bg, fg, 0.65)),
-            .hover = ref(FrameColors.mix(bg, fg, 0.12)),
+            .bar = c.toward(50),
+            .border = c.toward(250),
+            .field = FrameColors.colorref(c.background),
+            .text = FrameColors.colorref(c.foreground),
+            .dim = c.toward(650),
+            .hover = c.toward(120),
         };
     }
 

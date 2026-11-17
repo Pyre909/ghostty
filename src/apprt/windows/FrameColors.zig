@@ -104,37 +104,33 @@ pub const Oklab = struct {
     }
 };
 
-/// `a` with `t` of `b` mixed in, per channel in sRGB, rounded.
-pub fn mix(a: RGB, b: RGB, t: f32) RGB {
-    const ch = struct {
-        fn f(x: u8, y: u8, w: f32) u8 {
-            const v = @as(f32, @floatFromInt(x)) * (1 - w) + @as(f32, @floatFromInt(y)) * w;
-            return @intFromFloat(@round(std.math.clamp(v, 0, 255)));
-        }
-    }.f;
-    return .{ .r = ch(a.r, b.r, t), .g = ch(a.g, b.g, t), .b = ch(a.b, b.b, t) };
-}
-
+/// `c` as a COLORREF, as GDI and DWM take it.
 pub fn colorref(c: RGB) win32.COLORREF {
     return win32.rgb(c.r, c.g, c.b);
+}
+
+/// The background moved `t` thousandths of the way to the foreground
+/// (`win32.lerp`, per channel in sRGB).
+pub fn toward(self: FrameColors, t: u32) win32.COLORREF {
+    return win32.lerp(colorref(self.background), colorref(self.foreground), t);
 }
 
 /// The tab bar's colours under these: the bar in the background, the
 /// shown and hovered tab tinted toward the foreground, the text in it.
 /// The tints are ours; GTK leaves its tab bar to libadwaita.
 pub fn tabBar(self: FrameColors) struct {
-    bar: RGB,
-    shown: RGB,
-    hover: RGB,
-    text: RGB,
-    dim: RGB,
+    bar: win32.COLORREF,
+    shown: win32.COLORREF,
+    hover: win32.COLORREF,
+    text: win32.COLORREF,
+    dim: win32.COLORREF,
 } {
     return .{
-        .bar = self.background,
-        .shown = mix(self.background, self.foreground, 0.16),
-        .hover = mix(self.background, self.foreground, 0.08),
-        .text = self.foreground,
-        .dim = mix(self.background, self.foreground, 0.7),
+        .bar = colorref(self.background),
+        .shown = self.toward(160),
+        .hover = self.toward(80),
+        .text = colorref(self.foreground),
+        .dim = self.toward(700),
     };
 }
 
@@ -170,20 +166,20 @@ test "win32: frame colours only under window-theme = ghostty, from the config" {
     try testing.expectEqual(RGB{ .r = 0x10, .g = 0x20, .b = 0x30 }, c.foreground);
 }
 
-test "win32: frame colours mix toward the foreground" {
+test "win32: frame colours tint toward the foreground" {
     const testing = std.testing;
     const black: RGB = .{ .r = 0, .g = 0, .b = 0 };
     const white: RGB = .{ .r = 255, .g = 255, .b = 255 };
-    try testing.expectEqual(black, mix(black, white, 0));
-    try testing.expectEqual(white, mix(black, white, 1));
-    try testing.expectEqual(RGB{ .r = 128, .g = 128, .b = 128 }, mix(black, white, 0.5));
-    try testing.expectEqual(RGB{ .r = 0x10, .g = 0x80, .b = 0xF0 }, mix(.{ .r = 0x10, .g = 0x80, .b = 0xF0 }, white, 0));
+    const c: FrameColors = .{ .background = black, .foreground = white };
+    try testing.expectEqual(win32.rgb(0, 0, 0), c.toward(0));
+    try testing.expectEqual(win32.rgb(255, 255, 255), c.toward(1000));
+    try testing.expectEqual(win32.rgb(128, 128, 128), c.toward(500));
 
-    const bar = (FrameColors{ .background = black, .foreground = white }).tabBar();
-    try testing.expectEqual(black, bar.bar);
-    try testing.expectEqual(white, bar.text);
+    const bar = c.tabBar();
+    try testing.expectEqual(win32.rgb(0, 0, 0), bar.bar);
+    try testing.expectEqual(win32.rgb(255, 255, 255), bar.text);
     // The shown tab stands further from the bar than a hovered one.
-    try testing.expect(bar.shown.r > bar.hover.r and bar.hover.r > bar.bar.r);
+    try testing.expect(bar.shown & 0xFF > bar.hover & 0xFF and bar.hover & 0xFF > bar.bar & 0xFF);
     try testing.expectEqual(@as(win32.COLORREF, 0x00F08010), colorref(.{ .r = 0x10, .g = 0x80, .b = 0xF0 }));
 }
 
