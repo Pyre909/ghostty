@@ -1119,6 +1119,9 @@ pub const App = struct {
         // First, so that no request is taken during the teardown, and a
         // client waiting for its answer is told the instance is quitting.
         self.stopIpc();
+        // And no automatic update check starts in the teardown's message
+        // loops, only to be cut off at exit.
+        self.updater.disarm();
 
         // Then, so that the other programs have the keys back before the
         // teardown's waits for the terminals' threads.
@@ -1146,7 +1149,7 @@ pub const App = struct {
         self.freeRequests();
 
         self.stopQuitTimer();
-        self.updater.deinit();
+        self.updater.deinit(); // disarmed already, above
 
         if (self.session) |store| {
             self.session = null;
@@ -4943,7 +4946,7 @@ pub const App = struct {
                 self.undo.expireDue(self);
                 return 0;
             } else if (wparam == Updater.timer_id) {
-                self.updater.timerFired();
+                self.updater.timerFired(self.prompt_depth > 0 or self.quit or self.terminating);
                 return 0;
             },
 
@@ -17568,6 +17571,14 @@ const TestOffer = struct {
         callback = config.pfCallback;
         data = config.lpCallbackData;
         if (tamper) |path| http_testing.write(path, "tampered") catch {};
+        if (timer_app) |app| {
+            _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+            timer_started = app.updater.running != null;
+        }
+        if (check_app) |app| {
+            _ = app.performAction(.app, .check_for_updates, {}) catch {};
+            check_app = null;
+        }
         // The link works while the dialog is open, and only then.
         if (link_to_click) |href| _ = callback.?(null, About.TDN_HYPERLINK_CLICKED, 0, @bitCast(@intFromPtr(href.ptr)), data);
         button.?.* = choose;
@@ -17577,6 +17588,13 @@ const TestOffer = struct {
     /// A file the fake dialog overwrites while it is open, as anything
     /// could change the package between its check and its install.
     var tamper: ?[:0]const u16 = null;
+    /// An app whose updater timer fires while the dialog is open, and
+    /// whether that started a check.
+    var timer_app: ?*App = null;
+    var timer_started = false;
+    /// An app a check is asked of while the dialog is open, once, as a
+    /// global keybind could.
+    var check_app: ?*App = null;
 
     fn says(comptime part: []const u8) bool {
         return std.mem.indexOf(u16, content[0..content_len], std.unicode.utf8ToUtf16LeStringLiteral(part)) != null;
@@ -17776,6 +17794,34 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(6, TestOffer.installs);
 
+    // The timer, firing under the offer, waits; and a check started
+    // under it makes Install wait for that check, which tells what it
+    // finds: here the offer again.
+    TestOffer.choose = Updater.install_id;
+    About.test_record.task_dialog = TestOffer.taskDialog;
+    app.updater.configure(.check);
+    TestOffer.timer_app = &app;
+    defer TestOffer.timer_app = null;
+    const offers = TestOffer.offers;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    TestOffer.timer_app = null;
+    try std.testing.expect(!TestOffer.timer_started);
+    try std.testing.expect(app.updater.armed);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(7, TestOffer.installs);
+    TestOffer.check_app = &app;
+    defer TestOffer.check_app = null;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(offers + 2, TestOffer.offers);
+    TestOffer.choose = win32.IDCANCEL;
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(offers + 3, TestOffer.offers);
+    try std.testing.expectEqual(7, TestOffer.installs);
+    app.updater.configure(.off);
+    About.test_record.task_dialog = null;
+
     // An install that fails before msiexec says so, not that the check
     // failed.
     _ = win32.DeleteFileW(file);
@@ -17786,7 +17832,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(asked + 2, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not be installed (HttpStatus)"));
-    try std.testing.expectEqual(6, TestOffer.installs);
+    try std.testing.expectEqual(7, TestOffer.installs);
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {

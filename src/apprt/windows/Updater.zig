@@ -66,6 +66,8 @@ pub const timer_id: win32.UINT_PTR = 4;
 /// not at once, so as not to slow the first window.
 const first_delay_ms = 10 * std.time.ms_per_s;
 const interval_ms = 24 * std.time.ms_per_hour;
+/// The next try of an automatic check the app was busy for.
+const busy_retry_ms = std.time.ms_per_min;
 
 /// How long a job waits to post its result again after a post failed.
 const repost_ms = if (builtin.is_test) 10 else 1000;
@@ -350,11 +352,22 @@ fn arm(self: *Updater, ms: win32.UINT) void {
     self.armed = true;
 }
 
-/// The timer's WM_TIMER: check, and look again a day later.
-pub fn timerFired(self: *Updater) void {
+/// The timer's WM_TIMER: check, and look again a day later. Not while
+/// the app is `busy` (a prompt open, whose loop dispatches this; or
+/// quitting): then it tries again shortly. A check started under the
+/// offer's dialog would be running when the user chose Install.
+pub fn timerFired(self: *Updater, busy: bool) void {
     if (!self.armed) return; // a WM_TIMER queued before KillTimer
+    if (busy) return self.arm(busy_retry_ms);
     self.arm(interval_ms);
     _ = self.start(false); // automatic: a failure is not told
+}
+
+/// No more automatic checks: at exit, before anything that runs a
+/// message loop.
+pub fn disarm(self: *Updater) void {
+    if (self.armed) _ = win32.KillTimer(self.hwnd, timer_id);
+    self.armed = false;
 }
 
 /// Start a check, or make the running one `manual`. A manual one that
@@ -462,8 +475,7 @@ pub fn release(job: *Job) void {
 /// but is never dispatched, and its arena goes with the process; after
 /// that its post fails and it frees itself (`Job.run`).
 pub fn deinit(self: *Updater) void {
-    if (self.armed) _ = win32.KillTimer(self.hwnd, timer_id);
-    self.armed = false;
+    self.disarm();
     if (self.running) |job| {
         // Read before the store: from then on the job may free itself.
         const thread = job.thread;
@@ -571,7 +583,11 @@ fn offer(app: *App, found: update_feed.Update, path: ?[:0]const u16) void {
     defer app.endPrompt();
     const chosen = ask(app, owner, available, found.notes, installable) orelse return oom();
     switch (chosen) {
-        install_id => if (app.updater.startInstall(found, path)) |job| app.tellUpdate(job),
+        // Not once the app quits under the dialog: the install would be
+        // cut off at exit.
+        install_id => if (!app.quit and !app.terminating) {
+            if (app.updater.startInstall(found, path)) |job| app.tellUpdate(job);
+        },
         release_page_id => openPage(found.notes orelse app.updater.source.releases),
         else => {},
     }
@@ -674,9 +690,11 @@ fn openPage(url: []const u8) void {
 }
 
 /// Install `found` (`Job.installPackage`), downloading it first unless
-/// `path` has it, and tell what came of it. Not while a check runs, which
-/// the user then sees end on its own. One that could not start is
-/// returned, failed, as `start` returns a check.
+/// `path` has it, and tell what came of it. Not while a check runs: only
+/// a manual one can have started under the offer (a global keybind's;
+/// the timer waits out prompts, `timerFired`), which the user then sees
+/// end, offering the update again if it finds one. One that could not
+/// start is returned, failed, as `start` returns a check.
 pub fn startInstall(self: *Updater, found: update_feed.Update, path: ?[:0]const u16) ?*Job {
     if (self.running != null) {
         log.warn("update not installed: a check is running", .{});
