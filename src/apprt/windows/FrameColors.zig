@@ -57,11 +57,12 @@ pub fn unfocused(self: FrameColors) FrameColors {
 
 /// A colour in Oklab (Björn Ottosson, "A perceptual color space for image
 /// processing", 2020, whose matrices these are), from and to 8-bit sRGB.
-pub const Oklab = struct {
+const Oklab = struct {
     l: f32,
     a: f32,
     b: f32,
 
+    /// `c` in Oklab.
     pub fn of(c: RGB) Oklab {
         const r = linear(c.r);
         const g = linear(c.g);
