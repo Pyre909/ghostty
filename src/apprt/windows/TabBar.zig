@@ -566,8 +566,9 @@ pub fn scaleDpi(height: i32, to: u32, from: u32) i32 {
 }
 
 /// The bar's colours: the frame's own under `window-theme = ghostty`
-/// (`Window.shownColors`, darker while it is inactive), else by whether the title bar is dark
-/// (`Window.dark_frame`), as the frame follows `window-theme`.
+/// (`Window.shownColors`, darker while it is inactive), else by whether
+/// the title bar is dark (`Window.dark_frame`), as the frame follows
+/// `window-theme`.
 const Colors = struct {
     bar: win32.COLORREF,
     shown: win32.COLORREF,

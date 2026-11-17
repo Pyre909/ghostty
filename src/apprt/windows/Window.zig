@@ -3635,9 +3635,10 @@ pub fn dividerWidth(dpi: u32) i32 {
 /// system: `Config.finalize` turns such an `auto` into `system`. `ghostty`
 /// is taken as `auto`, as GTK takes it when it picks its color scheme, and
 /// finalize leaves it alone, so the pair is checked here; the caption
-/// itself is then in its own colours, in their mode (`applyTheme`). Followed by the background, a pair would
-/// pick the scheme from the half it picked: stuck on one half, or, if the
-/// light half is dark, flipping between them for good.
+/// itself is then in its own colours, in their mode (`applyTheme`).
+/// Followed by the background, a pair would pick the scheme from the half
+/// it picked: stuck on one half, or, if the light half is dark, flipping
+/// between them for good.
 pub fn frameDark(
     config: *const configpkg.Config,
     system: apprt.ColorScheme,
