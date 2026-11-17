@@ -46,7 +46,12 @@ new date, changing nothing else:
     python3 dist/windows/make_feed.py --renew ghostty-windows-update.json \\
         --key ghostty-update-key.pem
 
-and replace both files on the release (and on stable-windows).
+and replace both files on the release (and on stable-windows). The feed
+renewed is most often the published copy, which whoever holds the
+upload token could have changed: --renew signs it only if its signature
+beside it verifies with the key's public half (or, while keys change,
+--previous-public-key, the key that signed it), and only if it is a
+feed this script would write, of one release's packages.
 """
 
 from __future__ import annotations
@@ -258,6 +263,81 @@ def sign(tool: str, key: Path, feed_path: Path) -> Path:
     return dest
 
 
+def verified(tool: str, public_hex: str, feed_path: Path, sig_path: Path) -> bool:
+    """Whether `sig_path` is the Ed25519 signature of the file at
+    `feed_path`, its exact bytes, by the key whose public half is
+    `public_hex`."""
+    with tempfile.TemporaryDirectory() as d:
+        public = Path(d) / "public.der"
+        public.write_bytes(ED25519_SPKI + bytes.fromhex(public_hex))
+        try:
+            run = subprocess.run(
+                [
+                    tool,
+                    "pkeyutl",
+                    "-verify",
+                    "-rawin",
+                    "-pubin",
+                    "-keyform",
+                    "DER",
+                    "-inkey",
+                    str(public),
+                    "-sigfile",
+                    str(sig_path),
+                    "-in",
+                    str(feed_path),
+                ],
+                capture_output=True,
+                check=False,
+            )
+        except OSError as e:
+            raise Error(f"{tool} not run: {e}") from e
+    return run.returncode == 0
+
+
+def check_feed(content: object, where: Path) -> None:
+    """Refuse to sign again what make() would not have written: other
+    fields, a version or release make() refuses, or a package not that
+    version's for its architecture, at its URL on the release `notes`
+    names, with a SHA-256."""
+
+    def refuse(why: str) -> Error:
+        return Error(f"{where} is not a feed make_feed.py writes: {why}")
+
+    if not isinstance(content, dict):
+        raise refuse("not an object")
+    fields = {"version", "notes", "packages"}
+    if not fields <= content.keys() <= fields | {"expires"}:
+        raise refuse("its fields are " + ", ".join(sorted(content)))
+    version, notes, packages = (content[k] for k in ("version", "notes", "packages"))
+    if not (isinstance(version, str) and isinstance(notes, str)):
+        raise refuse("its version or notes is not a string")
+    check_version(version, where.name)
+    tag = notes.removeprefix(notes_url(""))
+    if notes_url(tag) != notes:
+        raise refuse(f"its notes are not a release's page: {notes}")
+    check_release(version, tag)
+    if not isinstance(packages, dict) or not packages:
+        raise refuse("it has no packages")
+    for arch, package in packages.items():
+        if arch not in make_msi.PLATFORMS:
+            raise refuse(f"no such architecture {arch!r}")
+        if not isinstance(package, dict) or package.keys() != {"url", "sha256"}:
+            raise refuse(f"{arch}'s package is not a url and a sha256")
+        url, sha256 = package["url"], package["sha256"]
+        if not isinstance(sha256, str) or re.fullmatch("[0-9a-f]{64}", sha256) is None:
+            raise refuse(f"{arch}'s sha256 is not 64 hex digits")
+        name = url.rpartition("/")[2] if isinstance(url, str) else ""
+        m = make_msi.FOLDER.fullmatch(name.removesuffix(".msi"))
+        if (
+            not name.endswith(".msi")
+            or m is None
+            or (m["version"], m["arch"]) != (version, arch)
+            or url != package_url(tag, name)
+        ):
+            raise refuse(f"{arch}'s package is not {version}'s on {tag}: {url}")
+
+
 def write(dest: Path, content: dict, args: argparse.Namespace) -> None:
     """Write the feed `content` to `dest`, and sign it unless --unsigned.
     Both are made in a stage beside `dest` and moved into place only once
@@ -279,15 +359,31 @@ def renew(args: argparse.Namespace) -> Path:
     else of it changes."""
     if args.key is None:
         raise Error("--renew signs the feed again: give its --key")
-    if args.packages or args.tag is not None or args.unsigned:
+    if args.packages or args.tag is not None or args.unsigned or args.out is not None:
         raise Error("--renew takes only the feed, its --key and its expiry")
     dest = args.renew.resolve()
+    # Ghostty fetches the feed by this name and its signature beside it
+    # by that name: renewing another file would sign over another's.
+    if dest.name != FEED:
+        raise Error(f"--renew takes the feed, named {FEED}, not {dest.name}")
     try:
-        content = json.loads(dest.read_text("utf-8"))
+        content = json.loads(dest.read_bytes())
     except (OSError, ValueError) as e:
         raise Error(f"{dest} is not a feed: {e}") from e
-    if not isinstance(content, dict) or not {"version", "packages"} <= content.keys():
-        raise Error(f"{dest} is not a feed")
+    # Its signature first, then its shape: no other feed is signed again.
+    signature = dest.with_name(SIGNATURE)
+    if not signature.is_file():
+        raise Error(f"{dest} has no {SIGNATURE} beside it: only a signed feed renews")
+    keys = [public_key(args.openssl, args.key)]
+    if args.previous_public_key is not None:
+        keys.append(args.previous_public_key)
+    if not any(verified(args.openssl, k, dest, signature) for k in keys):
+        raise Error(
+            f"{SIGNATURE} does not verify {dest} with --key's public half"
+            + (" or --previous-public-key" if len(keys) > 1 else "")
+            + ": it is not the feed that was signed"
+        )
+    check_feed(content, dest)
     expires = expiry(args)
     # In the place make writes it, for a feed of an older make_feed.py too.
     content = {
@@ -300,6 +396,11 @@ def renew(args: argparse.Namespace) -> Path:
 
 
 def make(args: argparse.Namespace) -> Path:
+    if args.previous_public_key is not None and (
+        args.renew is None
+        or re.fullmatch("[0-9a-f]{64}", args.previous_public_key) is None
+    ):
+        raise Error("--previous-public-key is for --renew: the hex --public-key prints")
     if args.renew is not None:
         return renew(args)
     if args.tag is None:
@@ -340,6 +441,11 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         metavar="FEED",
         help="sign FEED again with a new expiry, changing nothing else",
+    )
+    parser.add_argument(
+        "--previous-public-key",
+        metavar="HEX",
+        help="with --renew, the public key FEED was signed with, if not --key's",
     )
     parser.add_argument(
         "--public-key",

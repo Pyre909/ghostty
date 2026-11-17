@@ -394,47 +394,187 @@ class TestExpiry(Temp):
                     self.assertEqual(list(self.dir.glob(".stage-*")), [])
 
     def test_renew_puts_expires_after_the_version(self) -> None:
-        # A feed without one, as an older make_feed.py wrote.
+        # A signed feed without one, as an older make_feed.py wrote.
+        key = test_key(self.dir)
         feed = self.dir / mf.FEED
-        feed.write_text(
-            json.dumps({"version": "1.4.1-win.3", "notes": "n", "packages": {}}),
-            "utf-8",
-        )
-        code, _, err = run(
-            mf.main,
-            [
-                "--renew",
-                str(feed),
-                "--key",
-                str(test_key(self.dir)),
-                "--valid-days",
-                "7",
-            ],
-        )
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            argv = self.packages() + ["--tag", TAG, "--unsigned"]
+            self.assertEqual(run(mf.main, argv)[0], 0)
+            content = json.loads(feed.read_text("utf-8"))
+            del content["expires"]
+            feed.write_text(json.dumps(content), "utf-8")
+            mf.sign("openssl", key, feed)
+            renew = ["--renew", str(feed), "--key", str(key), "--valid-days", "7"]
+            code, _, err = run(mf.main, renew)
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(
             list(json.loads(feed.read_text("utf-8"))),
             ["version", "expires", "notes", "packages"],
         )
-        self.assertEqual((self.dir / mf.SIGNATURE).stat().st_size, 64)
+        self.assertTrue(
+            mf.verified("openssl", TEST_PUBLIC, feed, self.dir / mf.SIGNATURE)
+        )
 
     def test_renew_refusals(self) -> None:
         key = str(test_key(self.dir))
         feed = self.dir / mf.FEED
-        feed.write_text('{"version": "1.4.1"}', "utf-8")
+        feed.write_text("{", "utf-8")
+        other = self.dir / "other.json"
+        other.write_text("{}", "utf-8")
+        # Beside other.json, a signature renewing it would have replaced.
+        signature = self.dir / mf.SIGNATURE
+        signature.write_bytes(b"s" * 64)
+        empty = self.dir / "empty"
+        empty.mkdir()
+        unsigned = self.dir / "unsigned"
+        unsigned.mkdir()
+        (unsigned / mf.FEED).write_text("{}", "utf-8")
         for args, says in [
             (["--renew", str(feed)], "give its --key"),
             (["--renew", str(feed), "--key", key, "--unsigned"], "takes only"),
             (["--renew", str(feed), "--key", key, "--tag", TAG], "takes only"),
             (["--renew", str(feed), "--key", key, *self.packages()], "takes only"),
+            (["--renew", str(feed), "--key", key, "--out", str(empty)], "takes only"),
+            (["--renew", str(other), "--key", key], f"named {mf.FEED}"),
             (["--renew", str(feed), "--key", key], "is not a feed"),
-            (["--renew", str(self.dir / "none.json"), "--key", key], "is not a feed"),
+            (["--renew", str(empty / mf.FEED), "--key", key], "is not a feed"),
+            (["--renew", str(unsigned / mf.FEED), "--key", key], "has no"),
+            (
+                [*self.packages(), "--tag", TAG, "--key", key]
+                + ["--previous-public-key", TEST_PUBLIC],
+                "is for --renew",
+            ),
+            (
+                ["--renew", str(feed), "--key", key]
+                + ["--previous-public-key", TEST_PUBLIC.upper()],
+                "is for --renew",
+            ),
         ]:
             with self.subTest(args=args):
                 code, out, err = run(mf.main, args)
                 self.assertEqual((code, out), (1, ""))
                 self.assertIn(says, err)
-                self.assertFalse((self.dir / mf.SIGNATURE).exists())
+                self.assertEqual(signature.read_bytes(), b"s" * 64)
+                self.assertEqual(list(empty.iterdir()), [])
+                self.assertEqual(list(unsigned.iterdir()), [unsigned / mf.FEED])
+
+
+class TestRenew(Temp):
+    """--renew signs again only the feed that was signed, and only one
+    make() would write: the published copy may have been changed by
+    whoever holds the upload token, who must not get it signed."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.key = test_key(self.dir)
+        self.feed = self.dir / mf.FEED
+        self.signature = self.dir / mf.SIGNATURE
+        packages = [
+            str(self.package("ghostty-1.4.1-win.3-windows-aarch64.msi", b"arm")),
+            str(self.package("ghostty-1.4.1-win.3-windows-x86_64.msi", b"x64")),
+        ]
+        argv = packages + ["--tag", TAG, "--key", str(self.key)]
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            self.assertEqual(run(mf.main, argv + ["--valid-days", "9"])[0], 0)
+        self.content = json.loads(self.feed.read_text("utf-8"))
+
+    def renew(self, *extra: str) -> tuple[int, str, str]:
+        argv = ["--renew", str(self.feed), "--key", str(self.key), *extra]
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            return run(mf.main, argv)
+
+    def refused(self, says: str, *extra: str) -> None:
+        before = {p: p.read_bytes() for p in (self.feed, self.signature)}
+        code, out, err = self.renew(*extra)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(says, err)
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_renews_the_feed_that_was_signed(self) -> None:
+        self.assertEqual(self.renew("--valid-days", "30")[0], 0)
+        renewed = json.loads(self.feed.read_text("utf-8"))
+        self.assertEqual(renewed, {**self.content, "expires": NOW + 30 * mf.DAY})
+        self.assertTrue(mf.verified("openssl", TEST_PUBLIC, self.feed, self.signature))
+
+    def test_refuses_a_feed_its_signature_does_not_verify(self) -> None:
+        # The attack: one package's hash (and so its file) swapped.
+        swapped = json.loads(json.dumps(self.content))
+        swapped["packages"]["x86_64"]["sha256"] = "0" * 64
+        self.feed.write_text(json.dumps(swapped, indent=2) + "\n", "utf-8")
+        self.refused("does not verify")
+        # One byte more.
+        self.feed.write_bytes(self.feed.read_bytes() + b" ")
+        self.refused("does not verify")
+        # A signature cut short.
+        self.feed.write_text(json.dumps(self.content, indent=2) + "\n", "utf-8")
+        self.signature.write_bytes(self.signature.read_bytes()[:63])
+        self.refused("does not verify")
+        # None at all.
+        self.signature.unlink()
+        before = self.feed.read_bytes()
+        code, out, err = self.renew()
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("has no", err)
+        self.assertEqual(self.feed.read_bytes(), before)
+        self.assertFalse(self.signature.exists())
+
+    def test_a_new_key_renews_a_feed_the_previous_one_signed(self) -> None:
+        new = self.dir / "new.pem"
+        mf.openssl("openssl", ["genpkey", "-algorithm", "ed25519", "-out", str(new)])
+        new_public = mf.public_key("openssl", new)
+        self.key = new
+        self.refused("does not verify")
+        self.refused("does not verify", "--previous-public-key", new_public)
+        code, _, err = self.renew("--previous-public-key", TEST_PUBLIC)
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(mf.verified("openssl", new_public, self.feed, self.signature))
+        self.assertFalse(mf.verified("openssl", TEST_PUBLIC, self.feed, self.signature))
+
+    def test_refuses_a_signed_feed_make_would_not_write(self) -> None:
+        # Each signed with the key: --renew does not sign what make()
+        # refuses, however it came to be signed.
+        x64 = mf.package_url(TAG, "ghostty-1.4.1-win.3-windows-x86_64.msi")
+        sha = self.content["packages"]["x86_64"]["sha256"]
+        for change, says in [
+            ({"extra": 1}, "its fields are"),
+            ({"notes": "https://example.com/"}, "not a release's page"),
+            ({"notes": mf.notes_url("v9.9.9")}, "is tagged v1.4.1-win.3"),
+            ({"version": "1.4.1"}, "is tagged v1.4.1"),
+            ({"version": 1}, "not a string"),
+            ({"packages": {}}, "no packages"),
+            ({"packages": {"riscv64": {"url": x64, "sha256": sha}}}, "architecture"),
+            ({"packages": {"x86_64": {"url": x64}}}, "a url and a sha256"),
+            (
+                {"packages": {"x86_64": {"url": x64, "sha256": sha.upper()}}},
+                "64 hex digits",
+            ),
+            (
+                {"packages": {"x86_64": {"url": x64 + "x", "sha256": sha}}},
+                "not 1.4.1-win.3's",
+            ),
+            (
+                {"packages": {"aarch64": {"url": x64, "sha256": sha}}},
+                "not 1.4.1-win.3's",
+            ),
+            (
+                {
+                    "packages": {
+                        "x86_64": {
+                            "url": mf.package_url(
+                                "tip-windows", "ghostty-1.4.1-win.3-windows-x86_64.msi"
+                            ),
+                            "sha256": sha,
+                        }
+                    }
+                },
+                "not 1.4.1-win.3's",
+            ),
+            ({"packages": {"x86_64": {"url": 5, "sha256": sha}}}, "not 1.4.1-win.3's"),
+        ]:
+            with self.subTest(change=change):
+                self.feed.write_text(json.dumps({**self.content, **change}), "utf-8")
+                mf.sign("openssl", self.key, self.feed)
+                self.refused(says)
 
 
 class TestRepository(unittest.TestCase):
