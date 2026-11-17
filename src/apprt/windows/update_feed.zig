@@ -98,9 +98,8 @@ pub fn parse(
         else => error.InvalidFeed,
     };
 
-    // Both parsed: `SemanticVersion.order` is only safe on parsed versions.
-    const offered = SemanticVersion.parse(feed.version) catch return error.InvalidVersion;
-    const running = SemanticVersion.parse(current) catch return error.InvalidVersion;
+    const offered = try orderable(feed.version);
+    const running = try orderable(current);
     if (offered.order(running) != .gt) return null;
 
     const package = switch (arch) {
@@ -121,6 +120,24 @@ pub fn parse(
         .url = package.url,
         .sha256 = sha256,
     };
+}
+
+/// `text` parsed as a version `SemanticVersion.order` can compare. order
+/// reads every pre-release identifier with `parseUnsigned` and takes an
+/// overflow as unreachable, which parse rules out only for identifiers
+/// of digits alone: one of more digits than a usize holds, then a letter,
+/// is a valid alphanumeric identifier, yet overflows before the letter.
+/// So each identifier is read here as order reads it.
+fn orderable(text: []const u8) Error!SemanticVersion {
+    const version = SemanticVersion.parse(text) catch return error.InvalidVersion;
+    var ids = std.mem.splitScalar(u8, version.pre orelse "", '.');
+    while (ids.next()) |id| {
+        _ = std.fmt.parseUnsigned(usize, id, 10) catch |err| switch (err) {
+            error.Overflow => return error.InvalidVersion,
+            error.InvalidCharacter => {},
+        };
+    }
+    return version;
 }
 
 /// Whether `url` is `releases` then `under`, then one or more path
@@ -253,10 +270,23 @@ test "win32: a feed not of the feed's shape is refused, unknown fields aside" {
     try testing.expectError(error.InvalidVersion, parse(a,
         \\{"version":"9.0.0","packages":{}}
     , "not-a-version", .x86_64, test_releases));
-    // An identifier past usize: refused by parse, before order sees it.
-    try testing.expectError(error.InvalidVersion, parse(a,
-        \\{"version":"9.0.0-99999999999999999999999","packages":{}}
-    , "1.0.0", .x86_64, test_releases));
+    // An identifier past usize, of digits alone (which parse refuses) or
+    // then a letter (which parse takes, but order cannot compare): both
+    // refused, in the feed and in the build's own version.
+    for ([_][]const u8{ "1.4.1-win.99999999999999999999999", "1.4.1-win.99999999999999999999999a" }) |version| {
+        var buf: [256]u8 = undefined;
+        const body = std.fmt.bufPrint(&buf,
+            \\{{"version":"{s}","packages":{{}}}}
+        , .{version}) catch unreachable;
+        try testing.expectError(error.InvalidVersion, parse(a, body, "1.4.1-win.3", .x86_64, test_releases));
+        try testing.expectError(error.InvalidVersion, parse(a,
+            \\{"version":"1.4.1-win.3","packages":{}}
+        , version, .x86_64, test_releases));
+    }
+    // The largest that fits, then a letter: compared.
+    try testing.expectEqual(null, try parse(a,
+        \\{"version":"1.4.1-win.18446744073709551615a","packages":{}}
+    , "1.4.1-win.18446744073709551615b", .x86_64, test_releases));
     // A hash not 64 hex digits.
     for ([_][]const u8{ "00", test_sha ++ "00", "zz" ++ test_sha[2..] }) |sha| {
         var buf: [1024]u8 = undefined;
