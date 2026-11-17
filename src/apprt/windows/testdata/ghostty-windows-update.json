@@ -1,5 +1,6 @@
 {
   "version": "1.4.1-win.3",
+  "expires": 4102444800,
   "notes": "https://github.com/Pyre909/ghostty/releases/tag/v1.4.1-win.3",
   "packages": {
     "x86_64": {

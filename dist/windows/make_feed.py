@@ -33,7 +33,20 @@ releases (as upstream keeps its Sparkle key in a CI secret):
     openssl genpkey -algorithm ed25519 -out ghostty-update-key.pem
     python3 dist/windows/make_feed.py --public-key ghostty-update-key.pem
 
-the second printing the hex that -Dupdate-public-key takes.
+the second printing the hex that -Dupdate-public-key takes. That takes
+two keys too, comma-separated, the second the next key: to change keys,
+release builds that trust both, then sign with the new one, and drop the
+old from the builds after.
+
+A signed feed expires (--valid-days, 90 by default): a Ghostty with the
+key refuses it after that, so a feed replayed or frozen at an old
+release stops being believed. Before it expires, sign it again with a
+new date, changing nothing else:
+
+    python3 dist/windows/make_feed.py --renew ghostty-windows-update.json \\
+        --key ghostty-update-key.pem
+
+and replace both files on the release (and on stable-windows).
 """
 
 from __future__ import annotations
@@ -43,6 +56,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +76,12 @@ STABLE_TAG = "stable-windows"
 # The largest number `std.SemanticVersion.parse` reads: a usize, which
 # is 64 bits on each architecture a package is for.
 MAX_NUMBER = 2**64 - 1
+
+# How long a feed is believed, by default; and the latest `expires` an
+# i64 holds, as `update_feed.Feed` reads it.
+VALID_DAYS = 90
+DAY = 24 * 60 * 60
+MAX_EXPIRES = 2**63 - 1
 
 # A URL segment Ghostty accepts (`update_feed.allowed`).
 SEGMENT = re.compile(r"[A-Za-z0-9._+-]+", re.ASCII)
@@ -152,10 +172,30 @@ def notes_url(tag: str) -> str:
     return f"{RELEASES}tag/{tag}"
 
 
-def feed(packages: list[Package], tag: str) -> dict:
+def expiry(args: argparse.Namespace) -> int:
+    """When the feed expires, in Unix seconds: --expires, or --valid-days
+    from now."""
+    if args.expires is not None and args.valid_days is not None:
+        raise Error("give --expires or --valid-days, not both")
+    if args.expires is not None:
+        expires = args.expires
+    else:
+        days = VALID_DAYS if args.valid_days is None else args.valid_days
+        if days <= 0:
+            raise Error(f"--valid-days {days} is not a number of days to come")
+        expires = int(time.time()) + days * DAY
+    if not 0 < expires <= MAX_EXPIRES:
+        raise Error(f"{expires} is not a time Ghostty reads")
+    if expires <= time.time():
+        raise Error(f"{expires} has passed: Ghostty would refuse the feed")
+    return expires
+
+
+def feed(packages: list[Package], tag: str, expires: int) -> dict:
     check_release(packages[0].version, tag)
     return {
         "version": packages[0].version,
+        "expires": expires,
         "notes": notes_url(tag),
         "packages": {
             p.arch: {
@@ -216,7 +256,43 @@ def sign(tool: str, key: Path, feed_path: Path) -> Path:
     return dest
 
 
+def write(dest: Path, content: dict, args: argparse.Namespace) -> None:
+    """Write the feed `content` to `dest`, and sign it unless --unsigned."""
+    text = json.dumps(content, indent=2) + "\n"
+    dest.with_name(SIGNATURE).unlink(missing_ok=True)
+    dest.write_text(text, "utf-8")
+    if args.key is not None:
+        sign(args.openssl, args.key, dest)
+
+
+def renew(args: argparse.Namespace) -> Path:
+    """The feed at --renew, its `expires` moved and signed again: nothing
+    else of it changes."""
+    if args.key is None:
+        raise Error("--renew signs the feed again: give its --key")
+    if args.packages or args.tag is not None or args.unsigned:
+        raise Error("--renew takes only the feed, its --key and its expiry")
+    dest = args.renew.resolve()
+    try:
+        content = json.loads(dest.read_text("utf-8"))
+    except (OSError, ValueError) as e:
+        raise Error(f"{dest} is not a feed: {e}") from e
+    if not isinstance(content, dict) or not {"version", "packages"} <= content.keys():
+        raise Error(f"{dest} is not a feed")
+    expires = expiry(args)
+    # In the place make writes it, for a feed of an older make_feed.py too.
+    content = {
+        "version": content["version"],
+        "expires": expires,
+        **{k: v for k, v in content.items() if k not in ("version", "expires")},
+    }
+    write(dest, content, args)
+    return dest
+
+
 def make(args: argparse.Namespace) -> Path:
+    if args.renew is not None:
+        return renew(args)
     if args.tag is None:
         raise Error("give the release's --tag")
     if (args.key is None) == (not args.unsigned):
@@ -227,11 +303,7 @@ def make(args: argparse.Namespace) -> Path:
     out = (args.out or packages[0].path.parent).resolve()
     out.mkdir(parents=True, exist_ok=True)
     dest = out / FEED
-    text = json.dumps(feed(packages, args.tag), indent=2) + "\n"
-    dest.with_name(SIGNATURE).unlink(missing_ok=True)
-    dest.write_text(text, "utf-8")
-    if args.key is not None:
-        sign(args.openssl, args.key, dest)
+    write(dest, feed(packages, args.tag, expiry(args)), args)
     return dest
 
 
@@ -246,6 +318,20 @@ def main(argv: list[str] | None = None) -> int:
         "--key", type=Path, help="the Ed25519 private key (PEM) to sign the feed with"
     )
     parser.add_argument("--unsigned", action="store_true", help="write no signature")
+    parser.add_argument(
+        "--valid-days",
+        type=int,
+        help=f"days until the feed expires ({VALID_DAYS})",
+    )
+    parser.add_argument(
+        "--expires", type=int, help="when the feed expires, in Unix seconds"
+    )
+    parser.add_argument(
+        "--renew",
+        type=Path,
+        metavar="FEED",
+        help="sign FEED again with a new expiry, changing nothing else",
+    )
     parser.add_argument(
         "--public-key",
         type=Path,

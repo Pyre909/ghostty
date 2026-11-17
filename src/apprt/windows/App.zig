@@ -17341,13 +17341,24 @@ const TestUpdate = struct {
 
     /// As `feed`, with release notes at `notes` on `server`, unless empty.
     fn feedWithNotes(buf: []u8, server: *const http_testing.TestServer, version: []const u8, package: []const u8, sha256: [32]u8, notes: []const u8) []const u8 {
+        return feedExpiring(buf, server, version, package, sha256, notes, far_future);
+    }
+
+    /// 2100-01-01, in Unix seconds: the tests' feeds expire then.
+    const far_future = 4102444800;
+
+    /// As `feedWithNotes`, expiring at `expires` (Unix seconds), or never
+    /// saying when.
+    fn feedExpiring(buf: []u8, server: *const http_testing.TestServer, version: []const u8, package: []const u8, sha256: [32]u8, notes: []const u8, expires: ?i64) []const u8 {
+        var expires_buf: [32]u8 = undefined;
+        const expires_field = if (expires) |time| std.fmt.bufPrint(&expires_buf, "\"expires\":{d},", .{time}) catch unreachable else "";
         var notes_buf: [128]u8 = undefined;
         const notes_field = if (notes.len == 0) "" else std.fmt.bufPrint(&notes_buf, "\"notes\":\"http://127.0.0.1:{d}{s}\",", .{ server.port, notes }) catch unreachable;
         var body_buf: [768]u8 = undefined;
         const hex = std.fmt.bytesToHex(sha256, .lower);
         const body = std.fmt.bufPrint(&body_buf,
-            \\{{"version":"{s}",{s}"packages":{{"x86_64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}},"aarch64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}}}}}}
-        , .{ version, notes_field, server.port, package, &hex, server.port, package, &hex }) catch unreachable;
+            \\{{"version":"{s}",{s}{s}"packages":{{"x86_64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}},"aarch64":{{"url":"http://127.0.0.1:{d}{s}","sha256":"{s}"}}}}}}
+        , .{ version, expires_field, notes_field, server.port, package, &hex, server.port, package, &hex }) catch unreachable;
         return std.fmt.bufPrint(buf, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch unreachable;
     }
 };
@@ -17596,6 +17607,28 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
     Updater.test_package_dir = dir.path;
 
+    // A signed feed past its `expires`, or that names none, is not
+    // believed: a feed replayed, or frozen at an old release, stops
+    // being one. The clock is the system's: 1970 has passed.
+    var dated_buf: [1024]u8 = undefined;
+    TestUpdate.serve(&routes, TestUpdate.feedExpiring(&dated_buf, &server, "999.0.0", package_path, sha256, "", 1));
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(17, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check for updates (FeedExpired)"));
+    TestUpdate.serve(&routes, TestUpdate.feedExpiring(&dated_buf, &server, "999.0.0", package_path, sha256, "", null));
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(18, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check for updates (InvalidFeed)"));
+    // A build with no key reads no signature, so no `expires` either:
+    // it is only sent to the release page.
+    app.updater.source.keys = null;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(19, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+
     // A feed signed with the build's next key, as once the signing key
     // changes, is believed; and with neither key, not.
     const stranger = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
@@ -17603,12 +17636,12 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     TestUpdate.serve(&routes, newer);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(17, TestUpdate.boxes);
+    try std.testing.expectEqual(20, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("999.0.0"));
     app.updater.source.keys = .{ .current = stranger.public_key.toBytes() };
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(18, TestUpdate.boxes);
+    try std.testing.expectEqual(21, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not check for updates (BadSignature)"));
     app.updater.source.keys = .{ .current = TestUpdate.keyPair().public_key.toBytes() };
 
@@ -17618,12 +17651,12 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     _ = try app.performAction(.app, .check_for_updates, {});
     try std.testing.expectEqual(null, app.updater.running);
     app.createRequested();
-    try std.testing.expectEqual(19, TestUpdate.boxes);
+    try std.testing.expectEqual(22, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not check"));
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try std.testing.expectEqual(null, app.updater.running);
     app.createRequested();
-    try std.testing.expectEqual(19, TestUpdate.boxes);
+    try std.testing.expectEqual(22, TestUpdate.boxes);
 }
 
 /// For tests: the update offer's task dialog (`About.test_record`), and

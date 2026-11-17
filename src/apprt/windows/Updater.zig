@@ -189,13 +189,16 @@ pub const Job = struct {
         const session = try job.openSession();
         defer session.close();
         const body = try session.get(arena, job.source.feed, max_feed);
+        // A signed feed is checked to be unexpired as of now.
+        var now: ?i64 = null;
         if (job.source.keys) |keys| {
             // Beside the feed: ".sig" after its URL.
             const sig_url = try std.mem.concat(arena, u8, &.{ job.source.feed, ".sig" });
             const signature = try session.get(arena, sig_url, max_signature);
             try update_feed.verify(body, signature, keys);
+            now = unixTime();
         }
-        const found = try update_feed.parse(arena, body, build_config.version_string, arch, job.source.releases) orelse
+        const found = try update_feed.parse(arena, body, build_config.version_string, arch, job.source.releases, now) orelse
             return .current;
         const dir = job.dir orelse return .{ .update = .{ .found = found, .path = null } };
         const path = try packagePath(arena, dir, found.url);
@@ -336,6 +339,13 @@ fn msiexec(arena: Allocator, path: [:0]const u16) !u32 {
         return error.MsiexecNotStarted;
     }
     return code;
+}
+
+/// The time in Unix seconds, as a feed's `expires` is: the system's
+/// clock, in 100 ns units since 1601 (FILETIME's epoch).
+fn unixTime() i64 {
+    const since_1601 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
+    return @divFloor(since_1601, std.time.ns_per_s / 100) + std.time.epoch.windows;
 }
 
 /// msiexec's command line: `image` installing `path`, with its progress

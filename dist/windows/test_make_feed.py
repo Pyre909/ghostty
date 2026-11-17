@@ -35,6 +35,10 @@ TAG = "v1.4.1-win.3"
 # The feed both make_feed.py and Ghostty's parser are tested against
 # (update_feed.zig embeds it), and its signature.
 FIXTURE = REPO / "src/apprt/windows/testdata"
+# The signed fixture's `expires`: 2100-01-01 (update_feed.zig's
+# fixture_expires). And a fixed "now" for the default expiry.
+FIXTURE_EXPIRES = 4102444800
+NOW = 1_800_000_000
 # RFC 8032's first Ed25519 test key (section 7.1, TEST 1): it signs only
 # the fixture, and its public half is published with the RFC.
 TEST_SEED = bytes.fromhex(
@@ -79,16 +83,23 @@ class TestFeed(Temp):
     def test_names_each_package_by_its_asset_url_and_hash(self) -> None:
         arm = self.package("ghostty-1.4.1-win.3-windows-aarch64.msi", b"arm")
         x64 = self.package("ghostty-1.4.1-win.3-windows-x86_64.msi", b"x64")
-        code, out, err = run(mf.main, [str(arm), str(x64), "--tag", TAG, "--unsigned"])
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            code, out, err = run(
+                mf.main, [str(arm), str(x64), "--tag", TAG, "--unsigned"]
+            )
         self.assertEqual((code, err), (0, ""))
         dest = self.dir / mf.FEED
         self.assertEqual(out, f"{dest}\n")
         feed = json.loads(dest.read_text("utf-8"))
         releases = "https://github.com/Pyre909/ghostty/releases/"
+        # Expiring 90 days on, by default; in the order Ghostty's test of
+        # the signed fixture expects.
+        self.assertEqual(list(feed), ["version", "expires", "notes", "packages"])
         self.assertEqual(
             feed,
             {
                 "version": "1.4.1-win.3",
+                "expires": NOW + 90 * 24 * 60 * 60,
                 "notes": f"{releases}tag/{TAG}",
                 "packages": {
                     "x86_64": {
@@ -246,7 +257,9 @@ class TestSigned(Temp):
         # fails one of the two.
         key = test_key(self.dir)
         code, out, err = run(
-            mf.main, self.packages() + ["--tag", TAG, "--key", str(key)]
+            mf.main,
+            self.packages()
+            + ["--tag", TAG, "--key", str(key), "--expires", str(FIXTURE_EXPIRES)],
         )
         self.assertEqual((code, err), (0, ""))
         for name in (mf.FEED, mf.SIGNATURE):
@@ -287,6 +300,118 @@ class TestSigned(Temp):
         self.assertEqual((code, out), (1, ""))
         self.assertIn("is not an Ed25519 key", err)
         self.assertFalse((self.dir / mf.SIGNATURE).exists())
+
+
+class TestExpiry(Temp):
+    def packages(self) -> list[str]:
+        return [
+            str(self.package("ghostty-1.4.1-win.3-windows-aarch64.msi", b"arm")),
+            str(self.package("ghostty-1.4.1-win.3-windows-x86_64.msi", b"x64")),
+        ]
+
+    def expires(self, extra: list[str]) -> int:
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            code, _, err = run(
+                mf.main, self.packages() + ["--tag", TAG, "--unsigned", *extra]
+            )
+        self.assertEqual((code, err), (0, ""))
+        return json.loads((self.dir / mf.FEED).read_text("utf-8"))["expires"]
+
+    def test_valid_days_or_a_time(self) -> None:
+        self.assertEqual(self.expires(["--valid-days", "1"]), NOW + 24 * 60 * 60)
+        self.assertEqual(self.expires(["--expires", str(NOW + 1)]), NOW + 1)
+        self.assertEqual(self.expires(["--expires", str(2**63 - 1)]), 2**63 - 1)
+
+    def test_refusals(self) -> None:
+        for extra, says in [
+            (["--valid-days", "0"], "not a number of days to come"),
+            (["--valid-days", "-3"], "not a number of days to come"),
+            (["--expires", str(NOW)], "has passed"),
+            (["--expires", "-1"], "not a time Ghostty reads"),
+            (["--expires", str(2**63)], "not a time Ghostty reads"),
+            (["--expires", str(NOW + 9), "--valid-days", "9"], "not both"),
+        ]:
+            with self.subTest(extra=extra):
+                with mock.patch.object(mf.time, "time", return_value=NOW):
+                    code, out, err = run(
+                        mf.main, self.packages() + ["--tag", TAG, "--unsigned", *extra]
+                    )
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn(says, err)
+                self.assertFalse((self.dir / mf.FEED).exists())
+
+    def test_renew_changes_only_the_expiry_and_signs_again(self) -> None:
+        # The fixture, made to expire sooner, then renewed back to the
+        # fixture's date: byte for byte the fixture, signature and all.
+        key = test_key(self.dir)
+        feed = self.dir / mf.FEED
+        code, _, err = run(
+            mf.main,
+            self.packages()
+            + ["--tag", TAG, "--key", str(key), "--expires", str(NOW + 5)],
+        )
+        self.assertEqual((code, err), (0, ""))
+        with mock.patch.object(mf.time, "time", return_value=NOW):
+            code, out, err = run(
+                mf.main,
+                [
+                    "--renew",
+                    str(feed),
+                    "--key",
+                    str(key),
+                    "--expires",
+                    str(FIXTURE_EXPIRES),
+                ],
+            )
+        self.assertEqual((code, out, err), (0, f"{feed.resolve()}\n", ""))
+        for name in (mf.FEED, mf.SIGNATURE):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    (self.dir / name).read_bytes(), (FIXTURE / name).read_bytes()
+                )
+
+    def test_renew_puts_expires_after_the_version(self) -> None:
+        # A feed without one, as an older make_feed.py wrote.
+        feed = self.dir / mf.FEED
+        feed.write_text(
+            json.dumps({"version": "1.4.1-win.3", "notes": "n", "packages": {}}),
+            "utf-8",
+        )
+        code, _, err = run(
+            mf.main,
+            [
+                "--renew",
+                str(feed),
+                "--key",
+                str(test_key(self.dir)),
+                "--valid-days",
+                "7",
+            ],
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            list(json.loads(feed.read_text("utf-8"))),
+            ["version", "expires", "notes", "packages"],
+        )
+        self.assertEqual((self.dir / mf.SIGNATURE).stat().st_size, 64)
+
+    def test_renew_refusals(self) -> None:
+        key = str(test_key(self.dir))
+        feed = self.dir / mf.FEED
+        feed.write_text('{"version": "1.4.1"}', "utf-8")
+        for args, says in [
+            (["--renew", str(feed)], "give its --key"),
+            (["--renew", str(feed), "--key", key, "--unsigned"], "takes only"),
+            (["--renew", str(feed), "--key", key, "--tag", TAG], "takes only"),
+            (["--renew", str(feed), "--key", key, *self.packages()], "takes only"),
+            (["--renew", str(feed), "--key", key], "is not a feed"),
+            (["--renew", str(self.dir / "none.json"), "--key", key], "is not a feed"),
+        ]:
+            with self.subTest(args=args):
+                code, out, err = run(mf.main, args)
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn(says, err)
+                self.assertFalse((self.dir / mf.SIGNATURE).exists())
 
 
 class TestRepository(unittest.TestCase):

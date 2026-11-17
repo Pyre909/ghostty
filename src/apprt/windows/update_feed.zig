@@ -4,6 +4,7 @@
 //!
 //!     {
 //!       "version": "1.4.1-win.3",
+//!       "expires": 1780000000,
 //!       "notes": "https://github.com/<owner>/<repo>/releases/tag/<tag>",
 //!       "packages": {
 //!         "x86_64": { "url": ".../releases/download/<tag>/<name>.msi", "sha256": "<64 hex>" },
@@ -23,7 +24,12 @@
 //! A build that installs updates first checks the feed's signature
 //! (`verify`), which dist/windows/make_feed.py writes beside it: only
 //! then does the package's hash say who published the package, rather
-//! than only that it is the one the feed names.
+//! than only that it is the one the feed names. Such a build also
+//! refuses a feed past its `expires` (Unix seconds), or with none: a
+//! signed feed can otherwise be replayed for ever, and one frozen at an
+//! old release would keep a fix from ever being offered (the "freeze
+//! attack" of The Update Framework's threat model). An unsigned feed's
+//! `expires` says nothing, so a build without a key ignores it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -60,8 +66,11 @@ pub const Update = struct {
 };
 
 pub const Error = error{
-    /// Not JSON of the feed's shape, or a field not as described above.
+    /// Not JSON of the feed's shape, or a field not as described above;
+    /// for a signed feed, also one without `expires`.
     InvalidFeed,
+    /// A signed feed past its `expires`: refused until it is signed again.
+    FeedExpired,
     /// The feed's version, or this build's, is not semantic.
     InvalidVersion,
     /// The feed has no package for this architecture.
@@ -105,6 +114,8 @@ const Package = struct {
 
 const Feed = struct {
     version: []const u8,
+    /// Unix seconds; required of a signed feed (`parse`'s `now`).
+    expires: ?i64 = null,
     notes: ?[]const u8 = null,
     packages: struct {
         x86_64: ?Package = null,
@@ -115,14 +126,18 @@ const Feed = struct {
 /// The update `body` (the feed) offers a build of version `current` on
 /// `arch`, or null if the feed's version is not newer. `releases` is the
 /// releases page's URL, ending in "/releases/", under which the notes and
-/// the package must be. Allocates from `arena`, which should be one: the
-/// parse leaves what it allocates there, and the result points into it.
+/// the package must be. `now`, the time in Unix seconds, is given for a
+/// feed whose signature was verified, which must not have expired by
+/// then; null for an unsigned feed. Allocates from `arena`, which should
+/// be one: the parse leaves what it allocates there, and the result
+/// points into it.
 pub fn parse(
     arena: Allocator,
     body: []const u8,
     current: []const u8,
     arch: Arch,
     releases: []const u8,
+    now: ?i64,
 ) Error!?Update {
     std.debug.assert(std.mem.endsWith(u8, releases, "/releases/"));
 
@@ -133,6 +148,12 @@ pub fn parse(
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidFeed,
     };
+    // Before anything else is read from it: an expired feed's version
+    // is not to be trusted to be the newest.
+    if (now) |time| {
+        const expires = feed.expires orelse return error.InvalidFeed;
+        if (time >= expires) return error.FeedExpired;
+    }
 
     const offered = try orderable(feed.version);
     const running = try orderable(current);
@@ -217,7 +238,7 @@ test "win32: a newer feed is an update, its package and hash this arch's" {
     defer arena.deinit();
     var buf: [1024]u8 = undefined;
     const body = testFeed(&buf, "1.4.1-win.3", test_url, test_notes);
-    const update = (try parse(arena.allocator(), body, "1.4.1-win.2", .x86_64, test_releases)).?;
+    const update = (try parse(arena.allocator(), body, "1.4.1-win.2", .x86_64, test_releases, null)).?;
     try testing.expectEqualStrings("1.4.1-win.3", update.version);
     try testing.expectEqualStrings(test_url, update.url);
     try testing.expectEqualStrings(test_notes, update.notes.?);
@@ -226,7 +247,7 @@ test "win32: a newer feed is an update, its package and hash this arch's" {
     try testing.expectEqual(@as(u8, 0xff), update.sha256[31]);
 
     // No package for the other architecture.
-    try testing.expectError(error.NoPackage, parse(arena.allocator(), body, "1.4.1-win.2", .aarch64, test_releases));
+    try testing.expectError(error.NoPackage, parse(arena.allocator(), body, "1.4.1-win.2", .aarch64, test_releases, null));
 }
 
 test "win32: a feed no newer than the build is no update, by semver's precedence" {
@@ -247,7 +268,7 @@ test "win32: a feed no newer than the build is no update, by semver's precedence
         .{ .offered = "1.5.0", .current = "1.5.0-win.1", .update = true },
     }) |case| {
         const body = testFeed(&buf, case.offered, test_url, test_notes);
-        const got = try parse(arena.allocator(), body, case.current, .x86_64, test_releases);
+        const got = try parse(arena.allocator(), body, case.current, .x86_64, test_releases, null);
         testing.expectEqual(case.update, got != null) catch |err| {
             std.debug.print("offered {s} over {s}\n", .{ case.offered, case.current });
             return err;
@@ -274,7 +295,7 @@ test "win32: a feed's URLs must be under the build's releases, a download an .ms
         "https://github.com/owner/repo/releases/download/.msi/",
     }) |url| {
         const body = testFeed(&buf, "9.0.0", url, test_notes);
-        testing.expectError(error.UrlNotAllowed, parse(arena.allocator(), body, "1.0.0", .x86_64, test_releases)) catch |err| {
+        testing.expectError(error.UrlNotAllowed, parse(arena.allocator(), body, "1.0.0", .x86_64, test_releases, null)) catch |err| {
             std.debug.print("allowed: {s}\n", .{url});
             return err;
         };
@@ -286,26 +307,26 @@ test "win32: a feed's URLs must be under the build's releases, a download an .ms
         "https://github.com/owner/repo/releases/tag/v1?x",
     }) |notes| {
         const body = testFeed(&buf, "9.0.0", test_url, notes);
-        try testing.expectError(error.UrlNotAllowed, parse(arena.allocator(), body, "1.0.0", .x86_64, test_releases));
+        try testing.expectError(error.UrlNotAllowed, parse(arena.allocator(), body, "1.0.0", .x86_64, test_releases, null));
     }
     // Allowed: a plus in a name, as a version's build metadata has one.
     const body = testFeed(&buf, "9.0.0", test_releases ++ "download/v9.0.0/g-9.0.0+x.msi", test_notes);
-    try testing.expect(try parse(arena.allocator(), body, "1.0.0", .x86_64, test_releases) != null);
+    try testing.expect(try parse(arena.allocator(), body, "1.0.0", .x86_64, test_releases, null) != null);
 }
 
 test "win32: a feed not of the feed's shape is refused, unknown fields aside" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectError(error.InvalidFeed, parse(a, "", "1.0.0", .x86_64, test_releases));
-    try testing.expectError(error.InvalidFeed, parse(a, "<html>", "1.0.0", .x86_64, test_releases));
-    try testing.expectError(error.InvalidFeed, parse(a, "{\"version\":\"9.0.0\"}", "1.0.0", .x86_64, test_releases));
+    try testing.expectError(error.InvalidFeed, parse(a, "", "1.0.0", .x86_64, test_releases, null));
+    try testing.expectError(error.InvalidFeed, parse(a, "<html>", "1.0.0", .x86_64, test_releases, null));
+    try testing.expectError(error.InvalidFeed, parse(a, "{\"version\":\"9.0.0\"}", "1.0.0", .x86_64, test_releases, null));
     try testing.expectError(error.InvalidVersion, parse(a,
         \\{"version":"9","packages":{}}
-    , "1.0.0", .x86_64, test_releases));
+    , "1.0.0", .x86_64, test_releases, null));
     try testing.expectError(error.InvalidVersion, parse(a,
         \\{"version":"9.0.0","packages":{}}
-    , "not-a-version", .x86_64, test_releases));
+    , "not-a-version", .x86_64, test_releases, null));
     // An identifier past usize, of digits alone (which parse refuses) or
     // then a letter (which parse takes, but order cannot compare): both
     // refused, in the feed and in the build's own version.
@@ -314,22 +335,22 @@ test "win32: a feed not of the feed's shape is refused, unknown fields aside" {
         const body = std.fmt.bufPrint(&buf,
             \\{{"version":"{s}","packages":{{}}}}
         , .{version}) catch unreachable;
-        try testing.expectError(error.InvalidVersion, parse(a, body, "1.4.1-win.3", .x86_64, test_releases));
+        try testing.expectError(error.InvalidVersion, parse(a, body, "1.4.1-win.3", .x86_64, test_releases, null));
         try testing.expectError(error.InvalidVersion, parse(a,
             \\{"version":"1.4.1-win.3","packages":{}}
-        , version, .x86_64, test_releases));
+        , version, .x86_64, test_releases, null));
     }
     // The largest that fits, then a letter: compared.
     try testing.expectEqual(null, try parse(a,
         \\{"version":"1.4.1-win.18446744073709551615a","packages":{}}
-    , "1.4.1-win.18446744073709551615b", .x86_64, test_releases));
+    , "1.4.1-win.18446744073709551615b", .x86_64, test_releases, null));
     // A hash not 64 hex digits.
     for ([_][]const u8{ "00", test_sha ++ "00", "zz" ++ test_sha[2..] }) |sha| {
         var buf: [1024]u8 = undefined;
         const body = std.fmt.bufPrint(&buf,
             \\{{"version":"9.0.0","packages":{{"x86_64":{{"url":"{s}","sha256":"{s}"}}}}}}
         , .{ test_url, sha }) catch unreachable;
-        try testing.expectError(error.InvalidFeed, parse(a, body, "1.0.0", .x86_64, test_releases));
+        try testing.expectError(error.InvalidFeed, parse(a, body, "1.0.0", .x86_64, test_releases, null));
     }
     // Unknown fields, and no notes: still an update.
     const body =
@@ -339,7 +360,7 @@ test "win32: a feed not of the feed's shape is refused, unknown fields aside" {
     ++ test_sha ++
         \\","size":5},"riscv64":{"url":"x","sha256":"y"}}}
     ;
-    const update = (try parse(a, body, "1.0.0", .x86_64, test_releases)).?;
+    const update = (try parse(a, body, "1.0.0", .x86_64, test_releases, null)).?;
     try testing.expect(update.notes == null);
 }
 
@@ -386,7 +407,7 @@ test "win32: the feed make_feed.py writes and signs verifies, and parses for eac
     defer arena.deinit();
     const releases = "https://github.com/Pyre909/ghostty/releases/";
     inline for (.{ .{ Arch.x86_64, "x86_64", "x64" }, .{ Arch.aarch64, "aarch64", "arm" } }) |case| {
-        const update = (try parse(arena.allocator(), feed, "1.0.0", case[0], releases)).?;
+        const update = (try parse(arena.allocator(), feed, "1.0.0", case[0], releases, fixture_expires - 1)).?;
         try std.testing.expectEqualStrings("1.4.1-win.3", update.version);
         try std.testing.expectEqualStrings(releases ++ "tag/v1.4.1-win.3", update.notes.?);
         try std.testing.expectEqualStrings(releases ++ "download/v1.4.1-win.3/ghostty-1.4.1-win.3-windows-" ++ case[1] ++ ".msi", update.url);
@@ -394,5 +415,37 @@ test "win32: the feed make_feed.py writes and signs verifies, and parses for eac
         std.crypto.hash.sha2.Sha256.hash(case[2], &sha256, .{});
         try std.testing.expectEqualSlices(u8, &sha256, &update.sha256);
     }
-    try std.testing.expectEqual(null, try parse(arena.allocator(), feed, "1.4.1-win.3", .x86_64, releases));
+    try std.testing.expectEqual(null, try parse(arena.allocator(), feed, "1.4.1-win.3", .x86_64, releases, fixture_expires - 1));
+    // Signed, it is refused from the second it expires.
+    try std.testing.expectError(error.FeedExpired, parse(arena.allocator(), feed, "1.0.0", .x86_64, releases, fixture_expires));
+}
+
+/// The fixture's `expires`: 2100-01-01 (test_make_feed.py's --expires).
+const fixture_expires = 4102444800;
+
+test "win32: a signed feed must say when it expires, and is refused once it has" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [512]u8 = undefined;
+    const plain = testFeed(&buf, "1.4.1-win.3", test_url, test_notes);
+    // Unsigned (no `now`), no `expires` is needed; signed, it is.
+    try testing.expect(try parse(a, plain, "1.0.0", .x86_64, test_releases, null) != null);
+    try testing.expectError(error.InvalidFeed, parse(a, plain, "1.0.0", .x86_64, test_releases, 0));
+
+    // `expires` first, as make_feed.py writes it.
+    var dated_buf: [512]u8 = undefined;
+    const dated = try std.fmt.bufPrint(&dated_buf, "{{\"expires\":1000,{s}", .{plain[1..]});
+    try testing.expect(try parse(a, dated, "1.0.0", .x86_64, test_releases, 999) != null);
+    try testing.expectError(error.FeedExpired, parse(a, dated, "1.0.0", .x86_64, test_releases, 1000));
+    try testing.expectError(error.FeedExpired, parse(a, dated, "1.0.0", .x86_64, test_releases, 5000));
+    // Refused even where it would be no update: an expired feed says
+    // nothing of what is newest.
+    try testing.expectError(error.FeedExpired, parse(a, dated, "9.0.0", .x86_64, test_releases, 1000));
+    // An unsigned feed's `expires` is not read.
+    try testing.expect(try parse(a, dated, "1.0.0", .x86_64, test_releases, null) != null);
+    // Not a number of seconds: no feed.
+    var bad_buf: [512]u8 = undefined;
+    const bad = try std.fmt.bufPrint(&bad_buf, "{{\"expires\":\"2100-01-01\",{s}", .{plain[1..]});
+    try testing.expectError(error.InvalidFeed, parse(a, bad, "1.0.0", .x86_64, test_releases, 0));
 }
