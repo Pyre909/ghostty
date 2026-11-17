@@ -17278,6 +17278,14 @@ const TestUpdate = struct {
     /// Wait up to 20 s for the running check's message, dispatch it as
     /// the loop would, and carry out what it queued as `run` does.
     fn finish(app: *App) !void {
+        try dispatch(app);
+        app.createRequested();
+        try std.testing.expectEqual(0, app.requests.items.len);
+    }
+
+    /// The running job's message dispatched, its result queued but not
+    /// yet told (`createRequested`).
+    fn dispatch(app: *App) !void {
         try std.testing.expect(app.updater.running != null);
         var posted: win32.MSG = undefined;
         var waited: usize = 0;
@@ -17288,8 +17296,6 @@ const TestUpdate = struct {
         }
         _ = App.wndProc(app.msg_hwnd, posted.message, posted.wParam, posted.lParam);
         try std.testing.expectEqual(null, app.updater.running);
-        app.createRequested();
-        try std.testing.expectEqual(0, app.requests.items.len);
     }
 
     /// The key the tests' feeds are signed with: RFC 8032's first test
@@ -17363,6 +17369,8 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     const message_box = &@import("dialog.zig").test_message_box;
     message_box.* = &TestUpdate.box;
     defer message_box.* = null;
+    // Before the stubs above are reset: a job still running ends first.
+    defer app.updater.testDrop();
     TestUpdate.boxes = 0;
     defer Updater.test_post_failures.store(0, .monotonic);
 
@@ -17437,8 +17445,16 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expect(TestUpdate.says("could not check"));
     try std.testing.expect(!TestUpdate.says("999.0.0"));
 
-    // `auto-update` checks at its timer and tells only of an update.
-    app.updater.configure(.check);
+    // `auto-update`, set by a config change, checks at its timer and
+    // tells only of an update; a change of something else leaves it so.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"auto-update" = .check;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(app.updater.armed);
+    try std.testing.expectEqual(.check, app.updater.mode);
+    changed.@"window-title-font-family" = "Segoe UI";
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expect(app.updater.armed);
     for ([_][]const u8{ not_found, older }) |response| {
         TestUpdate.serve(&routes, response);
@@ -17481,7 +17497,8 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(9, TestUpdate.boxes);
 
     // Off, a WM_TIMER already queued starts nothing.
-    app.updater.configure(.off);
+    changed.@"auto-update" = .off;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expect(!app.updater.armed);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try std.testing.expectEqual(null, app.updater.running);
@@ -17705,6 +17722,8 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     Updater.test_msiexec = &TestOffer.msiexec;
     defer Updater.test_msiexec = null;
     defer Updater.test_opened = null;
+    // Before the stubs above are reset: a job still running ends first.
+    defer app.updater.testDrop();
     TestOffer.offers = 0;
     TestOffer.installs = 0;
     TestOffer.exit_code = 0;
@@ -17877,6 +17896,48 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expect(TestUpdate.says("Install it now?"));
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(7, TestOffer.installs);
+
+    // Without one, a Ghostty that is not the package's is asked about its
+    // release page, which Yes opens.
+    app.updater.installed = false;
+    Updater.test_opened = null;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    // The question, after the install's two boxes above.
+    try std.testing.expectEqual(boxes + 3, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("Open its release page?"));
+    try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
+    try std.testing.expectEqual(null, app.updater.running);
+    try std.testing.expectEqual(7, TestOffer.installs);
+
+    // A feed that names no notes: its releases are the page.
+    About.test_record.task_dialog = TestOffer.taskDialog;
+    TestOffer.choose = Updater.release_page_id;
+    var plain_buf: [1024]u8 = undefined;
+    TestUpdate.serve(&routes, TestUpdate.feed(&plain_buf, &server, "999.0.0", package_path, sha256));
+    Updater.test_opened = null;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqualStrings(app.updater.source.releases, Updater.test_opened.?);
+    TestUpdate.serve(&routes, TestUpdate.feedWithNotes(&feed_buf, &server, "999.0.0", package_path, sha256, releases ++ "tag/v999"));
+
+    // Once the app quits, nothing is told, not even what was asked for:
+    // the update stays queued until `terminate` frees it, as here.
+    app.quit = true;
+    const told_boxes = TestUpdate.boxes;
+    const told_offers = TestOffer.offers;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.dispatch(&app);
+    app.createRequested();
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .update);
+    try std.testing.expectEqual(told_boxes, TestUpdate.boxes);
+    try std.testing.expectEqual(told_offers, TestOffer.offers);
+    for (app.requests.items) |*request| app.freeRequest(request);
+    app.requests.clearRetainingCapacity();
+    app.quit = false;
+    app.updater.installed = true;
+    About.test_record.task_dialog = null;
 
     // The timer, firing under the offer, waits; and a check started
     // under it makes Install wait for that check, which tells what it
@@ -31118,7 +31179,6 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         // Not performed by this runtime yet: every action the command
         // palette leaves out, alone or chained.
         "global:ctrl+c=toggle_secure_input",
-        "global:ctrl+d=show_gtk_inspector",
         "global:ctrl+e=close_all_windows",
         "global:ctrl+g=paste_from_selection",
         "global:ctrl+h=show_gtk_inspector",
@@ -31132,13 +31192,13 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
     try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NeedsShift));
     try std.testing.expectEqual(2, TestHotkeys.refused(&app, error.AltGr));
     try std.testing.expectEqual(3, TestHotkeys.refused(&app, error.NoKey));
-    try std.testing.expectEqual(5, TestHotkeys.refused(&app, error.Unsupported));
+    try std.testing.expectEqual(4, TestHotkeys.refused(&app, error.Unsupported));
 
     // Ctrl+Alt+Q with Shift types nothing on that layout, and registers,
     // as does an action this runtime does not perform chained to one it
     // does, the quick terminal's toggle, the windows' visibility toggle,
-    // the session's window theme, and `ignore`, which the palette leaves
-    // out but which asks for its keys to be taken.
+    // the session's window theme, an update check, and `ignore`, which
+    // the palette leaves out but which asks for its keys to be taken.
     try TestHotkeys.apply(&app, &.{
         "global:ctrl+alt+shift+q=new_window",
         "global:ctrl+c=show_gtk_inspector",
@@ -31147,8 +31207,9 @@ test "win32: a global keybind that cannot be a hotkey registers nothing, logged"
         "global:ctrl+e=toggle_visibility",
         "global:ctrl+d=set_window_theme:dark",
         "global:ctrl+a=ignore",
+        "global:ctrl+f=check_for_updates",
     });
-    try std.testing.expectEqual(6, TestHotkeys.take().len);
+    try std.testing.expectEqual(7, TestHotkeys.take().len);
 }
 
 test "win32: two global keybinds on the same keys register once, for the physical key" {

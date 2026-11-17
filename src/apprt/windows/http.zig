@@ -312,6 +312,9 @@ const TestServer = testing.TestServer;
 const okResponse = testing.okResponse;
 
 const update_body = "the update's bytes";
+/// 40 KiB, "0123456789" over and over: a body WinHTTP reads in several
+/// parts, as `Response.read` takes at most 16 KiB at once.
+const forty_kib: [40 * 1024]u8 = @bitCast(@as([4 * 1024][10]u8, @splat("0123456789".*)));
 /// "0123456789" ten times.
 const hundred_bytes: [100]u8 = @bitCast(@as([10][10]u8, @splat("0123456789".*)));
 
@@ -402,4 +405,45 @@ test "win32: an HTTP download is saved when its hash is the feed's, and removed 
     const missing = try testing.tempPath(alloc, "missing.msi");
     defer alloc.free(missing);
     try std.testing.expectEqual(null, openVerified(missing, 1024, sha));
+}
+
+test "win32: an HTTP body read in several parts is capped and hashed whole" {
+    const alloc = std.testing.allocator;
+    var server: TestServer = undefined;
+    const routes = [_]TestServer.Route{
+        .{ .path = "/big.msi", .response = okResponse(&forty_kib) },
+    };
+    try server.start(&routes);
+    defer server.stop();
+    const session: Session = try .open(.{ .https_only = false, .system_proxy = false });
+    defer session.close();
+    var buf: [128]u8 = undefined;
+    const url = server.url(&buf, "/big.msi");
+
+    // The limit counts the whole body: one past it is past it, though no
+    // one part is.
+    const body = try session.get(alloc, url, forty_kib.len);
+    defer alloc.free(body);
+    try std.testing.expectEqualSlices(u8, &forty_kib, body);
+    try std.testing.expectError(error.TooLarge, session.get(alloc, url, forty_kib.len - 1));
+
+    // The hash is the whole body's, not its last part's nor its first's.
+    const path = try testing.tempPath(alloc, "big.msi");
+    defer alloc.free(path);
+    defer _ = win32.DeleteFileW(path);
+    var sha: Digest = undefined;
+    Sha256.hash(&forty_kib, &sha, .{});
+    var tail: Digest = undefined;
+    Sha256.hash(forty_kib[forty_kib.len - 16 * 1024 ..], &tail, .{});
+    var head: Digest = undefined;
+    Sha256.hash(forty_kib[0 .. 16 * 1024], &head, .{});
+    try std.testing.expectError(error.HashMismatch, session.download(alloc, url, path, forty_kib.len, tail));
+    try std.testing.expectError(error.HashMismatch, session.download(alloc, url, path, forty_kib.len, head));
+    try std.testing.expectEqual(null, try testing.read(alloc, path));
+    try std.testing.expectError(error.TooLarge, session.download(alloc, url, path, forty_kib.len - 1, sha));
+    try std.testing.expectEqual(null, try testing.read(alloc, path));
+    try session.download(alloc, url, path, forty_kib.len, sha);
+    const saved = (try testing.read(alloc, path)).?;
+    defer alloc.free(saved);
+    try std.testing.expectEqualSlices(u8, &forty_kib, saved);
 }
