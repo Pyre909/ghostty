@@ -59,17 +59,9 @@ SIGNATURE = FEED + ".sig"
 TIP_TAG = "tip-windows"
 STABLE_TAG = "stable-windows"
 
-PACKAGE = re.compile(
-    r"ghostty-(?P<version>.+)-windows-(?P<arch>[a-z0-9_]+)\.msi", re.ASCII
-)
-
-# semver.org's own expression, which `std.SemanticVersion.parse` follows.
-SEMVER = re.compile(
-    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
-    r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?",
-    re.ASCII,
-)
+# The largest number `std.SemanticVersion.parse` reads: a usize, which
+# is 64 bits on each architecture a package is for.
+MAX_NUMBER = 2**64 - 1
 
 # A URL segment Ghostty accepts (`update_feed.allowed`).
 SEGMENT = re.compile(r"[A-Za-z0-9._+-]+", re.ASCII)
@@ -94,16 +86,15 @@ def read_packages(paths: list[Path]) -> list[Package]:
         raise Error("no package given")
     packages: dict[str, Package] = {}
     for path in paths:
-        m = PACKAGE.fullmatch(path.name)
+        # Named as make_msi.py names a package: its app's folder, .msi.
+        stem = path.name.removesuffix(".msi")
+        m = make_msi.FOLDER.fullmatch(stem) if stem != path.name else None
         if m is None:
             raise Error(f"{path.name} is not ghostty-<version>-windows-<arch>.msi")
         version, arch = m["version"], m["arch"]
         if arch not in make_msi.PLATFORMS:
             raise Error(f"{path.name}: no such architecture {arch!r}")
-        if SEMVER.fullmatch(version) is None:
-            raise Error(f"{path.name}: {version!r} is not a semantic version")
-        if SEGMENT.fullmatch(path.name) is None or path.name in (".", ".."):
-            raise Error(f"{path.name} is not a plain name")
+        check_version(version, path.name)
         if not path.is_file():
             raise Error(f"{path} is not a file")
         if arch in packages:
@@ -113,6 +104,19 @@ def read_packages(paths: list[Path]) -> list[Package]:
     if len(versions) > 1:
         raise Error("the packages are of versions " + ", ".join(sorted(versions)))
     return [packages[a] for a in make_msi.PLATFORMS if a in packages]
+
+
+def check_version(version: str, name: str) -> None:
+    """Refuse a version Ghostty would not read: one not semantic, or with
+    a number past what `std.SemanticVersion.parse` reads. (A name of a
+    semantic version holds only characters a URL segment of the feed may,
+    SEGMENT.)"""
+    m = make_zip.SEMVER.fullmatch(version)
+    if m is None:
+        raise Error(f"{name}: {version!r} is not a semantic version")
+    numbers = [m[1], m[2], m[3], *(m[4] or "").split(".")]
+    if any(n.isdigit() and int(n) > MAX_NUMBER for n in numbers):
+        raise Error(f"{name}: {version!r} has a number past {MAX_NUMBER}")
 
 
 def check_tag(tag: str) -> None:
@@ -138,14 +142,24 @@ def check_release(version: str, tag: str) -> None:
         raise Error(f"a release of {version} is tagged v{version}, not {tag}")
 
 
+def package_url(tag: str, name: str) -> str:
+    """The URL of the release `tag`'s asset `name`."""
+    return f"{RELEASES}download/{tag}/{name}"
+
+
+def notes_url(tag: str) -> str:
+    """The URL of the release `tag`'s page."""
+    return f"{RELEASES}tag/{tag}"
+
+
 def feed(packages: list[Package], tag: str) -> dict:
     check_release(packages[0].version, tag)
     return {
         "version": packages[0].version,
-        "notes": f"{RELEASES}tag/{tag}",
+        "notes": notes_url(tag),
         "packages": {
             p.arch: {
-                "url": f"{RELEASES}download/{tag}/{p.path.name}",
+                "url": package_url(tag, p.path.name),
                 "sha256": p.sha256,
             }
             for p in packages

@@ -20,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -153,6 +154,17 @@ class TestFeed(Temp):
                 "is not ghostty-<version>-windows-<arch>.msi",
             ),
             (["ghostty-1.4.1 a-windows-x86_64.msi"], TAG, "not a semantic version"),
+            # Numbers past a usize, which Ghostty cannot read.
+            (
+                ["ghostty-18446744073709551616.0.0-windows-x86_64.msi"],
+                TAG,
+                "has a number past 18446744073709551615",
+            ),
+            (
+                ["ghostty-1.4.1-win.18446744073709551616-windows-x86_64.msi"],
+                TAG,
+                "has a number past",
+            ),
             (["ghostty-1.4.1-windows-x86_64.msi"], "a/b", "not a tag Ghostty accepts"),
             (["ghostty-1.4.1-windows-x86_64.msi"], "..", "not a tag Ghostty accepts"),
             # Each channel's packages only on its own release.
@@ -188,6 +200,11 @@ class TestFeed(Temp):
                 self.assertEqual((code, out), (1, ""))
                 self.assertIn(says, err)
                 self.assertFalse((self.dir / mf.FEED).exists())
+
+    def test_largest_numbers_ghostty_reads(self) -> None:
+        name = "ghostty-1.4.1-win.18446744073709551615-windows-x86_64.msi"
+        (p,) = mf.read_packages([self.package(name)])
+        self.assertEqual(p.version, "1.4.1-win.18446744073709551615")
 
     def test_missing_package(self) -> None:
         code, _, err = run(
@@ -314,8 +331,18 @@ class TestWinget(Temp):
         cls.built = Path(tmp.name)
         zip_path = tmm.app_zip(cls.built / "zips", version="1.4.1-win.3")
         cls.msi = tmm.build(zip_path, cls.built)
-        rows = mm.table(tmm.tools(), cls.msi, "Property")
-        (cls.code,) = [r["Value"] for r in rows if r["Property"] == "ProductCode"]
+        arm_zip = tmm.app_zip(
+            cls.built / "arm-zips", version="1.4.1-win.3", arch="aarch64"
+        )
+        cls.arm_msi = tmm.build(arm_zip, cls.built)
+        cls.code = cls.product_code(cls.msi)
+        cls.arm_code = cls.product_code(cls.arm_msi)
+
+    @staticmethod
+    def product_code(msi: Path) -> str:
+        rows = mm.table(tmm.tools(), msi, "Property")
+        (code,) = [r["Value"] for r in rows if r["Property"] == "ProductCode"]
+        return code
 
     def test_manifests(self) -> None:
         out = self.dir / "out"
@@ -370,6 +397,54 @@ class TestWinget(Temp):
         self.assertTrue(
             locale.endswith("ManifestType: defaultLocale\nManifestVersion: 1.6.0\n")
         )
+
+    def test_each_architecture_its_own_installer(self) -> None:
+        # Given aarch64 first, written in make_msi.PLATFORMS' order, each
+        # with its own package's URL, hash and ProductCode, which differ.
+        out = self.dir / "out"
+        argv = [str(self.arm_msi), str(self.msi), "--tag", TAG, "--out", str(out)]
+        code, _, err = run(mw.main, argv)
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotEqual(self.code, self.arm_code)
+        installer = (
+            out
+            / "manifests/p/Pyre909/Ghostty/1.4.1-win.3/Pyre909.Ghostty.installer.yaml"
+        ).read_text("utf-8")
+        entries = ""
+        for arch, msi, product in [
+            ("x64", self.msi, self.code),
+            ("arm64", self.arm_msi, self.arm_code),
+        ]:
+            entries += (
+                f"- Architecture: {arch}\n"
+                f"  InstallerUrl: '{mf.RELEASES}download/{TAG}/{msi.name}'\n"
+                f"  InstallerSha256: {mz.sha256(msi).upper()}\n"
+                f"  ProductCode: '{product}'\n"
+                "  AppsAndFeaturesEntries:\n"
+                "  - DisplayVersion: '1.4.1.3'\n"
+            )
+        self.assertIn(
+            "Installers:\n" + entries + "ManifestType: installer\n", installer
+        )
+
+    def test_partition_is_the_identifiers_letter(self) -> None:
+        out = self.dir / "out"
+        with (
+            mock.patch.object(mw, "PUBLISHER", "Zed"),
+            mock.patch.object(mw, "IDENTIFIER", "Zed.Ghostty"),
+        ):
+            code, printed, err = run(
+                mw.main, [str(self.msi), "--tag", TAG, "--out", str(out)]
+            )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(printed, f"{out / 'manifests/z/Zed/Ghostty/1.4.1-win.3'}\n")
+
+    def test_bad_tag(self) -> None:
+        code, out, err = run(
+            mw.main, [str(self.msi), "--tag", "a/b", "--out", str(self.dir)]
+        )
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("not a tag Ghostty accepts", err)
 
     def test_not_for_tip(self) -> None:
         code, out, err = run(

@@ -5,9 +5,11 @@ installers, for a pull request to microsoft/winget-pkgs:
     python3 dist/windows/make_winget.py --tag v1.4.1-win.3 \\
         ghostty-1.4.1-win.3-windows-x86_64.msi ghostty-1.4.1-win.3-windows-aarch64.msi
 
-writes manifests/p/Pyre909/Ghostty/<version>/ beside the first package
-(or in --out): the version, installer and default locale manifests of
-the multi-file format, schema 1.6.0
+writes manifests/<letter>/<Publisher>/<Product>/<version>/ beside the
+first package (or in --out), the letter the identifier's first,
+lowercased (today manifests/p/Pyre909/Ghostty/1.4.1-win.3/): the
+version, installer and default locale manifests of the multi-file
+format, schema 1.6.0
 (https://learn.microsoft.com/windows/package-manager/package/manifest).
 
 The packages are read as make_feed.py reads them: one per
@@ -83,7 +85,7 @@ def manifests(
     for p in packages:
         installers += (
             f"- Architecture: {ARCHES[p.arch]}\n"
-            f"  InstallerUrl: {quote(f'{make_feed.RELEASES}download/{tag}/{p.path.name}')}\n"
+            f"  InstallerUrl: {quote(make_feed.package_url(tag, p.path.name))}\n"
             f"  InstallerSha256: {p.sha256.upper()}\n"
             f"  ProductCode: {quote(codes[p.arch])}\n"
         )
@@ -118,7 +120,7 @@ def manifests(
                 ("License", "MIT"),
                 ("LicenseUrl", make_msi.HOMEPAGE + "/blob/main/LICENSE"),
                 ("ShortDescription", make_msi.DESCRIPTION),
-                ("ReleaseNotesUrl", f"{make_feed.RELEASES}tag/{tag}"),
+                ("ReleaseNotesUrl", make_feed.notes_url(tag)),
             ],
         ),
     }
@@ -133,7 +135,11 @@ def make(args: argparse.Namespace) -> Path:
     codes = {p.arch: product_code(tools, p.path) for p in packages}
     texts = manifests(packages, args.tag, codes)
     out = (args.out or packages[0].path.parent).resolve()
-    dest = out / "manifests" / "p" / PUBLISHER / make_msi.PRODUCT / packages[0].version
+    # winget-pkgs' partition: the identifier's first letter.
+    letter = IDENTIFIER[0].lower()
+    dest = (
+        out / "manifests" / letter / PUBLISHER / make_msi.PRODUCT / packages[0].version
+    )
     dest.mkdir(parents=True, exist_ok=True)
     for name, text in texts.items():
         (dest / name).write_text(text, "utf-8")
