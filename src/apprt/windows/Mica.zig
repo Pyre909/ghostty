@@ -33,10 +33,12 @@ const log = std.log.scoped(.win32);
 /// Give `window`'s frame Mica behind its tab bar, or take it away, as
 /// its bar, theme, decoration and tab overview now ask (`wanted`). The
 /// backdrop is asked for once, for the frame's life, with buffered
-/// painting for its bar (Learn: BufferedPaintInit, matched at the
-/// frame's WM_NCDESTROY); the extension follows the bar. A failed call
-/// leaves `Window.backdrop` and `Window.mica_top` as they were, so the
-/// next one tries again. Called after every layout and theme change.
+/// painting for its bar (Learn: BufferedPaintInit, matched at the frame's
+/// WM_NCDESTROY); the extension follows the bar. A failed
+/// call leaves `Window.backdrop` and `Window.mica_top` as they were, so
+/// the next layout tries again, and is said once for the process: a DWM
+/// that refuses would refuse at every WM_SIZE of a resize. Called after
+/// every layout and theme change.
 pub fn apply(window: *Window) void {
     if (window.transparent) return;
     // Only in tests that answer for DWM: the others' frames keep the
@@ -45,8 +47,10 @@ pub fn apply(window: *Window) void {
     if (Transparency.build() < Transparency.backdrop_build) return;
     if (window.backdrop != .mica) {
         if (!Transparency.bufferedPaintInit()) return;
-        if (!Transparency.setBackdrop(window.hwnd, .mica)) {
+        const hr = Transparency.askBackdrop(window.hwnd, .mica);
+        if (hr < 0) {
             Transparency.frameDestroyed();
+            refused("set a window's backdrop to Mica", hr);
             return;
         }
         window.backdrop = .mica;
@@ -60,6 +64,15 @@ pub fn apply(window: *Window) void {
         _ = Transparency.layer(edit);
     };
     window.bar.invalidate();
+}
+
+/// Whether `refused` has said once that DWM refused.
+var refused_logged = false;
+
+fn refused(what: []const u8, hr: win32.HRESULT) void {
+    if (refused_logged) return;
+    refused_logged = true;
+    log.warn("cannot {s}, so the tab bar shows no Mica behind it hr=0x{x}", .{ what, @as(u32, @bitCast(hr)) });
 }
 
 /// How far the frame is to reach into the client area: over the tab bar
@@ -82,7 +95,7 @@ fn extend(frame: win32.HWND, top: i32) bool {
     const margins: win32.MARGINS = .{ .cxLeftWidth = 0, .cxRightWidth = 0, .cyTopHeight = top, .cyBottomHeight = 0 };
     const hr = win32.DwmExtendFrameIntoClientArea(frame, &margins);
     if (hr >= 0) return true;
-    log.warn("cannot extend a window's frame top={} hr=0x{x}", .{ top, @as(u32, @bitCast(hr)) });
+    refused("extend a window's frame over its tab bar", hr);
     return false;
 }
 

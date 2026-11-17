@@ -200,13 +200,20 @@ pub fn applyBlur(window: *Window) void {
     window.backdrop = want;
 }
 
-pub fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
-    if (builtin.is_test) if (test_backdrop) |answer| return answer(frame, to);
-    const value: win32.DWORD = @backingInt(to);
-    const hr = win32.DwmSetWindowAttribute(frame, win32.DWMWA_SYSTEMBACKDROP_TYPE, &value, @sizeOf(win32.DWORD));
+fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
+    const hr = askBackdrop(frame, to);
     if (hr >= 0) return true;
     log.warn("cannot set a window's backdrop to={t} hr=0x{x}", .{ to, @as(u32, @bitCast(hr)) });
     return false;
+}
+
+/// Ask DWM to give `frame` the backdrop `to`; DWM's answer, which the
+/// caller logs as it sees fit (`setBackdrop` at every failure, `Mica.apply`
+/// once). In tests `test_backdrop` answers, E_FAIL for a refusal.
+pub fn askBackdrop(frame: win32.HWND, to: Backdrop) win32.HRESULT {
+    if (builtin.is_test) if (test_backdrop) |answer| return if (answer(frame, to)) win32.S_OK else win32.E_FAIL;
+    const value: win32.DWORD = @backingInt(to);
+    return win32.DwmSetWindowAttribute(frame, win32.DWMWA_SYSTEMBACKDROP_TYPE, &value, @sizeOf(win32.DWORD));
 }
 
 /// Layer `hwnd`, a GDI-drawn window just made in `window`'s frame (its

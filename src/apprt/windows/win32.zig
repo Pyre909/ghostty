@@ -954,8 +954,9 @@ pub const DWMWA_EXTENDED_FRAME_BOUNDS: DWORD = 9;
 /// dwmapi.h, from Windows 11 22H2 (build 22621): a DWORD, one of
 /// DWM_SYSTEMBACKDROP_TYPE's.
 pub const DWMWA_SYSTEMBACKDROP_TYPE: DWORD = 38;
-/// DWM_SYSTEMBACKDROP_TYPE: DWM decides, the default; and acrylic, a
-/// transient window's (Learn: "Desktop Acrylic").
+/// DWM_SYSTEMBACKDROP_TYPE: DWM decides, the default; Mica, a main
+/// window's; and acrylic, a transient window's (Learn: "Desktop
+/// Acrylic").
 pub const DWMSBT_AUTO: DWORD = 0;
 pub const DWMSBT_MAINWINDOW: DWORD = 2;
 pub const DWMSBT_TRANSIENTWINDOW: DWORD = 3;
@@ -1040,6 +1041,7 @@ pub extern "advapi32" fn RegCloseKey(key: HKEY) callconv(.winapi) LONG;
 // COM, shared by the runtime's own interfaces (taskbar.zig, toast.zig).
 pub const S_OK: HRESULT = internal_os.windows.S_OK;
 pub const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x80004002));
+pub const E_FAIL: HRESULT = @bitCast(@as(u32, 0x80004005));
 pub const IID_IUnknown: w.GUID = w.GUID.parse("{00000000-0000-0000-c000-000000000046}");
 /// An object that may be called on any thread, with no marshaling.
 pub const IID_IAgileObject: w.GUID = w.GUID.parse("{94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90}");
