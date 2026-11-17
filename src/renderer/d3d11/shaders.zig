@@ -663,7 +663,7 @@ test "d3d11 shaders: a second device's shaders come from the cache, a custom sha
     // distinct source compiles on the first device only; full_screen's
     // vertex shader, shared by bg_color, cell_bg and every custom shader,
     // compiles once even there.
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const D3D11 = @import("../D3D11.zig");
 
