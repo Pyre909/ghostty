@@ -963,6 +963,11 @@ pub const DWMSBT_TRANSIENTWINDOW: DWORD = 3;
 /// border. Both take on a borderless pop-up too.
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
 pub const DWMWA_BORDER_COLOR: DWORD = 34;
+/// dwmapi.h, from Windows 11 (build 22000): a COLORREF each, the caption's
+/// background and text; DWMWA_COLOR_DEFAULT gives the system's back.
+pub const DWMWA_CAPTION_COLOR: DWORD = 35;
+pub const DWMWA_TEXT_COLOR: DWORD = 36;
+pub const DWMWA_COLOR_DEFAULT: COLORREF = 0xFFFFFFFF;
 /// DWM_WINDOW_CORNER_PREFERENCE: rounded, as a top-level window's.
 pub const DWMWCP_ROUND: DWORD = 2;
 /// DWM_BLURBEHIND's `flags`: `enable` and `region` apply.

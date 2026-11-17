@@ -41,6 +41,7 @@ const Dividers = @import("Dividers.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
+const FrameColors = @import("FrameColors.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
 const BellBadge = @import("BellBadge.zig");
@@ -139,6 +140,11 @@ dpi_changing: bool,
 /// Whether the title bar was last made dark (`applyTheme`). A new frame
 /// has a light one.
 dark_frame: bool,
+
+/// The colours the caption was last given (`applyTheme`), under
+/// `window-theme = ghostty`; null while it has the system's, as a new
+/// frame has. The tab bar draws in them too.
+frame_colors: ?FrameColors,
 
 /// Whether the frame lets the desktop through where its terminals'
 /// background is translucent (Transparency.zig): set as the frame is made
@@ -1082,6 +1088,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .title_override = null,
         .bar = .{},
         .dark_frame = false,
+        .frame_colors = null,
         .transparent = false,
         .backdrop = .default,
         .fullscreen = null,
@@ -3608,10 +3615,10 @@ pub fn dividerWidth(dpi: u32) i32 {
 /// its color scheme (`Application.colorScheme`). `auto` follows the
 /// background, light above a perceived luminance of 0.5 as on GTK and
 /// macOS, except with a light and a dark `theme`, when it follows the
-/// system: `Config.finalize` turns such an `auto` into `system`. `ghostty`,
-/// the GTK header bar in the terminal's colors, is taken as `auto`, as GTK
-/// takes it when it picks its color scheme, and finalize leaves it alone,
-/// so the pair is checked here. Followed by the background, a pair would
+/// system: `Config.finalize` turns such an `auto` into `system`. `ghostty`
+/// is taken as `auto`, as GTK takes it when it picks its color scheme, and
+/// finalize leaves it alone, so the pair is checked here; the caption
+/// itself is then in its own colours, in their mode (`applyTheme`). Followed by the background, a pair would
 /// pick the scheme from the half it picked: stuck on one half, or, if the
 /// light half is dark, flipping between them for good.
 pub fn frameDark(
@@ -3635,26 +3642,32 @@ pub fn frameDark(
     };
 }
 
-/// Give the frame the title bar `frameDark` asks for, through DWM's
+/// Give the frame the title bar `window-theme` asks for: under `ghostty`
+/// its colours (`FrameColors`) and the mode they ask for, else the
+/// system's colours in the mode `frameDark` asks for, through DWM's
 /// immersive dark mode. A visible frame repaints its title bar by itself.
-/// A failed call leaves `dark_frame` as it was, so the next one tries
-/// again.
+/// A failed call leaves `dark_frame` or `frame_colors` as it was, so the
+/// next one tries again.
 pub fn applyTheme(self: *Window) void {
-    const dark = frameDark(&self.app.config, self.app.system_scheme, self.app.window_theme_override);
-    if (dark == self.dark_frame) return;
+    const colors = FrameColors.of(&self.app.config, self.app.window_theme_override);
+    const dark = if (colors) |c| c.dark() else frameDark(&self.app.config, self.app.system_scheme, self.app.window_theme_override);
+    const recolor = !std.meta.eql(colors, self.frame_colors) and setCaptionColors(self.hwnd, colors);
+    if (recolor) self.frame_colors = colors;
+    if (dark == self.dark_frame and !recolor) return;
 
-    const value: win32.BOOL = if (dark) .TRUE else .FALSE;
-    const hr = win32.DwmSetWindowAttribute(
-        self.hwnd,
-        win32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &value,
-        @sizeOf(win32.BOOL),
-    );
-    if (hr < 0) {
-        log.warn("cannot set the title bar's mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
-        return;
+    if (dark != self.dark_frame) {
+        const value: win32.BOOL = if (dark) .TRUE else .FALSE;
+        const hr = win32.DwmSetWindowAttribute(
+            self.hwnd,
+            win32.DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &value,
+            @sizeOf(win32.BOOL),
+        );
+        if (hr < 0) {
+            log.warn("cannot set the title bar's mode dark={} hr=0x{x}", .{ dark, @as(u32, @bitCast(hr)) });
+            if (!recolor) return;
+        } else self.dark_frame = dark;
     }
-    self.dark_frame = dark;
     // And its title prompt's and Kitty clipboard prompt's title bars, if
     // they are open.
     TitleDialog.setDark(self, dark);
@@ -3670,6 +3683,33 @@ pub fn applyTheme(self: *Window) void {
     }
     CommandPalette.invalidate(self);
     TabOverview.invalidate(self);
+}
+
+/// For tests: what answers in place of DwmSetWindowAttribute for the
+/// caption's colours, which DwmGetWindowAttribute does not read back
+/// (E_INVALIDARG, measured on build 26300).
+pub var test_caption: if (builtin.is_test) ?*const fn (win32.HWND, win32.DWORD, win32.COLORREF) bool else void =
+    if (builtin.is_test) null else {};
+
+/// Give the caption `colors`, or the system's back for null
+/// (DWMWA_COLOR_DEFAULT). False, logged, when DWM refused either.
+fn setCaptionColors(hwnd: win32.HWND, colors: ?FrameColors) bool {
+    const caption = if (colors) |c| FrameColors.colorref(c.background) else win32.DWMWA_COLOR_DEFAULT;
+    const text = if (colors) |c| FrameColors.colorref(c.foreground) else win32.DWMWA_COLOR_DEFAULT;
+    if (builtin.is_test) if (test_caption) |answer| {
+        return answer(hwnd, win32.DWMWA_CAPTION_COLOR, caption) and answer(hwnd, win32.DWMWA_TEXT_COLOR, text);
+    };
+    for ([_]struct { win32.DWORD, win32.COLORREF }{
+        .{ win32.DWMWA_CAPTION_COLOR, caption },
+        .{ win32.DWMWA_TEXT_COLOR, text },
+    }) |a| {
+        const hr = win32.DwmSetWindowAttribute(hwnd, a[0], &a[1], @sizeOf(win32.COLORREF));
+        if (hr < 0) {
+            log.warn("cannot set the caption's colours attribute={} hr=0x{x}", .{ a[0], @as(u32, @bitCast(hr)) });
+            return false;
+        }
+    }
+    return true;
 }
 
 /// Whether a WM_SETTINGCHANGE is about the light or dark mode of apps,

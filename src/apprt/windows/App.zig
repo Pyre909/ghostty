@@ -1988,9 +1988,9 @@ pub const App = struct {
     /// `config` goes back to `window-theme`. Every frame follows at once,
     /// and the core from `run` (`syncColorScheme`), which is woken for it,
     /// as for a change of the system's mode: a keybind or the palette asks
-    /// from inside a core call, which cannot be re-entered. GTK reloads its
-    /// header bar's CSS too, for `window-theme = ghostty`; that is `auto`
-    /// here, with nothing to reload.
+    /// from inside a core call, which cannot be re-entered. As GTK reloads
+    /// its header bar's CSS, for `window-theme = ghostty`, the frames give
+    /// their captions the system's colours or theirs back (`FrameColors`).
     fn setWindowTheme(self: *App, theme: apprt.action.WindowTheme) bool {
         self.window_theme_override = theme;
         for (self.windows.items) |window| window.applyTheme();
@@ -5892,6 +5892,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .title_override = null,
         .bar = .{},
         .dark_frame = false,
+        .frame_colors = null,
         .transparent = false,
         .backdrop = .default,
         .fullscreen = null,
@@ -16765,6 +16766,92 @@ test "win32: a title prompt's title bar follows its window's" {
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expect(!window.dark_frame);
     try std.testing.expect(!try darkBar(dialog));
+}
+
+test "win32: window-theme = ghostty gives the caption the configured colours" {
+    // From a reload, and back to the system's under another theme or a
+    // theme set for the session, as GTK writes its header bar's CSS.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // DWM does not read the caption's colours back: what the frame asked
+    // for is recorded in its place. The mode is DWM's own answer.
+    const attr = struct {
+        var caption: win32.COLORREF = 0;
+        var text: win32.COLORREF = 0;
+        var calls: u32 = 0;
+        fn set(_: win32.HWND, a: win32.DWORD, value: win32.COLORREF) bool {
+            calls += 1;
+            switch (a) {
+                win32.DWMWA_CAPTION_COLOR => caption = value,
+                win32.DWMWA_TEXT_COLOR => text = value,
+                else => return false,
+            }
+            return true;
+        }
+        fn get(_: win32.HWND, a: win32.DWORD) !win32.COLORREF {
+            return switch (a) {
+                win32.DWMWA_CAPTION_COLOR => caption,
+                win32.DWMWA_TEXT_COLOR => text,
+                else => error.TestUnexpectedResult,
+            };
+        }
+        fn dark(hwnd: win32.HWND) !bool {
+            var value: win32.BOOL = .FALSE;
+            if (win32.DwmGetWindowAttribute(hwnd, win32.DWMWA_USE_IMMERSIVE_DARK_MODE, &value, @sizeOf(win32.BOOL)) < 0) return error.TestUnexpectedResult;
+            return value.toBool();
+        }
+    };
+    Window.test_caption = &attr.set;
+    defer Window.test_caption = null;
+
+    const window = try testFrame(&app);
+    window.applyTheme();
+    try std.testing.expect(window.frame_colors == null);
+    // Nothing to give back: a new frame has the system's colours.
+    try std.testing.expectEqual(0, attr.calls);
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .ghostty;
+    changed.background = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+    changed.foreground = .{ .r = 0xF0, .g = 0xE0, .b = 0xD0 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    try std.testing.expectEqual(win32.rgb(0xF0, 0xE0, 0xD0), try attr.get(window.hwnd, win32.DWMWA_TEXT_COLOR));
+    try std.testing.expect(window.frame_colors != null);
+    try std.testing.expect(window.dark_frame);
+    try std.testing.expect(try attr.dark(window.hwnd));
+
+    // A light title bar colour: the caption's mode follows it, not the
+    // dark terminal background, so its buttons stay readable.
+    changed.@"window-titlebar-background" = .{ .r = 0xF8, .g = 0xF8, .b = 0xF8 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(win32.rgb(0xF8, 0xF8, 0xF8), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    try std.testing.expect(!window.dark_frame);
+    try std.testing.expect(!try attr.dark(window.hwnd));
+
+    // A theme set for the session: the system's colours, until it goes
+    // back to the configuration's.
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
+    try std.testing.expect(window.frame_colors == null);
+    try std.testing.expectEqual(win32.DWMWA_COLOR_DEFAULT, try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    try std.testing.expect(window.dark_frame);
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .config));
+    try std.testing.expectEqual(win32.rgb(0xF8, 0xF8, 0xF8), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+
+    // Another theme: the system's colours again.
+    changed.@"window-theme" = .dark;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(window.frame_colors == null);
+    try std.testing.expectEqual(win32.DWMWA_COLOR_DEFAULT, try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    try std.testing.expectEqual(win32.DWMWA_COLOR_DEFAULT, try attr.get(window.hwnd, win32.DWMWA_TEXT_COLOR));
 }
 
 test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {

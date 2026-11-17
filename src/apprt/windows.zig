@@ -423,6 +423,7 @@ test {
     _ = @import("windows/CommandPalette.zig");
     _ = @import("windows/ContextMenu.zig");
     _ = @import("windows/Dividers.zig");
+    _ = @import("windows/FrameColors.zig");
     _ = @import("windows/Hotkeys.zig");
     _ = @import("windows/Inspector.zig");
     _ = @import("windows/KeyState.zig");

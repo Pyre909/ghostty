@@ -20,6 +20,7 @@ const std = @import("std");
 const App = @import("App.zig").App;
 const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
+const FrameColors = @import("FrameColors.zig");
 const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const SearchBar = @import("SearchBar.zig");
@@ -563,8 +564,9 @@ pub fn scaleDpi(height: i32, to: u32, from: u32) i32 {
     return @intCast(if (n < 0) -q else q);
 }
 
-/// The bar's colours, by whether the title bar is dark (`Window.dark_frame`),
-/// as the frame follows `window-theme`.
+/// The bar's colours: the frame's own under `window-theme = ghostty`
+/// (`Window.frame_colors`), else by whether the title bar is dark
+/// (`Window.dark_frame`), as the frame follows `window-theme`.
 const Colors = struct {
     bar: win32.COLORREF,
     shown: win32.COLORREF,
@@ -572,8 +574,18 @@ const Colors = struct {
     text: win32.COLORREF,
     dim: win32.COLORREF,
 
-    fn of(dark: bool) Colors {
-        return if (dark) .{
+    fn of(window: *const Window) Colors {
+        if (window.frame_colors) |c| {
+            const t = c.tabBar();
+            return .{
+                .bar = FrameColors.colorref(t.bar),
+                .shown = FrameColors.colorref(t.shown),
+                .hover = FrameColors.colorref(t.hover),
+                .text = FrameColors.colorref(t.text),
+                .dim = FrameColors.colorref(t.dim),
+            };
+        }
+        return if (window.dark_frame) .{
             .bar = win32.rgb(0x1f, 0x1f, 0x1f),
             .shown = win32.rgb(0x3a, 0x3a, 0x3a),
             .hover = win32.rgb(0x2d, 0x2d, 0x2d),
@@ -807,7 +819,7 @@ pub fn wndProc(
 
         // The title field in the shown tab's colours, as its label is drawn.
         win32.WM_CTLCOLOREDIT => {
-            const colors = Colors.of(window.dark_frame);
+            const colors = Colors.of(window);
             const hdc: win32.HDC = @ptrFromInt(wparam);
             _ = win32.SetTextColor(hdc, colors.text);
             _ = win32.SetBkColor(hdc, colors.shown);
@@ -877,7 +889,7 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
         _ = win32.SelectObject(mem, b);
     };
 
-    const colors = Colors.of(window.dark_frame);
+    const colors = Colors.of(window);
     const l = layoutOf(window, hwnd);
     fill(mem, client, colors.bar);
 
@@ -1422,4 +1434,17 @@ test "win32: a tab bar's release frees its font and its title field's brush" {
     try std.testing.expect(bar.font == null);
     // Twice is nothing.
     bar.release();
+}
+
+test "win32: the tab bar takes the frame's colours under window-theme = ghostty" {
+    var window: Window = undefined;
+    window.dark_frame = true;
+    window.frame_colors = null;
+    try std.testing.expectEqual(win32.rgb(0x1f, 0x1f, 0x1f), Colors.of(&window).bar);
+
+    window.frame_colors = .{ .background = .{ .r = 0x10, .g = 0x20, .b = 0x30 }, .foreground = .{ .r = 0xF0, .g = 0xE0, .b = 0xD0 } };
+    const c = Colors.of(&window);
+    try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), c.bar);
+    try std.testing.expectEqual(win32.rgb(0xF0, 0xE0, 0xD0), c.text);
+    try std.testing.expect(c.shown != c.bar and c.hover != c.bar and c.shown != c.hover);
 }
