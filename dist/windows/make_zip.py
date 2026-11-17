@@ -19,8 +19,10 @@ zig on PATH (or --zig), ReleaseFast with the debug information kept for the
 .pdb files, from a checkout whose tracked files have no uncommitted changes
 and whose src/shell-integration, which the install copies whole, holds
 only tracked files (unless --allow-dirty). --update-public-key is the
-hex make_feed.py --public-key prints: a build without it never installs
-an update, only offers its release page.
+hex make_feed.py --public-key prints, or two such keys comma-separated
+while the feed's signing key changes: the build believes a feed either
+signs. A build without it never installs an update, only offers its
+release page.
 
 The zips are reproducible: their entries are sorted, they hold no directory
 entries and no owners, and every entry has one time, SOURCE_DATE_EPOCH or
@@ -802,10 +804,11 @@ def make(args: argparse.Namespace) -> None:
         raise Error(f"{args.version!r} is not a semantic version")
     if (
         args.update_public_key is not None
-        and re.fullmatch(r"[0-9a-f]{64}", args.update_public_key) is None
+        and re.fullmatch(r"[0-9a-f]{64}(,[0-9a-f]{64})?", args.update_public_key)
+        is None
     ):
         raise Error(
-            f"{args.update_public_key!r} is not a public key as make_feed.py prints one"
+            f"{args.update_public_key!r} is not one or two public keys as make_feed.py prints them"
         )
     if not args.allow_dirty:
         dirty = git("status", "--porcelain", "--untracked-files=no")
@@ -895,7 +898,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--update-public-key",
         metavar="HEX",
-        help="the public key the update feed is signed with (make_feed.py --public-key)",
+        help="the public key the update feed is signed with (make_feed.py --public-key),"
+        " or the current and next comma-separated",
     )
     try:
         make(parser.parse_args(argv))

@@ -20,13 +20,21 @@ pub const version_string = options.app_version_string;
 /// The release channel for this build.
 pub const release_channel = std.meta.stringToEnum(ReleaseChannel, @tagName(options.release_channel)).?;
 
-/// The Ed25519 public key that signs the Windows update feed
-/// (`-Dupdate-public-key`), or null: such a build installs no update.
-pub const update_public_key: ?[32]u8 = if (options.update_public_key.len == 0) null else key: {
-    var key: [32]u8 = undefined;
-    // The build checked it to be 64 hex digits.
-    _ = std.fmt.hexToBytes(&key, options.update_public_key) catch unreachable;
-    break :key key;
+/// The Ed25519 public keys that sign the Windows update feed
+/// (`-Dupdate-public-key`): none, in which case the build installs no
+/// update, or one or two, the second the next signing key.
+pub const update_public_keys: []const [32]u8 = keys: {
+    if (options.update_public_key.len == 0) break :keys &.{};
+    var keys: []const [32]u8 = &.{};
+    var it = std.mem.splitScalar(u8, options.update_public_key, ',');
+    while (it.next()) |hex| {
+        var key: [32]u8 = undefined;
+        // The build checked each to be 64 hex digits, and at most two.
+        _ = std.fmt.hexToBytes(&key, hex) catch unreachable;
+        keys = keys ++ .{key};
+    }
+    const done = keys[0..keys.len].*;
+    break :keys &done;
 };
 
 /// The optimization mode as a string.

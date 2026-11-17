@@ -1254,9 +1254,22 @@ class TestBuildFlags(unittest.TestCase):
         self.assertFalse(
             any("update-public-key" in f for f in mz.build_flags("x86_64", "1.4.1"))
         )
+        keys = f"{key},{'cd' * 32}"
+        self.assertIn(
+            f"-Dupdate-public-key={keys}", mz.build_flags("x86_64", "1.4.1", keys)
+        )
 
     def test_update_key_is_checked(self) -> None:
-        for key in ["ab" * 31, "AB" * 32, "zz" * 32]:
+        two = "ab" * 32 + "," + "cd" * 32
+        for key in [
+            "ab" * 31,
+            "AB" * 32,
+            "zz" * 32,
+            two + ",",
+            two + "," + "ef" * 32,
+            "," + two,
+            "ab" * 32 + ";" + "cd" * 32,
+        ]:
             with self.subTest(key=key):
                 err = io.StringIO()
                 argv = [
@@ -1269,7 +1282,21 @@ class TestBuildFlags(unittest.TestCase):
                 ]
                 with contextlib.redirect_stderr(err):
                     self.assertEqual(mz.main(argv), 1)
-                self.assertIn("is not a public key", err.getvalue())
+                self.assertIn("is not one or two public keys", err.getvalue())
+
+    def test_one_or_two_update_keys_are_taken(self) -> None:
+        # Taken, the build goes on to check the checkout, stopped here.
+        for key in ["ab" * 32, "ab" * 32 + "," + "cd" * 32]:
+            with self.subTest(key=key):
+                err = io.StringIO()
+                argv = ["--arch", "x86_64", "--version", "1.4.1"]
+                with (
+                    mock.patch.object(mz, "git", side_effect=mz.Error("checkout")),
+                    contextlib.redirect_stderr(err),
+                ):
+                    self.assertEqual(mz.main([*argv, "--update-public-key", key]), 1)
+                self.assertIn("checkout", err.getvalue())
+                self.assertNotIn("public key", err.getvalue())
 
     def test_build_takes_the_channel(self) -> None:
         config = (mz.REPO / "src/build/Config.zig").read_text("utf-8")

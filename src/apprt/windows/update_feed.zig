@@ -71,15 +71,31 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// The Ed25519 public keys a build trusts the feed to be signed by
+/// (`-Dupdate-public-key`): the key it is signed with now, and the one
+/// it will be, so the signing key can change without stranding a build.
+/// Make a key pair, build releases trusting it as `next`, and only once
+/// those are installed sign with it: the builds after that drop the old.
+pub const Keys = struct {
+    current: [32]u8,
+    next: ?[32]u8 = null,
+};
+
 /// Whether `signature`, the feed's signature file, is an Ed25519
-/// signature of `body`, its exact bytes, by the key whose public half is
-/// `public_key` (the build's, `-Dupdate-public-key`).
-pub fn verify(body: []const u8, signature: []const u8, public_key: [32]u8) error{BadSignature}!void {
+/// signature of `body`, its exact bytes, by one of `keys`.
+pub fn verify(body: []const u8, signature: []const u8, keys: Keys) error{BadSignature}!void {
     const Ed25519 = std.crypto.sign.Ed25519;
     if (signature.len != Ed25519.Signature.encoded_length) return error.BadSignature;
     const sig: Ed25519.Signature = .fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
-    const key = Ed25519.PublicKey.fromBytes(public_key) catch return error.BadSignature;
-    sig.verify(body, key) catch return error.BadSignature;
+    if (verifiedBy(body, sig, keys.current)) return;
+    if (keys.next) |next| if (verifiedBy(body, sig, next)) return;
+    return error.BadSignature;
+}
+
+fn verifiedBy(body: []const u8, sig: std.crypto.sign.Ed25519.Signature, public_key: [32]u8) bool {
+    const key = std.crypto.sign.Ed25519.PublicKey.fromBytes(public_key) catch return false;
+    sig.verify(body, key) catch return false;
+    return true;
 }
 
 const Package = struct {
@@ -341,19 +357,30 @@ test "win32: the feed make_feed.py writes and signs verifies, and parses for eac
     const pair = try Ed25519.KeyPair.generateDeterministic(seed);
     try std.testing.expectEqualSlices(u8, &public_key, &pair.public_key.toBytes());
 
-    try verify(feed, signature, public_key);
+    const keys: Keys = .{ .current = public_key };
+    try verify(feed, signature, keys);
     // Any other bytes, signature or key: refused.
     var changed = feed.*;
     changed[changed.len - 2] ^= 1;
-    try std.testing.expectError(error.BadSignature, verify(&changed, signature, public_key));
+    try std.testing.expectError(error.BadSignature, verify(&changed, signature, keys));
     var forged = signature.*;
     forged[0] ^= 1;
-    try std.testing.expectError(error.BadSignature, verify(feed, &forged, public_key));
-    try std.testing.expectError(error.BadSignature, verify(feed, signature[0 .. signature.len - 1], public_key));
+    try std.testing.expectError(error.BadSignature, verify(feed, &forged, keys));
+    try std.testing.expectError(error.BadSignature, verify(feed, signature[0 .. signature.len - 1], keys));
     const other = try Ed25519.KeyPair.generateDeterministic(@splat(1));
-    try std.testing.expectError(error.BadSignature, verify(feed, signature, other.public_key.toBytes()));
+    const another = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    try std.testing.expectError(error.BadSignature, verify(feed, signature, .{ .current = other.public_key.toBytes() }));
     const own = try other.sign(feed, null);
-    try std.testing.expectError(error.BadSignature, verify(feed, &own.toBytes(), public_key));
+    try std.testing.expectError(error.BadSignature, verify(feed, &own.toBytes(), keys));
+    // Either of a build's two keys verifies, in either slot; neither of
+    // two others does.
+    try verify(feed, signature, .{ .current = other.public_key.toBytes(), .next = public_key });
+    try verify(feed, signature, .{ .current = public_key, .next = other.public_key.toBytes() });
+    try verify(feed, &own.toBytes(), .{ .current = public_key, .next = other.public_key.toBytes() });
+    try std.testing.expectError(error.BadSignature, verify(feed, signature, .{
+        .current = other.public_key.toBytes(),
+        .next = another.public_key.toBytes(),
+    }));
 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

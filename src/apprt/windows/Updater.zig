@@ -43,9 +43,10 @@ pub const Source = struct {
     /// Both true but in tests, whose server is on a loopback port.
     https_only: bool = true,
     system_proxy: bool = true,
-    /// The key the feed is signed with (`update_feed.verify`), or null
-    /// for a build that installs no update and so checks no signature.
-    public_key: ?[32]u8 = null,
+    /// The keys the feed may be signed with (`update_feed.verify`), or
+    /// null for a build that installs no update and so checks no
+    /// signature.
+    keys: ?update_feed.Keys = null,
 
     const repo_releases = "https://github.com/Pyre909/ghostty/releases/";
     const feed_name = "ghostty-windows-update.json";
@@ -61,7 +62,12 @@ pub const Source = struct {
                 .stable => repo_releases ++ "download/stable-windows/" ++ feed_name,
                 .tip => repo_releases ++ "download/tip-windows/" ++ feed_name,
             },
-            .public_key = build_config.update_public_key,
+            .keys = switch (build_config.update_public_keys.len) {
+                0 => null,
+                1 => .{ .current = build_config.update_public_keys[0] },
+                2 => .{ .current = build_config.update_public_keys[0], .next = build_config.update_public_keys[1] },
+                else => @compileError("-Dupdate-public-key takes at most two keys"),
+            },
         };
     }
 };
@@ -183,11 +189,11 @@ pub const Job = struct {
         const session = try job.openSession();
         defer session.close();
         const body = try session.get(arena, job.source.feed, max_feed);
-        if (job.source.public_key) |key| {
+        if (job.source.keys) |keys| {
             // Beside the feed: ".sig" after its URL.
             const sig_url = try std.mem.concat(arena, u8, &.{ job.source.feed, ".sig" });
             const signature = try session.get(arena, sig_url, max_signature);
-            try update_feed.verify(body, signature, key);
+            try update_feed.verify(body, signature, keys);
         }
         const found = try update_feed.parse(arena, body, build_config.version_string, arch, job.source.releases) orelse
             return .current;
@@ -359,7 +365,7 @@ installed: bool = false,
 /// key the feed is signed with, so that the package's hash, from the
 /// feed, says who published it.
 pub fn installable(self: *const Updater) bool {
-    return self.installed and self.source.public_key != null;
+    return self.installed and self.source.keys != null;
 }
 
 /// Follow `auto-update`: arm the first check if it was off, disarm it if

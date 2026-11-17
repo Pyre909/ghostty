@@ -17353,6 +17353,8 @@ const TestUpdate = struct {
 };
 
 test "win32: check_for_updates reports an update, none or a failure; auto-update only an update, saved if it downloads" {
+    // Its many actions and wide literals, all evaluated at compile time.
+    @setEvalBranchQuota(10_000);
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -17395,7 +17397,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
         .feed = server.url(&feed_url_buf, releases ++ "feed.json"),
         .https_only = false,
         .system_proxy = false,
-        .public_key = TestUpdate.keyPair().public_key.toBytes(),
+        .keys = .{ .current = TestUpdate.keyPair().public_key.toBytes() },
     };
     var feed_buf: [1024]u8 = undefined;
     const newer = TestUpdate.feed(&feed_buf, &server, "999.0.0", package_path, sha256);
@@ -17578,13 +17580,13 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
     app.updater.installed = true;
     // Nor one built with no key to check a feed by: it cannot install.
-    app.updater.source.public_key = null;
+    app.updater.source.keys = null;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(15, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("999.0.0"));
     try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
-    app.updater.source.public_key = TestUpdate.keyPair().public_key.toBytes();
+    app.updater.source.keys = .{ .current = TestUpdate.keyPair().public_key.toBytes() };
     Updater.test_package_dir = &.{};
     downloads = server.hits(TestUpdate.package_route);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
@@ -17594,18 +17596,34 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
     Updater.test_package_dir = dir.path;
 
+    // A feed signed with the build's next key, as once the signing key
+    // changes, is believed; and with neither key, not.
+    const stranger = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    app.updater.source.keys = .{ .current = stranger.public_key.toBytes(), .next = TestUpdate.keyPair().public_key.toBytes() };
+    TestUpdate.serve(&routes, newer);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(17, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+    app.updater.source.keys = .{ .current = stranger.public_key.toBytes() };
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(18, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check for updates (BadSignature)"));
+    app.updater.source.keys = .{ .current = TestUpdate.keyPair().public_key.toBytes() };
+
     // A check that cannot start is told when asked for, and only then.
     Updater.test_spawn_fails = true;
     defer Updater.test_spawn_fails = false;
     _ = try app.performAction(.app, .check_for_updates, {});
     try std.testing.expectEqual(null, app.updater.running);
     app.createRequested();
-    try std.testing.expectEqual(17, TestUpdate.boxes);
+    try std.testing.expectEqual(19, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not check"));
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try std.testing.expectEqual(null, app.updater.running);
     app.createRequested();
-    try std.testing.expectEqual(17, TestUpdate.boxes);
+    try std.testing.expectEqual(19, TestUpdate.boxes);
 }
 
 /// For tests: the update offer's task dialog (`About.test_record`), and
@@ -17751,7 +17769,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
         .feed = server.url(&feed_url_buf, releases ++ "feed.json"),
         .https_only = false,
         .system_proxy = false,
-        .public_key = TestUpdate.keyPair().public_key.toBytes(),
+        .keys = .{ .current = TestUpdate.keyPair().public_key.toBytes() },
     };
     var feed_buf: [1024]u8 = undefined;
     TestUpdate.serve(&routes, TestUpdate.feedWithNotes(&feed_buf, &server, "999.0.0", package_path, sha256, releases ++ "tag/v999"));
@@ -17874,7 +17892,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqual(6, TestOffer.installs);
     // So is the package's own, built with no key to check a feed by.
     app.updater.installed = true;
-    app.updater.source.public_key = null;
+    app.updater.source.keys = null;
     Updater.test_opened = null;
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
@@ -17882,7 +17900,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
     try std.testing.expectEqual(null, app.updater.running);
     try std.testing.expectEqual(6, TestOffer.installs);
-    app.updater.source.public_key = TestUpdate.keyPair().public_key.toBytes();
+    app.updater.source.keys = .{ .current = TestUpdate.keyPair().public_key.toBytes() };
 
     // Without a task dialog, a message box asks, and Yes installs.
     About.test_record.task_dialog = null;

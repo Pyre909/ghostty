@@ -406,18 +406,24 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
     );
 
     // The Windows updater installs an update only if its feed is signed
-    // with the key whose public half this is (dist/windows/make_feed.py).
+    // with a key whose public half this names (dist/windows/make_feed.py):
+    // one, or two while the signing key changes (`update_feed.Keys`).
     if (b.option(
         []const u8,
         "update-public-key",
         "The Ed25519 public key, as 64 hex digits, that signs the " ++
-            "Windows update feed. If not specified, an update is only " ++
-            "offered on its release page.",
-    )) |key| {
-        var bytes: [32]u8 = undefined;
-        if (key.len != 2 * bytes.len) return error.InvalidUpdatePublicKey;
-        _ = std.fmt.hexToBytes(&bytes, key) catch return error.InvalidUpdatePublicKey;
-        config.update_public_key = key;
+            "Windows update feed; or two, comma-separated, the second " ++
+            "the next key. If not specified, an update is only offered " ++
+            "on its release page.",
+    )) |keys| {
+        var it = std.mem.splitScalar(u8, keys, ',');
+        var count: usize = 0;
+        while (it.next()) |key| : (count += 1) {
+            var bytes: [32]u8 = undefined;
+            if (count == 2 or key.len != 2 * bytes.len) return error.InvalidUpdatePublicKey;
+            _ = std.fmt.hexToBytes(&bytes, key) catch return error.InvalidUpdatePublicKey;
+        }
+        config.update_public_key = keys;
     }
 
     // libghostty-vt properties
