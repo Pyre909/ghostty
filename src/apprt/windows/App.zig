@@ -1978,7 +1978,9 @@ pub const App = struct {
         self.wakeup();
     }
 
-    /// Every open inspector's title bar follows the frames' (`Inspector.applyTheme`).
+    /// Every open inspector's title bar follows the terminals' mode
+    /// (`Inspector.applyTheme`): the frames' but under `window-theme = ghostty`,
+    /// where a frame's caption is in the mode of its own colour.
     fn applyInspectorThemes(self: *App) void {
         for (self.surfaces.items) |surface| if (surface.inspector) |inspector| inspector.applyTheme();
     }
@@ -16967,6 +16969,9 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     defer Window.test_caption = null;
 
     const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, pane);
+    window.tab().focused = pane;
     window.applyTheme();
     try std.testing.expect(window.frame_colors == null);
     // Nothing to give back: a new frame has the system's colours.
@@ -17011,6 +17016,18 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     try std.testing.expectEqual(win32.rgb(0xF8, 0xF8, 0xF8), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
     try std.testing.expect(!window.dark_frame);
     try std.testing.expect(!try attr.dark(window.hwnd));
+    // The terminal's scroll bar stays in the terminal's mode, as GTK's
+    // follow its color scheme, not the header bar's colours.
+    try std.testing.expect(pane.scroll_bar.dark);
+    // A light terminal under the same caption: the bar follows it, though
+    // the caption does not change.
+    changed.background = .{ .r = 0xF0, .g = 0xF0, .b = 0xF0 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(!window.dark_frame);
+    try std.testing.expect(!pane.scroll_bar.dark);
+    changed.background = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(pane.scroll_bar.dark);
 
     // A theme set for the session: the system's colours, until it goes
     // back to the configuration's.

@@ -50,6 +50,7 @@ const win32 = @import("win32.zig");
 const L = win32.L;
 const Surface = @import("Surface.zig").Surface;
 const SearchBar = @import("SearchBar.zig");
+const Window = @import("Window.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -472,7 +473,10 @@ pub fn restyle(surface: *Surface) void {
     if (want) apply(surface);
 }
 
-/// Give `surface`'s bar its frame's mode (`Window.dark_frame`): the
+/// Give `surface`'s bar its terminal's mode (`Window.frameDark`), as GTK
+/// themes its scroll bars by its color scheme: under
+/// `window-theme = ghostty` that of the terminal's background, not of the
+/// caption's colour (`Window.dark_frame`). The
 /// "DarkMode_Explorer" theme class in a dark one, as the command palette's
 /// list takes it (`CommandPalette.applyListTheme`), and the system's own
 /// back in a light one. The class name is not documented: a Windows
@@ -483,7 +487,8 @@ pub fn restyle(surface: *Surface) void {
 /// (`App.configChange`).
 pub fn applyTheme(surface: *Surface) void {
     const s = &surface.scroll_bar;
-    const dark = surface.window.dark_frame;
+    const app = surface.app;
+    const dark = Window.frameDark(&app.config, app.system_scheme, app.window_theme_override);
     if (dark == s.dark) return;
     const hr = win32.SetWindowTheme(surface.hwnd, if (dark) L("DarkMode_Explorer") else null, null);
     if (hr < 0) {

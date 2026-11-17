@@ -3673,6 +3673,12 @@ pub fn applyTheme(self: *Window) void {
     const recolor = !std.meta.eql(colors, self.frame_colors) and
         setCaptionColors(self.hwnd, asShown(colors, self.caption_active));
     if (recolor) self.frame_colors = colors;
+    // The terminals' scroll bars, by the terminals' mode, which under
+    // `ghostty` can change while the caption's does not.
+    for (self.tabs.items) |t| {
+        var it = t.tree.iterator();
+        while (it.next()) |entry| ScrollBar.applyTheme(entry.view);
+    }
     if (dark == self.dark_frame and !recolor) return;
 
     if (dark != self.dark_frame) {
@@ -3698,7 +3704,6 @@ pub fn applyTheme(self: *Window) void {
         while (it.next()) |entry| {
             entry.view.search_bar.invalidate();
             entry.view.overlays.invalidate();
-            ScrollBar.applyTheme(entry.view);
         }
     }
     CommandPalette.invalidate(self);
