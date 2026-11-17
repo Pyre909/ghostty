@@ -62,12 +62,7 @@ pub const Source = struct {
                 .stable => repo_releases ++ "download/stable-windows/" ++ feed_name,
                 .tip => repo_releases ++ "download/tip-windows/" ++ feed_name,
             },
-            .keys = switch (build_config.update_public_keys.len) {
-                0 => null,
-                1 => .{ .current = build_config.update_public_keys[0] },
-                2 => .{ .current = build_config.update_public_keys[0], .next = build_config.update_public_keys[1] },
-                else => @compileError("-Dupdate-public-key takes at most two keys"),
-            },
+            .keys = comptime update_feed.keysOf(build_config.update_public_key),
         };
     }
 };

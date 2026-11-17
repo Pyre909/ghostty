@@ -90,6 +90,25 @@ pub const Keys = struct {
     next: ?[32]u8 = null,
 };
 
+/// The keys -Dupdate-public-key names: one or two 64-hex-digit keys,
+/// comma-separated, the second the next; null for none (""), a build
+/// that installs no update. The build checked the option's form.
+pub fn keysOf(comptime hex: []const u8) ?Keys {
+    comptime {
+        if (hex.len == 0) return null;
+        var keys: [2][32]u8 = undefined;
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, hex, ',');
+        while (it.next()) |key| : (count += 1) {
+            if (count == keys.len) @compileError("-Dupdate-public-key takes at most two keys");
+            _ = std.fmt.hexToBytes(&keys[count], key) catch
+                @compileError("-Dupdate-public-key: not 64 hex digits: " ++ key);
+            if (key.len != 64) @compileError("-Dupdate-public-key: not 64 hex digits: " ++ key);
+        }
+        return .{ .current = keys[0], .next = if (count == 2) keys[1] else null };
+    }
+}
+
 /// Whether `signature`, the feed's signature file, is an Ed25519
 /// signature of `body`, its exact bytes, by one of `keys`.
 pub fn verify(body: []const u8, signature: []const u8, keys: Keys) error{BadSignature}!void {
@@ -402,6 +421,20 @@ test "win32: the feed make_feed.py writes and signs verifies, and parses for eac
         .current = other.public_key.toBytes(),
         .next = another.public_key.toBytes(),
     }));
+
+    // As a build given the option reads it: the key it signs with next.
+    // Held at run time, so a wrong result fails the test, not its build.
+    var rotating = comptime keysOf("3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29," ++
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a").?;
+    _ = &rotating;
+    try std.testing.expectEqualSlices(u8, &public_key, &(rotating.next orelse return error.TestExpectedNextKey));
+    try std.testing.expectEqualSlices(u8, &(try Ed25519.KeyPair.generateDeterministic(@splat(0))).public_key.toBytes(), &rotating.current);
+    try verify(feed, signature, rotating);
+    var single = comptime keysOf("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a").?;
+    _ = &single;
+    try std.testing.expectEqualSlices(u8, &public_key, &single.current);
+    try std.testing.expectEqual(null, single.next);
+    try std.testing.expectEqual(null, comptime keysOf(""));
 
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
