@@ -28,6 +28,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const SemanticVersion = std.SemanticVersion;
+const builtin = @import("builtin");
+
+/// A package's SHA-256, as the feed gives it and a download is checked by.
+pub const Digest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 /// The architectures packages are built for, by their feed key.
 pub const Arch = enum {
@@ -36,7 +40,7 @@ pub const Arch = enum {
 
     /// This build's, or null where no package is built.
     pub fn native() ?Arch {
-        return switch (@import("builtin").cpu.arch) {
+        return switch (builtin.target.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => null,
@@ -52,7 +56,7 @@ pub const Update = struct {
     notes: ?[]const u8,
     /// This architecture's installer package.
     url: []const u8,
-    sha256: [32]u8,
+    sha256: Digest,
 };
 
 pub const Error = error{
@@ -126,7 +130,7 @@ pub fn parse(
     if (feed.notes) |notes| {
         if (!allowed(notes, releases, "", "")) return error.UrlNotAllowed;
     }
-    var sha256: [32]u8 = undefined;
+    var sha256: Digest = undefined;
     if (package.sha256.len != 2 * sha256.len) return error.InvalidFeed;
     _ = std.fmt.hexToBytes(&sha256, package.sha256) catch return error.InvalidFeed;
 
@@ -359,7 +363,7 @@ test "win32: the feed make_feed.py writes and signs verifies, and parses for eac
         try std.testing.expectEqualStrings("1.4.1-win.3", update.version);
         try std.testing.expectEqualStrings(releases ++ "tag/v1.4.1-win.3", update.notes.?);
         try std.testing.expectEqualStrings(releases ++ "download/v1.4.1-win.3/ghostty-1.4.1-win.3-windows-" ++ case[1] ++ ".msi", update.url);
-        var sha256: [32]u8 = undefined;
+        var sha256: Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(case[2], &sha256, .{});
         try std.testing.expectEqualSlices(u8, &sha256, &update.sha256);
     }

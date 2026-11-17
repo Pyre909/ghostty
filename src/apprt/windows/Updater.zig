@@ -124,7 +124,7 @@ pub const Result = union(enum) {
 const Install = struct {
     version: []const u8,
     url: []const u8,
-    sha256: [32]u8,
+    sha256: update_feed.Digest,
     path: ?[:0]const u16,
 };
 
@@ -255,7 +255,7 @@ fn downloadVerified(
     session: http.Session,
     url: []const u8,
     path: [:0]const u16,
-    sha256: [32]u8,
+    sha256: update_feed.Digest,
 ) !win32.HANDLE {
     try session.download(arena, url, path, max_package, sha256);
     return http.openVerified(path, max_package, sha256) orelse error.HashMismatch;

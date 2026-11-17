@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const win32 = @import("win32.zig");
+const Digest = @import("update_feed.zig").Digest;
 
 const L = win32.L;
 const log = std.log.scoped(.win32);
@@ -95,7 +96,7 @@ pub const Session = struct {
         url: []const u8,
         path: [:0]const u16,
         max: usize,
-        sha256: [32]u8,
+        sha256: Digest,
     ) Error!void {
         var response = try self.request(alloc, url);
         defer response.close();
@@ -130,7 +131,7 @@ pub const Session = struct {
     }
 
     /// Write the body to `file`, then check its hash.
-    fn save(response: *Response, file: win32.HANDLE, max: usize, sha256: [32]u8) Error!void {
+    fn save(response: *Response, file: win32.HANDLE, max: usize, sha256: Digest) Error!void {
         var hash: Sha256 = .init(.{});
         const Sink = struct {
             file: win32.HANDLE,
@@ -146,7 +147,7 @@ pub const Session = struct {
             }
         };
         try response.read(max, Sink{ .file = file, .hash = &hash });
-        var got: [32]u8 = undefined;
+        var got: Digest = undefined;
         hash.final(&got);
         if (!std.mem.eql(u8, &got, &sha256)) {
             log.warn("update download: SHA-256 {x} is not the feed's {x}", .{ &got, &sha256 });
@@ -237,7 +238,7 @@ pub const part_suffix = ".part";
 /// handle shares only reading, so while it is open no process can change,
 /// replace or delete the file: what was checked is what a reader of
 /// `path` gets.
-pub fn openVerified(path: [:0]const u16, max: usize, sha256: [32]u8) ?win32.HANDLE {
+pub fn openVerified(path: [:0]const u16, max: usize, sha256: Digest) ?win32.HANDLE {
     const file = win32.CreateFileW(
         path,
         win32.GENERIC_READ,
@@ -253,7 +254,7 @@ pub fn openVerified(path: [:0]const u16, max: usize, sha256: [32]u8) ?win32.HAND
     return null;
 }
 
-fn verify(file: win32.HANDLE, max: usize, sha256: [32]u8) bool {
+fn verify(file: win32.HANDLE, max: usize, sha256: Digest) bool {
     var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
     if (!win32.GetFileInformationByHandle(file, &info).toBool()) return false;
     if (info.dwFileAttributes & (win32.FILE_ATTRIBUTE_DIRECTORY | win32.FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
@@ -267,7 +268,7 @@ fn verify(file: win32.HANDLE, max: usize, sha256: [32]u8) bool {
         if (got == 0) break;
         hash.update(buf[0..got]);
     }
-    var got: [32]u8 = undefined;
+    var got: Digest = undefined;
     hash.final(&got);
     return std.mem.eql(u8, &got, &sha256);
 }
@@ -367,7 +368,7 @@ test "win32: an HTTP download is saved when its hash is the feed's, and removed 
     defer alloc.free(path);
     defer _ = win32.DeleteFileW(path);
 
-    var sha: [32]u8 = undefined;
+    var sha: Digest = undefined;
     Sha256.hash(update_body, &sha, .{});
     try session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, sha);
     const saved = (try testing.read(alloc, path)).?;
