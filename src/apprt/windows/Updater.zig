@@ -83,7 +83,11 @@ pub const Result = union(enum) {
         /// The package's saved path, if it was downloaded.
         path: ?[:0]const u16,
     },
+    /// The check failed.
     failed: anyerror,
+    /// The install failed before msiexec ran: its package not downloaded,
+    /// or msiexec not started.
+    install_error: anyerror,
     /// The package installed, of this version: Ghostty takes it up once
     /// restarted.
     installed: []const u8,
@@ -98,7 +102,7 @@ pub const Result = union(enum) {
     /// user made it.
     pub fn tells(self: Result, manual: bool) bool {
         return switch (self) {
-            .update, .installed, .install_failed => true,
+            .update, .installed, .install_failed, .install_error => true,
             .current, .failed => manual,
             .install_cancelled => false,
         };
@@ -139,7 +143,7 @@ pub const Job = struct {
 
     fn run(job: *Job) void {
         job.result = if (job.install) |install|
-            job.installPackage(install) catch |err| .{ .failed = err }
+            job.installPackage(install) catch |err| .{ .install_error = err }
         else
             job.check() catch |err| .{ .failed = err };
         // A post fails when the UI thread's queue is full, as well as once
@@ -177,7 +181,12 @@ pub const Job = struct {
         // One saved by an earlier check of this release is kept, if it
         // is still the package.
         const file = http.openVerified(path, max_package, found.sha256) orelse
-            try downloadVerified(arena, session, found.url, path, found.sha256);
+            (downloadVerified(arena, session, found.url, path, found.sha256) catch |err| {
+                // Offered all the same: Install downloads it again, and
+                // tells if that fails too.
+                log.warn("update package not downloaded err={}", .{err});
+                return .{ .update = .{ .found = found, .path = null } };
+            });
         _ = win32.CloseHandle(file);
         return .{ .update = .{ .found = found, .path = path } };
     }
@@ -345,29 +354,61 @@ fn arm(self: *Updater, ms: win32.UINT) void {
 pub fn timerFired(self: *Updater) void {
     if (!self.armed) return; // a WM_TIMER queued before KillTimer
     self.arm(interval_ms);
-    self.start(false);
+    _ = self.start(false); // automatic: a failure is not told
 }
 
-/// Start a check, or make the running one `manual`.
-pub fn start(self: *Updater, manual: bool) void {
+/// Start a check, or make the running one `manual`. A manual one that
+/// could not start is returned, failed, for the app to tell as any other
+/// (`App.tellUpdate`).
+pub fn start(self: *Updater, manual: bool) ?*Job {
     if (self.running) |job| {
         job.manual = job.manual or manual;
-        return;
+        return null;
     }
     self.spawn(manual, null) catch |err| {
         log.warn("update check not started err={}", .{err});
+        if (manual) return self.failedJob(.{ .failed = err });
     };
+    return null;
+}
+
+/// A job that never ran, with `result`, to be told as a finished one is;
+/// null without the memory for it.
+fn failedJob(self: *Updater, result: Result) ?*Job {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    const job = arena.allocator().create(Job) catch {
+        arena.deinit();
+        oom();
+        return null;
+    };
+    job.* = .{
+        .arena = arena,
+        .hwnd = self.hwnd,
+        .msg = self.msg,
+        .source = self.source,
+        .dir = null,
+        .manual = true,
+        .result = result,
+    };
+    return job;
 }
 
 fn spawn(self: *Updater, manual: bool, install: ?Install) !void {
+    if (builtin.is_test and test_spawn_fails) return error.SystemResources;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     var moved = false;
     errdefer if (!moved) arena.deinit();
     const a = arena.allocator();
     const job = try a.create(Job);
-    // An install always has the directory, to prune and to download to
-    // again if its package changed.
-    const dir = if (self.mode == .download or install != null) try packageDir(a) else null;
+    // A package is downloaded ahead only where Install is offered
+    // (`installed`); an install always wants the directory, to prune and
+    // to download to again if its package changed. Without it a check
+    // goes on, and an install tells why it failed (`error.NoPackageDir`).
+    const wants_dir = install != null or (self.mode == .download and self.installed);
+    const dir = if (!wants_dir) null else packageDir(a) catch |err| dir: {
+        log.warn("update directory not found err={}", .{err});
+        break :dir null;
+    };
     // The install's slices, the UI thread's, copied into the job's own.
     const owned: ?Install = if (install) |i| .{
         .version = try a.dupe(u8, i.version),
@@ -437,7 +478,7 @@ pub fn deinit(self: *Updater) void {
 /// than the environment, which an inherited variable could point
 /// anywhere.
 fn packageDir(arena: Allocator) ![]const u16 {
-    if (builtin.is_test) if (test_package_dir) |dir| return dir;
+    if (builtin.is_test) if (test_package_dir) |dir| return if (dir.len == 0) error.PackageDir else dir;
     var local: ?[*:0]u16 = null;
     defer win32.CoTaskMemFree(local);
     if (win32.SHGetKnownFolderPath(&win32.FOLDERID_LocalAppData, 0, null, &local) < 0)
@@ -477,6 +518,12 @@ pub fn report(app: *App, job: *const Job) void {
             alloc,
             "Ghostty {s} is installed. Restart Ghostty to use it.",
             .{version},
+            0,
+        ) catch return oom(),
+        .install_error => |err| std.fmt.allocPrintSentinel(
+            alloc,
+            "Ghostty's update could not be installed ({s}).",
+            .{@errorName(err)},
             0,
         ) catch return oom(),
         .install_failed => |code| std.fmt.allocPrintSentinel(
@@ -524,7 +571,7 @@ fn offer(app: *App, found: update_feed.Update, path: ?[:0]const u16) void {
     defer app.endPrompt();
     const chosen = ask(app, owner, available, found.notes, installable) orelse return oom();
     switch (chosen) {
-        install_id => app.updater.startInstall(found, path),
+        install_id => if (app.updater.startInstall(found, path)) |job| app.tellUpdate(job),
         release_page_id => openPage(found.notes orelse app.updater.source.releases),
         else => {},
     }
@@ -628,15 +675,18 @@ fn openPage(url: []const u8) void {
 
 /// Install `found` (`Job.installPackage`), downloading it first unless
 /// `path` has it, and tell what came of it. Not while a check runs, which
-/// the user then sees end on its own.
-pub fn startInstall(self: *Updater, found: update_feed.Update, path: ?[:0]const u16) void {
+/// the user then sees end on its own. One that could not start is
+/// returned, failed, as `start` returns a check.
+pub fn startInstall(self: *Updater, found: update_feed.Update, path: ?[:0]const u16) ?*Job {
     if (self.running != null) {
         log.warn("update not installed: a check is running", .{});
-        return;
+        return null;
     }
     self.spawn(true, .{ .version = found.version, .url = found.url, .sha256 = found.sha256, .path = path }) catch |err| {
         log.warn("update install not started err={}", .{err});
+        return self.failedJob(.{ .install_error = err });
     };
+    return null;
 }
 
 /// Whether this process's image is the package's: ghostty.exe in its
@@ -668,8 +718,8 @@ pub const test_source: Source = .{
     .system_proxy = false,
 };
 
-/// For tests: where `download` saves a package, ending in a separator,
-/// in place of the cache directory.
+/// For tests: where a package is saved, ending in a separator, in place
+/// of the user's; empty, the directory cannot be made.
 pub var test_package_dir: if (builtin.is_test) ?[]const u16 else void =
     if (builtin.is_test) null else {};
 
@@ -677,6 +727,9 @@ pub var test_package_dir: if (builtin.is_test) ?[]const u16 else void =
 /// job's thread; its answer is the exit code.
 pub var test_msiexec: if (builtin.is_test) ?*const fn ([:0]const u16) u32 else void =
     if (builtin.is_test) null else {};
+
+/// For tests: whether a job's thread fails to start.
+pub var test_spawn_fails = false;
 
 /// For tests: how many of the next posts of a job's result fail, as
 /// they would with the UI thread's queue full.

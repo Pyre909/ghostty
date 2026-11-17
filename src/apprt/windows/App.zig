@@ -3378,15 +3378,20 @@ pub const App = struct {
     /// its toggle, since it moves the foreground. `true` once recorded.
     /// `check_for_updates`: a check that reports whatever it finds.
     fn checkForUpdates(self: *App) bool {
-        self.updater.start(true);
+        if (self.updater.start(true)) |job| self.tellUpdate(job);
         return true;
     }
 
-    /// WM_GHOSTTY_UPDATE: a check or an install is done. What came of it
-    /// is queued for `run` to show if there is something to tell
-    /// (`Updater.Result.tells`, `Updater.report`).
+    /// WM_GHOSTTY_UPDATE: a check or an install is done.
     fn updateFinished(self: *App, lparam: win32.LPARAM) void {
         const job = self.updater.finished(lparam) orelse return;
+        self.tellUpdate(job);
+    }
+
+    /// What came of an update check or install, queued for `run` to show
+    /// if there is something to tell (`Updater.Result.tells`,
+    /// `Updater.report`): `job` is then the queue's.
+    pub fn tellUpdate(self: *App, job: *Updater.Job) void {
         if (!job.result.tells(job.manual)) return Updater.release(job);
         self.requests.append(self.core_app.alloc, .{ .update = job }) catch |err| {
             log.warn("update check result not shown err={}", .{err});
@@ -17426,18 +17431,20 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(null, app.updater.running);
 
     // `download` saves the package, if its hash is the feed's, before
-    // telling of it; one that is not is not kept, and nothing told.
+    // telling of it; one that is not is not kept, and the update is
+    // offered all the same, for Install to try again.
     const dir: http_testing.TempDir = try .init(alloc, "update-check");
     defer dir.deinit(alloc);
     Updater.test_package_dir = dir.path;
     defer Updater.test_package_dir = null;
     const file = try dir.file(alloc, TestUpdate.package_name);
     defer alloc.free(file);
+    app.updater.installed = true;
     app.updater.configure(.download);
     routes[0].response = bad_hash;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(7, TestUpdate.boxes);
+    try std.testing.expectEqual(8, TestUpdate.boxes);
     try std.testing.expectEqual(null, try http_testing.read(alloc, file));
     try std.testing.expectEqual(0, try http_testing.countMatching(alloc, file, ".*.part"));
 
@@ -17455,7 +17462,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     var requests = server.requests.load(.monotonic);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(8, TestUpdate.boxes);
+    try std.testing.expectEqual(9, TestUpdate.boxes);
     try std.testing.expectEqual(requests + 2, server.requests.load(.monotonic));
     const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
@@ -17471,8 +17478,53 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     requests = server.requests.load(.monotonic);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(9, TestUpdate.boxes);
+    try std.testing.expectEqual(10, TestUpdate.boxes);
     try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
+
+    // One that does not download is offered all the same, for Install to
+    // download it again.
+    try http_testing.write(file, "junk");
+    routes[1].response = not_found;
+    requests = server.requests.load(.monotonic);
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(11, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+    try std.testing.expectEqual(requests + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(0, try http_testing.countMatching(alloc, file, ".*.part"));
+    routes[1].response = http_testing.okResponse(package);
+
+    // A Ghostty an update can only send to its release page downloads
+    // nothing; nor one whose directory for packages cannot be made, which
+    // still tells of the update.
+    app.updater.installed = false;
+    requests = server.requests.load(.monotonic);
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(12, TestUpdate.boxes);
+    try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
+    app.updater.installed = true;
+    Updater.test_package_dir = &.{};
+    requests = server.requests.load(.monotonic);
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(13, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+    try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
+    Updater.test_package_dir = dir.path;
+
+    // A check that cannot start is told when asked for, and only then.
+    Updater.test_spawn_fails = true;
+    defer Updater.test_spawn_fails = false;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try std.testing.expectEqual(null, app.updater.running);
+    app.createRequested();
+    try std.testing.expectEqual(14, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check"));
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try std.testing.expectEqual(null, app.updater.running);
+    app.createRequested();
+    try std.testing.expectEqual(14, TestUpdate.boxes);
 }
 
 /// For tests: the update offer's task dialog (`About.test_record`), and
@@ -17722,6 +17774,18 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expect(TestUpdate.buttons & win32.MB_YESNO != 0);
     try std.testing.expect(TestUpdate.says("Install it now?"));
     try TestUpdate.finish(&app);
+    try std.testing.expectEqual(6, TestOffer.installs);
+
+    // An install that fails before msiexec says so, not that the check
+    // failed.
+    _ = win32.DeleteFileW(file);
+    routes[1].response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const asked = TestUpdate.boxes;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(asked + 2, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not be installed (HttpStatus)"));
     try std.testing.expectEqual(6, TestOffer.installs);
 }
 

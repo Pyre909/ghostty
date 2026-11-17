@@ -4096,7 +4096,9 @@ term: []const u8 = "xterm-ghostty",
 /// preference stored in the standard user defaults (`defaults(1)`).
 /// On Windows, unset is `off`. There, `check` looks shortly after start
 /// and then daily, and an update is offered from its installer package
-/// (`.msi`), which `download` fetches before telling of it.
+/// (`.msi`), which `download` fetches before telling of it. A Ghostty
+/// not installed from that package (a zip, a build of one's own) is
+/// offered its release page instead, and `download` fetches nothing.
 ///
 /// Changing this value at runtime works after a small delay.
 @"auto-update": ?AutoUpdate = null,
