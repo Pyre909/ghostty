@@ -193,6 +193,20 @@ pub const Shaders = struct {
     }
 };
 
+/// Compile the built-in pipelines' shaders into `cache`, without a device:
+/// App.create's warmup thread does it while the first window is being
+/// made, so that window's renderer finds them compiled. A failure is
+/// logged and left for the renderer, which compiles it again and fails.
+pub fn warmCache(compile: api.D3DCompileFn, cache: *ShaderCache) void {
+    inline for (pipeline_descs) |pipeline| {
+        const desc = pipeline[1];
+        if (desc.vertex_fn) |source| _ = cache.bytecode(compile, pipeline[0], source, Pipeline.vertex_target) catch |err|
+            log.warn("shader warmup {s} vertex failed err={}", .{ pipeline[0], err });
+        if (desc.fragment_fn) |source| _ = cache.bytecode(compile, pipeline[0], source, Pipeline.pixel_target) catch |err|
+            log.warn("shader warmup {s} pixel failed err={}", .{ pipeline[0], err });
+    }
+}
+
 /// Initialize our custom shader pipelines: each one runs the full-screen
 /// vertex shader with a converted shadertoy shader as its pixel shader,
 /// without blending, as on Metal.
@@ -658,6 +672,28 @@ test "d3d11 shaders: bit masks and registers match the Zig side" {
     try testing.expect(std.mem.indexOf(u8, cell_bg, storage) != null);
 }
 
+/// For tests: the real D3DCompile, counting its calls.
+const Counting = struct {
+    var real: api.D3DCompileFn = undefined;
+    var calls: u32 = 0;
+    fn compile(
+        data: *const anyopaque,
+        data_size: api.SIZE_T,
+        filename: ?api.LPCSTR,
+        defines: ?[*]const api.D3D_SHADER_MACRO,
+        include: ?*api.ID3DInclude,
+        entrypoint: ?api.LPCSTR,
+        target: api.LPCSTR,
+        sflags: api.UINT,
+        eflags: api.UINT,
+        shader: *?*api.ID3DBlob,
+        messages: ?*?*api.ID3DBlob,
+    ) callconv(api.cc) api.HRESULT {
+        calls += 1;
+        return real(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, messages);
+    }
+};
+
 test "d3d11 shaders: a second device's shaders come from the cache, a custom shader's too" {
     // As a second split starts: the same sources on another device. Each
     // distinct source compiles on the first device only; full_screen's
@@ -667,26 +703,6 @@ test "d3d11 shaders: a second device's shaders come from the cache, a custom sha
     const testing = std.testing;
     const D3D11 = @import("../D3D11.zig");
 
-    const Counting = struct {
-        var real: api.D3DCompileFn = undefined;
-        var calls: u32 = 0;
-        fn compile(
-            data: *const anyopaque,
-            data_size: api.SIZE_T,
-            filename: ?api.LPCSTR,
-            defines: ?[*]const api.D3D_SHADER_MACRO,
-            include: ?*api.ID3DInclude,
-            entrypoint: ?api.LPCSTR,
-            target: api.LPCSTR,
-            sflags: api.UINT,
-            eflags: api.UINT,
-            shader: *?*api.ID3DBlob,
-            messages: ?*?*api.ID3DBlob,
-        ) callconv(api.cc) api.HRESULT {
-            calls += 1;
-            return real(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, messages);
-        }
-    };
     Counting.real = try D3D11.loadCompiler();
     Counting.calls = 0;
 
@@ -735,4 +751,28 @@ test "d3d11 shaders: a second device's shaders come from the cache, a custom sha
     }
     try testing.expectEqual(@as(usize, 1), second.post_pipelines.len);
     try testing.expect(second.post_pipelines[0].ready);
+}
+
+test "d3d11 shaders: the warmup compiles what the first surface asks for" {
+    // Shaders.init after warmCache compiles nothing: the warmup compiled
+    // every built-in source for the stage Pipeline.init asks it for.
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const D3D11 = @import("../D3D11.zig");
+    Counting.real = try D3D11.loadCompiler();
+    Counting.calls = 0;
+
+    var cache: ShaderCache = .init(testing.allocator);
+    defer cache.deinit();
+    warmCache(&Counting.compile, &cache);
+    const warmed = Counting.calls;
+    try testing.expect(warmed > 0);
+    try testing.expectEqual(@as(usize, warmed), cache.entries.count());
+
+    const d = try D3D11.TestDevice.init();
+    defer d.deinit();
+    var s = try Shaders.init(testing.allocator, d.device, &Counting.compile, &cache, &.{}, .B8G8R8A8_UNORM);
+    defer s.deinit(testing.allocator);
+    try testing.expectEqual(warmed, Counting.calls);
+    inline for (pipeline_descs) |p| try testing.expect(@field(s.pipelines, p[0]).ready);
 }

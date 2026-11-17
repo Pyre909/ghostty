@@ -40,6 +40,11 @@ pub const Options = struct {
     blending_enabled: bool = true,
 };
 
+/// The shader model targets of the two stages, which the process's shader
+/// cache is keyed by: `shaders.warmCache` compiles for the same ones.
+pub const vertex_target = "vs_5_0";
+pub const pixel_target = "ps_5_0";
+
 pub const Error = ShaderCache.Error || error{D3D11Failed};
 
 vs: ?*api.ID3D11VertexShader = null,
@@ -62,8 +67,8 @@ pub fn init(comptime VertexAttributes: ?type, opts: Options) Error!Self {
 
     const device = opts.device;
 
-    const vs_bytes = try opts.cache.bytecode(opts.compile, opts.name, vertex_source, "vs_5_0");
-    const ps_bytes = try opts.cache.bytecode(opts.compile, opts.name, fragment_source, "ps_5_0");
+    const vs_bytes = try opts.cache.bytecode(opts.compile, opts.name, vertex_source, vertex_target);
+    const ps_bytes = try opts.cache.bytecode(opts.compile, opts.name, fragment_source, pixel_target);
 
     var vs: ?*api.ID3D11VertexShader = null;
     var hr = device.vtable.CreateVertexShader(device, vs_bytes.ptr, vs_bytes.len, null, &vs);

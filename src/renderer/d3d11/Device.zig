@@ -9,10 +9,18 @@
 //! `D3D11.recoverDevice`. Sharing one device between surfaces would need
 //! deferred contexts and a recovery that reaches every surface, which is
 //! a change of its own.
+//!
+//! What every surface does share is device-independent: the compiled
+//! shaders, in the process's ShaderCache, which `warmup` fills before the
+//! first window needs them.
 const Device = @This();
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+
+const D3D11 = @import("../D3D11.zig");
+const ShaderCache = @import("ShaderCache.zig");
+const shaders = @import("shaders.zig");
 
 /// Options used when creating the Direct3D 11 device. There are none:
 /// each renderer creates its own device for its window.
@@ -27,4 +35,15 @@ pub fn init(alloc: Allocator, options: Options) !*Device {
 
 pub fn deinit(self: *Device, alloc: Allocator) void {
     alloc.destroy(self);
+}
+
+/// Compile the built-in shaders into the process's cache. App.create runs
+/// this on a thread of its own, so the compile (about 100 ms) overlaps the
+/// first window's creation instead of delaying its first frame. A
+/// renderer that starts before it finishes takes the same cache lock, so
+/// each shader still compiles once, by whichever asks first. Without a
+/// compiler there is nothing to warm, and the renderer reports it.
+pub fn warmup() void {
+    const compile = D3D11.loadCompiler() catch return;
+    shaders.warmCache(compile, &ShaderCache.process);
 }
