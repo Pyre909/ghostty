@@ -42,10 +42,14 @@ pub const Options = struct {
     system_proxy: bool = true,
 };
 
+/// A WinHTTP session; its requests share its proxy and timeouts.
 pub const Session = struct {
     handle: win32.HINTERNET,
     https_only: bool,
 
+    /// A session by `options`: by default HTTPS only, through the
+    /// system's proxy, and with timeouts that keep a stalled server from
+    /// holding the worker thread for long.
     pub fn open(options: Options) Error!Session {
         const access = if (options.system_proxy)
             win32.WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
@@ -150,7 +154,7 @@ pub const Session = struct {
         var got: Digest = undefined;
         hash.final(&got);
         if (!std.mem.eql(u8, &got, &sha256)) {
-            log.warn("update download: SHA-256 {x} is not the feed's {x}", .{ &got, &sha256 });
+            log.warn("update download: hash mismatch got={x} want={x}", .{ &got, &sha256 });
             return error.HashMismatch;
         }
     }
@@ -193,7 +197,7 @@ pub const Session = struct {
         if (parts.dwHostNameLength == 0) return error.BadUrl;
         const host = try alloc.dupeSentinel(u16, host_ptr[0..parts.dwHostNameLength], 0);
         defer alloc.free(host);
-        const path: [*:0]const u16 = if (parts.lpszUrlPath) |p| @ptrCast(p) else L("/");
+        const path: [*:0]const u16 = parts.lpszUrlPath orelse L("/");
 
         const connect = win32.WinHttpConnect(self.handle, host, parts.nPort, 0) orelse
             return failed("WinHttpConnect");
@@ -222,7 +226,7 @@ pub const Session = struct {
             null,
         ).toBool()) return failed("WinHttpQueryHeaders");
         if (status != 200) {
-            log.warn("update request: HTTP status {}", .{status});
+            log.warn("update request: unexpected HTTP status={}", .{status});
             return error.HttpStatus;
         }
         return .{ .connect = connect, .request = req };

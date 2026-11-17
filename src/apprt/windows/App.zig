@@ -3376,9 +3376,6 @@ pub const App = struct {
         };
     }
 
-    /// `.toggle_visibility`, which the core performs for the app wherever
-    /// it is bound: recorded for `run`, as `requestQuickTerminal` records
-    /// its toggle, since it moves the foreground. `true` once recorded.
     /// `check_for_updates`: a check that reports whatever it finds.
     fn checkForUpdates(self: *App) bool {
         if (self.updater.start(true)) |job| self.tellUpdate(job);
@@ -3403,6 +3400,9 @@ pub const App = struct {
         self.wakeup();
     }
 
+    /// `.toggle_visibility`, which the core performs for the app wherever
+    /// it is bound: recorded for `run`, as `requestQuickTerminal` records
+    /// its toggle, since it moves the foreground. `true` once recorded.
     fn requestVisibility(self: *App) bool {
         self.requests.append(self.core_app.alloc, .visibility) catch |err| {
             log.warn("cannot record toggling the windows' visibility err={}", .{err});

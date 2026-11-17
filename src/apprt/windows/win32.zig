@@ -2422,7 +2422,8 @@ pub extern "winhttp" fn WinHttpOpenRequest(
     object: ?LPCWSTR,
     version: ?LPCWSTR,
     referrer: ?LPCWSTR,
-    accept_types: ?*const ?LPCWSTR,
+    /// A null-terminated list of media types.
+    accept_types: ?[*:null]const ?LPCWSTR,
     flags: DWORD,
 ) callconv(.winapi) ?HINTERNET;
 pub extern "winhttp" fn WinHttpSendRequest(

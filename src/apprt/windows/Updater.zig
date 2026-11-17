@@ -411,6 +411,7 @@ pub fn start(self: *Updater, manual: bool) ?*Job {
 /// A job that never ran, with `result`, to be told as a finished one is;
 /// null without the memory for it.
 fn failedJob(self: *Updater, result: Result) ?*Job {
+    // Not the app's allocator, as for `spawn`'s jobs.
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     const job = arena.allocator().create(Job) catch {
         arena.deinit();
@@ -431,6 +432,9 @@ fn failedJob(self: *Updater, result: Result) ?*Job {
 
 fn spawn(self: *Updater, manual: bool, install: ?Install) !void {
     if (builtin.is_test and test_spawn_fails) return error.SystemResources;
+    // Not the app's allocator: a job still running at exit is detached
+    // (`deinit`) and frees its arena itself, after the app and its
+    // allocator are gone.
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     var moved = false;
     errdefer if (!moved) arena.deinit();
@@ -543,26 +547,22 @@ pub fn report(app: *App, job: *const Job) void {
     const text: [:0]const u8 = switch (job.result) {
         .update => |update| return offer(app, update.found, update.path),
         .current => alloc.dupeSentinel(u8, "Ghostty is up to date.", 0) catch return oom(),
-        .failed => |err| std.fmt.allocPrintSentinel(
-            alloc,
+        .failed => |err| alloc.printSentinel(
             "Ghostty could not check for updates ({s}).",
             .{@errorName(err)},
             0,
         ) catch return oom(),
-        .installed => |version| std.fmt.allocPrintSentinel(
-            alloc,
+        .installed => |version| alloc.printSentinel(
             "Ghostty {s} is installed. Restart Ghostty to use it.",
             .{version},
             0,
         ) catch return oom(),
-        .install_error => |err| std.fmt.allocPrintSentinel(
-            alloc,
+        .install_error => |err| alloc.printSentinel(
             "Ghostty's update could not be installed ({s}).",
             .{@errorName(err)},
             0,
         ) catch return oom(),
-        .install_failed => |code| std.fmt.allocPrintSentinel(
-            alloc,
+        .install_failed => |code| alloc.printSentinel(
             "Ghostty's update was not installed (msiexec exit code {d}).",
             .{code},
             0,
@@ -594,7 +594,7 @@ pub const release_page_id: c_int = 101;
 fn offer(app: *App, found: update_feed.Update, path: ?[:0]const u16) void {
     const alloc = app.core_app.alloc;
     const can_install = app.updater.installable();
-    const available = std.fmt.allocPrint(alloc, "Ghostty {s} is available. You have {s}.", .{
+    const available = alloc.print("Ghostty {s} is available. You have {s}.", .{
         found.version,
         build_config.version_string,
     }) catch return oom();
@@ -623,7 +623,7 @@ fn ask(app: *App, owner: ?win32.HWND, available: []const u8, notes: ?[]const u8,
     const action = if (can_install) install_id else release_page_id;
     if (About.taskDialog()) |task_dialog| task: {
         const content = if (notes) |url|
-            std.fmt.allocPrint(alloc, "{s}\n\n<a href=\"{s}\">Release notes</a>", .{ available, url }) catch return null
+            alloc.print("{s}\n\n<a href=\"{s}\">Release notes</a>", .{ available, url }) catch return null
         else
             alloc.dupe(u8, available) catch return null;
         defer alloc.free(content);
@@ -661,7 +661,7 @@ fn ask(app: *App, owner: ?win32.HWND, available: []const u8, notes: ?[]const u8,
         }
         return button;
     }
-    const question = std.fmt.allocPrintSentinel(alloc, "{s}\n\n{s}", .{
+    const question = alloc.printSentinel("{s}\n\n{s}", .{
         available,
         if (can_install) "Install it now?" else "Open its release page?",
     }, 0) catch return null;
