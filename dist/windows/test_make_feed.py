@@ -345,13 +345,15 @@ class TestExpiry(Temp):
         # fixture's date: byte for byte the fixture, signature and all.
         key = test_key(self.dir)
         feed = self.dir / mf.FEED
-        code, _, err = run(
-            mf.main,
-            self.packages()
-            + ["--tag", TAG, "--key", str(key), "--expires", str(NOW + 5)],
-        )
-        self.assertEqual((code, err), (0, ""))
+        # Both at NOW: --expires is checked against the clock, and a real
+        # one would pass NOW + 5 one day.
         with mock.patch.object(mf.time, "time", return_value=NOW):
+            code, _, err = run(
+                mf.main,
+                self.packages()
+                + ["--tag", TAG, "--key", str(key), "--expires", str(NOW + 5)],
+            )
+            self.assertEqual((code, err), (0, ""))
             code, out, err = run(
                 mf.main,
                 [
