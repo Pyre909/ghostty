@@ -635,26 +635,6 @@ pub const View = struct {
     }
 };
 
-/// A WARP device, which every supported Windows has, GPU driver or not.
-const TestDevice = struct {
-    device: *api.ID3D11Device,
-    context: *api.ID3D11DeviceContext,
-
-    fn init() !TestDevice {
-        const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
-        var device: ?*api.ID3D11Device = null;
-        var context: ?*api.ID3D11DeviceContext = null;
-        if (api.failed(D3D11.D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device, null, &context)))
-            return error.TestDeviceFailed;
-        return .{ .device = device orelse return error.TestDeviceFailed, .context = context orelse return error.TestDeviceFailed };
-    }
-
-    fn deinit(self: TestDevice) void {
-        api.release(self.context);
-        api.release(self.device);
-    }
-};
-
 /// An ImGui context with no ini or log file, current until `deinit`.
 const TestContext = struct {
     ctx: *cimgui.c.ImGuiContext,
@@ -696,7 +676,7 @@ fn testTexture(device: *api.ID3D11Device, usage: api.D3D11_USAGE, bind: api.UINT
 test "win32: ImGui's DirectX 11 backend compiles through ghostty_imgui_D3DCompile and draws" {
     const testing = std.testing;
 
-    const d3d = try TestDevice.init();
+    const d3d = try D3D11.TestDevice.init();
     defer d3d.deinit();
     const device = d3d.device;
     const context = d3d.context;
@@ -748,7 +728,7 @@ test "win32: ImGui_TextColored formats its arguments, in its colour" {
     const testing = std.testing;
 
     // The DirectX 11 backend makes the glyphs' texture as text needs it.
-    const d3d = try TestDevice.init();
+    const d3d = try D3D11.TestDevice.init();
     defer d3d.deinit();
     const ig = try TestContext.init(400, 300);
     defer ig.deinit();
@@ -811,7 +791,7 @@ test "win32: ImGui's DirectX 11 backend fails cleanly without a compiler" {
     test_load_compiler = &noCompiler;
     defer test_load_compiler = null;
 
-    const d3d = try TestDevice.init();
+    const d3d = try D3D11.TestDevice.init();
     defer d3d.deinit();
     const ig = try TestContext.init(64, 48);
     defer ig.deinit();

@@ -150,9 +150,38 @@ const win32 = struct {
 };
 
 /// The one declaration of D3D11CreateDevice, for a caller that needs a
-/// particular driver type (the ImGui tests' WARP device); `createDevice`
-/// makes the device a window draws with.
+/// particular driver type (`TestDevice`); `createDevice` makes the device a
+/// window draws with.
 pub const D3D11CreateDevice = win32.D3D11CreateDevice;
+
+/// For tests: a WARP device, which every supported Windows has, GPU
+/// driver or not. The ImGui tests draw with it; the shader tests create
+/// pipelines on it.
+pub const TestDevice = struct {
+    device: *api.ID3D11Device,
+    context: *api.ID3D11DeviceContext,
+
+    pub fn init() !TestDevice {
+        const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
+        var device: ?*api.ID3D11Device = null;
+        var context: ?*api.ID3D11DeviceContext = null;
+        if (api.failed(D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &device, null, &context)))
+            return error.TestDeviceFailed;
+        // A call that succeeds sets both; each is released if the other
+        // is missing.
+        errdefer if (device) |d| api.release(d);
+        errdefer if (context) |c| api.release(c);
+        return .{
+            .device = device orelse return error.TestDeviceFailed,
+            .context = context orelse return error.TestDeviceFailed,
+        };
+    }
+
+    pub fn deinit(self: TestDevice) void {
+        api.release(self.context);
+        api.release(self.device);
+    }
+};
 
 /// The window this renderer presents to. Borrowed from the apprt or the
 /// embedding host, which destroys it only after the renderer is gone.

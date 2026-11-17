@@ -712,21 +712,16 @@ test "d3d11 shaders: a second device's shaders come from the cache, a custom sha
     defer cache.deinit();
     const custom: [:0]const u8 = "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
 
-    var devices: [2]*api.ID3D11Device = undefined;
-    for (&devices) |*device| {
-        const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
-        var d: ?*api.ID3D11Device = null;
-        if (api.failed(D3D11.D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &d, null, null)))
-            return error.TestDeviceFailed;
-        device.* = d orelse return error.TestDeviceFailed;
-    }
-    defer for (devices) |d| api.release(d);
+    const a = try D3D11.TestDevice.init();
+    defer a.deinit();
+    const b = try D3D11.TestDevice.init();
+    defer b.deinit();
 
-    var first = try Shaders.init(testing.allocator, devices[0], &Counting.compile, &cache, &.{custom}, .B8G8R8A8_UNORM);
+    var first = try Shaders.init(testing.allocator, a.device, &Counting.compile, &cache, &.{custom}, .B8G8R8A8_UNORM);
     defer first.deinit(testing.allocator);
     try testing.expectEqual(distinct + 1, Counting.calls);
 
-    var second = try Shaders.init(testing.allocator, devices[1], &Counting.compile, &cache, &.{custom}, .B8G8R8A8_UNORM);
+    var second = try Shaders.init(testing.allocator, b.device, &Counting.compile, &cache, &.{custom}, .B8G8R8A8_UNORM);
     defer second.deinit(testing.allocator);
     try testing.expectEqual(distinct + 1, Counting.calls);
 
