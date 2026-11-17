@@ -98,7 +98,7 @@ class TestFeed(Temp):
             self.assertRegex(p["sha256"], r"\A[0-9a-f]{64}\Z")
 
     def test_one_architecture_and_out(self) -> None:
-        x64 = self.package("ghostty-1.4.1-windows-x86_64.msi")
+        x64 = self.package("ghostty-1.5.0-tip.7-windows-x86_64.msi")
         out = self.dir / "out"
         code, _, err = run(mf.main, [str(x64), "--tag", mf.TIP_TAG, "--out", str(out)])
         self.assertEqual((code, err), (0, ""))
@@ -117,6 +117,10 @@ class TestFeed(Temp):
             (["ghostty-1.4.1 a-windows-x86_64.msi"], TAG, "not a semantic version"),
             (["ghostty-1.4.1-windows-x86_64.msi"], "a/b", "not a tag Ghostty accepts"),
             (["ghostty-1.4.1-windows-x86_64.msi"], "..", "not a tag Ghostty accepts"),
+            # Each channel's packages only on its own release.
+            (["ghostty-1.4.1-win.3-windows-x86_64.msi"], mf.TIP_TAG, "1.4.1-win.3 is a stable build, not for tip-windows"),
+            (["ghostty-1.5.0-tip.7-windows-x86_64.msi"], "v1.5.0-tip.7", "is a tip build"),
+            (["ghostty-1.4.1-win.2-windows-x86_64.msi"], TAG, "tagged v1.4.1-win.2, not v1.4.1-win.3"),
         ]
         for names, tag, says in cases:
             with self.subTest(names=names, tag=tag):

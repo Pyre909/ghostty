@@ -1227,5 +1227,30 @@ class TestArguments(unittest.TestCase):
                 )
 
 
+class TestBuildFlags(unittest.TestCase):
+    def test_channel_is_the_release_s(self) -> None:
+        # The build alone would take every pre-release, the packaging's
+        # respins too, for tip's (src/build/Config.zig).
+        for version, channel in [
+            ("1.4.1", "stable"),
+            ("1.4.1-win.3", "stable"),
+            ("1.4.1-win.3+abc", "stable"),
+            ("1.5.0-tip.7", "tip"),
+            ("1.4.1-dev", "tip"),
+            ("1.4.1-win.3.1", "tip"),
+            ("1.4.1-win.03", "tip"),
+        ]:
+            with self.subTest(version=version):
+                flags = mz.build_flags("aarch64", version)
+                self.assertIn(f"-Dversion-string={version}", flags)
+                self.assertIn(f"-Drelease-channel={channel}", flags)
+                self.assertIn("-Dtarget=aarch64-windows-gnu", flags)
+
+    def test_build_takes_the_channel(self) -> None:
+        config = (mz.REPO / "src/build/Config.zig").read_text("utf-8")
+        self.assertIn('"release-channel",', config)
+        self.assertIn("self.release_channel orelse channel:", config)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -98,8 +98,24 @@ def check_tag(tag: str) -> None:
         raise Error(f"{tag!r} is not a tag Ghostty accepts in a URL")
 
 
-def feed(packages: list[Package], tag: str) -> dict:
+def check_release(version: str, tag: str) -> None:
+    """Refuse packages of `version` for the release `tag`: tip's tag
+    takes only a tip build, any other only the stable build it names
+    (v<version>), as a feed's packages read the feed of their own channel
+    (make_zip.channel)."""
     check_tag(tag)
+    built = make_zip.channel(version)
+    if tag == TIP_TAG:
+        if built != "tip":
+            raise Error(f"{version} is a {built} build, not for {tag}")
+    elif built != "stable":
+        raise Error(f"{version} is a {built} build, not for {tag}")
+    elif tag != f"v{version}":
+        raise Error(f"a release of {version} is tagged v{version}, not {tag}")
+
+
+def feed(packages: list[Package], tag: str) -> dict:
+    check_release(packages[0].version, tag)
     return {
         "version": packages[0].version,
         "notes": f"{RELEASES}tag/{tag}",

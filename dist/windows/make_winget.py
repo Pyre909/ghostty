@@ -67,9 +67,9 @@ def product_code(tools: dict[str, str], msi: Path) -> str:
 
 def manifests(packages: list[make_feed.Package], tag: str, codes: dict[str, str]) -> dict[str, str]:
     """Each manifest's text by its file name."""
-    make_feed.check_tag(tag)
     if tag == make_feed.TIP_TAG:
         raise Error("tip's packages are replaced in place, so are not for winget")
+    make_feed.check_release(packages[0].version, tag)
     version = packages[0].version
     head = [("PackageIdentifier", IDENTIFIER), ("PackageVersion", version)]
     installers = "Installers:\n"

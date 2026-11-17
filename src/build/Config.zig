@@ -39,6 +39,8 @@ wasm_shared: bool = true,
 exe_entrypoint: ExeEntrypoint = .ghostty,
 version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
+/// Null: by `version`, as `addOptions` decides it.
+release_channel: ?ReleaseChannel = null,
 
 /// The absolute path the Ghostty executable is installed at, for the Linux
 /// desktop, D-Bus and systemd files that launch it. Null means they name
@@ -391,6 +393,15 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
             .build = vsn.short_hash,
         };
     };
+
+    // A release whose version has a pre-release of its own that is not
+    // tip's (a packager's respin, 1.4.1-win.3) names its channel.
+    config.release_channel = b.option(
+        ReleaseChannel,
+        "release-channel",
+        "The release channel the build updates from. If not specified, " ++
+            "a version with a pre-release is tip's, any other stable's.",
+    );
 
     // libghostty-vt properties
 
@@ -894,7 +905,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(
         ReleaseChannel,
         "release_channel",
-        channel: {
+        self.release_channel orelse channel: {
             const pre = self.version.pre orelse break :channel .stable;
             if (pre.len == 0) break :channel .stable;
             break :channel .tip;

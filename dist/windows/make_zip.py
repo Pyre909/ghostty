@@ -137,6 +137,36 @@ SEMVER = re.compile(
     re.ASCII,
 )
 
+# A stable release's version: upstream's, or the Windows packaging's own
+# respin of it (1.4.1-win.3). Any other pre-release is tip's. The build
+# would take any pre-release for tip's, so it is told (-Drelease-channel).
+STABLE = re.compile(
+    r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-win\.(?:0|[1-9]\d*))?"
+    r"(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?",
+    re.ASCII,
+)
+
+
+def channel(version: str) -> str:
+    """The release channel of a build of `version`: the feed it reads."""
+    return "stable" if STABLE.fullmatch(version) else "tip"
+
+
+def build_flags(arch: str, version: str) -> list[str]:
+    """zig build's flags for the app of `version` on `arch`."""
+    return [
+        "-Dapp-runtime=windows",
+        f"-Dtarget={arch}-windows-gnu",
+        "-Doptimize=ReleaseFast",
+        "-Dstrip=false",
+        # Its default looks for pandoc on the build host, which would
+        # make what the zip holds depend on the host.
+        "-Demit-docs=false",
+        f"-Dversion-string={version}",
+        f"-Drelease-channel={channel(version)}",
+    ]
+
+
 LICENSE_FILE = re.compile(
     r"^(licen[cs]e|copying|notice|unlicense|ofl)(-[a-z0-9]+)?(\.(txt|md|rst))?$",
     re.ASCII | re.IGNORECASE,
@@ -799,16 +829,7 @@ def make(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=out, prefix=".stage-") as tmp:
         stage = Path(tmp)
-        flags = [
-            "-Dapp-runtime=windows",
-            f"-Dtarget={args.arch}-windows-gnu",
-            "-Doptimize=ReleaseFast",
-            "-Dstrip=false",
-            # Its default looks for pandoc on the build host, which would
-            # make what the zip holds depend on the host.
-            "-Demit-docs=false",
-            f"-Dversion-string={args.version}",
-        ]
+        flags = build_flags(args.arch, args.version)
         # Only this build reads every package's build.zig.zon.
         report = ["windows-packages", "-Demit-windows-packages"]
         zig_build(zig, [*report, *flags], stage / "report")
