@@ -3392,7 +3392,16 @@ pub const App = struct {
     /// if there is something to tell (`Updater.Result.tells`,
     /// `Updater.report`): `job` is then the queue's.
     pub fn tellUpdate(self: *App, job: *Updater.Job) void {
-        if (!job.result.tells(job.manual)) return Updater.release(job);
+        if (!job.result.tells(job.manual)) {
+            // An automatic check's failure is not shown, but a feed left
+            // to expire, or a clock set ahead, stops every automatic
+            // update: the log is where that shows.
+            switch (job.result) {
+                .failed => |err| log.warn("automatic update check failed err={}", .{err}),
+                else => {},
+            }
+            return Updater.release(job);
+        }
         self.requests.append(self.core_app.alloc, .{ .update = job }) catch |err| {
             log.warn("update check result not shown err={}", .{err});
             return Updater.release(job);
