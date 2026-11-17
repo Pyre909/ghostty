@@ -27,9 +27,10 @@ const windows = std.os.windows;
 
 /// The calling convention of every COM method and of D3DCompile: the
 /// platform convention on Windows (stdcall on x86, the C convention on
-/// x86_64 and aarch64). On other hosts only the layout tests analyze these
-/// types, and the Windows convention is not compilable there, so the C
-/// convention stands in; it never gets called.
+/// x86_64 and aarch64). On other hosts the Windows convention is not
+/// compilable, so the C convention stands in: the layout tests analyze
+/// these types there, and the ShaderCache tests call their fake compiler
+/// and blob through it.
 pub const cc: std.lang.CallingConvention = if (builtin.target.os.tag == .windows) .winapi else .c;
 
 pub const UINT = u32;
