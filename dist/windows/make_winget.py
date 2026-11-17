@@ -14,7 +14,11 @@ The packages are read as make_feed.py reads them: one per
 architecture, of one version, which their names give, each found at
 its URL among the release's assets. Each package's ProductCode, which
 winget matches against what is installed, is read from the package
-with msiinfo (msitools), as make_msi.py reads its packages.
+with msiinfo (msitools), as make_msi.py reads its packages. A fork
+release (-win.N) is listed among the installed apps by a version of four
+numbers (make_msi.product_version), which each installer maps to the
+manifest's version (AppsAndFeaturesEntries), as winget would otherwise
+read every such release as the 1.4.1 that it ranks above 1.4.1-win.N.
 
 The tip channel's packages are not for winget: a manifest is of one
 version, and tip's are replaced in place.
@@ -73,6 +77,7 @@ def manifests(
         raise Error("tip's packages are replaced in place, so are not for winget")
     make_feed.check_release(packages[0].version, tag)
     version = packages[0].version
+    listed = make_msi.product_version(version)
     head = [("PackageIdentifier", IDENTIFIER), ("PackageVersion", version)]
     installers = "Installers:\n"
     for p in packages:
@@ -82,6 +87,10 @@ def manifests(
             f"  InstallerSha256: {p.sha256.upper()}\n"
             f"  ProductCode: {quote(codes[p.arch])}\n"
         )
+        if listed != version:
+            installers += (
+                f"  AppsAndFeaturesEntries:\n  - DisplayVersion: {quote(listed)}\n"
+            )
     return {
         f"{IDENTIFIER}.yaml": document("version", head + [("DefaultLocale", LOCALE)]),
         f"{IDENTIFIER}.installer.yaml": document(

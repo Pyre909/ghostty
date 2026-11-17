@@ -354,7 +354,9 @@ class TestWinget(Temp):
             "- Architecture: x64\n"
             f"  InstallerUrl: '{url}'\n"
             f"  InstallerSha256: {mz.sha256(self.msi).upper()}\n"
-            f"  ProductCode: '{self.code}'\n",
+            f"  ProductCode: '{self.code}'\n"
+            "  AppsAndFeaturesEntries:\n"
+            "  - DisplayVersion: '1.4.1.3'\n",
             installer,
         )
         self.assertRegex(self.code, r"\A\{[0-9A-F-]{36}\}\Z")

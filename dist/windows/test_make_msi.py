@@ -342,12 +342,20 @@ class TestVersion(unittest.TestCase):
             ("1.4.1-rc.2+abc123", "1.4.1"),
             ("0.0.0", "0.0.0"),
             ("255.255.65535", "255.255.65535"),
+            # A fork release's number is the fourth; no other pre-release
+            # has one.
+            ("1.4.1-win.3", "1.4.1.3"),
+            ("1.4.1-win.0+abc", "1.4.1.0"),
+            ("255.255.65535-win.65535", "255.255.65535.65535"),
+            ("1.4.1-win.3.1", "1.4.1"),
+            ("1.4.1-winx.3", "1.4.1"),
+            ("1.4.1-rc.3", "1.4.1"),
         ]:
             with self.subTest(version):
                 self.assertEqual(mm.product_version(version), expected)
 
     def test_numbers_a_package_cannot_hold(self) -> None:
-        for version in ["256.0.0", "1.256.0", "1.0.65536"]:
+        for version in ["256.0.0", "1.256.0", "1.0.65536", "1.4.1-win.65536"]:
             with self.subTest(version), self.assertRaises(mm.Error) as e:
                 mm.product_version(version)
             self.assertIn("at most 255.255.65535", str(e.exception))

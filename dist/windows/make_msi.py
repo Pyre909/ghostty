@@ -38,8 +38,10 @@ The package:
     through an upgrade (see below) would go on without one;
 
     is listed among the installed apps as Ghostty, by Pyre909, with the
-    version's first three numbers, all a package's version can hold: a
-    pre-release such as 1.4.1-dev is listed as 1.4.1;
+    version's first three numbers, all a package's version compares by,
+    then a fork release's number: 1.4.1-win.3 is listed as 1.4.1.3, so
+    that each release is listed as its own, and any other pre-release,
+    such as 1.4.1-dev, as 1.4.1;
 
     replaces an installed Ghostty of the same or an older version (so a
     release replaces its pre-releases, and either architecture the other)
@@ -227,7 +229,13 @@ PLATFORMS = {"x86_64": "x64", "aarch64": "Arm64"}
 FOLDER = re.compile(r"ghostty-(?P<version>.+)-windows-(?P<arch>[a-z0-9_]+)", re.ASCII)
 
 # What a package's version can hold in its three numbers.
-VERSION_LIMITS = (255, 255, 65535)
+# The most each of a ProductVersion's fields holds. Windows Installer
+# compares versions by the first three only; the fourth is listed, and
+# AllowSameVersionUpgrades lets a release replace one differing only there.
+VERSION_LIMITS = (255, 255, 65535, 65535)
+# A fork release's pre-release (make_zip.STABLE), its number the fourth
+# field.
+FORK_RELEASE = re.compile(r"win\.(0|[1-9]\d*)", re.ASCII)
 
 # Names Windows keeps for devices, whatever their extension.
 DEVICES = frozenset(
@@ -355,10 +363,14 @@ def read_app(zf: zipfile.ZipFile) -> App:
 
 
 def product_version(version: str) -> str:
-    """A package's version of a semantic one: its first three numbers."""
+    """A package's version of a semantic one: its first three numbers,
+    then a fork release's number (-win.N), if it is one."""
     m = make_zip.SEMVER.fullmatch(version)
     assert m
     numbers = [int(m[i]) for i in (1, 2, 3)]
+    fork = FORK_RELEASE.fullmatch(m[4] or "")
+    if fork:
+        numbers.append(int(fork[1]))
     for n, limit in zip(numbers, VERSION_LIMITS):
         if n > limit:
             raise Error(
