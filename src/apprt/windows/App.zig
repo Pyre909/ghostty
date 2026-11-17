@@ -16905,12 +16905,14 @@ test "win32: an opaque frame's tab bar shows its Mica, but not under window-them
     try std.testing.expectEqual(0, window.mica_top);
 
     // A transparent frame: its backdrop is background-blur's, none of
-    // this.
+    // this, though its bar shows (else nothing would be asked anyway).
+    app.config.@"window-show-tab-bar" = .always;
     const clear = try testFrameOf(&app, true);
     const pane = try testPane(&app, clear);
     clear.tab().tree = try .init(alloc, pane);
     clear.relayout();
     clear.applyTheme();
+    try std.testing.expect(clear.bar.hwnd != null);
     try std.testing.expectEqual(1, TestClear.backdrop_count);
     try std.testing.expect(clear.backdrop == .default);
     try std.testing.expectEqual(0, clear.mica_top);
@@ -16921,6 +16923,7 @@ test "win32: an opaque frame's tab bar shows its Mica, but not under window-them
     const p = try testPane(&app, old);
     old.tab().tree = try .init(alloc, p);
     old.relayout();
+    try std.testing.expect(old.bar.hwnd != null);
     try std.testing.expectEqual(1, TestClear.backdrop_count);
     try std.testing.expect(old.backdrop == .default);
 }
