@@ -16943,8 +16943,10 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
         var caption: win32.COLORREF = 0;
         var text: win32.COLORREF = 0;
         var calls: u32 = 0;
+        var refuse = false;
         fn set(_: win32.HWND, a: win32.DWORD, value: win32.COLORREF) bool {
             calls += 1;
+            if (refuse) return false;
             switch (a) {
                 win32.DWMWA_CAPTION_COLOR => caption = value,
                 win32.DWMWA_TEXT_COLOR => text = value,
@@ -16985,6 +16987,13 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     changed.@"window-theme" = .ghostty;
     changed.background = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
     changed.foreground = .{ .r = 0xF0, .g = 0xE0, .b = 0xD0 };
+    // DWM refused them: the frame keeps the system's colours, and the next
+    // change asks again.
+    attr.refuse = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(window.frame_colors == null);
+    try std.testing.expectEqual(0, try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    attr.refuse = false;
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
     try std.testing.expectEqual(win32.rgb(0xF0, 0xE0, 0xD0), try attr.get(window.hwnd, win32.DWMWA_TEXT_COLOR));
@@ -16996,6 +17005,13 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     // active again, as configured. Through the frame's own message, as
     // DefWindowProcW draws the caption from it. The mode stays.
     _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 1, 0);
+    try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    // The command palette, as it is activated, keeps the caption active,
+    // as a menu does.
+    window.palette.activating = true;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 0, 0);
+    window.palette.activating = false;
+    try std.testing.expect(window.caption_active);
     try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
     _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 0, 0);
     const dim = (@import("FrameColors.zig"){
