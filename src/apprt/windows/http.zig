@@ -234,136 +234,13 @@ fn failed(comptime what: []const u8) error{RequestFailed} {
     return error.RequestFailed;
 }
 
-/// For tests, here and the updater's: an HTTP/1.1 server on a loopback port that answers each
-/// request by its path from `routes`, one connection at a time, until
-/// `stop`.
-pub const TestServer = struct {
-    const SOCKET = usize;
-    const invalid: SOCKET = std.math.maxInt(usize);
-    const SockaddrIn = extern struct {
-        family: u16 = 2, // AF_INET
-        port: u16 = 0,
-        addr: u32 = 0x0100007f, // 127.0.0.1, network order
-        zero: [8]u8 = @splat(0),
-    };
-    const ws = struct {
-        extern "ws2_32" fn WSAStartup(version: u16, data: *[512]u8) callconv(.winapi) c_int;
-        extern "ws2_32" fn socket(af: c_int, kind: c_int, protocol: c_int) callconv(.winapi) SOCKET;
-        extern "ws2_32" fn bind(s: SOCKET, addr: *const SockaddrIn, len: c_int) callconv(.winapi) c_int;
-        extern "ws2_32" fn listen(s: SOCKET, backlog: c_int) callconv(.winapi) c_int;
-        extern "ws2_32" fn getsockname(s: SOCKET, addr: *SockaddrIn, len: *c_int) callconv(.winapi) c_int;
-        extern "ws2_32" fn accept(s: SOCKET, addr: ?*SockaddrIn, len: ?*c_int) callconv(.winapi) SOCKET;
-        extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
-        extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
-        extern "ws2_32" fn shutdown(s: SOCKET, how: c_int) callconv(.winapi) c_int;
-        extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
-        extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
-    };
-
-    pub const Route = struct { path: []const u8, response: []const u8 };
-
-    listener: SOCKET,
-    port: u16,
-    routes: []const Route,
-    thread: std.Thread,
-    requests: std.atomic.Value(usize) = .init(0),
-
-    pub fn start(self: *TestServer, routes: []const Route) !void {
-        var data: [512]u8 align(8) = undefined;
-        if (ws.WSAStartup(0x0202, &data) != 0) return error.WSAStartup;
-        const s = ws.socket(2, 1, 6); // AF_INET, SOCK_STREAM, IPPROTO_TCP
-        if (s == invalid) return error.Socket;
-        errdefer _ = ws.closesocket(s);
-        var addr: SockaddrIn = .{};
-        if (ws.bind(s, &addr, @sizeOf(SockaddrIn)) != 0) return error.Bind;
-        if (ws.listen(s, 4) != 0) return error.Listen;
-        var len: c_int = @sizeOf(SockaddrIn);
-        if (ws.getsockname(s, &addr, &len) != 0) return error.Name;
-        self.* = .{
-            .listener = s,
-            .port = std.mem.bigToNative(u16, addr.port),
-            .routes = routes,
-            .thread = undefined,
-        };
-        self.thread = try std.Thread.spawn(.{}, serve, .{self});
-    }
-
-    /// Close the listener, which ends the pending accept, and wait.
-    pub fn stop(self: *TestServer) void {
-        _ = ws.closesocket(self.listener);
-        self.thread.join();
-        _ = ws.WSACleanup();
-    }
-
-    fn serve(self: *TestServer) void {
-        while (true) {
-            const c = ws.accept(self.listener, null, null);
-            if (c == invalid) return;
-            defer _ = ws.closesocket(c);
-            var buf: [4096]u8 = undefined;
-            var n: usize = 0;
-            while (std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") == null and n < buf.len) {
-                const got = ws.recv(c, buf[n..].ptr, @intCast(buf.len - n), 0);
-                if (got <= 0) break;
-                n += @intCast(got);
-            }
-            _ = self.requests.fetchAdd(1, .monotonic);
-            const line_end = std.mem.indexOf(u8, buf[0..n], "\r\n") orelse n;
-            var words = std.mem.splitScalar(u8, buf[0..line_end], ' ');
-            _ = words.next();
-            const path = words.next() orelse "";
-            const response = for (self.routes) |r| {
-                if (std.mem.eql(u8, r.path, path)) break r.response;
-            } else "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            var sent: usize = 0;
-            while (sent < response.len) {
-                const put = ws.send(c, response[sent..].ptr, @intCast(response.len - sent), 0);
-                if (put <= 0) break;
-                sent += @intCast(put);
-            }
-            _ = ws.shutdown(c, 1); // SD_SEND
-        }
-    }
-
-    pub fn url(self: *const TestServer, buf: []u8, path: []const u8) []const u8 {
-        return std.fmt.bufPrint(buf, "http://127.0.0.1:{}{s}", .{ self.port, path }) catch unreachable;
-    }
-};
-
-pub fn okResponse(comptime body: []const u8) []const u8 {
-    return std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{body.len}) ++ body;
-}
+const testing = @import("http_testing.zig");
+const TestServer = testing.TestServer;
+const okResponse = testing.okResponse;
 
 const update_body = "the update's bytes";
 /// "0123456789" ten times.
-const hundred_bytes: [100]u8 = blk: {
-    var b: [100]u8 = undefined;
-    for (&b, 0..) |*c, i| c.* = '0' + @as(u8, @intCast(i % 10));
-    break :blk b;
-};
-
-/// A temporary file's path, the caller's to free.
-pub fn testPath(alloc: Allocator, name: []const u8) ![:0]u16 {
-    var dir: [win32.MAX_PATH + 1]u16 = undefined;
-    const n = win32.GetTempPathW(dir.len, @ptrCast(&dir));
-    if (n == 0 or n >= dir.len) return error.TempPath;
-    const prefix = try std.unicode.utf16LeToUtf8Alloc(alloc, dir[0..n]);
-    defer alloc.free(prefix);
-    const full = try std.fmt.allocPrint(alloc, "{s}ghostty-http-{}-{s}", .{ prefix, std.os.windows.GetCurrentProcessId(), name });
-    defer alloc.free(full);
-    return std.unicode.utf8ToUtf16LeAllocZ(alloc, full);
-}
-
-/// The contents of `path`, or null if there is no such file.
-pub fn testRead(alloc: Allocator, path: [:0]const u16) !?[]u8 {
-    const file = win32.CreateFileW(path, win32.GENERIC_READ, win32.FILE_SHARE_READ, null, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, null);
-    if (file == win32.INVALID_HANDLE_VALUE) return null;
-    defer _ = win32.CloseHandle(file);
-    var buf: [4096]u8 = undefined;
-    var got: win32.DWORD = 0;
-    if (!win32.ReadFile(file, &buf, buf.len, &got, null).toBool()) return error.Read;
-    return try alloc.dupe(u8, buf[0..got]);
-}
+const hundred_bytes: [100]u8 = @bitCast(@as([10][10]u8, @splat("0123456789".*)));
 
 test "win32: an HTTP GET returns the body, follows a redirect and refuses others" {
     const alloc = std.testing.allocator;
@@ -418,29 +295,29 @@ test "win32: an HTTP download is saved when its hash is the feed's, and removed 
     const session: Session = try .open(.{ .https_only = false, .system_proxy = false });
     defer session.close();
     var buf: [128]u8 = undefined;
-    const path = try testPath(alloc, "update.msi");
+    const path = try testing.tempPath(alloc, "update.msi");
     defer alloc.free(path);
     defer _ = win32.DeleteFileW(path);
 
     var sha: [32]u8 = undefined;
     Sha256.hash(update_body, &sha, .{});
     try session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, sha);
-    const saved = (try testRead(alloc, path)).?;
+    const saved = (try testing.read(alloc, path)).?;
     defer alloc.free(saved);
     try std.testing.expectEqualStrings(update_body, saved);
 
     // Not found: the earlier file is gone, none saved in its place.
     try std.testing.expectError(error.HttpStatus, session.download(alloc, server.url(&buf, "/nothing.msi"), path, 1024, sha));
-    try std.testing.expect(try testRead(alloc, path) == null);
+    try std.testing.expect(try testing.read(alloc, path) == null);
 
     // Another hash: refused, and the earlier file is gone too.
     try session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, sha);
     var wrong = sha;
     wrong[0] ^= 1;
     try std.testing.expectError(error.HashMismatch, session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, wrong));
-    try std.testing.expect(try testRead(alloc, path) == null);
+    try std.testing.expect(try testing.read(alloc, path) == null);
 
     // Too large: no file either.
     try std.testing.expectError(error.TooLarge, session.download(alloc, server.url(&buf, "/update.msi"), path, update_body.len - 1, sha));
-    try std.testing.expect(try testRead(alloc, path) == null);
+    try std.testing.expect(try testing.read(alloc, path) == null);
 }

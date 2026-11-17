@@ -34,7 +34,7 @@ const IpcClient = @import("IpcClient.zig");
 const jumplist = @import("jumplist.zig");
 const About = @import("About.zig");
 const Updater = @import("Updater.zig");
-const http = @import("http.zig");
+const http_testing = @import("http_testing.zig");
 const build_config = @import("../../build_config.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
@@ -17281,12 +17281,12 @@ const TestUpdate = struct {
 
     /// The feed's response: `version`, its package at `package` on
     /// `server` for both architectures, of SHA-256 `sha256`.
-    fn feed(buf: []u8, server: *const http.TestServer, version: []const u8, package: []const u8, sha256: [32]u8) []const u8 {
+    fn feed(buf: []u8, server: *const http_testing.TestServer, version: []const u8, package: []const u8, sha256: [32]u8) []const u8 {
         return feedWithNotes(buf, server, version, package, sha256, "");
     }
 
     /// As `feed`, with release notes at `notes` on `server`, unless empty.
-    fn feedWithNotes(buf: []u8, server: *const http.TestServer, version: []const u8, package: []const u8, sha256: [32]u8, notes: []const u8) []const u8 {
+    fn feedWithNotes(buf: []u8, server: *const http_testing.TestServer, version: []const u8, package: []const u8, sha256: [32]u8, notes: []const u8) []const u8 {
         var notes_buf: [128]u8 = undefined;
         const notes_field = if (notes.len == 0) "" else std.fmt.bufPrint(&notes_buf, "\"notes\":\"http://127.0.0.1:{d}{s}\",", .{ server.port, notes }) catch unreachable;
         var body_buf: [768]u8 = undefined;
@@ -17323,10 +17323,10 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     var sha256: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(package, &sha256, .{});
     const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    var server: http.TestServer = undefined;
-    var routes = [_]http.TestServer.Route{
+    var server: http_testing.TestServer = undefined;
+    var routes = [_]http_testing.TestServer.Route{
         .{ .path = releases ++ "feed.json", .response = not_found },
-        .{ .path = package_path, .response = http.okResponse(package) },
+        .{ .path = package_path, .response = http_testing.okResponse(package) },
     };
     try server.start(&routes);
     defer server.stop();
@@ -17400,9 +17400,8 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
 
     // `download` saves the package, if its hash is the feed's, before
     // telling of it; one that is not is removed, and nothing told.
-    const saved = try http.testPath(alloc, "");
-    defer alloc.free(saved);
-    const dir = saved[0 .. std.mem.lastIndexOfScalar(u16, saved, '\\').? + 1];
+    const dir = try http_testing.tempDir(alloc);
+    defer alloc.free(dir);
     Updater.test_package_dir = dir;
     defer Updater.test_package_dir = null;
     const file = try std.mem.concatWithSentinel(alloc, u16, &.{ dir, std.unicode.utf8ToUtf16LeStringLiteral("ghostty-updater-test.msi") }, 0);
@@ -17413,12 +17412,12 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(5, TestUpdate.boxes);
-    try std.testing.expectEqual(null, try http.testRead(alloc, file));
+    try std.testing.expectEqual(null, try http_testing.read(alloc, file));
     routes[0].response = newer;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(6, TestUpdate.boxes);
-    const got = (try http.testRead(alloc, file)).?;
+    const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
 }
@@ -17518,10 +17517,10 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     const package = "the package's bytes";
     var sha256: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(package, &sha256, .{});
-    var server: http.TestServer = undefined;
-    var routes = [_]http.TestServer.Route{
+    var server: http_testing.TestServer = undefined;
+    var routes = [_]http_testing.TestServer.Route{
         .{ .path = releases ++ "feed.json", .response = "" },
-        .{ .path = package_path, .response = http.okResponse(package) },
+        .{ .path = package_path, .response = http_testing.okResponse(package) },
     };
     try server.start(&routes);
     defer server.stop();
@@ -17540,9 +17539,8 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     const notes_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, notes);
     defer alloc.free(notes_wide);
 
-    const saved = try http.testPath(alloc, "");
-    defer alloc.free(saved);
-    const dir = saved[0 .. std.mem.lastIndexOfScalar(u16, saved, '\\').? + 1];
+    const dir = try http_testing.tempDir(alloc);
+    defer alloc.free(dir);
     Updater.test_package_dir = dir;
     defer Updater.test_package_dir = null;
     const file = try std.mem.concatWithSentinel(alloc, u16, &.{ dir, W("ghostty-updater-test.msi") }, 0);
@@ -17584,7 +17582,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(1, TestOffer.installs);
     try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
-    const got = (try http.testRead(alloc, file)).?;
+    const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
     try std.testing.expectEqual(1, TestUpdate.boxes);
