@@ -1932,9 +1932,67 @@ pub const GetTempPathW = internal_os.windows.exp.kernel32.GetTempPathW;
 pub const GENERIC_READ: DWORD = internal_os.windows.GENERIC_READ;
 pub const GENERIC_WRITE: DWORD = internal_os.windows.GENERIC_WRITE;
 pub const FILE_SHARE_READ: DWORD = internal_os.windows.FILE_SHARE_READ;
+pub const FILE_SHARE_WRITE: DWORD = 0x00000002;
 pub const FILE_ATTRIBUTE_NORMAL: DWORD = internal_os.windows.FILE_ATTRIBUTE_NORMAL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew
 pub const CREATE_ALWAYS: DWORD = 2;
+pub const FILE_SHARE_DELETE: DWORD = 0x00000004;
+pub const FILE_ATTRIBUTE_DIRECTORY: DWORD = 0x00000010;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: DWORD = 0x00000400;
+pub const FILE_FLAG_OPEN_REPARSE_POINT: DWORD = 0x00200000;
+pub const FILE_FLAG_SEQUENTIAL_SCAN: DWORD = 0x08000000;
+
+// Files and directories, for the updater's packages (Updater.zig, http.zig).
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+pub extern "kernel32" fn MoveFileExW(existing: LPCWSTR, new: ?LPCWSTR, flags: DWORD) callconv(.winapi) BOOL;
+pub const MOVEFILE_REPLACE_EXISTING: DWORD = 0x00000001;
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw
+pub extern "kernel32" fn CreateDirectoryW(path: LPCWSTR, attributes: ?*SECURITY_ATTRIBUTES) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-removedirectoryw
+pub extern "kernel32" fn RemoveDirectoryW(path: LPCWSTR) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle
+pub extern "kernel32" fn GetFileInformationByHandle(file: HANDLE, info: *BY_HANDLE_FILE_INFORMATION) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information
+pub const BY_HANDLE_FILE_INFORMATION = extern struct {
+    dwFileAttributes: DWORD,
+    ftCreationTime: w.FILETIME,
+    ftLastAccessTime: w.FILETIME,
+    ftLastWriteTime: w.FILETIME,
+    dwVolumeSerialNumber: DWORD,
+    nFileSizeHigh: DWORD,
+    nFileSizeLow: DWORD,
+    nNumberOfLinks: DWORD,
+    nFileIndexHigh: DWORD,
+    nFileIndexLow: DWORD,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilew
+pub extern "kernel32" fn FindFirstFileW(pattern: LPCWSTR, data: *WIN32_FIND_DATAW) callconv(.winapi) HANDLE;
+pub extern "kernel32" fn FindNextFileW(find: HANDLE, data: *WIN32_FIND_DATAW) callconv(.winapi) BOOL;
+pub extern "kernel32" fn FindClose(find: HANDLE) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-win32_find_dataw
+pub const WIN32_FIND_DATAW = extern struct {
+    dwFileAttributes: DWORD,
+    ftCreationTime: w.FILETIME,
+    ftLastAccessTime: w.FILETIME,
+    ftLastWriteTime: w.FILETIME,
+    nFileSizeHigh: DWORD,
+    nFileSizeLow: DWORD,
+    dwReserved0: DWORD,
+    dwReserved1: DWORD,
+    cFileName: [MAX_PATH]WCHAR,
+    cAlternateFileName: [14]WCHAR,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
+/// The path is the caller's to free with CoTaskMemFree.
+pub extern "shell32" fn SHGetKnownFolderPath(
+    id: *const w.GUID,
+    flags: DWORD,
+    token: ?HANDLE,
+    path: *?[*:0]u16,
+) callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
+pub const FOLDERID_LocalAppData: w.GUID = w.GUID.parse("{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}");
 /// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
 pub const PIPE_ACCESS_DUPLEX: DWORD = 0x00000003;
 pub const PIPE_TYPE_BYTE: DWORD = 0x00000000;

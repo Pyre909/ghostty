@@ -166,39 +166,37 @@ pub const Job = struct {
     fn check(job: *Job) !Result {
         const arena = job.arena.allocator();
         const arch = update_feed.Arch.native() orelse return error.NoPackage;
-        const session = try http.Session.open(.{
-            .https_only = job.source.https_only,
-            .system_proxy = job.source.system_proxy,
-        });
+        const session = try job.openSession();
         defer session.close();
         const body = try session.get(arena, job.source.feed, max_feed);
         const found = try update_feed.parse(arena, body, build_config.version_string, arch, job.source.releases) orelse
             return .current;
         const dir = job.dir orelse return .{ .update = .{ .found = found, .path = null } };
-        // The package's own name, already checked to be a plain one.
-        const name = std.fs.path.basenamePosix(found.url);
-        const wide_name = try std.unicode.utf8ToUtf16LeAlloc(arena, name);
-        const path = try std.mem.concatWithSentinel(arena, u16, &.{ dir, wide_name }, 0);
-        try session.download(arena, found.url, path, max_package, found.sha256);
+        const path = try packagePath(arena, dir, found.url);
+        prune(arena, dir, path);
+        // One saved by an earlier check of this release is kept, if it
+        // is still the package.
+        const file = http.openVerified(path, max_package, found.sha256) orelse
+            try downloadVerified(arena, session, found.url, path, found.sha256);
+        _ = win32.CloseHandle(file);
         return .{ .update = .{ .found = found, .path = path } };
     }
 
     fn installPackage(job: *Job, install: Install) !Result {
-        const path = install.path orelse path: {
-            const dir = job.dir orelse return error.NoPackageDir;
-            const session = try http.Session.open(.{
-                .https_only = job.source.https_only,
-                .system_proxy = job.source.system_proxy,
-            });
+        const arena = job.arena.allocator();
+        const dir = job.dir orelse return error.NoPackageDir;
+        const path = install.path orelse try packagePath(arena, dir, install.url);
+        // The package is checked again, as anything could have changed
+        // it since its check, and held open, read-only to everyone, until
+        // msiexec is done: what it installs is what was checked.
+        const file = http.openVerified(path, max_package, install.sha256) orelse file: {
+            const session = try job.openSession();
             defer session.close();
-            const arena = job.arena.allocator();
-            const name = std.fs.path.basenamePosix(install.url);
-            const wide_name = try std.unicode.utf8ToUtf16LeAlloc(arena, name);
-            const path = try std.mem.concatWithSentinel(arena, u16, &.{ dir, wide_name }, 0);
-            try session.download(arena, install.url, path, max_package, install.sha256);
-            break :path path;
+            prune(arena, dir, path);
+            break :file try downloadVerified(arena, session, install.url, path, install.sha256);
         };
-        return switch (try msiexec(job.arena.allocator(), path)) {
+        defer _ = win32.CloseHandle(file);
+        return switch (try msiexec(arena, path)) {
             // ERROR_SUCCESS, ERROR_SUCCESS_REBOOT_REQUIRED: a file in use
             // is replaced at the next start of Windows, which this
             // Ghostty, still running, does not need.
@@ -208,7 +206,71 @@ pub const Job = struct {
             else => |code| .{ .install_failed = code },
         };
     }
+
+    fn openSession(job: *const Job) http.Error!http.Session {
+        return http.Session.open(.{
+            .https_only = job.source.https_only,
+            .system_proxy = job.source.system_proxy,
+        });
+    }
 };
+
+/// Where the package at `url` is saved in `dir`: under its own name,
+/// which the feed's parser checked to be a plain one.
+fn packagePath(arena: Allocator, dir: []const u16, url: []const u8) ![:0]u16 {
+    const name = std.fs.path.basenamePosix(url);
+    const wide_name = try std.unicode.utf8ToUtf16LeAlloc(arena, name);
+    return std.mem.concatWithSentinel(arena, u16, &.{ dir, wide_name }, 0);
+}
+
+/// Download the package to `path`, and open it as `http.openVerified`
+/// does: it is checked once saved and again once opened.
+fn downloadVerified(
+    arena: Allocator,
+    session: http.Session,
+    url: []const u8,
+    path: [:0]const u16,
+    sha256: [32]u8,
+) !win32.HANDLE {
+    try session.download(arena, url, path, max_package, sha256);
+    return http.openVerified(path, max_package, sha256) orelse error.HashMismatch;
+}
+
+/// Delete the packages in `dir` other than `keep`, and the part files
+/// downloads left there: only the latest package is kept. One in use (a
+/// download of another Ghostty, a package msiexec reads) is left.
+fn prune(arena: Allocator, dir: []const u16, keep: [:0]const u16) void {
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    for ([_][]const u16{ W(package_glob), W("*" ++ http.part_suffix) }) |glob| {
+        const pattern = std.mem.concatWithSentinel(arena, u16, &.{ dir, glob }, 0) catch return;
+        var data: win32.WIN32_FIND_DATAW = undefined;
+        const find = win32.FindFirstFileW(pattern, &data);
+        if (find == win32.INVALID_HANDLE_VALUE) continue;
+        defer _ = win32.FindClose(find);
+        while (true) {
+            const name = std.mem.sliceTo(&data.cFileName, 0);
+            // A wildcard also matches a file's 8.3 short name ("*.msi"
+            // matches "a.msix" as A~1.MSI), so the name is checked again.
+            if (data.dwFileAttributes & win32.FILE_ATTRIBUTE_DIRECTORY == 0 and
+                (isPackageName(name) or std.mem.endsWith(u16, name, W(http.part_suffix))))
+            {
+                const path = std.mem.concatWithSentinel(arena, u16, &.{ dir, name }, 0) catch return;
+                if (!std.os.windows.eqlIgnoreCaseWtf16(path, keep)) _ = win32.DeleteFileW(path);
+            }
+            if (!win32.FindNextFileW(find, &data).toBool()) break;
+        }
+    }
+}
+
+/// The packages' names (dist/windows/make_msi.py): this, wildcards and all.
+const package_glob = "ghostty-*-windows-*.msi";
+
+fn isPackageName(name: []const u16) bool {
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    return std.mem.startsWith(u16, name, W("ghostty-")) and
+        std.mem.indexOf(u16, name, W("-windows-")) != null and
+        std.mem.endsWith(u16, name, W(".msi"));
+}
 
 /// Install the package at `path` as the user would from Explorer, with
 /// msiexec's progress window and no restart of Windows, and wait for it:
@@ -303,8 +365,9 @@ fn spawn(self: *Updater, manual: bool, install: ?Install) !void {
     errdefer if (!moved) arena.deinit();
     const a = arena.allocator();
     const job = try a.create(Job);
-    const download = self.mode == .download or (install != null and install.?.path == null);
-    const dir = if (download) try packageDir(a) else null;
+    // An install always has the directory, to prune and to download to
+    // again if its package changed.
+    const dir = if (self.mode == .download or install != null) try packageDir(a) else null;
     // The install's slices, the UI thread's, copied into the job's own.
     const owned: ?Install = if (install) |i| .{
         .version = try a.dupe(u8, i.version),
@@ -369,16 +432,29 @@ pub fn deinit(self: *Updater) void {
     self.running = null;
 }
 
+/// %LOCALAPPDATA%\ghostty\updates\, made if need be: the user's own,
+/// as the installed Ghostty is, and found from the known folder rather
+/// than the environment, which an inherited variable could point
+/// anywhere.
 fn packageDir(arena: Allocator) ![]const u16 {
     if (builtin.is_test) if (test_package_dir) |dir| return dir;
-    const io = global.io();
-    var environ_map = try global.environMap();
-    defer environ_map.deinit();
-    const path = try internal_os.xdg.cache(io, arena, &environ_map, .{ .subdir = "ghostty/updates" });
-    if (!std.fs.path.isAbsolute(path)) return error.CacheDirNotAbsolute;
-    try std.Io.Dir.cwd().createDirPath(io, path);
-    const wide = try std.unicode.utf8ToUtf16LeAlloc(arena, path);
-    return std.mem.concat(arena, u16, &.{ wide, &.{'\\'} });
+    var local: ?[*:0]u16 = null;
+    defer win32.CoTaskMemFree(local);
+    if (win32.SHGetKnownFolderPath(&win32.FOLDERID_LocalAppData, 0, null, &local) < 0)
+        return error.LocalAppData;
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const ghostty = try std.mem.concatWithSentinel(arena, u16, &.{ std.mem.span(local.?), W("\\ghostty") }, 0);
+    try makeDir(ghostty);
+    const updates = try std.mem.concatWithSentinel(arena, u16, &.{ ghostty, W("\\updates") }, 0);
+    try makeDir(updates);
+    return std.mem.concat(arena, u16, &.{ updates, W("\\") });
+}
+
+fn makeDir(path: [:0]const u16) !void {
+    if (win32.CreateDirectoryW(path, null).toBool()) return;
+    if (win32.GetLastError() == .ALREADY_EXISTS) return;
+    log.warn("update directory not made err={}", .{win32.GetLastError()});
+    return error.PackageDir;
 }
 
 /// Tell the user what `job` found, which the app queued only if there is

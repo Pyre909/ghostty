@@ -82,9 +82,13 @@ pub const Session = struct {
         return body.toOwnedSlice(alloc);
     }
 
-    /// Save the body at `url` to `path`, at most `max` bytes, and check
-    /// that its SHA-256 is `sha256`. Any file at `path` is replaced; on
-    /// any failure none is left there.
+    /// Save the body at `url` to `path`, at most `max` bytes, once its
+    /// SHA-256 is `sha256`. The body is written to a file of this
+    /// thread's own beside `path` (`partPath`), which replaces `path` only
+    /// once verified: a failed download leaves whatever `path` held, and
+    /// another process downloading the same package writes a file of its
+    /// own. One cut off at exit is left as a part file, which no reader
+    /// of `path` sees.
     pub fn download(
         self: Session,
         alloc: Allocator,
@@ -93,12 +97,13 @@ pub const Session = struct {
         max: usize,
         sha256: [32]u8,
     ) Error!void {
-        _ = win32.DeleteFileW(path);
         var response = try self.request(alloc, url);
         defer response.close();
 
+        const part = try partPath(alloc, path);
+        defer alloc.free(part);
         const file = win32.CreateFileW(
-            path,
+            part,
             win32.GENERIC_WRITE,
             0,
             null,
@@ -113,9 +118,15 @@ pub const Session = struct {
         const saved = save(&response, file, max, sha256);
         _ = win32.CloseHandle(file);
         saved catch |err| {
-            _ = win32.DeleteFileW(path);
+            _ = win32.DeleteFileW(part);
             return err;
         };
+        if (!win32.MoveFileExW(part, path, win32.MOVEFILE_REPLACE_EXISTING).toBool()) {
+            // `path` held open by another (msiexec reading it): keep it.
+            log.warn("update download: MoveFileExW failed err={}", .{win32.GetLastError()});
+            _ = win32.DeleteFileW(part);
+            return error.WriteFailed;
+        }
     }
 
     /// Write the body to `file`, then check its hash.
@@ -141,6 +152,19 @@ pub const Session = struct {
             log.warn("update download: SHA-256 {x} is not the feed's {x}", .{ &got, &sha256 });
             return error.HashMismatch;
         }
+    }
+
+    /// `path`, then ".<process>-<thread>.part": a name no other download
+    /// uses while this one runs, and which ends in `part_suffix`.
+    fn partPath(alloc: Allocator, path: [:0]const u16) Error![:0]u16 {
+        var buf: [48]u8 = undefined;
+        const suffix = std.fmt.bufPrint(&buf, ".{}-{}" ++ part_suffix, .{
+            std.os.windows.GetCurrentProcessId(),
+            std.Thread.getCurrentId(),
+        }) catch unreachable;
+        const wide = std.unicode.utf8ToUtf16LeAlloc(alloc, suffix) catch return error.OutOfMemory;
+        defer alloc.free(wide);
+        return std.mem.concatWithSentinel(alloc, u16, &.{ path, wide }, 0);
     }
 
     /// Send a GET for `url` and wait for its response's headers.
@@ -203,6 +227,50 @@ pub const Session = struct {
         return .{ .connect = connect, .request = req };
     }
 };
+
+/// What a download's part file's name ends in.
+pub const part_suffix = ".part";
+
+/// `path` opened for reading if it is a regular file (not a directory,
+/// nor a reparse point, which could lead elsewhere) of at most `max`
+/// bytes whose SHA-256 is `sha256`, else null; the caller closes it. The
+/// handle shares only reading, so while it is open no process can change,
+/// replace or delete the file: what was checked is what a reader of
+/// `path` gets.
+pub fn openVerified(path: [:0]const u16, max: usize, sha256: [32]u8) ?win32.HANDLE {
+    const file = win32.CreateFileW(
+        path,
+        win32.GENERIC_READ,
+        win32.FILE_SHARE_READ,
+        null,
+        win32.OPEN_EXISTING,
+        win32.FILE_FLAG_OPEN_REPARSE_POINT | win32.FILE_FLAG_SEQUENTIAL_SCAN,
+        null,
+    );
+    if (file == win32.INVALID_HANDLE_VALUE) return null;
+    if (verify(file, max, sha256)) return file;
+    _ = win32.CloseHandle(file);
+    return null;
+}
+
+fn verify(file: win32.HANDLE, max: usize, sha256: [32]u8) bool {
+    var info: win32.BY_HANDLE_FILE_INFORMATION = undefined;
+    if (!win32.GetFileInformationByHandle(file, &info).toBool()) return false;
+    if (info.dwFileAttributes & (win32.FILE_ATTRIBUTE_DIRECTORY | win32.FILE_ATTRIBUTE_REPARSE_POINT) != 0) return false;
+    const size = (@as(u64, info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    if (size > max) return false;
+    var hash: Sha256 = .init(.{});
+    var buf: [64 * 1024]u8 = undefined;
+    while (true) {
+        var got: win32.DWORD = 0;
+        if (!win32.ReadFile(file, &buf, buf.len, &got, null).toBool()) return false;
+        if (got == 0) break;
+        hash.update(buf[0..got]);
+    }
+    var got: [32]u8 = undefined;
+    hash.final(&got);
+    return std.mem.eql(u8, &got, &sha256);
+}
 
 const Response = struct {
     connect: win32.HINTERNET,
@@ -306,18 +374,27 @@ test "win32: an HTTP download is saved when its hash is the feed's, and removed 
     defer alloc.free(saved);
     try std.testing.expectEqualStrings(update_body, saved);
 
-    // Not found: the earlier file is gone, none saved in its place.
-    try std.testing.expectError(error.HttpStatus, session.download(alloc, server.url(&buf, "/nothing.msi"), path, 1024, sha));
-    try std.testing.expect(try testing.read(alloc, path) == null);
-
-    // Another hash: refused, and the earlier file is gone too.
-    try session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, sha);
+    // Not found, another hash, too large: refused, and the file saved
+    // before is left as it was, with no part file beside it.
     var wrong = sha;
     wrong[0] ^= 1;
+    try std.testing.expectError(error.HttpStatus, session.download(alloc, server.url(&buf, "/nothing.msi"), path, 1024, sha));
     try std.testing.expectError(error.HashMismatch, session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, wrong));
-    try std.testing.expect(try testing.read(alloc, path) == null);
-
-    // Too large: no file either.
     try std.testing.expectError(error.TooLarge, session.download(alloc, server.url(&buf, "/update.msi"), path, update_body.len - 1, sha));
-    try std.testing.expect(try testing.read(alloc, path) == null);
+    const kept = (try testing.read(alloc, path)).?;
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings(update_body, kept);
+    try std.testing.expectEqual(0, try testing.countMatching(alloc, path, ".*" ++ part_suffix));
+
+    // Verified: the file of this hash, within the size; held open, it
+    // cannot be replaced, as another download would.
+    const held = openVerified(path, update_body.len, sha).?;
+    try std.testing.expectError(error.WriteFailed, session.download(alloc, server.url(&buf, "/update.msi"), path, 1024, sha));
+    _ = win32.CloseHandle(held);
+    try std.testing.expectEqual(0, try testing.countMatching(alloc, path, ".*" ++ part_suffix));
+    try std.testing.expectEqual(null, openVerified(path, update_body.len, wrong));
+    try std.testing.expectEqual(null, openVerified(path, update_body.len - 1, sha));
+    const missing = try testing.tempPath(alloc, "missing.msi");
+    defer alloc.free(missing);
+    try std.testing.expectEqual(null, openVerified(missing, 1024, sha));
 }

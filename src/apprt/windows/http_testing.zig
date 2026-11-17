@@ -119,6 +119,58 @@ pub fn tempDir(alloc: Allocator) ![]u16 {
     return alloc.dupe(u16, dir[0..n]);
 }
 
+/// A directory of a test's own in the temporary directory, made empty,
+/// and removed with its files by `deinit`: what the updater prunes there
+/// is only the test's.
+pub const TempDir = struct {
+    /// Ends in a separator, as the updater's package directory does.
+    path: []u16,
+
+    pub fn init(alloc: Allocator, name: []const u8) !TempDir {
+        const base = try tempPath(alloc, name);
+        defer alloc.free(base);
+        if (!win32.CreateDirectoryW(base, null).toBool() and win32.GetLastError() != .ALREADY_EXISTS)
+            return error.CreateDirectory;
+        const self: TempDir = .{ .path = try std.mem.concat(alloc, u16, &.{ base, &.{'\\'} }) };
+        self.empty(alloc);
+        return self;
+    }
+
+    pub fn deinit(self: TempDir, alloc: Allocator) void {
+        self.empty(alloc);
+        const dir = alloc.dupeSentinel(u16, self.path[0 .. self.path.len - 1], 0) catch return;
+        defer alloc.free(dir);
+        _ = win32.RemoveDirectoryW(dir);
+        alloc.free(self.path);
+    }
+
+    /// `name` in the directory, the caller's to free.
+    pub fn file(self: TempDir, alloc: Allocator, name: []const u8) ![:0]u16 {
+        const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, name);
+        defer alloc.free(wide);
+        return std.mem.concatWithSentinel(alloc, u16, &.{ self.path, wide }, 0);
+    }
+
+    fn empty(self: TempDir, alloc: Allocator) void {
+        const glob = std.mem.concatWithSentinel(alloc, u16, &.{ self.path, &.{'*'} }, 0) catch return;
+        defer alloc.free(glob);
+        var data: win32.WIN32_FIND_DATAW = undefined;
+        const find = win32.FindFirstFileW(glob, &data);
+        if (find == win32.INVALID_HANDLE_VALUE) return;
+        defer _ = win32.FindClose(find);
+        while (true) {
+            if (data.dwFileAttributes & win32.FILE_ATTRIBUTE_DIRECTORY == 0) {
+                const name = std.mem.sliceTo(&data.cFileName, 0);
+                if (std.mem.concatWithSentinel(alloc, u16, &.{ self.path, name }, 0)) |path| {
+                    _ = win32.DeleteFileW(path);
+                    alloc.free(path);
+                } else |_| {}
+            }
+            if (!win32.FindNextFileW(find, &data).toBool()) break;
+        }
+    }
+};
+
 /// A temporary file's path, the caller's to free.
 pub fn tempPath(alloc: Allocator, name: []const u8) ![:0]u16 {
     const dir = try tempDir(alloc);
@@ -145,6 +197,32 @@ pub fn read(alloc: Allocator, path: [:0]const u16) !?[]u8 {
         try out.appendSlice(alloc, buf[0..got]);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+/// How many files match `path` followed by `pattern`, a FindFirstFileW
+/// wildcard such as ".*.part".
+pub fn countMatching(alloc: Allocator, path: [:0]const u16, pattern: []const u8) !usize {
+    const wide = try std.unicode.utf8ToUtf16LeAlloc(alloc, pattern);
+    defer alloc.free(wide);
+    const glob = try std.mem.concatWithSentinel(alloc, u16, &.{ path, wide }, 0);
+    defer alloc.free(glob);
+    var data: win32.WIN32_FIND_DATAW = undefined;
+    const find = win32.FindFirstFileW(glob, &data);
+    if (find == win32.INVALID_HANDLE_VALUE) return 0;
+    defer _ = win32.FindClose(find);
+    var n: usize = 1;
+    while (win32.FindNextFileW(find, &data).toBool()) n += 1;
+    return n;
+}
+
+/// Whether `path` could be opened for writing now. Sharing everything,
+/// so that only the share modes of the handles open on it decide.
+pub fn writable(path: [:0]const u16) bool {
+    const share = win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE;
+    const file = win32.CreateFileW(path, win32.GENERIC_WRITE, share, null, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, null);
+    if (file == win32.INVALID_HANDLE_VALUE) return false;
+    _ = win32.CloseHandle(file);
+    return true;
 }
 
 /// Write `bytes` to `path`, replacing any file there.

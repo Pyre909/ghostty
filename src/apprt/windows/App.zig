@@ -17242,6 +17242,11 @@ test "win32: About Ghostty shows the dialog, and Ghostty Help opens the docs" {
 /// For tests: what an update check's report showed
 /// (`dialog.test_message_box`), and the check carried to its end.
 const TestUpdate = struct {
+    /// The update's package: named as the packages are, which the
+    /// updater prunes by.
+    const package_name = "ghostty-999.0.0-windows-x64.msi";
+    const package_bytes = "the package's bytes";
+
     var boxes: usize = 0;
     var buttons: win32.UINT = 0;
     /// What the box answers.
@@ -17319,8 +17324,8 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     defer Updater.test_post_failures.store(0, .monotonic);
 
     const releases = "/owner/repo/releases/";
-    const package_path = releases ++ "download/t/ghostty-updater-test.msi";
-    const package = "the package's bytes";
+    const package_path = releases ++ "download/t/" ++ TestUpdate.package_name;
+    const package = TestUpdate.package_bytes;
     var sha256: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(package, &sha256, .{});
     const not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -17421,27 +17426,53 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(null, app.updater.running);
 
     // `download` saves the package, if its hash is the feed's, before
-    // telling of it; one that is not is removed, and nothing told.
-    const dir = try http_testing.tempDir(alloc);
-    defer alloc.free(dir);
-    Updater.test_package_dir = dir;
+    // telling of it; one that is not is not kept, and nothing told.
+    const dir: http_testing.TempDir = try .init(alloc, "update-check");
+    defer dir.deinit(alloc);
+    Updater.test_package_dir = dir.path;
     defer Updater.test_package_dir = null;
-    const file = try std.mem.concatWithSentinel(alloc, u16, &.{ dir, std.unicode.utf8ToUtf16LeStringLiteral("ghostty-updater-test.msi") }, 0);
+    const file = try dir.file(alloc, TestUpdate.package_name);
     defer alloc.free(file);
-    defer _ = win32.DeleteFileW(file);
     app.updater.configure(.download);
     routes[0].response = bad_hash;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(7, TestUpdate.boxes);
     try std.testing.expectEqual(null, try http_testing.read(alloc, file));
+    try std.testing.expectEqual(0, try http_testing.countMatching(alloc, file, ".*.part"));
+
+    // Saving it prunes the packages saved before, and the part files of
+    // downloads cut off, but nothing else; a file in the package's place
+    // that is not the package is replaced.
+    const old = try dir.file(alloc, "ghostty-0.0.1-windows-x64.msi");
+    defer alloc.free(old);
+    const part = try dir.file(alloc, "ghostty-0.0.1-windows-x64.msi.12-34.part");
+    defer alloc.free(part);
+    const other = try dir.file(alloc, "ghostty-notes.txt");
+    defer alloc.free(other);
+    for ([_][:0]const u16{ old, part, other, file }) |path| try http_testing.write(path, "junk");
     routes[0].response = newer;
+    var requests = server.requests.load(.monotonic);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(8, TestUpdate.boxes);
+    try std.testing.expectEqual(requests + 2, server.requests.load(.monotonic));
     const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
+    try std.testing.expectEqual(null, try http_testing.read(alloc, old));
+    try std.testing.expectEqual(null, try http_testing.read(alloc, part));
+    const kept = (try http_testing.read(alloc, other)).?;
+    defer alloc.free(kept);
+    try std.testing.expectEqualStrings("junk", kept);
+
+    // A later check of the same release keeps the package it saved: only
+    // the feed is fetched.
+    requests = server.requests.load(.monotonic);
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(9, TestUpdate.boxes);
+    try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
 }
 
 /// For tests: the update offer's task dialog (`About.test_record`), and
@@ -17484,12 +17515,16 @@ const TestOffer = struct {
         @memcpy(content[0..content_len], c[0..content_len]);
         callback = config.pfCallback;
         data = config.lpCallbackData;
+        if (tamper) |path| http_testing.write(path, "tampered") catch {};
         // The link works while the dialog is open, and only then.
         if (link_to_click) |href| _ = callback.?(null, About.TDN_HYPERLINK_CLICKED, 0, @bitCast(@intFromPtr(href.ptr)), data);
         button.?.* = choose;
         return win32.S_OK;
     }
     var link_to_click: ?[:0]const u16 = null;
+    /// A file the fake dialog overwrites while it is open, as anything
+    /// could change the package between its check and its install.
+    var tamper: ?[:0]const u16 = null;
 
     fn says(comptime part: []const u8) bool {
         return std.mem.indexOf(u16, content[0..content_len], std.unicode.utf8ToUtf16LeStringLiteral(part)) != null;
@@ -17499,8 +17534,18 @@ const TestOffer = struct {
         installs += 1;
         installed_len = @min(path.len, installed.len);
         @memcpy(installed[0..installed_len], path[0..installed_len]);
+        // What msiexec would read is the package, and no one can change
+        // it while msiexec runs.
+        const alloc = std.heap.page_allocator;
+        package_read = if (http_testing.read(alloc, path) catch null) |got| read: {
+            defer alloc.free(got);
+            break :read std.mem.eql(u8, got, TestUpdate.package_bytes);
+        } else false;
+        package_writable = http_testing.writable(path);
         return exit_code;
     }
+    var package_read = false;
+    var package_writable = true;
 };
 
 test "win32: an offered update installs its package with msiexec, or opens its release page where Ghostty is not the package's" {
@@ -17535,8 +17580,8 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     defer TestOffer.link_to_click = null;
 
     const releases = "/owner/repo/releases/";
-    const package_path = releases ++ "download/t/ghostty-updater-test.msi";
-    const package = "the package's bytes";
+    const package_path = releases ++ "download/t/" ++ TestUpdate.package_name;
+    const package = TestUpdate.package_bytes;
     var sha256: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(package, &sha256, .{});
     var server: http_testing.TestServer = undefined;
@@ -17561,14 +17606,13 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     const notes_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, notes);
     defer alloc.free(notes_wide);
 
-    const dir = try http_testing.tempDir(alloc);
-    defer alloc.free(dir);
-    Updater.test_package_dir = dir;
+    const dir: http_testing.TempDir = try .init(alloc, "update-offer");
+    defer dir.deinit(alloc);
+    Updater.test_package_dir = dir.path;
     defer Updater.test_package_dir = null;
-    const file = try std.mem.concatWithSentinel(alloc, u16, &.{ dir, W("ghostty-updater-test.msi") }, 0);
+    const file = try dir.file(alloc, TestUpdate.package_name);
     defer alloc.free(file);
-    _ = win32.DeleteFileW(file);
-    defer _ = win32.DeleteFileW(file);
+    defer TestOffer.tamper = null;
 
     // The package's own Ghostty is offered Install, the default, and
     // Later; the release notes are a link, which opens them, and no other.
@@ -17604,6 +17648,8 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(1, TestOffer.installs);
     try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
+    try std.testing.expect(TestOffer.package_read);
+    try std.testing.expect(!TestOffer.package_writable);
     const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
@@ -17625,16 +17671,31 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqual(2, TestUpdate.boxes);
     TestOffer.exit_code = 0;
 
-    // A package `download` saved already is installed as it is.
+    // A package saved already, which a check finds still the package, is
+    // installed as it is: only the feed is fetched.
     app.updater.configure(.download);
-    const before = server.requests.load(.monotonic);
+    var before = server.requests.load(.monotonic);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(before + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(before + 1, server.requests.load(.monotonic));
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(before + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(before + 1, server.requests.load(.monotonic));
     try std.testing.expectEqual(4, TestOffer.installs);
     try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
+    try std.testing.expect(TestOffer.package_read);
+
+    // One changed while the offer is open is checked again before
+    // msiexec runs, and downloaded again.
+    TestOffer.tamper = file;
+    before = server.requests.load(.monotonic);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    TestOffer.tamper = null;
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(before + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(5, TestOffer.installs);
+    try std.testing.expect(TestOffer.package_read);
+    try std.testing.expect(!TestOffer.package_writable);
     app.updater.configure(.off);
 
     // A Ghostty that is not the package's (a zip, a build of one's own)
@@ -17648,7 +17709,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqualSlices(u16, W("Open Release Page"), TestOffer.labels[0]);
     try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
     try std.testing.expectEqual(null, app.updater.running);
-    try std.testing.expectEqual(4, TestOffer.installs);
+    try std.testing.expectEqual(5, TestOffer.installs);
 
     // Without a task dialog, a message box asks, and Yes installs.
     About.test_record.task_dialog = null;
@@ -17661,7 +17722,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expect(TestUpdate.buttons & win32.MB_YESNO != 0);
     try std.testing.expect(TestUpdate.says("Install it now?"));
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(5, TestOffer.installs);
+    try std.testing.expectEqual(6, TestOffer.installs);
 }
 
 test "win32: progress_report shows the focused terminal's progress on the taskbar button" {
