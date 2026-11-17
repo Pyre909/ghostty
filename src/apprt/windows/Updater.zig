@@ -47,13 +47,15 @@ pub const Source = struct {
     const repo_releases = "https://github.com/Pyre909/ghostty/releases/";
     const feed_name = "ghostty-windows-update.json";
 
-    /// The channel's feed: the latest release's for stable, the rolling
-    /// tip release's for tip.
+    /// The channel's feed, each at a rolling release of its own (not
+    /// GitHub's latest, which is whatever release was made last, of
+    /// anything the repository publishes); the packages it names are on
+    /// their own release's tag (dist/windows/make_feed.py).
     pub fn of(channel: build_config.ReleaseChannel) Source {
         return .{
             .releases = repo_releases,
             .feed = switch (channel) {
-                .stable => repo_releases ++ "latest/download/" ++ feed_name,
+                .stable => repo_releases ++ "download/stable-windows/" ++ feed_name,
                 .tip => repo_releases ++ "download/tip-windows/" ++ feed_name,
             },
         };

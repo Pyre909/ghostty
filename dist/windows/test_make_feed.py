@@ -121,6 +121,7 @@ class TestFeed(Temp):
             (["ghostty-1.4.1-win.3-windows-x86_64.msi"], mf.TIP_TAG, "1.4.1-win.3 is a stable build, not for tip-windows"),
             (["ghostty-1.5.0-tip.7-windows-x86_64.msi"], "v1.5.0-tip.7", "is a tip build"),
             (["ghostty-1.4.1-win.2-windows-x86_64.msi"], TAG, "tagged v1.4.1-win.2, not v1.4.1-win.3"),
+            (["ghostty-1.4.1-win.3-windows-x86_64.msi"], mf.STABLE_TAG, "holds only the feed"),
         ]
         for names, tag, says in cases:
             with self.subTest(names=names, tag=tag):
@@ -147,7 +148,7 @@ class TestRepository(unittest.TestCase):
         self.assertEqual(mf.RELEASES, releases)
         self.assertEqual(mf.FEED, name)
         self.assertIn(f'.tip => repo_releases ++ "download/{mf.TIP_TAG}/" ++ feed_name,', updater)
-        self.assertIn('.stable => repo_releases ++ "latest/download/" ++ feed_name,', updater)
+        self.assertIn(f'.stable => repo_releases ++ "download/{mf.STABLE_TAG}/" ++ feed_name,', updater)
 
     def test_accepts_what_ghostty_accepts(self) -> None:
         # `allowed`'s segment characters, as `ghostty_allows` and SEGMENT

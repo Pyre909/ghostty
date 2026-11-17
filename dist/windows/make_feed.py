@@ -7,11 +7,14 @@ which a running Ghostty fetches to learn of an update
         ghostty-1.4.1-win.3-windows-x86_64.msi ghostty-1.4.1-win.3-windows-aarch64.msi
 
 writes ghostty-windows-update.json beside the first package (or in
---out), to be published as an asset of the release `--tag` names, with
-the packages. The stable channel's feed is the latest release's
-(releases/latest/download/...), the tip channel's the release tagged
-tip-windows, so a tip build is published under that tag, replacing the
-assets it had.
+--out). Each channel's Ghostty reads the feed at a release of its own:
+stable's at the release tagged stable-windows, tip's at tip-windows. A
+stable release publishes its packages and the feed on its own tag
+(--tag), then replaces the feed on stable-windows with the same file;
+stable-windows holds nothing else, and is never marked the latest
+release (gh release create --latest=false), as the latest release is
+whatever was published last. A tip build is published under
+tip-windows, replacing the assets it had.
 
 The packages are those make_msi.py made, one per architecture, of one
 version, which their names give. The feed names each by its URL among
@@ -38,6 +41,7 @@ import make_zip
 RELEASES = make_msi.HOMEPAGE + "/releases/"
 FEED = "ghostty-windows-update.json"
 TIP_TAG = "tip-windows"
+STABLE_TAG = "stable-windows"
 
 PACKAGE = re.compile(r"ghostty-(?P<version>.+)-windows-(?P<arch>[a-z0-9_]+)\.msi", re.ASCII)
 
@@ -104,6 +108,8 @@ def check_release(version: str, tag: str) -> None:
     (v<version>), as a feed's packages read the feed of their own channel
     (make_zip.channel)."""
     check_tag(tag)
+    if tag == STABLE_TAG:
+        raise Error(f"{tag} holds only the feed: give the release's own tag")
     built = make_zip.channel(version)
     if tag == TIP_TAG:
         if built != "tip":
