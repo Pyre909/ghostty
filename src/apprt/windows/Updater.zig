@@ -67,6 +67,9 @@ pub const timer_id: win32.UINT_PTR = 4;
 const first_delay_ms = 10 * std.time.ms_per_s;
 const interval_ms = 24 * std.time.ms_per_hour;
 
+/// How long a job waits to post its result again after a post failed.
+const repost_ms = if (builtin.is_test) 10 else 1000;
+
 /// The feed is small; the cap only bounds a broken or hostile one.
 const max_feed = 1024 * 1024;
 const max_package = 512 * 1024 * 1024;
@@ -111,11 +114,15 @@ const Install = struct {
     path: ?[:0]const u16,
 };
 
-/// One check, owned by its thread until posted back, then by the UI
-/// thread. Everything it holds is in `arena`, so that a job posted when
-/// no window is left to take it can be dropped whole.
+/// One check, owned by the UI thread from `spawn` until it `release`s it
+/// or abandons it at exit (`deinit`); its thread only fills in `result`
+/// and posts it back. Everything it holds is in `arena`, so that an
+/// abandoned job can drop itself whole.
 pub const Job = struct {
     arena: std.heap.ArenaAllocator,
+    /// Set by the UI thread at exit, read by the job's thread when its post
+    /// fails: only then is the job its thread's to free.
+    state: std.atomic.Value(State) = .init(.owned),
     thread: std.Thread = undefined,
     hwnd: win32.HWND,
     msg: win32.UINT,
@@ -128,17 +135,32 @@ pub const Job = struct {
     install: ?Install = null,
     result: Result = .{ .failed = error.NotRun },
 
+    const State = enum(u8) { owned, abandoned };
+
     fn run(job: *Job) void {
         job.result = if (job.install) |install|
             job.installPackage(install) catch |err| .{ .failed = err }
         else
             job.check() catch |err| .{ .failed = err };
-        if (!win32.PostMessageW(job.hwnd, job.msg, 0, @bitCast(@intFromPtr(job))).toBool()) {
-            // No window to take it: the app is gone, and so is whoever
-            // would join this thread.
-            log.warn("update check result not posted err={}", .{win32.GetLastError()});
-            job.arena.deinit();
+        // A post fails when the UI thread's queue is full, as well as once
+        // the message window is gone: only in the second case, which
+        // `deinit` marks, is no one left to take the job.
+        while (!job.post()) {
+            if (job.state.load(.acquire) == .abandoned) {
+                log.warn("update check result not posted err={}", .{win32.GetLastError()});
+                job.arena.deinit();
+                return;
+            }
+            win32.Sleep(repost_ms);
         }
+    }
+
+    fn post(job: *Job) bool {
+        if (builtin.is_test and test_post_failures.load(.monotonic) > 0) {
+            _ = test_post_failures.fetchSub(1, .monotonic);
+            return false;
+        }
+        return win32.PostMessageW(job.hwnd, job.msg, 0, @bitCast(@intFromPtr(job))).toBool();
     }
 
     fn check(job: *Job) !Result {
@@ -309,27 +331,41 @@ fn spawn(self: *Updater, manual: bool, install: ?Install) !void {
     self.running = job;
 }
 
-/// The message the job posted: join its thread; the caller reports the
-/// result and then `release`s it.
-pub fn finished(self: *Updater, lparam: win32.LPARAM) *Job {
-    const job: *Job = @ptrFromInt(@as(usize, @bitCast(lparam)));
-    std.debug.assert(self.running == job);
+/// The message a job posted: join its thread, and the job is the
+/// caller's to report and then `release`. Null for a message that is not
+/// the running job's, which any process on the desktop could post: its
+/// LPARAM is only compared, never followed.
+pub fn finished(self: *Updater, lparam: win32.LPARAM) ?*Job {
+    const job = self.running orelse return null;
+    if (@intFromPtr(job) != @as(usize, @bitCast(lparam))) {
+        log.warn("update message not the running check's", .{});
+        return null;
+    }
     job.thread.join();
     self.running = null;
     return job;
 }
 
+/// Free a job `finished` returned, and everything it holds: `job` is
+/// invalid afterwards. (`deinit` takes the arena by value, so nothing is
+/// read from the job once its memory is freed.)
 pub fn release(job: *Job) void {
-    var arena = job.arena;
-    arena.deinit();
+    job.arena.deinit();
 }
 
-/// At exit: the running check, if any, is left to finish on its own.
-/// Its post then fails, as the message window is gone, and it frees
-/// itself (`Job.run`).
+/// At exit: the running check, if any, is abandoned to finish on its own.
+/// If it ends before the message window is destroyed, its post succeeds
+/// but is never dispatched, and its arena goes with the process; after
+/// that its post fails and it frees itself (`Job.run`).
 pub fn deinit(self: *Updater) void {
     if (self.armed) _ = win32.KillTimer(self.hwnd, timer_id);
-    if (self.running) |job| job.thread.detach();
+    self.armed = false;
+    if (self.running) |job| {
+        // Read before the store: from then on the job may free itself.
+        const thread = job.thread;
+        job.state.store(.abandoned, .release);
+        thread.detach();
+    }
     self.running = null;
 }
 
@@ -565,6 +601,10 @@ pub var test_package_dir: if (builtin.is_test) ?[]const u16 else void =
 /// job's thread; its answer is the exit code.
 pub var test_msiexec: if (builtin.is_test) ?*const fn ([:0]const u16) u32 else void =
     if (builtin.is_test) null else {};
+
+/// For tests: how many of the next posts of a job's result fail, as
+/// they would with the UI thread's queue full.
+pub var test_post_failures: std.atomic.Value(u32) = .init(0);
 
 /// For tests: the page last opened (`openPage`), in place of the browser.
 pub var test_opened: if (builtin.is_test) ?[]const u8 else void =

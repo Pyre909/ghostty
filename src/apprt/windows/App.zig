@@ -3386,7 +3386,7 @@ pub const App = struct {
     /// is queued for `run` to show if there is something to tell
     /// (`Updater.Result.tells`, `Updater.report`).
     fn updateFinished(self: *App, lparam: win32.LPARAM) void {
-        const job = self.updater.finished(lparam);
+        const job = self.updater.finished(lparam) orelse return;
         if (!job.result.tells(job.manual)) return Updater.release(job);
         self.requests.append(self.core_app.alloc, .{ .update = job }) catch |err| {
             log.warn("update check result not shown err={}", .{err});
@@ -17316,6 +17316,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     message_box.* = &TestUpdate.box;
     defer message_box.* = null;
     TestUpdate.boxes = 0;
+    defer Updater.test_post_failures.store(0, .monotonic);
 
     const releases = "/owner/repo/releases/";
     const package_path = releases ++ "download/t/ghostty-updater-test.msi";
@@ -17392,6 +17393,27 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try std.testing.expectEqual(5, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("up to date"));
 
+    // A post that fails while the app runs, as with its queue full, is
+    // made again: the job is still the UI thread's, and a later check
+    // runs.
+    Updater.test_post_failures.store(2, .monotonic);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(0, Updater.test_post_failures.load(.monotonic));
+    try std.testing.expectEqual(6, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("up to date"));
+
+    // A message not the running check's, as another process could post:
+    // ignored, with no check running or with one.
+    _ = App.wndProc(app.msg_hwnd, WM_GHOSTTY_UPDATE, 0, 0x1000);
+    try std.testing.expectEqual(null, app.updater.running);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    const running = app.updater.running;
+    _ = App.wndProc(app.msg_hwnd, WM_GHOSTTY_UPDATE, 0, 0x1000);
+    try std.testing.expectEqual(running, app.updater.running);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(7, TestUpdate.boxes);
+
     // Off, a WM_TIMER already queued starts nothing.
     app.updater.configure(.off);
     try std.testing.expect(!app.updater.armed);
@@ -17411,12 +17433,12 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     routes[0].response = bad_hash;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(5, TestUpdate.boxes);
+    try std.testing.expectEqual(7, TestUpdate.boxes);
     try std.testing.expectEqual(null, try http_testing.read(alloc, file));
     routes[0].response = newer;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(6, TestUpdate.boxes);
+    try std.testing.expectEqual(8, TestUpdate.boxes);
     const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
