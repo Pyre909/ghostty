@@ -41,6 +41,7 @@ const App = @import("App.zig").App;
 const win32 = @import("win32.zig");
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
+const FrameColors = @import("FrameColors.zig");
 const Overlays = @import("Overlays.zig");
 const Transparency = @import("Transparency.zig");
 const overlay_keys = @import("overlay_keys.zig");
@@ -689,7 +690,7 @@ pub fn wndProc(
 
         // The field in the bar's colours.
         win32.WM_CTLCOLOREDIT => {
-            const colors = Colors.of(surface.window.dark_frame);
+            const colors = Colors.ofFrame(surface.window);
             const hdc: win32.HDC = @ptrFromInt(wparam);
             _ = win32.SetTextColor(hdc, colors.text);
             _ = win32.SetBkColor(hdc, colors.field);
@@ -970,8 +971,8 @@ pub fn countLabel(buf: *[48]u8, total: ?usize, selected: ?usize) []const u8 {
 }
 
 /// The bar's colours, by whether the title bar is dark
-/// (`Window.dark_frame`), as the tab bar's are; the command palette's
-/// too.
+/// (`Window.dark_frame`), as the tab bar's are (`of`), or the frame's own
+/// under `window-theme = ghostty` (`ofFrame`).
 pub const Colors = struct {
     bar: win32.COLORREF,
     border: win32.COLORREF,
@@ -979,6 +980,24 @@ pub const Colors = struct {
     text: win32.COLORREF,
     dim: win32.COLORREF,
     hover: win32.COLORREF,
+
+    /// A frame's chrome: under `window-theme = ghostty` in its colours
+    /// (`Window.frame_colors`, the focused ones, as GTK gives its popovers
+    /// and tab overview the configured background), else by its mode.
+    pub fn ofFrame(window: *const Window) Colors {
+        const c = window.frame_colors orelse return of(window.dark_frame);
+        const bg = c.background;
+        const fg = c.foreground;
+        const ref = FrameColors.colorref;
+        return .{
+            .bar = ref(FrameColors.mix(bg, fg, 0.05)),
+            .border = ref(FrameColors.mix(bg, fg, 0.25)),
+            .field = ref(bg),
+            .text = ref(fg),
+            .dim = ref(FrameColors.mix(bg, fg, 0.65)),
+            .hover = ref(FrameColors.mix(bg, fg, 0.12)),
+        };
+    }
 
     pub fn of(dark: bool) Colors {
         return if (dark) .{
@@ -1020,7 +1039,7 @@ fn paint(surface: *Surface, hwnd: win32.HWND) void {
     };
 
     const dpi = Window.dpiOf(surface.app, hwnd);
-    const colors = Colors.of(surface.window.dark_frame);
+    const colors = Colors.ofFrame(surface.window);
     const l = Layout.init(.init(dpi), client.right, client.bottom, bar.text_height);
     const line = @max(1, Metrics.scale(1, dpi));
 
@@ -1370,4 +1389,24 @@ test "win32: the search count is GTK's" {
     try testing.expectEqualStrings("0/5", countLabel(&buf, 5, null));
     try testing.expectEqualStrings("1/5", countLabel(&buf, 5, 0));
     try testing.expectEqualStrings("5/5", countLabel(&buf, 5, 4));
+}
+
+test "win32: the search bar and tab overview take the frame's colours under window-theme = ghostty" {
+    var window: Window = undefined;
+    window.dark_frame = false;
+    window.frame_colors = null;
+    try std.testing.expectEqual(Colors.of(false), Colors.ofFrame(&window));
+    window.dark_frame = true;
+    try std.testing.expectEqual(Colors.of(true), Colors.ofFrame(&window));
+
+    window.frame_colors = .{ .background = .{ .r = 0x10, .g = 0x20, .b = 0x30 }, .foreground = .{ .r = 0xF0, .g = 0xE0, .b = 0xD0 } };
+    // The focused colours, whatever the caption shows.
+    for ([_]bool{ false, true }) |active| {
+        window.caption_active = active;
+        const c = Colors.ofFrame(&window);
+        try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), c.field);
+        try std.testing.expectEqual(win32.rgb(0xF0, 0xE0, 0xD0), c.text);
+        // Each part stands apart from the field it frames.
+        for ([_]win32.COLORREF{ c.bar, c.border, c.dim, c.hover }) |part| try std.testing.expect(part != c.field);
+    }
 }

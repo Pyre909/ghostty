@@ -845,7 +845,7 @@ pub fn wndProc(
         },
 
         win32.WM_CTLCOLOREDIT => {
-            const colors = SearchBar.Colors.of(window.dark_frame);
+            const colors = SearchBar.Colors.ofFrame(window);
             const hdc: win32.HDC = @ptrFromInt(wparam);
             _ = win32.SetTextColor(hdc, colors.text);
             _ = win32.SetBkColor(hdc, colors.field);
@@ -1104,7 +1104,7 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
 
     const alloc = window.app.core_app.alloc;
     const dpi = Window.dpiOf(window.app, window.hwnd);
-    const colors = SearchBar.Colors.of(window.dark_frame);
+    const colors = SearchBar.Colors.ofFrame(window);
     const m: Metrics = .init(dpi);
     const line = @max(1, SearchBar.Metrics.scale(1, dpi));
     SearchBar.fill(mem, client, colors.bar);
