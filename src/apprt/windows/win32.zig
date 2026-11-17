@@ -957,7 +957,17 @@ pub const DWMWA_SYSTEMBACKDROP_TYPE: DWORD = 38;
 /// DWM_SYSTEMBACKDROP_TYPE: DWM decides, the default; and acrylic, a
 /// transient window's (Learn: "Desktop Acrylic").
 pub const DWMSBT_AUTO: DWORD = 0;
+pub const DWMSBT_MAINWINDOW: DWORD = 2;
 pub const DWMSBT_TRANSIENTWINDOW: DWORD = 3;
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/ns-uxtheme-margins
+pub const MARGINS = extern struct {
+    cxLeftWidth: c_int,
+    cxRightWidth: c_int,
+    cyTopHeight: c_int,
+    cyBottomHeight: c_int,
+};
+/// https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/nf-dwmapi-dwmextendframeintoclientarea
+pub extern "dwmapi" fn DwmExtendFrameIntoClientArea(hwnd: HWND, margins: *const MARGINS) callconv(.winapi) HRESULT;
 /// dwmapi.h, from Windows 11 (build 22000): a DWORD, one of
 /// DWM_WINDOW_CORNER_PREFERENCE's; and a COLORREF for the window's
 /// border. Both take on a borderless pop-up too.
@@ -1816,6 +1826,10 @@ pub extern "uxtheme" fn BeginBufferedPaint(
 ) callconv(.winapi) ?HPAINTBUFFER;
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-bufferedpaintsetalpha
 pub extern "uxtheme" fn BufferedPaintSetAlpha(buffer: HPAINTBUFFER, rect: ?*const RECT, alpha: BYTE) callconv(.winapi) HRESULT;
+/// The buffer's pixels, 32-bit BGRA rows `row` pixels apart, which may be
+/// wider than the rect it was begun with.
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-getbufferedpaintbits
+pub extern "uxtheme" fn GetBufferedPaintBits(buffer: HPAINTBUFFER, bits: *?[*]u32, row: *c_int) callconv(.winapi) HRESULT;
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-endbufferedpaint
 pub extern "uxtheme" fn EndBufferedPaint(buffer: HPAINTBUFFER, update_target: BOOL) callconv(.winapi) HRESULT;
 

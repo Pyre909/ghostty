@@ -85,7 +85,7 @@ pub var test_no_buffered_paint: if (builtin.is_test) bool else void =
     if (builtin.is_test) false else {};
 
 /// BufferedPaintInit; whether it succeeded, logged if not.
-fn bufferedPaintInit() bool {
+pub fn bufferedPaintInit() bool {
     if (builtin.is_test and test_no_buffered_paint) return false;
     const hr = win32.BufferedPaintInit();
     if (hr >= 0) return true;
@@ -93,7 +93,8 @@ fn bufferedPaintInit() bool {
     return false;
 }
 
-/// For a transparent frame's WM_NCDESTROY: what `frameMade` started.
+/// For a transparent frame's WM_NCDESTROY, what `frameMade` started; and
+/// for a frame with Mica, what `Mica.apply` started.
 pub fn frameDestroyed() void {
     _ = win32.BufferedPaintUnInit();
 }
@@ -125,10 +126,12 @@ fn blurBehind(frame: win32.HWND, on: bool) bool {
 /// The system backdrop DWM draws behind a transparent frame
 /// (DWMWA_SYSTEMBACKDROP_TYPE, dwmapi.h's DWM_SYSTEMBACKDROP_TYPE): the
 /// default, which a window has until it asks, or acrylic, which blurs what
-/// is behind the frame (Mica, 2, was measured only tinting it with the
-/// wallpaper).
+/// is behind the frame (Mica was measured only tinting it with the
+/// wallpaper). An opaque frame has Mica (Mica.zig), behind its title bar
+/// and tab bar.
 pub const Backdrop = enum(win32.DWORD) {
     default = win32.DWMSBT_AUTO,
+    mica = win32.DWMSBT_MAINWINDOW,
     acrylic = win32.DWMSBT_TRANSIENTWINDOW,
 };
 
@@ -157,7 +160,7 @@ pub var test_backdrop: if (builtin.is_test) ?*const fn (win32.HWND, Backdrop) bo
 
 /// The running build of Windows, asked once: RtlGetVersion, which no
 /// manifest's compatibility section changes (unlike GetVersionEx).
-fn build() u32 {
+pub fn build() u32 {
     if (builtin.is_test) if (test_build) |b| return b;
     const Once = struct {
         var value: ?u32 = null;
@@ -197,7 +200,7 @@ pub fn applyBlur(window: *Window) void {
     window.backdrop = want;
 }
 
-fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
+pub fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
     if (builtin.is_test) if (test_backdrop) |answer| return answer(frame, to);
     const value: win32.DWORD = @backingInt(to);
     const hr = win32.DwmSetWindowAttribute(frame, win32.DWMWA_SYSTEMBACKDROP_TYPE, &value, @sizeOf(win32.DWORD));

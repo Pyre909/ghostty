@@ -41,6 +41,7 @@ const Dividers = @import("Dividers.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
+const Mica = @import("Mica.zig");
 const FrameColors = @import("FrameColors.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
@@ -161,8 +162,14 @@ transparent: bool,
 
 /// The system backdrop DWM was last given for the frame
 /// (`Transparency.applyBlur`): acrylic while `background-blur` is on in a
-/// transparent window. A new frame has the default.
+/// transparent window, Mica in an opaque one (`Mica.apply`). A new frame
+/// has the default.
 backdrop: Transparency.Backdrop,
+
+/// How far the frame was last extended into the client area, over the tab
+/// bar, for its Mica to show there (`Mica.apply`); 0 for not at all, as a
+/// new frame is. The bar draws over Mica while it is above 0.
+mica_top: i32,
 
 /// Where and how the window was before it covered its monitor, to put it
 /// back (`toggleFullscreen`); null while it does not.
@@ -1096,6 +1103,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .caption_active = false,
         .transparent = false,
         .backdrop = .default,
+        .mica_top = 0,
         .fullscreen = null,
         .decoration = null,
         .quick = kind == .quick,
@@ -2334,7 +2342,7 @@ fn handleMessage(
 
         // After the child windows: frees `self`, so nothing may follow.
         win32.WM_NCDESTROY => {
-            if (self.transparent) Transparency.frameDestroyed();
+            if (self.transparent or self.backdrop == .mica) Transparency.frameDestroyed();
             self.app.windowDestroyed(self);
             return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
@@ -2498,7 +2506,7 @@ fn barShownFor(self: *const Window, count: usize) bool {
 }
 
 /// The bar's height while it shows, else 0.
-fn barHeight(self: *const Window) i32 {
+pub fn barHeight(self: *const Window) i32 {
     return self.barHeightFor(self.tabs.items.len);
 }
 
@@ -3245,6 +3253,8 @@ pub fn relayout(self: *Window) void {
     // covers them, and the bar.
     _ = CommandPalette.place(self);
     _ = TabOverview.place(self);
+    // Over the bar as it is now placed.
+    Mica.apply(self);
     // The terminals moved, and Win32 tells the one now under a still
     // pointer with a WM_MOUSEMOVE that is no move (`Surface.followMouse`).
     if (cursorScreenPos()) |pt| self.app.pointer = pt;
@@ -3656,6 +3666,8 @@ pub fn frameDark(
 /// A failed call leaves `dark_frame` or `frame_colors` as it was, so the
 /// next one tries again.
 pub fn applyTheme(self: *Window) void {
+    // Mica behind the bar, but not under the configured colours.
+    defer Mica.apply(self);
     const colors = FrameColors.of(&self.app.config, self.app.window_theme_override);
     const dark = if (colors) |c| c.dark() else frameDark(&self.app.config, self.app.system_scheme, self.app.window_theme_override);
     const recolor = !std.meta.eql(colors, self.frame_colors) and

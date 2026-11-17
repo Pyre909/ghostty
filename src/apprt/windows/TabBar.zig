@@ -22,6 +22,7 @@ const win32 = @import("win32.zig");
 const Window = @import("Window.zig");
 const FrameColors = @import("FrameColors.zig");
 const Transparency = @import("Transparency.zig");
+const Mica = @import("Mica.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const SearchBar = @import("SearchBar.zig");
 const TabTitleEditor = @import("TabTitleEditor.zig");
@@ -879,6 +880,9 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     if (!win32.GetClientRect(hwnd, &client).toBool()) return;
     if (client.right <= 0 or client.bottom <= 0) return;
 
+    const colors = Colors.of(window);
+    if (window.mica_top > 0 and paintOverMica(window, hwnd, hdc, client, colors, font)) return;
+
     // Drawn off the screen, then copied at once, so that it never flickers.
     const mem = win32.CreateCompatibleDC(hdc) orelse return;
     defer _ = win32.DeleteDC(mem);
@@ -888,8 +892,50 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     defer if (old_bitmap) |b| {
         _ = win32.SelectObject(mem, b);
     };
+    draw(window, hwnd, mem, client, colors, font);
+    _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
+}
 
-    const colors = Colors.of(window);
+/// Whether `paintOverMica` has said once that it could not buffer a paint.
+var mica_buffer_failed_logged = false;
+
+/// Paint the bar where the frame's Mica shows behind it (Mica.zig): drawn
+/// into a 32-bit buffer, whose pixels in the bar's colour are then made
+/// transparent and the rest opaque (`Mica.keyOut`), and copied with their
+/// alpha. False, said once, if no buffer can be had: the bar is then
+/// painted as in any frame, its pixels added to the Mica.
+fn paintOverMica(
+    window: *Window,
+    hwnd: win32.HWND,
+    hdc: win32.HDC,
+    client: RECT,
+    colors: Colors,
+    font: ?win32.HGDIOBJ,
+) bool {
+    var mem: ?win32.HDC = null;
+    const buffer = win32.BeginBufferedPaint(hdc, &client, win32.BPBF_TOPDOWNDIB, null, &mem) orelse {
+        if (!mica_buffer_failed_logged) {
+            mica_buffer_failed_logged = true;
+            log.warn("the tab bar shows added to the Mica behind it: BeginBufferedPaint failed err={}", .{win32.GetLastError()});
+        }
+        return false;
+    };
+    // The buffer's DC, set whenever the buffer is (Learn), takes the
+    // target's coordinates, the bar's client area's.
+    draw(window, hwnd, mem.?, client, colors, font);
+    var bits: ?[*]u32 = null;
+    var row: c_int = 0;
+    if (win32.GetBufferedPaintBits(buffer, &bits, &row) >= 0 and row >= client.right) if (bits) |b| {
+        const r: usize = @intCast(row);
+        Mica.keyOut(b[0 .. r * @as(usize, @intCast(client.bottom))], r, @intCast(client.right), colors.bar);
+    };
+    _ = win32.EndBufferedPaint(buffer, .TRUE);
+    return true;
+}
+
+/// Draw the bar into `mem`, a DC the size of its client area, `client`:
+/// its background, the tabs, the dragged one last, and the "+" button.
+fn draw(window: *Window, hwnd: win32.HWND, mem: win32.HDC, client: RECT, colors: Colors, font: ?win32.HGDIOBJ) void {
     const l = layoutOf(window, hwnd);
     fill(mem, client, colors.bar);
 
@@ -925,8 +971,6 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     fill(mem, plus, if (window.bar.hover == .plus) colors.hover else colors.bar);
     _ = win32.SetTextColor(mem, colors.text);
     drawGlyph(window, mem, L("+"), &plus);
-
-    _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
 }
 
 /// What of a tab the pointer is over, for its highlight.

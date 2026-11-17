@@ -9,7 +9,8 @@
 //! The field is an EDIT, a child of the bar, which clips it out of what
 //! it paints (WS_CLIPCHILDREN); in a transparent window it is drawn into
 //! the bar's layered surface, opaque with it, as the search field is into
-//! its bar's (`Transparency.chrome`). It follows its tab's label as the
+//! its bar's (`Transparency.chrome`); over Mica it is layered itself
+//! (Mica.zig), as the bar is not. It follows its tab's label as the
 //! tabs move, scroll or resize (`place`, from the bar's paint), and goes,
 //! committing nothing, if its tab leaves the window. A field Windows
 //! cannot make falls back to the tab's title prompt (`prompt_tab_title`).
@@ -25,6 +26,7 @@ const win32 = @import("win32.zig");
 const App = @import("App.zig").App;
 const Window = @import("Window.zig");
 const SearchBar = @import("SearchBar.zig");
+const Transparency = @import("Transparency.zig");
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 const editText = @import("clipboard.zig").editText;
 
@@ -126,6 +128,8 @@ fn create(window: *Window, bar: win32.HWND, label: win32.RECT, editor: *Editor) 
         log.warn("cannot make a tab title field err={}", .{win32.GetLastError()});
         return null;
     };
+    // Over Mica, or GDI's text would show added to it.
+    if (window.mica_top > 0) _ = Transparency.layer(edit);
     const old = win32.SetWindowLongPtrW(edit, win32.GWLP_WNDPROC, @bitCast(@intFromPtr(&editProc)));
     if (edit_proc == null) edit_proc = @ptrFromInt(@as(usize, @bitCast(old)));
     // The bar's font, which the label is drawn in.

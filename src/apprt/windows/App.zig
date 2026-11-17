@@ -53,6 +53,7 @@ const TabOverview = @import("TabOverview.zig");
 const Transparency = @import("Transparency.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const TabTitleEditor = @import("TabTitleEditor.zig");
+const Mica = @import("Mica.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const input_pane = @import("input_pane.zig");
@@ -5896,6 +5897,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .caption_active = false,
         .transparent = false,
         .backdrop = .default,
+        .mica_top = 0,
         .fullscreen = null,
         .decoration = null,
         .quick = false,
@@ -16767,6 +16769,138 @@ test "win32: a title prompt's title bar follows its window's" {
     try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
     try std.testing.expect(!window.dark_frame);
     try std.testing.expect(!try darkBar(dialog));
+}
+
+test "win32: an opaque frame's tab bar shows its Mica, but not under window-theme = ghostty" {
+    // The frame asks for Mica once and reaches over the bar while it
+    // shows (Mica.zig); not under the configured colours, without a title
+    // bar, while the tab overview covers the bar, or in a transparent
+    // frame. DWM is answered for (`TestClear`, `Mica.test_extend`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_set_focus = &FocusSeen.seen;
+    defer Window.test_set_focus = null;
+    Window.test_get_focus = &FocusSeen.current;
+    defer Window.test_get_focus = null;
+    FocusSeen.last = null;
+    const dwm = struct {
+        var top: i32 = -1;
+        var calls: u32 = 0;
+        var refuse = false;
+        fn extend(_: win32.HWND, t: i32) bool {
+            calls += 1;
+            if (refuse) return false;
+            top = t;
+            return true;
+        }
+        fn caption(_: win32.HWND, _: win32.DWORD, _: win32.COLORREF) bool {
+            return true;
+        }
+    };
+    TestClear.start(1);
+    defer TestClear.stop();
+    Mica.test_extend = &dwm.extend;
+    defer Mica.test_extend = null;
+    Window.test_caption = &dwm.caption;
+    defer Window.test_caption = null;
+
+    // Three tabs, so the bar shows: Mica, asked for once, behind it.
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const height = window.barHeight();
+    try std.testing.expect(height > 0);
+    try std.testing.expectEqual(1, TestClear.backdrop_count);
+    try std.testing.expectEqual(Transparency.Backdrop.mica, TestClear.backdrops[0]);
+    try std.testing.expect(window.backdrop == .mica);
+    try std.testing.expectEqual(height, dwm.top);
+    try std.testing.expectEqual(height, window.mica_top);
+    // Laid out again as it is: nothing asked of DWM.
+    const calls = dwm.calls;
+    window.relayout();
+    window.applyTheme();
+    try std.testing.expectEqual(calls, dwm.calls);
+    try std.testing.expectEqual(1, TestClear.backdrop_count);
+    // Painted over it, shown (`TabBar.paintOverMica`).
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    _ = win32.InvalidateRect(window.bar.hwnd.?, null, .FALSE);
+    _ = win32.UpdateWindow(window.bar.hwnd.?);
+
+    // A title field opened over it is layered, or its text would show
+    // added to the Mica.
+    const layered = TestClear.layered_count;
+    TabTitleEditor.begin(window, 0, .{ .left = 10, .top = 2, .right = 100, .bottom = 20 });
+    const edit = window.bar.editor.edit orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(layered + 1, TestClear.layered_count);
+    try std.testing.expect(TestClear.layered[layered] == edit);
+    TabTitleEditor.finish(window, .cancel);
+
+    // Under window-theme = ghostty the bar is in its colours: no Mica
+    // there; back with another theme.
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"window-theme" = .ghostty;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(0, dwm.top);
+    try std.testing.expectEqual(0, window.mica_top);
+    changed.@"window-theme" = .dark;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expectEqual(height, dwm.top);
+    // The backdrop stays: asked once for the frame's life.
+    try std.testing.expectEqual(1, TestClear.backdrop_count);
+
+    // The tab overview covers the bar while it is open.
+    try std.testing.expect(try app.performAction(.{ .surface = &t.panes[0].core_surface }, .toggle_tab_overview, {}));
+    app.createRequested();
+    try std.testing.expect(window.overview.open);
+    try std.testing.expectEqual(0, dwm.top);
+    TabOverview.close(window);
+    try std.testing.expectEqual(height, dwm.top);
+
+    // Without a title bar, none; with it again, back.
+    window.toggleDecorations();
+    window.relayout();
+    try std.testing.expect(!window.isDecorated());
+    try std.testing.expectEqual(0, dwm.top);
+    window.toggleDecorations();
+    window.relayout();
+    try std.testing.expectEqual(height, dwm.top);
+
+    // Refused, the frame is taken to be as it was, and asked again.
+    dwm.refuse = true;
+    app.config.@"window-show-tab-bar" = .never;
+    window.relayout();
+    try std.testing.expectEqual(height, window.mica_top);
+    dwm.refuse = false;
+    window.relayout();
+    try std.testing.expectEqual(0, dwm.top);
+    try std.testing.expectEqual(0, window.mica_top);
+
+    // A transparent frame: its backdrop is background-blur's, none of
+    // this.
+    const clear = try testFrameOf(&app, true);
+    const pane = try testPane(&app, clear);
+    clear.tab().tree = try .init(alloc, pane);
+    clear.relayout();
+    clear.applyTheme();
+    try std.testing.expectEqual(1, TestClear.backdrop_count);
+    try std.testing.expect(clear.backdrop == .default);
+    try std.testing.expectEqual(0, clear.mica_top);
+
+    // Nor on a build of Windows before the backdrop.
+    Transparency.test_build = Transparency.backdrop_build - 1;
+    const old = try testFrame(&app);
+    const p = try testPane(&app, old);
+    old.tab().tree = try .init(alloc, p);
+    old.relayout();
+    try std.testing.expectEqual(1, TestClear.backdrop_count);
+    try std.testing.expect(old.backdrop == .default);
 }
 
 test "win32: window-theme = ghostty gives the caption the configured colours" {

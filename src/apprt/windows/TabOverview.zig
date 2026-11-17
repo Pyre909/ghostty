@@ -23,6 +23,7 @@ const Window = @import("Window.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const SearchBar = @import("SearchBar.zig");
 const Transparency = @import("Transparency.zig");
+const Mica = @import("Mica.zig");
 const overlay_keys = @import("overlay_keys.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
@@ -558,6 +559,8 @@ pub fn open(surface: *Surface) bool {
     // No tab was shown at a sync yet, so this selects the shown one's card.
     sync(window);
     if (!place(window)) return false;
+    // It covers the bar, so the frame need not reach over it (Mica.zig).
+    Mica.apply(window);
     reveal(window);
     window.setKeyboardFocus(edit, true);
     return true;
@@ -575,6 +578,7 @@ pub fn close(window: *Window) void {
         if (window.tab().focused) |s| window.setKeyboardFocus(Window.focusTarget(s), true);
     }
     _ = win32.DestroyWindow(hwnd);
+    Mica.apply(window);
 }
 
 /// Draw the overview again, as the theme changed.
