@@ -65,7 +65,9 @@ def product_code(tools: dict[str, str], msi: Path) -> str:
     return codes[0]
 
 
-def manifests(packages: list[make_feed.Package], tag: str, codes: dict[str, str]) -> dict[str, str]:
+def manifests(
+    packages: list[make_feed.Package], tag: str, codes: dict[str, str]
+) -> dict[str, str]:
     """Each manifest's text by its file name."""
     if tag == make_feed.TIP_TAG:
         raise Error("tip's packages are replaced in place, so are not for winget")
@@ -81,15 +83,18 @@ def manifests(packages: list[make_feed.Package], tag: str, codes: dict[str, str]
             f"  ProductCode: {quote(codes[p.arch])}\n"
         )
     return {
-        f"{IDENTIFIER}.yaml": document(
-            "version", head + [("DefaultLocale", LOCALE)]
-        ),
+        f"{IDENTIFIER}.yaml": document("version", head + [("DefaultLocale", LOCALE)]),
         f"{IDENTIFIER}.installer.yaml": document(
             "installer",
             # The package installs for the user alone, without elevation,
             # and an upgrade replaces the installed version in place
             # (make_msi.py's MajorUpgrade).
-            head + [("InstallerType", "msi"), ("Scope", "user"), ("UpgradeBehavior", "install")],
+            head
+            + [
+                ("InstallerType", "msi"),
+                ("Scope", "user"),
+                ("UpgradeBehavior", "install"),
+            ],
             installers,
         ),
         f"{IDENTIFIER}.locale.{LOCALE}.yaml": document(
@@ -127,10 +132,14 @@ def make(args: argparse.Namespace) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Write the winget manifests for a release.")
+    parser = argparse.ArgumentParser(
+        description="Write the winget manifests for a release."
+    )
     parser.add_argument("packages", type=Path, nargs="+", help="make_msi.py's packages")
     parser.add_argument("--tag", required=True, help="the release's tag")
-    parser.add_argument("--out", type=Path, help="where to write (beside the first package)")
+    parser.add_argument(
+        "--out", type=Path, help="where to write (beside the first package)"
+    )
     args = parser.parse_args(argv)
     try:
         dest = make(args)

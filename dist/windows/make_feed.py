@@ -59,7 +59,9 @@ SIGNATURE = FEED + ".sig"
 TIP_TAG = "tip-windows"
 STABLE_TAG = "stable-windows"
 
-PACKAGE = re.compile(r"ghostty-(?P<version>.+)-windows-(?P<arch>[a-z0-9_]+)\.msi", re.ASCII)
+PACKAGE = re.compile(
+    r"ghostty-(?P<version>.+)-windows-(?P<arch>[a-z0-9_]+)\.msi", re.ASCII
+)
 
 # semver.org's own expression, which `std.SemanticVersion.parse` follows.
 SEMVER = re.compile(
@@ -162,7 +164,9 @@ def openssl(tool: str, args: list[str]) -> bytes:
     except OSError as e:
         raise Error(f"{tool} not run: {e}") from e
     if run.returncode != 0:
-        raise Error(f"{tool} {args[0]} failed: {run.stderr.decode(errors='replace').strip()}")
+        raise Error(
+            f"{tool} {args[0]} failed: {run.stderr.decode(errors='replace').strip()}"
+        )
     return run.stdout
 
 
@@ -179,7 +183,20 @@ def sign(tool: str, key: Path, feed_path: Path) -> Path:
     """Sign the file at `feed_path` with `key`: the signature's path."""
     public_key(tool, key)
     dest = feed_path.with_name(SIGNATURE)
-    openssl(tool, ["pkeyutl", "-sign", "-rawin", "-inkey", str(key), "-in", str(feed_path), "-out", str(dest)])
+    openssl(
+        tool,
+        [
+            "pkeyutl",
+            "-sign",
+            "-rawin",
+            "-inkey",
+            str(key),
+            "-in",
+            str(feed_path),
+            "-out",
+            str(dest),
+        ],
+    )
     if dest.stat().st_size != 64:
         raise Error(f"{dest} is not an Ed25519 signature")
     return dest
@@ -189,7 +206,9 @@ def make(args: argparse.Namespace) -> Path:
     if args.tag is None:
         raise Error("give the release's --tag")
     if (args.key is None) == (not args.unsigned):
-        raise Error("give --key to sign the feed, or --unsigned for builds with no update key")
+        raise Error(
+            "give --key to sign the feed, or --unsigned for builds with no update key"
+        )
     packages = read_packages([p.resolve() for p in args.packages])
     out = (args.out or packages[0].path.parent).resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -206,11 +225,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write the update feed for a release.")
     parser.add_argument("packages", type=Path, nargs="*", help="make_msi.py's packages")
     parser.add_argument("--tag", help=f"the release's tag ({TIP_TAG} for tip)")
-    parser.add_argument("--out", type=Path, help="where to write (beside the first package)")
-    parser.add_argument("--key", type=Path, help="the Ed25519 private key (PEM) to sign the feed with")
+    parser.add_argument(
+        "--out", type=Path, help="where to write (beside the first package)"
+    )
+    parser.add_argument(
+        "--key", type=Path, help="the Ed25519 private key (PEM) to sign the feed with"
+    )
     parser.add_argument("--unsigned", action="store_true", help="write no signature")
-    parser.add_argument("--public-key", type=Path, metavar="KEY", help="print KEY's public half and stop")
-    parser.add_argument("--openssl", default="openssl", help="OpenSSL 3 or later (openssl)")
+    parser.add_argument(
+        "--public-key",
+        type=Path,
+        metavar="KEY",
+        help="print KEY's public half and stop",
+    )
+    parser.add_argument(
+        "--openssl", default="openssl", help="OpenSSL 3 or later (openssl)"
+    )
     args = parser.parse_args(argv)
     try:
         if args.public_key is not None:

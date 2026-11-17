@@ -800,8 +800,13 @@ def sha256(path: Path) -> str:
 def make(args: argparse.Namespace) -> None:
     if not SEMVER.fullmatch(args.version):
         raise Error(f"{args.version!r} is not a semantic version")
-    if args.update_public_key is not None and re.fullmatch(r"[0-9a-f]{64}", args.update_public_key) is None:
-        raise Error(f"{args.update_public_key!r} is not a public key as make_feed.py prints one")
+    if (
+        args.update_public_key is not None
+        and re.fullmatch(r"[0-9a-f]{64}", args.update_public_key) is None
+    ):
+        raise Error(
+            f"{args.update_public_key!r} is not a public key as make_feed.py prints one"
+        )
     if not args.allow_dirty:
         dirty = git("status", "--porcelain", "--untracked-files=no")
         if dirty:

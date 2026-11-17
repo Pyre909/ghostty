@@ -1248,14 +1248,25 @@ class TestBuildFlags(unittest.TestCase):
 
     def test_update_key_only_if_given(self) -> None:
         key = "ab" * 32
-        self.assertIn(f"-Dupdate-public-key={key}", mz.build_flags("x86_64", "1.4.1", key))
-        self.assertFalse(any("update-public-key" in f for f in mz.build_flags("x86_64", "1.4.1")))
+        self.assertIn(
+            f"-Dupdate-public-key={key}", mz.build_flags("x86_64", "1.4.1", key)
+        )
+        self.assertFalse(
+            any("update-public-key" in f for f in mz.build_flags("x86_64", "1.4.1"))
+        )
 
     def test_update_key_is_checked(self) -> None:
         for key in ["ab" * 31, "AB" * 32, "zz" * 32]:
             with self.subTest(key=key):
                 err = io.StringIO()
-                argv = ["--arch", "x86_64", "--version", "1.4.1", "--update-public-key", key]
+                argv = [
+                    "--arch",
+                    "x86_64",
+                    "--version",
+                    "1.4.1",
+                    "--update-public-key",
+                    key,
+                ]
                 with contextlib.redirect_stderr(err):
                     self.assertEqual(mz.main(argv), 1)
                 self.assertIn("is not a public key", err.getvalue())
