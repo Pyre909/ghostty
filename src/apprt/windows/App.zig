@@ -26679,6 +26679,24 @@ test "win32: a link preview moves with its tab to a new window, and follows its 
         try std.testing.expectEqual(theme == .dark, moved.dark_frame);
         try std.testing.expect(pending(hwnd));
     }
+
+    // Under window-theme = ghostty, on the frame's colours, as the search
+    // bar is (GTK gives both its header bar's): framed in its border, filled
+    // with its bar.
+    var ghostty: Config = try .default(alloc);
+    defer ghostty.deinit();
+    ghostty.@"window-theme" = .ghostty;
+    ghostty.background = .{ .r = 0x28, .g = 0x2C, .b = 0x34 };
+    ghostty.foreground = .{ .r = 0xD0, .g = 0xD8, .b = 0xE0 };
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &ghostty }));
+    try std.testing.expect(moved.frame_colors != null);
+    const colors = SearchBar.Colors.ofFrame(moved);
+    try std.testing.expect(colors.bar != SearchBar.Colors.of(moved.dark_frame).bar);
+    const printed = try Printed.of(hwnd);
+    defer printed.deinit();
+    const line = @max(1, SearchBar.Metrics.scale(1, 192));
+    try std.testing.expectEqual(colors.border, printed.at(0, 0));
+    try std.testing.expectEqual(colors.bar, printed.at(line, line));
 }
 
 test "win32: a link preview goes with its terminal, shown or not" {

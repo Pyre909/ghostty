@@ -28,7 +28,9 @@
 //! takes its own messages first (`handle`), and answers HTCLIENT over its
 //! button alone. Each draws a line of text in the system's message font,
 //! one for all of a terminal's overlays (`font`), on the search bar's
-//! colours, framed as GTK's labels are, or in its own (`Look`); the
+//! colours (`SearchBar.Colors.ofFrame`: under `window-theme = ghostty` the
+//! frame's, as GTK gives these overlays its header bar's), framed as GTK's
+//! labels are, or in its own (`Look`); the
 //! banner draws two (`draw`). The bell border has no text: it shows by a
 //! flag of its own (`shows`), draws itself, and its window is shaped to
 //! what it draws (`shape`).
@@ -533,22 +535,23 @@ fn draw(surface: *Surface, hwnd: win32.HWND, hdc: win32.HDC) void {
 
     const dpi = Window.dpiOf(surface.app, hwnd);
     const background = terminalBackground(surface);
+    const colors = SearchBar.Colors.ofFrame(surface.window);
     inline for (stack) |name| {
         const o = &@field(surface.overlays, name);
-        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, surface.window.dark_frame, background, surface.overlays.font);
+        if (o.hwnd == hwnd) drawOverlay(o, mem, client, dpi, surface.window.dark_frame, colors, background, surface.overlays.font);
     }
 
     _ = win32.BitBlt(hdc, 0, 0, client.right, client.bottom, mem, 0, 0, win32.SRCCOPY);
 }
 
-/// The overlay `o`, `client` big, drawn into `hdc` at `dpi` by whether the
-/// title bar is `dark`, over a terminal whose background is `background`:
-/// as it draws itself (`draw`), or its text in
-/// `font`, framed as GTK's labels are, where its own file puts it
-/// (`textIn`), in its colours (`lookOf`).
-fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, background: win32.COLORREF, font: ?win32.HGDIOBJ) void {
+/// The overlay `o`, `client` big, drawn into `hdc` at `dpi` over a
+/// terminal whose background is `background`: as it draws itself
+/// (`draw`), by whether the title bar is `dark`, or its text in `font`,
+/// framed as GTK's labels are, where its own file puts it (`textIn`), in
+/// its colours (`lookOf`) from the frame's chrome's (`colors`).
+fn drawOverlay(o: anytype, hdc: win32.HDC, client: RECT, dpi: u32, dark: bool, colors: SearchBar.Colors, background: win32.COLORREF, font: ?win32.HGDIOBJ) void {
     if (@hasDecl(@TypeOf(o.*), "draw")) return o.draw(hdc, client, dpi, dark, background, font);
-    const look = lookOf(o, SearchBar.Colors.of(dark), background);
+    const look = lookOf(o, colors, background);
     const line = @max(1, SearchBar.Metrics.scale(1, dpi));
     SearchBar.fill(hdc, client, look.line);
     SearchBar.fill(hdc, SearchBar.inset(client, line), look.fill);
