@@ -19,8 +19,10 @@
 //!
 //! Not under `window-theme = ghostty`, whose caption and bar are in its
 //! own colours; not for a transparent frame, whose backdrop is
-//! `background-blur`'s (Transparency.zig); not without a title bar; and
-//! not while the tab overview, which covers the bar, is open.
+//! `background-blur`'s (Transparency.zig); not without a title bar, nor
+//! in the quick terminal, a pop-up; and not while the tab overview,
+//! which covers the bar, is open: such a frame keeps the default backdrop
+//! until it first reaches over its bar.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -32,9 +34,10 @@ const log = std.log.scoped(.win32);
 
 /// Give `window`'s frame Mica behind its tab bar, or take it away, as
 /// its bar, theme, decoration and tab overview now ask (`wanted`). The
-/// backdrop is asked for once, for the frame's life, with buffered
-/// painting for its bar (Learn: BufferedPaintInit, matched at the frame's
-/// WM_NCDESTROY); the extension follows the bar. A failed
+/// backdrop is asked for as the frame first reaches over its bar, and then
+/// kept for the frame's life, with buffered painting for its bar (Learn:
+/// BufferedPaintInit, matched at the frame's WM_NCDESTROY): a frame that
+/// never does keeps the default. The extension follows the bar. A failed
 /// call leaves `Window.backdrop` and `Window.mica_top` as they were, so
 /// the next layout tries again, and is said once for the process: a DWM
 /// that refuses would refuse at every WM_SIZE of a resize. Called after
@@ -45,6 +48,8 @@ pub fn apply(window: *Window) void {
     // default, as they did before.
     if (builtin.is_test and test_extend == null) return;
     if (Transparency.build() < Transparency.backdrop_build) return;
+    const top = wanted(window);
+    if (top == window.mica_top) return;
     if (window.backdrop != .mica) {
         if (!Transparency.bufferedPaintInit()) return;
         const hr = Transparency.askBackdrop(window.hwnd, .mica);
@@ -55,8 +60,6 @@ pub fn apply(window: *Window) void {
         }
         window.backdrop = .mica;
     }
-    const top = wanted(window);
-    if (top == window.mica_top) return;
     if (!extend(window.hwnd, top)) return;
     window.mica_top = top;
     // A field open in the bar as Mica comes would show added to it.
@@ -76,9 +79,11 @@ fn refused(what: []const u8, hr: win32.HRESULT) void {
 }
 
 /// How far the frame is to reach into the client area: over the tab bar
-/// while it shows and Mica is wanted, else not at all.
+/// while it shows and Mica is wanted, else not at all. The quick
+/// terminal is a pop-up with no title bar, whatever `window-decoration`
+/// says (`Window.isDecorated` reads only that).
 fn wanted(window: *const Window) i32 {
-    if (window.frame_colors != null) return 0;
+    if (window.frame_colors != null or window.quick) return 0;
     if (!window.isDecorated() or window.overview.open) return 0;
     if (window.bar.hwnd == null) return 0;
     return window.barHeight();

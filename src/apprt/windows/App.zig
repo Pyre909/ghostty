@@ -16810,6 +16810,16 @@ test "win32: an opaque frame's tab bar shows its Mica, but not under window-them
     Window.test_caption = &dwm.caption;
     defer Window.test_caption = null;
 
+    // A frame whose bar does not show keeps the default backdrop.
+    const lone = try testFrame(&app);
+    const lone_pane = try testPane(&app, lone);
+    lone.tab().tree = try .init(alloc, lone_pane);
+    lone.relayout();
+    lone.applyTheme();
+    try std.testing.expectEqual(0, TestClear.backdrop_count);
+    try std.testing.expect(lone.backdrop == .default);
+    try std.testing.expectEqual(0, dwm.calls);
+
     // Three tabs, so the bar shows: Mica, asked for once, behind it.
     const t = try TestOverview.init(&app);
     const window = t.window;
@@ -16869,6 +16879,16 @@ test "win32: an opaque frame's tab bar shows its Mica, but not under window-them
     try std.testing.expect(!window.isDecorated());
     try std.testing.expectEqual(0, dwm.top);
     window.toggleDecorations();
+    window.relayout();
+    try std.testing.expectEqual(height, dwm.top);
+
+    // The quick terminal, a pop-up with no title bar whatever
+    // window-decoration says, has none (its frame's `quick` is set as it
+    // is made, so here in place of making one).
+    window.quick = true;
+    window.relayout();
+    try std.testing.expectEqual(0, dwm.top);
+    window.quick = false;
     window.relayout();
     try std.testing.expectEqual(height, dwm.top);
 
