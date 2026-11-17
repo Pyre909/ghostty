@@ -17292,6 +17292,41 @@ const TestUpdate = struct {
         try std.testing.expectEqual(0, app.requests.items.len);
     }
 
+    /// The key the tests' feeds are signed with: RFC 8032's first test
+    /// key (section 7.1, TEST 1), as update_feed.zig's test uses.
+    fn keyPair() std.crypto.sign.Ed25519.KeyPair {
+        var seed: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&seed, "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60") catch unreachable;
+        return std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
+    }
+
+    /// The routes' indexes: the feed, the package, the feed's signature.
+    const feed_route = 0;
+    const package_route = 1;
+    const signature_route = 2;
+
+    var signature_buf: [128]u8 = undefined;
+
+    /// Serve `response` as the feed and, where it is a 200, its body's
+    /// signature by `keyPair`; else no signature either.
+    fn serve(routes: []http_testing.TestServer.Route, response: []const u8) void {
+        const start = std.mem.indexOf(u8, response, "\r\n\r\n");
+        const ok = std.mem.startsWith(u8, response, "HTTP/1.1 200 ");
+        serveSigned(routes, response, if (ok) response[start.? + 4 ..] else null);
+    }
+
+    /// Serve `response` as the feed, and the signature of `signed`, not
+    /// necessarily its body, or none for null.
+    fn serveSigned(routes: []http_testing.TestServer.Route, response: []const u8, signed: ?[]const u8) void {
+        routes[feed_route].response = response;
+        const bytes = signed orelse {
+            routes[signature_route].response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            return;
+        };
+        const sig = (keyPair().sign(bytes, null) catch unreachable).toBytes();
+        routes[signature_route].response = std.fmt.bufPrint(&signature_buf, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{s}", .{ sig.len, &sig }) catch unreachable;
+    }
+
     /// The feed's response: `version`, its package at `package` on
     /// `server` for both architectures, of SHA-256 `sha256`.
     fn feed(buf: []u8, server: *const http_testing.TestServer, version: []const u8, package: []const u8, sha256: [32]u8) []const u8 {
@@ -17341,6 +17376,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     var routes = [_]http_testing.TestServer.Route{
         .{ .path = releases ++ "feed.json", .response = not_found },
         .{ .path = package_path, .response = http_testing.okResponse(package) },
+        .{ .path = releases ++ "feed.json.sig", .response = not_found },
     };
     try server.start(&routes);
     defer server.stop();
@@ -17351,6 +17387,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
         .feed = server.url(&feed_url_buf, releases ++ "feed.json"),
         .https_only = false,
         .system_proxy = false,
+        .public_key = TestUpdate.keyPair().public_key.toBytes(),
     };
     var feed_buf: [1024]u8 = undefined;
     const newer = TestUpdate.feed(&feed_buf, &server, "999.0.0", package_path, sha256);
@@ -17361,7 +17398,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
 
     // Asked for, a check tells whatever it finds; asked for again while
     // it runs, it is the same check.
-    routes[0].response = newer;
+    TestUpdate.serve(&routes, newer);
     try std.testing.expect(try app.performAction(.app, .check_for_updates, {}));
     const job = app.updater.running;
     try std.testing.expect(try app.performAction(.app, .check_for_updates, {}));
@@ -17369,41 +17406,57 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(1, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("999.0.0"));
-    // Only the feed: `auto-update` is off, so nothing downloads.
-    try std.testing.expectEqual(1, server.requests.load(.monotonic));
+    // Only the feed and its signature: `auto-update` is off, so nothing
+    // downloads.
+    try std.testing.expectEqual(0, server.hits(TestUpdate.package_route));
+    try std.testing.expectEqual(1, server.hits(TestUpdate.signature_route));
 
-    routes[0].response = older;
+    TestUpdate.serve(&routes, older);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(2, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("up to date"));
 
-    routes[0].response = not_found;
+    TestUpdate.serve(&routes, not_found);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(3, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not check"));
 
+    // A feed signed by a key not the build's, or not over these bytes,
+    // or not signed at all, is not believed, however new.
+    TestUpdate.serveSigned(&routes, newer, older);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(4, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check for updates (BadSignature)"));
+    TestUpdate.serveSigned(&routes, newer, null);
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(5, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("could not check"));
+    try std.testing.expect(!TestUpdate.says("999.0.0"));
+
     // `auto-update` checks at its timer and tells only of an update.
     app.updater.configure(.check);
     try std.testing.expect(app.updater.armed);
     for ([_][]const u8{ not_found, older }) |response| {
-        routes[0].response = response;
+        TestUpdate.serve(&routes, response);
         _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
         try TestUpdate.finish(&app);
     }
-    try std.testing.expectEqual(3, TestUpdate.boxes);
-    routes[0].response = newer;
+    try std.testing.expectEqual(5, TestUpdate.boxes);
+    TestUpdate.serve(&routes, newer);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(4, TestUpdate.boxes);
+    try std.testing.expectEqual(6, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("999.0.0"));
     // A manual check while an automatic one runs makes it tell all.
-    routes[0].response = older;
+    TestUpdate.serve(&routes, older);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(5, TestUpdate.boxes);
+    try std.testing.expectEqual(7, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("up to date"));
 
     // A post that fails while the app runs, as with its queue full, is
@@ -17413,7 +17466,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
     try std.testing.expectEqual(0, Updater.test_post_failures.load(.monotonic));
-    try std.testing.expectEqual(6, TestUpdate.boxes);
+    try std.testing.expectEqual(8, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("up to date"));
 
     // A message not the running check's, as another process could post:
@@ -17425,7 +17478,7 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     _ = App.wndProc(app.msg_hwnd, WM_GHOSTTY_UPDATE, 0, 0x1000);
     try std.testing.expectEqual(running, app.updater.running);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(7, TestUpdate.boxes);
+    try std.testing.expectEqual(9, TestUpdate.boxes);
 
     // Off, a WM_TIMER already queued starts nothing.
     app.updater.configure(.off);
@@ -17444,10 +17497,10 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     defer alloc.free(file);
     app.updater.installed = true;
     app.updater.configure(.download);
-    routes[0].response = bad_hash;
+    TestUpdate.serve(&routes, bad_hash);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(8, TestUpdate.boxes);
+    try std.testing.expectEqual(10, TestUpdate.boxes);
     try std.testing.expectEqual(null, try http_testing.read(alloc, file));
     try std.testing.expectEqual(0, try http_testing.countMatching(alloc, file, ".*.part"));
 
@@ -17461,12 +17514,12 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     const other = try dir.file(alloc, "ghostty-notes.txt");
     defer alloc.free(other);
     for ([_][:0]const u16{ old, part, other, file }) |path| try http_testing.write(path, "junk");
-    routes[0].response = newer;
-    var requests = server.requests.load(.monotonic);
+    TestUpdate.serve(&routes, newer);
+    var downloads = server.hits(TestUpdate.package_route);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(9, TestUpdate.boxes);
-    try std.testing.expectEqual(requests + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(11, TestUpdate.boxes);
+    try std.testing.expectEqual(downloads + 1, server.hits(TestUpdate.package_route));
     const got = (try http_testing.read(alloc, file)).?;
     defer alloc.free(got);
     try std.testing.expectEqualStrings(package, got);
@@ -17478,42 +17531,50 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
 
     // A later check of the same release keeps the package it saved: only
     // the feed is fetched.
-    requests = server.requests.load(.monotonic);
+    downloads = server.hits(TestUpdate.package_route);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(10, TestUpdate.boxes);
-    try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
+    try std.testing.expectEqual(12, TestUpdate.boxes);
+    try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
 
     // One that does not download is offered all the same, for Install to
     // download it again.
     try http_testing.write(file, "junk");
-    routes[1].response = not_found;
-    requests = server.requests.load(.monotonic);
+    routes[TestUpdate.package_route].response = not_found;
+    downloads = server.hits(TestUpdate.package_route);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(11, TestUpdate.boxes);
+    try std.testing.expectEqual(13, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("999.0.0"));
-    try std.testing.expectEqual(requests + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(downloads + 1, server.hits(TestUpdate.package_route));
     try std.testing.expectEqual(0, try http_testing.countMatching(alloc, file, ".*.part"));
-    routes[1].response = http_testing.okResponse(package);
+    routes[TestUpdate.package_route].response = http_testing.okResponse(package);
 
     // A Ghostty an update can only send to its release page downloads
     // nothing; nor one whose directory for packages cannot be made, which
     // still tells of the update.
     app.updater.installed = false;
-    requests = server.requests.load(.monotonic);
+    downloads = server.hits(TestUpdate.package_route);
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(12, TestUpdate.boxes);
-    try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
+    try std.testing.expectEqual(14, TestUpdate.boxes);
+    try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
     app.updater.installed = true;
-    Updater.test_package_dir = &.{};
-    requests = server.requests.load(.monotonic);
+    // Nor one built with no key to check a feed by: it cannot install.
+    app.updater.source.public_key = null;
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(13, TestUpdate.boxes);
+    try std.testing.expectEqual(15, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("999.0.0"));
-    try std.testing.expectEqual(requests + 1, server.requests.load(.monotonic));
+    try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
+    app.updater.source.public_key = TestUpdate.keyPair().public_key.toBytes();
+    Updater.test_package_dir = &.{};
+    downloads = server.hits(TestUpdate.package_route);
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(16, TestUpdate.boxes);
+    try std.testing.expect(TestUpdate.says("999.0.0"));
+    try std.testing.expectEqual(downloads, server.hits(TestUpdate.package_route));
     Updater.test_package_dir = dir.path;
 
     // A check that cannot start is told when asked for, and only then.
@@ -17522,12 +17583,12 @@ test "win32: check_for_updates reports an update, none or a failure; auto-update
     _ = try app.performAction(.app, .check_for_updates, {});
     try std.testing.expectEqual(null, app.updater.running);
     app.createRequested();
-    try std.testing.expectEqual(14, TestUpdate.boxes);
+    try std.testing.expectEqual(17, TestUpdate.boxes);
     try std.testing.expect(TestUpdate.says("could not check"));
     _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, Updater.timer_id, 0);
     try std.testing.expectEqual(null, app.updater.running);
     app.createRequested();
-    try std.testing.expectEqual(14, TestUpdate.boxes);
+    try std.testing.expectEqual(17, TestUpdate.boxes);
 }
 
 /// For tests: the update offer's task dialog (`About.test_record`), and
@@ -17658,6 +17719,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     var routes = [_]http_testing.TestServer.Route{
         .{ .path = releases ++ "feed.json", .response = "" },
         .{ .path = package_path, .response = http_testing.okResponse(package) },
+        .{ .path = releases ++ "feed.json.sig", .response = "" },
     };
     try server.start(&routes);
     defer server.stop();
@@ -17668,9 +17730,10 @@ test "win32: an offered update installs its package with msiexec, or opens its r
         .feed = server.url(&feed_url_buf, releases ++ "feed.json"),
         .https_only = false,
         .system_proxy = false,
+        .public_key = TestUpdate.keyPair().public_key.toBytes(),
     };
     var feed_buf: [1024]u8 = undefined;
-    routes[0].response = TestUpdate.feedWithNotes(&feed_buf, &server, "999.0.0", package_path, sha256, releases ++ "tag/v999");
+    TestUpdate.serve(&routes, TestUpdate.feedWithNotes(&feed_buf, &server, "999.0.0", package_path, sha256, releases ++ "tag/v999"));
     var notes_buf: [128]u8 = undefined;
     const notes = server.url(&notes_buf, releases ++ "tag/v999");
     const notes_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, notes);
@@ -17744,12 +17807,12 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     // A package saved already, which a check finds still the package, is
     // installed as it is: only the feed is fetched.
     app.updater.configure(.download);
-    var before = server.requests.load(.monotonic);
+    var before = server.hits(TestUpdate.package_route);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(before + 1, server.requests.load(.monotonic));
+    try std.testing.expectEqual(before, server.hits(TestUpdate.package_route));
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(before + 1, server.requests.load(.monotonic));
+    try std.testing.expectEqual(before, server.hits(TestUpdate.package_route));
     try std.testing.expectEqual(4, TestOffer.installs);
     try std.testing.expectEqualSlices(u16, file, TestOffer.installed[0..TestOffer.installed_len]);
     try std.testing.expect(TestOffer.package_read);
@@ -17757,12 +17820,12 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     // One changed while the offer is open is checked again before
     // msiexec runs, and downloaded again.
     TestOffer.tamper = file;
-    before = server.requests.load(.monotonic);
+    before = server.hits(TestUpdate.package_route);
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);
     TestOffer.tamper = null;
     try TestUpdate.finish(&app);
-    try std.testing.expectEqual(before + 2, server.requests.load(.monotonic));
+    try std.testing.expectEqual(before + 1, server.hits(TestUpdate.package_route));
     try std.testing.expectEqual(5, TestOffer.installs);
     try std.testing.expect(TestOffer.package_read);
     try std.testing.expect(!TestOffer.package_writable);
@@ -17780,6 +17843,17 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
     try std.testing.expectEqual(null, app.updater.running);
     try std.testing.expectEqual(5, TestOffer.installs);
+    // So is the package's own, built with no key to check a feed by.
+    app.updater.installed = true;
+    app.updater.source.public_key = null;
+    Updater.test_opened = null;
+    _ = try app.performAction(.app, .check_for_updates, {});
+    try TestUpdate.finish(&app);
+    try std.testing.expectEqual(Updater.release_page_id, TestOffer.ids[0]);
+    try std.testing.expectEqualStrings(notes, Updater.test_opened.?);
+    try std.testing.expectEqual(null, app.updater.running);
+    try std.testing.expectEqual(5, TestOffer.installs);
+    app.updater.source.public_key = TestUpdate.keyPair().public_key.toBytes();
 
     // Without a task dialog, a message box asks, and Yes installs.
     About.test_record.task_dialog = null;
@@ -17825,7 +17899,7 @@ test "win32: an offered update installs its package with msiexec, or opens its r
     // An install that fails before msiexec says so, not that the check
     // failed.
     _ = win32.DeleteFileW(file);
-    routes[1].response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    routes[TestUpdate.package_route].response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     const asked = TestUpdate.boxes;
     _ = try app.performAction(.app, .check_for_updates, {});
     try TestUpdate.finish(&app);

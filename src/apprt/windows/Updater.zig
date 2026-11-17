@@ -43,6 +43,9 @@ pub const Source = struct {
     /// Both true but in tests, whose server is on a loopback port.
     https_only: bool = true,
     system_proxy: bool = true,
+    /// The key the feed is signed with (`update_feed.verify`), or null
+    /// for a build that installs no update and so checks no signature.
+    public_key: ?[32]u8 = null,
 
     const repo_releases = "https://github.com/Pyre909/ghostty/releases/";
     const feed_name = "ghostty-windows-update.json";
@@ -58,6 +61,7 @@ pub const Source = struct {
                 .stable => repo_releases ++ "download/stable-windows/" ++ feed_name,
                 .tip => repo_releases ++ "download/tip-windows/" ++ feed_name,
             },
+            .public_key = build_config.update_public_key,
         };
     }
 };
@@ -77,6 +81,8 @@ const repost_ms = if (builtin.is_test) 10 else 1000;
 /// The feed is small; the cap only bounds a broken or hostile one.
 const max_feed = 1024 * 1024;
 const max_package = 512 * 1024 * 1024;
+/// An Ed25519 signature's 64 bytes, with room to tell a longer file.
+const max_signature = 128;
 
 pub const Result = union(enum) {
     /// The feed's version is not newer than this build's.
@@ -177,6 +183,12 @@ pub const Job = struct {
         const session = try job.openSession();
         defer session.close();
         const body = try session.get(arena, job.source.feed, max_feed);
+        if (job.source.public_key) |key| {
+            // Beside the feed: ".sig" after its URL.
+            const sig_url = try std.mem.concat(arena, u8, &.{ job.source.feed, ".sig" });
+            const signature = try session.get(arena, sig_url, max_signature);
+            try update_feed.verify(body, signature, key);
+        }
         const found = try update_feed.parse(arena, body, build_config.version_string, arch, job.source.releases) orelse
             return .current;
         const dir = job.dir orelse return .{ .update = .{ .found = found, .path = null } };
@@ -330,8 +342,17 @@ running: ?*Job = null,
 /// Armed on `hwnd` as `timer_id`.
 armed: bool = false,
 /// Whether this Ghostty is the package's (`isInstalledCopy`), which an
-/// update can replace; else it is only offered on its release page.
+/// update can replace (`installable`).
 installed: bool = false,
+
+/// Whether an update is installed here, rather than only offered on its
+/// release page: where this Ghostty is the package's, as a zip or a build
+/// of one's own is not the package's to replace, and its build has the
+/// key the feed is signed with, so that the package's hash, from the
+/// feed, says who published it.
+pub fn installable(self: *const Updater) bool {
+    return self.installed and self.source.public_key != null;
+}
 
 /// Follow `auto-update`: arm the first check if it was off, disarm it if
 /// it is now off. A change of channel takes a restart, as the docs say.
@@ -416,10 +437,10 @@ fn spawn(self: *Updater, manual: bool, install: ?Install) !void {
     const a = arena.allocator();
     const job = try a.create(Job);
     // A package is downloaded ahead only where Install is offered
-    // (`installed`); an install always wants the directory, to prune and
+    // (`installable`); an install always wants the directory, to prune and
     // to download to again if its package changed. Without it a check
     // goes on, and an install tells why it failed (`error.NoPackageDir`).
-    const wants_dir = install != null or (self.mode == .download and self.installed);
+    const wants_dir = install != null or (self.mode == .download and self.installable());
     const dir = if (!wants_dir) null else packageDir(a) catch |err| dir: {
         log.warn("update directory not found err={}", .{err});
         break :dir null;
@@ -567,13 +588,12 @@ pub fn report(app: *App, job: *const Job) void {
 pub const install_id: c_int = 100;
 pub const release_page_id: c_int = 101;
 
-/// Offer `found`: Install where this Ghostty is the package's
-/// (`installed`), else Open Release Page, as a zip or a build of one's
-/// own is not the package's to replace; and Later. The release notes are
-/// a link in the dialog. `path` is the package, if already downloaded.
+/// Offer `found`: Install where it can be (`installable`), else Open
+/// Release Page; and Later. The release notes are a link in the dialog.
+/// `path` is the package, if already downloaded.
 fn offer(app: *App, found: update_feed.Update, path: ?[:0]const u16) void {
     const alloc = app.core_app.alloc;
-    const installable = app.updater.installed;
+    const can_install = app.updater.installable();
     const available = std.fmt.allocPrint(alloc, "Ghostty {s} is available. You have {s}.", .{
         found.version,
         build_config.version_string,
@@ -583,7 +603,7 @@ fn offer(app: *App, found: update_feed.Update, path: ?[:0]const u16) void {
     const owner = app.promptOwner(null);
     app.beginUnframedPrompt(owner);
     defer app.endPrompt();
-    const chosen = ask(app, owner, available, found.notes, installable) orelse return oom();
+    const chosen = ask(app, owner, available, found.notes, can_install) orelse return oom();
     switch (chosen) {
         // Not once the app quits under the dialog: the install would be
         // cut off at exit.
@@ -598,9 +618,9 @@ fn offer(app: *App, found: update_feed.Update, path: ?[:0]const u16) void {
 /// The offer's dialog: the button chosen, or null without the memory for
 /// it. A task dialog, or a message box without TaskDialogIndirect or if
 /// that fails, as About's.
-fn ask(app: *App, owner: ?win32.HWND, available: []const u8, notes: ?[]const u8, installable: bool) ?c_int {
+fn ask(app: *App, owner: ?win32.HWND, available: []const u8, notes: ?[]const u8, can_install: bool) ?c_int {
     const alloc = app.core_app.alloc;
-    const action = if (installable) install_id else release_page_id;
+    const action = if (can_install) install_id else release_page_id;
     if (About.taskDialog()) |task_dialog| task: {
         const content = if (notes) |url|
             std.fmt.allocPrint(alloc, "{s}\n\n<a href=\"{s}\">Release notes</a>", .{ available, url }) catch return null
@@ -613,7 +633,7 @@ fn ask(app: *App, owner: ?win32.HWND, available: []const u8, notes: ?[]const u8,
         defer if (notes_wide) |w| alloc.free(w);
         const link: Link = .{ .url = notes orelse "", .wide = notes_wide orelse &.{} };
         const buttons = [_]About.TASKDIALOG_BUTTON{
-            .{ .nButtonID = action, .pszButtonText = if (installable) win32.L("Install") else win32.L("Open Release Page") },
+            .{ .nButtonID = action, .pszButtonText = if (can_install) win32.L("Install") else win32.L("Open Release Page") },
             .{ .nButtonID = win32.IDCANCEL, .pszButtonText = win32.L("Later") },
         };
         const config: About.TASKDIALOGCONFIG = .{
@@ -643,7 +663,7 @@ fn ask(app: *App, owner: ?win32.HWND, available: []const u8, notes: ?[]const u8,
     }
     const question = std.fmt.allocPrintSentinel(alloc, "{s}\n\n{s}", .{
         available,
-        if (installable) "Install it now?" else "Open its release page?",
+        if (can_install) "Install it now?" else "Open its release page?",
     }, 0) catch return null;
     defer alloc.free(question);
     const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, question) catch return null;

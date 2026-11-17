@@ -11,6 +11,7 @@ here and checked against its source, not by running it.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import json
@@ -30,6 +31,13 @@ import test_make_msi as tmm
 
 REPO = Path(__file__).resolve().parents[2]
 TAG = "v1.4.1-win.3"
+# The feed both make_feed.py and Ghostty's parser are tested against
+# (update_feed.zig embeds it), and its signature.
+FIXTURE = REPO / "src/apprt/windows/testdata"
+# RFC 8032's first Ed25519 test key (section 7.1, TEST 1): it signs only
+# the fixture, and its public half is published with the RFC.
+TEST_SEED = bytes.fromhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+TEST_PUBLIC = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
 
 
 def run(main, argv: list[str]) -> tuple[int, str, str]:
@@ -68,7 +76,7 @@ class TestFeed(Temp):
     def test_names_each_package_by_its_asset_url_and_hash(self) -> None:
         arm = self.package("ghostty-1.4.1-win.3-windows-aarch64.msi", b"arm")
         x64 = self.package("ghostty-1.4.1-win.3-windows-x86_64.msi", b"x64")
-        code, out, err = run(mf.main, [str(arm), str(x64), "--tag", TAG])
+        code, out, err = run(mf.main, [str(arm), str(x64), "--tag", TAG, "--unsigned"])
         self.assertEqual((code, err), (0, ""))
         dest = self.dir / mf.FEED
         self.assertEqual(out, f"{dest}\n")
@@ -100,7 +108,7 @@ class TestFeed(Temp):
     def test_one_architecture_and_out(self) -> None:
         x64 = self.package("ghostty-1.5.0-tip.7-windows-x86_64.msi")
         out = self.dir / "out"
-        code, _, err = run(mf.main, [str(x64), "--tag", mf.TIP_TAG, "--out", str(out)])
+        code, _, err = run(mf.main, [str(x64), "--tag", mf.TIP_TAG, "--out", str(out), "--unsigned"])
         self.assertEqual((code, err), (0, ""))
         feed = json.loads((out / mf.FEED).read_text("utf-8"))
         self.assertEqual(list(feed["packages"]), ["x86_64"])
@@ -127,15 +135,70 @@ class TestFeed(Temp):
             with self.subTest(names=names, tag=tag):
                 for n in set(names):
                     self.package(n)
-                code, out, err = run(mf.main, [str(self.dir / n) for n in names] + ["--tag", tag])
+                code, out, err = run(mf.main, [str(self.dir / n) for n in names] + ["--tag", tag, "--unsigned"])
                 self.assertEqual((code, out), (1, ""))
                 self.assertIn(says, err)
                 self.assertFalse((self.dir / mf.FEED).exists())
 
     def test_missing_package(self) -> None:
-        code, _, err = run(mf.main, [str(self.dir / "ghostty-1.4.1-windows-x86_64.msi"), "--tag", TAG])
+        code, _, err = run(mf.main, [str(self.dir / "ghostty-1.4.1-windows-x86_64.msi"), "--tag", TAG, "--unsigned"])
         self.assertEqual(code, 1)
         self.assertIn("is not a file", err)
+
+
+def test_key(directory: Path) -> Path:
+    """The RFC 8032 test key, as the PEM file OpenSSL reads."""
+    der = bytes.fromhex("302e020100300506032b657004220420") + TEST_SEED
+    pem = "-----BEGIN PRIVATE KEY-----\n" + base64.b64encode(der).decode() + "\n-----END PRIVATE KEY-----\n"
+    path = directory / "key.pem"
+    path.write_text(pem, "ascii")
+    return path
+
+
+class TestSigned(Temp):
+    def packages(self) -> list[str]:
+        return [
+            str(self.package("ghostty-1.4.1-win.3-windows-aarch64.msi", b"arm")),
+            str(self.package("ghostty-1.4.1-win.3-windows-x86_64.msi", b"x64")),
+        ]
+
+    def test_writes_the_fixture_ghostty_reads(self) -> None:
+        # Byte for byte, the feed and signature update_feed.zig's test
+        # verifies and parses: a change to the format on either side
+        # fails one of the two.
+        key = test_key(self.dir)
+        code, out, err = run(mf.main, self.packages() + ["--tag", TAG, "--key", str(key)])
+        self.assertEqual((code, err), (0, ""))
+        for name in (mf.FEED, mf.SIGNATURE):
+            with self.subTest(name=name):
+                self.assertEqual((self.dir / name).read_bytes(), (FIXTURE / name).read_bytes())
+
+    def test_prints_the_public_key(self) -> None:
+        code, out, err = run(mf.main, ["--public-key", str(test_key(self.dir))])
+        self.assertEqual((code, out, err), (0, TEST_PUBLIC + "\n", ""))
+
+    def test_signs_or_says_it_does_not(self) -> None:
+        key = test_key(self.dir)
+        for extra, says in [
+            ([], "give --key"),
+            (["--key", str(key), "--unsigned"], "give --key"),
+        ]:
+            with self.subTest(extra=extra):
+                code, out, err = run(mf.main, self.packages() + ["--tag", TAG, *extra])
+                self.assertEqual((code, out), (1, ""))
+                self.assertIn(says, err)
+        # An unsigned feed leaves no signature of an earlier one beside it.
+        self.assertEqual(run(mf.main, self.packages() + ["--tag", TAG, "--key", str(key)])[0], 0)
+        self.assertEqual(run(mf.main, self.packages() + ["--tag", TAG, "--unsigned"])[0], 0)
+        self.assertFalse((self.dir / mf.SIGNATURE).exists())
+
+    def test_refuses_another_kind_of_key(self) -> None:
+        other = self.dir / "ed448.pem"
+        mf.openssl("openssl", ["genpkey", "-algorithm", "ed448", "-out", str(other)])
+        code, out, err = run(mf.main, self.packages() + ["--tag", TAG, "--key", str(other)])
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("is not an Ed25519 key", err)
+        self.assertFalse((self.dir / mf.SIGNATURE).exists())
 
 
 class TestRepository(unittest.TestCase):

@@ -20,6 +20,20 @@ The packages are those make_msi.py made, one per architecture, of one
 version, which their names give. The feed names each by its URL among
 the release's assets, with its SHA-256, which Ghostty checks before it
 installs one; and the release's page, for its notes.
+
+--key signs the feed: ghostty-windows-update.json.sig, beside it and
+published with it, is an Ed25519 signature over its exact bytes. A
+Ghostty built with the key's public half (-Dupdate-public-key, which
+make_zip.py passes on) installs an update only from a feed that
+signature verifies; one built without it only offers the release page,
+and --unsigned writes the feed for such builds. The key is made once,
+with OpenSSL 3 or later, and kept apart from the token that uploads
+releases (as upstream keeps its Sparkle key in a CI secret):
+
+    openssl genpkey -algorithm ed25519 -out ghostty-update-key.pem
+    python3 dist/windows/make_feed.py --public-key ghostty-update-key.pem
+
+the second printing the hex that -Dupdate-public-key takes.
 """
 
 from __future__ import annotations
@@ -27,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +55,7 @@ import make_zip
 # feed's name under them.
 RELEASES = make_msi.HOMEPAGE + "/releases/"
 FEED = "ghostty-windows-update.json"
+SIGNATURE = FEED + ".sig"
 TIP_TAG = "tip-windows"
 STABLE_TAG = "stable-windows"
 
@@ -135,23 +151,71 @@ def feed(packages: list[Package], tag: str) -> dict:
     }
 
 
+# An Ed25519 public key's DER (SubjectPublicKeyInfo, RFC 8410) is this,
+# then the key's 32 bytes.
+ED25519_SPKI = bytes.fromhex("302a300506032b6570032100")
+
+
+def openssl(tool: str, args: list[str]) -> bytes:
+    try:
+        run = subprocess.run([tool, *args], capture_output=True, check=False)
+    except OSError as e:
+        raise Error(f"{tool} not run: {e}") from e
+    if run.returncode != 0:
+        raise Error(f"{tool} {args[0]} failed: {run.stderr.decode(errors='replace').strip()}")
+    return run.stdout
+
+
+def public_key(tool: str, key: Path) -> str:
+    """The Ed25519 key at `key`'s public half, as -Dupdate-public-key
+    takes it."""
+    der = openssl(tool, ["pkey", "-in", str(key), "-pubout", "-outform", "DER"])
+    if len(der) != len(ED25519_SPKI) + 32 or not der.startswith(ED25519_SPKI):
+        raise Error(f"{key} is not an Ed25519 key")
+    return der[len(ED25519_SPKI) :].hex()
+
+
+def sign(tool: str, key: Path, feed_path: Path) -> Path:
+    """Sign the file at `feed_path` with `key`: the signature's path."""
+    public_key(tool, key)
+    dest = feed_path.with_name(SIGNATURE)
+    openssl(tool, ["pkeyutl", "-sign", "-rawin", "-inkey", str(key), "-in", str(feed_path), "-out", str(dest)])
+    if dest.stat().st_size != 64:
+        raise Error(f"{dest} is not an Ed25519 signature")
+    return dest
+
+
 def make(args: argparse.Namespace) -> Path:
+    if args.tag is None:
+        raise Error("give the release's --tag")
+    if (args.key is None) == (not args.unsigned):
+        raise Error("give --key to sign the feed, or --unsigned for builds with no update key")
     packages = read_packages([p.resolve() for p in args.packages])
     out = (args.out or packages[0].path.parent).resolve()
     out.mkdir(parents=True, exist_ok=True)
     dest = out / FEED
     text = json.dumps(feed(packages, args.tag), indent=2) + "\n"
+    dest.with_name(SIGNATURE).unlink(missing_ok=True)
     dest.write_text(text, "utf-8")
+    if args.key is not None:
+        sign(args.openssl, args.key, dest)
     return dest
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write the update feed for a release.")
-    parser.add_argument("packages", type=Path, nargs="+", help="make_msi.py's packages")
-    parser.add_argument("--tag", required=True, help=f"the release's tag ({TIP_TAG} for tip)")
+    parser.add_argument("packages", type=Path, nargs="*", help="make_msi.py's packages")
+    parser.add_argument("--tag", help=f"the release's tag ({TIP_TAG} for tip)")
     parser.add_argument("--out", type=Path, help="where to write (beside the first package)")
+    parser.add_argument("--key", type=Path, help="the Ed25519 private key (PEM) to sign the feed with")
+    parser.add_argument("--unsigned", action="store_true", help="write no signature")
+    parser.add_argument("--public-key", type=Path, metavar="KEY", help="print KEY's public half and stop")
+    parser.add_argument("--openssl", default="openssl", help="OpenSSL 3 or later (openssl)")
     args = parser.parse_args(argv)
     try:
+        if args.public_key is not None:
+            print(public_key(args.openssl, args.public_key))
+            return 0
         dest = make(args)
     except Error as e:
         print(f"make_feed: {e}", file=sys.stderr)

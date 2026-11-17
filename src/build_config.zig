@@ -20,6 +20,15 @@ pub const version_string = options.app_version_string;
 /// The release channel for this build.
 pub const release_channel = std.meta.stringToEnum(ReleaseChannel, @tagName(options.release_channel)).?;
 
+/// The Ed25519 public key that signs the Windows update feed
+/// (`-Dupdate-public-key`), or null: such a build installs no update.
+pub const update_public_key: ?[32]u8 = if (options.update_public_key.len == 0) null else key: {
+    var key: [32]u8 = undefined;
+    // The build checked it to be 64 hex digits.
+    _ = std.fmt.hexToBytes(&key, options.update_public_key) catch unreachable;
+    break :key key;
+};
+
 /// The optimization mode as a string.
 pub const mode_string = mode: {
     const m = @tagName(builtin.mode);

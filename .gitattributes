@@ -38,6 +38,8 @@ Makefile text eol=lf
 *.icns binary
 *.ttf binary
 *.otf binary
+# Signatures over exact bytes (the Windows update feed's)
+*.sig binary
 
 #--------------------------------------------------------------------
 # Linguist

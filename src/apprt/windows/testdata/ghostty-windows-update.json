@@ -1,0 +1,14 @@
+{
+  "version": "1.4.1-win.3",
+  "notes": "https://github.com/Pyre909/ghostty/releases/tag/v1.4.1-win.3",
+  "packages": {
+    "x86_64": {
+      "url": "https://github.com/Pyre909/ghostty/releases/download/v1.4.1-win.3/ghostty-1.4.1-win.3-windows-x86_64.msi",
+      "sha256": "5609f728403e197bb255ef50c62aeabb1f93b09f7b7c379903440b65cd4319cb"
+    },
+    "aarch64": {
+      "url": "https://github.com/Pyre909/ghostty/releases/download/v1.4.1-win.3/ghostty-1.4.1-win.3-windows-aarch64.msi",
+      "sha256": "ddf7ff5ebd9d66ce161466c1c0262430fa04de32b0e420ee3f489e2e2112e386"
+    }
+  }
+}

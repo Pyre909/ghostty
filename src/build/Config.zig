@@ -41,6 +41,8 @@ version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 /// Null: by `version`, as `addOptions` decides it.
 release_channel: ?ReleaseChannel = null,
+/// Hex, or empty for none.
+update_public_key: []const u8 = "",
 
 /// The absolute path the Ghostty executable is installed at, for the Linux
 /// desktop, D-Bus and systemd files that launch it. Null means they name
@@ -402,6 +404,21 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
         "The release channel the build updates from. If not specified, " ++
             "a version with a pre-release is tip's, any other stable's.",
     );
+
+    // The Windows updater installs an update only if its feed is signed
+    // with the key whose public half this is (dist/windows/make_feed.py).
+    if (b.option(
+        []const u8,
+        "update-public-key",
+        "The Ed25519 public key, as 64 hex digits, that signs the " ++
+            "Windows update feed. If not specified, an update is only " ++
+            "offered on its release page.",
+    )) |key| {
+        var bytes: [32]u8 = undefined;
+        if (key.len != 2 * bytes.len) return error.InvalidUpdatePublicKey;
+        _ = std.fmt.hexToBytes(&bytes, key) catch return error.InvalidUpdatePublicKey;
+        config.update_public_key = key;
+    }
 
     // libghostty-vt properties
 
@@ -902,6 +919,7 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
         .{self.lib_version},
         0,
     ));
+    step.addOption([]const u8, "update_public_key", self.update_public_key);
     step.addOption(
         ReleaseChannel,
         "release_channel",

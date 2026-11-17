@@ -19,6 +19,11 @@
 //! `.msi` of plain path segments, and the version semantic (semver.org),
 //! newer than this build's by semver's precedence. Unknown fields are
 //! ignored, so that a later feed can add some.
+//!
+//! A build that installs updates first checks the feed's signature
+//! (`verify`), which dist/windows/make_feed.py writes beside it: only
+//! then does the package's hash say who published the package, rather
+//! than only that it is the one the feed names.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -61,6 +66,17 @@ pub const Error = error{
     UrlNotAllowed,
     OutOfMemory,
 };
+
+/// Whether `signature`, the feed's signature file, is an Ed25519
+/// signature of `body`, its exact bytes, by the key whose public half is
+/// `public_key` (the build's, `-Dupdate-public-key`).
+pub fn verify(body: []const u8, signature: []const u8, public_key: [32]u8) error{BadSignature}!void {
+    const Ed25519 = std.crypto.sign.Ed25519;
+    if (signature.len != Ed25519.Signature.encoded_length) return error.BadSignature;
+    const sig: Ed25519.Signature = .fromBytes(signature[0..Ed25519.Signature.encoded_length].*);
+    const key = Ed25519.PublicKey.fromBytes(public_key) catch return error.BadSignature;
+    sig.verify(body, key) catch return error.BadSignature;
+}
 
 const Package = struct {
     url: []const u8,
@@ -305,4 +321,47 @@ test "win32: a feed not of the feed's shape is refused, unknown fields aside" {
     ;
     const update = (try parse(a, body, "1.0.0", .x86_64, test_releases)).?;
     try testing.expect(update.notes == null);
+}
+
+test "win32: the feed make_feed.py writes and signs verifies, and parses for each arch" {
+    // testdata's feed and signature are byte for byte what make_feed.py
+    // writes for two packages (dist/windows/test_make_feed.py), signed
+    // with RFC 8032's first test key (section 7.1, TEST 1).
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const feed = @embedFile("testdata/ghostty-windows-update.json");
+    const signature = @embedFile("testdata/ghostty-windows-update.json.sig");
+    var seed: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&seed, "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+    var public_key: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&public_key, "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    const pair = try Ed25519.KeyPair.generateDeterministic(seed);
+    try std.testing.expectEqualSlices(u8, &public_key, &pair.public_key.toBytes());
+
+    try verify(feed, signature, public_key);
+    // Any other bytes, signature or key: refused.
+    var changed = feed.*;
+    changed[changed.len - 2] ^= 1;
+    try std.testing.expectError(error.BadSignature, verify(&changed, signature, public_key));
+    var forged = signature.*;
+    forged[0] ^= 1;
+    try std.testing.expectError(error.BadSignature, verify(feed, &forged, public_key));
+    try std.testing.expectError(error.BadSignature, verify(feed, signature[0 .. signature.len - 1], public_key));
+    const other = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    try std.testing.expectError(error.BadSignature, verify(feed, signature, other.public_key.toBytes()));
+    const own = try other.sign(feed, null);
+    try std.testing.expectError(error.BadSignature, verify(feed, &own.toBytes(), public_key));
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const releases = "https://github.com/Pyre909/ghostty/releases/";
+    inline for (.{ .{ Arch.x86_64, "x86_64", "x64" }, .{ Arch.aarch64, "aarch64", "arm" } }) |case| {
+        const update = (try parse(arena.allocator(), feed, "1.0.0", case[0], releases)).?;
+        try std.testing.expectEqualStrings("1.4.1-win.3", update.version);
+        try std.testing.expectEqualStrings(releases ++ "tag/v1.4.1-win.3", update.notes.?);
+        try std.testing.expectEqualStrings(releases ++ "download/v1.4.1-win.3/ghostty-1.4.1-win.3-windows-" ++ case[1] ++ ".msi", update.url);
+        var sha256: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(case[2], &sha256, .{});
+        try std.testing.expectEqualSlices(u8, &sha256, &update.sha256);
+    }
+    try std.testing.expectEqual(null, try parse(arena.allocator(), feed, "1.4.1-win.3", .x86_64, releases));
 }

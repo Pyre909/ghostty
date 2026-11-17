@@ -18,7 +18,9 @@ and prints their SHA-256 sums the way sha256sum does. It builds with the
 zig on PATH (or --zig), ReleaseFast with the debug information kept for the
 .pdb files, from a checkout whose tracked files have no uncommitted changes
 and whose src/shell-integration, which the install copies whole, holds
-only tracked files (unless --allow-dirty).
+only tracked files (unless --allow-dirty). --update-public-key is the
+hex make_feed.py --public-key prints: a build without it never installs
+an update, only offers its release page.
 
 The zips are reproducible: their entries are sorted, they hold no directory
 entries and no owners, and every entry has one time, SOURCE_DATE_EPOCH or
@@ -152,8 +154,10 @@ def channel(version: str) -> str:
     return "stable" if STABLE.fullmatch(version) else "tip"
 
 
-def build_flags(arch: str, version: str) -> list[str]:
-    """zig build's flags for the app of `version` on `arch`."""
+def build_flags(arch: str, version: str, public_key: str | None = None) -> list[str]:
+    """zig build's flags for the app of `version` on `arch`, whose
+    update feed is signed by the key whose public half is `public_key`."""
+    key = [] if public_key is None else [f"-Dupdate-public-key={public_key}"]
     return [
         "-Dapp-runtime=windows",
         f"-Dtarget={arch}-windows-gnu",
@@ -164,6 +168,7 @@ def build_flags(arch: str, version: str) -> list[str]:
         "-Demit-docs=false",
         f"-Dversion-string={version}",
         f"-Drelease-channel={channel(version)}",
+        *key,
     ]
 
 
@@ -795,6 +800,8 @@ def sha256(path: Path) -> str:
 def make(args: argparse.Namespace) -> None:
     if not SEMVER.fullmatch(args.version):
         raise Error(f"{args.version!r} is not a semantic version")
+    if args.update_public_key is not None and re.fullmatch(r"[0-9a-f]{64}", args.update_public_key) is None:
+        raise Error(f"{args.update_public_key!r} is not a public key as make_feed.py prints one")
     if not args.allow_dirty:
         dirty = git("status", "--porcelain", "--untracked-files=no")
         if dirty:
@@ -829,7 +836,7 @@ def make(args: argparse.Namespace) -> None:
 
     with tempfile.TemporaryDirectory(dir=out, prefix=".stage-") as tmp:
         stage = Path(tmp)
-        flags = build_flags(args.arch, args.version)
+        flags = build_flags(args.arch, args.version, args.update_public_key)
         # Only this build reads every package's build.zig.zon.
         report = ["windows-packages", "-Demit-windows-packages"]
         zig_build(zig, [*report, *flags], stage / "report")
@@ -879,6 +886,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--zig-license", type=Path, help="Zig's LICENSE, if not found")
     parser.add_argument(
         "--allow-dirty", action="store_true", help="build with uncommitted changes"
+    )
+    parser.add_argument(
+        "--update-public-key",
+        metavar="HEX",
+        help="the public key the update feed is signed with (make_feed.py --public-key)",
     )
     try:
         make(parser.parse_args(argv))

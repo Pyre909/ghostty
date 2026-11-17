@@ -39,10 +39,15 @@ pub const TestServer = struct {
     routes: []const Route,
     thread: std.Thread,
     requests: std.atomic.Value(usize) = .init(0),
+    /// Requests per route, by the route's index in `routes`.
+    route_hits: [max_routes]std.atomic.Value(usize) = @splat(.init(0)),
+
+    const max_routes = 8;
 
     /// Listen on a free port and serve `routes`, which the caller may
     /// change between requests.
     pub fn start(self: *TestServer, routes: []const Route) !void {
+        std.debug.assert(routes.len <= max_routes);
         var data: [512]u8 align(8) = undefined;
         if (ws.WSAStartup(0x0202, &data) != 0) return error.WSAStartup;
         const s = ws.socket(ws2_32.AF.INET, ws2_32.SOCK.STREAM, ws2_32.IPPROTO.TCP);
@@ -86,8 +91,11 @@ pub const TestServer = struct {
             var words = std.mem.splitScalar(u8, buf[0..line_end], ' ');
             _ = words.next();
             const path = words.next() orelse "";
-            const response = for (self.routes) |r| {
-                if (std.mem.eql(u8, r.path, path)) break r.response;
+            const response = for (self.routes, 0..) |r, i| {
+                if (std.mem.eql(u8, r.path, path)) {
+                    _ = self.route_hits[i].fetchAdd(1, .monotonic);
+                    break r.response;
+                }
             } else "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             var sent: usize = 0;
             while (sent < response.len) {
@@ -97,6 +105,11 @@ pub const TestServer = struct {
             }
             _ = ws.shutdown(c, SD_SEND);
         }
+    }
+
+    /// How many requests route `index` has answered.
+    pub fn hits(self: *const TestServer, index: usize) usize {
+        return self.route_hits[index].load(.monotonic);
     }
 
     /// `path` on this server, in `buf`.
