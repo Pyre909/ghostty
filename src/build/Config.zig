@@ -41,7 +41,8 @@ version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 lib_version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 0 },
 /// Null: by `version`, as `addOptions` decides it.
 release_channel: ?ReleaseChannel = null,
-/// Hex, or empty for none.
+/// One or two comma-separated 64-hex-digit Ed25519 public keys (current,
+/// then next), or empty for none.
 update_public_key: []const u8 = "",
 
 /// The absolute path the Ghostty executable is installed at, for the Linux
@@ -416,12 +417,23 @@ pub fn init(b: *std.Build, versions: Versions) !Config {
             "the next key. If not specified, an update is only offered " ++
             "on its release page.",
     )) |keys| {
-        var it = std.mem.splitScalar(u8, keys, ',');
-        var count: usize = 0;
-        while (it.next()) |key| : (count += 1) {
-            var bytes: [32]u8 = undefined;
-            if (count == 2 or key.len != 2 * bytes.len) return error.InvalidUpdatePublicKey;
-            _ = std.fmt.hexToBytes(&bytes, key) catch return error.InvalidUpdatePublicKey;
+        const valid = valid: {
+            var it = std.mem.splitScalar(u8, keys, ',');
+            var count: usize = 0;
+            while (it.next()) |key| : (count += 1) {
+                var bytes: [32]u8 = undefined;
+                if (count == 2 or key.len != 2 * bytes.len) break :valid false;
+                _ = std.fmt.hexToBytes(&bytes, key) catch break :valid false;
+            }
+            break :valid true;
+        };
+        if (!valid) {
+            std.log.err(
+                "-Dupdate-public-key must be one or two comma-separated " ++
+                    "64-hex-digit Ed25519 public keys (no spaces), got '{s}'",
+                .{keys},
+            );
+            return error.InvalidUpdatePublicKey;
         }
         config.update_public_key = keys;
     }
