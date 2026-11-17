@@ -1826,8 +1826,22 @@ pub extern "uxtheme" fn BeginBufferedPaint(
 ) callconv(.winapi) ?HPAINTBUFFER;
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-bufferedpaintsetalpha
 pub extern "uxtheme" fn BufferedPaintSetAlpha(buffer: HPAINTBUFFER, rect: ?*const RECT, alpha: BYTE) callconv(.winapi) HRESULT;
+/// BP_PAINTPARAMS: how a buffered paint begins. BPPF_NOCLIP gives the
+/// buffer the whole target rect; without it the buffer is clipped to the
+/// target DC's clip region, a WM_PAINT's update region (Learn:
+/// BP_PAINTPARAMS).
+pub const BP_PAINTPARAMS = extern struct {
+    cbSize: DWORD = @sizeOf(BP_PAINTPARAMS),
+    dwFlags: DWORD = 0,
+    prcExclude: ?*const RECT = null,
+    pBlendFunction: ?*const anyopaque = null,
+};
+pub const BPPF_NOCLIP: DWORD = 0x0002;
+/// The rect of the target the buffer covers, in the target's coordinates.
+/// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-getbufferedpainttargetrect
+pub extern "uxtheme" fn GetBufferedPaintTargetRect(buffer: HPAINTBUFFER, rect: *RECT) callconv(.winapi) HRESULT;
 /// The buffer's pixels, 32-bit BGRA rows `row` pixels apart, which may be
-/// wider than the rect it was begun with.
+/// wider than the rect it covers (`GetBufferedPaintTargetRect`).
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-getbufferedpaintbits
 pub extern "uxtheme" fn GetBufferedPaintBits(buffer: HPAINTBUFFER, bits: *?[*]u32, row: *c_int) callconv(.winapi) HRESULT;
 /// https://learn.microsoft.com/en-us/windows/win32/api/uxtheme/nf-uxtheme-endbufferedpaint

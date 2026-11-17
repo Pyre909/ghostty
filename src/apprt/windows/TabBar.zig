@@ -902,8 +902,11 @@ var mica_buffer_failed_logged = false;
 /// Paint the bar where the frame's Mica shows behind it (Mica.zig): drawn
 /// into a 32-bit buffer, whose pixels in the bar's colour are then made
 /// transparent and the rest opaque (`Mica.keyOut`), and copied with their
-/// alpha. False, said once, if no buffer can be had: the bar is then
-/// painted as in any frame, its pixels added to the Mica.
+/// alpha. The buffer is the whole bar (BPPF_NOCLIP), not the update
+/// region a partial repaint would clip it to, and the pixels made over
+/// are the ones it covers (`GetBufferedPaintTargetRect`). False, said
+/// once, if no buffer can be had: the bar is then painted as in any
+/// frame, its pixels added to the Mica.
 fn paintOverMica(
     window: *Window,
     hwnd: win32.HWND,
@@ -913,7 +916,8 @@ fn paintOverMica(
     font: ?win32.HGDIOBJ,
 ) bool {
     var mem: ?win32.HDC = null;
-    const buffer = win32.BeginBufferedPaint(hdc, &client, win32.BPBF_TOPDOWNDIB, null, &mem) orelse {
+    const params: win32.BP_PAINTPARAMS = .{ .dwFlags = win32.BPPF_NOCLIP };
+    const buffer = win32.BeginBufferedPaint(hdc, &client, win32.BPBF_TOPDOWNDIB, &params, &mem) orelse {
         if (!mica_buffer_failed_logged) {
             mica_buffer_failed_logged = true;
             log.warn("the tab bar shows added to the Mica behind it: BeginBufferedPaint failed err={}", .{win32.GetLastError()});
@@ -923,14 +927,27 @@ fn paintOverMica(
     // The buffer's DC, set whenever the buffer is (Learn), takes the
     // target's coordinates, the bar's client area's.
     draw(window, hwnd, mem.?, client, colors, font);
-    var bits: ?[*]u32 = null;
-    var row: c_int = 0;
-    if (win32.GetBufferedPaintBits(buffer, &bits, &row) >= 0 and row >= client.right) if (bits) |b| {
-        const r: usize = @intCast(row);
-        Mica.keyOut(b[0 .. r * @as(usize, @intCast(client.bottom))], r, @intCast(client.right), colors.bar);
-    };
+    keyBuffer(buffer, colors.bar);
     _ = win32.EndBufferedPaint(buffer, .TRUE);
     return true;
+}
+
+/// Make `buffer`'s pixels ready to show over Mica (`Mica.keyOut`), those
+/// in `key` transparent: as many rows of as many pixels as the rect it
+/// covers, whatever size it was asked for. Left as GDI drew them, added to
+/// the Mica, if its pixels cannot be had.
+fn keyBuffer(buffer: win32.HPAINTBUFFER, key: win32.COLORREF) void {
+    var rect: RECT = undefined;
+    if (win32.GetBufferedPaintTargetRect(buffer, &rect) < 0) return;
+    var bits: ?[*]u32 = null;
+    var row: c_int = 0;
+    if (win32.GetBufferedPaintBits(buffer, &bits, &row) < 0) return;
+    const b = bits orelse return;
+    const width = rect.right - rect.left;
+    const height = rect.bottom - rect.top;
+    if (width <= 0 or height <= 0 or row < width) return;
+    const r: usize = @intCast(row);
+    Mica.keyOut(b[0 .. r * @as(usize, @intCast(height))], r, @intCast(width), key);
 }
 
 /// Draw the bar into `mem`, a DC the size of its client area, `client`:
