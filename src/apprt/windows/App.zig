@@ -17364,7 +17364,9 @@ const TestUpdate = struct {
 };
 
 test "win32: check_for_updates reports an update, none or a failure; auto-update only an update, saved if it downloads" {
-    // Its many actions and wide literals, all evaluated at compile time.
+    // Each performAction resolves apprt.Action.Value(action) at compile
+    // time, an inline loop over Action's fields: this many exceed the
+    // default quota.
     @setEvalBranchQuota(10_000);
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
