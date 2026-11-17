@@ -565,7 +565,7 @@ pub fn scaleDpi(height: i32, to: u32, from: u32) i32 {
 }
 
 /// The bar's colours: the frame's own under `window-theme = ghostty`
-/// (`Window.frame_colors`), else by whether the title bar is dark
+/// (`Window.shownColors`, darker while it is inactive), else by whether the title bar is dark
 /// (`Window.dark_frame`), as the frame follows `window-theme`.
 const Colors = struct {
     bar: win32.COLORREF,
@@ -575,7 +575,7 @@ const Colors = struct {
     dim: win32.COLORREF,
 
     fn of(window: *const Window) Colors {
-        if (window.frame_colors) |c| {
+        if (window.shownColors()) |c| {
             const t = c.tabBar();
             return .{
                 .bar = FrameColors.colorref(t.bar),
@@ -1440,6 +1440,7 @@ test "win32: the tab bar takes the frame's colours under window-theme = ghostty"
     var window: Window = undefined;
     window.dark_frame = true;
     window.frame_colors = null;
+    window.caption_active = true;
     try std.testing.expectEqual(win32.rgb(0x1f, 0x1f, 0x1f), Colors.of(&window).bar);
 
     window.frame_colors = .{ .background = .{ .r = 0x10, .g = 0x20, .b = 0x30 }, .foreground = .{ .r = 0xF0, .g = 0xE0, .b = 0xD0 } };
@@ -1447,4 +1448,10 @@ test "win32: the tab bar takes the frame's colours under window-theme = ghostty"
     try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), c.bar);
     try std.testing.expectEqual(win32.rgb(0xF0, 0xE0, 0xD0), c.text);
     try std.testing.expect(c.shown != c.bar and c.hover != c.bar and c.shown != c.hover);
+
+    // Inactive: the darker bar of an unfocused frame.
+    window.caption_active = false;
+    const u = window.frame_colors.?.unfocused().background;
+    try std.testing.expectEqual(win32.rgb(u.r, u.g, u.b), Colors.of(&window).bar);
+    try std.testing.expect(Colors.of(&window).bar != c.bar);
 }

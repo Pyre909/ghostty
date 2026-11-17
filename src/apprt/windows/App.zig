@@ -5893,6 +5893,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .bar = .{},
         .dark_frame = false,
         .frame_colors = null,
+        .caption_active = false,
         .transparent = false,
         .backdrop = .default,
         .fullscreen = null,
@@ -16816,6 +16817,9 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     try std.testing.expect(window.frame_colors == null);
     // Nothing to give back: a new frame has the system's colours.
     try std.testing.expectEqual(0, attr.calls);
+    // Active, as a shown frame is.
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 1, 0);
+    try std.testing.expectEqual(0, attr.calls);
 
     var changed: Config = try .default(alloc);
     defer changed.deinit();
@@ -16828,6 +16832,23 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     try std.testing.expect(window.frame_colors != null);
     try std.testing.expect(window.dark_frame);
     try std.testing.expect(try attr.dark(window.hwnd));
+
+    // Inactive, the caption is darker, as GTK's unfocused header bar is;
+    // active again, as configured. Through the frame's own message, as
+    // DefWindowProcW draws the caption from it. The mode stays.
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 1, 0);
+    try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 0, 0);
+    const dim = (@import("FrameColors.zig"){
+        .background = .{ .r = 0x10, .g = 0x20, .b = 0x30 },
+        .foreground = .{ .r = 0xF0, .g = 0xE0, .b = 0xD0 },
+    }).unfocused().background;
+    try std.testing.expect(dim.r != 0x10 or dim.g != 0x20 or dim.b != 0x30);
+    try std.testing.expectEqual(win32.rgb(dim.r, dim.g, dim.b), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
+    try std.testing.expectEqual(win32.rgb(0xF0, 0xE0, 0xD0), try attr.get(window.hwnd, win32.DWMWA_TEXT_COLOR));
+    try std.testing.expect(window.dark_frame);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 1, 0);
+    try std.testing.expectEqual(win32.rgb(0x10, 0x20, 0x30), try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
 
     // A light title bar colour: the caption's mode follows it, not the
     // dark terminal background, so its buttons stay readable.
@@ -16852,6 +16873,12 @@ test "win32: window-theme = ghostty gives the caption the configured colours" {
     try std.testing.expect(window.frame_colors == null);
     try std.testing.expectEqual(win32.DWMWA_COLOR_DEFAULT, try attr.get(window.hwnd, win32.DWMWA_CAPTION_COLOR));
     try std.testing.expectEqual(win32.DWMWA_COLOR_DEFAULT, try attr.get(window.hwnd, win32.DWMWA_TEXT_COLOR));
+
+    // There, activation leaves the system's colours alone.
+    const calls = attr.calls;
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 0, 0);
+    _ = win32.SendMessageW(window.hwnd, win32.WM_NCACTIVATE, 1, 0);
+    try std.testing.expectEqual(calls, attr.calls);
 }
 
 test "win32: toggle_window_decorations waits for run and takes the caption off or puts it back" {

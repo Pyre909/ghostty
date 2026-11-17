@@ -143,8 +143,12 @@ dark_frame: bool,
 
 /// The colours the caption was last given (`applyTheme`), under
 /// `window-theme = ghostty`; null while it has the system's, as a new
-/// frame has. The tab bar draws in them too.
+/// frame has. The tab bar draws in them too, as shown (`shownColors`).
 frame_colors: ?FrameColors,
+
+/// Whether the caption is drawn active (WM_NCACTIVATE), as it is while
+/// the command palette has the activation. A new frame's is not.
+caption_active: bool,
 
 /// Whether the frame lets the desktop through where its terminals'
 /// background is translucent (Transparency.zig): set as the frame is made
@@ -1089,6 +1093,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .bar = .{},
         .dark_frame = false,
         .frame_colors = null,
+        .caption_active = false,
         .transparent = false,
         .backdrop = .default,
         .fullscreen = null,
@@ -2192,8 +2197,10 @@ fn handleMessage(
         // The caption stays active while the command palette, a pop-up
         // of the frame's, is activated, as a menu keeps it: the palette
         // is part of the window to the user.
-        win32.WM_NCACTIVATE => if (wparam == 0 and self.palette.activating) {
-            return win32.DefWindowProcW(hwnd, msg, 1, lparam);
+        win32.WM_NCACTIVATE => {
+            const keep = wparam == 0 and self.palette.activating;
+            self.captionActivated(wparam != 0 or keep);
+            if (keep) return win32.DefWindowProcW(hwnd, msg, 1, lparam);
         },
 
         // The command palette moves with the frame.
@@ -3651,7 +3658,8 @@ pub fn frameDark(
 pub fn applyTheme(self: *Window) void {
     const colors = FrameColors.of(&self.app.config, self.app.window_theme_override);
     const dark = if (colors) |c| c.dark() else frameDark(&self.app.config, self.app.system_scheme, self.app.window_theme_override);
-    const recolor = !std.meta.eql(colors, self.frame_colors) and setCaptionColors(self.hwnd, colors);
+    const recolor = !std.meta.eql(colors, self.frame_colors) and
+        setCaptionColors(self.hwnd, asShown(colors, self.caption_active));
     if (recolor) self.frame_colors = colors;
     if (dark == self.dark_frame and !recolor) return;
 
@@ -3683,6 +3691,30 @@ pub fn applyTheme(self: *Window) void {
     }
     CommandPalette.invalidate(self);
     TabOverview.invalidate(self);
+}
+
+/// `colors` as an active or an inactive caption shows them: darkened
+/// while inactive, as GTK darkens an unfocused header bar.
+fn asShown(colors: ?FrameColors, active: bool) ?FrameColors {
+    const c = colors orelse return null;
+    return if (active) c else c.unfocused();
+}
+
+/// The colours the caption and tab bar show now, under
+/// `window-theme = ghostty`; null for the system's.
+pub fn shownColors(self: *const Window) ?FrameColors {
+    return asShown(self.frame_colors, self.caption_active);
+}
+
+/// The caption was drawn active or inactive (WM_NCACTIVATE): under
+/// `window-theme = ghostty` it and the tab bar change colour with it. A
+/// failed call leaves the caption as it was until the next change.
+fn captionActivated(self: *Window, active: bool) void {
+    if (active == self.caption_active) return;
+    self.caption_active = active;
+    if (self.frame_colors == null) return;
+    _ = setCaptionColors(self.hwnd, self.shownColors());
+    self.bar.invalidate();
 }
 
 /// For tests: what answers in place of DwmSetWindowAttribute for the
