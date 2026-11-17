@@ -39,11 +39,7 @@ pub const Options = struct {
     blending_enabled: bool = true,
 };
 
-pub const Error = error{
-    ShaderCompileFailed,
-    D3D11Failed,
-    OutOfMemory,
-};
+pub const Error = ShaderCache.Error || error{D3D11Failed};
 
 vs: ?*api.ID3D11VertexShader = null,
 ps: ?*api.ID3D11PixelShader = null,
