@@ -2,15 +2,16 @@
 //! state one draw step uses.
 //!
 //! Shaders compile at runtime with D3DCompile from the HLSL source the
-//! backend embeds, as the OpenGL backend compiles its GLSL at runtime. A
-//! pipeline given no source stays a placeholder: `ready` is false and render
-//! steps skip it.
+//! backend embeds, as the OpenGL backend compiles its GLSL at runtime, but
+//! once per process: the bytecode comes from a ShaderCache. A pipeline
+//! given no source stays a placeholder: `ready` is false and render steps
+//! skip it.
 const Self = @This();
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const api = @import("api.zig");
+const ShaderCache = @import("ShaderCache.zig");
 
 const log = std.log.scoped(.d3d11);
 
@@ -19,6 +20,9 @@ pub const Options = struct {
 
     /// D3DCompile, resolved by the backend at init.
     compile: api.D3DCompileFn,
+
+    /// The bytecode of sources compiled before, the process's in the app.
+    cache: *ShaderCache,
 
     /// The render target format the pipeline draws into.
     format: api.DXGI_FORMAT,
@@ -38,6 +42,7 @@ pub const Options = struct {
 pub const Error = error{
     ShaderCompileFailed,
     D3D11Failed,
+    OutOfMemory,
 };
 
 vs: ?*api.ID3D11VertexShader = null,
@@ -60,13 +65,8 @@ pub fn init(comptime VertexAttributes: ?type, opts: Options) Error!Self {
 
     const device = opts.device;
 
-    const vs_blob = try compileShader(opts.compile, opts.name, vertex_source, "vs_5_0");
-    defer api.release(vs_blob);
-    const ps_blob = try compileShader(opts.compile, opts.name, fragment_source, "ps_5_0");
-    defer api.release(ps_blob);
-
-    const vs_bytes = vs_blob.bytes();
-    const ps_bytes = ps_blob.bytes();
+    const vs_bytes = try opts.cache.bytecode(opts.compile, opts.name, vertex_source, "vs_5_0");
+    const ps_bytes = try opts.cache.bytecode(opts.compile, opts.name, fragment_source, "ps_5_0");
 
     var vs: ?*api.ID3D11VertexShader = null;
     var hr = device.vtable.CreateVertexShader(device, vs_bytes.ptr, vs_bytes.len, null, &vs);
@@ -274,60 +274,4 @@ fn vertexFormat(comptime T: type, comptime count: usize) api.DXGI_FORMAT {
         },
         else => comptime unreachable,
     };
-}
-
-/// Compile one shader stage. Debug builds keep the shader debuggable;
-/// release builds optimize fully. The compiler's messages go to the log in
-/// both cases, as errors when it failed and at debug level otherwise.
-fn compileShader(
-    compile: api.D3DCompileFn,
-    name: []const u8,
-    source: [:0]const u8,
-    target: [*:0]const u8,
-) Error!*api.ID3DBlob {
-    const flags: api.UINT = api.D3DCOMPILE_ENABLE_STRICTNESS |
-        if (comptime builtin.mode == .debug)
-            api.D3DCOMPILE_DEBUG | api.D3DCOMPILE_SKIP_OPTIMIZATION
-        else
-            api.D3DCOMPILE_OPTIMIZATION_LEVEL3;
-
-    var shader: ?*api.ID3DBlob = null;
-    var messages: ?*api.ID3DBlob = null;
-    const hr = compile(
-        source.ptr,
-        source.len,
-        null,
-        null,
-        null,
-        "main",
-        target,
-        flags,
-        0,
-        &shader,
-        &messages,
-    );
-    defer if (messages) |m| api.release(m);
-
-    if (api.failed(hr)) {
-        if (shader) |s| api.release(s);
-        log.err("D3DCompile {s} ({s}) failed hr=0x{x}: {s}", .{
-            name,
-            std.mem.span(target),
-            @as(u32, @bitCast(hr)),
-            if (messages) |m| trimMessages(m.bytes()) else "(no compiler output)",
-        });
-        return error.ShaderCompileFailed;
-    }
-    if (messages) |m| {
-        const text = trimMessages(m.bytes());
-        if (text.len > 0) log.debug("D3DCompile {s} ({s}): {s}", .{ name, std.mem.span(target), text });
-    }
-
-    return shader orelse error.ShaderCompileFailed;
-}
-
-/// The compiler's text is NUL-terminated and ends with a newline.
-fn trimMessages(text: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, text, 0) orelse text.len;
-    return std.mem.trimEnd(u8, text[0..end], "\r\n ");
 }

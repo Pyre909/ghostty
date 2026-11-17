@@ -6,15 +6,18 @@
 //! scalars, so the u32-packed bit fields are what the shaders will read.
 //!
 //! The HLSL sources under shaders/hlsl/ are embedded at build time with
-//! their `#include`s expanded and compiled at runtime by D3DCompile. A
-//! pipeline built without sources stays a placeholder that render steps skip.
+//! their `#include`s expanded and compiled at runtime by D3DCompile, once
+//! per process (ShaderCache.zig). A pipeline built without sources stays a
+//! placeholder that render steps skip.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../../quirks.zig").inlineAssert;
 const math = @import("../../math.zig");
 
 const api = @import("api.zig");
 const Pipeline = @import("Pipeline.zig");
+const ShaderCache = @import("ShaderCache.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const log = std.log.scoped(.d3d11);
@@ -69,11 +72,13 @@ const PipelineDescription = struct {
         name: []const u8,
         device: *api.ID3D11Device,
         compile: api.D3DCompileFn,
+        cache: *ShaderCache,
         format: api.DXGI_FORMAT,
     ) !Pipeline {
         return try .init(self.vertex_attributes, .{
             .device = device,
             .compile = compile,
+            .cache = cache,
             .format = format,
             .name = name,
             .vertex_source = self.vertex_fn,
@@ -125,6 +130,7 @@ pub const Shaders = struct {
         alloc: Allocator,
         device: *api.ID3D11Device,
         compile: api.D3DCompileFn,
+        cache: *ShaderCache,
         post_shaders: []const [:0]const u8,
         format: api.DXGI_FORMAT,
     ) !Shaders {
@@ -142,6 +148,7 @@ pub const Shaders = struct {
                 pipeline[0],
                 device,
                 compile,
+                cache,
                 format,
             );
             initialized_pipelines += 1;
@@ -151,6 +158,7 @@ pub const Shaders = struct {
             alloc,
             device,
             compile,
+            cache,
             post_shaders,
             format,
         );
@@ -194,6 +202,7 @@ fn initPostPipelines(
     alloc: Allocator,
     device: *api.ID3D11Device,
     compile: api.D3DCompileFn,
+    cache: *ShaderCache,
     shaders: []const [:0]const u8,
     format: api.DXGI_FORMAT,
 ) ![]const Pipeline {
@@ -213,6 +222,7 @@ fn initPostPipelines(
         pipelines[i] = Pipeline.init(null, .{
             .device = device,
             .compile = compile,
+            .cache = cache,
             .format = format,
             .name = "custom shader",
             .vertex_source = full_screen_vertex,
@@ -641,4 +651,88 @@ test "d3d11 shaders: bit masks and registers match the Zig side" {
     const storage = print("register(t{d})", .{RenderPass.storage_register_base});
     try testing.expect(std.mem.indexOf(u8, text, storage) != null);
     try testing.expect(std.mem.indexOf(u8, cell_bg, storage) != null);
+}
+
+test "d3d11 shaders: a second device's shaders come from the cache, a custom shader's too" {
+    // As a second split starts: the same sources on another device. Each
+    // distinct source compiles on the first device only; full_screen's
+    // vertex shader, shared by bg_color, cell_bg and every custom shader,
+    // compiles once even there.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const D3D11 = @import("../D3D11.zig");
+
+    const Counting = struct {
+        var real: api.D3DCompileFn = undefined;
+        var calls: u32 = 0;
+        fn compile(
+            data: *const anyopaque,
+            data_size: api.SIZE_T,
+            filename: ?api.LPCSTR,
+            defines: ?[*]const api.D3D_SHADER_MACRO,
+            include: ?*api.ID3DInclude,
+            entrypoint: ?api.LPCSTR,
+            target: api.LPCSTR,
+            sflags: api.UINT,
+            eflags: api.UINT,
+            shader: *?*api.ID3DBlob,
+            messages: ?*?*api.ID3DBlob,
+        ) callconv(api.cc) api.HRESULT {
+            calls += 1;
+            return real(data, data_size, filename, defines, include, entrypoint, target, sflags, eflags, shader, messages);
+        }
+    };
+    Counting.real = try D3D11.loadCompiler();
+    Counting.calls = 0;
+
+    // The distinct (source, stage) pairs of the built-in pipelines.
+    var distinct: u32 = 0;
+    const sources = comptime s: {
+        var list: [2 * pipeline_descs.len][:0]const u8 = undefined;
+        for (pipeline_descs, 0..) |p, i| {
+            list[2 * i] = p[1].vertex_fn.?;
+            list[2 * i + 1] = p[1].fragment_fn.?;
+        }
+        break :s list;
+    };
+    for (sources, 0..) |s, i| {
+        const seen = for (sources[0..i], 0..) |earlier, j| {
+            if (j % 2 == i % 2 and std.mem.eql(u8, earlier, s)) break true;
+        } else false;
+        if (!seen) distinct += 1;
+    }
+    try testing.expect(distinct < sources.len);
+
+    var cache: ShaderCache = .init(testing.allocator);
+    defer cache.deinit();
+    const custom: [:0]const u8 = "float4 main() : SV_Target { return float4(1, 0, 0, 1); }";
+
+    var devices: [2]*api.ID3D11Device = undefined;
+    for (&devices) |*device| {
+        const levels = [_]api.D3D_FEATURE_LEVEL{.@"11_0"};
+        var d: ?*api.ID3D11Device = null;
+        if (api.failed(D3D11.D3D11CreateDevice(null, .WARP, null, 0, &levels, levels.len, api.D3D11_SDK_VERSION, &d, null, null)))
+            return error.TestDeviceFailed;
+        device.* = d orelse return error.TestDeviceFailed;
+    }
+    defer for (devices) |d| api.release(d);
+
+    var first = try Shaders.init(testing.allocator, devices[0], &Counting.compile, &cache, &.{custom}, .B8G8R8A8_UNORM);
+    defer first.deinit(testing.allocator);
+    try testing.expectEqual(distinct + 1, Counting.calls);
+
+    var second = try Shaders.init(testing.allocator, devices[1], &Counting.compile, &cache, &.{custom}, .B8G8R8A8_UNORM);
+    defer second.deinit(testing.allocator);
+    try testing.expectEqual(distinct + 1, Counting.calls);
+
+    // The second device's pipelines are whole: shaders and input layouts
+    // made from the cached bytecode.
+    inline for (pipeline_descs) |p| {
+        const pipeline = @field(second.pipelines, p[0]);
+        try testing.expect(pipeline.ready);
+        try testing.expect(pipeline.vs != null and pipeline.ps != null);
+        try testing.expectEqual(p[1].vertex_attributes != null, pipeline.input_layout != null);
+    }
+    try testing.expectEqual(@as(usize, 1), second.post_pipelines.len);
+    try testing.expect(second.post_pipelines[0].ready);
 }

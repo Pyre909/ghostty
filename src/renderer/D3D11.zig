@@ -52,6 +52,7 @@ const global = @import("../global.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(D3D11);
 const shadertoy = @import("shadertoy.zig");
+const ShaderCache = @import("d3d11/ShaderCache.zig");
 
 /// The Direct3D 11, DXGI and compiler bindings, which the Windows apprt's
 /// ImGui backend draws with too.
@@ -1093,6 +1094,7 @@ pub fn initShaders(
         alloc,
         self.device,
         self.compile,
+        &ShaderCache.process,
         custom_shaders,
         self.targetFormat(),
     );

@@ -67,6 +67,7 @@ test {
     _ = @import("renderer/d3d11/api.zig");
     _ = @import("renderer/d3d11/buffer.zig");
     _ = @import("renderer/d3d11/shaders.zig");
+    _ = @import("renderer/d3d11/ShaderCache.zig");
 
     // Dmabuf is platform-independent apart from its fd handling.
     _ = @import("renderer/Dmabuf.zig");
