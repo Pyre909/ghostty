@@ -336,11 +336,13 @@ fn msiexec(arena: Allocator, path: [:0]const u16) !u32 {
     return code;
 }
 
-/// The time in Unix seconds, as a feed's `expires` is: the system's
-/// clock, in 100 ns units since 1601 (FILETIME's epoch).
+/// The time in Unix seconds, as a feed's `expires` is. It is the
+/// system's clock, which its user can set: set back, a feed past its
+/// expiry is believed again, as it would have been then; set ahead,
+/// every feed is refused. Expiry bounds how long a feed can be
+/// replayed to a correct clock, not to one turned back.
 fn unixTime() i64 {
-    const since_1601 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
-    return @divFloor(since_1601, std.time.ns_per_s / 100) + std.time.epoch.windows;
+    return std.os.windows.fromSysTime(std.os.windows.ntdll.RtlGetSystemTimePrecise()).toSeconds();
 }
 
 /// msiexec's command line: `image` installing `path`, with its progress
