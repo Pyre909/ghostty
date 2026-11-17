@@ -91,8 +91,9 @@ fn keyOf(source: []const u8, target: []const u8) [Sha256.digest_length]u8 {
 /// Compile one shader stage. Debug builds keep the shader debuggable;
 /// release builds optimize fully. The compiler's messages go to the log in
 /// both cases: at warn level when it failed, as the caller decides what a
-/// failure means (a custom shader is left out, a built-in one fails the
-/// surface), and at debug level otherwise.
+/// failure means (shaders.zig's initPostPipelines leaves a custom shader
+/// out at warn; its PipelineDescription.initPipeline logs a built-in one's
+/// failure as an error), and at debug level otherwise.
 fn compileShader(
     compile: api.D3DCompileFn,
     name: []const u8,

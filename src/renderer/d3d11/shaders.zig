@@ -75,7 +75,9 @@ const PipelineDescription = struct {
         cache: *ShaderCache,
         format: api.DXGI_FORMAT,
     ) !Pipeline {
-        return try .init(self.vertex_attributes, .{
+        // A built-in pipeline that fails leaves the surface blank, which
+        // is an error; the cache logged the compiler's text at warn.
+        return Pipeline.init(self.vertex_attributes, .{
             .device = device,
             .compile = compile,
             .cache = cache,
@@ -84,7 +86,10 @@ const PipelineDescription = struct {
             .vertex_source = self.vertex_fn,
             .fragment_source = self.fragment_fn,
             .blending_enabled = self.blending_enabled,
-        });
+        }) catch |err| {
+            log.err("pipeline {s} init failed err={}", .{ name, err });
+            return err;
+        };
     }
 };
 
