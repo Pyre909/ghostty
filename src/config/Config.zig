@@ -2236,7 +2236,14 @@ keybind: Keybinds = .{},
 ///   * `ghostty` - Use the background and foreground colors specified in the
 ///     Ghostty configuration. If the "theme" configuration has separate light
 ///     and dark themes, light or dark mode follows the system theme. This is
-///     only supported on Linux builds. On Windows it behaves as `auto`.
+///     only supported on Linux and Windows builds.
+///
+/// On Windows, under `ghostty` the title bar and the tab bar take those
+/// colors (or `window-titlebar-background` and `window-titlebar-foreground`),
+/// darkened while the window is inactive as on Linux, and the search bar
+/// and tab overview take them too; the title bar's buttons are light or
+/// dark to suit the title bar's color. Under the other values an opaque
+/// window's tab bar shows the title bar's Mica, from Windows 11 22H2.
 ///
 /// On macOS, if `macos-titlebar-style` is `tabs` or `transparent`, the window theme will be
 /// automatically set based on the luminosity of the terminal background color.
@@ -2405,15 +2412,15 @@ keybind: Keybinds = .{},
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
 /// Background color for the window titlebar. This only takes effect if
-/// window-theme is set to ghostty. Currently only supported in the GTK app
-/// runtime.
+/// window-theme is set to ghostty. Currently only supported in the GTK and
+/// Windows app runtimes; on Windows the tab bar takes it too.
 ///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"window-titlebar-background": ?Color = null,
 
 /// Foreground color for the window titlebar. This only takes effect if
-/// window-theme is set to ghostty. Currently only supported in the GTK app
-/// runtime.
+/// window-theme is set to ghostty. Currently only supported in the GTK and
+/// Windows app runtimes; on Windows the tab bar takes it too.
 ///
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"window-titlebar-foreground": ?Color = null,
