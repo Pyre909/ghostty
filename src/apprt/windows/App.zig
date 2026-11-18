@@ -1755,11 +1755,14 @@ pub const App = struct {
     /// (`promptOwner`): the one the user was last in, else the first one,
     /// but not the quick terminal while it is hidden or on its way out
     /// (`Window.quickShown`), which would take the activation back when the
-    /// box closes, out of sight.
+    /// box closes, out of sight. Nor a window that is closing: one parked
+    /// for `undo` keeps its terminals, so the last focused one can be in
+    /// it, hidden and out of the windows, and it would show empty
+    /// (`Window.park`).
     fn fallbackOwner(self: *const App) ?*Window {
         const shows = struct {
             fn f(window: *const Window) bool {
-                return !window.quick or window.quickShown();
+                return !window.closing and (!window.quick or window.quickShown());
             }
         }.f;
         if (self.core_app.focusedSurface()) |s| {
@@ -5789,6 +5792,9 @@ test "win32: a prompt belongs to a top-level window" {
     s.wb.hwnd = @ptrFromInt(0x20);
     s.wa.quick = false;
     s.wb.quick = false;
+    s.wa.closing = false;
+    s.wb.closing = false;
+    s.wq.closing = false;
     s.a.window = &s.wa;
     s.b.window = &s.wb;
     s.a.core_surface.rt_surface = &s.a;
@@ -5814,6 +5820,14 @@ test "win32: a prompt belongs to a top-level window" {
     core_app.focused_surface = &s.q.core_surface;
     try std.testing.expectEqual(s.wa.hwnd, app.promptOwner(null).?);
     core_app.focused_surface = &s.b.core_surface;
+    // Nor a closing one, as a window parked for `undo` is, whose
+    // terminals stay; with none left but those, the box has no owner.
+    s.wb.closing = true;
+    try std.testing.expectEqual(s.wa.hwnd, app.promptOwner(null).?);
+    s.wa.closing = true;
+    try std.testing.expect(app.promptOwner(null) == null);
+    s.wa.closing = false;
+    s.wb.closing = false;
 
     // The caller's own window always wins, and for a terminal that is its
     // frame. A hidden top-level window and a child of it stand in for them.
@@ -13357,6 +13371,15 @@ test "win32: a window closed while another stays is parked whole, and undo shows
         try std.testing.expect(pane.parked);
         try std.testing.expect(!shown(pane.hwnd));
     }
+    // The core still names its terminal the last focused one: a prompt
+    // with no window of its own goes to the window that shows.
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    try core_app.surfaces.append(alloc, t.a);
+    core_app.focused_surface = &t.a.core_surface;
+    try std.testing.expectEqual(other.hwnd, app.promptOwner(null).?);
+    core_app.focused_surface = null;
+    core_app.surfaces.clearRetainingCapacity();
     // Refused what would show, as a parked tab's terminals are.
     const queued = app.requests.items.len;
     try std.testing.expect(!try app.performAction(.{ .surface = &t.a.core_surface }, .new_split, .right));
