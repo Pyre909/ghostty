@@ -5029,6 +5029,29 @@ test "win32: the quick terminal's size is in DIPs, and all of the work area is a
     }
 }
 
+test "win32: a pane dropped on another goes to the side of it nearest the drop, as on GTK" {
+    const place: win32.RECT = .{ .left = 100, .top = 50, .right = 300, .bottom = 150 };
+    const Case = struct { x: i32, y: i32, side: Tree.Split.Direction };
+    for ([_]Case{
+        .{ .x = 110, .y = 100, .side = .left },
+        .{ .x = 290, .y = 100, .side = .right },
+        .{ .x = 200, .y = 55, .side = .up },
+        .{ .x = 200, .y = 145, .side = .down },
+        // By the share of each side, not pixels: 30 of 200 across is
+        // nearer its edge than 20 of 100 down.
+        .{ .x = 130, .y = 70, .side = .left },
+        .{ .x = 150, .y = 60, .side = .up },
+        // A tie goes left, then right, then up; the middle, equally near
+        // all four, left.
+        .{ .x = 200, .y = 100, .side = .left },
+        .{ .x = 100, .y = 50, .side = .left },
+        .{ .x = 300, .y = 150, .side = .right },
+        .{ .x = 200, .y = 50, .side = .up },
+    }) |case| {
+        try std.testing.expectEqual(case.side, dropSide(place, .{ .x = case.x, .y = case.y }));
+    }
+}
+
 test "win32: a tab dropped outside its window is placed with its label at the pointer" {
     const testing = std.testing;
     const RECT = win32.RECT;

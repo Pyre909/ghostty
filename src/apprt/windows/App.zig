@@ -9207,29 +9207,6 @@ fn testLeavesUnder(tree: *const Window.Tree, handle: Window.Tree.Node.Handle, na
     }
 }
 
-test "win32: a pane dropped on another goes to the side of it nearest the drop, as on GTK" {
-    const place: win32.RECT = .{ .left = 100, .top = 50, .right = 300, .bottom = 150 };
-    const Case = struct { x: i32, y: i32, side: Window.Tree.Split.Direction };
-    for ([_]Case{
-        .{ .x = 110, .y = 100, .side = .left },
-        .{ .x = 290, .y = 100, .side = .right },
-        .{ .x = 200, .y = 55, .side = .up },
-        .{ .x = 200, .y = 145, .side = .down },
-        // By the share of each side, not pixels: 30 of 200 across is
-        // nearer its edge than 20 of 100 down.
-        .{ .x = 130, .y = 70, .side = .left },
-        .{ .x = 150, .y = 60, .side = .up },
-        // A tie goes left, then right, then up; the middle, equally near
-        // all four, left.
-        .{ .x = 200, .y = 100, .side = .left },
-        .{ .x = 100, .y = 50, .side = .left },
-        .{ .x = 300, .y = 150, .side = .right },
-        .{ .x = 200, .y = 50, .side = .up },
-    }) |case| {
-        try std.testing.expectEqual(case.side, Window.dropSide(place, .{ .x = case.x, .y = case.y }));
-    }
-}
-
 test "win32: a pane dropped on another of its tab goes beside it, with the focus" {
     // As GTK moves it (`SplitTree.moveSplit`): the place it was dropped on
     // is split in half, and it leaves its own. Dropped on itself, nothing
