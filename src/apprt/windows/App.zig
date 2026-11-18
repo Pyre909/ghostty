@@ -13575,6 +13575,14 @@ test "win32: undo closes the tab or window just opened, for good, and redo opens
     app.createRequested();
     try std.testing.expectEqual(2, app.windows.items.len);
     try std.testing.expectEqual(1, app.undo.entries.items.len);
+
+    // A tab opened in the quick terminal is not kept.
+    window.quick = true;
+    defer window.quick = false;
+    try std.testing.expect(try app.performAction(from, .new_tab, {}));
+    app.createRequested();
+    try std.testing.expectEqual(3, window.tabs.items.len);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {

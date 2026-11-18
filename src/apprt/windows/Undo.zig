@@ -286,9 +286,11 @@ pub fn pushWindow(self: *Undo, app: *App, window: *Window, index: usize) void {
 /// Remember that `tab` of `window`, or `window` itself when null, was
 /// just opened, for `undo` to close, as macOS registers a new tab or
 /// window (`TerminalController.newTab`, `newWindow`). Nothing when no
-/// close could be taken back either (`reachable`), or no room is left.
+/// close could be taken back either (`reachable`), or no room is left;
+/// nor in the quick terminal, as `parks` keeps nothing of it: macOS
+/// opens no tab there, and a redo could not bring it back.
 pub fn opened(self: *Undo, app: *App, window: *Window, tab: ?*Window.Tab) void {
-    if (!self.enabled or app.terminating) return;
+    if (!self.enabled or app.terminating or window.quick) return;
     self.entries.ensureUnusedCapacity(app.core_app.alloc, 1) catch |err| {
         log.warn("a new tab or window cannot be kept for undo err={}", .{err});
         return;
