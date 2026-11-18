@@ -65,7 +65,7 @@ group: u64 = 0,
 
 /// Its close is not kept for `undo`: `undo` is closing the tab it opened
 /// (`Undo.opened`), which then is gone for good, as on macOS. Cleared
-/// when that close is declined.
+/// when that close is declined or given up on (`giveUpClose`).
 unkept: bool = false,
 
 /// The tab's title as `set_tab_title` gave it, which the window shows in
@@ -82,9 +82,17 @@ pub fn closingWhole(self: *Tab) bool {
     var it = self.tree.iterator();
     while (it.next()) |entry| {
         if (entry.view.closing) continue;
-        self.closing = false;
-        self.group = 0;
+        self.giveUpClose();
         return false;
     }
     return true;
+}
+
+/// The tab is not closing after all: its close was declined, or given up
+/// on before every terminal of it went. All a close marked it with goes,
+/// so that a later close of it is kept for `undo` as any is.
+pub fn giveUpClose(self: *Tab) void {
+    self.closing = false;
+    self.group = 0;
+    self.unkept = false;
 }

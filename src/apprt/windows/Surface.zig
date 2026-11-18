@@ -1119,7 +1119,7 @@ pub const Surface = struct {
                 var left = window.takePane(t, at.handle) catch |err| {
                     log.err("unable to take a closing terminal out of its window err={}", .{err});
                     self.closing = false;
-                    t.closing = false;
+                    t.giveUpClose();
                     return false;
                 };
                 if (parks) {

@@ -13578,6 +13578,16 @@ test "win32: undo closes the tab or window just opened, for good, and redo opens
     try std.testing.expectEqual(1, TestDecline.asked);
     try std.testing.expectEqual(2, window.tabs.items.len);
     try std.testing.expect(!window.tabs.items[1].unkept);
+    // Nor when the close is given up on later, one terminal of it not
+    // closing after all.
+    {
+        const opened = window.tabs.items[1];
+        opened.closing = true;
+        opened.unkept = true;
+        try std.testing.expect(!opened.closingWhole());
+        try std.testing.expect(!opened.closing);
+        try std.testing.expect(!opened.unkept);
+    }
     try std.testing.expect(window.closeTabs(1, .this));
     testPump();
     try std.testing.expectEqual(1, window.tabs.items.len);
