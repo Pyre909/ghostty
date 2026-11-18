@@ -6069,6 +6069,16 @@ const TestClear = struct {
     }
 };
 
+/// For tests (`Window.test_create_pane`): a terminal as `newTab` and
+/// `newWindow` make one, a test's, with no core to take a font size or a
+/// directory after.
+fn testCreatePane(w: *Window, _: Surface.Options) anyerror!*Surface {
+    const made = try testPane(w.app, w);
+    // `App.newTab` and `App.newWindow` make it the app's.
+    _ = w.app.surfaces.pop();
+    return made;
+}
+
 /// For tests: a hidden terminal window of the real class in `window`,
 /// owned by `app`, with no core surface, and the scroll bar the
 /// configuration asks for (`ScrollBar.style`): a teardown only destroys
@@ -13385,13 +13395,18 @@ test "win32: a window closed while another stays is parked whole, and undo shows
     try std.testing.expect(!try app.performAction(.{ .surface = &t.a.core_surface }, .new_split, .right));
     try std.testing.expectEqual(queued, app.requests.items.len);
     // Room is kept for it among the windows (`App.reserveWindow`): with
-    // the others filled up to their last place, it still goes back.
+    // the others filled up to their last place, as new windows fill them,
+    // it still goes back.
+    Window.test_create_pane = &testCreatePane;
+    defer Window.test_create_pane = null;
+    app.config.@"window-inherit-font-size" = false;
+    app.config.@"window-inherit-working-directory" = false;
     var extra: std.ArrayList(*Window) = .empty;
     defer extra.deinit(alloc);
     while (app.windows.items.len + 1 < app.windows.capacity) {
-        try extra.append(alloc, try testFrame(&app));
+        try extra.append(alloc, try app.newWindow(null, .normal, null));
     }
-    try extra.append(alloc, try testFrame(&app));
+    try extra.append(alloc, try app.newWindow(null, .normal, null));
 
     // A title bar theme given every frame meanwhile is given it too.
     try std.testing.expect(!window.dark_frame);
@@ -13484,6 +13499,55 @@ test "win32: the last window's close is not kept, and ends the windows parked be
         testPump();
     }
 
+    // The quick terminal open beside them counts for neither: the last
+    // other window's close is not kept, and ends those parked.
+    {
+        const t = try TestUndo.init(&app);
+        const d = try testUndoOther(&app, t);
+        const q = try testFrame(&app);
+        q.quick = true;
+        _ = Window.wndProc(t.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(1, app.undo.parkedWindows());
+        _ = Window.wndProc(d.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqualSlices(*Window, &.{q}, app.windows.items);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        q.quick = false;
+        try std.testing.expect(win32.DestroyWindow(q.hwnd).toBool());
+        try std.testing.expectEqual(0, app.windows.items.len);
+    }
+
+    // Each comes back at its own place among the windows, or last when
+    // fewer are left than were before it.
+    {
+        const t = try TestUndo.init(&app);
+        const a = t.window;
+        const b = (try testUndoOther(&app, t)).window;
+        const c = (try testUndoOther(&app, t)).window;
+        try std.testing.expectEqualSlices(*Window, &.{ a, b, c }, app.windows.items);
+        _ = Window.wndProc(b.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqualSlices(*Window, &.{ a, c }, app.windows.items);
+        try std.testing.expect(app.undo.undo(&app));
+        try std.testing.expectEqualSlices(*Window, &.{ a, b, c }, app.windows.items);
+        _ = Window.wndProc(c.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        // Gone for good, as a failed start of it would be.
+        try std.testing.expect(win32.DestroyWindow(b.hwnd).toBool());
+        try std.testing.expectEqualSlices(*Window, &.{a}, app.windows.items);
+        try std.testing.expect(app.undo.undo(&app));
+        try std.testing.expectEqualSlices(*Window, &.{ a, c }, app.windows.items);
+        _ = Window.wndProc(c.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        _ = Window.wndProc(a.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(0, app.windows.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+    }
+
     // A window closed by its last terminal, as a shell's exit closes it,
     // is parked as its own close parks it.
     {
@@ -13540,17 +13604,8 @@ test "win32: undo closes the tab or window just opened, for good, and redo opens
     const t = try TestUndo.init(&app);
     const window = t.window;
     _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
-    // As `new_tab` and `new_window` make them; a test's terminal has no
-    // core to take a font size or a directory after.
-    const Panes = struct {
-        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
-            const made = try testPane(w.app, w);
-            // `App.newTab` and `App.newWindow` make it the app's.
-            _ = w.app.surfaces.pop();
-            return made;
-        }
-    };
-    Window.test_create_pane = &Panes.create;
+    // As `new_tab` and `new_window` make them.
+    Window.test_create_pane = &testCreatePane;
     defer Window.test_create_pane = null;
     app.config.@"window-inherit-font-size" = false;
     app.config.@"tab-inherit-working-directory" = false;
@@ -13618,6 +13673,51 @@ test "win32: undo closes the tab or window just opened, for good, and redo opens
     app.createRequested();
     try std.testing.expectEqual(2, app.windows.items.len);
     try std.testing.expectEqual(1, app.undo.entries.items.len);
+
+    // A new tab that is by then its window's only one: undo closes the
+    // window, which is not parked though another stays, and redo opens a
+    // window.
+    {
+        const second = app.windows.items[1];
+        const first = second.tab().focused.?;
+        try std.testing.expect(try app.performAction(.{ .surface = &first.core_surface }, .new_tab, {}));
+        app.createRequested();
+        try std.testing.expectEqual(2, second.tabs.items.len);
+        try std.testing.expectEqual(2, app.undo.entries.items.len);
+        try std.testing.expect(try app.performAction(.{ .surface = &first.core_surface }, .move_tab_to_new_window, {}));
+        app.createRequested();
+        try std.testing.expectEqual(1, second.tabs.items.len);
+        try std.testing.expectEqual(3, app.windows.items.len);
+        const hwnd = second.hwnd;
+        try std.testing.expect(app.undo.undo(&app));
+        testPump();
+        try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+        try std.testing.expectEqual(2, app.windows.items.len);
+        try std.testing.expectEqual(0, app.undo.parkedWindows());
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        try std.testing.expect(app.undo.redo(&app));
+        try std.testing.expectEqual(3, app.windows.items.len);
+        try std.testing.expectEqual(1, app.undo.entries.items.len);
+    }
+
+    // Declined where a program runs: the new window stays, and a later
+    // close of it is kept as any is.
+    {
+        const last = app.windows.items[app.windows.items.len - 1];
+        Window.test_needs_confirm = true;
+        defer Window.test_needs_confirm = false;
+        TestDecline.asked = 0;
+        try std.testing.expect(!app.undo.undo(&app));
+        Window.test_needs_confirm = false;
+        try std.testing.expectEqual(1, TestDecline.asked);
+        try std.testing.expectEqual(last, app.windows.items[app.windows.items.len - 1]);
+        try std.testing.expect(!last.closing);
+        try std.testing.expect(!last.unkept);
+        _ = Window.wndProc(last.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(1, app.undo.parkedWindows());
+        try std.testing.expectEqual(1, app.undo.entries.items.len);
+    }
 
     // A tab opened in the quick terminal is not kept.
     window.quick = true;
