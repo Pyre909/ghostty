@@ -9283,9 +9283,11 @@ test "win32: a pane dropped on another of its tab goes beside it, with the focus
     const d = try testTab(&app, window);
     window.selectTab(1);
     try std.testing.expect(window.tab().focused == d);
-    try std.testing.expect(try app.movePane(b, a, .left));
-    try std.testing.expectEqualStrings("cba", testLeaves(window.tabs.items[0], &names, &buf));
-    try std.testing.expect(window.tabs.items[0].focused == b);
+    // From (c over b) beside a: a to the left of c, an order only a move
+    // gives.
+    try std.testing.expect(try app.movePane(a, c, .left));
+    try std.testing.expectEqualStrings("acb", testLeaves(window.tabs.items[0], &names, &buf));
+    try std.testing.expect(window.tabs.items[0].focused == a);
 
     // One recorded for later is dropped when either terminal begins to
     // close.
@@ -9295,6 +9297,27 @@ test "win32: a pane dropped on another of its tab goes beside it, with the focus
         try std.testing.expect(app.requests.items[app.requests.items.len - 1] == .dropped);
     }
     app.requests.clearRetainingCapacity();
+
+    // A drop while no teardown may run, as under a title prompt, is
+    // recorded and made once the loop runs its requests.
+    window.selectTab(0);
+    app.prompt_depth = 1;
+    a.core_state = .live;
+    c.core_state = .live;
+    Window.dropPane(a, c, .right);
+    a.core_state = .none;
+    c.core_state = .none;
+    app.prompt_depth = 0;
+    try std.testing.expectEqualStrings("acb", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expectEqual(1, app.requests.items.len);
+    try std.testing.expect(app.requests.items[0] == .move_pane);
+    app.createRequested();
+    try std.testing.expectEqual(0, app.requests.items.len);
+    const ra = try paneRect(window, a);
+    const rc = try paneRect(window, c);
+    try std.testing.expect(ra.left >= rc.right);
+    try std.testing.expectEqual(rc.top, ra.top);
+    try std.testing.expectEqual(rc.bottom, ra.bottom);
 }
 
 test "win32: a pane dropped in another window leaves its tab for that frame, and that window comes forward" {
@@ -9719,12 +9742,16 @@ test "win32: a terminal dragged by its handle onto another goes beside it; a cli
     try std.testing.expect(window.tab().focused == a);
     try std.testing.expect(!shown(h));
 
-    // Onto itself, or where no frame of ours is: nothing.
+    // Onto itself, or where no frame of ours is: nothing. Not b to the
+    // left of c, which would keep the order but halve c and focus b.
+    const c_was = try paneRect(window, c);
     try testDragHandle(a, try testPaneAt(a, 3));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
     TestHandle.frame = null;
     try testDragHandle(b, try testPaneAt(c, 3));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expectEqual(c_was, try paneRect(window, c));
     TestHandle.frame = window.hwnd;
 
     // Escape, taken from the queue as `run` takes it, whichever window
@@ -9743,6 +9770,8 @@ test "win32: a terminal dragged by its handle onto another goes beside it; a cli
     try std.testing.expect(a.ime.swallow_up.isSet(test_esc_slot));
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONUP, 0, try testScreenPoint(hb, to));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expectEqual(c_was, try paneRect(window, c));
     // The key-up clears it, through the terminal's own key handling.
     a.core_state = .live;
     _ = win32.SendMessageW(a.hwnd, win32.WM_KEYUP, win32.VK_ESCAPE, test_esc_up);
@@ -9764,12 +9793,19 @@ test "win32: a terminal dragged by its handle onto another goes beside it; a cli
     for ([_]*Surface{ a, b, c }) |pane| try std.testing.expectEqual(0, pane.ime.swallow_up.count());
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONUP, 0, try testScreenPoint(hb, to));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expectEqual(c_was, try paneRect(window, c));
 
     // Near b's top: above it. Then near the right of b's bottom, under a:
     // to the right of b, the terminal there, not below a above it.
     try std.testing.expect(win32.GetWindowRect(b.hwnd, &br).toBool());
     try testDragHandle(a, .{ .x = @divTrunc(br.left + br.right, 2), .y = br.top + 3 });
     try std.testing.expectEqualStrings("abc", testLeaves(window.tab(), &names, &buf));
+    // Above, not to the left: a over b, in b's columns.
+    const ra = try paneRect(window, a);
+    const rb = try paneRect(window, b);
+    try std.testing.expect(ra.bottom <= rb.top);
+    try std.testing.expectEqual(rb.left, ra.left);
+    try std.testing.expectEqual(rb.right, ra.right);
     try std.testing.expect(win32.GetWindowRect(b.hwnd, &br).toBool());
     try testDragHandle(c, .{ .x = br.right - 3, .y = br.bottom - 10 });
     try std.testing.expectEqualStrings("abc", testLeaves(window.tab(), &names, &buf));
