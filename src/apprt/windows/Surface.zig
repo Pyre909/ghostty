@@ -1129,7 +1129,16 @@ pub const Surface = struct {
                 }
                 left.deinit();
             } else if (window.tabs.items.len == 1) {
-                // The window's last terminal takes it with it.
+                // The window's last terminal takes it with it, kept for
+                // `undo` while another window stays, as the window's own
+                // close keeps it (`Window.destroyPosted`); as there, it is
+                // closing until `undo` shows it again. Not when the window
+                // is closing already: its own teardown is under way.
+                if (!window.closing and app.undo.parksWindow(app, window)) {
+                    window.closing = true;
+                    window.park();
+                    return false;
+                }
                 return window.destroy();
             } else {
                 // A tab's last terminal takes the tab with it.

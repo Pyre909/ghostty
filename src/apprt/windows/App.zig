@@ -13476,6 +13476,31 @@ test "win32: the last window's close is not kept, and ends the windows parked be
         testPump();
     }
 
+    // A window closed by its last terminal, as a shell's exit closes it,
+    // is parked as its own close parks it.
+    {
+        const t = try TestUndo.init(&app);
+        const d = try testUndoOther(&app, t);
+        TestUndo.close(t.a);
+        TestUndo.close(t.b);
+        try std.testing.expectEqual(1, app.undo.parkedWindows());
+        try std.testing.expectEqualSlices(*Window, &.{d.window}, app.windows.items);
+        try std.testing.expect(TestUndo.has(&app, t.b));
+        try std.testing.expect(t.b.parked);
+        try std.testing.expect(!shown(t.window.hwnd));
+        try std.testing.expect(app.undo.undo(&app));
+        try std.testing.expectEqualSlices(*Window, &.{ t.window, d.window }, app.windows.items);
+        try std.testing.expect(!t.b.parked);
+        try std.testing.expect(shown(t.b.hwnd));
+        _ = Window.wndProc(t.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        _ = Window.wndProc(d.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(0, app.windows.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+    }
+
     // The app's end tears down the parked windows with the others.
     {
         const t = try TestUndo.init(&app);
