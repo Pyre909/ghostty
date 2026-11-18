@@ -4278,17 +4278,7 @@ pub const App = struct {
                 // only for the process in front. The hotkey lets this one
                 // take it with SetForegroundWindow. Not the initial window
                 // (`run`): a launcher may ask for it minimized.
-                .window => |parent| if (self.newWindow(parent, .normal, null)) |window| {
-                    _ = window.present();
-                    self.undo.opened(self, window, null);
-                } else |err| {
-                    log.err("failed to create a window err={}", .{err});
-                    notice(
-                        self,
-                        if (parent) |p| p.rt_surface.hwnd else null,
-                        L("Ghostty could not open a new window."),
-                    );
-                },
+                .window => |parent| _ = self.openWindow(parent),
                 .quick_terminal => self.toggleQuick() catch |err| {
                     log.warn("failed to create the quick terminal err={}", .{err});
                     notice(self, null, L("Ghostty could not open the quick terminal."));
@@ -4626,13 +4616,17 @@ pub const App = struct {
         return true;
     }
 
-    /// `redo` of a window that `undo` closed (`Undo.opened`): another,
-    /// opened as `new_window` opens one with no terminal to take after.
-    /// Whether it opened; a failure is reported as `new_window`'s is.
-    pub fn reopenWindow(self: *App) bool {
-        const window = self.newWindow(null, .normal, null) catch |err| {
+    /// `new_window` from `parent`, a live surface, or from none: as `redo`
+    /// opens one again after `undo` closed it (`Undo.opened`). Shown and
+    /// remembered for `undo`. Whether it opened; a failure is reported.
+    pub fn openWindow(self: *App, parent: ?*CoreSurface) bool {
+        const window = self.newWindow(parent, .normal, null) catch |err| {
             log.err("failed to create a window err={}", .{err});
-            notice(self, null, L("Ghostty could not open a new window."));
+            notice(
+                self,
+                if (parent) |p| p.rt_surface.hwnd else null,
+                L("Ghostty could not open a new window."),
+            );
             return false;
         };
         _ = window.present();

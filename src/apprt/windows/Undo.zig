@@ -758,7 +758,7 @@ pub fn redo(self: *Undo, app: *App) bool {
 fn close(self: *Undo, app: *App, item: Redo) bool {
     const window = item.window orelse {
         assert(item.what == .reopen_window);
-        return app.reopenWindow();
+        return app.openWindow(null);
     };
     switch (item.what) {
         .pane => |surface| {
