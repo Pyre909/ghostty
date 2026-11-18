@@ -39,6 +39,7 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const Overlays = @import("Overlays.zig");
 const SearchBar = @import("SearchBar.zig");
+const Dib = @import("Dib.zig");
 const DropPreview = @import("DropPreview.zig");
 const TabBar = @import("TabBar.zig");
 const Config = @import("../../config.zig").Config;
@@ -221,7 +222,7 @@ pub const Press = struct {
 /// The height of a handle at `dpi`: that of a 16-pixel icon, as GTK's
 /// handle holds one with no padding.
 pub fn heightAt(dpi: u32) i32 {
-    return @intCast((16 * @as(u64, dpi) + 48) / 96);
+    return SearchBar.Metrics.scale(16, dpi);
 }
 
 /// Whether `surface` has a handle under `mode`, as GTK's
@@ -418,28 +419,10 @@ pub var test_update: if (builtin.is_test) ?*const fn (win32.HWND, Size) bool els
 fn update(hwnd: win32.HWND, size: Size, dpi: u32, color: win32.COLORREF) bool {
     const dc = win32.CreateCompatibleDC(null) orelse return false;
     defer _ = win32.DeleteDC(dc);
-    const header: win32.BITMAPINFOHEADER = .{
-        .biSize = @sizeOf(win32.BITMAPINFOHEADER),
-        .biWidth = size.width,
-        // Rows from the top down.
-        .biHeight = -size.height,
-        .biPlanes = 1,
-        .biBitCount = 32,
-        .biCompression = win32.BI_RGB,
-        .biSizeImage = 0,
-        .biXPelsPerMeter = 0,
-        .biYPelsPerMeter = 0,
-        .biClrUsed = 0,
-        .biClrImportant = 0,
-    };
-    var bits: ?*anyopaque = null;
-    const bitmap = win32.CreateDIBSection(dc, &header, win32.DIB_RGB_COLORS, &bits, null, 0) orelse return false;
-    defer _ = win32.DeleteObject(bitmap);
-    const width: usize = @intCast(size.width);
-    const height: usize = @intCast(size.height);
-    const pixels = @as([*][4]u8, @ptrCast(@alignCast(bits.?)))[0 .. width * height];
-    paint(pixels, width, height, dpi, color);
-    const old = win32.SelectObject(dc, bitmap) orelse return false;
+    const dib = Dib.init(dc, size.width, size.height) orelse return false;
+    defer dib.deinit();
+    paint(dib.pixels, @intCast(size.width), @intCast(size.height), dpi, color);
+    const old = win32.SelectObject(dc, dib.bitmap) orelse return false;
     defer _ = win32.SelectObject(dc, old);
     const src: POINT = .{ .x = 0, .y = 0 };
     const blend: win32.BLENDFUNCTION = .{};
@@ -483,12 +466,8 @@ pub fn paint(pixels: [][4]u8, width: usize, height: usize, dpi: u32, color: win3
 }
 
 /// How much of a pixel whose centre is `dx`, `dy` from a dot's centre the
-/// dot of `radius` covers: all within it less half a pixel, none beyond
-/// it plus half, and in between by the distance, as the bell's disk is
-/// blended (BellBadge.zig).
-fn coverage(dx: f32, dy: f32, radius: f32) f32 {
-    return std.math.clamp(radius - @sqrt(dx * dx + dy * dy) + 0.5, 0, 1);
-}
+/// dot of `radius` covers, as the bell's disc is blended.
+const coverage = Dib.discCoverage;
 
 /// A dot's colour `rgb` (blue, green, red), as much as `cover`, over the
 /// band, premultiplied.

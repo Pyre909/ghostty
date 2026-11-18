@@ -27,6 +27,7 @@ const std = @import("std");
 const win32 = @import("win32.zig");
 const BellBorder = @import("BellBorder.zig");
 const Window = @import("Window.zig");
+const Dib = @import("Dib.zig");
 
 const L = win32.L;
 const log = std.log.scoped(.win32);
@@ -116,7 +117,7 @@ fn make(size: i32) ?win32.HICON {
 
     const dc = win32.CreateCompatibleDC(null) orelse return failed("CreateCompatibleDC", false);
     defer _ = win32.DeleteDC(dc);
-    const color = Dib.init(dc, size) orelse return failed("CreateDIBSection", true);
+    const color = Dib.init(dc, size, size) orelse return failed("CreateDIBSection", true);
     defer color.deinit();
     if (!paint(dc, color, size)) return failed("SelectObject", false);
 
@@ -128,37 +129,6 @@ fn make(size: i32) ?win32.HICON {
     return win32.CreateIconIndirect(&.{ .fIcon = .TRUE, .hbmMask = mask, .hbmColor = color.bitmap }) orelse
         failed("CreateIconIndirect", true);
 }
-
-/// A 32-bit DIB section `size` pixels square and its pixels, BGRA, top
-/// row first (each row of 32-bit pixels is DWORD-aligned already).
-const Dib = struct {
-    bitmap: win32.HGDIOBJ,
-    pixels: [][4]u8,
-
-    fn init(dc: win32.HDC, size: i32) ?Dib {
-        const header: win32.BITMAPINFOHEADER = .{
-            .biSize = @sizeOf(win32.BITMAPINFOHEADER),
-            .biWidth = size,
-            .biHeight = -size,
-            .biPlanes = 1,
-            .biBitCount = 32,
-            .biCompression = win32.BI_RGB,
-            .biSizeImage = 0,
-            .biXPelsPerMeter = 0,
-            .biYPelsPerMeter = 0,
-            .biClrUsed = 0,
-            .biClrImportant = 0,
-        };
-        var bits: ?*anyopaque = null;
-        const bitmap = win32.CreateDIBSection(dc, &header, win32.DIB_RGB_COLORS, &bits, null, 0) orelse return null;
-        const n: usize = @intCast(size * size);
-        return .{ .bitmap = bitmap, .pixels = @as([*][4]u8, @ptrCast(@alignCast(bits.?)))[0..n] };
-    }
-
-    fn deinit(self: Dib) void {
-        _ = win32.DeleteObject(self.bitmap);
-    }
-};
 
 /// Paint the bell into `dib`, `size` pixels square: the glyph is drawn in
 /// white on black, so that any channel is its coverage, and then each
@@ -243,7 +213,7 @@ fn diskCoverage(size: i32, x: i32, y: i32) f32 {
     const r: f32 = @as(f32, @floatFromInt(size)) / 2;
     const dx = @as(f32, @floatFromInt(x)) + 0.5 - r;
     const dy = @as(f32, @floatFromInt(y)) + 0.5 - r;
-    return std.math.clamp(r - @sqrt(dx * dx + dy * dy) + 0.5, 0, 1);
+    return Dib.discCoverage(dx, dy, r);
 }
 
 /// A pixel of the icon, BGRA with straight (not premultiplied) alpha, as
@@ -282,7 +252,7 @@ test "win32: the bell's icon blends its edge as straight alpha" {
     defer _ = win32.DestroyIcon(icon);
     const dc = win32.CreateCompatibleDC(null) orelse return error.TestUnexpectedResult;
     defer _ = win32.DeleteDC(dc);
-    const target = Dib.init(dc, size) orelse return error.TestUnexpectedResult;
+    const target = Dib.init(dc, size, size) orelse return error.TestUnexpectedResult;
     defer target.deinit();
     const pixels = target.pixels;
     @memset(pixels, .{ 255, 255, 255, 255 });
@@ -357,7 +327,7 @@ test "win32: the bell's icon is made, its glyph drawn" {
     for ([_]i32{ 16, 32 }) |size| {
         const dc = win32.CreateCompatibleDC(null) orelse return error.TestUnexpectedResult;
         defer _ = win32.DeleteDC(dc);
-        const dib = Dib.init(dc, size) orelse return error.TestUnexpectedResult;
+        const dib = Dib.init(dc, size, size) orelse return error.TestUnexpectedResult;
         defer dib.deinit();
         try t.expect(paint(dc, dib, size));
         try t.expectEqual(@as(u8, 0), dib.pixels[0][3]);
