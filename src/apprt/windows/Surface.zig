@@ -2388,13 +2388,6 @@ pub const Surface = struct {
             win32.WM_KEYUP,
             win32.WM_SYSKEYUP,
             => {
-                // Escape cancels a drag by a terminal's handle, which holds
-                // the capture, not the focus; its key-up is withheld too.
-                if (msg == win32.WM_KEYDOWN and wparam == win32.VK_ESCAPE and DragHandle.cancelByKey()) {
-                    self.ime.swallow_up.set(Ime.scanSlot(lparam));
-                    return 0;
-                }
-
                 // First, so that a terminal with no core clears it too.
                 if (self.app.hotkeyRelease(msg, wparam)) {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);

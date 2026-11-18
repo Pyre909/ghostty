@@ -412,11 +412,28 @@ pub fn paneAt(app: *App, at: POINT) ?Target {
 /// stale one is never acted on.
 var captured: ?win32.HWND = null;
 
-/// Escape went down (the focused terminal's WM_KEYDOWN): a handle's press
-/// or drag is cancelled by letting go of its capture (its
-/// WM_CAPTURECHANGED). Whether there was one, whose key then goes no
-/// further.
-pub fn cancelByKey() bool {
+/// A key-down `msg` taken from the thread's queue (`App.dispatch`),
+/// before any window has it, wherever the keyboard focus is: a terminal,
+/// its search field or a tab's rename field. Escape cancels a handle's
+/// press or drag (`cancelByKey`); whether it did, the key then going
+/// nowhere. Its key-up still comes, to the window that would have had
+/// the press: a terminal there withholds it, as after a title prompt
+/// (`Surface.withholdKeyUp`), and a field ignores a release alone.
+pub fn escapeDown(app: *App, msg: *const win32.MSG) bool {
+    if (msg.message != win32.WM_KEYDOWN or msg.wParam != win32.VK_ESCAPE) return false;
+    if (!cancelByKey()) return false;
+    for (app.surfaces.items) |surface| {
+        if (surface.hwnd != msg.hwnd) continue;
+        surface.withholdKeyUp(msg.lParam);
+        break;
+    }
+    return true;
+}
+
+/// Escape went down (`escapeDown`): a handle's press or drag is cancelled
+/// by letting go of its capture (its WM_CAPTURECHANGED). Whether there
+/// was one.
+fn cancelByKey() bool {
     const hwnd = captured orelse return false;
     captured = null;
     if (win32.GetCapture() != hwnd) return false;

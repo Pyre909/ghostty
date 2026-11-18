@@ -1593,6 +1593,10 @@ pub const App = struct {
         // which are no window procedure of ours.
         handler_depth += 1;
         defer handler_depth -= 1;
+        // Before the title prompt or any field takes it: Escape cancels a
+        // drag by a terminal's handle, which holds the capture, not the
+        // focus.
+        if (DragHandle.escapeDown(self, msg)) return;
         if (self.dialogMessage(msg)) return;
         _ = win32.TranslateMessage(msg);
         _ = win32.DispatchMessageW(msg);
@@ -9723,19 +9727,43 @@ test "win32: a terminal dragged by its handle onto another goes beside it; a cli
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
     TestHandle.frame = window.hwnd;
 
-    // Escape, which goes to the terminal with the focus, lets go of the
-    // capture: the release that follows moves nothing.
+    // Escape, taken from the queue as `run` takes it, whichever window
+    // has the focus, lets go of the capture: the release that follows
+    // moves nothing. The key goes no further, and its key-up is withheld
+    // from the terminal it goes to.
     testPointer(b, 20, 2);
     const hb = b.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult;
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
     const to = try testPaneAt(c, 3);
     _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, to));
-    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0x0001_0001);
+    try std.testing.expectEqual(0, a.ime.swallow_up.count());
+    testEscape(&app, a.hwnd);
     try std.testing.expect(win32.GetCapture() != hb);
     try std.testing.expect(!shown(hb));
+    try std.testing.expect(a.ime.swallow_up.isSet(test_esc_slot));
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONUP, 0, try testScreenPoint(hb, to));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
-    try std.testing.expect(!DragHandle.cancelByKey());
+    // The key-up clears it, through the terminal's own key handling.
+    a.core_state = .live;
+    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYUP, win32.VK_ESCAPE, test_esc_up);
+    a.core_state = .none;
+    try std.testing.expectEqual(0, a.ime.swallow_up.count());
+    // With no drag, Escape is the terminal's: nothing withheld.
+    try std.testing.expect(!DragHandle.escapeDown(&app, &testEscapeMsg(a.hwnd)));
+    try std.testing.expectEqual(0, a.ime.swallow_up.count());
+
+    // The same from a window that is no terminal, as a search or rename
+    // field is: the drag ends; no terminal has the key, so none withholds
+    // its key-up.
+    testPointer(b, 20, 2);
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, to));
+    try std.testing.expect(win32.GetCapture() == hb);
+    testEscape(&app, window.hwnd);
+    try std.testing.expect(win32.GetCapture() != hb);
+    for ([_]*Surface{ a, b, c }) |pane| try std.testing.expectEqual(0, pane.ime.swallow_up.count());
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONUP, 0, try testScreenPoint(hb, to));
+    try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
 
     // Near b's top: above it. Then near the right of b's bottom, under a:
     // to the right of b, the terminal there, not below a above it.
@@ -9839,7 +9867,7 @@ test "win32: a terminal dragged by its handle shows where it would go over the t
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
     _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, try testPaneAt(c, -3)));
     try std.testing.expect(Shows.of(c));
-    _ = win32.SendMessageW(b.hwnd, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0x0001_0001);
+    testEscape(&app, b.hwnd);
     try std.testing.expect(!Shows.of(c));
 
     // Its handle hidden mid-drag, as by a tab switch: none.
@@ -31512,6 +31540,30 @@ test "win32: a teardown posted while a terminal's context menu is open waits for
         try std.testing.expect(std.mem.indexOfScalar(*Window, app.windows.items, c[1]) == null);
     }
     try std.testing.expectEqual(0, app.terminal_loops);
+}
+
+/// For tests: Escape's key-down and key-up lParams (scan code 0x01, the
+/// slot `Ime.scanSlot` gives), and a key-down for `hwnd` as `run` takes
+/// it from the queue.
+const test_esc_down: win32.LPARAM = 0x0001_0001;
+const test_esc_up: win32.LPARAM = @bitCast(@as(usize, 0xC001_0001));
+const test_esc_slot = 0x001;
+
+fn testEscapeMsg(hwnd: win32.HWND) win32.MSG {
+    return .{
+        .hwnd = hwnd,
+        .message = win32.WM_KEYDOWN,
+        .wParam = win32.VK_ESCAPE,
+        .lParam = test_esc_down,
+        .time = 0,
+        .pt = .{ .x = 0, .y = 0 },
+    };
+}
+
+/// For tests: Escape pressed in `hwnd`, dispatched as `run` does.
+fn testEscape(app: *App, hwnd: win32.HWND) void {
+    var msg = testEscapeMsg(hwnd);
+    app.dispatch(&msg);
 }
 
 /// For tests: dispatch every message waiting on this thread, as a loop
