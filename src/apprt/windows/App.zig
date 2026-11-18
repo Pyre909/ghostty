@@ -18588,11 +18588,18 @@ test "win32: progress_report shows a bar along the top of each terminal" {
     try report(&app, a, .{ .state = .indeterminate });
     try std.testing.expectEqual(1000, a.overlays.progress_bar.started);
 
-    // Over the read-only badge, as GTK stacks them.
+    // Over the read-only badge and under the bell border, as GTK stacks
+    // them.
     try std.testing.expect(try testReadOnly(&app, a, .on));
     const badge = a.overlays.readonly.hwnd.?;
     try std.testing.expect(win32.GetWindow(a.hwnd, win32.GW_HWNDPREV) == badge);
     try std.testing.expect(win32.GetWindow(badge, win32.GW_HWNDPREV) == hwnd);
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"bell-features".border = true;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    try std.testing.expect(try testBell(&app, a));
+    try std.testing.expect(win32.GetWindow(hwnd, win32.GW_HWNDPREV) == a.overlays.bell_border.hwnd.?);
     try std.testing.expect(try testReadOnly(&app, a, .off));
 
     // Hidden with its terminal, and back with it; resized with it. The
