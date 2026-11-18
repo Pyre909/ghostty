@@ -83,12 +83,18 @@ pub const Bar = struct {
     hwnd: ?win32.HWND = null,
     /// The terminal's progress, as `set` last took it.
     progress: taskbar.Progress = .{},
+    /// Whether the report `set` last took gave a value. `progress` keeps
+    /// an earlier report's for one that gives none, as the taskbar
+    /// button needs to show an error filled; the bar decides from the
+    /// last report alone, as macOS does.
+    valued: bool = false,
     /// When the block set out from the left, in `now`'s milliseconds.
     started: u64 = 0,
 
     pub fn deinit(self: *Bar, alloc: std.mem.Allocator) void {
         _ = alloc;
         self.progress = .{};
+        self.valued = false;
     }
 
     /// For `Overlays.place`: it has no text to show it.
@@ -97,11 +103,13 @@ pub const Bar = struct {
     }
 
     /// Whether it shows a moving block, not a value: progress of no known
-    /// amount, or an error with none, as macOS shows each.
+    /// amount, or an error reported with none, as macOS shows each and
+    /// GTK pulses each. A pause with none keeps the value it had, as on
+    /// GTK.
     pub fn moves(self: *const Bar) bool {
         return switch (self.progress.state) {
             .indeterminate => true,
-            .@"error" => self.progress.value == null,
+            .@"error" => !self.valued,
             .none, .normal, .paused => false,
         };
     }
@@ -198,13 +206,14 @@ pub fn timer(surface: *Surface) void {
 }
 
 /// Show `surface`'s progress (`Surface.progress`) on its bar, its window
-/// made first if it has none, or hide it. A window that cannot be made is
-/// logged, and tried again at the terminal's next report; a removal with
-/// none makes none.
-pub fn set(surface: *Surface) void {
+/// made first if it has none, or hide it; `valued` if the report that left
+/// it gave a value. A window that cannot be made is logged, and tried
+/// again at the terminal's next report; a removal with none makes none.
+pub fn set(surface: *Surface, valued: bool) void {
     const self = &surface.overlays.progress_bar;
     const moved = self.moves();
     self.progress = surface.progress;
+    self.valued = valued;
     if (self.moves()) {
         if (!moved) self.started = now();
         startTimer(surface);

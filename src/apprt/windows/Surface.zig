@@ -1910,11 +1910,8 @@ pub const Surface = struct {
     /// stalls or exits without removing it, and with
     /// `progress-style = false` a report removes what was shown instead.
     pub fn reportProgress(self: *Surface, report: terminal.osc.Command.ProgressReport) void {
-        if (self.app.config.@"progress-style") {
-            self.progress.update(report);
-        } else {
-            self.progress.update(.{ .state = .remove });
-        }
+        const style = self.app.config.@"progress-style";
+        self.progress.update(if (style) report else .{ .state = .remove });
 
         if (self.progress.state == .none) {
             _ = win32.KillTimer(self.hwnd, progress_timer_id);
@@ -1925,7 +1922,7 @@ pub const Surface = struct {
                 log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
             }
         }
-        ProgressBar.set(self);
+        ProgressBar.set(self, style and report.progress != null);
         if (self.window.tab().focused == self) self.window.showProgress();
     }
 

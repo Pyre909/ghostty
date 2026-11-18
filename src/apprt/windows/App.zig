@@ -18540,6 +18540,20 @@ test "win32: progress_report shows a bar along the top of each terminal" {
         defer printed.deinit();
         try std.testing.expectEqual(ProgressBar.red, printed.at(0, 0));
     }
+    // An error with no value after one: the block, in red, as macOS
+    // and GTK show it, though the taskbar button keeps the value.
+    try report(&app, a, .{ .state = .@"error" });
+    try expectBarAt(window, a, 100);
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(ProgressBar.red, printed.at(0, 0));
+        try std.testing.expectEqual(win32.lerp(Overlays.terminalBackground(a), ProgressBar.red, 300), printed.at(printed.width - 1, 0));
+    }
+    try std.testing.expect(win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .@"error", .progress = 50 });
+    try expectBarAt(window, a, 50);
+
     // A new colour where it stays is drawn again.
     _ = win32.UpdateWindow(hwnd);
     try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
