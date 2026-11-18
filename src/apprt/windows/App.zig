@@ -7146,15 +7146,7 @@ test "win32: a new window shows at window-position-x and window-position-y" {
     app.config.@"window-position-y" = 40;
 
     // As `new_window` makes one.
-    const Panes = struct {
-        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
-            const made = try testPane(w.app, w);
-            // `App.newWindow` makes it the app's.
-            _ = w.app.surfaces.pop();
-            return made;
-        }
-    };
-    Window.test_create_pane = &Panes.create;
+    Window.test_create_pane = &testCreatePane;
     defer Window.test_create_pane = null;
     const made = try app.newWindow(null, .normal, null);
     const made_visible = TabBar.visibleBounds(made.hwnd) orelse return error.TestUnexpectedResult;
@@ -9250,15 +9242,8 @@ test "win32: a new window is transparent while background-opacity is below 1, if
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
     defer TestClear.stop();
-    const Panes = struct {
-        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
-            const pane = try testPane(w.app, w);
-            // `App.newWindow` makes it the app's.
-            _ = w.app.surfaces.pop();
-            return pane;
-        }
-    };
-    Window.test_create_pane = &Panes.create;
+    // As `new_window` makes one.
+    Window.test_create_pane = &testCreatePane;
     defer Window.test_create_pane = null;
 
     const Case = struct { opacity: f64, takes: usize, paints: bool = true, transparent: bool };
@@ -9300,15 +9285,8 @@ test "win32: a transparent window's backdrop is acrylic while background-blur is
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
     defer TestClear.stop();
-    const Panes = struct {
-        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
-            const pane = try testPane(w.app, w);
-            // `App.newWindow` makes it the app's.
-            _ = w.app.surfaces.pop();
-            return pane;
-        }
-    };
-    Window.test_create_pane = &Panes.create;
+    // As `new_window` makes one.
+    Window.test_create_pane = &testCreatePane;
     defer Window.test_create_pane = null;
 
     const Case = struct { opacity: f64, blur: Config.BackgroundBlur, build: u32, acrylic: bool };
@@ -9351,14 +9329,8 @@ test "win32: a transparent window's backdrop follows the configuration, an opaqu
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
     defer TestClear.stop();
-    const Panes = struct {
-        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
-            const pane = try testPane(w.app, w);
-            _ = w.app.surfaces.pop();
-            return pane;
-        }
-    };
-    Window.test_create_pane = &Panes.create;
+    // As `new_window` makes one.
+    Window.test_create_pane = &testCreatePane;
     defer Window.test_create_pane = null;
 
     TestClear.start(1);
@@ -13626,6 +13598,7 @@ test "win32: undo closes the tab or window just opened, for good, and redo opens
     // Declined where a program runs: the tab stays, and a later close of
     // it is kept as any is.
     Window.test_needs_confirm = true;
+    defer Window.test_needs_confirm = false;
     TestDecline.asked = 0;
     @import("dialog.zig").test_message_box = &TestDecline.box;
     defer @import("dialog.zig").test_message_box = null;
