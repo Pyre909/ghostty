@@ -144,7 +144,6 @@ pub const Handle = struct {
     /// the hit test, the activation, the cursor, and the pointer and the
     /// left button over it. Null for the others.
     pub fn handle(self: *Handle, surface: *Surface, hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) ?win32.LRESULT {
-        _ = wparam;
         switch (msg) {
             // All of it takes the pointer, as GTK's handle does.
             win32.WM_NCHITTEST => return win32.HTCLIENT,
@@ -196,6 +195,20 @@ pub const Handle = struct {
                 const at = screenPoint(hwnd, lparam) orelse return 0;
                 release(surface, hwnd, at);
                 return 0;
+            },
+
+            // The other buttons are the terminal's, as over the rest of
+            // it: its menu, a paste, a program that reads the mouse.
+            win32.WM_RBUTTONDOWN,
+            win32.WM_RBUTTONUP,
+            win32.WM_MBUTTONDOWN,
+            win32.WM_MBUTTONUP,
+            win32.WM_XBUTTONDOWN,
+            win32.WM_XBUTTONUP,
+            => {
+                var at = screenPoint(hwnd, lparam) orelse return 0;
+                if (!win32.ScreenToClient(surface.hwnd, &at).toBool()) return 0;
+                return win32.SendMessageW(surface.hwnd, msg, wparam, win32.pointLparam(at));
             },
 
             // Another window took the capture, or Escape let it go

@@ -8667,6 +8667,37 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
     );
     try std.testing.expect(window.tab().focused == right);
     try std.testing.expect(right.overlays.drag_handle.press == null);
+
+    // Its other buttons are the terminal's: the menu's right button, a
+    // middle paste. Only the left one is the handle's.
+    const Buttons = struct {
+        var seen: [4]?Surface.Mouse.Button = .{ null, null, null, null };
+        var n: usize = 0;
+        fn answer(surface: *Surface, button: Surface.Mouse.Button, _: input.MouseButtonState) ?bool {
+            if (n < seen.len and surface == to) seen[n] = button;
+            n += 1;
+            return true;
+        }
+        var to: ?*Surface = null;
+    };
+    Buttons.to = right;
+    Surface.test_mouse_button = &Buttons.answer;
+    defer Surface.test_mouse_button = null;
+    _ = win32.SendMessageW(h, win32.WM_RBUTTONDOWN, win32.MK_RBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(h, win32.WM_RBUTTONUP, 0, testPoint(10, 5));
+    _ = win32.SendMessageW(h, win32.WM_MBUTTONDOWN, win32.MK_MBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(h, win32.WM_MBUTTONUP, 0, testPoint(10, 5));
+    try std.testing.expectEqual(4, Buttons.n);
+    try std.testing.expectEqual([4]?Surface.Mouse.Button{ .right, .right, .middle, .middle }, Buttons.seen);
+    try std.testing.expect(right.overlays.drag_handle.press == null);
+}
+
+test "win32: a point in a mouse message's lParam comes back from it, negative too" {
+    for ([_]win32.POINT{ .{ .x = 0, .y = 0 }, .{ .x = 1234, .y = 77 }, .{ .x = -3, .y = -40 }, .{ .x = 32767, .y = -32768 } }) |at| {
+        const lparam = win32.pointLparam(at);
+        try std.testing.expectEqual(at.x, win32.xLparam(lparam));
+        try std.testing.expectEqual(at.y, win32.yLparam(lparam));
+    }
 }
 
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {

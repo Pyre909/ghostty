@@ -2419,6 +2419,14 @@ pub fn yLparam(v: LPARAM) i16 {
     return @bitCast(hiword(v));
 }
 
+/// MAKELPARAM of a point, as a mouse message carries it: the inverse of
+/// `xLparam` and `yLparam`, each coordinate as its low 16 bits.
+pub fn pointLparam(at: POINT) LPARAM {
+    const x: u16 = @bitCast(@as(i16, @truncate(at.x)));
+    const y: u16 = @bitCast(@as(i16, @truncate(at.y)));
+    return @bitCast(@as(usize, @as(u32, x) | (@as(u32, y) << 16)));
+}
+
 /// GET_WHEEL_DELTA_WPARAM: the signed high word.
 pub fn wheelDelta(v: WPARAM) i16 {
     return @bitCast(hiword(v));
