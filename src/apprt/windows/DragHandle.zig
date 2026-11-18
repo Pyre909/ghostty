@@ -67,6 +67,16 @@ pub const Handle = struct {
     press: ?Press = null,
     /// The dots' colour, as `sync` last found it.
     color: win32.COLORREF = 0,
+    /// What its window was last given pixels for (`shape`), so that a
+    /// place that changes none of it gives them no more; null until
+    /// then, and for a window made again, which has none.
+    shaped: ?Shaped = null,
+    /// Its window could not be made (`make`): not tried again at every
+    /// move over the strip, but at the next `sync`, when the frame or the
+    /// configuration may have changed.
+    make_failed: bool = false,
+
+    const Shaped = struct { size: Size, dpi: u32, color: win32.COLORREF };
 
     pub fn deinit(self: *Handle, alloc: std.mem.Allocator) void {
         _ = alloc;
@@ -74,6 +84,7 @@ pub const Handle = struct {
         self.hover = false;
         self.tracking = false;
         self.press = null;
+        self.shaped = null;
     }
 
     /// For `Overlays.place`: it has no text to show it.
@@ -95,8 +106,15 @@ pub const Handle = struct {
     pub fn shape(self: *Handle, hwnd: win32.HWND, dpi: u32, in: RECT) bool {
         const size: Size = .{ .width = in.right - in.left, .height = in.bottom - in.top };
         if (size.width <= 0 or size.height <= 0) return false;
-        if (builtin.is_test) if (test_update) |answer| return answer(hwnd, size);
-        return update(hwnd, size, dpi, self.color);
+        const want: Shaped = .{ .size = size, .dpi = dpi, .color = self.color };
+        if (self.shaped) |had| if (std.meta.eql(had, want)) return true;
+        self.shaped = null;
+        const took = took: {
+            if (builtin.is_test) if (test_update) |answer| break :took answer(hwnd, size);
+            break :took update(hwnd, size, dpi, self.color);
+        };
+        if (took) self.shaped = want;
+        return took;
     }
 
     /// Nothing: a window given its pixels (`update`) gets no WM_PAINT.
@@ -196,6 +214,7 @@ pub const Handle = struct {
             win32.WM_DESTROY => {
                 self.hover = false;
                 self.tracking = false;
+                self.shaped = null;
                 if (self.press != null) {
                     self.press = null;
                     DropPreview.clear();
@@ -243,6 +262,7 @@ pub fn sync(surface: *Surface, config: *const Config) void {
     const self = &surface.overlays.drag_handle;
     self.on = !cannot_layer and wanted(surface, config.@"drag-handle");
     self.color = SearchBar.Colors.ofFrame(surface.window).text;
+    self.make_failed = false;
 }
 
 /// The pointer moved over `surface` to `at`, in its client coordinates,
@@ -261,11 +281,15 @@ pub fn pointerAt(surface: *Surface, at: POINT, held: bool) void {
         }
         return;
     }
-    if (self.hover or cannot_layer) return;
+    if (self.hover or cannot_layer or self.make_failed) return;
     if (!wanted(surface, surface.app.config.@"drag-handle")) return;
     const hwnd = self.hwnd orelse made: {
-        const made = make(surface) orelse return;
+        const made = make(surface) orelse {
+            self.make_failed = true;
+            return;
+        };
         self.hwnd = made;
+        self.shaped = null;
         break :made made;
     };
     self.hover = true;

@@ -9505,7 +9505,9 @@ const TestHandle = struct {
         DragHandle.test_update = null;
         DragHandle.cannot_layer = latched;
     }
+    var updates: usize = 0;
     fn update(_: win32.HWND, _: Overlays.Size) bool {
+        updates += 1;
         return true;
     }
     fn at(_: win32.POINT) ?win32.HWND {
@@ -9601,6 +9603,61 @@ test "win32: a terminal's drag handle shows across its top while the pointer is 
     testPointer(b, 20, 2);
     try std.testing.expect(shown(b.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult));
     try std.testing.expect(!shown(h));
+}
+
+test "win32: a drag handle is given its pixels once for what it shows, and a window that cannot be made is tried once" {
+    // Placed again with nothing changed, it keeps them; a new size gives
+    // it new ones. A window that cannot be made is not tried at every
+    // move over the strip, but again once the terminal's overlays are
+    // placed anew (`DragHandle.sync`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const handle_latch = TestHandle.install();
+    defer TestHandle.uninstall(handle_latch);
+    app.config.@"drag-handle" = .always;
+
+    const window = try testFrame(&app);
+    testResize(window, 600, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    const before = TestHandle.updates;
+    testPointer(a, 20, 2);
+    try std.testing.expect(shown(a.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult));
+    try std.testing.expectEqual(before + 1, TestHandle.updates);
+    window.placeOverlays();
+    window.placeOverlays();
+    try std.testing.expectEqual(before + 1, TestHandle.updates);
+    testResize(window, 700, 300);
+    window.relayout();
+    try std.testing.expectEqual(before + 2, TestHandle.updates);
+
+    const Make = struct {
+        var handles: usize = 0;
+        fn fails(class: []const u8) ?win32.HWND {
+            if (std.mem.eql(u8, class, DragHandle.class_name)) handles += 1;
+            return null;
+        }
+    };
+    Overlays.test_make = &Make.fails;
+    defer Overlays.test_make = null;
+    testPointer(b, 20, 2);
+    testPointer(b, 21, 2);
+    try std.testing.expectEqual(1, Make.handles);
+    try std.testing.expect(b.overlays.drag_handle.hwnd == null);
+    window.placeOverlays();
+    testPointer(b, 20, 2);
+    try std.testing.expectEqual(2, Make.handles);
 }
 
 test "win32: a terminal dragged by its handle onto another goes beside it; a click, Escape or a drop off any terminal moves nothing" {
