@@ -4596,6 +4596,14 @@ pub const App = struct {
         };
     }
 
+    /// Make room in `windows` for one more, and for each window parked for
+    /// `undo` besides, which goes back among them when it comes back or
+    /// its time is up (`Undo.parkedWindows`). Every window is added after
+    /// this.
+    pub fn reserveWindow(self: *App) !void {
+        try self.windows.ensureUnusedCapacity(self.core_app.alloc, 1 + self.undo.parkedWindows());
+    }
+
     /// Create a terminal window: the initial one (`run`), or one the core
     /// asked for (`createRequested`) from `parent`, a live surface, or an
     /// IPC request with `overrides` (`carryOutIpc`); or the quick terminal
@@ -4603,7 +4611,7 @@ pub const App = struct {
     fn newWindow(self: *App, parent: ?*CoreSurface, kind: Window.Kind, overrides: ?*const Overrides) !*Window {
         const alloc = self.core_app.alloc;
         try self.surfaces.ensureUnusedCapacity(alloc, 1);
-        try self.windows.ensureUnusedCapacity(alloc, 1);
+        try self.reserveWindow();
 
         var opts = self.inheritedOptions(parent, .window);
         defer if (opts.working_directory) |v| alloc.free(v);
@@ -4663,13 +4671,12 @@ pub const App = struct {
     /// teardown is running, and for a drop (`moveTabOut`), which may come
     /// inside one.
     fn moveTabAt(self: *App, old: *Window, index: usize, drop: ?Window.Drop) !?Window.Moved {
-        const alloc = self.core_app.alloc;
         if (old.closing or old.tabs.items.len <= 1) {
             log.info("the tab is not moved to a new window: its window is closing, or it is the only tab", .{});
             return null;
         }
 
-        try self.windows.ensureUnusedCapacity(alloc, 1);
+        try self.reserveWindow();
         // Of the old window's kind, so that its terminals, whose renderers
         // present as that frame does, stay in one that shows it
         // (`Surface.presentsAlpha`): if the new frame cannot be
@@ -4851,6 +4858,15 @@ pub const App = struct {
         if (self.quick == window) self.quick = null;
         // The quick terminal may be all that is left (`closeStrandedQuick`).
         if (!window.quick) self.quick_check = true;
+        // With no other window left, those parked for `undo` go too:
+        // nothing is left to bring them back in, and the app quits once
+        // their terminals are gone (`Undo.parksWindow`). So at the app's
+        // end too (`destroyWindows`), which gets here for every window.
+        if (!window.quick) {
+            for (self.windows.items) |other| {
+                if (!other.quick) break;
+            } else self.undo.endWindows(self);
+        }
         // Its tabs' trees are empty already unless `terminate` gave up on
         // the frame, which then had no WM_DESTROY.
         window.deinit(self.core_app.alloc);
@@ -5885,7 +5901,7 @@ fn testFrame(app: *App) !*Window {
 /// stands in for DWM (`TestClear`).
 fn testFrameOf(app: *App, transparent: bool) !*Window {
     const alloc = app.core_app.alloc;
-    try app.windows.ensureUnusedCapacity(alloc, 1);
+    try app.reserveWindow();
     const window = try alloc.create(Window);
     errdefer alloc.destroy(window);
     window.* = .{
@@ -6074,6 +6090,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
 pub fn testCleanup(app: *App) void {
     const alloc = app.core_app.alloc;
     app.stopIpc();
+    app.undo.endWindows(app);
     while (app.windows.getLastOrNull()) |window| {
         if (!win32.DestroyWindow(window.hwnd).toBool()) break;
     }
@@ -13252,6 +13269,173 @@ test "win32: what undo brought back is not closed again once its window is gone"
     try std.testing.expect(win32.DestroyWindow(t.window.hwnd).toBool());
     try std.testing.expectEqual(0, app.undo.redos.items.len);
     try std.testing.expect(!try app.performAction(.app, .redo, {}));
+}
+
+/// For tests: a second window beside `TestUndo`'s, both shown, with one
+/// terminal; its terminal.
+fn testUndoOther(app: *App, t: TestUndo) !*Surface {
+    _ = win32.ShowWindow(t.window.hwnd, win32.SW_SHOWNOACTIVATE);
+    const other = try testFrame(app);
+    const d = try testPane(app, other);
+    other.tab().tree = try .init(app.core_app.alloc, d);
+    other.tab().focused = d;
+    _ = win32.ShowWindow(other.hwnd, win32.SW_SHOWNOACTIVATE);
+    other.relayout();
+    return d;
+}
+
+/// For tests: answers No to every prompt, and counts them.
+const TestDecline = struct {
+    var asked: usize = 0;
+    fn box(_: ?win32.HWND, _: win32.LPCWSTR, _: win32.UINT) c_int {
+        asked += 1;
+        return win32.IDCANCEL;
+    }
+};
+
+test "win32: a window closed while another stays is parked whole, and undo shows it where it was" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    const c = try testTab(&app, window);
+    window.selectTab(0);
+    const d = try testUndoOther(&app, t);
+    const other = d.window;
+    try std.testing.expectEqualSlices(*Window, &.{ window, other }, app.windows.items);
+
+    // Closed as its title bar button closes it: hidden and out of the
+    // windows, every terminal of its tabs parked, none torn down.
+    _ = Window.wndProc(window.hwnd, win32.WM_CLOSE, 0, 0);
+    testPump();
+    try std.testing.expectEqualSlices(*Window, &.{other}, app.windows.items);
+    try std.testing.expect(!shown(window.hwnd));
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    try std.testing.expectEqual(1, app.undo.parkedWindows());
+    for ([_]*Surface{ t.a, t.b, c }) |pane| {
+        try std.testing.expect(TestUndo.has(&app, pane));
+        try std.testing.expect(pane.parked);
+        try std.testing.expect(!shown(pane.hwnd));
+    }
+    // Refused what would show, as a parked tab's terminals are.
+    const queued = app.requests.items.len;
+    try std.testing.expect(!try app.performAction(.{ .surface = &t.a.core_surface }, .new_split, .right));
+    try std.testing.expectEqual(queued, app.requests.items.len);
+    // Room is kept for it among the windows (`App.reserveWindow`): with
+    // the others filled up to their last place, it still goes back.
+    var extra: std.ArrayList(*Window) = .empty;
+    defer extra.deinit(alloc);
+    while (app.windows.items.len + 1 < app.windows.capacity) {
+        try extra.append(alloc, try testFrame(&app));
+    }
+    try extra.append(alloc, try testFrame(&app));
+
+    // Back where it was, its tab shown, its terminals live again.
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(window, app.windows.items[0]);
+    try std.testing.expectEqual(other, app.windows.items[1]);
+    for (extra.items) |w| try std.testing.expect(win32.DestroyWindow(w.hwnd).toBool());
+    try std.testing.expectEqualSlices(*Window, &.{ window, other }, app.windows.items);
+    try std.testing.expect(shown(window.hwnd));
+    try std.testing.expect(!window.closing);
+    for ([_]*Surface{ t.a, t.b, c }) |pane| {
+        try std.testing.expect(!pane.parked);
+        try std.testing.expect(!pane.closing);
+    }
+    try std.testing.expect(shown(t.a.hwnd));
+    try std.testing.expect(shown(t.b.hwnd));
+    try std.testing.expect(!shown(c.hwnd));
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expect(try app.performAction(.{ .surface = &t.a.core_surface }, .new_split, .right));
+    app.requests.items[app.requests.items.len - 1] = .dropped;
+
+    // Redo closes it again without asking, though a program runs in it;
+    // its time running out then tears it down whole.
+    Window.test_needs_confirm = true;
+    defer Window.test_needs_confirm = false;
+    TestDecline.asked = 0;
+    @import("dialog.zig").test_message_box = &TestDecline.box;
+    defer @import("dialog.zig").test_message_box = null;
+    try std.testing.expect(try app.performAction(.app, .redo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(0, TestDecline.asked);
+    try std.testing.expectEqualSlices(*Window, &.{other}, app.windows.items);
+    try std.testing.expect(t.a.parked);
+    Undo.test_now = TestUndo.due;
+    TestUndo.tick(&app);
+    testPump();
+    try std.testing.expectEqualSlices(*Window, &.{other}, app.windows.items);
+    for ([_]*Surface{ t.a, t.b, c }) |pane| try std.testing.expect(!TestUndo.has(&app, pane));
+    try std.testing.expect(TestUndo.has(&app, d));
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+}
+
+test "win32: the last window's close is not kept, and ends the windows parked before it" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    {
+        const t = try TestUndo.init(&app);
+        const d = try testUndoOther(&app, t);
+        _ = Window.wndProc(t.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(1, app.undo.parkedWindows());
+
+        // The other is the last: torn down, and the parked one with it,
+        // for nothing is left to bring it back in.
+        _ = Window.wndProc(d.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(0, app.windows.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+    }
+
+    // With `undo` unbound, a window's close is not kept either.
+    {
+        const t = try TestUndo.init(&app);
+        const d = try testUndoOther(&app, t);
+        var config: Config = try .default(alloc);
+        defer config.deinit();
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
+        _ = Window.wndProc(t.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqualSlices(*Window, &.{d.window}, app.windows.items);
+        try std.testing.expect(!TestUndo.has(&app, t.a));
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+        _ = Window.wndProc(d.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+    }
+
+    // The app's end tears down the parked windows with the others.
+    {
+        const t = try TestUndo.init(&app);
+        const d = try testUndoOther(&app, t);
+        _ = Window.wndProc(t.window.hwnd, win32.WM_CLOSE, 0, 0);
+        testPump();
+        try std.testing.expectEqual(1, app.undo.parkedWindows());
+        // Both are freed by the end.
+        const frames = [_]win32.HWND{ t.window.hwnd, d.window.hwnd };
+        app.endSession(0x1);
+        try std.testing.expect(testTakeQuit());
+        for (frames) |hwnd| try std.testing.expect(!win32.IsWindow(hwnd).toBool());
+        try std.testing.expectEqual(0, app.windows.items.len);
+        try std.testing.expectEqual(0, app.surfaces.items.len);
+        try std.testing.expectEqual(0, app.undo.entries.items.len);
+    }
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {

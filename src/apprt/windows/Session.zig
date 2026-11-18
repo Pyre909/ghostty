@@ -183,7 +183,7 @@ pub fn apply(app: *App, state: State) usize {
 fn applyWindow(app: *App, saved: State.Window) !void {
     const alloc = app.core_app.alloc;
     try app.surfaces.ensureUnusedCapacity(alloc, 1);
-    try app.windows.ensureUnusedCapacity(alloc, 1);
+    try app.reserveWindow();
 
     const window = try Window.create(app, leafOptions(saved.tabs[0].nodes, 0, .window), .normal);
     errdefer comptime unreachable;

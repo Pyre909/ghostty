@@ -123,6 +123,10 @@ bar: TabBar.Bar,
 /// declines or the post fails; otherwise the teardown frees the window.
 closing: bool,
 
+/// Its close is not kept for `undo` (`Undo.parksWindow`): a parked
+/// window's time is up (`Undo.end`).
+unkept: bool = false,
+
 /// Whether the question that `closing` waits on is still open
 /// (`requestClose`): the user has not said yes, and may yet say no. What
 /// is saved of the windows counts such a window as open
@@ -536,6 +540,42 @@ pub fn parkTab(self: *Window, t: *Tab) void {
         entry.view.park();
     }
     self.app.undo.pushTab(self.app, self, t, index);
+}
+
+/// `destroy` for a window that `undo` may bring back (`Undo.parksWindow`):
+/// it leaves the screen and the app's windows, and every terminal of its
+/// tabs is parked, as a closed tab's are (`parkTab`), but nothing is torn
+/// down. `closing` stays set until `undo` shows it again (`unpark`). Where
+/// the core may be entered (`Surface.park`): from its teardown, or from
+/// `redo` in `App.run`.
+pub fn park(self: *Window) void {
+    const app = self.app;
+    // What is open over it goes, as at its teardown (`destroy`).
+    TitleDialog.close(self);
+    CommandPalette.close(self);
+    TabOverview.close(self);
+    for (self.tabs.items) |t| {
+        t.pending_focus = null;
+        var it = t.tree.iterator();
+        while (it.next()) |entry| {
+            entry.view.closing = true;
+            entry.view.park();
+        }
+    }
+    _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
+    const index = std.mem.indexOfScalar(*Window, app.windows.items, self).?;
+    _ = app.windows.orderedRemove(index);
+    app.undo.pushWindow(app, self, index);
+}
+
+/// Show the window `park` hid, back among the app's windows already, its
+/// shown tab laid out with the focus, as `undo` brings it back
+/// (`Undo.restore`).
+pub fn unpark(self: *Window) void {
+    // Not activated here: `undo` brings it forward once all is back.
+    _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNA);
+    self.showTab();
+    self.bar.invalidate();
 }
 
 /// Put `t`, which `parkTab` took out, back among the tabs at `index`, or
@@ -2637,6 +2677,12 @@ fn destroyPosted(self: *Window) void {
 
     if (!app.canTearDown()) {
         self.destroy_deferred = true;
+        return;
+    }
+
+    // With another window open and `undo` bound, kept for it instead.
+    if (app.undo.parksWindow(app, self)) {
+        self.park();
         return;
     }
 

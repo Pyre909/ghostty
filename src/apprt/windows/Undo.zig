@@ -8,6 +8,11 @@
 //! running out posts the teardowns the close would have run. `redo`
 //! closes again what `undo` last brought back.
 //!
+//! A window that closes while another stays is parked whole, as macOS
+//! keeps a closed window: hidden and out of the app's windows, with every
+//! terminal of it parked (`Window.park`), until `undo` shows it again or
+//! its time is up.
+//!
 //! Nothing is parked unless an `undo` binding exists and `undo-timeout`
 //! is not zero (`reachable`): Windows binds none by default, and a closed
 //! shell kept running that nobody can bring back is only a surprise.
@@ -89,6 +94,13 @@ pub const Entry = struct {
             /// Where it was among the window's tabs.
             index: usize,
         },
+        /// The window itself, closed while another stayed open: hidden
+        /// and out of the app's windows, with every terminal of it parked
+        /// (`Window.park`).
+        window: struct {
+            /// Where it was among the app's windows.
+            index: usize,
+        },
     };
 
     /// Whether the terminal of `core_surface` is parked by this entry.
@@ -102,6 +114,15 @@ pub const Entry = struct {
                 }
                 return false;
             },
+            .window => {
+                for (self.window.tabs.items) |t| {
+                    var it = t.tree.iterator();
+                    while (it.next()) |leaf| {
+                        if (&leaf.view.core_surface == core_surface) return true;
+                    }
+                }
+                return false;
+            },
         }
     }
 };
@@ -110,7 +131,12 @@ pub const Entry = struct {
 /// names does.
 pub const Redo = struct {
     window: *Window,
-    what: union(enum) { pane: *Surface, tab: *Window.Tab },
+    what: union(enum) {
+        pane: *Surface,
+        tab: *Window.Tab,
+        /// The window itself, to close again.
+        window,
+    },
     expires: u64,
     group: u64,
 };
@@ -177,6 +203,7 @@ fn free(alloc: std.mem.Allocator, entry: *Entry) void {
     switch (entry.what) {
         .pane => |*pane| pane.tree.deinit(),
         .tab => |parked| Window.freeTab(alloc, parked.tab),
+        .window => {},
     }
 }
 
@@ -214,6 +241,55 @@ pub fn pushPane(
 /// it was the tab at `index`. The tab is this entry's now. After `parks`.
 pub fn pushTab(self: *Undo, app: *App, window: *Window, tab: *Window.Tab, index: usize) void {
     self.push(app, window, tab.group, .{ .tab = .{ .tab = tab, .index = index } });
+}
+
+/// Whether `window`, whose close was agreed to (`Window.requestClose`),
+/// is parked rather than torn down (`Window.park`), as macOS keeps a
+/// closed window for `undo`; room for its entry is then made. As `parks`,
+/// and only while another window, not the quick terminal, stays open:
+/// closing the last one quits (`App.setQuitTimer`), which would leave
+/// nothing to take it back from. Not one whose time is up
+/// (`Window.unkept`).
+pub fn parksWindow(self: *Undo, app: *App, window: *const Window) bool {
+    if (!self.enabled or app.terminating) return false;
+    if (window.quick or window.unkept) return false;
+    for (app.windows.items) |other| {
+        if (other != window and !other.quick and !other.closing) break;
+    } else return false;
+    self.entries.ensureUnusedCapacity(app.core_app.alloc, 1) catch |err| {
+        log.warn("a closed window cannot be kept for undo err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
+/// Remember `window`, parked, as having been the app's window at `index`.
+/// After `parksWindow`.
+pub fn pushWindow(self: *Undo, app: *App, window: *Window, index: usize) void {
+    self.push(app, window, 0, .{ .window = .{ .index = index } });
+}
+
+/// How many windows are parked (`Window.park`). The app's windows keep
+/// room for each (`App.reserveWindow`), so that one can always go back
+/// among them (`restore`, `end`).
+pub fn parkedWindows(self: *const Undo) usize {
+    var count: usize = 0;
+    for (self.entries.items) |entry| {
+        if (entry.what == .window) count += 1;
+    }
+    return count;
+}
+
+/// End every parked window (`end`): the last other window has closed,
+/// and nothing is left to bring them back in, or the app is quitting
+/// (`App.destroyWindows`).
+pub fn endWindows(self: *Undo, app: *App) void {
+    const held = self.entries.items.len;
+    var i: usize = 0;
+    while (i < self.entries.items.len) {
+        if (self.entries.items[i].what == .window) self.expire(app, i) else i += 1;
+    }
+    if (self.entries.items.len != held) self.arm(app);
 }
 
 fn push(self: *Undo, app: *App, window: *Window, group: u64, what: Entry.What) void {
@@ -271,6 +347,24 @@ fn end(self: *Undo, app: *App, entry: *Entry, freed: ?*const Surface) void {
                 if (leaf.view != freed) unpark(leaf.view);
             }
         },
+        // Torn down whole, as a window close tears it down (`Window.destroy`),
+        // from among the app's windows again, where a teardown that cannot
+        // be posted is posted again (`App.repostDeferredDestroys`). There is
+        // room for it (`parkedWindows`). Hidden still, and closing.
+        .window => {
+            const window = entry.window;
+            for (window.tabs.items) |t| {
+                var it = t.tree.iterator();
+                while (it.next()) |leaf| leaf.view.parked = false;
+            }
+            window.unkept = true;
+            app.windows.appendAssumeCapacity(window);
+            window.postDestroy();
+            if (!window.closing) {
+                window.closing = true;
+                window.destroy_deferred = true;
+            }
+        },
     }
     free(app.core_app.alloc, entry);
 }
@@ -326,15 +420,15 @@ pub fn forgetTab(self: *Undo, app: *App, tab: *const Window.Tab) void {
     while (i < self.entries.items.len) {
         const of = switch (self.entries.items[i].what) {
             .pane => |pane| pane.tab == tab,
-            .tab => false,
+            .tab, .window => false,
         };
         if (of) self.expire(app, i) else i += 1;
     }
     i = 0;
     while (i < self.redos.items.len) {
         const of = switch (self.redos.items[i].what) {
-            .pane => false,
             .tab => |t| t == tab,
+            .pane, .window => false,
         };
         if (of) _ = self.redos.orderedRemove(i) else i += 1;
     }
@@ -350,11 +444,12 @@ pub fn forgetSurface(self: *Undo, app: *App, surface: *const Surface) void {
     var i: usize = 0;
     while (i < self.entries.items.len) {
         const entry = &self.entries.items[i];
-        const tree = switch (entry.what) {
-            .pane => |*pane| &pane.tree,
-            .tab => |parked| &parked.tab.tree,
+        const in_it = switch (entry.what) {
+            .pane => |*pane| pane.tree.locate(surface) != null,
+            .tab => |parked| parked.tab.tree.locate(surface) != null,
+            .window => entry.window.find(surface) != null,
         };
-        if (tree.locate(surface) == null) {
+        if (!in_it) {
             i += 1;
             continue;
         }
@@ -368,7 +463,7 @@ pub fn forgetSurface(self: *Undo, app: *App, surface: *const Surface) void {
     while (i < self.redos.items.len) {
         const of = switch (self.redos.items[i].what) {
             .pane => |s| s == surface,
-            .tab => false,
+            .tab, .window => false,
         };
         if (of) _ = self.redos.orderedRemove(i) else i += 1;
     }
@@ -401,8 +496,8 @@ pub fn pendingRedo(self: *const Undo) bool {
 /// Take the last close back, and with it those made as one with it: a
 /// terminal returns to its tab, where and as large as it was, with the
 /// focus, and its tab is shown; a tab returns to its place among the window's tabs, shown if
-/// it alone comes back; and the window comes forward. Returns whether
-/// anything came back. A close that cannot be taken back, because its
+/// it alone comes back; a window shows again where it was; and the window comes forward.
+/// Returns whether anything came back. A close that cannot be taken back, because its
 /// tab's terminals are no longer the ones it left, is torn down instead.
 /// Run where a window may be laid out and the focus moved (`App.run`).
 pub fn undo(self: *Undo, app: *App) bool {
@@ -503,6 +598,33 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
             });
             return true;
         },
+        .window => |parked| {
+            self.redos.ensureUnusedCapacity(alloc, 1) catch |err| {
+                log.warn("a closed window cannot be put back err={}", .{err});
+                self.end(app, entry, null);
+                return false;
+            };
+            window.closing = false;
+            window.unkept = false;
+            for (window.tabs.items) |t| {
+                var it = t.tree.iterator();
+                while (it.next()) |leaf| {
+                    leaf.view.parked = false;
+                    leaf.view.closing = false;
+                    if (dpi != entry.dpi) leaf.view.scaleChanged(std.math.lossyCast(u16, dpi));
+                }
+            }
+            // Room was kept for it (`parkedWindows`).
+            app.windows.insertAssumeCapacity(@min(parked.index, app.windows.items.len), window);
+            window.unpark();
+            self.redos.appendAssumeCapacity(.{
+                .window = window,
+                .what = .window,
+                .expires = expires,
+                .group = entry.group,
+            });
+            return true;
+        },
     }
 }
 
@@ -510,7 +632,8 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
 /// with it, without asking: the user closed it once already. Each is
 /// parked again, for `undo`. Returns whether anything closed. One that
 /// has changed too much since is left as it is: a terminal that is now
-/// its tab's only one, a tab that is now its window's only one.
+/// its tab's only one, a tab that is now its window's only one, a window
+/// that is now the only one.
 pub fn redo(self: *Undo, app: *App) bool {
     var item = self.redos.pop() orelse return false;
     if (item.expires <= now()) {
@@ -556,6 +679,14 @@ fn close(self: *Undo, app: *App, item: Redo) bool {
             tab.closing = true;
             tab.group = item.group;
             window.parkTab(tab);
+            return true;
+        },
+        .window => {
+            if (window.closing) return false;
+            if (std.mem.indexOfScalar(*Window, app.windows.items, window) == null) return false;
+            if (!self.parksWindow(app, window)) return false;
+            window.closing = true;
+            window.park();
             return true;
         },
     }
