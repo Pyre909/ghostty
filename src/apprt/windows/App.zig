@@ -13393,9 +13393,17 @@ test "win32: a window closed while another stays is parked whole, and undo shows
     }
     try extra.append(alloc, try testFrame(&app));
 
+    // A title bar theme given every frame meanwhile is given it too.
+    try std.testing.expect(!window.dark_frame);
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
+    try std.testing.expect(other.dark_frame);
+    try std.testing.expect(!window.dark_frame);
+
     // Back where it was, its tab shown, its terminals live again.
     try std.testing.expect(try app.performAction(.app, .undo, {}));
     app.createRequested();
+    try std.testing.expect(window.dark_frame);
+    try std.testing.expect(try app.performAction(.app, .set_window_theme, .config));
     try std.testing.expectEqual(window, app.windows.items[0]);
     try std.testing.expectEqual(other, app.windows.items[1]);
     for (extra.items) |w| try std.testing.expect(win32.DestroyWindow(w.hwnd).toBool());

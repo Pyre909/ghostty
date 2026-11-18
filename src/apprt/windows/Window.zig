@@ -573,6 +573,12 @@ pub fn park(self: *Window) void {
 /// shown tab laid out with the focus, as `undo` brings it back
 /// (`Undo.restore`).
 pub fn unpark(self: *Window) void {
+    // What every frame was given while it was out of the app's windows
+    // (`App.setWindowTheme`, `App.toggleBackgroundOpacity`), before it
+    // shows, as `configChange` pairs them; each does nothing when the
+    // frame has it already.
+    self.applyTheme();
+    Transparency.applyBlur(self);
     // Not activated here: `undo` brings it forward once all is back.
     _ = win32.ShowWindow(self.hwnd, win32.SW_SHOWNA);
     self.showTab();
