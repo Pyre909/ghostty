@@ -9470,12 +9470,24 @@ test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its
     try std.testing.expect(shown(x.hwnd));
     try std.testing.expectEqualStrings("ba", testLeaves(two.tab(), &names, &buf));
 
+    // Its teardown not posted, as when the queue is full: owed all the
+    // same, and posted again inside another terminal's teardown wait:
+    // deferred.
+    const PostFails = struct {
+        fn all(_: win32.HWND) bool {
+            return true;
+        }
+    };
+    defer test_post_fails = null;
     const gone = one.hwnd;
+    test_post_fails = &PostFails.all;
     try std.testing.expect(try app.movePane(x, a, .right));
+    test_post_fails = null;
     try std.testing.expect(one.closing);
+    try std.testing.expect(one.destroy_deferred);
     try std.testing.expect(!win32.IsWindowVisible(gone).toBool());
-    // Inside another terminal's teardown wait: deferred.
     app.teardown_depth = 1;
+    app.repostDeferredDestroys();
     testPump();
     try std.testing.expect(win32.IsWindow(gone).toBool());
     try std.testing.expect(one.destroy_deferred);
@@ -9741,6 +9753,14 @@ test "win32: a terminal dragged by its handle onto another goes beside it; a cli
     const to = try testPaneAt(c, 3);
     _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, to));
     try std.testing.expectEqual(0, a.ime.swallow_up.count());
+    // Any other key, or Escape's release, leaves it.
+    var other = testEscapeMsg(a.hwnd);
+    other.wParam = 'A';
+    try std.testing.expect(!DragHandle.escapeDown(&app, &other));
+    other = testEscapeMsg(a.hwnd);
+    other.message = win32.WM_KEYUP;
+    try std.testing.expect(!DragHandle.escapeDown(&app, &other));
+    try std.testing.expect(win32.GetCapture() == hb);
     testEscape(&app, a.hwnd);
     try std.testing.expect(win32.GetCapture() != hb);
     try std.testing.expect(!shown(hb));
@@ -9878,6 +9898,21 @@ test "win32: a terminal dragged by its handle shows where it would go over the t
     testPointer(b, 20, 2);
     const hb = b.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult;
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, try testPaneAt(c, -3)));
+    try std.testing.expect(Shows.of(c));
+    testEscape(&app, b.hwnd);
+    try std.testing.expect(!Shows.of(c));
+
+    // The terminal it shows over hidden mid-drag, as by a zoom, and shown
+    // again: none until the drag's next move over it.
+    testPointer(b, 20, 2);
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, try testPaneAt(c, -3)));
+    try std.testing.expect(Shows.of(c));
+    c.overlays.hideWindows();
+    try std.testing.expect(!Shows.of(c));
+    Overlays.place(c);
+    try std.testing.expect(!Shows.of(c));
     _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, try testPaneAt(c, -3)));
     try std.testing.expect(Shows.of(c));
     testEscape(&app, b.hwnd);
