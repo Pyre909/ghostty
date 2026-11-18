@@ -18473,7 +18473,7 @@ fn expectBarAt(window: *const Window, surface: *const Surface, percent: u8) !voi
 test "win32: progress_report shows a bar along the top of each terminal" {
     // GTK's and macOS's bar, drawn as macOS draws it, over every terminal
     // that reports progress, not only the focused one the taskbar button
-    // shows: filled to its value in the accent colour, red for an error,
+    // shows: filled to its value in the highlight colour, red for an error,
     // orange while paused; with no value, a block that goes across and
     // back over a track. Just above the terminal and its read-only badge;
     // hidden with it; gone when the report is removed, lapses, or
@@ -18487,8 +18487,8 @@ test "win32: progress_report shows a bar along the top of each terminal" {
     defer unregisterClasses(app.hinstance);
     defer testCleanup(&app);
     const accent = win32.rgb(0x00, 0x78, 0xd7);
-    ProgressBar.test_accent = accent;
-    defer ProgressBar.test_accent = null;
+    ProgressBar.test_highlight = accent;
+    defer ProgressBar.test_highlight = null;
     ProgressBar.test_now = 1000;
     defer ProgressBar.test_now = null;
 

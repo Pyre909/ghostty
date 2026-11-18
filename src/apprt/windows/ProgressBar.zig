@@ -6,11 +6,12 @@
 //! macos/Sources/Ghostty/Surface View/SurfaceProgressBar.swift). It is
 //! drawn as macOS draws it, which says what it looks like where GTK
 //! leaves it to the theme: 2 points high; filled from the left to its
-//! value in the accent colour, red for an error and orange while paused;
-//! and with no value, a block a quarter as wide going from one side to
-//! the other and back, 1.2 seconds each way, eased in and out, over a
-//! track of its colour at 30%. macOS also eases a new value in over 0.2
-//! seconds; this one shows it at once.
+//! value in the system's highlight colour, red for an error and orange
+//! while paused; and with no value, a block a quarter as wide going from
+//! one side to the other and back, 1.2 seconds each way, eased in and
+//! out, over a track of its colour at 30%. macOS fills it in its accent
+//! colour, and eases a new value in over 0.2 seconds; this one shows it
+//! at once.
 //!
 //! Every terminal shows its own, as on GTK and macOS; the window's
 //! taskbar button shows its focused terminal's as well (taskbar.zig).
@@ -60,18 +61,20 @@ pub const orange = win32.rgb(255, 149, 0);
 /// GetTickCount64's.
 pub var test_now: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
 
-/// For tests: the accent colour (`accent`), in place of the system's.
-pub var test_accent: if (builtin.is_test) ?win32.COLORREF else void = if (builtin.is_test) null else {};
+/// For tests: the highlight colour (`highlight`), in place of the
+/// system's.
+pub var test_highlight: if (builtin.is_test) ?win32.COLORREF else void = if (builtin.is_test) null else {};
 
 fn now() u64 {
     if (builtin.is_test) if (test_now) |t| return t;
     return win32.GetTickCount64();
 }
 
-/// The system's accent colour, as the command palette and the tab
-/// overview take it.
-fn accent() win32.COLORREF {
-    if (builtin.is_test) if (test_accent) |c| return c;
+/// The system's highlight colour, of selected items, as the command
+/// palette and the tab overview take it, which may differ from the
+/// accent colour the Settings app sets.
+fn highlight() win32.COLORREF {
+    if (builtin.is_test) if (test_highlight) |c| return c;
     return win32.GetSysColor(win32.COLOR_HIGHLIGHT);
 }
 
@@ -134,7 +137,7 @@ pub const Bar = struct {
         return switch (self.progress.state) {
             .@"error" => red,
             .paused => orange,
-            .none, .normal, .indeterminate => accent(),
+            .none, .normal, .indeterminate => highlight(),
         };
     }
 
