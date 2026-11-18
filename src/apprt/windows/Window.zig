@@ -813,6 +813,56 @@ fn setParent(child: win32.HWND, parent: win32.HWND) bool {
     return set(child, parent) != null;
 }
 
+/// Make `surface`'s window a child of `to`'s frame, for a pane moved
+/// there (`App.movePane`); whether it is. Its overlays and search bar
+/// follow it as it is laid out there (`Overlays.place`). A failure is
+/// logged.
+pub fn reparentPane(surface: *Surface, to: *Window) bool {
+    if (setParent(surface.hwnd, to.hwnd)) return true;
+    log.warn("SetParent failed for a terminal moving to another window err={}", .{win32.GetLastError()});
+    return false;
+}
+
+/// The side of a terminal laid out at `place` that a pane dropped at `at`
+/// goes to: the nearest of its edges, as GTK picks it
+/// (`calcDropDirection` in src/apprt/gtk/class/surface.zig), a tie going
+/// left, then right, then up, as there.
+pub fn dropSide(place: win32.RECT, at: win32.POINT) Tree.Split.Direction {
+    const width: f64 = @floatFromInt(@max(1, place.right - place.left));
+    const height: f64 = @floatFromInt(@max(1, place.bottom - place.top));
+    const left = @as(f64, @floatFromInt(at.x - place.left)) / width;
+    const top = @as(f64, @floatFromInt(at.y - place.top)) / height;
+    const right = 1 - left;
+    const bottom = 1 - top;
+    const least = @min(left, top, right, bottom);
+    if (least == left) return .left;
+    if (least == right) return .right;
+    if (least == top) return .up;
+    return .down;
+}
+
+/// `source`, dragged by its handle, dropped on `target`, to go to its
+/// side `side` (`App.movePane`). At once whenever the core may be
+/// re-entered, as a tab dragged out of the bar is moved
+/// (`dropTabOut`); else, under a prompt or a core frame, recorded for
+/// `run`, naming both terminals, which must be live (`App.requests`).
+pub fn dropPane(source: *Surface, target: *Surface, side: Tree.Split.Direction) void {
+    const app = source.window.app;
+    if (app.terminating or source == target) return;
+    if (app.canReenterCore()) return app.movePaneOrSay(source, target, side);
+    const from = source.liveCore() orelse return;
+    const onto = target.liveCore() orelse return;
+    app.requests.append(app.core_app.alloc, .{ .move_pane = .{
+        .source = from,
+        .target = onto,
+        .side = side,
+    } }) catch |err| {
+        log.warn("cannot record a pane to move err={}", .{err});
+        return;
+    };
+    app.wakeup();
+}
+
 /// Take the tab at `index`, whose terminals another frame holds now
 /// (`moveTabTo`), out of the window, which shows the next tab in its place
 /// if it was shown, as `removeTab` does, and lays itself out again: with
@@ -3024,7 +3074,7 @@ pub fn equalizeTab(self: *Window, t: *Tab) void {
 /// keeps each terminal its least where the tab has room for them all
 /// (`splitArea`), as GTK keeps them whatever ratio its tree asks for, and
 /// the ratios stay for when it has room again.
-fn adopt(self: *Window, t: *Tab, tree: Tree) void {
+pub fn adopt(self: *Window, t: *Tab, tree: Tree) void {
     self.setTree(t, tree);
     if (t == self.tab()) self.relayout();
 }
@@ -3255,6 +3305,15 @@ pub fn removePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !void {
 /// `removePane`, returning the tree the terminal left, the caller's now:
 /// what `undo` puts back (`Undo`).
 pub fn takePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !Tree {
+    return self.leavePane(t, handle, try t.tree.remove(self.app.core_app.alloc, handle));
+}
+
+/// `takePane` once `tree`, `t`'s tree without `handle`, is made, which
+/// then cannot fail: `t` takes `tree`, its focus moves off the terminal
+/// that left, which is hidden, and the tree it left is returned. A pane
+/// moved to another tab makes `tree` before anything moves
+/// (`App.movePane`).
+pub fn leavePane(self: *Window, t: *Tab, handle: Tree.Node.Handle, tree: Tree) Tree {
     const alloc = self.app.core_app.alloc;
     const surface = t.tree.nodes[handle.idx()].leaf;
 
@@ -3267,8 +3326,6 @@ pub fn takePane(self: *Window, t: *Tab, handle: Tree.Node.Handle) !Tree {
         break :focus t.tree.nodes[to.idx()].leaf;
     };
 
-    const tree = try t.tree.remove(alloc, handle);
-    errdefer comptime unreachable;
     // As `setTree`, but for the old tree, which is kept.
     const left = t.tree;
     t.tree = tree;

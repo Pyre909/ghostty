@@ -819,6 +819,15 @@ pub const App = struct {
             drop: ?Window.Drop = null,
         },
 
+        /// A pane dragged by its handle and dropped on another, under a
+        /// prompt or a core frame (`Window.dropPane`), moved by `run`
+        /// (`movePane`).
+        move_pane: struct {
+            source: *CoreSurface,
+            target: *CoreSurface,
+            side: Window.Tree.Split.Direction,
+        },
+
         /// `.close_window` behind a move of `from`'s tab to a new window,
         /// which it then closes (`closeWindow`); dropped if the tab does
         /// not move (`dropBehind`).
@@ -3646,6 +3655,9 @@ pub const App = struct {
                 request.* = .dropped;
                 self.dropBehind(i);
             },
+            .move_pane => |move| {
+                if (move.source == core_surface or move.target == core_surface) request.* = .dropped;
+            },
             .close_window => |close| {
                 if (close.from == core_surface) request.* = .dropped;
             },
@@ -4286,6 +4298,7 @@ pub const App = struct {
                 .visibility => self.toggleVisibility(),
                 .undo => _ = self.undo.undo(self),
                 .redo => _ = self.undo.redo(self),
+                .move_pane => |move| self.movePaneOrSay(move.source.rt_surface, move.target.rt_surface, move.side),
                 .split => |split| self.newSplit(split.parent, split.direction) catch |err| switch (err) {
                     // As when a key has nothing to do: the window is as it was.
                     error.SplitTooSmall => log.info("no room for a split: a terminal would have less than its cell and padding", .{}),
@@ -4732,6 +4745,91 @@ pub const App = struct {
         // it or Windows did: `window-position-x` is a new window's.
         window.show(.as_is);
         return moved;
+    }
+
+    /// `movePane`, its failure logged: nothing moved then. Where the core
+    /// may be re-entered (`Window.dropPane`).
+    pub fn movePaneOrSay(self: *App, source: *Surface, target: *Surface, side: Window.Tree.Split.Direction) void {
+        self.movePane(source, target, side) catch |err| {
+            log.warn("the pane is not moved err={}", .{err});
+        };
+    }
+
+    /// Put `source` beside `target`, on its side `side`, as GTK moves a
+    /// pane dropped on another (`SplitTree.moveSplit` in
+    /// src/apprt/gtk/class/split_tree.zig): `target`'s place is split in
+    /// half, `source` taking the half on that side, and `source` leaves
+    /// the place it had. From another tab, of this window or another,
+    /// `source` leaves that tab; one it leaves empty, which only a pane
+    /// alone in its tab with `drag-handle = always` can, closes, and with
+    /// it its window, if it was the window's last, as macOS closes them.
+    /// The moved pane has the focus, and its window comes forward.
+    ///
+    /// Nothing for a pane dropped on itself. Refused, logged, for a pane
+    /// or window that is closing, a parked pane, and a frame that is
+    /// transparent where the other is not, whose terminals present as it
+    /// does (`Surface.presentsAlpha`), as a tab moves only between frames
+    /// of one kind (`moveTabAt`). Every allocation, and the one step that
+    /// can fail outside them, moving the pane's window to the new frame,
+    /// come first, so that a failure leaves everything as it was. Where
+    /// the core may be re-entered: it moves the focus.
+    pub fn movePane(self: *App, source: *Surface, target: *Surface, side: Window.Tree.Split.Direction) !void {
+        if (source == target) return;
+        const alloc = self.core_app.alloc;
+        const from = source.window;
+        const to = target.window;
+        if (from.closing or to.closing or source.closing or target.closing or source.parked or target.parked) {
+            log.info("the pane is not moved: a pane or its window is closing", .{});
+            return error.PaneClosing;
+        }
+        if (from != to and from.transparent != to.transparent) {
+            log.info("the pane is not moved: one window is transparent, the other is not", .{});
+            return error.FrameKind;
+        }
+        const st = from.tabOf(source) orelse return error.PaneClosing;
+        const tt = to.tabOf(target) orelse return error.PaneClosing;
+        const sh = st.tree.locate(source).?;
+        const th = tt.tree.locate(target).?;
+
+        var single: Window.Tree = try .init(alloc, source);
+        defer single.deinit();
+        var joined = try tt.tree.split(alloc, th, side, 0.5, &single);
+        if (st == tt) {
+            // `split` keeps every handle of the tree it splits, `sh` too.
+            defer joined.deinit();
+            const moved = try joined.remove(alloc, sh);
+            errdefer comptime unreachable;
+            st.focused = source;
+            from.adopt(st, moved);
+            if (st == from.tab()) from.giveFocus(source);
+            return;
+        }
+        errdefer joined.deinit();
+        var left = try st.tree.remove(alloc, sh);
+        errdefer left.deinit();
+        if (from != to and !Window.reparentPane(source, to)) return Error.Win32CallFailed;
+        errdefer comptime unreachable;
+
+        const emptied = left.isEmpty();
+        var old = from.leavePane(st, sh, left);
+        old.deinit();
+        if (from != to) {
+            source.window = to;
+            const dpi = Window.dpiOf(self, to.hwnd);
+            if (dpi != Window.dpiOf(self, from.hwnd)) source.scaleChanged(std.math.lossyCast(u16, dpi));
+            // A title prompt over `from` for `source` closes.
+            TitleDialog.followMove(from);
+        }
+        tt.focused = source;
+        to.setTree(tt, joined);
+        if (tt == to.tab()) {
+            to.relayout();
+            to.giveFocus(source);
+        }
+        if (emptied) {
+            if (from.tabs.items.len > 1) from.removeTab(st) else _ = from.destroy();
+        }
+        if (from != to) _ = to.present();
     }
 
     /// A tab dragged out of `old`'s bar, the one at `index`, dropped
@@ -9045,6 +9143,210 @@ test "win32: move_tab_to_new_window waits for run, and only with another tab" {
     try std.testing.expectEqual(1, window.tabs.items.len);
     try std.testing.expect(a.window == window);
     try std.testing.expect(win32.GetAncestor(a.hwnd, win32.GA_PARENT) == window.hwnd);
+}
+
+/// For the pane move tests: the terminals of `t`'s tree as they are laid
+/// out, left before right and top before bottom (the tree's iterator goes
+/// in the order of its nodes, which a split does not keep), as letters,
+/// each its index in `named` from 'a' ('?' for one not there), so that a
+/// mismatch prints them.
+fn testLeaves(t: *const Tab, named: []const *Surface, buf: []u8) []const u8 {
+    if (t.tree.isEmpty()) return buf[0..0];
+    var n: usize = 0;
+    testLeavesUnder(&t.tree, .root, named, buf, &n);
+    return buf[0..n];
+}
+
+fn testLeavesUnder(tree: *const Window.Tree, handle: Window.Tree.Node.Handle, named: []const *Surface, buf: []u8, n: *usize) void {
+    switch (tree.nodes[handle.idx()]) {
+        .leaf => |view| {
+            const at = std.mem.indexOfScalar(*Surface, named, view);
+            buf[n.*] = if (at) |i| 'a' + @as(u8, @intCast(i)) else '?';
+            n.* += 1;
+        },
+        .split => |split| {
+            testLeavesUnder(tree, split.left, named, buf, n);
+            testLeavesUnder(tree, split.right, named, buf, n);
+        },
+    }
+}
+
+test "win32: a pane dropped on another goes to the side of it nearest the drop, as on GTK" {
+    const place: win32.RECT = .{ .left = 100, .top = 50, .right = 300, .bottom = 150 };
+    const Case = struct { x: i32, y: i32, side: Window.Tree.Split.Direction };
+    for ([_]Case{
+        .{ .x = 110, .y = 100, .side = .left },
+        .{ .x = 290, .y = 100, .side = .right },
+        .{ .x = 200, .y = 55, .side = .up },
+        .{ .x = 200, .y = 145, .side = .down },
+        // By the share of each side, not pixels: 30 of 200 across is
+        // nearer its edge than 20 of 100 down.
+        .{ .x = 130, .y = 70, .side = .left },
+        .{ .x = 150, .y = 60, .side = .up },
+        // A tie goes left, then right, then up.
+        .{ .x = 100, .y = 50, .side = .left },
+        .{ .x = 300, .y = 150, .side = .right },
+        .{ .x = 200, .y = 50, .side = .up },
+    }) |case| {
+        try std.testing.expectEqual(case.side, Window.dropSide(place, .{ .x = case.x, .y = case.y }));
+    }
+}
+
+test "win32: a pane dropped on another of its tab goes beside it, with the focus" {
+    // As GTK moves it (`SplitTree.moveSplit`): the place it was dropped on
+    // is split in half, and it leaves its own. Dropped on itself, nothing
+    // moves.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 300);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
+    window.tab().focused = b;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    const names = [_]*Surface{ a, b, c };
+    var buf: [4]u8 = undefined;
+    try app.movePane(a, a, .right);
+    try std.testing.expectEqualStrings("abc", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(window.tab().focused == b);
+
+    try app.movePane(a, c, .right);
+    try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(window.tab().focused == a);
+    // c's place, split in half: a has its right half.
+    const ca = try paneRect(window, c);
+    const aa = try paneRect(window, a);
+    try std.testing.expectEqual(ca.top, aa.top);
+    try std.testing.expect(aa.left > ca.right);
+    try std.testing.expect(@abs((ca.right - ca.left) - (aa.right - aa.left)) <= 1);
+    for ([_]*Surface{ a, b, c }) |pane| try std.testing.expect(shown(pane.hwnd));
+
+    // Above b now: b's place split down.
+    try app.movePane(c, b, .up);
+    try std.testing.expectEqualStrings("cba", testLeaves(window.tab(), &names, &buf));
+    const cc = try paneRect(window, c);
+    const bb = try paneRect(window, b);
+    try std.testing.expect(cc.bottom < bb.top);
+    try std.testing.expectEqual(cc.left, bb.left);
+}
+
+test "win32: a pane dropped in another window leaves its tab for that frame, and that window comes forward" {
+    // It is the new frame's child, points back at its window, and has the
+    // focus there; its old tab keeps the rest, the focus moving off it.
+    // Refused, nothing moved: a pane that is closing, and a frame that is
+    // transparent where the other is not.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_foreground = &ForegroundSeen.seen;
+    defer Window.test_foreground = null;
+    ForegroundSeen.last = null;
+
+    const one = try testFrame(&app);
+    const a = try testPane(&app, one);
+    const b = try testPane(&app, one);
+    one.tab().tree = try testRow(alloc, &.{ a, b });
+    one.tab().focused = b;
+    _ = win32.ShowWindow(one.hwnd, win32.SW_SHOWNOACTIVATE);
+    one.relayout();
+    const two = try testFrame(&app);
+    const c = try testPane(&app, two);
+    two.tab().tree = try .init(alloc, c);
+    two.tab().focused = c;
+    _ = win32.ShowWindow(two.hwnd, win32.SW_SHOWNOACTIVATE);
+    two.relayout();
+
+    b.closing = true;
+    try std.testing.expectError(error.PaneClosing, app.movePane(b, c, .left));
+    b.closing = false;
+    const clear = try testFrameOf(&app, true);
+    const d = try testPane(&app, clear);
+    clear.tab().tree = try .init(alloc, d);
+    clear.tab().focused = d;
+    try std.testing.expectError(error.FrameKind, app.movePane(b, d, .left));
+    const names = [_]*Surface{ a, b, c, d };
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("ab", testLeaves(one.tab(), &names, &buf));
+    try std.testing.expect(ForegroundSeen.last == null);
+
+    try app.movePane(b, c, .left);
+    try std.testing.expectEqualStrings("a", testLeaves(one.tab(), &names, &buf));
+    try std.testing.expectEqualStrings("bc", testLeaves(two.tab(), &names, &buf));
+    try std.testing.expect(b.window == two);
+    try std.testing.expectEqual(two.hwnd, win32.GetAncestor(b.hwnd, win32.GA_PARENT).?);
+    try std.testing.expect(one.tab().focused == a);
+    try std.testing.expect(two.tab().focused == b);
+    try std.testing.expect(shown(b.hwnd));
+    try std.testing.expectEqual(two.hwnd, ForegroundSeen.last.?);
+    const bb = try paneRect(two, b);
+    const cc = try paneRect(two, c);
+    try std.testing.expect(bb.right < cc.left);
+}
+
+test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its window when it was the last" {
+    // Which only `drag-handle = always` lets be dragged; macOS closes them
+    // so. Its window's other tab shows; with none, the window is torn
+    // down, and the pane lives on in its new one.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    Window.test_foreground = &ForegroundSeen.seen;
+    defer Window.test_foreground = null;
+
+    const one = try testFrame(&app);
+    const a = try testPane(&app, one);
+    one.tab().tree = try .init(alloc, a);
+    one.tab().focused = a;
+    _ = win32.ShowWindow(one.hwnd, win32.SW_SHOWNOACTIVATE);
+    one.relayout();
+    const x = try testTab(&app, one);
+    one.selectTab(0);
+    const two = try testFrame(&app);
+    const c = try testPane(&app, two);
+    two.tab().tree = try .init(alloc, c);
+    two.tab().focused = c;
+    _ = win32.ShowWindow(two.hwnd, win32.SW_SHOWNOACTIVATE);
+    two.relayout();
+
+    // a, c and x as a, b and c.
+    const names = [_]*Surface{ a, c, x };
+    var buf: [4]u8 = undefined;
+    try app.movePane(a, c, .down);
+    try std.testing.expectEqual(1, one.tabs.items.len);
+    try std.testing.expect(one.tab().focused == x);
+    try std.testing.expect(shown(x.hwnd));
+    try std.testing.expectEqualStrings("ba", testLeaves(two.tab(), &names, &buf));
+
+    const gone = one.hwnd;
+    try app.movePane(x, a, .right);
+    testPump();
+    try std.testing.expect(!win32.IsWindow(gone).toBool());
+    try std.testing.expectEqualSlices(*Window, &.{two}, app.windows.items);
+    try std.testing.expectEqualStrings("bac", testLeaves(two.tab(), &names, &buf));
+    try std.testing.expect(x.window == two);
+    try std.testing.expect(TestUndo.has(&app, x));
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
 }
 
 test "win32: move_tab_to_new_window moves a tab whole into a new window" {
