@@ -842,14 +842,15 @@ pub fn dropSide(place: win32.RECT, at: win32.POINT) Tree.Split.Direction {
 }
 
 /// `source`, dragged by its handle, dropped on `target`, to go to its
-/// side `side` (`App.movePane`). At once whenever the core may be
-/// re-entered, as a tab dragged out of the bar is moved
-/// (`dropTabOut`); else, under a prompt or a core frame, recorded for
-/// `run`, naming both terminals, which must be live (`App.requests`).
+/// side `side` (`App.movePane`). At once whenever a teardown could run
+/// (`App.canTearDown`), as the move may close the window it leaves;
+/// else, under a prompt, a core frame or another terminal's teardown
+/// wait, recorded for `run`, naming both terminals, which must be live
+/// (`App.requests`).
 pub fn dropPane(source: *Surface, target: *Surface, side: Tree.Split.Direction) void {
     const app = source.window.app;
     if (app.terminating or source == target) return;
-    if (app.canReenterCore()) return app.movePaneOrSay(source, target, side);
+    if (app.canTearDown()) return app.movePaneOrSay(source, target, side);
     const from = source.liveCore() orelse return;
     const onto = target.liveCore() orelse return;
     app.requests.append(app.core_app.alloc, .{ .move_pane = .{

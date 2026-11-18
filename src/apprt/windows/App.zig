@@ -4828,10 +4828,28 @@ pub const App = struct {
             to.relayout();
             to.giveFocus(source);
         }
-        if (emptied) {
-            if (from.tabs.items.len > 1) from.removeTab(st) else _ = from.destroy();
-        }
         if (from != to) _ = to.present();
+        if (emptied) {
+            if (from.tabs.items.len > 1) from.removeTab(st) else closeEmptied(from);
+        }
+    }
+
+    /// `window`, whose last terminal moved away (`movePane`), off the
+    /// screen at once and torn down from a message loop, as every window
+    /// is (`Window.destroyPosted`): not here, where a drop may come inside
+    /// another terminal's teardown wait, nor kept for `undo`, which would
+    /// put back an empty window. `closing` keeps drops and moves off it
+    /// meanwhile; a teardown that cannot be posted waits for the next
+    /// `repostDeferredDestroys`, as a deferred one does.
+    fn closeEmptied(window: *Window) void {
+        window.unkept = true;
+        window.closing = true;
+        _ = win32.ShowWindow(window.hwnd, win32.SW_HIDE);
+        window.postDestroy();
+        if (!window.closing) {
+            window.closing = true;
+            window.destroy_deferred = true;
+        }
     }
 
     /// A tab dragged out of `old`'s bar, the one at `index`, dropped
@@ -9323,8 +9341,9 @@ test "win32: a pane dropped in another window leaves its tab for that frame, and
 
 test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its window when it was the last" {
     // Which only `drag-handle = always` lets be dragged; macOS closes them
-    // so. Its window's other tab shows; with none, the window is torn
-    // down, and the pane lives on in its new one.
+    // so. Its window's other tab shows; with none, the window is hidden
+    // at once and torn down from the message loop, as any window is, not
+    // kept for `undo`, and the pane lives on in its new one.
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -9335,6 +9354,9 @@ test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its
     defer testCleanup(&app);
     Window.test_foreground = &ForegroundSeen.seen;
     defer Window.test_foreground = null;
+
+    try TestUndo.enable(&app);
+    defer Undo.test_now = null;
 
     const one = try testFrame(&app);
     const a = try testPane(&app, one);
@@ -9362,6 +9384,15 @@ test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its
 
     const gone = one.hwnd;
     try app.movePane(x, a, .right);
+    try std.testing.expect(one.closing);
+    try std.testing.expect(!win32.IsWindowVisible(gone).toBool());
+    // Inside another terminal's teardown wait: deferred.
+    app.teardown_depth = 1;
+    testPump();
+    try std.testing.expect(win32.IsWindow(gone).toBool());
+    try std.testing.expect(one.destroy_deferred);
+    app.teardown_depth = 0;
+    app.repostDeferredDestroys();
     testPump();
     try std.testing.expect(!win32.IsWindow(gone).toBool());
     try std.testing.expectEqualSlices(*Window, &.{two}, app.windows.items);
@@ -13121,13 +13152,7 @@ const TestUndo = struct {
     const due = start + timeout_ms;
 
     fn init(app: *App) !TestUndo {
-        var config: Config = try .default(app.core_app.alloc);
-        defer config.deinit();
-        try config.keybind.parseCLI(config._arena.?.allocator(), "ctrl+shift+z=undo");
-        config.@"undo-timeout" = .{ .duration = timeout_ms * std.time.ns_per_ms };
-        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
-        try std.testing.expect(app.undo.enabled);
-        Undo.test_now = start;
+        try enable(app);
         const window = try testFrame(app);
         const a = try testPane(app, window);
         const b = try testPane(app, window);
@@ -13135,6 +13160,17 @@ const TestUndo = struct {
         window.tab().focused = b;
         window.relayout();
         return .{ .window = window, .a = a, .b = b };
+    }
+
+    /// `undo` bound, with `timeout_ms`, at `start`.
+    fn enable(app: *App) !void {
+        var config: Config = try .default(app.core_app.alloc);
+        defer config.deinit();
+        try config.keybind.parseCLI(config._arena.?.allocator(), "ctrl+shift+z=undo");
+        config.@"undo-timeout" = .{ .duration = timeout_ms * std.time.ns_per_ms };
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
+        try std.testing.expect(app.undo.enabled);
+        Undo.test_now = start;
     }
 
     /// Close `pane` as its shell's exit or a binding does, and run the
