@@ -45,6 +45,7 @@ const SaveDialog = @import("SaveDialog.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const ChildExited = @import("ChildExited.zig");
 const BellBorder = @import("BellBorder.zig");
+const ProgressBar = @import("ProgressBar.zig");
 const RendererHealth = @import("RendererHealth.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const TitleDialog = @import("TitleDialog.zig");
@@ -18451,6 +18452,191 @@ test "win32: progress_report shows the focused terminal's progress on the taskba
     app.config.@"progress-style" = false;
     try report(&app, left, .{ .state = .set, .progress = 50 });
     try std.testing.expectEqual(.none, fake.state);
+}
+
+/// For tests: `surface`'s progress bar shows in `window` along the top of
+/// its terminal, as far across as `percent` fills, and its height.
+fn expectBarAt(window: *const Window, surface: *const Surface, percent: u8) !void {
+    const hwnd = surface.overlays.progress_bar.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(win32.GetAncestor(hwnd, win32.GA_PARENT) == window.hwnd);
+    const pane = try paneClient(window, surface);
+    const h = ProgressBar.height(Window.dpiOf(surface.app, window.hwnd));
+    try std.testing.expectEqual(win32.RECT{
+        .left = pane.left,
+        .top = pane.top,
+        .right = pane.left + @divTrunc((pane.right - pane.left) * percent, 100),
+        .bottom = pane.top + h,
+    }, try childRect(window, hwnd));
+}
+
+test "win32: progress_report shows a bar along the top of each terminal" {
+    // GTK's and macOS's bar, drawn as macOS draws it, over every terminal
+    // that reports progress, not only the focused one the taskbar button
+    // shows: filled to its value in the accent colour, red for an error,
+    // orange while paused; with no value, a block that goes across and
+    // back over a track. Just above the terminal and its read-only badge;
+    // hidden with it; gone when the report is removed, lapses, or
+    // `progress-style` is false.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const accent = win32.rgb(0x00, 0x78, 0xd7);
+    ProgressBar.test_accent = accent;
+    defer ProgressBar.test_accent = null;
+    ProgressBar.test_now = 1000;
+    defer ProgressBar.test_now = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const report = struct {
+        fn f(app_: *App, pane: *Surface, value: terminal.osc.Command.ProgressReport) !void {
+            try std.testing.expect(try app_.performAction(.{ .surface = &pane.core_surface }, .progress_report, value));
+        }
+    }.f;
+    const timer = @import("Surface.zig").progress_timer_id;
+
+    // A value: 40% of the terminal, at its top, just above it, in the
+    // accent colour; none on the other terminal.
+    try std.testing.expect(a.overlays.progress_bar.hwnd == null);
+    try report(&app, a, .{ .state = .set, .progress = 40 });
+    try expectBarAt(window, a, 40);
+    const hwnd = a.overlays.progress_bar.hwnd.?;
+    try std.testing.expect(win32.GetWindow(a.hwnd, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(b.overlays.progress_bar.hwnd == null);
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(accent, printed.at(0, 0));
+        try std.testing.expectEqual(accent, printed.at(printed.width - 1, printed.height - 1));
+    }
+
+    // The other terminal, without the focus, shows its own: paused, in
+    // orange.
+    try report(&app, b, .{ .state = .pause, .progress = 30 });
+    try expectBarAt(window, b, 30);
+    {
+        const printed = try Printed.of(b.overlays.progress_bar.hwnd.?);
+        defer printed.deinit();
+        try std.testing.expectEqual(ProgressBar.orange, printed.at(0, 0));
+    }
+
+    // An error with a value: red, as far.
+    try report(&app, a, .{ .state = .@"error", .progress = 50 });
+    try expectBarAt(window, a, 50);
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(ProgressBar.red, printed.at(0, 0));
+    }
+    // A new colour where it stays is drawn again.
+    _ = win32.UpdateWindow(hwnd);
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    try report(&app, a, .{ .state = .pause, .progress = 50 });
+    try expectBarAt(window, a, 50);
+    try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+
+    // No known amount: across all of it, the block at the left as it
+    // sets out, over the track; at the right a sweep later.
+    try report(&app, a, .{ .state = .indeterminate });
+    try expectBarAt(window, a, 100);
+    const track = win32.lerp(Overlays.terminalBackground(a), accent, 300);
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(accent, printed.at(0, 0));
+        try std.testing.expectEqual(track, printed.at(printed.width - 1, 0));
+    }
+    ProgressBar.test_now = 1000 + ProgressBar.sweep_ms;
+    {
+        const printed = try Printed.of(hwnd);
+        defer printed.deinit();
+        try std.testing.expectEqual(track, printed.at(0, 0));
+        try std.testing.expectEqual(accent, printed.at(printed.width - 1, 0));
+    }
+
+    // Its timer draws it again; a newer report does not start it over.
+    _ = win32.UpdateWindow(hwnd);
+    try std.testing.expect(!win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    _ = Surface.wndProc(a.hwnd, win32.WM_TIMER, ProgressBar.timer_id, 0);
+    try std.testing.expect(win32.GetUpdateRect(hwnd, null, .FALSE).toBool());
+    try report(&app, a, .{ .state = .indeterminate });
+    try std.testing.expectEqual(1000, a.overlays.progress_bar.started);
+
+    // Over the read-only badge, as GTK stacks them.
+    try std.testing.expect(try testReadOnly(&app, a, .on));
+    const badge = a.overlays.readonly.hwnd.?;
+    try std.testing.expect(win32.GetWindow(a.hwnd, win32.GW_HWNDPREV) == badge);
+    try std.testing.expect(win32.GetWindow(badge, win32.GW_HWNDPREV) == hwnd);
+    try std.testing.expect(try testReadOnly(&app, a, .off));
+
+    // Hidden with its terminal, and back with it; resized with it. The
+    // block's timer stops at its first tick while the bar is hidden,
+    // and starts again as it shows; a value stops it.
+    window.toggleZoom(b);
+    try std.testing.expect(!shown(hwnd));
+    _ = Surface.wndProc(a.hwnd, win32.WM_TIMER, ProgressBar.timer_id, 0);
+    try std.testing.expect(!win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    window.toggleZoom(b);
+    try expectBarAt(window, a, 100);
+    try std.testing.expect(win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .indeterminate });
+    try report(&app, a, .{ .state = .set, .progress = 100 });
+    try std.testing.expect(!win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .indeterminate });
+    testResize(window, 1000, 600);
+    try expectBarAt(window, a, 100);
+    try expectBarAt(window, b, 30);
+
+    // Nothing filled shows nothing; a removal hides it, as a report
+    // that lapses does.
+    try report(&app, a, .{ .state = .set, .progress = 0 });
+    try std.testing.expect(!shown(hwnd));
+    try report(&app, a, .{ .state = .set, .progress = 60 });
+    try expectBarAt(window, a, 60);
+    try report(&app, a, .{ .state = .remove });
+    try std.testing.expect(!shown(hwnd));
+    try report(&app, a, .{ .state = .set, .progress = 20 });
+    try expectBarAt(window, a, 20);
+    a.progress_expires = 0;
+    _ = Surface.wndProc(a.hwnd, win32.WM_TIMER, timer, 0);
+    try std.testing.expect(!shown(hwnd));
+
+    // With progress-style = false a report hides it.
+    try report(&app, a, .{ .state = .set, .progress = 20 });
+    try expectBarAt(window, a, 20);
+    app.config.@"progress-style" = false;
+    try report(&app, a, .{ .state = .set, .progress = 50 });
+    try std.testing.expect(!shown(hwnd));
+    app.config.@"progress-style" = true;
+
+    // A window that cannot be made is made at the next report.
+    _ = win32.DestroyWindow(b.overlays.progress_bar.hwnd.?);
+    try std.testing.expect(b.overlays.progress_bar.hwnd == null);
+    const NoWindow = struct {
+        fn make(c: []const u8) ?win32.HWND {
+            _ = c;
+            return null;
+        }
+    };
+    Overlays.test_make = &NoWindow.make;
+    defer Overlays.test_make = null;
+    try report(&app, b, .{ .state = .set, .progress = 70 });
+    try std.testing.expect(b.overlays.progress_bar.hwnd == null);
+    Overlays.test_make = null;
+    try report(&app, b, .{ .state = .set, .progress = 70 });
+    try expectBarAt(window, b, 70);
 }
 
 test "win32: desktop_notification shows a toast for its terminal, which a click goes back to" {

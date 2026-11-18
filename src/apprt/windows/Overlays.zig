@@ -1,12 +1,12 @@
 //! A terminal's overlays: windows that show something about the terminal
 //! over it, as GTK stacks overlays over its surface
 //! (src/apprt/gtk/ui/1.0/surface.blp): the read-only badge (ReadOnly.zig),
-//! the bell border (BellBorder.zig), the child-exited banner
-//! (ChildExited.zig), the resize overlay (ResizeOverlay.zig), the link
-//! preview (LinkPreview.zig), the renderer error view (RendererHealth.zig,
-//! which GTK lacks, over those as macOS stacks it), the key-state
-//! indicator (KeyState.zig) and the dim of an unfocused split
-//! (UnfocusedSplit.zig).
+//! the progress bar (ProgressBar.zig), the bell border (BellBorder.zig),
+//! the child-exited banner (ChildExited.zig), the resize overlay
+//! (ResizeOverlay.zig), the link preview (LinkPreview.zig), the renderer
+//! error view (RendererHealth.zig, which GTK lacks, over those as macOS
+//! stacks it), the key-state indicator (KeyState.zig) and the dim of an
+//! unfocused split (UnfocusedSplit.zig).
 //! This file does for each what they all need: their window class and
 //! procedure, their place in the Z order, their font, colours and frame,
 //! and their teardown; each overlay's own file says what it shows and where
@@ -49,6 +49,7 @@ const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
 const ReadOnly = @import("ReadOnly.zig");
 const BellBorder = @import("BellBorder.zig");
+const ProgressBar = @import("ProgressBar.zig");
 const RendererHealth = @import("RendererHealth.zig");
 const ChildExited = @import("ChildExited.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
@@ -66,6 +67,10 @@ const log = std.log.scoped(.win32);
 /// The read-only badge, made the first time the terminal is made
 /// read-only (`ReadOnly.set`).
 readonly: ReadOnly.Badge = .{},
+
+/// The progress bar, made the first time the terminal reports progress
+/// (`ProgressBar.set`).
+progress_bar: ProgressBar.Bar = .{},
 
 /// The bell border, made the first time the terminal's bell rings with
 /// `bell-features` `border` (`BellBorder.set`).
@@ -116,11 +121,11 @@ background: ?terminal.color.RGB = null,
 /// its text to measure), `shape` (its window's region), `handle`
 /// (messages of its own) and `hidden` (what it does as its window is
 /// hidden).
-pub const stack = [_][]const u8{ "readonly", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim" };
+pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, ProgressBar.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -289,7 +294,8 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// again, so the terminal shows no more previews; the key-state
 /// indicator is made again at its next change that leaves something to
 /// show (`KeyState.update`), the read-only badge the next time the
-/// terminal is made read-only (`ReadOnly.set`), the bell border the next
+/// terminal is made read-only (`ReadOnly.set`), the progress bar at the
+/// terminal's next report (`ProgressBar.set`), the bell border the next
 /// time it shows (`BellBorder.set`), the renderer error view the next
 /// time the renderer is unhealthy (`RendererHealth.set`), the resize
 /// overlay at its terminal's next change of size

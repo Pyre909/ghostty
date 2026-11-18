@@ -25,6 +25,7 @@ const LinkPreview = @import("LinkPreview.zig");
 const Overlays = @import("Overlays.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const BellBorder = @import("BellBorder.zig");
+const ProgressBar = @import("ProgressBar.zig");
 const BellBadge = @import("BellBadge.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
@@ -1903,9 +1904,10 @@ pub const Surface = struct {
     // ---------------------------------------------------------------------
 
     /// `.progress_report`: take the program's report, and show it on the
-    /// window's taskbar button if this terminal has the window's focus. As
-    /// on GTK, a report with no newer one lapses after 15 seconds, for a
-    /// program that stalls or exits without removing it, and with
+    /// terminal's progress bar (`ProgressBar`), and on the window's taskbar
+    /// button if this terminal has the window's focus. As on GTK, a report
+    /// with no newer one lapses after 15 seconds, for a program that
+    /// stalls or exits without removing it, and with
     /// `progress-style = false` a report removes what was shown instead.
     pub fn reportProgress(self: *Surface, report: terminal.osc.Command.ProgressReport) void {
         if (self.app.config.@"progress-style") {
@@ -1923,6 +1925,7 @@ pub const Surface = struct {
                 log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
             }
         }
+        ProgressBar.set(self);
         if (self.window.tab().focused == self) self.window.showProgress();
     }
 
@@ -2283,6 +2286,10 @@ pub const Surface = struct {
                 },
                 ResizeOverlay.timer_id => {
                     ResizeOverlay.timer(self);
+                    return 0;
+                },
+                ProgressBar.timer_id => {
+                    ProgressBar.timer(self);
                     return 0;
                 },
                 else => {},

@@ -430,6 +430,7 @@ test {
     _ = @import("windows/LinkPreview.zig");
     _ = @import("windows/Mica.zig");
     _ = @import("windows/Overlays.zig");
+    _ = @import("windows/ProgressBar.zig");
     _ = @import("windows/ReadOnly.zig");
     _ = @import("windows/RendererHealth.zig");
     _ = @import("windows/ResizeOverlay.zig");
