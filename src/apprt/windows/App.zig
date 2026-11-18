@@ -13423,6 +13423,53 @@ test "win32: a window closed while another stays is parked whole, and undo shows
     try std.testing.expectEqual(0, app.undo.entries.items.len);
 }
 
+test "win32: a window parked while the background's opacity is toggled has its backdrop as undo shows it" {
+    // `toggle_background_opacity` gives a backdrop only to the app's
+    // windows, which a parked one is not (`Window.park`): it is given it
+    // as it comes back (`Window.unpark`).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer TestClear.stop();
+    Window.test_create_pane = &testCreatePane;
+    defer Window.test_create_pane = null;
+
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    try config.keybind.parseCLI(config._arena.?.allocator(), "ctrl+shift+z=undo");
+    config.@"background-opacity" = 0.5;
+    config.@"background-blur" = .true;
+    config.@"window-inherit-font-size" = false;
+    config.@"window-inherit-working-directory" = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
+    Undo.test_now = TestUndo.start;
+    TestClear.start(2);
+    const window = try app.newWindow(null, .normal, null);
+    const other = try app.newWindow(null, .normal, null);
+    try std.testing.expectEqual(.acrylic, window.backdrop);
+    try std.testing.expectEqual(.acrylic, other.backdrop);
+
+    _ = Window.wndProc(window.hwnd, win32.WM_CLOSE, 0, 0);
+    testPump();
+    try std.testing.expectEqual(1, app.undo.parkedWindows());
+    try std.testing.expect(try app.performAction(.{ .surface = &other.tab().focused.?.core_surface }, .toggle_background_opacity, {}));
+    app.createRequested();
+    try std.testing.expect(app.background_opaque);
+    try std.testing.expectEqual(.default, other.backdrop);
+    try std.testing.expectEqual(.acrylic, window.backdrop);
+
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqualSlices(*Window, &.{ window, other }, app.windows.items);
+    try std.testing.expectEqual(.default, window.backdrop);
+    try std.testing.expectEqual(window.hwnd, TestClear.backdrop_frames[TestClear.backdrop_count - 1]);
+}
+
 test "win32: the last window's close is not kept, and ends the windows parked before it" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
