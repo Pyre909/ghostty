@@ -149,9 +149,11 @@ pub const Handle = struct {
             // All of it takes the pointer, as GTK's handle does.
             win32.WM_NCHITTEST => return win32.HTCLIENT,
 
-            // A press on it neither activates the frame nor moves the
-            // focus out of the terminal.
-            win32.WM_MOUSEACTIVATE => return win32.MA_NOACTIVATE,
+            // A press on it is a click on its terminal first: in an
+            // inactive frame, or with the focus elsewhere (a palette, a
+            // field, another split), it only focuses the terminal, and
+            // no drag starts. Otherwise it leaves the activation alone.
+            win32.WM_MOUSEACTIVATE => return surface.clickFocus() orelse win32.MA_NOACTIVATE,
 
             // GTK gives it the "grab" cursor, which Windows lacks; its
             // own for moving a thing is the four arrows.

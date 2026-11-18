@@ -8651,6 +8651,22 @@ test "win32: a click on an inactive window picks the terminal it focuses" {
         Surface.wndProc(right.hwnd, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), lparam),
     );
     try std.testing.expect(window.tab().focused == right);
+
+    // As one on its drag handle, which covers the top of it: the click
+    // focuses the terminal under the handle, and starts no drag.
+    const handle_latch = TestHandle.install();
+    defer TestHandle.uninstall(handle_latch);
+    window.tab().focused = left;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    testPointer(right, 20, 2);
+    const h = right.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        win32.MA_ACTIVATEANDEAT,
+        win32.SendMessageW(h, win32.WM_MOUSEACTIVATE, @intFromPtr(window.hwnd), lparam),
+    );
+    try std.testing.expect(window.tab().focused == right);
+    try std.testing.expect(right.overlays.drag_handle.press == null);
 }
 
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {

@@ -1995,6 +1995,35 @@ pub const Surface = struct {
         if (!self.focused) self.setBellRinging(true);
     }
 
+    /// A click on this terminal, or on its drag handle, that only moves
+    /// the focus here: MA_ACTIVATEANDEAT, its WM_MOUSEACTIVATE answer,
+    /// with the focus given; null when the focus is here already and the
+    /// click is the terminal's (or the handle's).
+    pub fn clickFocus(self: *Surface) ?win32.LRESULT {
+        // A click on an inactive window only activates it, as on macOS:
+        // it must not clear the selection, move the prompt cursor, or
+        // reach a program that reads the mouse. The button-up that may
+        // follow is dropped by mouseButton, because the press was never
+        // recorded. The terminal clicked is the one the activation gives
+        // the focus (the frame's WM_SETFOCUS).
+        if (win32.GetActiveWindow() != self.window.hwnd) {
+            // The terminal itself, not its search field.
+            self.search_bar.field_focus = false;
+            self.window.setFocused(self);
+            return win32.MA_ACTIVATEANDEAT;
+        }
+
+        // In an active window with the focus elsewhere in it, the click
+        // only moves the focus here, and is consumed as macOS consumes a
+        // click that moves the focus between splits
+        // (`localEventLeftMouseDown` in SurfaceView_AppKit.swift).
+        if (win32.GetFocus() != self.hwnd) {
+            _ = win32.SetFocus(self.hwnd);
+            return win32.MA_ACTIVATEANDEAT;
+        }
+        return null;
+    }
+
     /// Set `bell_ringing`, and show it where it changed.
     fn setBellRinging(self: *Surface, ringing: bool) void {
         if (self.bell_ringing == ringing) return;
@@ -2717,34 +2746,8 @@ pub const Surface = struct {
                 // Sent for every click on a child window, not only for one
                 // that activates its frame. Client area only; the caption is
                 // the frame's, so a click there never comes here.
-                if (win32.loword(lparam) == win32.HTCLIENT) {
-                    // A click on an inactive window only activates it, as on
-                    // macOS: it must not clear the selection, move the prompt
-                    // cursor, or reach a program that reads the mouse. The
-                    // button-up that may follow is dropped by mouseButton,
-                    // because the press was never recorded. The terminal
-                    // clicked is the one the activation gives the focus
-                    // (the frame's WM_SETFOCUS).
-                    if (win32.GetActiveWindow() != self.window.hwnd) {
-                        // The terminal itself, not its search field.
-                        self.search_bar.field_focus = false;
-                        self.window.setFocused(self);
-                        return win32.MA_ACTIVATEANDEAT;
-                    }
-
-                    // In an active window with the focus elsewhere in it,
-                    // the click only moves the focus here, and is consumed
-                    // as macOS consumes a click that moves the focus between
-                    // splits (`localEventLeftMouseDown` in
-                    // SurfaceView_AppKit.swift).
-                    if (win32.GetFocus() != hwnd) {
-                        _ = win32.SetFocus(hwnd);
-                        return win32.MA_ACTIVATEANDEAT;
-                    }
-
-                    // Otherwise the click is the terminal's.
-                    return win32.MA_ACTIVATE;
-                }
+                if (win32.loword(lparam) == win32.HTCLIENT)
+                    return self.clickFocus() orelse win32.MA_ACTIVATE;
             },
 
             win32.WM_PAINT => {
