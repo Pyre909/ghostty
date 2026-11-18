@@ -117,7 +117,7 @@ pub const Handle = struct {
         self.tracking = false;
         if (self.press == null) return;
         self.press = null;
-        if (Overlays.surfaceOf(hwnd)) |surface| DropPreview.clear(surface.app);
+        DropPreview.clear();
         if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
     }
 
@@ -183,15 +183,22 @@ pub const Handle = struct {
                 if (self.press != null) {
                     self.press = null;
                     self.hover = false;
-                    DropPreview.clear(surface.app);
+                    DropPreview.clear();
                     Overlays.place(surface);
                 }
                 return 0;
             },
 
-            // Its press goes with it; then `Overlays.wndProc` forgets it.
+            // Its press and hover go with it, so that the next move over
+            // the strip makes it again; then `Overlays.wndProc` forgets
+            // it.
             win32.WM_DESTROY => {
-                self.press = null;
+                self.hover = false;
+                self.tracking = false;
+                if (self.press != null) {
+                    self.press = null;
+                    DropPreview.clear();
+                }
                 if (captured == hwnd) captured = null;
                 return null;
             },
@@ -317,7 +324,7 @@ fn release(surface: *Surface, hwnd: win32.HWND, at: POINT) void {
     self.hover = false;
     if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
     if (captured == hwnd) captured = null;
-    DropPreview.clear(surface.app);
+    DropPreview.clear();
     Overlays.place(surface);
     if (!p.active and !TabBar.pastDragThreshold(p.at, at, p.threshold)) return;
     const target = paneAt(surface.app, at) orelse return;
@@ -329,9 +336,9 @@ fn release(surface: *Surface, hwnd: win32.HWND, at: POINT) void {
 /// under it, if another, shows where `surface` would go
 /// (`DropPreview.set`); none does over anything else.
 fn preview(surface: *Surface, at: POINT) void {
-    const target = paneAt(surface.app, at) orelse return DropPreview.clear(surface.app);
-    if (target.surface == surface) return DropPreview.clear(surface.app);
-    DropPreview.set(surface.app, target.surface, Window.dropSide(target.rect, at));
+    const target = paneAt(surface.app, at) orelse return DropPreview.clear();
+    if (target.surface == surface) return DropPreview.clear();
+    DropPreview.set(target.surface, Window.dropSide(target.rect, at));
 }
 
 /// A terminal under the pointer, and its place on the screen.

@@ -20,7 +20,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const win32 = @import("win32.zig");
-const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const Overlays = @import("Overlays.zig");
@@ -43,20 +42,32 @@ pub const Preview = struct {
     /// it shows; null until then, if it could not be made or layered, and
     /// once it is destroyed (its WM_DESTROY).
     hwnd: ?win32.HWND = null,
-    /// The side the dragged terminal would go to, while it shows.
+    /// The side the dragged terminal would go to, while it shows; set
+    /// only once its window is made and layered.
     side: ?Side = null,
-    /// Whether its window is layered at `alpha`.
-    layered: bool = false,
 
+    /// The terminal is freed (`Surface.deinit`): no preview of the drag
+    /// is left naming it.
     pub fn deinit(self: *Preview, alloc: std.mem.Allocator) void {
         _ = alloc;
         self.side = null;
-        self.layered = false;
+        if (shown_on == self) shown_on = null;
+        if (failed_on == self) failed_on = null;
     }
 
     /// For `Overlays.place`: it has no text to show it.
     pub fn shows(self: *const Preview) bool {
-        return self.side != null and self.layered;
+        return self.side != null;
+    }
+
+    /// Its window is hidden with the terminal's overlays
+    /// (`Overlays.hide`): the terminal is parked, zoomed out of sight or
+    /// in a tab not shown. The preview ends, so that it does not show
+    /// again with the terminal, after the drag; the drag's next move
+    /// shows it again where it applies.
+    pub fn hidden(self: *Preview, hwnd: win32.HWND) void {
+        _ = hwnd;
+        self.side = null;
     }
 
     /// The half of the terminal on its side, for `Overlays.place`.
@@ -100,54 +111,54 @@ fn highlight() win32.COLORREF {
     return win32.GetSysColor(win32.COLOR_HIGHLIGHT);
 }
 
-/// The terminal that shows a preview now, if any (`set`).
-var shown_on: ?*Surface = null;
+/// The preview set now, if any (`set`); let go of when its terminal is
+/// freed (`Preview.deinit`).
+var shown_on: ?*Preview = null;
+
+/// The preview whose window could not be made or layered during this
+/// drag (`show`): not tried again, nor logged again, until the pointer
+/// goes over another terminal or the drag ends (`set`, `clear`).
+var failed_on: ?*Preview = null;
 
 /// Show the preview over `target`, on `side`, and hide the one shown
-/// before, if it was another's; with no target, hide it. The terminal
-/// that showed it is looked for among `app`'s before it is touched, as it
-/// may have closed since.
-pub fn set(app: *App, target: ?*Surface, side: Side) void {
-    if (shown_on) |old| {
-        if (old != target and live(app, old)) hide(old);
-    }
+/// before, if it was another's; with no target, hide it.
+pub fn set(target: ?*Surface, side: Side) void {
+    const want: ?*Preview = if (target) |t| &t.overlays.drop_preview else null;
+    if (shown_on) |old| if (old != want) hide(old);
     shown_on = null;
+    if (failed_on != want) failed_on = null;
     const t = target orelse return;
-    if (show(t, side)) shown_on = t;
+    if (show(t, side)) shown_on = want;
 }
 
-/// Hide the preview, wherever it shows (`set` with no target).
-pub fn clear(app: *App) void {
-    set(app, null, .left);
+/// Hide the preview, wherever it shows (`set` with no target), at the end
+/// of a drag.
+pub fn clear() void {
+    set(null, .left);
 }
 
-/// Whether `surface` is one of `app`'s terminals, in any tab of any of
-/// its windows.
-fn live(app: *const App, surface: *const Surface) bool {
-    for (app.windows.items) |window| {
-        for (window.tabs.items) |t| {
-            var it = t.tree.iterator();
-            while (it.next()) |entry| if (entry.view == surface) return true;
-        }
-    }
-    return false;
-}
-
-fn hide(surface: *Surface) void {
-    const self = &surface.overlays.drop_preview;
+fn hide(self: *Preview) void {
     if (self.side == null) return;
     self.side = null;
+    const overlays: *Overlays = @alignCast(@fieldParentPtr("drop_preview", self));
+    const surface: *Surface = @alignCast(@fieldParentPtr("overlays", overlays));
     Overlays.place(surface);
 }
 
 /// Show the preview over `surface` on `side`, its window made and layered
-/// the first time; whether it shows. Logged, and not shown, if its window
-/// cannot be made or layered: made again at the next show.
+/// the first time, and placed whenever it is made, as a window made again
+/// after its own was destroyed shows nothing yet; whether its side is set.
+/// Logged once, and not shown, if its window cannot be made or layered
+/// (`failed_on`).
 fn show(surface: *Surface, side: Side) bool {
     const self = &surface.overlays.drop_preview;
-    if (self.hwnd == null) {
+    const fresh = self.hwnd == null;
+    if (fresh) {
+        self.side = null;
+        if (failed_on == self) return false;
         const made = Overlays.make(surface, class_name) orelse {
             log.warn("cannot make a drop preview err={}", .{win32.GetLastError()});
+            failed_on = self;
             return false;
         };
         // Passed over by every hit test once layered.
@@ -156,17 +167,17 @@ fn show(surface: *Surface, side: Side) bool {
         _ = win32.SetWindowLongPtrW(made, win32.GWL_EXSTYLE, style | see_through);
         if (!Transparency.layerAt(made, alpha)) {
             log.warn("cannot show a drop preview: its window cannot be layered err={}", .{win32.GetLastError()});
+            failed_on = self;
             // Its WM_DESTROY forgets it.
             _ = win32.DestroyWindow(made);
             return false;
         }
         self.hwnd = made;
-        self.layered = true;
     }
     if (self.side == side) return true;
     self.side = side;
     Overlays.place(surface);
-    return SearchBar.visibleStyle(self.hwnd orelse return false);
+    return true;
 }
 
 test "win32: a drop preview is the half of the terminal on its side" {

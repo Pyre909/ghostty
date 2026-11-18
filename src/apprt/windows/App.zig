@@ -9720,6 +9720,127 @@ test "win32: a terminal dragged by its handle shows where it would go over the t
     Alpha.layers = true;
 }
 
+test "win32: a drop preview ends with what it shows over, and its window is tried once a drag" {
+    // Its terminal parked mid-drag shows none when undo puts it back; its
+    // terminal freed mid-drag leaves nothing to touch; its window
+    // destroyed mid-drag is made again and placed at the next move; the
+    // dragged terminal's handle destroyed mid-drag ends it; and a window
+    // that cannot be layered is tried once while the pointer stays over
+    // its terminal.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const handle_latch = TestHandle.install();
+    defer TestHandle.uninstall(handle_latch);
+    DragHandle.test_window_at = &TestHandle.at;
+    defer DragHandle.test_window_at = null;
+    const Alpha = struct {
+        var layers = true;
+        var calls: usize = 0;
+        fn set(_: win32.HWND, _: u8) bool {
+            calls += 1;
+            return layers;
+        }
+    };
+    Transparency.test_set_alpha = &Alpha.set;
+    defer Transparency.test_set_alpha = null;
+    try TestUndo.enable(&app);
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 300);
+    TestHandle.frame = window.hwnd;
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    const d = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b, c, d });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const Drag = struct {
+        fn start(pane: *Surface) !win32.HWND {
+            testPointer(pane, 20, 2);
+            const h = pane.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult;
+            _ = win32.SendMessageW(h, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+            return h;
+        }
+        fn over(h: win32.HWND, pane: *const Surface, dx: i32) !void {
+            _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(pane, dx)));
+        }
+        fn shows(pane: *const Surface) bool {
+            const h = pane.overlays.drop_preview.hwnd orelse return false;
+            return shown(h);
+        }
+    };
+
+    // Parked under the drag, then put back by undo: no preview.
+    var h = try Drag.start(a);
+    try Drag.over(h, b, -3);
+    try std.testing.expect(Drag.shows(b));
+    TestUndo.close(b);
+    try std.testing.expect(b.parked);
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, try testScreenPoint(h, try testPaneAt(a, 3)));
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expect(!b.parked and shown(b.hwnd));
+    try std.testing.expect(!Drag.shows(b));
+
+    // Its window destroyed under the drag: made again, and placed, at the
+    // next move.
+    h = try Drag.start(a);
+    try Drag.over(h, c, -3);
+    _ = win32.DestroyWindow(c.overlays.drop_preview.hwnd orelse return error.TestUnexpectedResult);
+    try std.testing.expect(c.overlays.drop_preview.hwnd == null);
+    try Drag.over(h, c, -4);
+    try std.testing.expect(Drag.shows(c));
+    const cc = try paneClient(window, c);
+    const mid = cc.left + @divTrunc(cc.right - cc.left, 2);
+    try std.testing.expectEqual(win32.RECT{ .left = mid, .top = cc.top, .right = cc.right, .bottom = cc.bottom }, try childRect(window, c.overlays.drop_preview.hwnd.?));
+
+    // The dragged terminal's handle destroyed under the drag: none.
+    _ = win32.DestroyWindow(h);
+    try std.testing.expect(!Drag.shows(c));
+    try std.testing.expect(c.overlays.drop_preview.side == null);
+
+    // Freed under the drag, with no undo: nothing names it, and the drag
+    // goes on over another.
+    app.undo.enabled = false;
+    h = try Drag.start(a);
+    try Drag.over(h, c, -3);
+    try std.testing.expect(Drag.shows(c));
+    TestUndo.close(c);
+    try std.testing.expect(!TestUndo.has(&app, c));
+    try Drag.over(h, d, 3);
+    try std.testing.expect(Drag.shows(d));
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, try testScreenPoint(h, try testPaneAt(a, 3)));
+    try std.testing.expect(!Drag.shows(d));
+
+    // Not layered: tried once while over its terminal, again over it
+    // after another, and again the next drag.
+    Alpha.layers = false;
+    _ = win32.DestroyWindow(d.overlays.drop_preview.hwnd orelse return error.TestUnexpectedResult);
+    const before = Alpha.calls;
+    h = try Drag.start(a);
+    try Drag.over(h, d, 3);
+    try Drag.over(h, d, 4);
+    try std.testing.expectEqual(before + 1, Alpha.calls);
+    try Drag.over(h, b, 3);
+    try Drag.over(h, d, 3);
+    try std.testing.expectEqual(before + 2, Alpha.calls);
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, try testScreenPoint(h, try testPaneAt(a, 3)));
+    h = try Drag.start(a);
+    try Drag.over(h, d, 3);
+    try std.testing.expectEqual(before + 3, Alpha.calls);
+    try std.testing.expect(!Drag.shows(d));
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, try testScreenPoint(h, try testPaneAt(a, 3)));
+    Alpha.layers = true;
+}
+
 test "win32: a terminal dragged by its handle into another window goes beside the terminal it is dropped on" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
