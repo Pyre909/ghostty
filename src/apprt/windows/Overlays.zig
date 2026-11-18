@@ -27,14 +27,15 @@
 //! handle: each answers WM_NCHITTEST with HTTRANSPARENT, so the pointer
 //! and clicks over it go to the terminal under it, and none is ever given
 //! the focus. The banner and the handle take their own messages first
-//! (`handle`), and answer HTCLIENT, the banner over its button alone. Each draws a line of text in the system's message font,
-//! one for all of a terminal's overlays (`font`), on the search bar's
-//! colours (`SearchBar.Colors.ofFrame`: under `window-theme = ghostty` the
-//! frame's, as GTK gives these overlays its header bar's), framed as GTK's
-//! labels are, or in its own (`Look`); the
-//! banner draws two (`draw`). The bell border has no text: it shows by a
-//! flag of its own (`shows`), draws itself, and its window is shaped to
-//! what it draws (`shape`).
+//! (`handle`), and answer HTCLIENT, the banner over its button alone.
+//! Each draws a line of text in the system's message font, one for all
+//! of a terminal's overlays (`font`), on the search bar's colours
+//! (`SearchBar.Colors.ofFrame`: under `window-theme = ghostty` the
+//! frame's, as GTK gives these overlays its header bar's), framed as
+//! GTK's labels are, or in its own (`Look`); the banner draws two
+//! (`draw`). The bell border has no text: it shows by a flag of its own
+//! (`shows`), draws itself, and its window is shaped to what it draws
+//! (`shape`).
 
 const Overlays = @This();
 
@@ -129,9 +130,9 @@ background: ?terminal.color.RGB = null,
 /// `deinit`, and either the `text` it draws, `text_size` and `measured`
 /// for that text in `font`, or `shows` (whether it shows, with no text);
 /// and `textIn` or `draw`. It may have `look`, `measureMore` (more than
-/// its text to measure), `shape` (its window's region, or its pixels), `handle`
-/// (messages of its own) and `hidden` (what it does as its window is
-/// hidden).
+/// its text to measure), `shape` (its window's region, or its pixels),
+/// `handle` (messages of its own) and `hidden` (what it does as its
+/// window is hidden).
 pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim", "drag_handle", "drop_preview" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
@@ -310,9 +311,12 @@ pub fn make(surface: *Surface, comptime class: []const u8) ?win32.HWND {
 /// time it shows (`BellBorder.set`), the renderer error view the next
 /// time the renderer is unhealthy (`RendererHealth.set`), the resize
 /// overlay at its terminal's next change of size
-/// (`ResizeOverlay.resized`), and the dim of an unfocused split the next
-/// time it is placed (`UnfocusedSplit.sync`, from here); the
-/// child-exited banner, asked for once, is not.
+/// (`ResizeOverlay.resized`), the dim of an unfocused split the next
+/// time it is placed (`UnfocusedSplit.sync`, from here), the drag handle
+/// the next time the pointer is over the terminal's top
+/// (`DragHandle.pointerAt`), and the drop preview the next time a drag
+/// is over the terminal (`DropPreview.set`); the child-exited banner,
+/// asked for once, is not.
 ///
 /// The terminals tile their area, and the search bars are placed above
 /// all of them (`SearchBar.place`), so just above its own terminal an
