@@ -22,6 +22,7 @@ const taskbar = @import("taskbar.zig");
 const DesktopNotifications = @import("desktop_notifications.zig");
 const SearchBar = @import("SearchBar.zig");
 const LinkPreview = @import("LinkPreview.zig");
+const DragHandle = @import("DragHandle.zig");
 const Overlays = @import("Overlays.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const BellBorder = @import("BellBorder.zig");
@@ -2387,6 +2388,13 @@ pub const Surface = struct {
             win32.WM_KEYUP,
             win32.WM_SYSKEYUP,
             => {
+                // Escape cancels a drag by a terminal's handle, which holds
+                // the capture, not the focus; its key-up is withheld too.
+                if (msg == win32.WM_KEYDOWN and wparam == win32.VK_ESCAPE and DragHandle.cancelByKey()) {
+                    self.ime.swallow_up.set(Ime.scanSlot(lparam));
+                    return 0;
+                }
+
                 // First, so that a terminal with no core clears it too.
                 if (self.app.hotkeyRelease(msg, wparam)) {
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -2515,6 +2523,9 @@ pub const Surface = struct {
                 // the pointer is over its place, which the preview passes
                 // through to here (`LinkPreview.pointerAt`).
                 LinkPreview.pointerAt(self, .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) });
+                // Over the top of the terminal, its drag handle shows and
+                // takes the pointer from here.
+                DragHandle.pointerAt(self, .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) }, Mouse.Button.downIn(wparam).count() != 0);
                 self.followMouse(wparam, lparam);
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);

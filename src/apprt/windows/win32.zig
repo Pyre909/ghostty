@@ -188,6 +188,36 @@ pub const WS_EX_LAYOUTRTL: DWORD = 0x00400000;
 pub const LWA_ALPHA: DWORD = 0x00000002;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setlayeredwindowattributes
 pub extern "user32" fn SetLayeredWindowAttributes(hwnd: HWND, key: COLORREF, alpha: BYTE, flags: DWORD) callconv(.winapi) BOOL;
+/// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-blendfunction
+/// How UpdateLayeredWindow blends a window's pixels: `AC_SRC_OVER` with
+/// `AC_SRC_ALPHA`, each pixel's own alpha, its colour premultiplied.
+pub const BLENDFUNCTION = extern struct {
+    BlendOp: BYTE = AC_SRC_OVER,
+    BlendFlags: BYTE = 0,
+    SourceConstantAlpha: BYTE = 255,
+    AlphaFormat: BYTE = AC_SRC_ALPHA,
+};
+pub const AC_SRC_OVER: BYTE = 0x00;
+pub const AC_SRC_ALPHA: BYTE = 0x01;
+/// UpdateLayeredWindow: blend with the BLENDFUNCTION.
+pub const ULW_ALPHA: DWORD = 0x00000002;
+pub const SIZE = extern struct { cx: LONG, cy: LONG };
+/// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-updatelayeredwindow
+/// A layered window's pixels, from `src`, which then shows them as they
+/// are, with no WM_PAINT. Refused once SetLayeredWindowAttributes has
+/// been called on the window, until its layered style is taken off and
+/// put back.
+pub extern "user32" fn UpdateLayeredWindow(
+    hwnd: HWND,
+    dst: ?HDC,
+    dst_at: ?*const POINT,
+    size: ?*const SIZE,
+    src: ?HDC,
+    src_at: ?*const POINT,
+    key: COLORREF,
+    blend: ?*const BLENDFUNCTION,
+    flags: DWORD,
+) callconv(.winapi) BOOL;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getlayeredwindowattributes
 pub extern "user32" fn GetLayeredWindowAttributes(hwnd: HWND, key: ?*COLORREF, alpha: ?*BYTE, flags: ?*DWORD) callconv(.winapi) BOOL;
 /// SetWindowPos's place for a window above every window that is not on

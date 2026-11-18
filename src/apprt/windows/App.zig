@@ -48,6 +48,7 @@ const BellBorder = @import("BellBorder.zig");
 const ProgressBar = @import("ProgressBar.zig");
 const RendererHealth = @import("RendererHealth.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
+const DragHandle = @import("DragHandle.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
@@ -9347,6 +9348,223 @@ test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its
     try std.testing.expect(x.window == two);
     try std.testing.expect(TestUndo.has(&app, x));
     try std.testing.expectEqual(0, app.undo.entries.items.len);
+}
+
+/// For tests: the drag handle's answers (`DragHandle.test_update`,
+/// `DragHandle.test_window_at`): every handle takes its pixels, and the
+/// window at any point is `frame`.
+const TestHandle = struct {
+    var frame: ?win32.HWND = null;
+    fn update(_: win32.HWND, _: Overlays.Size) bool {
+        return true;
+    }
+    fn at(_: win32.POINT) ?win32.HWND {
+        return frame;
+    }
+};
+
+/// For tests: a mouse message's lParam for the screen point `at`, in
+/// `hwnd`'s client coordinates.
+fn testScreenPoint(hwnd: win32.HWND, at: win32.POINT) !win32.LPARAM {
+    var p = at;
+    if (!win32.ScreenToClient(hwnd, &p).toBool()) return error.TestUnexpectedResult;
+    return testPoint(p.x, p.y);
+}
+
+/// For tests: a point inside `pane` on the screen, `dx` from its left
+/// edge (from its right one if negative), halfway down.
+fn testPaneAt(pane: *const Surface, dx: i32) !win32.POINT {
+    var r: win32.RECT = undefined;
+    if (!win32.GetWindowRect(pane.hwnd, &r).toBool()) return error.TestUnexpectedResult;
+    return .{ .x = if (dx >= 0) r.left + dx else r.right + dx, .y = @divTrunc(r.top + r.bottom, 2) };
+}
+
+/// For tests: drag `from`'s handle, which the pointer brings out, to the
+/// screen point `to`, past the drag threshold, and let go there.
+fn testDragHandle(from: *Surface, to: win32.POINT) !void {
+    testPointer(from, 20, 2);
+    const h = from.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult;
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, to));
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, try testScreenPoint(h, to));
+}
+
+test "win32: a terminal's drag handle shows across its top while the pointer is there, as drag-handle says" {
+    // As GTK's (`closureShouldDragHandleBeShown`): by default only over a
+    // terminal in a tab of more than one, always, or never; and only
+    // while hovered, which here the terminal's own moves over its top
+    // strip start, with no button held.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    DragHandle.test_update = &TestHandle.update;
+    defer DragHandle.test_update = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 600, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+
+    testPointer(a, 20, 2);
+    try std.testing.expect(a.overlays.drag_handle.hwnd == null);
+
+    app.config.@"drag-handle" = .always;
+    testPointer(a, 20, 2);
+    const h = a.overlays.drag_handle.hwnd.?;
+    try std.testing.expect(shown(h));
+    const pane = try paneClient(window, a);
+    const at = try childRect(window, h);
+    const tall = DragHandle.heightAt(Window.dpiOf(&app, window.hwnd));
+    try std.testing.expectEqual(win32.RECT{ .left = pane.left, .top = pane.top, .right = pane.right, .bottom = pane.top + tall }, at);
+    // The topmost of its overlays, just above the terminal with none
+    // other shown.
+    try std.testing.expect(win32.GetWindow(a.hwnd, win32.GW_HWNDPREV) == h);
+
+    // Off the strip, or the pointer leaving it, hides it.
+    testPointer(a, 20, tall + 2);
+    try std.testing.expect(!shown(h));
+    testPointer(a, 20, tall - 1);
+    try std.testing.expect(shown(h));
+    _ = win32.SendMessageW(h, win32.WM_MOUSELEAVE, 0, 0);
+    try std.testing.expect(!shown(h));
+    // Not with a button held, as during a selection.
+    _ = win32.SendMessageW(a.hwnd, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, testPoint(20, 2));
+    try std.testing.expect(!shown(h));
+
+    app.config.@"drag-handle" = .never;
+    testPointer(a, 20, 2);
+    try std.testing.expect(!shown(h));
+
+    app.config.@"drag-handle" = .auto;
+    const b = try testPane(&app, window);
+    window.tab().tree.deinit();
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.relayout();
+    testPointer(b, 20, 2);
+    try std.testing.expect(shown(b.overlays.drag_handle.hwnd.?));
+    try std.testing.expect(!shown(h));
+}
+
+test "win32: a terminal dragged by its handle onto another goes beside it; a click, Escape or a drop off any terminal moves nothing" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    DragHandle.test_update = &TestHandle.update;
+    defer DragHandle.test_update = null;
+    DragHandle.test_window_at = &TestHandle.at;
+    defer DragHandle.test_window_at = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 300);
+    TestHandle.frame = window.hwnd;
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
+    window.tab().focused = b;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const names = [_]*Surface{ a, b, c };
+    var buf: [4]u8 = undefined;
+
+    // A click: the press holds the capture, and the release, within the
+    // drag threshold, lets it go and hides the handle.
+    testPointer(a, 20, 2);
+    const h = a.overlays.drag_handle.hwnd.?;
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    try std.testing.expect(win32.GetCapture() == h);
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, testPoint(11, 5));
+    try std.testing.expect(win32.GetCapture() != h);
+    try std.testing.expect(!shown(h));
+    try std.testing.expectEqualStrings("abc", testLeaves(window.tab(), &names, &buf));
+
+    // Near c's right edge: to its right, with the focus.
+    try testDragHandle(a, try testPaneAt(c, -3));
+    try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expect(!shown(h));
+
+    // Onto itself, or where no frame of ours is: nothing.
+    try testDragHandle(a, try testPaneAt(a, 3));
+    try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    TestHandle.frame = null;
+    try testDragHandle(b, try testPaneAt(c, 3));
+    try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    TestHandle.frame = window.hwnd;
+
+    // Escape, which goes to the terminal with the focus, lets go of the
+    // capture: the release that follows moves nothing.
+    testPointer(b, 20, 2);
+    const hb = b.overlays.drag_handle.hwnd.?;
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    const to = try testPaneAt(c, 3);
+    _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, to));
+    _ = win32.SendMessageW(a.hwnd, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0x0001_0001);
+    try std.testing.expect(win32.GetCapture() != hb);
+    try std.testing.expect(!shown(hb));
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONUP, 0, try testScreenPoint(hb, to));
+    try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(!DragHandle.cancelByKey());
+}
+
+test "win32: a terminal dragged by its handle into another window goes beside the terminal it is dropped on" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    DragHandle.test_update = &TestHandle.update;
+    defer DragHandle.test_update = null;
+    DragHandle.test_window_at = &TestHandle.at;
+    defer DragHandle.test_window_at = null;
+    Window.test_foreground = &ForegroundSeen.seen;
+    defer Window.test_foreground = null;
+    ForegroundSeen.last = null;
+
+    const one = try testFrame(&app);
+    const a = try testPane(&app, one);
+    const b = try testPane(&app, one);
+    one.tab().tree = try testRow(alloc, &.{ a, b });
+    one.tab().focused = a;
+    _ = win32.ShowWindow(one.hwnd, win32.SW_SHOWNOACTIVATE);
+    one.relayout();
+    const two = try testFrame(&app);
+    const c = try testPane(&app, two);
+    two.tab().tree = try .init(alloc, c);
+    two.tab().focused = c;
+    _ = win32.ShowWindow(two.hwnd, win32.SW_SHOWNOACTIVATE);
+    two.relayout();
+    const names = [_]*Surface{ a, b, c };
+    var buf: [4]u8 = undefined;
+
+    // Near c's left edge, in the other frame.
+    TestHandle.frame = two.hwnd;
+    try testDragHandle(b, try testPaneAt(c, 3));
+    try std.testing.expectEqualStrings("a", testLeaves(one.tab(), &names, &buf));
+    try std.testing.expectEqualStrings("bc", testLeaves(two.tab(), &names, &buf));
+    try std.testing.expect(b.window == two);
+    try std.testing.expect(two.tab().focused == b);
+    try std.testing.expectEqual(two.hwnd, ForegroundSeen.last.?);
+    // Its handle went with it, hidden.
+    const h = b.overlays.drag_handle.hwnd.?;
+    try std.testing.expectEqual(two.hwnd, win32.GetAncestor(h, win32.GA_PARENT).?);
+    try std.testing.expect(!shown(h));
 }
 
 test "win32: move_tab_to_new_window moves a tab whole into a new window" {

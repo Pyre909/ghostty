@@ -401,7 +401,7 @@ pub fn pastDragThreshold(press: win32.POINT, now: win32.POINT, threshold: win32.
 /// GetSystemMetrics's. Windows 11 25H2 gives the same at 96 and 192 DPI
 /// (4 by default): it does not scale these two, so the fallback does not
 /// either.
-fn dragThreshold(dpi: u32) win32.POINT {
+pub fn dragThreshold(dpi: u32) win32.POINT {
     if (win32.GetModuleHandleW(L("user32.dll"))) |user32| {
         if (win32.GetProcAddress(user32, "GetSystemMetricsForDpi")) |p| {
             const f: win32.GetSystemMetricsForDpiFn = @ptrCast(@alignCast(p));

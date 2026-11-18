@@ -6,7 +6,8 @@
 //! (ResizeOverlay.zig), the link preview (LinkPreview.zig), the renderer
 //! error view (RendererHealth.zig, which GTK lacks, over those as macOS
 //! stacks it), the key-state indicator (KeyState.zig) and the dim of an
-//! unfocused split (UnfocusedSplit.zig).
+//! unfocused split (UnfocusedSplit.zig) and the drag handle
+//! (DragHandle.zig).
 //! This file does for each what they all need: their window class and
 //! procedure, their place in the Z order, their font, colours and frame,
 //! and their teardown; each overlay's own file says what it shows and where
@@ -22,11 +23,11 @@
 //! just above their own terminal, in GTK's order (`stack`), under the
 //! terminal's search bar and the window's command palette.
 //!
-//! They are passive but for the child-exited banner's button: each answers
-//! WM_NCHITTEST with HTTRANSPARENT, so the pointer and clicks over it go
-//! to the terminal under it, and none is ever given the focus. The banner
-//! takes its own messages first (`handle`), and answers HTCLIENT over its
-//! button alone. Each draws a line of text in the system's message font,
+//! They are passive but for the child-exited banner's button and the drag
+//! handle: each answers WM_NCHITTEST with HTTRANSPARENT, so the pointer
+//! and clicks over it go to the terminal under it, and none is ever given
+//! the focus. The banner and the handle take their own messages first
+//! (`handle`), and answer HTCLIENT, the banner over its button alone. Each draws a line of text in the system's message font,
 //! one for all of a terminal's overlays (`font`), on the search bar's
 //! colours (`SearchBar.Colors.ofFrame`: under `window-theme = ghostty` the
 //! frame's, as GTK gives these overlays its header bar's), framed as GTK's
@@ -55,6 +56,7 @@ const ChildExited = @import("ChildExited.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
 const KeyState = @import("KeyState.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
+const DragHandle = @import("DragHandle.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
 const terminal = @import("../../terminal/main.zig");
@@ -99,6 +101,10 @@ key_state: KeyState.Indicator = .{},
 /// (`UnfocusedSplit.sync`, from `place`).
 dim: UnfocusedSplit.Dim = .{},
 
+/// The drag handle, made the first time the pointer comes over the top
+/// of the terminal (`DragHandle.pointerAt`).
+drag_handle: DragHandle.Handle = .{},
+
 /// The system's message font at `font_dpi`, which every overlay draws
 /// in, made as the first of them is placed with something to show
 /// (`applyFont`).
@@ -118,14 +124,14 @@ background: ?terminal.color.RGB = null,
 /// `deinit`, and either the `text` it draws, `text_size` and `measured`
 /// for that text in `font`, or `shows` (whether it shows, with no text);
 /// and `textIn` or `draw`. It may have `look`, `measureMore` (more than
-/// its text to measure), `shape` (its window's region), `handle`
+/// its text to measure), `shape` (its window's region, or its pixels), `handle`
 /// (messages of its own) and `hidden` (what it does as its window is
 /// hidden).
-pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim" };
+pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim", "drag_handle" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, ProgressBar.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, ProgressBar.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name, DragHandle.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -314,6 +320,9 @@ pub fn place(surface: *Surface) void {
     // Whether it is dimmed changes with its tab's focus, its search bar
     // and the configuration, each of which places it again.
     UnfocusedSplit.sync(surface, &surface.app.config);
+    // Whether it has a handle changes with its tab's splits and the
+    // configuration, each of which places it again.
+    DragHandle.sync(surface, &surface.app.config);
     inline for (stack) |name| {
         if (@field(self, name).hwnd) |hwnd| reparent(hwnd, window, name);
     }
