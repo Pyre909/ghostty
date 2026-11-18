@@ -2107,6 +2107,7 @@ pub const Surface = struct {
     /// (`Surface.occlusionCallback`).
     pub fn occlusionChanged(self: *Surface, visible: bool) void {
         if (builtin.is_test) if (test_occlusion) |seen| seen(self, visible);
+        ProgressBar.occlusionChanged(self, visible);
         const core_surface = self.liveCore() orelse return;
         core_surface.occlusionCallback(visible) catch |err|
             log.warn("occlusion callback failed err={}", .{err});

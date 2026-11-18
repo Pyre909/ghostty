@@ -18596,8 +18596,9 @@ test "win32: progress_report shows a bar along the top of each terminal" {
     try std.testing.expect(try testReadOnly(&app, a, .off));
 
     // Hidden with its terminal, and back with it; resized with it. The
-    // block's timer stops at its first tick while the bar is hidden,
-    // and starts again as it shows; a value stops it.
+    // block's timer stops while the terminal is hidden, a tick does not
+    // start it, and it starts again as the terminal shows; a value
+    // stops it.
     window.toggleZoom(b);
     try std.testing.expect(!shown(hwnd));
     _ = Surface.wndProc(a.hwnd, win32.WM_TIMER, ProgressBar.timer_id, 0);
@@ -18608,6 +18609,18 @@ test "win32: progress_report shows a bar along the top of each terminal" {
     try report(&app, a, .{ .state = .indeterminate });
     try report(&app, a, .{ .state = .set, .progress = 100 });
     try std.testing.expect(!win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .indeterminate });
+
+    // Minimized, its frame leaves the bar's window shown, yet its timer
+    // stops, and a report does not start it; it starts again as the
+    // terminal is placed back in sight.
+    _ = Window.wndProc(window.hwnd, win32.WM_SIZE, win32.SIZE_MINIMIZED, 0);
+    try std.testing.expect(shown(hwnd));
+    try std.testing.expect(!win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .indeterminate });
+    try std.testing.expect(!win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    window.relayout();
+    try std.testing.expect(win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
     try report(&app, a, .{ .state = .indeterminate });
     testResize(window, 1000, 600);
     try expectBarAt(window, a, 100);

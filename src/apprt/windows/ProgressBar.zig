@@ -90,11 +90,17 @@ pub const Bar = struct {
     valued: bool = false,
     /// When the block set out from the left, in `now`'s milliseconds.
     started: u64 = 0,
+    /// Whether its terminal is out of sight (`occlusionChanged`): its
+    /// frame minimized or hidden, its tab hidden, or a zoom hiding it.
+    /// The bar's own window stays shown when its frame is minimized or
+    /// hidden, so this, not its visibility, stops the block's timer.
+    occluded: bool = false,
 
     pub fn deinit(self: *Bar, alloc: std.mem.Allocator) void {
         _ = alloc;
         self.progress = .{};
         self.valued = false;
+        self.occluded = false;
     }
 
     /// For `Overlays.place`: it has no text to show it.
@@ -143,19 +149,6 @@ pub const Bar = struct {
         SearchBar.fill(hdc, client, win32.lerp(background, c, 300));
         SearchBar.fill(hdc, blockIn(client, now() -% self.started), c);
     }
-
-    /// Its window `hwnd` shows or hides: the block moves only while it
-    /// shows (`timer`), and moves again once it shows again, as from a
-    /// hidden tab.
-    pub fn handle(self: *Bar, surface: *Surface, hwnd: win32.HWND, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) ?win32.LRESULT {
-        _ = hwnd;
-        _ = wparam;
-        if (msg == win32.WM_WINDOWPOSCHANGED) {
-            const pos: *const win32.WINDOWPOS = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            if (pos.flags & win32.SWP_SHOWWINDOW != 0 and self.moves()) startTimer(surface);
-        }
-        return null;
-    }
 };
 
 /// The bar's height at `dpi`: macOS's 2 points, at least a pixel.
@@ -195,7 +188,7 @@ fn startTimer(surface: *Surface) void {
 
 /// The block's timer on `surface` fired: it is drawn where it is now,
 /// while it moves and shows; otherwise the timer stops until it shows
-/// moving again (`set`, `Bar.handle`).
+/// moving again (`set`, `occlusionChanged`).
 pub fn timer(surface: *Surface) void {
     const self = &surface.overlays.progress_bar;
     if (self.hwnd) |hwnd| if (self.moves() and SearchBar.visibleStyle(hwnd)) {
@@ -203,6 +196,20 @@ pub fn timer(surface: *Surface) void {
         return;
     };
     _ = win32.KillTimer(surface.hwnd, timer_id);
+}
+
+/// `surface` came into sight or went out of it (`Surface.occlusionChanged`):
+/// the block's timer stops while it is out of sight, so that a long task
+/// in a minimized or hidden window wakes nothing, and starts again as it
+/// comes back while the bar moves.
+pub fn occlusionChanged(surface: *Surface, visible: bool) void {
+    const self = &surface.overlays.progress_bar;
+    self.occluded = !visible;
+    if (visible and self.moves()) {
+        startTimer(surface);
+    } else {
+        _ = win32.KillTimer(surface.hwnd, timer_id);
+    }
 }
 
 /// Show `surface`'s progress (`Surface.progress`) on its bar, its window
@@ -214,8 +221,8 @@ pub fn set(surface: *Surface, valued: bool) void {
     const moved = self.moves();
     self.progress = surface.progress;
     self.valued = valued;
-    if (self.moves()) {
-        if (!moved) self.started = now();
+    if (self.moves() and !moved) self.started = now();
+    if (self.moves() and !self.occluded) {
         startTimer(surface);
     } else {
         _ = win32.KillTimer(surface.hwnd, timer_id);
