@@ -6,8 +6,8 @@
 //! (ResizeOverlay.zig), the link preview (LinkPreview.zig), the renderer
 //! error view (RendererHealth.zig, which GTK lacks, over those as macOS
 //! stacks it), the key-state indicator (KeyState.zig) and the dim of an
-//! unfocused split (UnfocusedSplit.zig) and the drag handle
-//! (DragHandle.zig).
+//! unfocused split (UnfocusedSplit.zig), the drag handle (DragHandle.zig)
+//! and the preview of where a dragged terminal goes (DropPreview.zig).
 //! This file does for each what they all need: their window class and
 //! procedure, their place in the Z order, their font, colours and frame,
 //! and their teardown; each overlay's own file says what it shows and where
@@ -57,6 +57,7 @@ const ResizeOverlay = @import("ResizeOverlay.zig");
 const KeyState = @import("KeyState.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const DragHandle = @import("DragHandle.zig");
+const DropPreview = @import("DropPreview.zig");
 const messageFont = @import("TabBar.zig").messageFont;
 
 const terminal = @import("../../terminal/main.zig");
@@ -105,6 +106,10 @@ dim: UnfocusedSplit.Dim = .{},
 /// of the terminal (`DragHandle.pointerAt`).
 drag_handle: DragHandle.Handle = .{},
 
+/// The preview of where a terminal dragged by its handle goes, made the
+/// first time one is dragged over this terminal (`DropPreview.set`).
+drop_preview: DropPreview.Preview = .{},
+
 /// The system's message font at `font_dpi`, which every overlay draws
 /// in, made as the first of them is placed with something to show
 /// (`applyFont`).
@@ -127,11 +132,11 @@ background: ?terminal.color.RGB = null,
 /// its text to measure), `shape` (its window's region, or its pixels), `handle`
 /// (messages of its own) and `hidden` (what it does as its window is
 /// hidden).
-pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim", "drag_handle" };
+pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim", "drag_handle", "drop_preview" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
 /// what reads windows can tell them apart.
-const classes = [_][]const u8{ ReadOnly.class_name, ProgressBar.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name, DragHandle.class_name };
+const classes = [_][]const u8{ ReadOnly.class_name, ProgressBar.class_name, BellBorder.class_name, ChildExited.class_name, ResizeOverlay.class_name, LinkPreview.class_name, RendererHealth.class_name, KeyState.class_name, UnfocusedSplit.class_name, DragHandle.class_name, DropPreview.class_name };
 
 /// For tests: how many WM_DESTROYs an overlay's window got after its
 /// terminal had let go of it (`deinit`), which the default procedure
@@ -446,7 +451,7 @@ fn unregisterFirst(hinstance: win32.HINSTANCE, n: usize) void {
 }
 
 /// The terminal whose overlay the window `hwnd` is, null once it is freed.
-fn surfaceOf(hwnd: win32.HWND) ?*Surface {
+pub fn surfaceOf(hwnd: win32.HWND) ?*Surface {
     const v = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
     if (v == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(v)));

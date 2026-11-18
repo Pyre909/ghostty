@@ -26,7 +26,8 @@
 //! dragged (`TabBar.pastDragThreshold`), drags the terminal; it holds the
 //! mouse capture meanwhile. Released over a terminal (`paneAt`), the
 //! dragged one goes to the side of it nearest the pointer
-//! (`Window.dropSide`); anywhere else, nothing moves, as on GTK. Escape
+//! (`Window.dropSide`), which shows over it as the pointer moves
+//! (DropPreview.zig); anywhere else, nothing moves, as on GTK. Escape
 //! (`cancelByKey`) or a capture taken away cancels it.
 
 const std = @import("std");
@@ -38,6 +39,7 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const Overlays = @import("Overlays.zig");
 const SearchBar = @import("SearchBar.zig");
+const DropPreview = @import("DropPreview.zig");
 const TabBar = @import("TabBar.zig");
 const Config = @import("../../config.zig").Config;
 
@@ -115,6 +117,7 @@ pub const Handle = struct {
         self.tracking = false;
         if (self.press == null) return;
         self.press = null;
+        if (Overlays.surfaceOf(hwnd)) |surface| DropPreview.clear(surface.app);
         if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
     }
 
@@ -143,6 +146,7 @@ pub const Handle = struct {
                 if (self.press) |*p| {
                     if (screenPoint(hwnd, lparam)) |at| {
                         if (TabBar.pastDragThreshold(p.at, at, p.threshold)) p.active = true;
+                        if (p.active) preview(surface, at);
                     }
                 }
                 return 0;
@@ -179,6 +183,7 @@ pub const Handle = struct {
                 if (self.press != null) {
                     self.press = null;
                     self.hover = false;
+                    DropPreview.clear(surface.app);
                     Overlays.place(surface);
                 }
                 return 0;
@@ -312,11 +317,21 @@ fn release(surface: *Surface, hwnd: win32.HWND, at: POINT) void {
     self.hover = false;
     if (win32.GetCapture() == hwnd) _ = win32.ReleaseCapture();
     if (captured == hwnd) captured = null;
+    DropPreview.clear(surface.app);
     Overlays.place(surface);
     if (!p.active and !TabBar.pastDragThreshold(p.at, at, p.threshold)) return;
     const target = paneAt(surface.app, at) orelse return;
     if (target.surface == surface) return;
     Window.dropPane(surface, target.surface, Window.dropSide(target.rect, at));
+}
+
+/// The pointer at `at`, on the screen, dragging `surface`: the terminal
+/// under it, if another, shows where `surface` would go
+/// (`DropPreview.set`); none does over anything else.
+fn preview(surface: *Surface, at: POINT) void {
+    const target = paneAt(surface.app, at) orelse return DropPreview.clear(surface.app);
+    if (target.surface == surface) return DropPreview.clear(surface.app);
+    DropPreview.set(surface.app, target.surface, Window.dropSide(target.rect, at));
 }
 
 /// A terminal under the pointer, and its place on the screen.

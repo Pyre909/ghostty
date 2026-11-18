@@ -49,6 +49,7 @@ const ProgressBar = @import("ProgressBar.zig");
 const RendererHealth = @import("RendererHealth.zig");
 const UnfocusedSplit = @import("UnfocusedSplit.zig");
 const DragHandle = @import("DragHandle.zig");
+const DropPreview = @import("DropPreview.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
@@ -9518,6 +9519,114 @@ test "win32: a terminal dragged by its handle onto another goes beside it; a cli
     _ = win32.SendMessageW(hb, win32.WM_LBUTTONUP, 0, try testScreenPoint(hb, to));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
     try std.testing.expect(!DragHandle.cancelByKey());
+}
+
+test "win32: a terminal dragged by its handle shows where it would go over the terminal under the pointer" {
+    // As GTK's drop overlay: the half of the terminal under the pointer
+    // nearest it, in the accent at half opacity; over the dragged terminal
+    // itself or anything else, none. One at a time, and none once the
+    // drag ends, by a drop or by Escape. With no layering, none at all,
+    // and the drop still moves the terminal.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    DragHandle.test_update = &TestHandle.update;
+    defer DragHandle.test_update = null;
+    DragHandle.test_window_at = &TestHandle.at;
+    defer DragHandle.test_window_at = null;
+    const Alpha = struct {
+        var layers = true;
+        var asked: u8 = 0;
+        fn set(_: win32.HWND, alpha: u8) bool {
+            asked = alpha;
+            return layers;
+        }
+    };
+    Transparency.test_set_alpha = &Alpha.set;
+    defer Transparency.test_set_alpha = null;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 300);
+    TestHandle.frame = window.hwnd;
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    const c = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b, c });
+    window.tab().focused = b;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const names = [_]*Surface{ a, b, c };
+    var buf: [4]u8 = undefined;
+    const Shows = struct {
+        fn of(pane: *const Surface) bool {
+            const h = pane.overlays.drop_preview.hwnd orelse return false;
+            return shown(h);
+        }
+    };
+
+    testPointer(a, 20, 2);
+    const h = a.overlays.drag_handle.hwnd.?;
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    // Near c's right edge: its right half, at half opacity.
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(c, -3)));
+    try std.testing.expect(Shows.of(c) and !Shows.of(a) and !Shows.of(b));
+    try std.testing.expectEqual(DropPreview.alpha, Alpha.asked);
+    const cc = try paneClient(window, c);
+    const mid = cc.left + @divTrunc(cc.right - cc.left, 2);
+    try std.testing.expectEqual(win32.RECT{ .left = mid, .top = cc.top, .right = cc.right, .bottom = cc.bottom }, try childRect(window, c.overlays.drop_preview.hwnd.?));
+    // The topmost overlay, over its terminal.
+    try std.testing.expect(win32.GetWindow(c.hwnd, win32.GW_HWNDPREV) == c.overlays.drop_preview.hwnd.?);
+    // Near b's left edge: b's left half, and c's goes.
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(b, 3)));
+    try std.testing.expect(Shows.of(b) and !Shows.of(c));
+    const bb = try paneClient(window, b);
+    try std.testing.expectEqual(win32.RECT{ .left = bb.left, .top = bb.top, .right = bb.left + @divTrunc(bb.right - bb.left, 2), .bottom = bb.bottom }, try childRect(window, b.overlays.drop_preview.hwnd.?));
+    // Over itself, or no frame of ours: none.
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(a, 3)));
+    try std.testing.expect(!Shows.of(a) and !Shows.of(b) and !Shows.of(c));
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(c, 3)));
+    try std.testing.expect(Shows.of(c));
+    TestHandle.frame = null;
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(c, 3)));
+    try std.testing.expect(!Shows.of(c));
+    TestHandle.frame = window.hwnd;
+    // Dropped: none.
+    _ = win32.SendMessageW(h, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(h, try testPaneAt(c, 3)));
+    _ = win32.SendMessageW(h, win32.WM_LBUTTONUP, 0, try testScreenPoint(h, try testPaneAt(c, 3)));
+    try std.testing.expectEqualStrings("bac", testLeaves(window.tab(), &names, &buf));
+    try std.testing.expect(!Shows.of(a) and !Shows.of(b) and !Shows.of(c));
+
+    // Escape: none.
+    testPointer(b, 20, 2);
+    const hb = b.overlays.drag_handle.hwnd.?;
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, try testPaneAt(c, -3)));
+    try std.testing.expect(Shows.of(c));
+    _ = win32.SendMessageW(b.hwnd, win32.WM_KEYDOWN, win32.VK_ESCAPE, 0x0001_0001);
+    try std.testing.expect(!Shows.of(c));
+
+    // Its handle hidden mid-drag, as by a tab switch: none.
+    testPointer(b, 20, 2);
+    _ = win32.SendMessageW(hb, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(hb, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(hb, try testPaneAt(c, -3)));
+    try std.testing.expect(Shows.of(c));
+    b.overlays.hideWindows();
+    try std.testing.expect(!Shows.of(c));
+    try std.testing.expect(win32.GetCapture() != hb);
+
+    // A terminal whose preview cannot be layered shows none; the drop
+    // still moves.
+    Alpha.layers = false;
+    try std.testing.expect(a.overlays.drop_preview.hwnd == null);
+    try testDragHandle(b, try testPaneAt(a, -3));
+    try std.testing.expect(a.overlays.drop_preview.hwnd == null);
+    try std.testing.expectEqualStrings("abc", testLeaves(window.tab(), &names, &buf));
+    Alpha.layers = true;
 }
 
 test "win32: a terminal dragged by its handle into another window goes beside the terminal it is dropped on" {
