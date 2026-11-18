@@ -652,15 +652,18 @@ pub const App = struct {
     /// quick terminal toggled.
     fn ipcAction(self: *App, request: *IpcRequest) !void {
         switch (request.action) {
-            .new_window => _ = (try self.newWindow(null, .normal, &request.overrides)).present(),
+            .new_window => {},
             .new_tab => if (self.ipcTabParent(request.surface_id)) |parent| {
                 try self.newTab(parent, &request.overrides);
                 _ = parent.rt_surface.window.present();
-            } else {
-                _ = (try self.newWindow(null, .normal, &request.overrides)).present();
+                return;
             },
-            .toggle_quick_terminal => try self.toggleQuick(),
+            .toggle_quick_terminal => return try self.toggleQuick(),
         }
+        // A new window, or a new tab with no window to go in.
+        const window = try self.newWindow(null, .normal, &request.overrides);
+        _ = window.present();
+        self.undo.opened(self, window, null);
     }
 
     /// The terminal an IPC new tab goes beside, as GTK picks it: the one
@@ -2705,6 +2708,7 @@ pub const App = struct {
 
         // Shown once it is owned, as a new window is.
         window.selectTab(index);
+        self.undo.opened(self, window, window.tabs.items[index]);
     }
 
     /// Give `surface`, a new terminal not yet shown, the title `overrides`
@@ -4273,6 +4277,7 @@ pub const App = struct {
                 // (`run`): a launcher may ask for it minimized.
                 .window => |parent| if (self.newWindow(parent, .normal, null)) |window| {
                     _ = window.present();
+                    self.undo.opened(self, window, null);
                 } else |err| {
                     log.err("failed to create a window err={}", .{err});
                     notice(
@@ -4602,6 +4607,34 @@ pub const App = struct {
     /// this.
     pub fn reserveWindow(self: *App) !void {
         try self.windows.ensureUnusedCapacity(self.core_app.alloc, 1 + self.undo.parkedWindows());
+    }
+
+    /// `redo` of a tab that `undo` closed (`Undo.opened`): another in
+    /// `window`, opened from its focused terminal as `new_tab` opens one.
+    /// Whether it opened; a failure is reported as `new_tab`'s is.
+    pub fn reopenTab(self: *App, window: *Window) bool {
+        const from = window.tab().focused orelse return false;
+        if (from.closing) return false;
+        self.newTab(&from.core_surface, null) catch |err| {
+            log.err("failed to create a tab err={}", .{err});
+            notice(self, from.hwnd, L("Ghostty could not open a new tab."));
+            return false;
+        };
+        return true;
+    }
+
+    /// `redo` of a window that `undo` closed (`Undo.opened`): another,
+    /// opened as `new_window` opens one with no terminal to take after.
+    /// Whether it opened; a failure is reported as `new_window`'s is.
+    pub fn reopenWindow(self: *App) bool {
+        const window = self.newWindow(null, .normal, null) catch |err| {
+            log.err("failed to create a window err={}", .{err});
+            notice(self, null, L("Ghostty could not open a new window."));
+            return false;
+        };
+        _ = window.present();
+        self.undo.opened(self, window, null);
+        return true;
     }
 
     /// Create a terminal window: the initial one (`run`), or one the core
@@ -13436,6 +13469,89 @@ test "win32: the last window's close is not kept, and ends the windows parked be
         try std.testing.expectEqual(0, app.surfaces.items.len);
         try std.testing.expectEqual(0, app.undo.entries.items.len);
     }
+}
+
+test "win32: undo closes the tab or window just opened, for good, and redo opens another" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const t = try TestUndo.init(&app);
+    const window = t.window;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    // As `new_tab` and `new_window` make them; a test's terminal has no
+    // core to take a font size or a directory after.
+    const Panes = struct {
+        fn create(w: *Window, _: Surface.Options) anyerror!*Surface {
+            const made = try testPane(w.app, w);
+            // `App.newTab` and `App.newWindow` make it the app's.
+            _ = w.app.surfaces.pop();
+            return made;
+        }
+    };
+    Window.test_create_pane = &Panes.create;
+    defer Window.test_create_pane = null;
+    app.config.@"window-inherit-font-size" = false;
+    app.config.@"tab-inherit-working-directory" = false;
+    app.config.@"window-inherit-working-directory" = false;
+    const from: apprt.Target = .{ .surface = &t.b.core_surface };
+
+    // A new tab: undo closes it, and keeps nothing of it.
+    try std.testing.expect(try app.performAction(from, .new_tab, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    // As the app's loop runs it (`App.run`): something closed.
+    try std.testing.expect(app.undo.undo(&app));
+    testPump();
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expectEqual(2, app.surfaces.items.len);
+    // Redo opens another, which undo can close in turn.
+    try std.testing.expect(try app.performAction(.app, .redo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+
+    // Declined where a program runs: the tab stays, and a later close of
+    // it is kept as any is.
+    Window.test_needs_confirm = true;
+    TestDecline.asked = 0;
+    @import("dialog.zig").test_message_box = &TestDecline.box;
+    defer @import("dialog.zig").test_message_box = null;
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    Window.test_needs_confirm = false;
+    try std.testing.expectEqual(1, TestDecline.asked);
+    try std.testing.expectEqual(2, window.tabs.items.len);
+    try std.testing.expect(!window.tabs.items[1].unkept);
+    try std.testing.expect(window.closeTabs(1, .this));
+    testPump();
+    try std.testing.expectEqual(1, window.tabs.items.len);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, window.tabs.items.len);
+
+    // A new window: undo closes it, for good, though another stays.
+    try std.testing.expect(try app.performAction(from, .new_window, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    testPump();
+    try std.testing.expectEqualSlices(*Window, &.{window}, app.windows.items);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
+    try std.testing.expect(try app.performAction(.app, .redo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(2, app.windows.items.len);
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
 }
 
 test "win32: new windows and splits are recorded where they are asked for" {
@@ -32679,8 +32795,27 @@ fn testIpcOpens() !void {
     try std.testing.expect(win32.IsWindowVisible(a.hwnd).toBool());
     try std.testing.expectEqual(a.hwnd, TestQuick.front.?);
 
-    // A second window, focused, as the core has it.
+    // A second window, focused, as the core has it; with `undo` bound,
+    // remembered for it to close, as one the core asks for is
+    // (`Undo.opened`), and forgotten when it is unbound again.
+    const Undoable = struct {
+        fn set(on: *App, bound: bool) !void {
+            var config: Config = try .default(on.core_app.alloc);
+            defer config.deinit();
+            if (bound) try config.keybind.parseCLI(config._arena.?.allocator(), "ctrl+shift+z=undo");
+            // As set above, which the change replaces.
+            config.@"window-inherit-working-directory" = false;
+            config.@"tab-inherit-working-directory" = false;
+            config.@"window-inherit-font-size" = false;
+            try std.testing.expect(try on.performAction(.app, .config_change, .{ .config = &config }));
+        }
+    };
+    try Undoable.set(&app, true);
     try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_window, 0, null));
+    try std.testing.expectEqual(1, app.undo.entries.items.len);
+    try std.testing.expectEqual(.opened_window, std.meta.activeTag(app.undo.entries.items[0].what));
+    try Undoable.set(&app, false);
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
     try std.testing.expectEqual(2, app.windows.items.len);
     const b = app.windows.items[1];
     const pb = b.tab().focused orelse return error.TestUnexpectedResult;
@@ -32695,6 +32830,8 @@ fn testIpcOpens() !void {
     // and its window brought forward.
     TestQuick.front = null;
     try std.testing.expectEqual(.ok, try TestIpc.send(&app, name, .new_tab, 0x11, &.{ "--title=t", "-e", "pwsh.exe" }));
+    // With `undo` unbound, nothing is remembered.
+    try std.testing.expectEqual(0, app.undo.entries.items.len);
     try std.testing.expectEqual(2, app.windows.items.len);
     try std.testing.expectEqual(2, a.tabs.items.len);
     try std.testing.expectEqual(1, b.tabs.items.len);

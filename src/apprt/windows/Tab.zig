@@ -63,6 +63,11 @@ closing: bool = false,
 /// zero (`Undo.Entry.group`).
 group: u64 = 0,
 
+/// Its close is not kept for `undo`: `undo` is closing the tab it opened
+/// (`Undo.opened`), which then is gone for good, as on macOS. Cleared
+/// when that close is declined.
+unkept: bool = false,
+
 /// The tab's title as `set_tab_title` gave it, which the window shows in
 /// place of its focused terminal's (`Window.tabTitle`); null for none.
 /// Owned, from the app's allocator.

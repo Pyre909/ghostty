@@ -123,8 +123,9 @@ bar: TabBar.Bar,
 /// declines or the post fails; otherwise the teardown frees the window.
 closing: bool,
 
-/// Its close is not kept for `undo` (`Undo.parksWindow`): a parked
-/// window's time is up (`Undo.end`).
+/// Its close is not kept for `undo` (`Undo.parksWindow`): `undo` is
+/// closing the window it opened (`Undo.opened`), or a parked window's
+/// time is up (`Undo.end`). Cleared when that close is declined.
 unkept: bool = false,
 
 /// Whether the question that `closing` waits on is still open

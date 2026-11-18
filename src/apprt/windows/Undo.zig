@@ -11,7 +11,9 @@
 //! A window that closes while another stays is parked whole, as macOS
 //! keeps a closed window: hidden and out of the app's windows, with every
 //! terminal of it parked (`Window.park`), until `undo` shows it again or
-//! its time is up.
+//! its time is up. A tab or window just opened is remembered too
+//! (`opened`): `undo` closes it, asking first as a close does, and that
+//! close is not kept; `redo` opens another, as macOS does.
 //!
 //! Nothing is parked unless an `undo` binding exists and `undo-timeout`
 //! is not zero (`reachable`): Windows binds none by default, and a closed
@@ -36,6 +38,7 @@ const Surface = @import("Surface.zig").Surface;
 const Window = @import("Window.zig");
 const win32 = @import("win32.zig");
 
+const assert = std.debug.assert;
 const log = std.log.scoped(.win32);
 
 /// The timer on the app's message window that ends the entry due first.
@@ -101,6 +104,11 @@ pub const Entry = struct {
             /// Where it was among the app's windows.
             index: usize,
         },
+        /// A tab just opened in the window, which `undo` closes. Owns
+        /// nothing.
+        opened_tab: *Window.Tab,
+        /// The window, just opened, which `undo` closes. Owns nothing.
+        opened_window,
     };
 
     /// Whether the terminal of `core_surface` is parked by this entry.
@@ -123,19 +131,25 @@ pub const Entry = struct {
                 }
                 return false;
             },
+            .opened_tab, .opened_window => return false,
         }
     }
 };
 
-/// What `undo` brought back. It owns nothing, and goes before what it
-/// names does.
+/// What `undo` brought back, or closed. It owns nothing, and goes before
+/// what it names does.
 pub const Redo = struct {
-    window: *Window,
+    /// Null for a window to open again: the one `undo` closed is gone.
+    window: ?*Window,
     what: union(enum) {
         pane: *Surface,
         tab: *Window.Tab,
         /// The window itself, to close again.
         window,
+        /// A tab to open again in the window, as `undo` closed one.
+        reopen_tab,
+        /// A window to open again, as `undo` closed one.
+        reopen_window,
     },
     expires: u64,
     group: u64,
@@ -203,7 +217,7 @@ fn free(alloc: std.mem.Allocator, entry: *Entry) void {
     switch (entry.what) {
         .pane => |*pane| pane.tree.deinit(),
         .tab => |parked| Window.freeTab(alloc, parked.tab),
-        .window => {},
+        .window, .opened_tab, .opened_window => {},
     }
 }
 
@@ -248,7 +262,7 @@ pub fn pushTab(self: *Undo, app: *App, window: *Window, tab: *Window.Tab, index:
 /// closed window for `undo`; room for its entry is then made. As `parks`,
 /// and only while another window, not the quick terminal, stays open:
 /// closing the last one quits (`App.setQuitTimer`), which would leave
-/// nothing to take it back from. Not one whose time is up
+/// nothing to take it back from. Not a window that `undo` itself closes
 /// (`Window.unkept`).
 pub fn parksWindow(self: *Undo, app: *App, window: *const Window) bool {
     if (!self.enabled or app.terminating) return false;
@@ -267,6 +281,19 @@ pub fn parksWindow(self: *Undo, app: *App, window: *const Window) bool {
 /// After `parksWindow`.
 pub fn pushWindow(self: *Undo, app: *App, window: *Window, index: usize) void {
     self.push(app, window, 0, .{ .window = .{ .index = index } });
+}
+
+/// Remember that `tab` of `window`, or `window` itself when null, was
+/// just opened, for `undo` to close, as macOS registers a new tab or
+/// window (`TerminalController.newTab`, `newWindow`). Nothing when no
+/// close could be taken back either (`reachable`), or no room is left.
+pub fn opened(self: *Undo, app: *App, window: *Window, tab: ?*Window.Tab) void {
+    if (!self.enabled or app.terminating) return;
+    self.entries.ensureUnusedCapacity(app.core_app.alloc, 1) catch |err| {
+        log.warn("a new tab or window cannot be kept for undo err={}", .{err});
+        return;
+    };
+    self.push(app, window, 0, if (tab) |t| .{ .opened_tab = t } else .opened_window);
 }
 
 /// How many windows are parked (`Window.park`). The app's windows keep
@@ -365,6 +392,7 @@ fn end(self: *Undo, app: *App, entry: *Entry, freed: ?*const Surface) void {
                 window.destroy_deferred = true;
             }
         },
+        .opened_tab, .opened_window => {},
     }
     free(app.core_app.alloc, entry);
 }
@@ -420,7 +448,8 @@ pub fn forgetTab(self: *Undo, app: *App, tab: *const Window.Tab) void {
     while (i < self.entries.items.len) {
         const of = switch (self.entries.items[i].what) {
             .pane => |pane| pane.tab == tab,
-            .tab, .window => false,
+            .opened_tab => |t| t == tab,
+            .tab, .window, .opened_window => false,
         };
         if (of) self.expire(app, i) else i += 1;
     }
@@ -428,7 +457,7 @@ pub fn forgetTab(self: *Undo, app: *App, tab: *const Window.Tab) void {
     while (i < self.redos.items.len) {
         const of = switch (self.redos.items[i].what) {
             .tab => |t| t == tab,
-            .pane, .window => false,
+            .pane, .window, .reopen_tab, .reopen_window => false,
         };
         if (of) _ = self.redos.orderedRemove(i) else i += 1;
     }
@@ -448,6 +477,7 @@ pub fn forgetSurface(self: *Undo, app: *App, surface: *const Surface) void {
             .pane => |*pane| pane.tree.locate(surface) != null,
             .tab => |parked| parked.tab.tree.locate(surface) != null,
             .window => entry.window.find(surface) != null,
+            .opened_tab, .opened_window => false,
         };
         if (!in_it) {
             i += 1;
@@ -463,7 +493,7 @@ pub fn forgetSurface(self: *Undo, app: *App, surface: *const Surface) void {
     while (i < self.redos.items.len) {
         const of = switch (self.redos.items[i].what) {
             .pane => |s| s == surface,
-            .tab, .window => false,
+            .tab, .window, .reopen_tab, .reopen_window => false,
         };
         if (of) _ = self.redos.orderedRemove(i) else i += 1;
     }
@@ -497,9 +527,11 @@ pub fn pendingRedo(self: *const Undo) bool {
 /// terminal returns to its tab, where and as large as it was, with the
 /// focus, and its tab is shown; a tab returns to its place among the window's tabs, shown if
 /// it alone comes back; a window shows again where it was; and the window comes forward.
-/// Returns whether anything came back. A close that cannot be taken back, because its
+/// Or close the tab or window last opened (`opened`). Returns whether
+/// anything came back or closed. A close that cannot be taken back, because its
 /// tab's terminals are no longer the ones it left, is torn down instead.
-/// Run where a window may be laid out and the focus moved (`App.run`).
+/// Run where a window may be laid out, the focus moved and a prompt
+/// shown (`App.run`).
 pub fn undo(self: *Undo, app: *App) bool {
     self.expireDue(app);
     var entry = self.entries.pop() orelse return false;
@@ -509,24 +541,40 @@ pub fn undo(self: *Undo, app: *App) bool {
     const shown = window.tab();
     var count: usize = 0;
     var back: usize = 0;
+    var closed = false;
     while (true) {
         count += 1;
-        if (self.restore(app, &entry)) back += 1;
+        switch (self.restore(app, &entry)) {
+            .none => {},
+            .back => back += 1,
+            .closed => closed = true,
+        }
         if (group == 0) break;
         const entries = self.entries.items;
         if (entries.len == 0 or entries[entries.len - 1].group != group) break;
         entry = self.entries.pop().?;
     }
     self.arm(app);
-    if (back == 0) return false;
+    if (back == 0) return closed;
     if (count > 1) if (window.tabIndex(shown)) |index| window.selectTab(index);
     _ = window.present();
     return true;
 }
 
+/// What `restore` did with an entry.
+const Restored = enum {
+    /// Nothing: it could not be put back, and was ended, or what it
+    /// opened is gone or closing already, or its close was declined.
+    none,
+    /// What it held came back.
+    back,
+    /// What it opened is closing.
+    closed,
+};
+
 /// Put back what `entry`, already taken out of the list, holds, or end
-/// it. Returns whether it came back.
-fn restore(self: *Undo, app: *App, entry: *Entry) bool {
+/// it; or close what it opened.
+fn restore(self: *Undo, app: *App, entry: *Entry) Restored {
     const alloc = app.core_app.alloc;
     const window = entry.window;
     const dpi = Window.dpiOf(app, window.hwnd);
@@ -537,12 +585,12 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
             if (window.closing or window.tabIndex(pane.tab) == null or !fits(&pane.tree, &pane.tab.tree, surface)) {
                 log.warn("a closed terminal's tab has changed since; it cannot be put back", .{});
                 self.end(app, entry, null);
-                return false;
+                return .none;
             }
             self.redos.ensureUnusedCapacity(alloc, 1) catch |err| {
                 log.warn("a closed terminal cannot be put back err={}", .{err});
                 self.end(app, entry, null);
-                return false;
+                return .none;
             };
             surface.parked = false;
             surface.closing = false;
@@ -563,13 +611,13 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
                 .expires = expires,
                 .group = entry.group,
             });
-            return true;
+            return .back;
         },
         .tab => |parked| {
             const tab = parked.tab;
             if (window.closing) {
                 self.end(app, entry, null);
-                return false;
+                return .none;
             }
             const room = if (window.tabs.ensureUnusedCapacity(alloc, 1)) |_|
                 self.redos.ensureUnusedCapacity(alloc, 1)
@@ -578,7 +626,7 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
             room catch |err| {
                 log.warn("a closed tab cannot be put back err={}", .{err});
                 self.end(app, entry, null);
-                return false;
+                return .none;
             };
             tab.closing = false;
             tab.group = 0;
@@ -596,13 +644,13 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
                 .expires = expires,
                 .group = entry.group,
             });
-            return true;
+            return .back;
         },
         .window => |parked| {
             self.redos.ensureUnusedCapacity(alloc, 1) catch |err| {
                 log.warn("a closed window cannot be put back err={}", .{err});
                 self.end(app, entry, null);
-                return false;
+                return .none;
             };
             window.closing = false;
             window.unkept = false;
@@ -623,14 +671,64 @@ fn restore(self: *Undo, app: *App, entry: *Entry) bool {
                 .expires = expires,
                 .group = entry.group,
             });
-            return true;
+            return .back;
+        },
+        // Closed as macOS closes it, asking first if a program runs in
+        // it, and gone for good (`Tab.unkept`): its close is not taken
+        // back. The window's only tab closes the window.
+        .opened_tab => |t| {
+            const index = window.tabIndex(t) orelse return .none;
+            if (window.closing or t.closing) return .none;
+            self.redos.ensureUnusedCapacity(alloc, 1) catch |err| {
+                log.warn("a new tab cannot be closed err={}", .{err});
+                return .none;
+            };
+            const alone = window.tabs.items.len == 1;
+            t.unkept = true;
+            if (alone) window.unkept = true;
+            _ = window.closeTabs(index, .this);
+            if (!(if (alone) window.closing else t.closing)) {
+                // Declined, or not posted: it stays, and a later close
+                // of it is kept as any is.
+                t.unkept = false;
+                window.unkept = false;
+                return .none;
+            }
+            self.redos.appendAssumeCapacity(.{
+                .window = if (alone) null else window,
+                .what = if (alone) .reopen_window else .reopen_tab,
+                .expires = expires,
+                .group = 0,
+            });
+            return .closed;
+        },
+        .opened_window => {
+            if (window.closing) return .none;
+            self.redos.ensureUnusedCapacity(alloc, 1) catch |err| {
+                log.warn("a new window cannot be closed err={}", .{err});
+                return .none;
+            };
+            window.unkept = true;
+            window.requestClose();
+            if (!window.closing) {
+                window.unkept = false;
+                return .none;
+            }
+            self.redos.appendAssumeCapacity(.{
+                .window = null,
+                .what = .reopen_window,
+                .expires = expires,
+                .group = 0,
+            });
+            return .closed;
         },
     }
 }
 
 /// Close again what `undo` last brought back, and what came back as one
 /// with it, without asking: the user closed it once already. Each is
-/// parked again, for `undo`. Returns whether anything closed. One that
+/// parked again, for `undo`. Or open again a tab or window like the one
+/// `undo` closed. Returns whether anything closed or opened. One that
 /// has changed too much since is left as it is: a terminal that is now
 /// its tab's only one, a tab that is now its window's only one, a window
 /// that is now the only one.
@@ -656,7 +754,10 @@ pub fn redo(self: *Undo, app: *App) bool {
 }
 
 fn close(self: *Undo, app: *App, item: Redo) bool {
-    const window = item.window;
+    const window = item.window orelse {
+        assert(item.what == .reopen_window);
+        return app.reopenWindow();
+    };
     switch (item.what) {
         .pane => |surface| {
             const at = window.find(surface) orelse return false;
@@ -689,6 +790,8 @@ fn close(self: *Undo, app: *App, item: Redo) bool {
             window.park();
             return true;
         },
+        .reopen_tab => return !window.closing and app.reopenTab(window),
+        .reopen_window => unreachable,
     }
 }
 

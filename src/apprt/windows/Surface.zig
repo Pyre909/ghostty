@@ -1107,7 +1107,7 @@ pub const Surface = struct {
             // them parked.
             const tab_closing = t.closingWhole();
             const whole = at.handle == .root or tab_closing;
-            if (whole and window.tabs.items.len > 1 and app.undo.parks(app, window, self)) {
+            if (whole and window.tabs.items.len > 1 and !t.unkept and app.undo.parks(app, window, self)) {
                 window.parkTab(t);
                 return false;
             }
