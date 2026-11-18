@@ -1,15 +1,16 @@
 //! A terminal's progress bar: a thin bar across the top of the terminal
 //! while its program reports progress (OSC 9;4, `progress-style`), as GTK
-//! shows one over its surface (the `osd` ProgressBar at
-//! src/apprt/gtk/ui/1.0/surface.blp:113, along the top) and macOS
-//! (`SurfaceProgressBar`, macos/Sources/Ghostty/Surface
-//! View/SurfaceProgressBar.swift). It is drawn as macOS draws it, which
-//! says what it looks like where GTK leaves it to the theme: 2 points
-//! high; filled from the left to its value in the accent colour, red for
-//! an error and orange while paused; and with no value, a block a quarter
-//! as wide going from one side to the other and back, 1.2 seconds each
-//! way, eased in and out, over a track of its colour at 30%. macOS also
-//! eases a new value in over 0.2 seconds; this one shows it at once.
+//! shows one over its surface (the `osd` ProgressBar
+//! `progress_bar_overlay` in src/apprt/gtk/ui/1.0/surface.blp, along the
+//! top) and macOS (`SurfaceProgressBar`, in
+//! macos/Sources/Ghostty/Surface View/SurfaceProgressBar.swift). It is
+//! drawn as macOS draws it, which says what it looks like where GTK
+//! leaves it to the theme: 2 points high; filled from the left to its
+//! value in the accent colour, red for an error and orange while paused;
+//! and with no value, a block a quarter as wide going from one side to
+//! the other and back, 1.2 seconds each way, eased in and out, over a
+//! track of its colour at 30%. macOS also eases a new value in over 0.2
+//! seconds; this one shows it at once.
 //!
 //! Every terminal shows its own, as on GTK and macOS; the window's
 //! taskbar button shows its focused terminal's as well (taskbar.zig).
