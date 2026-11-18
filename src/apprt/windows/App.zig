@@ -18655,6 +18655,19 @@ test "win32: progress_report shows a bar along the top of each terminal" {
     try std.testing.expect(!shown(hwnd));
     app.config.@"progress-style" = true;
 
+    // A moving bar whose window is gone while its terminal stays in sight
+    // stops its timer at the next tick; the next report makes the window
+    // and starts the timer again.
+    try report(&app, a, .{ .state = .indeterminate });
+    _ = win32.DestroyWindow(a.overlays.progress_bar.hwnd.?);
+    try std.testing.expect(a.overlays.progress_bar.hwnd == null);
+    _ = Surface.wndProc(a.hwnd, win32.WM_TIMER, ProgressBar.timer_id, 0);
+    try std.testing.expect(!win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .indeterminate });
+    try expectBarAt(window, a, 100);
+    try std.testing.expect(win32.KillTimer(a.hwnd, ProgressBar.timer_id).toBool());
+    try report(&app, a, .{ .state = .remove });
+
     // A window that cannot be made is made at the next report.
     _ = win32.DestroyWindow(b.overlays.progress_bar.hwnd.?);
     try std.testing.expect(b.overlays.progress_bar.hwnd == null);
