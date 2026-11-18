@@ -4752,8 +4752,10 @@ pub const App = struct {
     /// `movePane`, its failure logged: nothing moved then. Where the core
     /// may be re-entered (`Window.dropPane`).
     pub fn movePaneOrSay(self: *App, source: *Surface, target: *Surface, side: Window.Tree.Split.Direction) void {
-        self.movePane(source, target, side) catch |err| {
-            log.warn("the pane is not moved err={}", .{err});
+        _ = self.movePane(source, target, side) catch |err| switch (err) {
+            // Logged where it failed (`Window.reparentPane`).
+            Error.Win32CallFailed => {},
+            else => log.warn("the pane is not moved err={}", .{err}),
         };
     }
 
@@ -4767,31 +4769,34 @@ pub const App = struct {
     /// it its window, if it was the window's last, as macOS closes them.
     /// The moved pane has the focus, and its window comes forward.
     ///
-    /// Nothing for a pane dropped on itself. Refused, logged, for a pane
-    /// or window that is closing, a parked pane, and a frame that is
-    /// transparent where the other is not, whose terminals present as it
-    /// does (`Surface.presentsAlpha`), as a tab moves only between frames
-    /// of one kind (`moveTabAt`). Every allocation, and the one step that
-    /// can fail outside them, moving the pane's window to the new frame,
-    /// come first, so that a failure leaves everything as it was. Where
-    /// the core may be re-entered: it moves the focus.
-    pub fn movePane(self: *App, source: *Surface, target: *Surface, side: Window.Tree.Split.Direction) !void {
-        if (source == target) return;
+    /// Whether it moved: nothing for a pane dropped on itself. Refused,
+    /// logged, for a pane or window that is closing, a parked pane, and a
+    /// frame that is transparent where the other is not, whose terminals
+    /// present as it does (`Surface.presentsAlpha`), as a tab moves only
+    /// between frames of one kind (`moveTabAt`). Every allocation, and
+    /// the one step that can fail outside them, moving the pane's window
+    /// to the new frame, come first, so that a failure, an error, leaves
+    /// everything as it was. Where the core may be re-entered: it moves
+    /// the focus.
+    pub fn movePane(self: *App, source: *Surface, target: *Surface, side: Window.Tree.Split.Direction) !bool {
+        if (source == target) return false;
         const alloc = self.core_app.alloc;
         const from = source.window;
         const to = target.window;
         if (from.closing or to.closing or source.closing or target.closing or source.parked or target.parked) {
             log.info("the pane is not moved: a pane or its window is closing", .{});
-            return error.PaneClosing;
+            return false;
         }
         if (from != to and from.transparent != to.transparent) {
             log.info("the pane is not moved: one window is transparent, the other is not", .{});
-            return error.FrameKind;
+            return false;
         }
-        const st = from.tabOf(source) orelse return error.PaneClosing;
-        const tt = to.tabOf(target) orelse return error.PaneClosing;
-        const sh = st.tree.locate(source).?;
-        const th = tt.tree.locate(target).?;
+        const sp = from.find(source) orelse return false;
+        const tp = to.find(target) orelse return false;
+        const st = from.tabs.items[sp.index];
+        const tt = to.tabs.items[tp.index];
+        const sh = sp.handle;
+        const th = tp.handle;
 
         var single: Window.Tree = try .init(alloc, source);
         defer single.deinit();
@@ -4804,7 +4809,7 @@ pub const App = struct {
             st.focused = source;
             from.adopt(st, moved);
             if (st == from.tab()) from.giveFocus(source);
-            return;
+            return true;
         }
         errdefer joined.deinit();
         var left = try st.tree.remove(alloc, sh);
@@ -4823,15 +4828,22 @@ pub const App = struct {
             TitleDialog.followMove(from);
         }
         tt.focused = source;
-        to.setTree(tt, joined);
+        to.adopt(tt, joined);
         if (tt == to.tab()) {
-            to.relayout();
             to.giveFocus(source);
+        } else {
+            // In a tab not shown, hidden as `hideTab` hides its terminals:
+            // its search bar and overlays too, which follow it to its
+            // frame first, and it is told it cannot be seen.
+            Overlays.place(source);
+            SearchBar.place(source);
+            source.occlusionChanged(false);
         }
         if (from != to) _ = to.present();
         if (emptied) {
             if (from.tabs.items.len > 1) from.removeTab(st) else closeEmptied(from);
         }
+        return true;
     }
 
     /// `window`, whose last terminal moved away (`movePane`), off the
@@ -9239,11 +9251,11 @@ test "win32: a pane dropped on another of its tab goes beside it, with the focus
 
     const names = [_]*Surface{ a, b, c };
     var buf: [4]u8 = undefined;
-    try app.movePane(a, a, .right);
+    try std.testing.expect(!try app.movePane(a, a, .right));
     try std.testing.expectEqualStrings("abc", testLeaves(window.tab(), &names, &buf));
     try std.testing.expect(window.tab().focused == b);
 
-    try app.movePane(a, c, .right);
+    try std.testing.expect(try app.movePane(a, c, .right));
     try std.testing.expectEqualStrings("bca", testLeaves(window.tab(), &names, &buf));
     try std.testing.expect(window.tab().focused == a);
     // c's place, split in half: a has its right half.
@@ -9255,7 +9267,7 @@ test "win32: a pane dropped on another of its tab goes beside it, with the focus
     for ([_]*Surface{ a, b, c }) |pane| try std.testing.expect(shown(pane.hwnd));
 
     // Above b now: b's place split down.
-    try app.movePane(c, b, .up);
+    try std.testing.expect(try app.movePane(c, b, .up));
     try std.testing.expectEqualStrings("cba", testLeaves(window.tab(), &names, &buf));
     const cc = try paneRect(window, c);
     const bb = try paneRect(window, b);
@@ -9267,7 +9279,7 @@ test "win32: a pane dropped on another of its tab goes beside it, with the focus
     const d = try testTab(&app, window);
     window.selectTab(1);
     try std.testing.expect(window.tab().focused == d);
-    try app.movePane(b, a, .left);
+    try std.testing.expect(try app.movePane(b, a, .left));
     try std.testing.expectEqualStrings("cba", testLeaves(window.tabs.items[0], &names, &buf));
     try std.testing.expect(window.tabs.items[0].focused == b);
 
@@ -9313,19 +9325,19 @@ test "win32: a pane dropped in another window leaves its tab for that frame, and
     two.relayout();
 
     b.closing = true;
-    try std.testing.expectError(error.PaneClosing, app.movePane(b, c, .left));
+    try std.testing.expect(!try app.movePane(b, c, .left));
     b.closing = false;
     const clear = try testFrameOf(&app, true);
     const d = try testPane(&app, clear);
     clear.tab().tree = try .init(alloc, d);
     clear.tab().focused = d;
-    try std.testing.expectError(error.FrameKind, app.movePane(b, d, .left));
+    try std.testing.expect(!try app.movePane(b, d, .left));
     const names = [_]*Surface{ a, b, c, d };
     var buf: [4]u8 = undefined;
     try std.testing.expectEqualStrings("ab", testLeaves(one.tab(), &names, &buf));
     try std.testing.expect(ForegroundSeen.last == null);
 
-    try app.movePane(b, c, .left);
+    try std.testing.expect(try app.movePane(b, c, .left));
     try std.testing.expectEqualStrings("a", testLeaves(one.tab(), &names, &buf));
     try std.testing.expectEqualStrings("bc", testLeaves(two.tab(), &names, &buf));
     try std.testing.expect(b.window == two);
@@ -9337,6 +9349,78 @@ test "win32: a pane dropped in another window leaves its tab for that frame, and
     const bb = try paneRect(two, b);
     const cc = try paneRect(two, c);
     try std.testing.expect(bb.right < cc.left);
+}
+
+test "win32: a pane dropped in another window takes that window's DPI, and in a tab not shown hides with it" {
+    // Told the new DPI once, where the frames differ; and in a tab not
+    // shown, its overlays follow it to the new frame hidden, and it is
+    // told it cannot be seen, as the tab's own terminals are.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const Seen = struct {
+        var low: ?win32.HWND = null;
+        var dpi: ?u16 = null;
+        var scaled: usize = 0;
+        var hidden: usize = 0;
+        fn of(hwnd: win32.HWND) callconv(.winapi) win32.UINT {
+            return if (win32.GetAncestor(hwnd, win32.GA_ROOT) == low) 96 else 144;
+        }
+        fn scale(_: *Surface, to: u16) void {
+            dpi = to;
+            scaled += 1;
+        }
+        fn occlusion(_: *Surface, visible: bool) void {
+            if (!visible) hidden += 1;
+        }
+    };
+    app.get_dpi_for_window = &Seen.of;
+    Surface.test_scale_changed = &Seen.scale;
+    defer Surface.test_scale_changed = null;
+    Surface.test_occlusion = &Seen.occlusion;
+    defer Surface.test_occlusion = null;
+
+    const one = try testFrame(&app);
+    Seen.low = one.hwnd;
+    const a = try testPane(&app, one);
+    const b = try testPane(&app, one);
+    const x = try testPane(&app, one);
+    one.tab().tree = try testRow(alloc, &.{ a, b, x });
+    one.tab().focused = a;
+    _ = win32.ShowWindow(one.hwnd, win32.SW_SHOWNOACTIVATE);
+    one.relayout();
+    const two = try testFrame(&app);
+    const c = try testPane(&app, two);
+    two.tab().tree = try .init(alloc, c);
+    two.tab().focused = c;
+    _ = win32.ShowWindow(two.hwnd, win32.SW_SHOWNOACTIVATE);
+    two.relayout();
+
+    // In the same frame: no new DPI.
+    try std.testing.expect(try app.movePane(x, a, .left));
+    try std.testing.expectEqual(0, Seen.scaled);
+    try std.testing.expect(try app.movePane(b, c, .left));
+    try std.testing.expectEqual(1, Seen.scaled);
+    try std.testing.expectEqual(144, Seen.dpi.?);
+
+    // c's tab hidden behind another; a, its link shown, dropped on c.
+    _ = try testTab(&app, two);
+    two.selectTab(1);
+    try std.testing.expect(try testLink(&app, a, "https://example.com"));
+    const link = a.overlays.link_preview.hwnd orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shown(link));
+    const hidden = Seen.hidden;
+    try std.testing.expect(try app.movePane(a, c, .right));
+    try std.testing.expectEqual(two.hwnd, win32.GetAncestor(link, win32.GA_PARENT).?);
+    try std.testing.expect(!shown(link));
+    try std.testing.expect(!shown(a.hwnd));
+    try std.testing.expectEqual(hidden + 1, Seen.hidden);
+    try std.testing.expect(two.tabs.items[0].focused == a);
 }
 
 test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its window when it was the last" {
@@ -9376,14 +9460,14 @@ test "win32: a pane alone in its tab, dropped elsewhere, closes its tab, and its
     // a, c and x as a, b and c.
     const names = [_]*Surface{ a, c, x };
     var buf: [4]u8 = undefined;
-    try app.movePane(a, c, .down);
+    try std.testing.expect(try app.movePane(a, c, .down));
     try std.testing.expectEqual(1, one.tabs.items.len);
     try std.testing.expect(one.tab().focused == x);
     try std.testing.expect(shown(x.hwnd));
     try std.testing.expectEqualStrings("ba", testLeaves(two.tab(), &names, &buf));
 
     const gone = one.hwnd;
-    try app.movePane(x, a, .right);
+    try std.testing.expect(try app.movePane(x, a, .right));
     try std.testing.expect(one.closing);
     try std.testing.expect(!win32.IsWindowVisible(gone).toBool());
     // Inside another terminal's teardown wait: deferred.

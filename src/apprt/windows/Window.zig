@@ -2847,8 +2847,9 @@ pub var test_create_pane: if (builtin.is_test) ?*const fn (*Window, Surface.Opti
     if (builtin.is_test) null else {};
 
 /// Make `tree` `t`'s tree in place of the one it has, which is freed. A
-/// split, a resize or equalize (`adopt`) and a terminal leaving
-/// (`removePane`, `keepLeftOut`) put their new tree here, which ends a
+/// split, a resize or equalize (`adopt`), a pane moved in or out
+/// (`App.movePane`) and a terminal leaving (`removePane`, `keepLeftOut`)
+/// put their new tree here, which ends a
 /// drag of a divider in the tab (`Dividers.tabChanged`): the split it
 /// moves may be gone, and its handle name another. A zoom ends it too
 /// (`toggleZoom`).
@@ -3070,8 +3071,9 @@ pub fn equalizeTab(self: *Window, t: *Tab) void {
     self.adopt(t, tree);
 }
 
-/// Make `tree`, a resized or equalized copy of `t.tree`, its tree, and lay
-/// its terminals out if `t` is shown. Whatever its ratios, the layout
+/// Make `tree` `t`'s tree, and lay its terminals out if `t` is shown:
+/// a resized or equalized copy of `t.tree`, or one with a pane moved in
+/// or out (`App.movePane`). Whatever its ratios, the layout
 /// keeps each terminal its least where the tab has room for them all
 /// (`splitArea`), as GTK keeps them whatever ratio its tree asks for, and
 /// the ratios stay for when it has room again.
