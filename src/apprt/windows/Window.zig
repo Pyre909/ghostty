@@ -534,13 +534,19 @@ pub fn parkTab(self: *Window, t: *Tab) void {
     } else {
         self.relayout();
     }
+    parkTerminals(t);
+    self.app.undo.pushTab(self.app, self, t, index);
+}
+
+/// Park every terminal of `t` (`Surface.park`), closing as its close left
+/// it, for `parkTab` and `park`; nothing waits to take the focus.
+fn parkTerminals(t: *Tab) void {
     t.pending_focus = null;
     var it = t.tree.iterator();
     while (it.next()) |entry| {
         entry.view.closing = true;
         entry.view.park();
     }
-    self.app.undo.pushTab(self.app, self, t, index);
 }
 
 /// `destroy` for a window that `undo` may bring back (`Undo.parksWindow`):
@@ -555,14 +561,7 @@ pub fn park(self: *Window) void {
     TitleDialog.close(self);
     CommandPalette.close(self);
     TabOverview.close(self);
-    for (self.tabs.items) |t| {
-        t.pending_focus = null;
-        var it = t.tree.iterator();
-        while (it.next()) |entry| {
-            entry.view.closing = true;
-            entry.view.park();
-        }
-    }
+    for (self.tabs.items) |t| parkTerminals(t);
     _ = win32.ShowWindow(self.hwnd, win32.SW_HIDE);
     const index = std.mem.indexOfScalar(*Window, app.windows.items, self).?;
     _ = app.windows.orderedRemove(index);

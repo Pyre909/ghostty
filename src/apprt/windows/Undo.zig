@@ -563,6 +563,17 @@ pub fn undo(self: *Undo, app: *App) bool {
     return true;
 }
 
+/// Make the terminals of `t`, parked by an entry, live again, told the
+/// scale `rescale` their window took on meanwhile, if any.
+fn wake(t: *Window.Tab, rescale: ?u16) void {
+    var it = t.tree.iterator();
+    while (it.next()) |leaf| {
+        leaf.view.parked = false;
+        leaf.view.closing = false;
+        if (rescale) |scale| leaf.view.scaleChanged(scale);
+    }
+}
+
 /// What `restore` did with an entry.
 const Restored = enum {
     /// Nothing: it could not be put back, and was ended, or what it
@@ -580,6 +591,8 @@ fn restore(self: *Undo, app: *App, entry: *Entry) Restored {
     const alloc = app.core_app.alloc;
     const window = entry.window;
     const dpi = Window.dpiOf(app, window.hwnd);
+    // The scale its window took on while it was parked, if it changed.
+    const rescale: ?u16 = if (dpi != entry.dpi) std.math.lossyCast(u16, dpi) else null;
     const expires = now() +| self.timeout;
     switch (entry.what) {
         .pane => |*pane| {
@@ -598,7 +611,7 @@ fn restore(self: *Undo, app: *App, entry: *Entry) Restored {
             surface.closing = false;
             // The tab has the tree from here on.
             window.setTree(pane.tab, pane.tree);
-            if (dpi != entry.dpi) surface.scaleChanged(std.math.lossyCast(u16, dpi));
+            if (rescale) |scale| surface.scaleChanged(scale);
             if (pane.tab == window.tab()) {
                 window.showPane(surface);
             } else {
@@ -632,12 +645,7 @@ fn restore(self: *Undo, app: *App, entry: *Entry) Restored {
             };
             tab.closing = false;
             tab.group = 0;
-            var it = tab.tree.iterator();
-            while (it.next()) |leaf| {
-                leaf.view.parked = false;
-                leaf.view.closing = false;
-                if (dpi != entry.dpi) leaf.view.scaleChanged(std.math.lossyCast(u16, dpi));
-            }
+            wake(tab, rescale);
             // The window has the tab from here on.
             window.relinkTab(tab, parked.index);
             self.redos.appendAssumeCapacity(.{
@@ -656,14 +664,7 @@ fn restore(self: *Undo, app: *App, entry: *Entry) Restored {
             };
             window.closing = false;
             window.unkept = false;
-            for (window.tabs.items) |t| {
-                var it = t.tree.iterator();
-                while (it.next()) |leaf| {
-                    leaf.view.parked = false;
-                    leaf.view.closing = false;
-                    if (dpi != entry.dpi) leaf.view.scaleChanged(std.math.lossyCast(u16, dpi));
-                }
-            }
+            for (window.tabs.items) |t| wake(t, rescale);
             // Room was kept for it (`parkedWindows`).
             app.windows.insertAssumeCapacity(@min(parked.index, app.windows.items.len), window);
             window.unpark();
