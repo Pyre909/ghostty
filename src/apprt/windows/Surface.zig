@@ -32,6 +32,7 @@ const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const input_pane = @import("input_pane.zig");
 const ScrollBar = @import("ScrollBar.zig");
+const RenderWindow = @import("RenderWindow.zig");
 const Inspector = @import("Inspector.zig");
 const Transparency = @import("Transparency.zig");
 const IpcClient = @import("IpcClient.zig");
@@ -100,6 +101,11 @@ pub const Surface = struct {
     /// Written from WM_NCCREATE, which is the first message this window
     /// receives, so it is valid in every other handler.
     hwnd: win32.HWND,
+
+    /// The window the renderer presents to (RenderWindow.zig), filling
+    /// `hwnd`'s client area; null if it could not be made, when the
+    /// renderer presents to `hwnd` itself (`renderHwnd`).
+    render_hwnd: ?win32.HWND,
 
     /// The current window title, owned by this struct. `getTitle` reads it
     /// back to answer CSI 21 t; a native runtime has to store it itself.
@@ -881,6 +887,7 @@ pub const Surface = struct {
             // `hwnd` is written from WM_NCCREATE, the first message this
             // window receives, so it is set before anything can read it.
             .hwnd = undefined,
+            .render_hwnd = null,
             .title = null,
             .title_override = null,
             .pwd = null,
@@ -932,6 +939,8 @@ pub const Surface = struct {
         // will not free a surface that is not yet in App.surfaces.
         errdefer _ = win32.DestroyWindow(hwnd);
         ScrollBar.made(self);
+        // Before the core, whose renderer presents to it.
+        self.render_hwnd = RenderWindow.create(self);
 
         // Its link preview, hidden, so that no window is made as the
         // pointer reaches a link (`LinkPreview`).
@@ -1542,6 +1551,12 @@ pub const Surface = struct {
         if (self.overlays.readonly.on and self.overlays.child_exited.exited)
             return L("This terminal is read-only. Close it anyway?");
         return question.text("Close Split?", "The currently running process in this split will be terminated.");
+    }
+
+    /// The window the renderer presents to: the render window, or this
+    /// terminal's own if there is none.
+    pub fn renderHwnd(self: *const Surface) win32.HWND {
+        return self.render_hwnd orelse self.hwnd;
     }
 
     /// The Direct3D 11 device has no options: each renderer creates its
@@ -2357,7 +2372,12 @@ pub const Surface = struct {
                 // this window is never minimized itself.
                 switch (SizeChange.init(lparam)) {
                     .empty => {},
-                    .resize => |size| self.resize(size),
+                    .resize => |size| {
+                        // Before the core: the renderer's swap chain is
+                        // sized by the render window.
+                        if (self.render_hwnd) |r| RenderWindow.place(r, @intCast(size.width), @intCast(size.height));
+                        self.resize(size);
+                    },
                 }
                 return 0;
             },
@@ -4944,6 +4964,7 @@ test "win32: key messages under a prompt never reach the core" {
     const surface = &s.surface;
     surface.app = &app;
     surface.hwnd = hwnd;
+    surface.render_hwnd = null;
     surface.core_state = .live;
     surface.ime = .{};
 
@@ -5019,6 +5040,7 @@ test "win32: losing focus mid-drag wakes the app loop" {
     const surface = &s.surface;
     surface.app = &app;
     surface.hwnd = hwnd;
+    surface.render_hwnd = null;
     surface.core_state = .none;
     surface.ime = .{};
     surface.preedit = .none;
@@ -5111,6 +5133,7 @@ test "win32: a teardown dispatched inside another waits for it" {
         const pane = try messageWindow();
         defer _ = win32.DestroyWindow(pane);
         surface.hwnd = pane;
+        surface.render_hwnd = null;
         s.window.hwnd = frame;
         surface.destroy_deferred = false;
         app.teardown_depth = depth;
@@ -5153,6 +5176,7 @@ test "win32: a finished teardown posts the ones it deferred again" {
         surface.core_state = .none;
         surface.closing = true;
         surface.parked = false;
+        surface.render_hwnd = null;
         surface.hwnd = win32.CreateWindowExW(
             0,
             L("STATIC"),

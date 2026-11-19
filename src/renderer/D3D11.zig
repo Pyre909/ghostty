@@ -381,7 +381,7 @@ pub fn init(
     _ = device;
 
     const hwnd: api.HWND = switch (apprt.runtime) {
-        apprt.windows => opts.rt_surface.hwnd,
+        apprt.windows => opts.rt_surface.renderHwnd(),
         apprt.embedded => switch (opts.rt_surface.platform) {
             .windows => |v| v.hwnd,
             // Platform.init refuses these tags on Windows.

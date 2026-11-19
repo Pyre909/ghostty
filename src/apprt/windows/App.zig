@@ -54,6 +54,7 @@ const TitleDialog = @import("TitleDialog.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
 const Transparency = @import("Transparency.zig");
+const RenderWindow = @import("RenderWindow.zig");
 const ContextMenu = @import("ContextMenu.zig");
 const TabTitleEditor = @import("TabTitleEditor.zig");
 const Mica = @import("Mica.zig");
@@ -5269,6 +5270,10 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     }
     errdefer _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
 
+    // The window each terminal's renderer presents to (RenderWindow.zig).
+    if (!RenderWindow.registerClass(hinstance)) return App.Error.Win32ClassRegistrationFailed;
+    errdefer RenderWindow.unregisterClass(hinstance);
+
     // CS_DBLCLKS: a double click on its empty part opens a tab; with it
     // every button's second quick press is a *BUTTONDBLCLK, which the bar
     // takes as a press anywhere else (`TabBar.wndProc`). The bar
@@ -5378,6 +5383,7 @@ fn unregisterClasses(hinstance: win32.HINSTANCE) void {
     imgui.View.unregisterClass(hinstance);
     _ = win32.UnregisterClassW(L(app_class_name), hinstance);
     _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
+    RenderWindow.unregisterClass(hinstance);
     _ = win32.UnregisterClassW(L(Window.class_name), hinstance);
     _ = win32.UnregisterClassW(L(TabBar.class_name), hinstance);
     _ = win32.UnregisterClassW(L(SearchBar.class_name), hinstance);
