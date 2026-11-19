@@ -9,6 +9,7 @@ const quirks = @import("../../quirks.zig");
 const directwrite = @import("../directwrite/main.zig");
 const api = directwrite.api;
 const FontFileLoader = directwrite.FontFileLoader;
+const thicken = @import("../directwrite/thicken.zig");
 const stb = @import("../../stb/main.zig");
 const wuffs = @import("wuffs");
 
@@ -705,8 +706,16 @@ pub const Face = struct {
         // The pixels DirectWrite drew on are the glyph. They are not cut
         // to the box above: the ink of a simulated bold or oblique is
         // larger than the metrics of the font say, and the edge of any
-        // glyph may touch one more pixel than its box.
-        const bitmap = (try self.rasterize(alloc, glyph, matrix)) orelse return empty_glyph;
+        // glyph may touch one more pixel than its box, and more thickened.
+        const bitmap = (if (opts.thicken)
+            try self.rasterizeThick(
+                alloc,
+                glyph,
+                matrix,
+                thicken.radius(self.size.pixels(), opts.thicken_strength),
+            )
+        else
+            try self.rasterize(alloc, glyph, matrix)) orelse return empty_glyph;
         defer alloc.free(bitmap.data);
 
         // Write our rasterized glyph to the atlas.
@@ -1092,6 +1101,66 @@ pub const Face = struct {
             .width = width,
             .height = height,
             .bounds = bounds,
+        };
+    }
+
+    /// Rasterize a glyph through a transform as `rasterize` does, its
+    /// outline grown by `r` samples on every side, for font-thicken: it
+    /// is drawn in samples, `thicken.scale` to the pixel each way, grown
+    /// there and averaged back to pixels (thicken.zig says why). Null
+    /// when the glyph draws on no pixel.
+    fn rasterizeThick(
+        self: Face,
+        alloc: Allocator,
+        glyph: u16,
+        matrix: api.DWRITE_MATRIX,
+        r: f64,
+    ) (Allocator.Error || directwrite.Error)!?Bitmap {
+        // The space the glyph is drawn in, scaled about its origin: the
+        // pixel in column c covers samples c * scale to (c + 1) * scale.
+        const s: f32 = @floatFromInt(thicken.scale);
+        const drawn = (try self.rasterize(alloc, glyph, .{
+            .m11 = matrix.m11 * s,
+            .m12 = matrix.m12 * s,
+            .m21 = matrix.m21 * s,
+            .m22 = matrix.m22 * s,
+            .dx = matrix.dx * s,
+            .dy = matrix.dy * s,
+        })) orelse return null;
+        defer alloc.free(drawn.data);
+
+        const box = thicken.sampleBox(.{
+            .left = drawn.bounds.left,
+            .top = drawn.bounds.top,
+            .right = drawn.bounds.right,
+            .bottom = drawn.bounds.bottom,
+        }, r);
+        const width = box.width();
+        const height = box.height();
+        const samples = try alloc.alloc(u8, @as(usize, width) * height);
+        defer alloc.free(samples);
+        @memset(samples, 0);
+        const left: usize = @intCast(drawn.bounds.left - box.left);
+        const top: usize = @intCast(drawn.bounds.top - box.top);
+        for (0..drawn.height) |row| @memcpy(
+            samples[(top + row) * width + left ..][0..drawn.width],
+            drawn.data[row * drawn.width ..][0..drawn.width],
+        );
+
+        const grown = try thicken.dilate(alloc, samples, width, height, r);
+        defer alloc.free(grown);
+        const data = try thicken.downsample(alloc, grown, width, height);
+        const px = thicken.pixelBox(box);
+        return .{
+            .data = data,
+            .width = px.width(),
+            .height = px.height(),
+            .bounds = .{
+                .left = px.left,
+                .top = px.top,
+                .right = px.right,
+                .bottom = px.bottom,
+            },
         };
     }
 
@@ -2668,6 +2737,138 @@ test "coverage is linear vertically" {
     }, columns) |want, column| {
         try testing.expectEqual(want.len, column.len);
         for (want, column) |w, v| try testing.expect(@abs(w - @as(i32, v)) <= 1);
+    }
+}
+
+/// The coverage of a bitmap, in pixels, and the point it balances on,
+/// in the space it was rasterized in.
+const TestMoments = struct { sum: f64, x: f64, y: f64 };
+
+fn testMoments(b: Face.Bitmap) TestMoments {
+    var sum: f64 = 0;
+    var sx: f64 = 0;
+    var sy: f64 = 0;
+    for (0..b.height) |row| for (0..b.width) |col| {
+        const v: f64 = @as(f64, @floatFromInt(b.data[row * b.width + col])) / 255;
+        const x: f64 = @floatFromInt(b.bounds.left + @as(i32, @intCast(col)));
+        const y: f64 = @floatFromInt(b.bounds.top + @as(i32, @intCast(row)));
+        sum += v;
+        sx += v * (x + 0.5);
+        sy += v * (y + 0.5);
+    };
+    return .{ .sum = sum, .x = sx / sum, .y = sy / sum };
+}
+
+// The bar and the hyphen of JetBrains Mono are rectangles, so the box of
+// their ink from the font's metrics is all of them: what any raster of
+// them should add up to and balance on. DirectWrite's own raster is off
+// by a part of a pixel in both: it samples each pixel 4 by 4 (its
+// coverage comes in steps of 16), and measured 2026-11-18 its bar at 24
+// points lost 4.7% of its area and stood 0.12 of a pixel low.
+
+test "font-thicken draws a stem where its outline is, grown by the radius" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var face = try Face.init(lib, testFont, .{
+        .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 },
+    });
+    defer face.deinit();
+
+    for ("|-") |char| {
+        const glyph: u16 = @intCast(face.glyphIndex(char).?);
+        var gm: [1]api.DWRITE_GLYPH_METRICS = undefined;
+        const box = (try face.designBox(&[_]api.UINT16{glyph}, &gm)).?;
+
+        // Off the pixel grid by a different fraction each time.
+        for ([_]f32{ 0, 0.3, 0.55, 0.8 }) |sub| {
+            const matrix: api.DWRITE_MATRIX = .{
+                .m11 = 1,
+                .m12 = 0,
+                .m21 = 0,
+                .m22 = 1,
+                .dx = sub,
+                .dy = -sub / 2,
+            };
+            // The middle of the box, +Y down as the raster is.
+            const want_x = sub + box.x + box.width / 2;
+            const want_y = -sub / 2 - (box.y + box.height / 2);
+
+            for ([_]f64{ 0, thicken.radius(32, 0), thicken.radius(32, 255) }) |r| {
+                const bitmap = (try face.rasterizeThick(alloc, glyph, matrix, r)).?;
+                defer alloc.free(bitmap.data);
+                const m = testMoments(bitmap);
+
+                // Each edge out by d: the corners are rounded, a disc's.
+                const d = r / thicken.scale;
+                const want_area = (box.width + 2 * d) * (box.height + 2 * d) - (4 - std.math.pi) * d * d;
+                errdefer std.debug.print(
+                    "'{c}' +{d:.2} r={d:.3}: area {d:.3} at ({d:.3},{d:.3}), want {d:.3} at ({d:.3},{d:.3})\n",
+                    .{ char, sub, r, m.sum, m.x, m.y, want_area, want_x, want_y },
+                );
+                try testing.expectApproxEqRel(want_area, m.sum, 0.01);
+                // Drawn in samples, DirectWrite's own 4 by 4 within each
+                // sample still leaves up to 0.09 of a pixel, measured.
+                try testing.expectApproxEqAbs(want_x, m.x, 0.1);
+                try testing.expectApproxEqAbs(want_y, m.y, 0.1);
+            }
+        }
+    }
+}
+
+test "font-thicken grows a rendered stem by what CoreText's smoothing does" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    var atlas = try font.Atlas.init(alloc, 512, .grayscale);
+    defer atlas.deinit(alloc);
+
+    // 20 pixels to the em, where macOS widens a stem by 0.23 of a pixel
+    // at strength 0 and by 0.6 at 255, the most it does.
+    var face = try Face.init(lib, testFont, .{
+        .size = .{ .points = 15, .xdpi = 96, .ydpi = 96 },
+    });
+    defer face.deinit();
+    const metrics = font.Metrics.calc(face.getMetrics());
+
+    // The bar and the hyphen gain the widening across their stem and
+    // along it. They are rectangles of the size their cell puts them
+    // at. DirectWrite samples each of our samples 4 by 4, so an edge
+    // lands within a 32nd of a pixel of where it is, the same on every
+    // row of a stem: 0.046 of a pixel short across this bar, measured.
+    for ("|-") |char| {
+        const index = face.glyphIndex(char).?;
+        var gm: [1]api.DWRITE_GLYPH_METRICS = undefined;
+        const design = (try face.designBox(&[_]api.UINT16{@intCast(index)}, &gm)).?;
+        const box = Face.place(design, .{ .grid_metrics = metrics });
+        for ([_]u8{ 0, 128, 255 }) |strength| {
+            const glyph = try face.renderGlyph(alloc, &atlas, index, .{
+                .grid_metrics = metrics,
+                .thicken = true,
+                .thicken_strength = strength,
+            });
+            const area = @as(f64, @floatFromInt(testCoverage(&atlas, glyph))) / 255;
+            const d = thicken.widening(20, strength) / 2;
+            const want = (box.width + 2 * d) * (box.height + 2 * d) - (4 - std.math.pi) * d * d;
+            errdefer std.debug.print("'{c}' at {}: {d:.3}x{d:.3}, area {d:.3}, want {d:.3}\n", .{
+                char,
+                strength,
+                box.width,
+                box.height,
+                area,
+                want,
+            });
+            const perimeter = 2 * (box.width + box.height + 4 * d);
+            try testing.expectApproxEqAbs(want, area, perimeter / 32);
+        }
     }
 }
 
