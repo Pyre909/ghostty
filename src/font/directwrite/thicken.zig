@@ -83,8 +83,8 @@ pub fn sampleBox(drawn: Box, r: f64) Box {
     return .{
         .left = @divFloor(drawn.left - pad, s) * s,
         .top = @divFloor(drawn.top - pad, s) * s,
-        .right = -@divFloor(-(drawn.right + pad), s) * s,
-        .bottom = -@divFloor(-(drawn.bottom + pad), s) * s,
+        .right = @divCeil(drawn.right + pad, s) * s,
+        .bottom = @divCeil(drawn.bottom + pad, s) * s,
     };
 }
 
