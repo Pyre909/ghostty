@@ -8783,6 +8783,98 @@ test "win32: a finger focuses its terminal and scrolls it; a pen is left to be a
     try std.testing.expect(window.tab().focused == left);
 }
 
+test "win32: a finger's tap asks for the touch keyboard, and held still opens the menu" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const Touch = struct {
+        const finger: u16 = 7;
+        const primary: win32.WPARAM = @as(win32.WPARAM, win32.POINTER_MESSAGE_FLAG_PRIMARY) << 16;
+        var keyboards: usize = 0;
+        var menus: usize = 0;
+        var menu_at: win32.POINT = .{ .x = 0, .y = 0 };
+        fn kind(_: u16) win32.DWORD {
+            return win32.PT_TOUCH;
+        }
+        fn scrolled(_: *Surface, _: i32) void {}
+        fn tryShow(_: win32.HWND) error{InputPaneFailed}!bool {
+            keyboards += 1;
+            return true;
+        }
+        fn track(_: win32.HMENU, _: win32.HWND, at: win32.POINT) u32 {
+            menus += 1;
+            menu_at = at;
+            return 0;
+        }
+        fn send(surface: *Surface, msg: win32.UINT, flags: win32.WPARAM, x: i32, y: i32) void {
+            _ = Surface.wndProc(surface.hwnd, msg, finger | flags, testPoint(x, y));
+        }
+        fn held(surface: *Surface) void {
+            _ = Surface.wndProc(surface.hwnd, win32.WM_TIMER, @import("Surface.zig").touch_hold_timer_id, 0);
+        }
+    };
+    Touch.keyboards = 0;
+    Touch.menus = 0;
+    Surface.test_pointer_type = &Touch.kind;
+    defer Surface.test_pointer_type = null;
+    Surface.test_touch_scroll = &Touch.scrolled;
+    defer Surface.test_touch_scroll = null;
+    input_pane.test_try_show = &Touch.tryShow;
+    defer input_pane.test_try_show = null;
+    ContextMenu.test_track = &Touch.track;
+    defer ContextMenu.test_track = null;
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+
+    // A tap, a jitter of the finger allowed.
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUPDATE, Touch.primary, 104, 103);
+    try std.testing.expectEqual(0, Touch.keyboards);
+    Touch.send(a, win32.WM_POINTERUP, Touch.primary, 104, 103);
+    try std.testing.expectEqual(1, Touch.keyboards);
+    try std.testing.expectEqual(0, Touch.menus);
+
+    // A drag is no tap, even one that ends where it began, and its timer
+    // opens nothing.
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUPDATE, Touch.primary, 100, 180);
+    Touch.held(a);
+    try std.testing.expectEqual(0, Touch.menus);
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUPDATE, Touch.primary, 100, 180);
+    Touch.send(a, win32.WM_POINTERUPDATE, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUP, Touch.primary, 100, 100);
+    try std.testing.expectEqual(1, Touch.keyboards);
+
+    // Nor is a contact the system took away.
+    const canceled = @as(win32.WPARAM, win32.POINTER_MESSAGE_FLAG_CANCELED) << 16;
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUP, Touch.primary | canceled, 100, 100);
+    try std.testing.expectEqual(1, Touch.keyboards);
+
+    // Held still: the menu, where the finger came down on the screen, and
+    // the release that follows is no tap.
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    Touch.held(a);
+    try std.testing.expectEqual(1, Touch.menus);
+    try std.testing.expectEqual(win32.POINT{ .x = 100, .y = 120 }, Touch.menu_at);
+    Touch.send(a, win32.WM_POINTERUP, Touch.primary, 100, 120);
+    try std.testing.expectEqual(1, Touch.keyboards);
+
+    // A timer left over once the finger has gone opens nothing.
+    Touch.held(a);
+    try std.testing.expectEqual(1, Touch.menus);
+}
+
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {
     // Only with the option, in the active window, with no button held, and
     // only for a move: not the WM_MOUSEMOVE Win32 sends when a layout change

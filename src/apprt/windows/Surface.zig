@@ -30,6 +30,7 @@ const ProgressBar = @import("ProgressBar.zig");
 const BellBadge = @import("BellBadge.zig");
 const Dividers = @import("Dividers.zig");
 const ContextMenu = @import("ContextMenu.zig");
+const input_pane = @import("input_pane.zig");
 const ScrollBar = @import("ScrollBar.zig");
 const Inspector = @import("Inspector.zig");
 const Transparency = @import("Transparency.zig");
@@ -66,6 +67,14 @@ const log = std.log.scoped(.win32);
 /// The WM_TIMER that removes a progress report no newer one followed
 /// (`reportProgress`).
 pub const progress_timer_id: win32.UINT_PTR = 1;
+
+/// The WM_TIMER of a finger held still on the terminal (`touchHeld`),
+/// beside `progress_timer_id` and the others its WM_TIMER tells apart.
+pub const touch_hold_timer_id: win32.UINT_PTR = 5;
+
+/// How long a finger stays still before it opens the context menu.
+/// Windows does not say how long its own press and hold is.
+const touch_hold_ms: win32.UINT = 700;
 
 /// How long a progress report shows with no newer one: GTK's 15 seconds.
 const progress_timeout_ms: u32 = 15 * std.time.ms_per_s;
@@ -667,6 +676,17 @@ pub const Surface = struct {
             /// Where the rows scrolled so far have brought the finger, in
             /// pixels down the screen.
             anchor: i32,
+            /// Where the finger came down, on the screen.
+            start: win32.POINT,
+            /// It has gone half a row from `start`, so it is no tap and
+            /// no press and hold.
+            moved: bool = false,
+
+            /// The finger is at `at`: note whether it has left its place.
+            fn track(self: *Pan, at: win32.POINT, cell: u32) void {
+                const reach: i32 = @intCast(cell / 2);
+                if (@abs(at.x - self.start.x) >= reach or @abs(at.y - self.start.y) >= reach) self.moved = true;
+            }
 
             /// The finger is at `y`: the rows it has moved down since the
             /// anchor, to the nearest row, negative for up. What is left
@@ -2354,6 +2374,10 @@ pub const Surface = struct {
                     ProgressBar.timer(self);
                     return 0;
                 },
+                touch_hold_timer_id => {
+                    self.touchHeld();
+                    return 0;
+                },
                 else => {},
             },
 
@@ -3531,46 +3555,82 @@ pub const Surface = struct {
     /// A finger on the terminal gives it the focus, and dragged scrolls
     /// its viewport (`Mouse.Pan`). As in Windows Terminal that is so
     /// whatever the program in it reads: a finger is never reported as a
-    /// mouse. Only the first finger counts; the others do nothing.
+    /// mouse. A tap asks for the touch keyboard, as there, and a finger
+    /// held still opens the context menu, the right click Windows would
+    /// have made of it. Only the first finger counts; the others do
+    /// nothing.
     pub fn touchPointer(self: *Surface, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
         // Whichever device it was: the contact is over, and the id in this
         // message's wParam is not one to ask about.
         if (msg == win32.WM_POINTERCAPTURECHANGED) {
-            self.mouse.pan = null;
+            self.endPan();
             return false;
         }
         if (!isTouch(@truncate(wparam))) return false;
         const flags = win32.hiword(wparam);
         if (flags & win32.POINTER_MESSAGE_FLAG_PRIMARY == 0) return true;
-        const y: i32 = win32.yLparam(lparam);
+        const at: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
         switch (msg) {
             win32.WM_POINTERDOWN => {
                 _ = self.clickFocus();
-                self.mouse.pan = .{ .anchor = y };
+                self.mouse.pan = .{ .anchor = at.y, .start = at };
+                if (win32.SetTimer(self.hwnd, touch_hold_timer_id, touch_hold_ms, null) == 0) {
+                    log.warn("SetTimer failed, a held finger shows no menu err={}", .{win32.GetLastError()});
+                }
             },
             win32.WM_POINTERUPDATE => {
                 if (flags & win32.POINTER_MESSAGE_FLAG_CANCELED != 0) {
-                    self.mouse.pan = null;
+                    self.endPan();
                 } else if (self.mouse.pan) |*pan| {
-                    self.touchScroll(pan, y);
+                    pan.track(at, self.touchCell());
+                    if (pan.moved) _ = win32.KillTimer(self.hwnd, touch_hold_timer_id);
+                    self.touchScroll(pan, at.y);
                 }
             },
-            else => self.mouse.pan = null,
+            else => {
+                const tapped = if (self.mouse.pan) |pan| !pan.moved else false;
+                self.endPan();
+                if (tapped and flags & win32.POINTER_MESSAGE_FLAG_CANCELED == 0) {
+                    _ = input_pane.tryShow(self.window.hwnd) catch false;
+                }
+            },
         }
         return true;
+    }
+
+    /// The finger is gone, or no longer counts.
+    fn endPan(self: *Surface) void {
+        if (self.mouse.pan == null) return;
+        self.mouse.pan = null;
+        _ = win32.KillTimer(self.hwnd, touch_hold_timer_id);
+    }
+
+    /// The hold timer's WM_TIMER: a finger still where it came down opens
+    /// the context menu there. It is over then: its release is no tap.
+    fn touchHeld(self: *Surface) void {
+        _ = win32.KillTimer(self.hwnd, touch_hold_timer_id);
+        const pan = self.mouse.pan orelse return;
+        self.mouse.pan = null;
+        if (pan.moved or self.closing or !self.app.canReenterCore()) return;
+        var at = pan.start;
+        if (!win32.ScreenToClient(self.hwnd, &at).toBool()) return;
+        ContextMenu.show(self, at);
+    }
+
+    /// The height of the terminal's rows, in pixels.
+    fn touchCell(self: *Surface) u32 {
+        if (builtin.is_test) if (test_touch_scroll != null) return test_touch_cell;
+        const core_surface = self.liveCore() orelse return 0;
+        return core_surface.size.cell.height;
     }
 
     /// Scroll the viewport by what the finger at `y` has moved: down the
     /// screen is back through the scrollback, the core's negative lines.
     fn touchScroll(self: *Surface, pan: *Mouse.Pan, y: i32) void {
-        if (builtin.is_test) if (test_touch_scroll) |scrolled| {
-            const rows = pan.add(y, test_touch_cell);
-            if (rows != 0) scrolled(self, -rows);
-            return;
-        };
-        const core_surface = self.liveCore() orelse return;
-        const rows = pan.add(y, core_surface.size.cell.height);
+        const rows = pan.add(y, self.touchCell());
         if (rows == 0) return;
+        if (builtin.is_test) if (test_touch_scroll) |scrolled| return scrolled(self, -rows);
+        const core_surface = self.liveCore() orelse return;
         const lines: i16 = @intCast(std.math.clamp(-rows, std.math.minInt(i16), std.math.maxInt(i16)));
         _ = core_surface.performBindingAction(.{ .scroll_page_lines = lines }) catch |err|
             log.warn("touch scroll failed err={}", .{err});
@@ -4188,7 +4248,7 @@ test "win32: a wheel's ticks go to the core as they are, its lines in pixels" {
 }
 
 test "win32: a finger's move scrolls from half a row on, and keeps what is left of one" {
-    var pan: Surface.Mouse.Pan = .{ .anchor = 100 };
+    var pan: Surface.Mouse.Pan = .{ .anchor = 100, .start = .{ .x = 0, .y = 100 } };
     try std.testing.expectEqual(0, pan.add(109, 20));
     try std.testing.expectEqual(0, pan.add(91, 20));
     try std.testing.expectEqual(1, pan.add(110, 20));
@@ -4202,6 +4262,21 @@ test "win32: a finger's move scrolls from half a row on, and keeps what is left 
     try std.testing.expectEqual(160, pan.anchor);
     // Rows of no height scroll nothing.
     try std.testing.expectEqual(0, pan.add(500, 0));
+}
+
+test "win32: a finger has left its place at half a row, across or down" {
+    const at: win32.POINT = .{ .x = 50, .y = 100 };
+    var pan: Surface.Mouse.Pan = .{ .anchor = at.y, .start = at };
+    pan.track(.{ .x = 59, .y = 91 }, 20);
+    try std.testing.expect(!pan.moved);
+    pan.track(.{ .x = 40, .y = 100 }, 20);
+    try std.testing.expect(pan.moved);
+    pan = .{ .anchor = at.y, .start = at };
+    pan.track(.{ .x = 50, .y = 110 }, 20);
+    try std.testing.expect(pan.moved);
+    // Having left, it has left, wherever it comes back to.
+    pan.track(at, 20);
+    try std.testing.expect(pan.moved);
 }
 
 test "win32: wheel points off the client area clamp to its edge" {
