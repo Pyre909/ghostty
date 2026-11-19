@@ -13898,8 +13898,23 @@ test "win32: a split closed where undo is bound is parked, and undo puts it back
     const tab = window.tab();
     const before = .{ try paneRect(window, t.a), try paneRect(window, t.b) };
 
+    // A finger down on it as it closes: its pan and hold timer end with
+    // the rest of its input, so no menu opens for a parked terminal.
+    const Finger = struct {
+        fn kind(_: u16) win32.DWORD {
+            return win32.PT_TOUCH;
+        }
+    };
+    Surface.test_pointer_type = &Finger.kind;
+    defer Surface.test_pointer_type = null;
+    const primary: win32.WPARAM = @as(win32.WPARAM, win32.POINTER_MESSAGE_FLAG_PRIMARY) << 16;
+    try std.testing.expect(t.b.touchPointer(win32.WM_POINTERDOWN, 7 | primary, testPoint(10, 10)));
+    try std.testing.expect(t.b.mouse.pan != null);
+
     // Closed: out of the tab and hidden, but not torn down.
     TestUndo.close(t.b);
+    try std.testing.expect(t.b.mouse.pan == null);
+    try std.testing.expect(!win32.KillTimer(t.b.hwnd, @import("Surface.zig").touch_hold_timer_id).toBool());
     try std.testing.expect(TestUndo.has(&app, t.b));
     try std.testing.expect(t.b.parked);
     try std.testing.expect(t.b.closing);
