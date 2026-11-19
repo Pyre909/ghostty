@@ -131,8 +131,9 @@ background: ?terminal.color.RGB = null,
 /// for that text in `font`, or `shows` (whether it shows, with no text);
 /// and `textIn` or `draw`. It may have `look`, `measureMore` (more than
 /// its text to measure), `shape` (its window's region, or its pixels),
-/// `handle` (messages of its own) and `hidden` (what it does as its
-/// window is hidden).
+/// `handle` (messages of its own), `hidden` (what it does as its
+/// window is hidden) and `own_layering` (layered by itself in any frame,
+/// which `chromeAgain` leaves as it is).
 pub const stack = [_][]const u8{ "readonly", "progress_bar", "bell_border", "child_exited", "resize_overlay", "link_preview", "renderer_health", "key_state", "dim", "drag_handle", "drop_preview" };
 
 /// Each overlay's window class, all with `wndProc`: one for each, so that
@@ -211,18 +212,10 @@ pub fn deinit(self: *Overlays, alloc: std.mem.Allocator) void {
 /// their terminal's.
 pub fn chromeAgain(self: *const Overlays, window: *const Window) void {
     inline for (stack) |name| {
-        if (comptime !ownLayering(name))
-            Transparency.chromeAgain(window, @field(self, name).hwnd);
+        const o = &@field(self, name);
+        if (comptime !@hasDecl(@TypeOf(o.*), "own_layering"))
+            Transparency.chromeAgain(window, o.hwnd);
     }
-}
-
-/// The overlays layered for an alpha of their own (the dim, the drop
-/// preview) or for UpdateLayeredWindow (the drag handle), in any frame.
-const own_layering = [_][]const u8{ "dim", "drag_handle", "drop_preview" };
-
-fn ownLayering(comptime name: []const u8) bool {
-    inline for (own_layering) |o| if (comptime std.mem.eql(u8, o, name)) return true;
-    return false;
 }
 
 /// Draw them again: the theme changed.

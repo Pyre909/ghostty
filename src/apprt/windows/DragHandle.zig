@@ -56,6 +56,10 @@ pub const class_name = "GhosttyDragHandleClass";
 
 /// A terminal's handle (`Overlays.drag_handle`).
 pub const Handle = struct {
+    /// Layered for its pixels (UpdateLayeredWindow) in any frame: `Overlays.chromeAgain`
+    /// leaves it as it is when its window turns transparent or opaque.
+    pub const own_layering = {};
+
     /// Its window, a child of the terminal's frame, made the first time
     /// the pointer comes over the strip (`pointerAt`); null until then,
     /// if it could not be made, and once it is destroyed (its WM_DESTROY).

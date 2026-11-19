@@ -40,6 +40,10 @@ pub const class_name = "GhosttyUnfocusedSplitClass";
 
 /// A terminal's dim (`Overlays.dim`).
 pub const Dim = struct {
+    /// Layered for an alpha of its own in any frame: `Overlays.chromeAgain`
+    /// leaves it as it is when its window turns transparent or opaque.
+    pub const own_layering = {};
+
     /// Its window, a child of the terminal's frame, made the first time
     /// the dim shows; null until then, if it could not be made or
     /// layered, and once it is destroyed (its WM_DESTROY).

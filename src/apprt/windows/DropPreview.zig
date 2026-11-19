@@ -38,6 +38,10 @@ pub const alpha: u8 = 128;
 
 /// A terminal's preview (`Overlays.drop_preview`).
 pub const Preview = struct {
+    /// Layered for an alpha of its own in any frame: `Overlays.chromeAgain`
+    /// leaves it as it is when its window turns transparent or opaque.
+    pub const own_layering = {};
+
     /// Its window, a child of the terminal's frame, made the first time
     /// it shows; null until then, if it could not be made or layered, and
     /// once it is destroyed (its WM_DESTROY).
