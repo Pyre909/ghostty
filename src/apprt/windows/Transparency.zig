@@ -231,6 +231,8 @@ pub fn applyBlur(window: *Window) void {
     window.backdrop = want;
 }
 
+/// Ask DWM to give `frame` the backdrop `to`; whether it did, logged if
+/// not. The caller records it (`Window.backdrop`).
 pub fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
     const hr = askBackdrop(frame, to);
     if (hr >= 0) return true;
