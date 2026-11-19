@@ -214,7 +214,14 @@ test "widening follows CoreText's measured factors and stops at 0.6" {
     try testing.expectApproxEqAbs(@as(f64, 0.184), widening(16, 0), 0.001);
     try testing.expectApproxEqAbs(@as(f64, 0.184), widening(16, 96), 0.001);
     try testing.expectApproxEqAbs(@as(f64, 0.2656), widening(16, 128), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.344), widening(16, 192), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.424), widening(16, 224), 0.001);
     try testing.expectApproxEqAbs(@as(f64, 0.5008), widening(16, 255), 0.001);
+    // Halfway, or near it, along each ramp: interpolated, not stepped.
+    try testing.expectApproxEqAbs(@as(f64, 0.2248), widening(16, 112), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.3048), widening(16, 160), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.384), widening(16, 208), 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0.4636), widening(16, 240), 0.001);
     // 48 pixels: 0.596 from 128 on, measured; 0.557 at 0.
     try testing.expectApproxEqAbs(@as(f64, 0.552), widening(48, 0), 0.001);
     try testing.expectEqual(@as(f64, 0.6), widening(48, 128));
@@ -224,10 +231,12 @@ test "widening follows CoreText's measured factors and stops at 0.6" {
 }
 
 test "widening never falls as the strength or the size rises" {
+    // Flat up to 96, then rising at every strength: each has its own.
+    // At 16 pixels, where the cap is never reached.
     var prev: f64 = 0;
     for (0..256) |s| {
-        const w = widening(20, @intCast(s));
-        try testing.expect(w >= prev);
+        const w = widening(16, @intCast(s));
+        if (s > 96) try testing.expect(w > prev) else try testing.expect(w >= prev);
         prev = w;
     }
     try testing.expect(widening(20, 255) > widening(20, 0));
