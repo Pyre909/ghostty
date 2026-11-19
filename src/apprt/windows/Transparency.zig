@@ -35,15 +35,21 @@
 //! measured and rejected: it loses the scroll bar and every pixel the
 //! frame paints, and can be chosen only as the frame is made.
 //!
-//! A window is transparent, or not, from when its frame is made until it
-//! closes (`Window.transparent`): as `background-opacity` is then
-//! (`wanted`), or for a tab moved to a new window as its old window was
-//! (`App.moveTabAt`). So a terminal is always in a frame of the kind its
-//! renderer was asked to present for, once, as it was made; a renderer
-//! that could not make a composition chain presents opaque in a
-//! transparent frame (`renderer.D3D11`). A window made
-//! opaque stays so when the opacity drops below 1 later, until it is
-//! opened again; macOS needs a restart for any change of it.
+//! A window is transparent as `background-opacity` is when its frame is
+//! made (`wanted`), or for a tab moved to a new window as its old window
+//! was (`App.moveTabAt`), and turns transparent or opaque when a reload
+//! takes the opacity across 1 (`Window.setTransparent`), which macOS needs
+//! a restart for. A terminal presents for the kind of frame it is in: a
+//! window that has presented through an HWND chain keeps that chain's
+//! last frame, opaque, under any composition chain made on it later, so
+//! the renderer presents to a child window of the terminal's
+//! (RenderWindow.zig), and a terminal whose frame turns transparent gets
+//! a new one, which its renderer moves to at the configuration it is then
+//! given (`renderer.D3D11.followWindow`). Turning opaque, it keeps the
+//! window and changes the chain. A renderer that could not make a
+//! composition chain presents opaque in a transparent frame
+//! (`renderer.D3D11`), as does a terminal whose new render window could
+//! not be made.
 
 const std = @import("std");
 const builtin = @import("builtin");
