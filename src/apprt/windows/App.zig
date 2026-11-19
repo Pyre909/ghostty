@@ -11005,6 +11005,29 @@ test "win32: a window DWM will not make transparent at a reload stays opaque" {
     try std.testing.expectEqual(0, TestGiven.count);
 }
 
+test "win32: a render window that outlives its terminal paints without it" {
+    // As when a frame cannot be destroyed (`destroyWindows`): the Surface
+    // is freed while its window, and the render window in it, still
+    // exist. The render window's WM_PAINT then finds no terminal
+    // (`RenderWindow.terminalOf`), rather than reading the freed one.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    const render = a.render_hwnd.?;
+    app.surfaceDestroyed(a);
+    try std.testing.expect(win32.IsWindow(render).toBool());
+    _ = win32.InvalidateRect(render, null, .FALSE);
+    _ = win32.SendMessageW(render, win32.WM_PAINT, 0, 0);
+}
+
 test "win32: toggle_background_opacity gives each live terminal an opaque background, then the configured one" {
     // `run` carries it out (`toggleBackgroundOpacity`): each live terminal
     // is given the app's configuration with `background-opacity` 1 at its

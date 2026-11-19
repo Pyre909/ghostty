@@ -69,7 +69,9 @@ pub fn create(surface: *Surface) ?win32.HWND {
         surface.hwnd,
         null,
         surface.app.hinstance,
-        surface,
+        // No pointer of its own: one could outlive the terminal it named
+        // (`terminalOf`).
+        null,
     ) orelse {
         log.err("CreateWindowExW failed for a render window err={}", .{win32.GetLastError()});
         return null;
@@ -85,8 +87,15 @@ pub fn place(hwnd: win32.HWND, width: i32, height: i32) void {
     _ = win32.SetWindowPos(hwnd, null, 0, 0, width, height, win32.SWP_NOZORDER | win32.SWP_NOACTIVATE | win32.SWP_NOMOVE);
 }
 
-fn surfaceOf(hwnd: win32.HWND) ?*Surface {
-    const v = win32.GetWindowLongPtrW(hwnd, win32.GWLP_USERDATA);
+/// The terminal `hwnd` presents for, from its parent's GWLP_USERDATA,
+/// which `App.surfaceDestroyed` zeroes before the Surface is freed: null
+/// from then on. A render window, the current one or one the renderer
+/// left (`Surface.renderLeft`), is always a child of its terminal's
+/// window and never moved, but can outlive the Surface when a frame
+/// cannot be destroyed (`App.destroyWindows`), so it keeps no pointer.
+fn terminalOf(hwnd: win32.HWND) ?*Surface {
+    const parent = win32.GetAncestor(hwnd, win32.GA_PARENT) orelse return null;
+    const v = win32.GetWindowLongPtrW(parent, win32.GWLP_USERDATA);
     if (v == 0) return null;
     return @ptrFromInt(@as(usize, @bitCast(v)));
 }
@@ -98,12 +107,6 @@ fn wndProc(
     lparam: win32.LPARAM,
 ) callconv(.winapi) win32.LRESULT {
     switch (msg) {
-        win32.WM_NCCREATE => {
-            const cs: *const win32.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            if (cs.lpCreateParams) |param| {
-                _ = win32.SetWindowLongPtrW(hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(param)));
-            }
-        },
         win32.WM_NCHITTEST => return win32.HTTRANSPARENT,
         // The swap chain draws all of it.
         win32.WM_ERASEBKGND => return 1,
@@ -112,7 +115,7 @@ fn wndProc(
         // desktop, and validated either way, or Windows would post
         // WM_PAINT again at once, forever.
         win32.WM_PAINT => {
-            const transparent = if (surfaceOf(hwnd)) |s| s.window.transparent else false;
+            const transparent = if (terminalOf(hwnd)) |s| s.window.transparent else false;
             if (transparent) Transparency.paintTerminal(hwnd) else _ = win32.ValidateRect(hwnd, null);
             return 0;
         },
