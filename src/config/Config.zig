@@ -2444,7 +2444,8 @@ keybind: Keybinds = .{},
 ///    in **fullscreen** mode, otherwise it's shown when hovered.
 ///
 ///    On Windows, with `always` or `auto` alike, the handle shows only
-///    while the pointer is over the top of a split.
+///    while the pointer is over the top of a split. A finger does not
+///    show it, so splits are rearranged by drag with a mouse or a pen.
 ///
 ///  - `never`
 ///

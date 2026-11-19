@@ -20,7 +20,10 @@
 //! is not shown, said once for the process (`cannot_layer`). GTK's handle
 //! takes the pointer over its strip whether it shows or not; this one is
 //! made to show by the terminal's own moves over the strip (`pointerAt`),
-//! and then takes the pointer itself, until it leaves (WM_MOUSELEAVE).
+//! and then takes the pointer itself, until it leaves (WM_MOUSELEAVE). A
+//! finger makes no such moves: the terminal takes its pointer messages
+//! (`Surface.touchPointer`), so Windows makes no mouse of it, and the
+//! handle is for a mouse or a pen.
 //!
 //! A press on it and a move past the system's drag threshold, as a tab is
 //! dragged (`TabBar.pastDragThreshold`), drags the terminal; it holds the
