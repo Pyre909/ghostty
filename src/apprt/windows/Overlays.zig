@@ -205,6 +205,26 @@ pub fn deinit(self: *Overlays, alloc: std.mem.Allocator) void {
     self.font_dpi = 0;
 }
 
+/// Layer them, or take it off, as their window turned transparent or
+/// opaque (`Transparency.chromeAgain`); not those layered for their own
+/// alpha or pixels whatever the frame (`own_layering`). `window` is
+/// their terminal's.
+pub fn chromeAgain(self: *const Overlays, window: *const Window) void {
+    inline for (stack) |name| {
+        if (comptime !ownLayering(name))
+            Transparency.chromeAgain(window, @field(self, name).hwnd);
+    }
+}
+
+/// The overlays layered for an alpha of their own (the dim, the drop
+/// preview) or for UpdateLayeredWindow (the drag handle), in any frame.
+const own_layering = [_][]const u8{ "dim", "drag_handle", "drop_preview" };
+
+fn ownLayering(comptime name: []const u8) bool {
+    inline for (own_layering) |o| if (comptime std.mem.eql(u8, o, name)) return true;
+    return false;
+}
+
 /// Draw them again: the theme changed.
 pub fn invalidate(self: *const Overlays) void {
     inline for (stack) |name| {

@@ -77,14 +77,20 @@ pub fn frameMade(window: *Window) bool {
     return false;
 }
 
+/// Make `window`'s frame, transparent until now, opaque again: no
+/// blur-behind. Buffered painting stays started, for Mica.
+pub fn frameOpaque(window: *Window) void {
+    _ = blurBehind(window.hwnd, false);
+}
+
 /// For tests: BufferedPaintInit in `frameMade` and BeginBufferedPaint in
 /// `fillOpaque` fail, which the test runner cannot make them do.
 pub var test_no_buffered_paint: if (builtin.is_test) bool else void =
     if (builtin.is_test) false else {};
 
 /// Start buffered painting on this thread for `window`'s frame, once for
-/// its life (`Window.buffered_paint`), whether it is transparent, gets
-/// Mica, or both: each BufferedPaintInit is to be matched by a
+/// its life (`Window.buffered_paint`), however often it turns transparent
+/// or gets Mica: each BufferedPaintInit is to be matched by a
 /// BufferedPaintUnInit (Learn), which the frame's WM_NCDESTROY makes
 /// (`frameDestroyed`). Whether it is started, logged if not.
 pub fn startBufferedPaint(window: *Window) bool {
@@ -219,7 +225,7 @@ pub fn applyBlur(window: *Window) void {
     window.backdrop = want;
 }
 
-fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
+pub fn setBackdrop(frame: win32.HWND, to: Backdrop) bool {
     const hr = askBackdrop(frame, to);
     if (hr >= 0) return true;
     log.warn("cannot set a window's backdrop to={t} hr=0x{x}", .{ to, @as(u32, @bitCast(hr)) });
@@ -244,6 +250,23 @@ pub fn askBackdrop(frame: win32.HWND, to: Backdrop) win32.HRESULT {
 /// in an opaque window).
 pub fn chrome(window: *const Window, hwnd: win32.HWND) void {
     if (window.transparent) _ = layer(hwnd);
+}
+
+/// `chrome` again for `hwnd`, made in `window`'s frame before the window
+/// turned transparent or opaque (`Window.setTransparent`): layered, or
+/// not any more.
+pub fn chromeAgain(window: *const Window, hwnd: ?win32.HWND) void {
+    const h = hwnd orelse return;
+    if (window.transparent) _ = layer(h) else unlayer(h);
+}
+
+/// Take `hwnd`'s layering (`layer`) off again: GDI draws it into the
+/// frame's surface, opaque.
+pub fn unlayer(hwnd: win32.HWND) void {
+    const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE);
+    const layered: isize = win32.WS_EX_LAYERED;
+    if (style & layered == 0) return;
+    _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE, style & ~layered);
 }
 
 /// For tests: answers in place of SetLayeredWindowAttributes in `layerAt`,

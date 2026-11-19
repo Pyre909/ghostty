@@ -2624,6 +2624,26 @@ pub const App = struct {
         for (self.windows.items) |window| Transparency.applyBlur(window);
     }
 
+    /// Turn each window transparent or opaque as `background-opacity`
+    /// now asks (`Transparency.wanted`, `Window.setTransparent`), and give
+    /// the terminals of each that changed the configuration again, at
+    /// which their renderers follow (`renderer.D3D11.followWindow`): the
+    /// reload gave it to them before. A soft reload's comes inside a core
+    /// frame, so this runs from `run` (`redecorate`).
+    fn followTransparency(self: *App) void {
+        const want = Transparency.wanted(&self.config);
+        for (self.windows.items) |window| {
+            if (window.closing or !window.setTransparent(want)) continue;
+            for (self.surfaces.items) |surface| {
+                if (surface.window != window) continue;
+                const core = surface.liveCore() orelse continue;
+                self.giveSurface(core, &self.config) catch |err| {
+                    log.warn("cannot give a terminal its window's transparency err={}", .{err});
+                };
+            }
+        }
+    }
+
     fn closeWindow(self: *App, target: apprt.Target) bool {
         return switch (target) {
             .app => false,
@@ -4342,11 +4362,14 @@ pub const App = struct {
                     resize.size,
                 ),
                 // And `window-show-tab-bar` may have changed.
-                .redecorate => for (self.windows.items) |window| {
-                    window.applyDecorations();
-                    window.applyScrollBars();
-                    if (window.quick) window.placeQuickAgain();
-                    window.relayout();
+                .redecorate => {
+                    self.followTransparency();
+                    for (self.windows.items) |window| {
+                        window.applyDecorations();
+                        window.applyScrollBars();
+                        if (window.quick) window.placeQuickAgain();
+                        window.relayout();
+                    }
                 },
                 // A window covering its monitor is left as it is: maximized,
                 // it would have the work area instead.
@@ -6256,6 +6279,9 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.preedit = .none;
     surface.shell = null;
     surface.inspector = null;
+    surface.render_hwnd = null;
+    surface.render_alpha = window.transparent;
+    surface.render_lock = .init;
     _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
@@ -6273,8 +6299,9 @@ fn testPane(app: *App, window: *Window) !*Surface {
         alloc.destroy(surface);
         return error.TestUnexpectedResult;
     };
-    // As `Surface.create` makes it.
+    // As `Surface.create` makes them.
     ScrollBar.made(surface);
+    surface.render_hwnd = RenderWindow.create(surface);
     Overlays.create(surface);
     ResizeOverlay.start(surface);
     app.surfaces.appendAssumeCapacity(surface);
@@ -10855,6 +10882,127 @@ test "win32: toggle_background_opacity is recorded once for run, and refused at 
     app.createRequested();
     try std.testing.expect(!app.background_opaque);
     try std.testing.expectEqual(0, app.requests.items.len);
+}
+
+test "win32: a reload across an opacity of 1 turns a window transparent, and opaque again" {
+    // `run` does it after the reload (`followTransparency`): the frame
+    // gets blur-behind and its bar is layered; the terminal is given a new
+    // render window to present to with alpha, the old one kept until its
+    // renderer hands it back (`Surface.renderLeft`), and the configuration
+    // again, at which its renderer follows. Back at 1: no blur-behind, the
+    // bar not layered, the same render window without alpha.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(1);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const first = a.render_hwnd.?;
+    try std.testing.expect(!a.presentsAlpha());
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    // Not inside the core's frame the reload comes in.
+    try std.testing.expect(!window.transparent);
+    // As `run` does it (`redecorate`), with the terminal live, given
+    // only through `App.test_give`: the layout `run` makes after would
+    // reach its core.
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    try std.testing.expect(window.transparent);
+    try std.testing.expectEqual(1, TestClear.asked);
+    // The test runner cannot layer a child window (no manifest), so
+    // only the asking is seen, not the style; nor its taking off below.
+    try std.testing.expect(TestClear.isLayered(window.bar.hwnd));
+    const second = a.render_hwnd.?;
+    try std.testing.expect(second != first);
+    try std.testing.expect(a.presentsAlpha());
+    try std.testing.expect(win32.IsWindow(first).toBool());
+    try std.testing.expectEqual(1, TestGiven.count);
+    try std.testing.expectEqual(&a.core_surface, TestGiven.cores[0]);
+    try std.testing.expectEqual(0.5, TestGiven.opacities[0]);
+
+    // Handed back once the renderer presents to the new one; never the
+    // one it presents to.
+    a.renderLeft(first);
+    a.renderLeft(second);
+    testPump();
+    try std.testing.expect(!win32.IsWindow(first).toBool());
+    try std.testing.expect(win32.IsWindow(second).toBool());
+
+    // `run` again, and a reload that keeps it below 1: nothing changes.
+    app.createRequested();
+    changed.@"background-opacity" = 0.75;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    app.createRequested();
+    try std.testing.expect(a.render_hwnd.? == second);
+    try std.testing.expectEqual(1, TestClear.asked);
+    try std.testing.expectEqual(1, TestGiven.count);
+
+    changed.@"background-opacity" = 1;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    app.createRequested();
+    try std.testing.expect(!window.transparent);
+    try std.testing.expectEqual(1, TestClear.undone);
+    try std.testing.expect(a.render_hwnd.? == second);
+    try std.testing.expect(!a.presentsAlpha());
+    try std.testing.expectEqual(2, TestGiven.count);
+    try std.testing.expectEqual(1, TestGiven.opacities[1]);
+}
+
+test "win32: a window DWM will not make transparent at a reload stays opaque" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(0);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    const first = a.render_hwnd.?;
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    app.createRequested();
+    // Asked again by `run`: refused again.
+    try std.testing.expectEqual(2, TestClear.asked);
+    try std.testing.expect(!window.transparent);
+    try std.testing.expect(a.render_hwnd.? == first);
+    try std.testing.expect(!a.presentsAlpha());
+    try std.testing.expectEqual(0, TestGiven.count);
 }
 
 test "win32: toggle_background_opacity gives each live terminal an opaque background, then the configured one" {

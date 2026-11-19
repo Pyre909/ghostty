@@ -12,7 +12,9 @@
 //! later (measured on Windows 11: a clear frame showed the old one, and
 //! hiding, cloaking, resizing, repainting or presenting black first did
 //! not help), while a window new to it blends as it should. So a
-//! terminal whose window turns transparent gets a new one of these.
+//! terminal whose window turns transparent gets a new one of these
+//! (`Window.setTransparent`), and the renderer hands the old one back
+//! once it presents to the new one (`Surface.renderLeft`).
 
 const std = @import("std");
 
@@ -72,6 +74,8 @@ pub fn create(surface: *Surface) ?win32.HWND {
         log.err("CreateWindowExW failed for a render window err={}", .{win32.GetLastError()});
         return null;
     };
+    // Over the one it replaces (`Window.setTransparent`) until that goes.
+    _ = win32.SetWindowPos(hwnd, win32.HWND_TOP, 0, 0, 0, 0, win32.SWP_NOMOVE | win32.SWP_NOSIZE | win32.SWP_NOACTIVATE);
     return hwnd;
 }
 

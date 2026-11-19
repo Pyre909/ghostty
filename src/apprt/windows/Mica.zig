@@ -35,7 +35,7 @@ const log = std.log.scoped(.win32);
 /// Give `window`'s frame Mica behind its tab bar, or take it away, as
 /// its bar, theme, decoration and tab overview now ask (`wanted`). The
 /// backdrop is asked for as the frame first reaches over its bar, and then
-/// kept for the frame's life, with buffered painting for its bar
+/// kept while the frame is opaque, with buffered painting for its bar
 /// (`Transparency.startBufferedPaint`): a frame that never does keeps the
 /// default. The extension follows the bar. A failed
 /// call leaves `Window.backdrop` and `Window.mica_top` as they were, so
@@ -66,6 +66,17 @@ pub fn apply(window: *Window) void {
         _ = Transparency.layer(edit);
     };
     window.bar.invalidate();
+}
+
+/// Take the frame's reach over its bar away, as `window` turns
+/// transparent (`Window.setTransparent`): a transparent frame's backdrop
+/// is `background-blur`'s (`Transparency.applyBlur`), which replaces
+/// Mica, and its bar is layered, with the title field in it. Left
+/// extended, logged, if DWM refuses; the next turn to opaque applies
+/// Mica again.
+pub fn leave(window: *Window) void {
+    if (window.mica_top != 0 and extend(window.hwnd, 0)) window.mica_top = 0;
+    if (window.bar.editor.edit) |edit| Transparency.unlayer(edit);
 }
 
 /// Whether `refused` has said once that DWM refused.

@@ -42,6 +42,7 @@ const ScrollBar = @import("ScrollBar.zig");
 const TitleDialog = @import("TitleDialog.zig");
 const Transparency = @import("Transparency.zig");
 const Mica = @import("Mica.zig");
+const RenderWindow = @import("RenderWindow.zig");
 const FrameColors = @import("FrameColors.zig");
 const CommandPalette = @import("CommandPalette.zig");
 const TabOverview = @import("TabOverview.zig");
@@ -158,11 +159,12 @@ caption_active: bool,
 
 /// Whether the frame lets the desktop through where its terminals'
 /// background is translucent (Transparency.zig): set as the frame is made
-/// (`makeTransparent`), never changed. Its terminals' renderers are asked
-/// to present with alpha (`Surface.presentsAlpha`), which each does unless
-/// it could not make a composition chain (`renderer.D3D11`), and the
-/// terminals paint black under their chains; its chrome is layered. A
-/// terminal only ever moves to a frame of the same kind (`App.moveTabAt`).
+/// (`makeTransparent`), and changed by a reload (`setTransparent`). Its
+/// terminals' renderers are asked to present with alpha
+/// (`Surface.presentsAlpha`), which each does unless it could not make a
+/// composition chain (`renderer.D3D11`), and the terminals paint black
+/// under their chains; its chrome is layered. A terminal only ever moves
+/// to a frame of the same kind (`App.moveTabAt`).
 transparent: bool,
 
 /// Whether buffered painting was started for the frame
@@ -1336,6 +1338,47 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
 pub fn makeTransparent(self: *Window) void {
     assert(!self.transparent);
     self.transparent = Transparency.frameMade(self);
+}
+
+/// Turn the frame transparent (`on`) or opaque, as a reload asks
+/// (`App.followTransparency`): the frame's blur-behind and backdrop, its
+/// chrome's layering, and where its terminals' renderers present. A
+/// terminal turning transparent is given a new render window, since its
+/// own kept its opaque chain's last frame (RenderWindow.zig); one that
+/// cannot be made leaves that terminal opaque. Each renderer follows at
+/// the next config it is given, which the caller gives, and the caller
+/// lays the window out after, which gives an opaque frame its Mica
+/// (`Mica.apply`). Whether the frame changed; one that cannot be made
+/// transparent, logged, stays opaque.
+pub fn setTransparent(self: *Window, on: bool) bool {
+    if (on == self.transparent) return false;
+    if (on) {
+        if (!Transparency.frameMade(self)) return false;
+        Mica.leave(self);
+        self.transparent = true;
+        Transparency.applyBlur(self);
+    } else {
+        Transparency.frameOpaque(self);
+        self.transparent = false;
+        // Acrylic is a transparent frame's; Mica comes back with the
+        // layout below, where it is wanted.
+        if (self.backdrop != .default and Transparency.setBackdrop(self.hwnd, .default)) self.backdrop = .default;
+    }
+
+    Transparency.chromeAgain(self, self.bar.hwnd);
+    Transparency.chromeAgain(self, self.bar.overview);
+    for (self.app.surfaces.items) |surface| {
+        if (surface.window != self) continue;
+        Transparency.chromeAgain(self, surface.search_bar.hwnd);
+        surface.overlays.chromeAgain(self);
+        if (!on) {
+            surface.setRenderTarget(surface.render_hwnd, false);
+        } else if (surface.render_hwnd != null) {
+            if (RenderWindow.create(surface)) |made| surface.setRenderTarget(made, true);
+        }
+    }
+    _ = win32.RedrawWindow(self.hwnd, null, null, win32.RDW_INVALIDATE | win32.RDW_ERASE | win32.RDW_FRAME | win32.RDW_ALLCHILDREN);
+    return true;
 }
 
 /// Where `show` leaves the frame it shows.
