@@ -582,7 +582,10 @@ pub fn unpark(self: *Window) void {
     // What every frame was given while it was out of the app's windows
     // (`App.setWindowTheme`, `App.toggleBackgroundOpacity`), before it
     // shows, as `configChange` pairs them; each does nothing when the
-    // frame has it already.
+    // frame has it already. Not its transparency (`setTransparent`):
+    // only a reload changes that, and a reload ends every parked window
+    // first (`Undo.configure`). Were one to outlive a reload, it would
+    // come back as it was and need `setTransparent` here.
     self.applyTheme();
     Transparency.applyBlur(self);
     // Not activated here: `undo` brings it forward once all is back.
