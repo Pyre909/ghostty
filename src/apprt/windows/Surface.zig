@@ -15,6 +15,7 @@ const surface_class_name = @import("App.zig").surface_class_name;
 const WM_GHOSTTY_WAKEUP = @import("App.zig").WM_GHOSTTY_WAKEUP;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
 const WM_GHOSTTY_LINK_REFUSED = @import("App.zig").WM_GHOSTTY_LINK_REFUSED;
+const WM_GHOSTTY_RENDER_LEFT = @import("App.zig").WM_GHOSTTY_RENDER_LEFT;
 const App = @import("App.zig").App;
 const postTeardown = @import("App.zig").postTeardown;
 const Window = @import("Window.zig");
@@ -104,8 +105,17 @@ pub const Surface = struct {
 
     /// The window the renderer presents to (RenderWindow.zig), filling
     /// `hwnd`'s client area; null if it could not be made, when the
-    /// renderer presents to `hwnd` itself (`renderHwnd`).
+    /// renderer presents to `hwnd` itself (`renderTarget`).
     render_hwnd: ?win32.HWND,
+
+    /// Whether the renderer is to present with alpha there: true only
+    /// for a render window made while the frame was transparent, as a
+    /// window that has presented opaque cannot show alpha after
+    /// (RenderWindow.zig). Written with `render_hwnd` on this thread,
+    /// read with it on the render thread (`renderTarget`), both under
+    /// `render_lock`.
+    render_alpha: bool,
+    render_lock: std.Io.Mutex = .init,
 
     /// The current window title, owned by this struct. `getTitle` reads it
     /// back to answer CSI 21 t; a native runtime has to store it itself.
@@ -888,6 +898,7 @@ pub const Surface = struct {
             // window receives, so it is set before anything can read it.
             .hwnd = undefined,
             .render_hwnd = null,
+            .render_alpha = window.transparent,
             .title = null,
             .title_override = null,
             .pwd = null,
@@ -1559,6 +1570,31 @@ pub const Surface = struct {
         return self.render_hwnd orelse self.hwnd;
     }
 
+    /// Where the renderer is to present, and whether with alpha
+    /// (`render_alpha`): the render window, or this terminal's own if
+    /// there is none. From any thread.
+    pub fn renderTarget(self: *Surface) struct { hwnd: win32.HWND, alpha: bool } {
+        self.render_lock.lockUncancelable(global.io());
+        defer self.render_lock.unlock(global.io());
+        return .{ .hwnd = self.render_hwnd orelse self.hwnd, .alpha = self.render_alpha };
+    }
+
+    /// Set where the renderer is to present (`renderTarget`). This
+    /// thread only; the renderer follows at its next config change.
+    pub fn setRenderTarget(self: *Surface, hwnd: ?win32.HWND, alpha: bool) void {
+        self.render_lock.lockUncancelable(global.io());
+        defer self.render_lock.unlock(global.io());
+        self.render_hwnd = hwnd;
+        self.render_alpha = alpha;
+    }
+
+    /// From the render thread, once it presents elsewhere: `old`, the
+    /// render window it left, is to be destroyed on this thread
+    /// (WM_GHOSTTY_RENDER_LEFT). Until then nothing presents to it.
+    pub fn renderLeft(self: *const Surface, old: win32.HWND) void {
+        _ = win32.PostMessageW(self.hwnd, WM_GHOSTTY_RENDER_LEFT, 0, @bitCast(@intFromPtr(old)));
+    }
+
     /// The Direct3D 11 device has no options: each renderer creates its
     /// own device for this window.
     pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
@@ -1568,14 +1604,12 @@ pub const Surface = struct {
 
     /// Whether this terminal's renderer is to present with alpha, through a
     /// swap chain DWM composes with what is behind the window, rather than
-    /// opaque. Asked once, when the renderer is made: true in a transparent
-    /// window, whose frame lets the desktop through (Transparency.zig). A
-    /// terminal only ever moves to a frame of its window's kind
-    /// (`App.moveTabAt`), so the answer holds for its life. A renderer that
-    /// cannot make the swap chain asked for presents opaque all the same
-    /// (`renderer.D3D11`), and says so itself.
-    pub fn presentsAlpha(self: *const Surface) bool {
-        return self.window.transparent;
+    /// opaque: true while its render window was made for a transparent
+    /// frame (`renderTarget`). A renderer that cannot make the swap chain
+    /// asked for presents opaque all the same (`renderer.D3D11`), and says
+    /// so itself.
+    pub fn presentsAlpha(self: *Surface) bool {
+        return self.renderTarget().alpha;
     }
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
@@ -2341,6 +2375,16 @@ pub const Surface = struct {
                             "A link printed by a program is only opened when it is an http, https or mailto link.",
                     ));
                 }
+                return 0;
+            },
+
+            WM_GHOSTTY_RENDER_LEFT => {
+                // Only a render window of this terminal's that the
+                // renderer left: a handle posted before a teardown may
+                // name a window gone since, or one made after.
+                const old: win32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                if (old != self.render_hwnd and win32.IsWindow(old).toBool() and win32.GetAncestor(old, win32.GA_PARENT) == self.hwnd)
+                    _ = win32.DestroyWindow(old);
                 return 0;
             },
 

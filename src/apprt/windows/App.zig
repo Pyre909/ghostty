@@ -107,6 +107,10 @@ pub const WM_GHOSTTY_QUICK_HIDE: win32.UINT = win32.WM_APP + 5;
 pub const WM_GHOSTTY_IPC: win32.UINT = win32.WM_APP + 6;
 /// An update check's thread is done; LPARAM is its `Updater.Job`.
 pub const WM_GHOSTTY_UPDATE: win32.UINT = win32.WM_APP + 7;
+/// Posted to a terminal's window by its render thread once it presents
+/// to another render window; LPARAM is the one it left, which the handler
+/// destroys (`Surface.renderLeft`).
+pub const WM_GHOSTTY_RENDER_LEFT: win32.UINT = win32.WM_APP + 8;
 
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
