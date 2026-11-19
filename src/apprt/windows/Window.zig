@@ -165,6 +165,11 @@ caption_active: bool,
 /// terminal only ever moves to a frame of the same kind (`App.moveTabAt`).
 transparent: bool,
 
+/// Whether buffered painting was started for the frame
+/// (`Transparency.startBufferedPaint`), for a transparent frame's
+/// dividers or the bar over Mica; ended as the frame is destroyed.
+buffered_paint: bool,
+
 /// The system backdrop DWM was last given for the frame
 /// (`Transparency.applyBlur`): acrylic while `background-blur` is on in a
 /// transparent window, Mica in an opaque one (`Mica.apply`). A new frame
@@ -1199,6 +1204,7 @@ pub fn createBare(app: *App, kind: Kind, transparent: bool) !*Window {
         .frame_colors = null,
         .caption_active = false,
         .transparent = false,
+        .buffered_paint = false,
         .backdrop = .default,
         .mica_top = 0,
         .fullscreen = null,
@@ -1329,7 +1335,7 @@ pub fn createFrame(self: *Window, x: c_int, y: c_int, width: c_int, height: c_in
 /// opaque, logged, if DWM does not let it.
 pub fn makeTransparent(self: *Window) void {
     assert(!self.transparent);
-    self.transparent = Transparency.frameMade(self.hwnd);
+    self.transparent = Transparency.frameMade(self);
 }
 
 /// Where `show` leaves the frame it shows.
@@ -2439,7 +2445,7 @@ fn handleMessage(
 
         // After the child windows: frees `self`, so nothing may follow.
         win32.WM_NCDESTROY => {
-            if (self.transparent or self.backdrop == .mica) Transparency.frameDestroyed();
+            Transparency.frameDestroyed(self);
             self.app.windowDestroyed(self);
             return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },

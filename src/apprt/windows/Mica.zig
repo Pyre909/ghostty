@@ -35,9 +35,9 @@ const log = std.log.scoped(.win32);
 /// Give `window`'s frame Mica behind its tab bar, or take it away, as
 /// its bar, theme, decoration and tab overview now ask (`wanted`). The
 /// backdrop is asked for as the frame first reaches over its bar, and then
-/// kept for the frame's life, with buffered painting for its bar (Learn:
-/// BufferedPaintInit, matched at the frame's WM_NCDESTROY): a frame that
-/// never does keeps the default. The extension follows the bar. A failed
+/// kept for the frame's life, with buffered painting for its bar
+/// (`Transparency.startBufferedPaint`): a frame that never does keeps the
+/// default. The extension follows the bar. A failed
 /// call leaves `Window.backdrop` and `Window.mica_top` as they were, so
 /// the next layout tries again, and is said once for the process: a DWM
 /// that refuses would refuse at every WM_SIZE of a resize. Called after
@@ -51,10 +51,9 @@ pub fn apply(window: *Window) void {
     const top = wanted(window);
     if (top == window.mica_top) return;
     if (window.backdrop != .mica) {
-        if (!Transparency.bufferedPaintInit()) return;
+        if (!Transparency.startBufferedPaint(window)) return;
         const hr = Transparency.askBackdrop(window.hwnd, .mica);
         if (hr < 0) {
-            Transparency.frameDestroyed();
             refused("set a window's backdrop to Mica", hr);
             return;
         }

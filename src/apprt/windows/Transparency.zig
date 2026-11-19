@@ -66,16 +66,14 @@ pub fn wanted(config: *const configpkg.Config) bool {
 pub var test_blur_behind: if (builtin.is_test) ?*const fn (win32.HWND, bool) bool else void =
     if (builtin.is_test) null else {};
 
-/// Make `frame`, a new window's, let the desktop through: blur-behind over
-/// an empty region; and start buffered painting on this thread for its
-/// dividers (`fillOpaque`), which the frame's WM_NCDESTROY ends
-/// (`frameDestroyed`), as each BufferedPaintInit is to be matched by a
-/// BufferedPaintUnInit (Learn). Whether the window is transparent; if
-/// either step fails, logged, it is opaque, with no blur-behind.
-pub fn frameMade(frame: win32.HWND) bool {
-    if (!blurBehind(frame, true)) return false;
-    if (bufferedPaintInit()) return true;
-    _ = blurBehind(frame, false);
+/// Make `window`'s frame let the desktop through: blur-behind over an
+/// empty region, and buffered painting for its dividers (`fillOpaque`).
+/// Whether it does; if either step fails, logged, it is opaque, with no
+/// blur-behind.
+pub fn frameMade(window: *Window) bool {
+    if (!blurBehind(window.hwnd, true)) return false;
+    if (startBufferedPaint(window)) return true;
+    _ = blurBehind(window.hwnd, false);
     return false;
 }
 
@@ -84,19 +82,28 @@ pub fn frameMade(frame: win32.HWND) bool {
 pub var test_no_buffered_paint: if (builtin.is_test) bool else void =
     if (builtin.is_test) false else {};
 
-/// BufferedPaintInit; whether it succeeded, logged if not.
-pub fn bufferedPaintInit() bool {
+/// Start buffered painting on this thread for `window`'s frame, once for
+/// its life (`Window.buffered_paint`), whether it is transparent, gets
+/// Mica, or both: each BufferedPaintInit is to be matched by a
+/// BufferedPaintUnInit (Learn), which the frame's WM_NCDESTROY makes
+/// (`frameDestroyed`). Whether it is started, logged if not.
+pub fn startBufferedPaint(window: *Window) bool {
+    if (window.buffered_paint) return true;
     if (builtin.is_test and test_no_buffered_paint) return false;
     const hr = win32.BufferedPaintInit();
-    if (hr >= 0) return true;
-    log.warn("a window is opaque: BufferedPaintInit failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
-    return false;
+    if (hr < 0) {
+        log.warn("a window is opaque: BufferedPaintInit failed hr=0x{x}", .{@as(u32, @bitCast(hr))});
+        return false;
+    }
+    window.buffered_paint = true;
+    return true;
 }
 
-/// For a transparent frame's WM_NCDESTROY, what `frameMade` started; and
-/// for a frame with Mica, what `Mica.apply` started.
-pub fn frameDestroyed() void {
+/// For a frame's WM_NCDESTROY: end what `startBufferedPaint` started.
+pub fn frameDestroyed(window: *Window) void {
+    if (!window.buffered_paint) return;
     _ = win32.BufferedPaintUnInit();
+    window.buffered_paint = false;
 }
 
 /// DwmEnableBlurBehindWindow on all of `frame` (`on`) or none; whether DWM

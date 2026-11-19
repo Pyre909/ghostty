@@ -6100,6 +6100,7 @@ fn testFrameOf(app: *App, transparent: bool) !*Window {
         .frame_colors = null,
         .caption_active = false,
         .transparent = false,
+        .buffered_paint = false,
         .backdrop = .default,
         .mica_top = 0,
         .fullscreen = null,
