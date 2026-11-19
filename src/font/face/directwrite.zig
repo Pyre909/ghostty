@@ -2820,6 +2820,57 @@ test "font-thicken draws a stem where its outline is, grown by the radius" {
     }
 }
 
+test "font-thicken draws a synthetic bold face as bold as without it" {
+    // The face's bold simulation widens its outline before any transform,
+    // by an amount in em, so drawing in samples scales it along with the
+    // glyph. If it were a number of device pixels instead, the samples
+    // would keep only a quarter of what bold adds over regular. So bold
+    // drawn in samples must cover what it does in pixels, in the same
+    // place, and add most of what it adds there.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const testFont = font.embedded.regular;
+
+    var lib = try font.Library.init(alloc);
+    defer lib.deinit();
+
+    const opts: font.face.Options = .{ .size = .{ .points = 24, .xdpi = 96, .ydpi = 96 } };
+    var regular = try Face.init(lib, testFont, opts);
+    defer regular.deinit();
+    var bold = try regular.syntheticBold(opts);
+    defer bold.deinit();
+
+    const identity: api.DWRITE_MATRIX = .{ .m11 = 1, .m12 = 0, .m21 = 0, .m22 = 1, .dx = 0, .dy = 0 };
+    for ("I|-") |char| {
+        const glyph: u16 = @intCast(regular.glyphIndex(char).?);
+        var m: [2][2]TestMoments = undefined;
+        for ([_]Face{ regular, bold }, 0..) |face, f| {
+            const plain = (try face.rasterize(alloc, glyph, identity)).?;
+            defer alloc.free(plain.data);
+            const thick = (try face.rasterizeThick(alloc, glyph, identity, 0)).?;
+            defer alloc.free(thick.data);
+            m[f] = .{ testMoments(plain), testMoments(thick) };
+        }
+        const gain_plain = m[1][0].sum - m[0][0].sum;
+        const gain_thick = m[1][1].sum - m[0][1].sum;
+        errdefer std.debug.print(
+            "'{c}': bold adds {d:.3} in pixels, {d:.3} in samples; bold at ({d:.3},{d:.3}) and ({d:.3},{d:.3})\n",
+            .{ char, gain_plain, gain_thick, m[1][0].x, m[1][0].y, m[1][1].x, m[1][1].y },
+        );
+        try testing.expect(gain_plain > 0);
+        // DirectWrite's own raster in pixels is off by up to 5% of the
+        // area (above), and not alike for both faces: measured
+        // 2026-11-19, the bar's bold covered 107.6 and 107.4 pixels in
+        // pixels and in samples, but its regular 82.5 and 86.4, so bold
+        // seemed to add 25.1 in pixels and 20.9 in samples. A bold kept
+        // at a quarter would cover 18% less and add a quarter.
+        try testing.expectApproxEqRel(m[1][0].sum, m[1][1].sum, 0.05);
+        try testing.expect(gain_thick > gain_plain * 0.6);
+        try testing.expectApproxEqAbs(m[1][0].x, m[1][1].x, 0.15);
+        try testing.expectApproxEqAbs(m[1][0].y, m[1][1].y, 0.15);
+    }
+}
+
 test "font-thicken grows a rendered stem by what CoreText's smoothing does" {
     const testing = std.testing;
     const alloc = testing.allocator;
