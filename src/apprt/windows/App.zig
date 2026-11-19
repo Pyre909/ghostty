@@ -8774,6 +8774,21 @@ test "win32: a finger focuses its terminal and scrolls it; a pen is left to be a
     _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300);
     try std.testing.expectEqual(calls, Touch.calls);
 
+    // Under a prompt a finger neither scrolls nor focuses, nor is it left
+    // to become a mouse; one already down stops there.
+    window.tab().focused = left;
+    _ = Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100);
+    window.tab().focused = left;
+    app.prompt_depth += 1;
+    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300));
+    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100));
+    app.prompt_depth -= 1;
+    try std.testing.expectEqual(calls, Touch.calls);
+    try std.testing.expect(window.tab().focused == left);
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300);
+    try std.testing.expectEqual(calls, Touch.calls);
+    try std.testing.expect(right.mouse.pan == null);
+
     // A pen neither scrolls nor takes the focus here.
     window.tab().focused = left;
     try std.testing.expect(!right.touchPointer(win32.WM_POINTERDOWN, Touch.pen | Touch.primary, testPoint(0, 100)));

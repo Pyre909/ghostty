@@ -3567,6 +3567,14 @@ pub const Surface = struct {
             return false;
         }
         if (!isTouch(@truncate(wparam))) return false;
+        // Not under a prompt, as no other input reaches the core then
+        // (`syncMouse`): a prompt's loop dispatches the finger's messages
+        // with a core frame beneath it. Taken all the same, so that
+        // Windows makes no mouse of the finger either.
+        if (!self.app.canReenterCore()) {
+            self.endPan();
+            return true;
+        }
         const flags = win32.hiword(wparam);
         if (flags & win32.POINTER_MESSAGE_FLAG_PRIMARY == 0) return true;
         const at: win32.POINT = .{ .x = win32.xLparam(lparam), .y = win32.yLparam(lparam) };
