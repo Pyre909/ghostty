@@ -1345,9 +1345,9 @@ pub fn makeTransparent(self: *Window) void {
 /// chrome's layering, and where its terminals' renderers present. A
 /// terminal turning transparent is given a new render window, since its
 /// own kept its opaque chain's last frame (RenderWindow.zig); one that
-/// cannot be made leaves that terminal opaque. Each renderer follows at
-/// the next config it is given, which the caller gives, and the caller
-/// lays the window out after, which gives an opaque frame its Mica
+/// cannot be made leaves that terminal opaque. Each renderer is woken to
+/// follow (`Surface.setRenderTarget`), and follows at the latest with the
+/// config the caller gives next; the caller lays the window out after, which gives an opaque frame its Mica
 /// (`Mica.apply`). Whether the frame changed; one that cannot be made
 /// transparent, logged, stays opaque.
 pub fn setTransparent(self: *Window, on: bool) bool {

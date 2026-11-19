@@ -6282,6 +6282,8 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.render_hwnd = null;
     surface.render_alpha = window.transparent;
     surface.render_lock = .init;
+    surface.render_taken = null;
+    surface.render_changes = .init(0);
     _ = win32.CreateWindowExW(
         0,
         L(surface_class_name),
@@ -10910,6 +10912,9 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     window.tab().focused = a;
     const first = a.render_hwnd.?;
     try std.testing.expect(!a.presentsAlpha());
+    // Its renderer presents to it (`renderer.D3D11.init`).
+    try std.testing.expect(a.takeRenderTarget().hwnd == first);
+    Surface.test_render_wakes = 0;
 
     var changed: Config = try .default(alloc);
     defer changed.deinit();
@@ -10931,15 +10936,18 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     const second = a.render_hwnd.?;
     try std.testing.expect(second != first);
     try std.testing.expect(a.presentsAlpha());
+    // Kept for the renderer, which presents to it until it follows,
+    // woken to follow.
     try std.testing.expect(win32.IsWindow(first).toBool());
+    try std.testing.expectEqual(1, Surface.test_render_wakes);
     try std.testing.expectEqual(1, TestGiven.count);
     try std.testing.expectEqual(&a.core_surface, TestGiven.cores[0]);
     try std.testing.expectEqual(0.5, TestGiven.opacities[0]);
 
     // Handed back once the renderer presents to the new one; never the
     // one it presents to.
-    a.renderLeft(first);
-    a.renderLeft(second);
+    try std.testing.expect(a.renderLeft(first));
+    try std.testing.expect(a.renderLeft(second));
     testPump();
     try std.testing.expect(!win32.IsWindow(first).toBool());
     try std.testing.expect(win32.IsWindow(second).toBool());
@@ -10968,6 +10976,67 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     try std.testing.expect(!a.presentsAlpha());
     try std.testing.expectEqual(2, TestGiven.count);
     try std.testing.expectEqual(1, TestGiven.opacities[1]);
+}
+
+test "win32: a render window the renderer never took is destroyed when its frame turns transparent again" {
+    // No renderer will hand back a window it never presented to
+    // (`Surface.renderLeft`), so the terminal destroys it itself when
+    // a reload replaces it; one the renderer took stays for it. Each
+    // change counts, and wakes the renderer to follow.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(3);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const first = a.render_hwnd.?;
+    Surface.test_render_wakes = 0;
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    var made: [2]win32.HWND = undefined;
+    for (&made, 0..) |*m, i| {
+        changed.@"background-opacity" = 0.5;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        a.core_state = .live;
+        app.followTransparency();
+        a.core_state = .none;
+        m.* = a.render_hwnd.?;
+        try std.testing.expect(window.transparent);
+        try std.testing.expect(!win32.IsWindow(if (i == 0) first else made[0]).toBool());
+
+        changed.@"background-opacity" = 1;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        a.core_state = .live;
+        app.followTransparency();
+        a.core_state = .none;
+        try std.testing.expect(!window.transparent);
+        try std.testing.expect(a.render_hwnd.? == m.*);
+        try std.testing.expect(win32.IsWindow(m.*).toBool());
+    }
+    try std.testing.expectEqual(4, a.render_changes.load(.monotonic));
+    try std.testing.expectEqual(4, Surface.test_render_wakes);
+
+    // Taken, it stays through the next change.
+    try std.testing.expect(a.takeRenderTarget().hwnd == made[1]);
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    try std.testing.expect(a.render_hwnd.? != made[1]);
+    try std.testing.expect(win32.IsWindow(made[1]).toBool());
 }
 
 test "win32: a window DWM will not make transparent at a reload stays opaque" {

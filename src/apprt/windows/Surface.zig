@@ -117,6 +117,18 @@ pub const Surface = struct {
     render_alpha: bool,
     render_lock: std.Io.Mutex = .init,
 
+    /// The window the renderer last took to present to (`takeRenderTarget`),
+    /// under `render_lock`: one replaced before the renderer took it never
+    /// had a chain, and is destroyed by `setRenderTarget` itself, since no
+    /// renderer will hand it back (`renderLeft`).
+    render_taken: ?win32.HWND = null,
+
+    /// Counts the changes of `setRenderTarget`, written under
+    /// `render_lock`. The renderer compares it with the count it last
+    /// took at the start of every frame, so it follows a change even when
+    /// no config reaches it (`renderer.D3D11.drawFrameStart`).
+    render_changes: std.atomic.Value(u32) = .init(0),
+
     /// The current window title, owned by this struct. `getTitle` reads it
     /// back to answer CSI 21 t; a native runtime has to store it itself.
     title: ?[:0]u8,
@@ -1564,30 +1576,86 @@ pub const Surface = struct {
         return question.text("Close Split?", "The currently running process in this split will be terminated.");
     }
 
-    /// Where the renderer is to present, and whether with alpha
-    /// (`render_alpha`): the render window, or this terminal's own if
-    /// there is none. From any thread.
-    pub fn renderTarget(self: *Surface) struct { hwnd: win32.HWND, alpha: bool } {
+    pub const RenderTarget = struct {
+        /// The render window, or this terminal's own if there is none.
+        hwnd: win32.HWND,
+        /// Whether with alpha (`render_alpha`).
+        alpha: bool,
+        /// `render_changes` as it was read with them.
+        changes: u32,
+    };
+
+    /// Where the renderer is to present. From any thread.
+    pub fn renderTarget(self: *Surface) RenderTarget {
         self.render_lock.lockUncancelable(global.io());
         defer self.render_lock.unlock(global.io());
-        return .{ .hwnd = self.render_hwnd orelse self.hwnd, .alpha = self.render_alpha };
+        return self.renderTargetLocked();
     }
 
-    /// Set where the renderer is to present (`renderTarget`). This
-    /// thread only; the renderer follows at its next config change.
-    pub fn setRenderTarget(self: *Surface, hwnd: ?win32.HWND, alpha: bool) void {
+    /// `renderTarget`, for the renderer that is to present there from
+    /// now on (`render_taken`). Render thread.
+    pub fn takeRenderTarget(self: *Surface) RenderTarget {
         self.render_lock.lockUncancelable(global.io());
         defer self.render_lock.unlock(global.io());
-        self.render_hwnd = hwnd;
-        self.render_alpha = alpha;
+        const target = self.renderTargetLocked();
+        self.render_taken = target.hwnd;
+        return target;
     }
+
+    fn renderTargetLocked(self: *const Surface) RenderTarget {
+        return .{
+            .hwnd = self.render_hwnd orelse self.hwnd,
+            .alpha = self.render_alpha,
+            .changes = self.render_changes.load(.monotonic),
+        };
+    }
+
+    /// Set where the renderer is to present (`renderTarget`), and wake
+    /// it to follow (`render_changes`), whether or not a config reaches
+    /// it. A render window replaced before the renderer took it is
+    /// destroyed here. This thread only.
+    pub fn setRenderTarget(self: *Surface, hwnd: ?win32.HWND, alpha: bool) void {
+        const unused: ?win32.HWND = unused: {
+            self.render_lock.lockUncancelable(global.io());
+            defer self.render_lock.unlock(global.io());
+            const old = self.render_hwnd;
+            self.render_hwnd = hwnd;
+            self.render_alpha = alpha;
+            _ = self.render_changes.fetchAdd(1, .release);
+            const o = old orelse break :unused null;
+            break :unused if (o != hwnd and o != self.render_taken) o else null;
+        };
+        // After the lock: the renderer can no longer take it, as it takes
+        // only `render_hwnd`.
+        if (unused) |o| _ = win32.DestroyWindow(o);
+        const cs = self.liveCore() orelse return;
+        // The tests' live cores have no renderer thread.
+        if (builtin.is_test) {
+            test_render_wakes += 1;
+            return;
+        }
+        cs.renderer_thread.wakeup.notify() catch |err|
+            log.warn("error waking the renderer to follow its window err={}", .{err});
+    }
+
+    /// For tests: the wakes `setRenderTarget` gave a live core.
+    pub var test_render_wakes: if (builtin.is_test) usize else void =
+        if (builtin.is_test) 0 else {};
 
     /// From the render thread, once it presents elsewhere: `old`, the
     /// render window it left, is to be destroyed on this thread
     /// (WM_GHOSTTY_RENDER_LEFT). Until then nothing presents to it.
-    pub fn renderLeft(self: *const Surface, old: win32.HWND) void {
-        _ = win32.PostMessageW(self.hwnd, WM_GHOSTTY_RENDER_LEFT, 0, @bitCast(@intFromPtr(old)));
+    /// Whether it was posted; the renderer keeps it to post again if not.
+    pub fn renderLeft(self: *const Surface, old: win32.HWND) bool {
+        if (builtin.is_test and test_render_left_fails) return false;
+        if (win32.PostMessageW(self.hwnd, WM_GHOSTTY_RENDER_LEFT, 0, @bitCast(@intFromPtr(old))).toBool()) return true;
+        log.warn("cannot hand a render window back hwnd={x} err={}", .{ @intFromPtr(old), win32.GetLastError() });
+        return false;
     }
+
+    /// For tests: `renderLeft` cannot post.
+    pub var test_render_left_fails: if (builtin.is_test) bool else void =
+        if (builtin.is_test) false else {};
 
     /// The Direct3D 11 device has no options: each renderer creates its
     /// own device for this window.

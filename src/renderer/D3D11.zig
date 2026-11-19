@@ -235,9 +235,15 @@ chain: Chain,
 /// `followWindow` follows; null for the tests' bare windows.
 rt_surface: RtSurface = if (RtSurface == void) {} else null,
 
+/// The terminal's count of render target changes as this renderer last
+/// took the target (`Surface.render_changes`): `drawFrameStart` follows
+/// when it moved on.
+render_changes: u32 = 0,
+
 /// The render window left by `followWindow`, still holding the old chain
 /// until `recoverDevice` releases it, then handed back to the terminal to
-/// destroy. Render thread only.
+/// destroy, and kept until the terminal takes it (`drawFrameStart`
+/// tries again). Under the draw mutex.
 left: ?api.HWND = null,
 
 /// Set by `followWindow` until `recoverDevice` makes the new chain. A
@@ -402,14 +408,7 @@ pub fn init(
     _ = device;
 
     switch (apprt.runtime) {
-        apprt.windows => {
-            // The terminal's render window, with a composition chain if
-            // it was made for a transparent frame.
-            const target = opts.rt_surface.renderTarget();
-            var self = try initWindow(target.hwnd, try loadCompiler(), opts.config.vsync, opts.config.blending, if (target.alpha) .composition else .hwnd);
-            self.rt_surface = opts.rt_surface;
-            return self;
-        },
+        apprt.windows => return initSurface(opts.rt_surface, opts.config.vsync, opts.config.blending),
         // A host owns its window and Ghostty cannot know what its frame
         // draws, so an embedded surface keeps the HWND chain.
         apprt.embedded => {
@@ -422,6 +421,16 @@ pub fn init(
         },
         else => @compileError("unsupported apprt for Direct3D 11"),
     }
+}
+
+/// `init` for a terminal of this apprt: its render window, with a
+/// composition chain if it was made for a transparent frame.
+fn initSurface(surface: *apprt.Surface, vsync: bool, blending: configpkg.Config.AlphaBlending) !D3D11 {
+    const target = surface.takeRenderTarget();
+    var self = try initWindow(target.hwnd, try loadCompiler(), vsync, blending, if (target.alpha) .composition else .hwnd);
+    self.rt_surface = surface;
+    self.render_changes = target.changes;
+    return self;
 }
 
 /// `init` once the window and its chain are known. A composition chain
@@ -1040,11 +1049,13 @@ pub fn drawFrameUnlocked(self: *D3D11) void {
 /// `recoverDevice` builds it again for the new target, the path a GPU
 /// reset takes. generic.zig calls this from `changeConfig`, which the
 /// terminal sends after it changed the target, before it asks
-/// `presentsAlpha`. Render thread, under the draw mutex.
+/// `presentsAlpha`; and `drawFrameStart` when the target changed with
+/// no config to bring it. Under the draw mutex.
 pub fn followWindow(self: *D3D11) void {
     if (comptime RtSurface == void) return;
     const surface = self.rt_surface orelse return;
-    const target = surface.renderTarget();
+    const target = surface.takeRenderTarget();
+    self.render_changes = target.changes;
     self.follow(target.hwnd, if (target.alpha) .composition else .hwnd);
 }
 
@@ -1055,10 +1066,11 @@ fn follow(self: *D3D11, hwnd: api.HWND, chain: Chain) void {
         if (self.left == null) {
             // The old chain is on this one until recovery releases it.
             self.left = self.hwnd;
-        } else {
-            // Followed twice before a frame: this one, between the
-            // two, never had a chain.
-            self.handBack(self.hwnd);
+        } else if (!self.handBack(self.hwnd)) {
+            // Followed twice before a frame: this one, between the two,
+            // never had a chain. Kept by its terminal until it closes if
+            // the terminal cannot be told, with `left` taken.
+            log.warn("a render window stays until its terminal closes hwnd={x}", .{@intFromPtr(self.hwnd)});
         }
     }
     log.info("following the terminal old_hwnd={x} hwnd={x} old_chain={t} chain={t}", .{
@@ -1073,14 +1085,20 @@ fn follow(self: *D3D11, hwnd: api.HWND, chain: Chain) void {
 }
 
 /// Give a render window this renderer left back to its terminal to
-/// destroy (`Surface.renderLeft`); the tests' bare windows are recorded
-/// in `test_handed_back` instead.
-fn handBack(self: *D3D11, old: api.HWND) void {
+/// destroy (`Surface.renderLeft`); whether the terminal was told. The
+/// tests' bare windows are recorded in `test_handed_back` instead, and
+/// refused while `test_hand_back_fails`.
+fn handBack(self: *D3D11, old: api.HWND) bool {
     if (comptime RtSurface != void) if (self.rt_surface) |surface| return surface.renderLeft(old);
-    if (builtin.is_test) test_handed_back = old;
+    if (builtin.is_test) {
+        if (test_hand_back_fails) return false;
+        test_handed_back = old;
+    }
+    return true;
 }
 
 var test_handed_back: ?api.HWND = null;
+var test_hand_back_fails = false;
 
 /// Whether the device was lost since the last frame. The generic renderer
 /// asks at the start of every frame and, when so, releases everything it
@@ -1146,10 +1164,14 @@ pub fn recoverDevice(self: *D3D11) !void {
 
     // The old chain was released with the old device: the window it
     // was on can go.
-    if (self.left) |old| {
-        self.left = null;
-        self.handBack(old);
-    }
+    self.handBackLeft();
+}
+
+/// Hand `left` back (`handBack`), keeping it to try again at the next
+/// frame if the terminal cannot be told.
+fn handBackLeft(self: *D3D11) void {
+    const old = self.left orelse return;
+    if (self.handBack(old)) self.left = null;
 }
 
 /// A device on the software rasterizer is given up once the adapters
@@ -1157,7 +1179,14 @@ pub fn recoverDevice(self: *D3D11) !void {
 /// replaces it with one on the GPU that arrived. If none did, the
 /// replacement is software again and its own factory is current.
 pub fn drawFrameStart(self: *D3D11) void {
+    // A terminal whose target changed with no config to say so (one
+    // that failed to reach the renderer) is followed all the same.
+    if (comptime RtSurface != void) if (self.rt_surface) |surface| {
+        if (surface.render_changes.load(.acquire) != self.render_changes) self.followWindow();
+    };
     if (self.lost) return;
+    // A window the terminal could not be told of at the recovery.
+    self.handBackLeft();
     const factory = self.software_factory orelse return;
     if (factory.isCurrent()) return;
     log.info("graphics adapters changed; replacing the software device hwnd={x}", .{@intFromPtr(self.hwnd)});
@@ -1673,6 +1702,34 @@ test "d3d11: a renderer followed twice before a frame hands back the window betw
     try testing.expect(r.hwnd == c);
     try testing.expect(test_handed_back == a);
     try expectPresents(&r, .PREMULTIPLIED);
+}
+
+test "d3d11: a renderer keeps a window the terminal cannot be told of until a later frame" {
+    // Until it is, the renderer keeps it: dropped, it would stay a child
+    // of the terminal, unseen, until the terminal closes.
+    const testing = std.testing;
+    const a = try testWindow();
+    defer _ = win32.DestroyWindow(a);
+    const b = try testWindow();
+    defer _ = win32.DestroyWindow(b);
+    test_handed_back = null;
+    defer test_handed_back = null;
+    defer test_hand_back_fails = false;
+
+    var r = try initWindow(a, try loadCompiler(), true, .native, .hwnd);
+    defer r.deinit();
+    r.follow(b, .composition);
+    test_hand_back_fails = true;
+    try r.recoverDevice();
+    try testing.expect(r.left == a);
+    r.drawFrameStart();
+    r.drawFrameEnd();
+    try testing.expect(r.left == a);
+    test_hand_back_fails = false;
+    r.drawFrameStart();
+    r.drawFrameEnd();
+    try testing.expect(r.left == null);
+    try testing.expect(test_handed_back == a);
 }
 
 test "d3d11: a renderer followed to a window whose composition target is taken presents opaque" {
