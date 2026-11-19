@@ -505,6 +505,8 @@ pub const Surface = struct {
         left_press_pos: apprt.CursorPos,
         wheel_x: Wheel,
         wheel_y: Wheel,
+        /// The finger on the terminal, from its press to its release.
+        pan: ?Pan,
         /// The last `.mouse_shape` and its stock cursor, applied in
         /// WM_SETCURSOR. `cursor` is null only if LoadCursorW failed; the
         /// class arrow shows then.
@@ -538,6 +540,7 @@ pub const Surface = struct {
                 .left_press_pos = outside,
                 .wheel_x = .horizontal,
                 .wheel_y = .{},
+                .pan = null,
                 // The core starts at `.text` and never sends that first
                 // shape (`Terminal.mouse_shape`); the GTK runtime
                 // starts there too.
@@ -654,6 +657,28 @@ pub const Surface = struct {
                     .x1 => .eight,
                     .x2 => .nine,
                 };
+            }
+        };
+
+        /// A finger dragged over the terminal, which scrolls it as in
+        /// Windows Terminal (`TouchMoved` in its ControlInteractivity.cpp):
+        /// the content follows the finger, from half a row's move on.
+        const Pan = struct {
+            /// Where the rows scrolled so far have brought the finger, in
+            /// pixels down the screen.
+            anchor: i32,
+
+            /// The finger is at `y`: the rows it has moved down since the
+            /// anchor, to the nearest row, negative for up. What is left
+            /// of a row stays for the next move.
+            fn add(self: *Pan, y: i32, cell: u32) i32 {
+                if (cell == 0) return 0;
+                const size: i32 = @intCast(cell);
+                const dy = y - self.anchor;
+                const half = if (dy < 0) -@divTrunc(size, 2) else @divTrunc(size, 2);
+                const rows = @divTrunc(dy + half, size);
+                self.anchor += rows * size;
+                return rows;
             }
         };
 
@@ -2651,6 +2676,12 @@ pub const Surface = struct {
                 return 0;
             },
 
+            win32.WM_POINTERDOWN,
+            win32.WM_POINTERUPDATE,
+            win32.WM_POINTERUP,
+            win32.WM_POINTERCAPTURECHANGED,
+            => if (self.touchPointer(msg, wparam, lparam)) return 0,
+
             win32.WM_MOUSEWHEEL, win32.WM_MOUSEHWHEEL => {
                 const core_surface = self.liveCore() orelse
                     return win32.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -3492,6 +3523,76 @@ pub const Surface = struct {
         return consumed;
     }
 
+    /// A pointer message: whether it was a finger's, which is then handled
+    /// here and Windows makes no mouse messages of it. A pen's is left to
+    /// DefWindowProcW, whose mouse messages select text as a mouse does,
+    /// as a pen does in Windows Terminal.
+    ///
+    /// A finger on the terminal gives it the focus, and dragged scrolls
+    /// its viewport (`Mouse.Pan`). As in Windows Terminal that is so
+    /// whatever the program in it reads: a finger is never reported as a
+    /// mouse. Only the first finger counts; the others do nothing.
+    pub fn touchPointer(self: *Surface, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
+        // Whichever device it was: the contact is over, and the id in this
+        // message's wParam is not one to ask about.
+        if (msg == win32.WM_POINTERCAPTURECHANGED) {
+            self.mouse.pan = null;
+            return false;
+        }
+        if (!isTouch(@truncate(wparam))) return false;
+        const flags = win32.hiword(wparam);
+        if (flags & win32.POINTER_MESSAGE_FLAG_PRIMARY == 0) return true;
+        const y: i32 = win32.yLparam(lparam);
+        switch (msg) {
+            win32.WM_POINTERDOWN => {
+                _ = self.clickFocus();
+                self.mouse.pan = .{ .anchor = y };
+            },
+            win32.WM_POINTERUPDATE => {
+                if (flags & win32.POINTER_MESSAGE_FLAG_CANCELED != 0) {
+                    self.mouse.pan = null;
+                } else if (self.mouse.pan) |*pan| {
+                    self.touchScroll(pan, y);
+                }
+            },
+            else => self.mouse.pan = null,
+        }
+        return true;
+    }
+
+    /// Scroll the viewport by what the finger at `y` has moved: down the
+    /// screen is back through the scrollback, the core's negative lines.
+    fn touchScroll(self: *Surface, pan: *Mouse.Pan, y: i32) void {
+        if (builtin.is_test) if (test_touch_scroll) |scrolled| {
+            const rows = pan.add(y, test_touch_cell);
+            if (rows != 0) scrolled(self, -rows);
+            return;
+        };
+        const core_surface = self.liveCore() orelse return;
+        const rows = pan.add(y, core_surface.size.cell.height);
+        if (rows == 0) return;
+        const lines: i16 = @intCast(std.math.clamp(-rows, std.math.minInt(i16), std.math.maxInt(i16)));
+        _ = core_surface.performBindingAction(.{ .scroll_page_lines = lines }) catch |err|
+            log.warn("touch scroll failed err={}", .{err});
+    }
+
+    /// Whether the pointer `id` is a finger.
+    fn isTouch(id: u16) bool {
+        if (builtin.is_test) if (test_pointer_type) |kind| return kind(id) == win32.PT_TOUCH;
+        var kind: win32.DWORD = 0;
+        return win32.GetPointerType(id, &kind).toBool() and kind == win32.PT_TOUCH;
+    }
+
+    /// For tests: what GetPointerType answers for a pointer id.
+    pub var test_pointer_type: if (builtin.is_test) ?*const fn (u16) win32.DWORD else void =
+        if (builtin.is_test) null else {};
+
+    /// For tests: the lines a finger scrolls a terminal with no core by,
+    /// whose rows are `test_touch_cell` pixels tall.
+    pub var test_touch_scroll: if (builtin.is_test) ?*const fn (*Surface, i32) void else void =
+        if (builtin.is_test) null else {};
+    pub const test_touch_cell: u32 = 20;
+
     /// For tests: answers for the core of a terminal with no core, which
     /// then takes its button messages as `mouseButton` would answer them,
     /// whether the core consumed the event or null for one it did not
@@ -4084,6 +4185,23 @@ test "win32: a wheel's ticks go to the core as they are, its lines in pixels" {
     const lines = Wheel.scrollBy(.{ .lines = -3 }, 17);
     try std.testing.expectEqual(-51.0, lines[0]);
     try std.testing.expectEqual(input.ScrollMods{ .precision = true }, lines[1]);
+}
+
+test "win32: a finger's move scrolls from half a row on, and keeps what is left of one" {
+    var pan: Surface.Mouse.Pan = .{ .anchor = 100 };
+    try std.testing.expectEqual(0, pan.add(109, 20));
+    try std.testing.expectEqual(0, pan.add(91, 20));
+    try std.testing.expectEqual(1, pan.add(110, 20));
+    try std.testing.expectEqual(120, pan.anchor);
+    // Three rows at once, and the eight pixels past them stay.
+    try std.testing.expectEqual(3, pan.add(188, 20));
+    try std.testing.expectEqual(180, pan.anchor);
+    try std.testing.expectEqual(1, pan.add(190, 20));
+    // Back up.
+    try std.testing.expectEqual(-2, pan.add(160, 20));
+    try std.testing.expectEqual(160, pan.anchor);
+    // Rows of no height scroll nothing.
+    try std.testing.expectEqual(0, pan.add(500, 0));
 }
 
 test "win32: wheel points off the client area clamp to its edge" {

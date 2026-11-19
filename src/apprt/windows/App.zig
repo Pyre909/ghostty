@@ -8700,6 +8700,89 @@ test "win32: a point in a mouse message's lParam comes back from it, negative to
     }
 }
 
+test "win32: a finger focuses its terminal and scrolls it; a pen is left to be a mouse" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const Touch = struct {
+        const finger: u16 = 7;
+        const pen: u16 = 8;
+        const primary: win32.WPARAM = @as(win32.WPARAM, win32.POINTER_MESSAGE_FLAG_PRIMARY) << 16;
+        var lines: i32 = 0;
+        var calls: usize = 0;
+        fn kind(id: u16) win32.DWORD {
+            return if (id == finger) win32.PT_TOUCH else 3;
+        }
+        fn scrolled(_: *Surface, n: i32) void {
+            lines += n;
+            calls += 1;
+        }
+        fn send(surface: *Surface, msg: win32.UINT, id: u16, flags: win32.WPARAM, y: i32) win32.LRESULT {
+            return Surface.wndProc(surface.hwnd, msg, id | flags, testPoint(0, y));
+        }
+    };
+    Touch.lines = 0;
+    Touch.calls = 0;
+    Surface.test_pointer_type = &Touch.kind;
+    defer Surface.test_pointer_type = null;
+    Surface.test_touch_scroll = &Touch.scrolled;
+    defer Surface.test_touch_scroll = null;
+
+    const window = try testFrame(&app);
+    const left = try testPane(&app, window);
+    const right = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ left, right });
+    window.tab().focused = left;
+
+    // The press focuses the terminal under the finger.
+    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100));
+    try std.testing.expect(window.tab().focused == right);
+
+    // Under half a row nothing moves. A finger going down the screen
+    // brings earlier lines into view: the core's lines up, negative.
+    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 109));
+    try std.testing.expectEqual(0, Touch.calls);
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 140);
+    try std.testing.expectEqual(-2, Touch.lines);
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 100);
+    try std.testing.expectEqual(0, Touch.lines);
+
+    // A second finger does nothing, and is not left to become a mouse.
+    try std.testing.expect(right.touchPointer(win32.WM_POINTERUPDATE, Touch.finger, testPoint(0, 300)));
+    try std.testing.expectEqual(0, Touch.lines);
+
+    // After the release a move scrolls nothing.
+    const calls = Touch.calls;
+    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERUP, Touch.finger, Touch.primary, 100));
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300);
+    try std.testing.expectEqual(calls, Touch.calls);
+
+    // Nor after the system took the contact away, or the capture went.
+    const canceled = @as(win32.WPARAM, win32.POINTER_MESSAGE_FLAG_CANCELED) << 16;
+    _ = Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100);
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary | canceled, 300);
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300);
+    try std.testing.expectEqual(calls, Touch.calls);
+    _ = Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100);
+    _ = Touch.send(right, win32.WM_POINTERCAPTURECHANGED, Touch.finger, 0, 100);
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300);
+    try std.testing.expectEqual(calls, Touch.calls);
+
+    // A pen neither scrolls nor takes the focus here.
+    window.tab().focused = left;
+    try std.testing.expect(!right.touchPointer(win32.WM_POINTERDOWN, Touch.pen | Touch.primary, testPoint(0, 100)));
+    _ = Touch.send(right, win32.WM_POINTERUPDATE, Touch.pen, Touch.primary, 300);
+    try std.testing.expectEqual(calls, Touch.calls);
+    try std.testing.expect(right.mouse.pan == null);
+    try std.testing.expect(window.tab().focused == left);
+}
+
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {
     // Only with the option, in the active window, with no button held, and
     // only for a move: not the WM_MOUSEMOVE Win32 sends when a layout change

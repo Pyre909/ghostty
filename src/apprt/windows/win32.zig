@@ -313,6 +313,19 @@ pub const WM_ENTERSIZEMOVE: UINT = 0x0231;
 pub const WM_EXITSIZEMOVE: UINT = 0x0232;
 /// wParam is the drop's HDROP, which the window frees with DragFinish.
 pub const WM_DROPFILES: UINT = 0x0233;
+/// wParam: the pointer's id in the low word (`GetPointerType`), the
+/// POINTER_MESSAGE_FLAGs in the high word. lParam: its point on the screen.
+pub const WM_POINTERUPDATE: UINT = 0x0245;
+pub const WM_POINTERDOWN: UINT = 0x0246;
+pub const WM_POINTERUP: UINT = 0x0247;
+pub const WM_POINTERCAPTURECHANGED: UINT = 0x024C;
+/// The high word of a pointer message's wParam: the first finger down.
+pub const POINTER_MESSAGE_FLAG_PRIMARY: u16 = 0x2000;
+/// The high word of a pointer message's wParam: the system took the
+/// contact away, as for an edge gesture.
+pub const POINTER_MESSAGE_FLAG_CANCELED: u16 = 0x8000;
+/// GetPointerType: a finger.
+pub const PT_TOUCH: DWORD = 2;
 pub const WM_MOUSELEAVE: UINT = 0x02A3;
 pub const WM_DPICHANGED: UINT = 0x02E0;
 pub const WM_APP: UINT = 0x8000;
@@ -723,6 +736,7 @@ pub extern "user32" fn SetCapture(hwnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn ReleaseCapture() callconv(.winapi) BOOL;
 pub extern "user32" fn GetCapture() callconv(.winapi) ?HWND;
 pub extern "user32" fn TrackMouseEvent(tme: *TRACKMOUSEEVENT) callconv(.winapi) BOOL;
+pub extern "user32" fn GetPointerType(id: u32, kind: *DWORD) callconv(.winapi) BOOL;
 pub extern "user32" fn WindowFromPoint(pt: POINT) callconv(.winapi) ?HWND;
 pub extern "user32" fn ScreenToClient(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
 pub extern "user32" fn ClientToScreen(hwnd: HWND, pt: *POINT) callconv(.winapi) BOOL;
