@@ -8793,8 +8793,8 @@ test "win32: a finger focuses its terminal and scrolls it; a pen is left to be a
     _ = Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100);
     window.tab().focused = left;
     app.prompt_depth += 1;
-    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERUPDATE, Touch.finger, Touch.primary, 300));
-    try std.testing.expectEqual(0, Touch.send(right, win32.WM_POINTERDOWN, Touch.finger, Touch.primary, 100));
+    try std.testing.expect(right.touchPointer(win32.WM_POINTERUPDATE, Touch.finger | Touch.primary, testPoint(0, 300)));
+    try std.testing.expect(right.touchPointer(win32.WM_POINTERDOWN, Touch.finger | Touch.primary, testPoint(0, 100)));
     app.prompt_depth -= 1;
     try std.testing.expectEqual(calls, Touch.calls);
     try std.testing.expect(window.tab().focused == left);
