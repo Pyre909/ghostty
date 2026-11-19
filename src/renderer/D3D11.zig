@@ -1149,7 +1149,9 @@ pub fn recoverDevice(self: *D3D11) !void {
             if (createGpu(self.hwnd, self.vsync, .hwnd)) |g| break :gpu g else |e| err = e;
         }
         self.recovery.failed(now);
-        log.err("D3D11 device recovery failed err={}; retrying in {d}ms", .{ err, recovery_retry_ms });
+        // Retried, so a warning: a test that drives this path would fail
+        // on an error-level line.
+        log.warn("D3D11 device recovery failed err={}; retrying in {d}ms", .{ err, recovery_retry_ms });
         return err;
     };
     self.adopt(gpu);
@@ -1762,6 +1764,39 @@ test "d3d11: a renderer followed to a window whose composition target is taken p
     try testing.expect(r.composition == null);
     try testing.expect(test_handed_back == a);
     try expectPresents(&r, .IGNORE);
+}
+
+test "d3d11: a renderer keeps a composition chain it cannot make yet after a plain device loss" {
+    // Only following the terminal falls back to an HWND chain, opaque:
+    // a GPU reset whose composition binding fails retries the same kind
+    // later rather than leave a transparent terminal opaque for good.
+    // After a follow that succeeded too.
+    const testing = std.testing;
+    const a = try testWindow();
+    defer _ = win32.DestroyWindow(a);
+    const b = try testWindow();
+    defer _ = win32.DestroyWindow(b);
+    const compile = try loadCompiler();
+    test_handed_back = null;
+    defer test_handed_back = null;
+
+    var r = try initWindow(a, compile, true, .native, .hwnd);
+    defer r.deinit();
+    r.follow(b, .composition);
+    try r.recoverDevice();
+    try testing.expect(r.presentsAlpha());
+
+    r.lost = true;
+    r.releaseGpu();
+    // Its composition target, taken while it has none.
+    var holder = try initWindow(b, compile, true, .native, .composition);
+    defer holder.deinit();
+    try testing.expect(holder.presentsAlpha());
+    try testing.expectError(error.D3D11CompositionFailed, r.recoverDevice());
+    try testing.expect(r.lost);
+    try testing.expect(r.presentsAlpha());
+    try testing.expectEqual(Chain.composition, r.chain);
+    try testing.expect(r.recovery.delayMs(.now(global.io(), .awake)) > 0);
 }
 
 test "d3d11: only a composition chain keeps the background's opacity" {
