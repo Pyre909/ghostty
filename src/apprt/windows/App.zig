@@ -8825,13 +8825,15 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
         const finger: u16 = 7;
         const primary: win32.WPARAM = @as(win32.WPARAM, win32.POINTER_MESSAGE_FLAG_PRIMARY) << 16;
         var keyboards: usize = 0;
+        var keyboard_for: ?win32.HWND = null;
         var menus: usize = 0;
         var menu_at: win32.POINT = .{ .x = 0, .y = 0 };
         fn kind(_: u16) win32.DWORD {
             return win32.PT_TOUCH;
         }
         fn scrolled(_: *Surface, _: i16) void {}
-        fn tryShow(_: win32.HWND) error{InputPaneFailed}!bool {
+        fn tryShow(frame: win32.HWND) error{InputPaneFailed}!bool {
+            keyboard_for = frame;
             keyboards += 1;
             return true;
         }
@@ -8848,6 +8850,7 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
         }
     };
     Touch.keyboards = 0;
+    Touch.keyboard_for = null;
     Touch.menus = 0;
     Surface.test_pointer_type = &Touch.kind;
     defer Surface.test_pointer_type = null;
@@ -8874,6 +8877,8 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     Touch.send(a, win32.WM_POINTERUP, Touch.primary, 104, 103);
     try std.testing.expectEqual(1, Touch.keyboards);
     try std.testing.expectEqual(0, Touch.menus);
+    // For the frame, the top-level window the input pane is asked for.
+    try std.testing.expectEqual(window.hwnd, Touch.keyboard_for.?);
 
     // A drag is no tap, even one that ends where it began, and its timer
     // opens nothing.
@@ -8962,6 +8967,29 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     Touch.held(a);
     try std.testing.expectEqual(2, Right.presses);
     try std.testing.expectEqual(2, Touch.menus);
+
+    // The press starts the hold timer, a jitter leaves it, and a move off
+    // the finger's place, a release or the hold itself stops it. KillTimer
+    // answers whether it was there, and stops it for the next case.
+    const Timer = struct {
+        fn running(surface: *Surface) bool {
+            return win32.KillTimer(surface.hwnd, @import("Surface.zig").touch_hold_timer_id).toBool();
+        }
+    };
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    try std.testing.expect(Timer.running(a));
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUPDATE, Touch.primary, 104, 103);
+    try std.testing.expect(Timer.running(a));
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUPDATE, Touch.primary, 100, 180);
+    try std.testing.expect(!Timer.running(a));
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.send(a, win32.WM_POINTERUP, Touch.primary, 100, 100);
+    try std.testing.expect(!Timer.running(a));
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
+    Touch.held(a);
+    try std.testing.expect(!Timer.running(a));
 }
 
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {
