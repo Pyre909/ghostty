@@ -101,9 +101,16 @@ pub fn frameDestroyed() void {
 
 /// DwmEnableBlurBehindWindow on all of `frame` (`on`) or none; whether DWM
 /// took it, logged if not. The region (0, 0)-(-1, -1) is empty: blur-behind
-/// is on, and blurs nothing.
+/// is on, and blurs nothing. Turned off with DWM_BB_ENABLE alone: DWM
+/// refuses the empty region then (measured: E_INVALIDARG).
 fn blurBehind(frame: win32.HWND, on: bool) bool {
     if (builtin.is_test) if (test_blur_behind) |answer| return answer(frame, on);
+    if (!on) return askBlurBehind(frame, .{
+        .flags = win32.DWM_BB_ENABLE,
+        .enable = .FALSE,
+        .region = null,
+        .transition_on_maximized = .FALSE,
+    });
     const empty = win32.CreateRectRgn(0, 0, -1, -1) orelse {
         log.warn("a window is opaque: no region for its blur-behind err={}", .{win32.GetLastError()});
         return false;
@@ -111,15 +118,20 @@ fn blurBehind(frame: win32.HWND, on: bool) bool {
     // DWM keeps none of it: blur-behind was measured working with the
     // region deleted at once.
     defer _ = win32.DeleteObject(empty);
-    const blur: win32.DWM_BLURBEHIND = .{
+    return askBlurBehind(frame, .{
         .flags = win32.DWM_BB_ENABLE | win32.DWM_BB_BLURREGION,
-        .enable = if (on) .TRUE else .FALSE,
+        .enable = .TRUE,
         .region = empty,
         .transition_on_maximized = .FALSE,
-    };
+    });
+}
+
+/// DwmEnableBlurBehindWindow with `blur`; whether DWM took it, logged if
+/// not.
+fn askBlurBehind(frame: win32.HWND, blur: win32.DWM_BLURBEHIND) bool {
     const hr = win32.DwmEnableBlurBehindWindow(frame, &blur);
     if (hr >= 0) return true;
-    log.warn("DwmEnableBlurBehindWindow failed on={} hr=0x{x}", .{ on, @as(u32, @bitCast(hr)) });
+    log.warn("DwmEnableBlurBehindWindow failed enable={} hr=0x{x}", .{ blur.enable.toBool(), @as(u32, @bitCast(hr)) });
     return false;
 }
 
@@ -378,6 +390,20 @@ test "win32: a window layered over a transparent frame is opaque, and one that c
     defer test_set_alpha = null;
     try testing.expect(!layer(refused));
     try testing.expectEqual(before, win32.GetWindowLongPtrW(refused, win32.GWL_EXSTYLE));
+}
+
+test "win32: blur-behind turns on and off again" {
+    // With DWM's own answers: off was refused with the empty region
+    // (E_INVALIDARG), which left a frame that `frameMade` gave up on
+    // blurred behind. A session without DWM composition refuses both,
+    // and the test is skipped.
+    const testing = std.testing;
+    const hwnd = try testPopup();
+    defer _ = win32.DestroyWindow(hwnd);
+    if (!blurBehind(hwnd, true)) return error.SkipZigTest;
+    try testing.expect(blurBehind(hwnd, false));
+    try testing.expect(blurBehind(hwnd, true));
+    try testing.expect(blurBehind(hwnd, false));
 }
 
 test "win32: a transparent frame's terminal paints black, its dividers their colour" {
