@@ -433,6 +433,13 @@ fn initSurface(surface: *apprt.Surface, vsync: bool, blending: configpkg.Config.
     return self;
 }
 
+/// For the apprt's tests: a renderer for `surface`, as `init` makes one
+/// with the default config, but with no core to bring it a config.
+pub fn testInit(surface: *apprt.Surface) !D3D11 {
+    if (comptime !builtin.is_test or RtSurface == void) @compileError("for the Windows apprt's tests");
+    return initSurface(surface, true, .native);
+}
+
 /// `init` once the window and its chain are known. A composition chain
 /// that cannot be made or shown falls back to an HWND chain, with a
 /// warning: the terminal then presents opaque, which `presentsAlpha` says

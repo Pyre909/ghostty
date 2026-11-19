@@ -11039,6 +11039,54 @@ test "win32: a render window the renderer never took is destroyed when its frame
     try std.testing.expect(win32.IsWindow(made[1]).toBool());
 }
 
+test "win32: a renderer follows its terminal to a transparent frame and hands the old window back" {
+    // The real renderer, woken with no config to bring it there
+    // (`renderer.D3D11.drawFrameStart`), presents to the new render
+    // window from its next recovery and hands the old one back
+    // (`Surface.renderLeft`), which this thread destroys.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(1);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    const first = a.render_hwnd.?;
+    var r = try renderer.D3D11.testInit(a);
+    defer r.deinit();
+    try std.testing.expect(!r.presentsAlpha());
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    const second = a.render_hwnd.?;
+    try std.testing.expect(second != first);
+
+    r.drawFrameStart();
+    r.drawFrameEnd();
+    try std.testing.expect(r.deviceLost());
+    try r.recoverDevice();
+    try std.testing.expect(r.presentsAlpha());
+    try std.testing.expect(r.hwnd == second);
+    testPump();
+    try std.testing.expect(!win32.IsWindow(first).toBool());
+    try std.testing.expect(win32.IsWindow(second).toBool());
+}
+
 test "win32: a window DWM will not make transparent at a reload stays opaque" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
