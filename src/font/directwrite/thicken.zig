@@ -25,11 +25,13 @@ pub const scale: u32 = 4;
 /// The most width a stem gains, in pixels, at any size and strength.
 const max_widening = 0.6;
 
-/// The width a stem gains per pixel of the font's size, at the
-/// strengths where CoreText's own steps begin. CoreText draws the same
-/// below 128 as at 0, and the same from 128 to 191; between these
-/// points the factor is interpolated so that every strength has its
-/// own, and the factor is that of 0 up to 96.
+/// The width a stem gains per pixel of the font's size, measured at
+/// the strengths where CoreText's own steps begin: 128, 192, 224 and
+/// 255. CoreText draws the same below 128 as at 0, so that step's
+/// factor stands at 96, not 0: the ramp up to 128 is then 32 wide, as
+/// the two above 192 are, and strengths up to 96 draw as macOS draws
+/// them. Between these points the factor is interpolated so that every
+/// strength has its own.
 const factors = [_]struct { strength: f64, factor: f64 }{
     .{ .strength = 96, .factor = 0.0115 },
     .{ .strength = 128, .factor = 0.0166 },
