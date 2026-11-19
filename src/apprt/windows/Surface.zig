@@ -72,8 +72,8 @@ pub const progress_timer_id: win32.UINT_PTR = 1;
 /// beside `progress_timer_id` and the others its WM_TIMER tells apart.
 pub const touch_hold_timer_id: win32.UINT_PTR = 5;
 
-/// How long a finger stays still before it opens the context menu.
-/// Windows does not say how long its own press and hold is.
+/// How long a finger stays still before it opens the context menu:
+/// picked by hand, not read from the system's press and hold setting.
 const touch_hold_ms: win32.UINT = 700;
 
 /// How long a progress report shows with no newer one: GTK's 15 seconds.

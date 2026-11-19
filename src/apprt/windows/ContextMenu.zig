@@ -21,10 +21,12 @@
 //! button comes up, if the core left that button's press to it
 //! (`Surface.Mouse.menu`): on the release, the Windows convention, rather
 //! than on the press, as GTK and macOS open theirs, so that the menu's loop
-//! never takes the capture from the terminal in the middle of a click. No
-//! key opens it.
+//! never takes the capture from the terminal in the middle of a click. A
+//! finger held still on the terminal opens it too, from its hold timer's
+//! WM_TIMER (`Surface.touchHeld`): as a right click the core answers, or
+//! at once where a program reads the mouse. No key opens it.
 //!
-//! The loop runs inside the terminal's WM_RBUTTONUP handler and dispatches
+//! The loop runs inside the terminal's message handler and dispatches
 //! whatever is posted meanwhile, so no teardown runs until it ends
 //! (`App.beginTerminalLoop`). The terminal has the focus back when it
 //! closes, and its chosen item's action is then performed on it, as the
@@ -373,9 +375,11 @@ const Wide = struct {
     }
 };
 
-/// Show `surface`'s menu at `at`, a point in its client area, where its
-/// right button came up, once the core has had that release and the
-/// terminal has let go of the capture (`Surface.handleMessage`); then
+/// Show `surface`'s menu at `at`, the point in its client area it opens
+/// at: where its right button came up, once the core has had that
+/// release and the terminal has let go of the capture
+/// (`Surface.handleMessage`), or where a finger was held still
+/// (`Surface.touchHeld`); then
 /// give the terminal the keyboard focus back, chosen or not, as GTK's
 /// popover gives it back when it closes, and perform the chosen item.
 /// Copy and Read-only follow the core's selection and flag; a terminal
@@ -411,7 +415,8 @@ pub fn show(surface: *Surface, at: win32.POINT) void {
     // To the terminal itself, not to whatever its window gives the focus
     // to (`Window.focusTarget`): the menu opened only with the focus on the
     // terminal, as a click that moves it there is eaten
-    // (WM_MOUSEACTIVATE), and its search bar's field would take the keys
+    // (WM_MOUSEACTIVATE) and a finger's press takes it as it lands
+    // (`Surface.touchPointer`), and its search bar's field would take the keys
     // meant for the shell. GTK's popover gives its surface the
     // focus back in the same way. First, so that it comes back whether the
     // item is then performed or not.
@@ -497,7 +502,9 @@ fn track(menu: win32.HMENU, owner: win32.HWND, at: win32.POINT) u32 {
 /// while it may be (`showTab`), and a terminal's only for a
 /// release that reached the core (`consumed` in `Surface.handleMessage`),
 /// which `Surface.syncMouse` lets through only while
-/// `App.canReenterCore`. Nothing between that and here changes it:
+/// `App.canReenterCore`, or for a finger held still, only while
+/// `App.canTearDown`, which implies it (`Surface.touchHeld`). Nothing
+/// between that and here changes it:
 /// a prompt opened meanwhile, by the release's own callback or by a tick
 /// the menu's loop dispatches, runs its loop inside that call and has
 /// closed when it returns (`App.endPrompt`), and `App.tick` clears
