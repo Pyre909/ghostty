@@ -101,10 +101,31 @@ pub fn pixelBox(samples: Box) Box {
     };
 }
 
-/// Grow coverage by `r` samples: each sample becomes the most coverage
-/// within that distance of it. A fraction of a sample is the blend of
-/// the growths by the whole samples on either side of it, which moves
-/// a straight edge by exactly `r`. The caller frees the result.
+/// The widest disc `dilate` takes: the most an edge moves, in
+/// samples, rounded up. Raising `max_widening` or `scale` past it
+/// fails here rather than in `dilate`.
+const max_disc = 2;
+comptime {
+    std.debug.assert(@ceil(@as(f64, max_widening) / 2 * @as(f64, scale)) <= max_disc);
+}
+
+/// Grow coverage by `r` samples, at most `max_disc`: each sample
+/// becomes the most coverage within that distance of it. A fraction of
+/// a sample is the blend of the growths by the whole samples on either
+/// side of it, which moves a straight edge by exactly `r`. The caller
+/// frees the result.
+///
+/// The distance is the digital disc: the offsets within r * r + r,
+/// which is within half a sample of the round one. Within r * r alone,
+/// the disc of 1 is a cross and the corners of a glyph grew by next to
+/// nothing: 0.28 of a pixel's area short on a hyphen at strength 255
+/// (2026-11-18). Straight edges move by `r` either way. The disc of 1
+/// is the whole 3 by 3 square and that of 2 the 5 by 5 one without its
+/// corners, so both are taken from the most of each 3 and 5 samples of
+/// a row. That gives the same bytes as visiting each offset of both
+/// discs, in a quarter of the time at strength 0 and a seventh at 255
+/// (ReleaseFast, 2026-11-19: 80 against 534 microseconds for the
+/// samples of a 48 pixel glyph).
 pub fn dilate(
     alloc: Allocator,
     src: []const u8,
@@ -120,37 +141,58 @@ pub fn dilate(
     const lo: u32 = @intFromFloat(@floor(clamped));
     const frac = clamped - @floor(clamped);
     const hi = if (frac > 0) lo + 1 else lo;
+    std.debug.assert(hi <= max_disc);
+    if (hi == 0) {
+        @memcpy(out, src);
+        return out;
+    }
+
+    // The most of the 3 and the 5 samples of a row centred on each.
+    const row3 = try alloc.alloc(u8, src.len);
+    defer alloc.free(row3);
+    const row5 = try alloc.alloc(u8, src.len);
+    defer alloc.free(row5);
+    for (0..height) |y| {
+        const row = src[y * width ..][0..width];
+        for (0..width) |x| {
+            const m3 = @max(row[x], if (x >= 1) row[x - 1] else 0, if (x + 1 < width) row[x + 1] else 0);
+            row3[y * width + x] = m3;
+            row5[y * width + x] = @max(m3, if (x >= 2) row[x - 2] else 0, if (x + 2 < width) row[x + 2] else 0);
+        }
+    }
 
     for (0..height) |y| {
         for (0..width) |x| {
-            const a: f64 = @floatFromInt(maxWithin(src, width, height, x, y, lo));
-            const b: f64 = if (hi == lo) a else @floatFromInt(maxWithin(src, width, height, x, y, hi));
+            const a: f64 = @floatFromInt(disc(src, row3, row5, width, height, x, y, lo));
+            const b: f64 = if (hi == lo) a else @floatFromInt(disc(src, row3, row5, width, height, x, y, hi));
             out[y * width + x] = @intFromFloat(@round(a + (b - a) * frac));
         }
     }
     return out;
 }
 
-/// The most coverage within `r` whole samples of a sample: the digital
-/// disc, the offsets within r * r + r, which is within half a sample of
-/// the round one. Within r * r alone, the disc of 1 is a cross and the
-/// corners of a glyph grew by next to nothing: 0.28 of a pixel's area
-/// short on a hyphen at strength 255 (2026-11-18). Straight edges move
-/// by `r` either way.
-fn maxWithin(src: []const u8, width: u32, height: u32, x: usize, y: usize, r: u32) u8 {
-    const ri: i64 = r;
-    var best: u8 = 0;
-    var dy: i64 = -ri;
-    while (dy <= ri) : (dy += 1) {
-        const sy = @as(i64, @intCast(y)) + dy;
-        if (sy < 0 or sy >= height) continue;
-        var dx: i64 = -ri;
-        while (dx <= ri) : (dx += 1) {
-            if (dx * dx + dy * dy > ri * ri + ri) continue;
-            const sx = @as(i64, @intCast(x)) + dx;
-            if (sx < 0 or sx >= width) continue;
-            best = @max(best, src[@as(usize, @intCast(sy)) * width + @as(usize, @intCast(sx))]);
-        }
+/// The most coverage within the digital disc of `r` (0, 1 or 2) of a
+/// sample, from the row maxima `dilate` made.
+fn disc(
+    src: []const u8,
+    row3: []const u8,
+    row5: []const u8,
+    width: u32,
+    height: u32,
+    x: usize,
+    y: usize,
+    r: u32,
+) u8 {
+    if (r == 0) return src[y * width + x];
+    // Rows y - 1 to y + 1 take the whole width of the disc.
+    const wide = if (r == 1) row3 else row5;
+    var best = wide[y * width + x];
+    if (y >= 1) best = @max(best, wide[(y - 1) * width + x]);
+    if (y + 1 < height) best = @max(best, wide[(y + 1) * width + x]);
+    if (r == 2) {
+        // Rows y - 2 and y + 2 take 3 samples: 2 * 2 + 1 * 1 is within 6.
+        if (y >= 2) best = @max(best, row3[(y - 2) * width + x]);
+        if (y + 2 < height) best = @max(best, row3[(y + 2) * width + x]);
     }
     return best;
 }
@@ -186,6 +228,55 @@ pub fn downsample(
 }
 
 const testing = std.testing;
+
+/// The most coverage within the digital disc of `r` whole samples of
+/// a sample, offset by offset: what `disc` must equal.
+fn maxWithin(src: []const u8, width: u32, height: u32, x: usize, y: usize, r: u32) u8 {
+    const ri: i64 = r;
+    var best: u8 = 0;
+    var dy: i64 = -ri;
+    while (dy <= ri) : (dy += 1) {
+        const sy = @as(i64, @intCast(y)) + dy;
+        if (sy < 0 or sy >= height) continue;
+        var dx: i64 = -ri;
+        while (dx <= ri) : (dx += 1) {
+            if (dx * dx + dy * dy > ri * ri + ri) continue;
+            const sx = @as(i64, @intCast(x)) + dx;
+            if (sx < 0 or sx >= width) continue;
+            best = @max(best, src[@as(usize, @intCast(sy)) * width + @as(usize, @intCast(sx))]);
+        }
+    }
+    return best;
+}
+
+test "growing from the row maxima equals visiting each offset of the disc" {
+    const alloc = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x7417);
+    const rand = prng.random();
+    // Grids as narrow and as short as one sample, where the discs are
+    // cut at every side, and wider ones. Most samples are empty, so the
+    // most within a disc is decided by where its few inked ones are.
+    for ([_]u32{ 1, 2, 3, 4, 5, 6, 23 }) |width| {
+        for ([_]u32{ 1, 2, 3, 5, 17 }) |height| {
+            const src = try alloc.alloc(u8, @as(usize, width) * height);
+            defer alloc.free(src);
+            for (src) |*v| v.* = if (rand.uintLessThan(u8, 6) == 0) rand.int(u8) else 0;
+            for ([_]f64{ 0, 0.25, 0.46, 1, 1.104, 1.2, 1.75, 2 }) |r| {
+                const out = try dilate(alloc, src, width, height, r);
+                defer alloc.free(out);
+                const lo: u32 = @intFromFloat(@floor(r));
+                const frac = r - @floor(r);
+                for (0..height) |y| for (0..width) |x| {
+                    const a: f64 = @floatFromInt(maxWithin(src, width, height, x, y, lo));
+                    const b: f64 = if (frac > 0) @floatFromInt(maxWithin(src, width, height, x, y, lo + 1)) else a;
+                    const want: u8 = @intFromFloat(@round(a + (b - a) * frac));
+                    errdefer std.debug.print("{d}x{d} r={d} at ({d},{d})\n", .{ width, height, r, x, y });
+                    try testing.expectEqual(want, out[y * width + x]);
+                };
+            }
+        }
+    }
+}
 
 /// Coverage of a vertical stem from `left` to `right` samples, in a
 /// grid `width` samples wide and `height` high: what a rasterizer draws
