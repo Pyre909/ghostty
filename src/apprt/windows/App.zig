@@ -8719,7 +8719,7 @@ test "win32: a finger focuses its terminal and scrolls it; a pen is left to be a
         fn kind(id: u16) win32.DWORD {
             return if (id == finger) win32.PT_TOUCH else 3;
         }
-        fn scrolled(_: *Surface, n: i32) void {
+        fn scrolled(_: *Surface, n: i16) void {
             lines += n;
             calls += 1;
         }
@@ -8830,7 +8830,7 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
         fn kind(_: u16) win32.DWORD {
             return win32.PT_TOUCH;
         }
-        fn scrolled(_: *Surface, _: i32) void {}
+        fn scrolled(_: *Surface, _: i16) void {}
         fn tryShow(_: win32.HWND) error{InputPaneFailed}!bool {
             keyboards += 1;
             return true;

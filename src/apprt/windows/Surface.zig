@@ -3682,9 +3682,9 @@ pub const Surface = struct {
     fn touchScroll(self: *Surface, pan: *Mouse.Pan, y: i32) void {
         const rows = pan.add(y, self.touchCell());
         if (rows == 0) return;
-        if (builtin.is_test) if (test_touch_scroll) |scrolled| return scrolled(self, -rows);
-        const core_surface = self.liveCore() orelse return;
         const lines: i16 = @intCast(std.math.clamp(-rows, std.math.minInt(i16), std.math.maxInt(i16)));
+        if (builtin.is_test) if (test_touch_scroll) |scrolled| return scrolled(self, lines);
+        const core_surface = self.liveCore() orelse return;
         _ = core_surface.performBindingAction(.{ .scroll_page_lines = lines }) catch |err|
             log.warn("touch scroll failed err={}", .{err});
     }
@@ -3702,7 +3702,7 @@ pub const Surface = struct {
 
     /// For tests: the lines a finger scrolls a terminal with no core by,
     /// whose rows are `test_touch_cell` pixels tall.
-    pub var test_touch_scroll: if (builtin.is_test) ?*const fn (*Surface, i32) void else void =
+    pub var test_touch_scroll: if (builtin.is_test) ?*const fn (*Surface, i16) void else void =
         if (builtin.is_test) null else {};
     pub const test_touch_cell: u32 = 20;
 
