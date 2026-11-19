@@ -8888,6 +8888,19 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     // A timer left over once the finger has gone opens nothing.
     Touch.held(a);
     try std.testing.expectEqual(1, Touch.menus);
+
+    // Nor one that fires inside a teardown's wait, or for a window that
+    // began to close.
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    app.teardown_depth += 1;
+    Touch.held(a);
+    app.teardown_depth -= 1;
+    try std.testing.expectEqual(1, Touch.menus);
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    window.closing = true;
+    Touch.held(a);
+    window.closing = false;
+    try std.testing.expectEqual(1, Touch.menus);
 }
 
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {

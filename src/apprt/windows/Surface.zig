@@ -1401,6 +1401,9 @@ pub const Surface = struct {
         }
         self.mouse.owed = .empty;
         self.mouse.leave_owed = false;
+        // A finger's too, and its hold timer with it, which would open
+        // the menu inside the teardown's wait.
+        self.endPan();
 
         // No mouse event reaches the core from here on, so the core cannot
         // show a pointer it hid while typing; WM_SETCURSOR would keep it
@@ -3619,7 +3622,10 @@ pub const Surface = struct {
         _ = win32.KillTimer(self.hwnd, touch_hold_timer_id);
         const pan = self.mouse.pan orelse return;
         self.mouse.pan = null;
-        if (pan.moved or self.closing or !self.app.canReenterCore()) return;
+        // Not in a teardown's wait either (`App.canTearDown`): a finger
+        // that comes down during one starts the timer again, and a window
+        // stopping its terminals does not mark them as closing.
+        if (pan.moved or self.closing or self.window.closing or !self.app.canTearDown()) return;
         var at = pan.start;
         if (!win32.ScreenToClient(self.hwnd, &at).toBool()) return;
         ContextMenu.show(self, at);
