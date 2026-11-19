@@ -19,6 +19,7 @@
 const std = @import("std");
 
 const win32 = @import("win32.zig");
+const App = @import("App.zig").App;
 const Surface = @import("Surface.zig").Surface;
 const Transparency = @import("Transparency.zig");
 
@@ -27,7 +28,8 @@ const log = std.log.scoped(.win32);
 
 pub const class_name = "GhosttyRenderClass";
 
-pub fn registerClass(hinstance: win32.HINSTANCE) bool {
+/// Register the render window's class (`create`).
+pub fn registerClass(hinstance: win32.HINSTANCE) App.Error!void {
     const class: win32.WNDCLASSEXW = .{
         .cbSize = @sizeOf(win32.WNDCLASSEXW),
         .style = 0,
@@ -43,11 +45,12 @@ pub fn registerClass(hinstance: win32.HINSTANCE) bool {
         .lpszClassName = L(class_name),
         .hIconSm = null,
     };
-    if (win32.RegisterClassExW(&class) != 0) return true;
+    if (win32.RegisterClassExW(&class) != 0) return;
     log.err("failed to register the render window class err={}", .{win32.GetLastError()});
-    return false;
+    return App.Error.Win32ClassRegistrationFailed;
 }
 
+/// Unregister what `registerClass` registered.
 pub fn unregisterClass(hinstance: win32.HINSTANCE) void {
     _ = win32.UnregisterClassW(L(class_name), hinstance);
 }

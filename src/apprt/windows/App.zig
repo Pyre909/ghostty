@@ -5298,7 +5298,7 @@ fn registerClasses(hinstance: win32.HINSTANCE) !void {
     errdefer _ = win32.UnregisterClassW(L(surface_class_name), hinstance);
 
     // The window each terminal's renderer presents to (RenderWindow.zig).
-    if (!RenderWindow.registerClass(hinstance)) return App.Error.Win32ClassRegistrationFailed;
+    try RenderWindow.registerClass(hinstance);
     errdefer RenderWindow.unregisterClass(hinstance);
 
     // CS_DBLCLKS: a double click on its empty part opens a tab; with it
