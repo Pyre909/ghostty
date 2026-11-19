@@ -3598,8 +3598,10 @@ pub const Surface = struct {
                 if (flags & win32.POINTER_MESSAGE_FLAG_CANCELED != 0) {
                     self.endPan();
                 } else if (self.mouse.pan) |*pan| {
+                    // The hold timer stops once, as the finger leaves.
+                    const was_moved = pan.moved;
                     pan.track(at, self.touchCell());
-                    if (pan.moved) _ = win32.KillTimer(self.hwnd, touch_hold_timer_id);
+                    if (pan.moved and !was_moved) _ = win32.KillTimer(self.hwnd, touch_hold_timer_id);
                     self.touchScroll(pan, at.y);
                 }
             },
