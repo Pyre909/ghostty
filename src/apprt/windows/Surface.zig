@@ -2406,16 +2406,17 @@ pub const Surface = struct {
 
             win32.WM_SIZE => {
                 self.ime.form = null;
+                // The render window first, at any size, the core's before
+                // it: the renderer's swap chain is sized by it, and a pane
+                // laid out at no width or height has a renderer that
+                // skips its frames only if the render window is empty too
+                // (`renderer.D3D11.surfaceSize`).
+                if (self.render_hwnd) |r| RenderWindow.place(r, win32.loword(lparam), win32.hiword(lparam));
                 // Visibility is the frame's to report (`occlusionChanged`):
                 // this window is never minimized itself.
                 switch (SizeChange.init(lparam)) {
                     .empty => {},
-                    .resize => |size| {
-                        // Before the core: the renderer's swap chain is
-                        // sized by the render window.
-                        if (self.render_hwnd) |r| RenderWindow.place(r, @intCast(size.width), @intCast(size.height));
-                        self.resize(size);
-                    },
+                    .resize => |size| self.resize(size),
                 }
                 return 0;
             },

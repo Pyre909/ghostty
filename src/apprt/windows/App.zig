@@ -11028,6 +11028,36 @@ test "win32: a render window that outlives its terminal paints without it" {
     _ = win32.SendMessageW(render, win32.WM_PAINT, 0, 0);
 }
 
+test "win32: a terminal laid out at no width or height empties its render window" {
+    // The renderer skips a frame while the window it presents to is
+    // empty (`renderer.D3D11.surfaceSize`): a pane given no width or
+    // height (`Placer.pane`) has its render window sized to nothing too.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    const render = a.render_hwnd.?;
+    RenderWindow.place(render, 120, 80);
+    var rect: win32.RECT = undefined;
+    try std.testing.expect(win32.GetClientRect(render, &rect).toBool());
+    try std.testing.expectEqual(120, rect.right);
+
+    for ([_]win32.LPARAM{ 0, 120, 80 << 16 }) |size| {
+        _ = win32.SendMessageW(a.hwnd, win32.WM_SIZE, 0, size);
+        try std.testing.expect(win32.GetClientRect(render, &rect).toBool());
+        try std.testing.expectEqual(win32.loword(size), rect.right);
+        try std.testing.expectEqual(win32.hiword(size), rect.bottom);
+    }
+}
+
 test "win32: toggle_background_opacity gives each live terminal an opaque background, then the configured one" {
     // `run` carries it out (`toggleBackgroundOpacity`): each live terminal
     // is given the app's configuration with `background-opacity` 1 at its
