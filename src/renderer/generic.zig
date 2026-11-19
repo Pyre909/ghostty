@@ -1864,9 +1864,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.api.recoverDevice() catch return false;
                     // The backend may have fallen back to a chain that
                     // composes no alpha (Direct3D 11's `followWindow`).
+                    const opacity = self.config.background_opacity;
                     opaqueUnlessPresentsAlpha(&self.api, &self.config);
                     self.reinitialize_shaders = true;
                     try self.prepBackgroundImage();
+                    // The uniforms and cells were built by `updateFrame`
+                    // at the opacity the chain no longer shows: drawn,
+                    // the background would be rgb * opacity, darker, not
+                    // translucent. Built again by the next `updateFrame`
+                    // instead, which the render thread is woken for, or
+                    // an idle terminal would keep this frame.
+                    if (self.config.background_opacity != opacity) {
+                        self.markDirty();
+                        if (self.render_wakeup) |wakeup| wakeup.notify() catch |err| {
+                            log.warn("error waking the render thread err={}", .{err});
+                        };
+                        return false;
+                    }
                 }
             }
 
