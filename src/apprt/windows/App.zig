@@ -8901,6 +8901,18 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     Touch.held(a);
     window.closing = false;
     try std.testing.expectEqual(1, Touch.menus);
+
+    // Nor while the mouse holds a button on the terminal, pressed before
+    // the finger or after it.
+    a.mouse.held.insert(.left);
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    Touch.held(a);
+    a.mouse.held = .empty;
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    a.mouse.held.insert(.left);
+    Touch.held(a);
+    a.mouse.held = .empty;
+    try std.testing.expectEqual(1, Touch.menus);
 }
 
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {

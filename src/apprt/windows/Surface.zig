@@ -3626,6 +3626,10 @@ pub const Surface = struct {
         // that comes down during one starts the timer again, and a window
         // stopping its terminals does not mark them as closing.
         if (pan.moved or self.closing or self.window.closing or !self.app.canTearDown()) return;
+        // Nor in the middle of a mouse's click or drag, whose capture the
+        // menu's loop would take, as the right button's menu waits for no
+        // button to be held (`handleMessage`).
+        if (self.mouse.held.count() != 0) return;
         var at = pan.start;
         if (!win32.ScreenToClient(self.hwnd, &at).toBool()) return;
         ContextMenu.show(self, at);
