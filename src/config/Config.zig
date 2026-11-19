@@ -347,7 +347,10 @@ language: ?[:0]const u8 = null,
 @"clipboard-codepoint-map": RepeatableClipboardCodepointMap = .{},
 
 /// Draw fonts with a thicker stroke, if supported.
-/// This is currently only supported on macOS.
+/// This is currently only supported on macOS and on Windows. On Windows
+/// the text is grown by as much as macOS grows it, which is up to 0.6
+/// of a pixel more width for each stroke; color glyphs are drawn as
+/// they are.
 @"font-thicken": bool = false,
 
 /// Strength of thickening when `font-thicken` is enabled.
@@ -357,7 +360,9 @@ language: ?[:0]const u8 = null,
 ///
 /// Has no effect when `font-thicken` is set to `false`.
 ///
-/// This is currently only supported on macOS.
+/// This is currently only supported on macOS and on Windows. macOS takes
+/// the strength in a few steps; Windows has a thickness for each value,
+/// the same as macOS's where each of its steps begins.
 @"font-thicken-strength": u8 = 255,
 
 /// Locations to break font shaping into multiple runs.
