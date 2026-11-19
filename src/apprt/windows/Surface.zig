@@ -3636,7 +3636,31 @@ pub const Surface = struct {
         if (!win32.IsWindowVisible(self.hwnd).toBool()) return;
         var at = pan.start;
         if (!win32.ScreenToClient(self.hwnd, &at).toBool()) return;
+        // The right click Windows made of it before: the core answers it
+        // as `right-click-action` says, selecting the word under it by
+        // default, and the menu opens only for a press it left to the
+        // menu, as on the right button's release (`handleMessage`). A
+        // program that reads the mouse is not told of a finger, though:
+        // there the menu opens at once, as touch has no other way to it.
+        const consumed: ?bool = if (self.liveCore()) |core_surface|
+            (if (core_surface.mouseReportingActive()) false else self.heldClick(core_surface, at))
+        else if (testMouseButton(self, .right, .press)) |answer|
+            answer
+        else
+            false;
+        if (consumed orelse true) return;
         ContextMenu.show(self, at);
+    }
+
+    /// A right press and release at `at`, in the client area, for a finger
+    /// held still: the press's answer, as `mouseButton` gives it.
+    fn heldClick(self: *Surface, core_surface: *CoreSurface, at: win32.POINT) ?bool {
+        const pos: apprt.CursorPos = .{ .x = @floatFromInt(at.x), .y = @floatFromInt(at.y) };
+        const mods: input.Mods = if (self.focused) currentMods().binding() else .{};
+        const consumed = self.mouseButton(core_surface, .right, .press, win32.MK_RBUTTON, pos, mods) orelse
+            return null;
+        _ = self.mouseButton(core_surface, .right, .release, 0, pos, mods);
+        return consumed;
     }
 
     /// The height of the terminal's rows, in pixels.

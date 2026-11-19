@@ -8924,6 +8924,31 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     Touch.held(a);
     _ = win32.ShowWindow(a.hwnd, win32.SW_SHOWNA);
     try std.testing.expectEqual(1, Touch.menus);
+
+    // The hold is the right button's press: the menu opens only for a
+    // press the core leaves to it, and none for one it consumed, as
+    // `right-click-action` other than the menu has it do.
+    const Right = struct {
+        var consumed: bool = false;
+        var presses: usize = 0;
+        fn answer(_: *Surface, button: Surface.Mouse.Button, state: input.MouseButtonState) ?bool {
+            if (button == .right and state == .press) presses += 1;
+            return consumed;
+        }
+    };
+    Right.presses = 0;
+    Surface.test_mouse_button = &Right.answer;
+    defer Surface.test_mouse_button = null;
+    Right.consumed = true;
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    Touch.held(a);
+    try std.testing.expectEqual(1, Right.presses);
+    try std.testing.expectEqual(1, Touch.menus);
+    Right.consumed = false;
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    Touch.held(a);
+    try std.testing.expectEqual(2, Right.presses);
+    try std.testing.expectEqual(2, Touch.menus);
 }
 
 test "win32: focus-follows-mouse focuses the split the pointer moves over" {
