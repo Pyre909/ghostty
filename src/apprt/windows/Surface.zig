@@ -673,6 +673,8 @@ pub const Surface = struct {
         /// Windows Terminal (`TouchMoved` in its ControlInteractivity.cpp):
         /// the content follows the finger, from half a row's move on.
         const Pan = struct {
+            /// The finger's pointer id.
+            id: u16,
             /// Where the rows scrolled so far have brought the finger, in
             /// pixels down the screen.
             anchor: i32,
@@ -3563,13 +3565,16 @@ pub const Surface = struct {
     /// have made of it. Only the first finger counts; the others do
     /// nothing.
     pub fn touchPointer(self: *Surface, msg: win32.UINT, wparam: win32.WPARAM, lparam: win32.LPARAM) bool {
-        // Whichever device it was: the contact is over, and the id in this
-        // message's wParam is not one to ask about.
+        // The finger's own contact is over, and its message is taken, as
+        // the rest of its messages were. Another pointer's is left to
+        // Windows: its id is not one to ask GetPointerType about.
+        const id: u16 = @truncate(wparam);
         if (msg == win32.WM_POINTERCAPTURECHANGED) {
-            self.endPan();
-            return false;
+            const ours = if (self.mouse.pan) |pan| pan.id == id else false;
+            if (ours) self.endPan();
+            return ours;
         }
-        if (!isTouch(@truncate(wparam))) return false;
+        if (!isTouch(id)) return false;
         // Not under a prompt, as no other input reaches the core then
         // (`syncMouse`): a prompt's loop dispatches the finger's messages
         // with a core frame beneath it. Taken all the same, so that
@@ -3584,7 +3589,7 @@ pub const Surface = struct {
         switch (msg) {
             win32.WM_POINTERDOWN => {
                 _ = self.clickFocus();
-                self.mouse.pan = .{ .anchor = at.y, .start = at };
+                self.mouse.pan = .{ .id = id, .anchor = at.y, .start = at };
                 if (win32.SetTimer(self.hwnd, touch_hold_timer_id, touch_hold_ms, null) == 0) {
                     log.warn("SetTimer failed, a held finger shows no menu err={}", .{win32.GetLastError()});
                 }
@@ -4294,7 +4299,7 @@ test "win32: a wheel's ticks go to the core as they are, its lines in pixels" {
 }
 
 test "win32: a finger's move scrolls from half a row on, and keeps what is left of one" {
-    var pan: Surface.Mouse.Pan = .{ .anchor = 100, .start = .{ .x = 0, .y = 100 } };
+    var pan: Surface.Mouse.Pan = .{ .id = 1, .anchor = 100, .start = .{ .x = 0, .y = 100 } };
     try std.testing.expectEqual(0, pan.add(109, 20));
     try std.testing.expectEqual(0, pan.add(91, 20));
     try std.testing.expectEqual(1, pan.add(110, 20));
@@ -4312,12 +4317,12 @@ test "win32: a finger's move scrolls from half a row on, and keeps what is left 
 
 test "win32: a finger has left its place at half a row, across or down" {
     const at: win32.POINT = .{ .x = 50, .y = 100 };
-    var pan: Surface.Mouse.Pan = .{ .anchor = at.y, .start = at };
+    var pan: Surface.Mouse.Pan = .{ .id = 1, .anchor = at.y, .start = at };
     pan.track(.{ .x = 59, .y = 91 }, 20);
     try std.testing.expect(!pan.moved);
     pan.track(.{ .x = 40, .y = 100 }, 20);
     try std.testing.expect(pan.moved);
-    pan = .{ .anchor = at.y, .start = at };
+    pan = .{ .id = 1, .anchor = at.y, .start = at };
     pan.track(.{ .x = 50, .y = 110 }, 20);
     try std.testing.expect(pan.moved);
     // Having left, it has left, wherever it comes back to.
