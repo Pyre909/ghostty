@@ -49,7 +49,10 @@ pub fn apply(window: *Window) void {
     if (builtin.is_test and test_extend == null) return;
     if (Transparency.build() < Transparency.backdrop_build) return;
     const top = wanted(window);
-    if (top == window.mica_top) return;
+    // As it is, unless left extended under another backdrop: a frame
+    // DWM would not take the reach from as it turned transparent
+    // (`leave`) asks for Mica again on turning opaque.
+    if (top == window.mica_top and (top == 0 or window.backdrop == .mica)) return;
     if (window.backdrop != .mica) {
         if (!Transparency.startBufferedPaint(window)) return;
         const hr = Transparency.askBackdrop(window.hwnd, .mica);

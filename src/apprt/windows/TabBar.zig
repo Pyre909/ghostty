@@ -876,7 +876,9 @@ fn paint(window: *Window, hwnd: win32.HWND) void {
     if (client.right <= 0 or client.bottom <= 0) return;
 
     const colors = Colors.of(window);
-    if (window.mica_top > 0 and paintOverMica(window, hwnd, hdc, client, colors, font)) return;
+    // Not in a transparent frame, which a refusal can leave extended
+    // (`Mica.leave`): its bar is layered, not over Mica.
+    if (window.mica_top > 0 and !window.transparent and paintOverMica(window, hwnd, hdc, client, colors, font)) return;
 
     // Drawn off the screen, then copied at once, so that it never flickers.
     const mem = win32.CreateCompatibleDC(hdc) orelse return;

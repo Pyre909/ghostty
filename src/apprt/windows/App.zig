@@ -18891,6 +18891,61 @@ test "win32: a title prompt's title bar follows its window's" {
     try std.testing.expect(!try darkBar(dialog));
 }
 
+test "win32: Mica leaves a frame turned transparent at a reload, and comes back" {
+    // Turned transparent (`Window.setTransparent`), the frame loses Mica
+    // and its reach over the bar; turned opaque again, both come back
+    // with the layout. Also when DWM would not take the reach away
+    // (`Mica.leave`), which leaves the frame extended under another
+    // backdrop.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    const dwm = struct {
+        var top: i32 = -1;
+        var refuse = false;
+        fn extend(_: win32.HWND, t: i32) bool {
+            if (refuse) return false;
+            top = t;
+            return true;
+        }
+        fn caption(_: win32.HWND, _: win32.DWORD, _: win32.COLORREF) bool {
+            return true;
+        }
+    };
+    TestClear.start(2);
+    defer TestClear.stop();
+    Mica.test_extend = &dwm.extend;
+    defer Mica.test_extend = null;
+    Window.test_caption = &dwm.caption;
+    defer Window.test_caption = null;
+
+    // Three tabs, so the bar shows, with Mica behind it.
+    const t = try TestOverview.init(&app);
+    const window = t.window;
+    const height = window.barHeight();
+    try std.testing.expect(height > 0);
+    try std.testing.expectEqual(height, window.mica_top);
+    try std.testing.expect(window.backdrop == .mica);
+
+    for ([_]bool{ false, true }) |refuse| {
+        dwm.refuse = refuse;
+        try std.testing.expect(window.setTransparent(true));
+        dwm.refuse = false;
+        try std.testing.expectEqual(if (refuse) height else 0, window.mica_top);
+        try std.testing.expect(window.backdrop != .mica);
+        try std.testing.expect(window.setTransparent(false));
+        window.relayout();
+        try std.testing.expect(window.backdrop == .mica);
+        try std.testing.expectEqual(height, dwm.top);
+        try std.testing.expectEqual(height, window.mica_top);
+    }
+}
+
 test "win32: an opaque frame's tab bar shows its Mica, but not under window-theme = ghostty" {
     // The frame asks for Mica once and reaches over the bar while it
     // shows (Mica.zig); not under the configured colours, without a title
