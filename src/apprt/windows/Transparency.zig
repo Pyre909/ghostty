@@ -428,6 +428,25 @@ test "win32: a window layered over a transparent frame is opaque, and one that c
     try testing.expectEqual(before, win32.GetWindowLongPtrW(refused, win32.GWL_EXSTYLE));
 }
 
+test "win32: chrome of a frame turned opaque is layered no more" {
+    // `chromeAgain` both ways on a pop-up, which the test runner can
+    // layer: on with the frame, and off, so GDI draws it opaque again.
+    const testing = std.testing;
+    const hwnd = try testPopup();
+    defer _ = win32.DestroyWindow(hwnd);
+    const layered: isize = win32.WS_EX_LAYERED;
+    var window: Window = undefined;
+    window.transparent = true;
+    chromeAgain(&window, hwnd);
+    try testing.expect(win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE) & layered != 0);
+    window.transparent = false;
+    chromeAgain(&window, hwnd);
+    try testing.expect(win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE) & layered == 0);
+    // Nothing to take off a second time.
+    chromeAgain(&window, hwnd);
+    try testing.expect(win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE) & layered == 0);
+}
+
 test "win32: blur-behind turns on and off again" {
     // With DWM's own answers: off was refused with the empty region
     // (E_INVALIDARG), which left a frame that `frameMade` gave up on

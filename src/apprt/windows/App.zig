@@ -11087,6 +11087,72 @@ test "win32: a renderer follows its terminal to a transparent frame and hands th
     try std.testing.expect(win32.IsWindow(second).toBool());
 }
 
+test "win32: a split turned transparent and back changes its chrome and backdrop, not its dim" {
+    // The link preview is layered with the frame; the dim, layered for
+    // its own alpha whatever the frame (`own_layering`), is not layered
+    // again, which would reset its alpha so that it covered its pane.
+    // The frame gets acrylic, and the default back. The test runner
+    // cannot layer a child window (no manifest), so only the asking is
+    // seen (`TestClear`), not the style, nor its taking off: the
+    // Transparency.zig test takes it off a pop-up.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(1);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+    const latched = UnfocusedSplit.cannot_layer;
+    UnfocusedSplit.cannot_layer = false;
+    defer UnfocusedSplit.cannot_layer = latched;
+
+    const window = try testFrame(&app);
+    testResize(window, 900, 500);
+    const a = try testPane(&app, window);
+    const b = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{ a, b });
+    window.tab().focused = a;
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    const dim = b.overlays.dim.hwnd orelse return error.TestUnexpectedResult;
+    const link = a.overlays.link_preview.hwnd orelse return error.TestUnexpectedResult;
+    const layers = struct {
+        fn of(hwnd: win32.HWND) usize {
+            var n: usize = 0;
+            for (TestClear.layered[0..TestClear.layered_count]) |l| n += @intFromBool(l == hwnd);
+            return n;
+        }
+    };
+    const dim_layers = layers.of(dim);
+    try std.testing.expectEqual(1, dim_layers);
+    try std.testing.expect(!TestClear.isLayered(link));
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-blur" = .true;
+    for ([_]f64{ 0.5, 1 }) |opacity| {
+        changed.@"background-opacity" = opacity;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        a.core_state = .live;
+        b.core_state = .live;
+        app.followTransparency();
+        a.core_state = .none;
+        b.core_state = .none;
+        try std.testing.expectEqual(opacity < 1, window.transparent);
+        try std.testing.expectEqual(dim_layers, layers.of(dim));
+    }
+    try std.testing.expect(TestClear.isLayered(link));
+    try std.testing.expect(TestClear.backdrop_count >= 2);
+    try std.testing.expectEqual(.acrylic, TestClear.backdrops[TestClear.backdrop_count - 2]);
+    try std.testing.expectEqual(.default, TestClear.backdrops[TestClear.backdrop_count - 1]);
+    try std.testing.expect(window.backdrop != .acrylic);
+}
+
 test "win32: a window DWM will not make transparent at a reload stays opaque" {
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
