@@ -67,7 +67,7 @@ pub const RenderOptions = struct {
     /// Thicken the glyph. This draws the glyph with a thicker stroke width.
     /// This is purely an aesthetic setting.
     ///
-    /// This only works with CoreText currently.
+    /// This only works with CoreText and DirectWrite currently.
     thicken: bool = false,
 
     /// "Strength" of the thickening, between `0` and `255`.
@@ -76,7 +76,7 @@ pub const RenderOptions = struct {
     /// `0` does not correspond to *no* thickening,
     /// just the *lightest* thickening available.
     ///
-    /// CoreText only.
+    /// CoreText and DirectWrite only.
     thicken_strength: u8 = 255,
 
     /// See the `constraint` field.
