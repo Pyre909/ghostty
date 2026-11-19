@@ -723,7 +723,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// so per instance with `presentsAlpha` (Direct3D 11: an HWND chain
         /// or a composition chain, chosen per window at init); one without
         /// it composes alpha. Every config the renderer adopts goes through
-        /// here: in `init` and `changeConfig`.
+        /// here: in `init` and `changeConfig`, and again after a device
+        /// recovery, which may change the answer.
         pub fn opaqueUnlessPresentsAlpha(api: *const GraphicsAPI, config: *DerivedConfig) void {
             if (comptime !@hasDecl(GraphicsAPI, "presentsAlpha")) return;
             if (!api.presentsAlpha()) config.background_opacity = 1;
@@ -1861,6 +1862,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.bg_image = null;
                     }
                     self.api.recoverDevice() catch return false;
+                    // The backend may have fallen back to a chain that
+                    // composes no alpha (Direct3D 11's `followWindow`).
+                    opaqueUnlessPresentsAlpha(&self.api, &self.config);
                     self.reinitialize_shaders = true;
                     try self.prepBackgroundImage();
                 }
@@ -2331,6 +2335,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.config.deinit();
             self.config = config.*;
+            // The apprt changes where the backend presents before it
+            // sends the config that wants it (Direct3D 11: a new render
+            // window when its frame turns transparent). The backend
+            // follows here, and draws there from the next frame, so the
+            // config is judged by where it will present.
+            if (comptime @hasDecl(GraphicsAPI, "followWindow")) self.api.followWindow();
             opaqueUnlessPresentsAlpha(&self.api, &self.config);
 
             // If our background image path changed, prepare the new bg image.

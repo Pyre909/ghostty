@@ -28,13 +28,16 @@
 //! reports it, or at the end of any frame it failed some other way first.
 //! The generic renderer then releases what it created on the device and
 //! `recoverDevice` creates a new one for the same window, after which
-//! everything is rebuilt lazily, as after an unrealize. That swap chain is
-//! created off the window's thread, which keeps pumping, so DXGI can take
-//! an Alt+Enter on it to full-screen before `createGpu` turns that
-//! handling off; see `fullscreen_chain`. A device on the
-//! software rasterizer is replaced the same way once the adapters change,
-//! so a surface that recovered onto it while a driver was being replaced
-//! moves back to the GPU when the driver returns.
+//! everything is rebuilt lazily, as after an unrealize. A terminal whose
+//! window turns transparent or opaque is followed the same way, onto the
+//! render window and kind of chain it then asks for (`followWindow`). A
+//! device on the software rasterizer is replaced the same way once the
+//! adapters change, so a surface that recovered onto it while a driver
+//! was being replaced moves back to the GPU when the driver returns.
+//!
+//! The swap chain is created off the window's thread, which keeps
+//! pumping, so DXGI can take an Alt+Enter on it to full-screen before
+//! `createGpu` turns that handling off; see `fullscreen_chain`.
 //!
 //! This is the Windows renderer: every pipeline the other backends draw is
 //! here, custom shaders included.
@@ -80,11 +83,14 @@ pub const custom_shader_y_is_down = true;
 /// HWND chain is not: DXGI only allows it DXGI_ALPHA_MODE_IGNORE, so DWM
 /// composes the window as opaque, and the premultiplied background would
 /// show as its colour scaled toward black; generic.zig draws it opaque
-/// instead (`opaqueUnlessPresentsAlpha`). The chain never changes after
-/// init, so neither does the answer.
+/// instead (`opaqueUnlessPresentsAlpha`). The chain changes only by
+/// `followWindow`, and by `recoverDevice` when the composition chain it
+/// follows to cannot be made; generic.zig asks again after each.
 pub fn presentsAlpha(self: *const D3D11) bool {
     return self.chain == .composition;
 }
+
+const RtSurface = if (apprt.runtime == apprt.windows) ?*apprt.Surface else void;
 
 /// The two kinds of swap chain; see the top of this file.
 const Chain = enum {
@@ -222,8 +228,23 @@ lost: bool = false,
 vsync: bool,
 
 /// The kind of swap chain this window presents through, chosen at init
-/// and kept for `recoverDevice`, which makes the same kind or fails.
+/// and by `followWindow`, and kept for `recoverDevice`.
 chain: Chain,
+
+/// The terminal drawn, on the Windows apprt, whose render window
+/// `followWindow` follows; null for the tests' bare windows.
+rt_surface: RtSurface = if (RtSurface == void) {} else null,
+
+/// The render window left by `followWindow`, still holding the old chain
+/// until `recoverDevice` releases it, then handed back to the terminal to
+/// destroy. Render thread only.
+left: ?api.HWND = null,
+
+/// Set by `followWindow` until `recoverDevice` makes the new chain. A
+/// composition chain that cannot be made for the new window then falls
+/// back to an HWND chain, as at init, rather than leaving the terminal
+/// undrawn; a plain device loss retries the same kind instead.
+following: bool = false,
 
 /// The DirectComposition objects that show a composition chain; null for
 /// an HWND chain and while the GPU objects are released.
@@ -380,25 +401,27 @@ pub fn init(
     _ = alloc;
     _ = device;
 
-    const hwnd: api.HWND = switch (apprt.runtime) {
-        apprt.windows => opts.rt_surface.renderHwnd(),
-        apprt.embedded => switch (opts.rt_surface.platform) {
-            .windows => |v| v.hwnd,
-            // Platform.init refuses these tags on Windows.
-            .macos, .ios => unreachable,
+    switch (apprt.runtime) {
+        apprt.windows => {
+            // The terminal's render window, with a composition chain if
+            // it was made for a transparent frame.
+            const target = opts.rt_surface.renderTarget();
+            var self = try initWindow(target.hwnd, try loadCompiler(), opts.config.vsync, opts.config.blending, if (target.alpha) .composition else .hwnd);
+            self.rt_surface = opts.rt_surface;
+            return self;
+        },
+        // A host owns its window and Ghostty cannot know what its frame
+        // draws, so an embedded surface keeps the HWND chain.
+        apprt.embedded => {
+            const hwnd: api.HWND = switch (opts.rt_surface.platform) {
+                .windows => |v| v.hwnd,
+                // Platform.init refuses these tags on Windows.
+                .macos, .ios => unreachable,
+            };
+            return initWindow(hwnd, try loadCompiler(), opts.config.vsync, opts.config.blending, .hwnd);
         },
         else => @compileError("unsupported apprt for Direct3D 11"),
-    };
-
-    // A host owns its window and Ghostty cannot know what its frame
-    // draws, so an embedded surface keeps the HWND chain.
-    const chain: Chain = switch (apprt.runtime) {
-        apprt.windows => if (opts.rt_surface.presentsAlpha()) .composition else .hwnd,
-        apprt.embedded => .hwnd,
-        else => unreachable,
-    };
-
-    return initWindow(hwnd, try loadCompiler(), opts.config.vsync, opts.config.blending, chain);
+    }
 }
 
 /// `init` once the window and its chain are known. A composition chain
@@ -1008,6 +1031,57 @@ pub fn drawFrameUnlocked(self: *D3D11) void {
     self.fullscreen_chain = null;
 }
 
+/// Follow the terminal to the render window and kind of chain it now
+/// asks for (`Surface.renderTarget`): a terminal whose frame turns
+/// transparent gets a new render window, since the one it has kept the
+/// HWND chain's last frame (RenderWindow.zig), and one turning opaque
+/// keeps its window and changes the chain. Either way the device is
+/// treated as lost, so the next frame releases everything and
+/// `recoverDevice` builds it again for the new target, the path a GPU
+/// reset takes. generic.zig calls this from `changeConfig`, which the
+/// terminal sends after it changed the target, before it asks
+/// `presentsAlpha`. Render thread, under the draw mutex.
+pub fn followWindow(self: *D3D11) void {
+    if (comptime RtSurface == void) return;
+    const surface = self.rt_surface orelse return;
+    const target = surface.renderTarget();
+    self.follow(target.hwnd, if (target.alpha) .composition else .hwnd);
+}
+
+/// `followWindow` once the target is known.
+fn follow(self: *D3D11, hwnd: api.HWND, chain: Chain) void {
+    if (hwnd == self.hwnd and chain == self.chain) return;
+    if (hwnd != self.hwnd) {
+        if (self.left == null) {
+            // The old chain is on this one until recovery releases it.
+            self.left = self.hwnd;
+        } else {
+            // Followed twice before a frame: this one, between the
+            // two, never had a chain.
+            self.handBack(self.hwnd);
+        }
+    }
+    log.info("following the terminal old_hwnd={x} hwnd={x} old_chain={t} chain={t}", .{
+        @intFromPtr(self.hwnd), @intFromPtr(hwnd), self.chain, chain,
+    });
+    self.hwnd = hwnd;
+    self.chain = chain;
+    self.following = true;
+    self.lost = true;
+    // Not a failure to wait out: the next frame rebuilds.
+    self.recovery.succeeded();
+}
+
+/// Give a render window this renderer left back to its terminal to
+/// destroy (`Surface.renderLeft`); the tests' bare windows are recorded
+/// in `test_handed_back` instead.
+fn handBack(self: *D3D11, old: api.HWND) void {
+    if (comptime RtSurface != void) if (self.rt_surface) |surface| return surface.renderLeft(old);
+    if (builtin.is_test) test_handed_back = old;
+}
+
+var test_handed_back: ?api.HWND = null;
+
 /// Whether the device was lost since the last frame. The generic renderer
 /// asks at the start of every frame and, when so, releases everything it
 /// created on the device before calling `recoverDevice`.
@@ -1027,20 +1101,28 @@ pub fn recoveryDelayMs(self: *const D3D11) ?u64 {
 }
 
 /// Replace a lost device: release it with everything created on it, and
-/// create them again for the same window, with the same kind of chain.
-/// Under the draw mutex, on the thread drawing the frame, after the
-/// generic renderer released its own resources. On failure the device
-/// stays lost, the caller draws nothing, and the first frame after
-/// `recovery_retry_ms` tries again. A composition chain that cannot be
-/// made is such a failure, not a fall back to an HWND chain: generic.zig
-/// adopted its configs by `presentsAlpha`, which must not change.
+/// create them again for the window and kind of chain kept, the same as
+/// before unless `followWindow` changed them. Under the draw mutex, on
+/// the thread drawing the frame, after the generic renderer released its
+/// own resources. On failure the device stays lost, the caller draws
+/// nothing, and the first frame after `recovery_retry_ms` tries again.
+/// A composition chain that cannot be made is such a failure after a
+/// device loss, which may be passing, but falls back to an HWND chain
+/// after `followWindow`, as at init; generic.zig asks `presentsAlpha`
+/// again after a recovery either way.
 pub fn recoverDevice(self: *D3D11) !void {
     assert(self.lost);
     self.releaseGpu();
     const now: std.Io.Timestamp = .now(global.io(), .awake);
     if (self.recovery.delayMs(now) > 0) return error.DeviceLost;
     if (self.fullscreen_chain != null) return error.DeviceLost;
-    const gpu = createGpu(self.hwnd, self.vsync, self.chain) catch |err| {
+    const gpu = createGpu(self.hwnd, self.vsync, self.chain) catch |first| gpu: {
+        var err = first;
+        if (err == error.D3D11CompositionFailed and self.following) {
+            log.warn("no composition swap chain for hwnd={x}; presenting through an HWND chain, opaque", .{@intFromPtr(self.hwnd)});
+            self.chain = .hwnd;
+            if (createGpu(self.hwnd, self.vsync, .hwnd)) |g| break :gpu g else |e| err = e;
+        }
         self.recovery.failed(now);
         log.err("D3D11 device recovery failed err={}; retrying in {d}ms", .{ err, recovery_retry_ms });
         return err;
@@ -1059,7 +1141,15 @@ pub fn recoverDevice(self: *D3D11) !void {
 
     self.recovery.succeeded();
     self.lost = false;
+    self.following = false;
     log.info("D3D11 device recovered hwnd={x}", .{@intFromPtr(self.hwnd)});
+
+    // The old chain was released with the old device: the window it
+    // was on can go.
+    if (self.left) |old| {
+        self.left = null;
+        self.handBack(old);
+    }
 }
 
 /// A device on the software rasterizer is given up once the adapters
@@ -1520,6 +1610,94 @@ test "d3d11: a window whose composition target is taken gets an opaque HWND chai
     try testing.expect(!second.presentsAlpha());
     try testing.expect(second.composition == null);
     try testing.expectEqual(Chain.hwnd, second.chain);
+}
+
+test "d3d11: a renderer follows its terminal to a new window and chain" {
+    // As a window turns transparent and back: from an HWND chain to a
+    // composition chain on another window, then to an HWND chain on that
+    // one, each through the next frame's recovery. The window left is
+    // handed back only once its chain is gone.
+    const testing = std.testing;
+    const a = try testWindow();
+    defer _ = win32.DestroyWindow(a);
+    const b = try testWindow();
+    defer _ = win32.DestroyWindow(b);
+    test_handed_back = null;
+    defer test_handed_back = null;
+
+    var r = try initWindow(a, try loadCompiler(), true, .native, .hwnd);
+    defer r.deinit();
+    r.follow(a, .hwnd);
+    try testing.expect(!r.lost);
+
+    r.follow(b, .composition);
+    try testing.expect(r.lost);
+    try testing.expect(r.presentsAlpha());
+    try testing.expect(test_handed_back == null);
+    try r.recoverDevice();
+    try testing.expect(!r.lost);
+    try testing.expect(r.hwnd == b);
+    try testing.expect(r.presentsAlpha());
+    try testing.expect(r.composition != null);
+    try testing.expect(test_handed_back == a);
+    try testing.expect(!r.following);
+    try expectPresents(&r, .PREMULTIPLIED);
+
+    test_handed_back = null;
+    r.follow(b, .hwnd);
+    try testing.expect(!r.presentsAlpha());
+    try r.recoverDevice();
+    try testing.expect(r.composition == null);
+    try testing.expect(test_handed_back == null);
+    try expectPresents(&r, .IGNORE);
+}
+
+test "d3d11: a renderer followed twice before a frame hands back the window between" {
+    const testing = std.testing;
+    const a = try testWindow();
+    defer _ = win32.DestroyWindow(a);
+    const b = try testWindow();
+    defer _ = win32.DestroyWindow(b);
+    const c = try testWindow();
+    defer _ = win32.DestroyWindow(c);
+    test_handed_back = null;
+    defer test_handed_back = null;
+
+    var r = try initWindow(a, try loadCompiler(), true, .native, .hwnd);
+    defer r.deinit();
+    r.follow(b, .composition);
+    try testing.expect(test_handed_back == null);
+    r.follow(c, .composition);
+    try testing.expect(test_handed_back == b);
+    try r.recoverDevice();
+    try testing.expect(r.hwnd == c);
+    try testing.expect(test_handed_back == a);
+    try expectPresents(&r, .PREMULTIPLIED);
+}
+
+test "d3d11: a renderer followed to a window whose composition target is taken presents opaque" {
+    // As at init: drawn opaque rather than not at all, and generic.zig
+    // asks `presentsAlpha` again after the recovery.
+    const testing = std.testing;
+    const a = try testWindow();
+    defer _ = win32.DestroyWindow(a);
+    const b = try testWindow();
+    defer _ = win32.DestroyWindow(b);
+    const compile = try loadCompiler();
+    test_handed_back = null;
+    defer test_handed_back = null;
+
+    var holder = try initWindow(b, compile, true, .native, .composition);
+    defer holder.deinit();
+    var r = try initWindow(a, compile, true, .native, .hwnd);
+    defer r.deinit();
+    r.follow(b, .composition);
+    try r.recoverDevice();
+    try testing.expect(!r.lost);
+    try testing.expect(!r.presentsAlpha());
+    try testing.expect(r.composition == null);
+    try testing.expect(test_handed_back == a);
+    try expectPresents(&r, .IGNORE);
 }
 
 test "d3d11: only a composition chain keeps the background's opacity" {

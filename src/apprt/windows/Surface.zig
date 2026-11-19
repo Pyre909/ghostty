@@ -1564,12 +1564,6 @@ pub const Surface = struct {
         return question.text("Close Split?", "The currently running process in this split will be terminated.");
     }
 
-    /// The window the renderer presents to: the render window, or this
-    /// terminal's own if there is none.
-    pub fn renderHwnd(self: *const Surface) win32.HWND {
-        return self.render_hwnd orelse self.hwnd;
-    }
-
     /// Where the renderer is to present, and whether with alpha
     /// (`render_alpha`): the render window, or this terminal's own if
     /// there is none. From any thread.
