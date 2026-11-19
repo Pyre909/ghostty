@@ -8849,6 +8849,10 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     const a = try testPane(&app, window);
     window.tab().tree = try testRow(alloc, &.{a});
     window.tab().focused = a;
+    // Shown, as a held finger opens no menu for a hidden terminal.
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    try std.testing.expect(win32.IsWindowVisible(a.hwnd).toBool());
 
     // A tap, a jitter of the finger allowed.
     Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 100);
@@ -8912,6 +8916,13 @@ test "win32: a finger's tap asks for the touch keyboard, and held still opens th
     a.mouse.held.insert(.left);
     Touch.held(a);
     a.mouse.held = .empty;
+    try std.testing.expectEqual(1, Touch.menus);
+
+    // Nor for a terminal hidden since the finger came down.
+    Touch.send(a, win32.WM_POINTERDOWN, Touch.primary, 100, 120);
+    _ = win32.ShowWindow(a.hwnd, win32.SW_HIDE);
+    Touch.held(a);
+    _ = win32.ShowWindow(a.hwnd, win32.SW_SHOWNA);
     try std.testing.expectEqual(1, Touch.menus);
 }
 

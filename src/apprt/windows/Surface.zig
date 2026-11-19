@@ -3630,6 +3630,10 @@ pub const Surface = struct {
         // menu's loop would take, as the right button's menu waits for no
         // button to be held (`handleMessage`).
         if (self.mouse.held.count() != 0) return;
+        // Nor for a terminal hidden since the finger came down, by a tab
+        // switch, a zoom or the quick terminal: its window or one of its
+        // parents is hidden, and the menu would give it the focus.
+        if (!win32.IsWindowVisible(self.hwnd).toBool()) return;
         var at = pan.start;
         if (!win32.ScreenToClient(self.hwnd, &at).toBool()) return;
         ContextMenu.show(self, at);
