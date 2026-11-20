@@ -14,7 +14,6 @@ const configpkg = @import("../../config.zig");
 const global = @import("../../global.zig");
 const internal_os = @import("../../os/main.zig");
 const termio = @import("../../termio.zig");
-const HandoffSize = @import("handoff.zig").Size;
 
 const log = std.log.scoped(.win32);
 
@@ -39,10 +38,6 @@ title: ?[:0]const u8 = null,
 /// in place of starting the command. The slot is the asker's, and the
 /// terminal empties it as it takes the console (`Surface.takeHandoff`).
 handoff: ?*?termio.Exec.Handoff = null,
-
-/// Not from arguments: the size in cells a handed-off console's program
-/// asked for, in place of `window-width` and `window-height`.
-size: ?HandoffSize = null,
 
 pub const ParseError = Allocator.Error || error{
     /// A `--command=` that does not parse, for which GTK does nothing.
@@ -146,11 +141,6 @@ pub fn apply(self: *const Overrides, config: *configpkg.Config) Allocator.Error!
     if (self.working_directory) |wd| if (wd == .inherit) {
         config.@"working-directory" = .inherit;
     };
-    // The least the configuration takes (`Config.finalize`).
-    if (self.size) |size| {
-        config.@"window-width" = @max(10, size.cols);
-        config.@"window-height" = @max(4, size.rows);
-    }
 }
 
 /// The path a new terminal starts in, for one that would inherit
@@ -291,17 +281,6 @@ test "win32: IPC overrides give a new terminal's configuration its command and s
     try std.testing.expectEqual(.home, config.@"working-directory".?);
     try (try parse(alloc, &.{"--working-directory=inherit"})).apply(&config);
     try std.testing.expectEqual(.inherit, config.@"working-directory".?);
-}
-
-test "win32: a handed-off console's size is the window's, at least the configuration's least" {
-    var config = try configpkg.Config.default(std.testing.allocator);
-    defer config.deinit();
-    try (Overrides{ .size = .{ .cols = 120, .rows = 40 } }).apply(&config);
-    try std.testing.expectEqual(120, config.@"window-width");
-    try std.testing.expectEqual(40, config.@"window-height");
-    try (Overrides{ .size = .{ .cols = 3, .rows = 1 } }).apply(&config);
-    try std.testing.expectEqual(10, config.@"window-width");
-    try std.testing.expectEqual(4, config.@"window-height");
 }
 
 test "win32: a command or a console handed off replaces the shell" {

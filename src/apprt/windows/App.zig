@@ -824,7 +824,7 @@ pub const App = struct {
                 entry.handoff.deinit();
                 continue;
             };
-            request.* = .{ .handoff = entry.handoff, .size = entry.size, .maximized = entry.maximized };
+            request.* = .{ .handoff = entry.handoff, .maximized = entry.maximized };
             self.requests.append(alloc, .{ .handoff = request }) catch |err| {
                 log.warn("cannot record a console handed off, closing it err={}", .{err});
                 request.destroy(alloc);
@@ -836,7 +836,6 @@ pub const App = struct {
     const HandoffRequest = struct {
         /// Emptied by the terminal that takes it (`Surface.takeHandoff`).
         handoff: ?termio.Exec.Handoff,
-        size: ?handoff.Size,
         maximized: bool,
 
         /// Closing a console not taken ends its program, as closing its
@@ -848,14 +847,14 @@ pub const App = struct {
     };
 
     /// Open a window for a console handed off, as `ipcAction` opens one
-    /// for `ghostty +new-window`, at the size and, maximized, as its
-    /// program asked. Should the window fail, the console is closed.
+    /// for `ghostty +new-window`, maximized if its program asked. Should the
+    /// window fail, the console is closed.
     fn openHandoff(self: *App, request: *HandoffRequest) void {
         defer request.destroy(self.core_app.alloc);
         // Its window, or its failure, ends the wait: a window that cannot
         // open leaves none, and the instance quits as one would.
         self.endHandoffWait();
-        const overrides: Overrides = .{ .handoff = &request.handoff, .size = request.size };
+        const overrides: Overrides = .{ .handoff = &request.handoff };
         const window = self.newWindow(null, .normal, &overrides) catch |err| {
             log.warn("cannot open a window for a console handed off, closing it err={}", .{err});
             return;
@@ -35338,7 +35337,7 @@ test "win32: quitting stops the app's IPC, and so does the session's end" {
     }
 }
 
-test "win32: a console handed off opens a window, at the size and state its program asked, or is closed" {
+test "win32: a console handed off opens a window, maximized as its program asked, or is closed" {
     // On a desktop of its own: its windows show (testOnOwnDesktop).
     try testOnOwnDesktop(testHandoffWindow, .{});
 }
@@ -35348,27 +35347,22 @@ test "win32: a console handed off opens a window, at the size and state its prog
 /// core, never reach.
 const TestHandoff = struct {
     var taken: ?termio.Exec.Handoff = null;
-    var size: ?handoff.Size = null;
     var fail = false;
 
     fn start() void {
         TestQuick.start();
         Window.test_create_pane = &create;
         taken = null;
-        size = null;
         fail = false;
     }
 
     fn create(w: *Window, opts: Surface.Options) anyerror!*Surface {
         if (fail) return error.TestPaneFailed;
         const pane = try TestQuick.create(w, opts);
-        if (opts.overrides) |o| {
-            size = o.size;
-            if (o.handoff) |slot| {
-                taken = slot.*;
-                slot.* = null;
-            }
-        }
+        if (opts.overrides) |o| if (o.handoff) |slot| {
+            taken = slot.*;
+            slot.* = null;
+        };
         return pane;
     }
 };
@@ -35423,10 +35417,10 @@ fn testHandoffWindow() !void {
     try std.testing.expect(!app.quitsNow());
     app.quit_timer = .off;
 
-    // Read, it is recorded; `run` opens its window, maximized, its
-    // terminal at the size asked, and the terminal has the console.
+    // Read, it is recorded; `run` opens its window, maximized, and its
+    // terminal has the console.
     {
-        var caller: handoff.TestCaller = .init(120, 40, true);
+        var caller: handoff.TestCaller = .init(true);
         defer caller.deinit();
         try caller.call();
         try IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_HANDOFF);
@@ -35439,7 +35433,6 @@ fn testHandoffWindow() !void {
         try std.testing.expect(!app.awaiting_handoff);
         try std.testing.expect(!win32.KillTimer(app.msg_hwnd, handoff_wait_timer_id).toBool());
         try std.testing.expect(TestHandoff.taken != null);
-        try std.testing.expectEqual(handoff.Size{ .cols = 120, .rows = 40 }, TestHandoff.size.?);
         try std.testing.expect(win32.IsZoomed(app.windows.items[0].hwnd).toBool());
         var taken = TestHandoff.taken.?;
         TestHandoff.taken = null;
@@ -35451,7 +35444,7 @@ fn testHandoffWindow() !void {
     // program as closing its window would.
     {
         TestHandoff.fail = true;
-        var caller: handoff.TestCaller = .init(0, 0, false);
+        var caller: handoff.TestCaller = .init(false);
         defer caller.deinit();
         try caller.call();
         try IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_HANDOFF);
@@ -35466,7 +35459,7 @@ fn testHandoffWindow() !void {
     // classic conhost's.
     app.stopHandoff();
     {
-        var caller: handoff.TestCaller = .init(0, 0, false);
+        var caller: handoff.TestCaller = .init(false);
         defer caller.deinit();
         try std.testing.expectError(error.TestExpectedEqual, caller.call());
     }

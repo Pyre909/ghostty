@@ -93,7 +93,10 @@ fn commandNames(command: []const u16, exe: []const u16) bool {
 }
 
 /// TERMINAL_STARTUP_INFO: what the console's program asked of its window
-/// in its STARTUPINFO. Explorer's starts ask for nothing.
+/// in its STARTUPINFO. The console's host sends the title, the icon and
+/// `wShowWindow` only, the last already resolved from the program's
+/// STARTF_USESHOWWINDOW, and leaves the rest zero, `dwFlags` included
+/// (ConsoleEstablishHandoff in microsoft/terminal's src/host/srvinit.cpp).
 pub const StartupInfo = extern struct {
     pszTitle: ?[*:0]const u16,
     pszIconPath: ?[*:0]const u16,
@@ -109,18 +112,9 @@ pub const StartupInfo = extern struct {
     wShowWindow: u16,
 };
 
-/// STARTUPINFO's flags for the fields `entryOf` reads.
-const STARTF_USESHOWWINDOW: u32 = 0x1;
-const STARTF_USECOUNTCHARS: u32 = 0x8;
-
-/// A window's size in cells.
-pub const Size = struct { cols: u32, rows: u32 };
-
 /// A console handed off, for the UI thread to open a window for.
 pub const Entry = struct {
     handoff: termio.Exec.Handoff,
-    /// The size its program asked for, if any.
-    size: ?Size,
     /// Whether its program asked to start maximized.
     maximized: bool,
 };
@@ -418,13 +412,9 @@ fn receive(
     return .{
         .entry = .{
             .handoff = .{ .pty = pty, .client = client_copy },
-            .size = if (info.dwFlags & STARTF_USECOUNTCHARS != 0 and
-                info.dwXCountChars > 0 and info.dwYCountChars > 0)
-                .{ .cols = info.dwXCountChars, .rows = info.dwYCountChars }
-            else
-                null,
-            .maximized = info.dwFlags & STARTF_USESHOWWINDOW != 0 and
-                info.wShowWindow == @as(u16, @intCast(win32.SW_SHOWMAXIMIZED)),
+            // As Windows Terminal reads it (ConptyConnection.cpp), with no
+            // flag: the host sends none (`StartupInfo`).
+            .maximized = info.wShowWindow == @as(u16, @intCast(win32.SW_SHOWMAXIMIZED)),
         },
         .host_in = opened.host_in,
         .host_out = opened.host_out,
@@ -500,12 +490,10 @@ pub const TestCaller = struct {
     hr: HRESULT = win32.E_FAIL,
     host_in: ?HANDLE = null,
     host_out: ?HANDLE = null,
-    /// A caller asking for `cols` x `rows`, maximized or not.
-    pub fn init(cols: u32, rows: u32, maximized: bool) TestCaller {
+    /// A caller of a program started maximized or not, with what the
+    /// console's host sends (`StartupInfo`).
+    pub fn init(maximized: bool) TestCaller {
         return .{ .info = std.mem.zeroInit(StartupInfo, .{
-            .dwXCountChars = cols,
-            .dwYCountChars = rows,
-            .dwFlags = STARTF_USECOUNTCHARS | STARTF_USESHOWWINDOW,
             .wShowWindow = @as(u16, @intCast(if (maximized) win32.SW_SHOWMAXIMIZED else win32.SW_SHOWNORMAL)),
         }) };
     }
@@ -588,7 +576,7 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
     var server = try Server.start(hwnd, test_message);
     defer server.stop();
 
-    var caller: TestCaller = .init(120, 40, true);
+    var caller: TestCaller = .init(true);
     defer caller.deinit();
     try caller.call();
 
@@ -597,7 +585,6 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
     defer free(&entries);
     try testing.expectEqual(1, entries.items.len);
     var entry = &entries.items[0];
-    try testing.expectEqual(Size{ .cols = 120, .rows = 40 }, entry.size.?);
     try testing.expect(entry.maximized);
 
     // The caller closed its handles: the entry's copies still reach the
@@ -630,7 +617,7 @@ test "win32: a console handed off is refused when the UI thread cannot be told" 
 
     test_post_fails = true;
     defer test_post_fails = false;
-    var caller: TestCaller = .init(80, 24, false);
+    var caller: TestCaller = .init(false);
     defer caller.deinit();
     const thread = try std.Thread.spawn(.{}, TestCaller.run, .{&caller});
     thread.join();
