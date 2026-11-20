@@ -1294,10 +1294,18 @@ class TestRepository(unittest.TestCase):
         # The class handoff.zig serves, and the two values
         # default_terminal.zig's writeClass gives it.
         handoff = (REPO / "src/apprt/windows/handoff.zig").read_text("utf-8")
-        (key,) = re.findall(
-            r'^pub const class_key = "([^"]+)";$', handoff, re.MULTILINE
+        # The key is composed from the classes key and the class id.
+        self.assertIn(
+            'pub const class_key = classes_key ++ "\\\\" ++ clsid_text;\n', handoff
         )
-        self.assertEqual(mm.CONSOLE_CLASS_KEY, key.replace("\\\\", "\\"))
+        (classes,) = re.findall(
+            r'^pub const classes_key = "([^"]+)";$', handoff, re.MULTILINE
+        )
+        (clsid,) = re.findall(
+            r'^pub const clsid_text = "([^"]+)";$', handoff, re.MULTILINE
+        )
+        key = classes.replace("\\\\", "\\") + "\\" + clsid
+        self.assertEqual(mm.CONSOLE_CLASS_KEY, key)
         terminal = (REPO / "src/apprt/windows/default_terminal.zig").read_text("utf-8")
         write = terminal[terminal.index("\nfn writeClass(") :]
         write = write[: write.index("\n}\n")]
