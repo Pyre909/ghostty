@@ -4756,7 +4756,7 @@ pub const App = struct {
         try self.reserveWindow();
         // Of the old window's kind, so that its terminals, whose renderers
         // present as that frame does, stay in one that shows it
-        // (`Surface.presentsAlpha`): if the new frame cannot be
+        // (`Surface.renderTarget`): if the new frame cannot be
         // transparent too, the tab stays where it is.
         const window = try Window.createBare(self, .normal, old.transparent);
         errdefer window.discard();
@@ -4804,7 +4804,7 @@ pub const App = struct {
     /// Whether it moved: nothing for a pane dropped on itself. Refused,
     /// logged, for a pane or window that is closing, a parked pane, and a
     /// frame that is transparent where the other is not, whose terminals
-    /// present as it does (`Surface.presentsAlpha`), as a tab moves only
+    /// present as it does (`Surface.renderTarget`), as a tab moves only
     /// between frames of one kind (`moveTabAt`). Every allocation, and
     /// the one step that can fail outside them, moving the pane's window
     /// to the new frame, come first, so that a failure, an error, leaves
@@ -10665,7 +10665,7 @@ test "win32: a new window is transparent while background-opacity is below 1, if
     // Asked as its frame is made (`Window.createBare`), before its bar,
     // which is layered then, as the link preview made with its terminal
     // is (`Transparency.chrome`); not the terminal, whose renderer
-    // presents with alpha instead (`Surface.presentsAlpha`). At opacity 1
+    // presents with alpha instead (`Surface.renderTarget`). At opacity 1
     // DWM is not asked; refused, the window is opaque, and nothing in it
     // is layered. So too if buffered painting, which its dividers need,
     // cannot start (`Transparency.frameMade`): then blur-behind, taken,
@@ -10697,7 +10697,7 @@ test "win32: a new window is transparent while background-opacity is below 1, if
         const window = try app.newWindow(null, .normal, null);
         const pane = window.tab().focused.?;
         try std.testing.expectEqual(case.transparent, window.transparent);
-        try std.testing.expectEqual(case.transparent, pane.presentsAlpha());
+        try std.testing.expectEqual(case.transparent, pane.renderTarget().alpha);
         try std.testing.expectEqual(@intFromBool(case.opacity < 1), TestClear.asked);
         try std.testing.expectEqual(@intFromBool(!case.paints), TestClear.undone);
         try std.testing.expectEqual(case.transparent, TestClear.isLayered(window.bar.hwnd));
@@ -10911,7 +10911,7 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     window.tab().tree = try .init(alloc, a);
     window.tab().focused = a;
     const first = a.render_hwnd.?;
-    try std.testing.expect(!a.presentsAlpha());
+    try std.testing.expect(!a.renderTarget().alpha);
     try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(first, win32.WM_NCHITTEST, 0, 0));
     // Its renderer presents to it (`renderer.D3D11.init`).
     try std.testing.expect(a.takeRenderTarget().hwnd == first);
@@ -10936,7 +10936,7 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     try std.testing.expect(TestClear.isLayered(window.bar.hwnd));
     const second = a.render_hwnd.?;
     try std.testing.expect(second != first);
-    try std.testing.expect(a.presentsAlpha());
+    try std.testing.expect(a.renderTarget().alpha);
     // Kept for the renderer, which presents to it until it follows,
     // woken to follow.
     try std.testing.expect(win32.IsWindow(first).toBool());
@@ -10984,7 +10984,7 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     try std.testing.expect(!window.transparent);
     try std.testing.expectEqual(1, TestClear.undone);
     try std.testing.expect(a.render_hwnd.? == second);
-    try std.testing.expect(!a.presentsAlpha());
+    try std.testing.expect(!a.renderTarget().alpha);
     try std.testing.expectEqual(2, TestGiven.count);
     try std.testing.expectEqual(1, TestGiven.opacities[1]);
 }
@@ -11195,7 +11195,7 @@ test "win32: a window DWM will not make transparent at a reload stays opaque" {
     try std.testing.expectEqual(2, TestClear.asked);
     try std.testing.expect(!window.transparent);
     try std.testing.expect(a.render_hwnd.? == first);
-    try std.testing.expect(!a.presentsAlpha());
+    try std.testing.expect(!a.renderTarget().alpha);
     try std.testing.expectEqual(0, TestGiven.count);
 }
 
@@ -11410,7 +11410,7 @@ test "win32: a toggled opaque background takes the acrylic away, and the toggle 
 
 test "win32: a tab moved to a new window keeps its window's transparency, or stays" {
     // Its terminals' renderers present for the frame they were made in
-    // (`Surface.presentsAlpha`), so the new window is made as the old one
+    // (`Surface.renderTarget`), so the new window is made as the old one
     // was (`App.moveTabAt`): a transparent window's tab goes to a
     // transparent window, with its bar layered; if DWM refuses that
     // frame, the tab stays where it was and the new window is discarded
@@ -11450,7 +11450,7 @@ test "win32: a tab moved to a new window keeps its window's transparency, or sta
     try std.testing.expect(b.window == window);
     try std.testing.expect(win32.GetAncestor(b.hwnd, win32.GA_PARENT) == window.hwnd);
     try std.testing.expect(shown(b.hwnd));
-    try std.testing.expect(b.presentsAlpha());
+    try std.testing.expect(b.renderTarget().alpha);
 
     // Taken: it moves.
     TestClear.takes = 1;
@@ -11460,7 +11460,7 @@ test "win32: a tab moved to a new window keeps its window's transparency, or sta
     try std.testing.expect(to != window);
     try std.testing.expect(to.transparent);
     try std.testing.expect(b.window == to);
-    try std.testing.expect(b.presentsAlpha());
+    try std.testing.expect(b.renderTarget().alpha);
     try std.testing.expect(TestClear.isLayered(to.bar.hwnd));
 
     // From an opaque window.
@@ -11478,7 +11478,7 @@ test "win32: a tab moved to a new window keeps its window's transparency, or sta
     try std.testing.expect(plain_to != plain);
     try std.testing.expect(e.window == plain_to);
     try std.testing.expect(!plain_to.transparent);
-    try std.testing.expect(!e.presentsAlpha());
+    try std.testing.expect(!e.renderTarget().alpha);
     try std.testing.expectEqual(3, TestClear.asked);
     try std.testing.expectEqual(layered, TestClear.layered_count);
 }

@@ -5,7 +5,7 @@
 //!
 //! - The terminal presents through a composition swap chain, whose alpha
 //!   DWM honours; it ignores an HWND chain's (`renderer.D3D11`, asked by
-//!   `Surface.presentsAlpha`).
+//!   `Surface.renderTarget`).
 //! - The frame has blur-behind over an empty region (`frameMade`): on
 //!   Windows 8 and later nothing is blurred, but DWM composes the frame's
 //!   redirection surface with its alpha. Without it the frame is opaque;

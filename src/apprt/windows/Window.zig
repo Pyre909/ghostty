@@ -161,7 +161,7 @@ caption_active: bool,
 /// background is translucent (Transparency.zig): set as the frame is made
 /// (`makeTransparent`), and changed by a reload (`setTransparent`). Its
 /// terminals' renderers are asked to present with alpha
-/// (`Surface.presentsAlpha`), which each does unless it could not make a
+/// (`Surface.renderTarget`), which each does unless it could not make a
 /// composition chain (`renderer.D3D11`), and the terminals paint black
 /// under their chains; its chrome is layered. A terminal only ever moves
 /// to a frame of the same kind (`App.moveTabAt`).

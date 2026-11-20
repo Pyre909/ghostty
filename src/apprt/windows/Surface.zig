@@ -1585,7 +1585,13 @@ pub const Surface = struct {
         changes: u32,
     };
 
-    /// Where the renderer is to present. From any thread.
+    /// Where the renderer is to present, and whether with alpha, through
+    /// a swap chain DWM composes with what is behind the window, rather
+    /// than opaque: true while its render window was made for a
+    /// transparent frame. A renderer that cannot make the swap chain
+    /// asked for presents opaque all the same (`renderer.D3D11`), and says
+    /// so itself. From any thread; the renderer takes it instead
+    /// (`takeRenderTarget`).
     pub fn renderTarget(self: *Surface) RenderTarget {
         self.render_lock.lockUncancelable(global.io());
         defer self.render_lock.unlock(global.io());
@@ -1657,16 +1663,6 @@ pub const Surface = struct {
     pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
         _ = self;
         return .{};
-    }
-
-    /// Whether this terminal's renderer is to present with alpha, through a
-    /// swap chain DWM composes with what is behind the window, rather than
-    /// opaque: true while its render window was made for a transparent
-    /// frame (`renderTarget`). A renderer that cannot make the swap chain
-    /// asked for presents opaque all the same (`renderer.D3D11`), and says
-    /// so itself.
-    pub fn presentsAlpha(self: *Surface) bool {
-        return self.renderTarget().alpha;
     }
 
     /// The ratio of this window's DPI to the Windows reference DPI of 96.
