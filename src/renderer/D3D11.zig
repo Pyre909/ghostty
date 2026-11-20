@@ -48,6 +48,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const apprt = @import("../apprt.zig");
+const build_config = @import("../build_config.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const internal_os = @import("../os/main.zig");
@@ -90,7 +91,12 @@ pub fn presentsAlpha(self: *const D3D11) bool {
     return self.chain == .composition;
 }
 
-const RtSurface = if (apprt.runtime == apprt.windows) ?*apprt.Surface else void;
+/// The Windows apprt's Surface, which the renderer follows to a new
+/// render window (`followWindow`); void for every other runtime. Chosen
+/// from the build options, as apprt.zig chooses the runtime: naming
+/// `apprt.windows` here, in a field's type, would bring that apprt's
+/// tests into a test build of another runtime.
+const RtSurface = if (build_config.artifact == .exe and build_config.app_runtime == .windows) ?*apprt.Surface else void;
 
 /// The two kinds of swap chain; see the top of this file.
 const Chain = enum {
