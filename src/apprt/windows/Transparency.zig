@@ -108,14 +108,21 @@ pub fn startBufferedPaint(window: *Window) bool {
         return false;
     }
     window.buffered_paint = true;
+    if (builtin.is_test) test_buffered_paints += 1;
     return true;
 }
+
+/// For tests: BufferedPaintInit calls not yet matched by a
+/// BufferedPaintUnInit, on every frame.
+pub var test_buffered_paints: if (builtin.is_test) isize else void =
+    if (builtin.is_test) 0 else {};
 
 /// For a frame's WM_NCDESTROY: end what `startBufferedPaint` started.
 pub fn frameDestroyed(window: *Window) void {
     if (!window.buffered_paint) return;
     _ = win32.BufferedPaintUnInit();
     window.buffered_paint = false;
+    if (builtin.is_test) test_buffered_paints -= 1;
 }
 
 /// DwmEnableBlurBehindWindow on all of `frame` (`on`) or none; whether DWM

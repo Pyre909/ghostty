@@ -19176,10 +19176,16 @@ test "win32: Mica leaves a frame turned transparent at a reload, and comes back"
     try std.testing.expect(height > 0);
     try std.testing.expectEqual(height, window.mica_top);
     try std.testing.expect(window.backdrop == .mica);
+    // Buffered painting, started for Mica, is not started again for the
+    // frame however often it turns transparent and back to Mica: each
+    // start is matched only once, when the frame is destroyed.
+    try std.testing.expect(window.buffered_paint);
+    const paints = Transparency.test_buffered_paints;
 
     for ([_]bool{ false, true }) |refuse| {
         dwm.refuse = refuse;
         try std.testing.expect(window.setTransparent(true));
+        try std.testing.expectEqual(paints, Transparency.test_buffered_paints);
         dwm.refuse = false;
         try std.testing.expectEqual(if (refuse) height else 0, window.mica_top);
         try std.testing.expect(window.backdrop != .mica);
@@ -19188,6 +19194,7 @@ test "win32: Mica leaves a frame turned transparent at a reload, and comes back"
         try std.testing.expect(window.backdrop == .mica);
         try std.testing.expectEqual(height, dwm.top);
         try std.testing.expectEqual(height, window.mica_top);
+        try std.testing.expectEqual(paints, Transparency.test_buffered_paints);
     }
 }
 
