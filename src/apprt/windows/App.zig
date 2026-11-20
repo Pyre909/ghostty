@@ -11205,9 +11205,18 @@ test "win32: a split turned transparent and back changes its chrome and backdrop
     const latched = UnfocusedSplit.cannot_layer;
     UnfocusedSplit.cannot_layer = false;
     defer UnfocusedSplit.cannot_layer = latched;
+    // The drag handle and the drop preview are layered by their own
+    // code too, and are not layered again: the handle would stop taking
+    // its pixels, and the preview would hide the half it marks.
+    const handle_latch = TestHandle.install();
+    defer TestHandle.uninstall(handle_latch);
+    DragHandle.test_window_at = &TestHandle.at;
+    defer DragHandle.test_window_at = null;
+    defer TestHandle.frame = null;
 
     const window = try testFrame(&app);
     testResize(window, 900, 500);
+    TestHandle.frame = window.hwnd;
     const a = try testPane(&app, window);
     const b = try testPane(&app, window);
     window.tab().tree = try testRow(alloc, &.{ a, b });
@@ -11218,14 +11227,22 @@ test "win32: a split turned transparent and back changes its chrome and backdrop
     const link = a.overlays.link_preview.hwnd orelse return error.TestUnexpectedResult;
     const layers = struct {
         fn of(hwnd: win32.HWND) usize {
-            var n: usize = 0;
-            for (TestClear.layered[0..TestClear.layered_count]) |l| n += @intFromBool(l == hwnd);
-            return n;
+            return std.mem.countScalar(win32.HWND, TestClear.layered[0..TestClear.layered_count], hwnd);
         }
     };
     const dim_layers = layers.of(dim);
     try std.testing.expectEqual(1, dim_layers);
     try std.testing.expect(!TestClear.isLayered(link));
+
+    // A drag from a's handle, its preview over b.
+    testPointer(a, 20, 2);
+    const handle = a.overlays.drag_handle.hwnd orelse return error.TestUnexpectedResult;
+    _ = win32.SendMessageW(handle, win32.WM_LBUTTONDOWN, win32.MK_LBUTTON, testPoint(10, 5));
+    _ = win32.SendMessageW(handle, win32.WM_MOUSEMOVE, win32.MK_LBUTTON, try testScreenPoint(handle, try testPaneAt(b, -3)));
+    const preview = b.overlays.drop_preview.hwnd orelse return error.TestUnexpectedResult;
+    const handle_layers = layers.of(handle);
+    const preview_layers = layers.of(preview);
+    try std.testing.expectEqual(1, preview_layers);
 
     var changed: Config = try .default(alloc);
     defer changed.deinit();
@@ -11240,7 +11257,10 @@ test "win32: a split turned transparent and back changes its chrome and backdrop
         b.core_state = .none;
         try std.testing.expectEqual(opacity < 1, window.transparent);
         try std.testing.expectEqual(dim_layers, layers.of(dim));
+        try std.testing.expectEqual(handle_layers, layers.of(handle));
+        try std.testing.expectEqual(preview_layers, layers.of(preview));
     }
+    _ = win32.SendMessageW(handle, win32.WM_LBUTTONUP, 0, try testScreenPoint(handle, try testPaneAt(b, -3)));
     try std.testing.expect(TestClear.isLayered(link));
     try std.testing.expect(TestClear.backdrop_count >= 2);
     try std.testing.expectEqual(.acrylic, TestClear.backdrops[TestClear.backdrop_count - 2]);
