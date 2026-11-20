@@ -1032,10 +1032,10 @@ palette: Palette = .{},
 ///
 /// On macOS, changing this configuration requires restarting Ghostty completely.
 ///
-/// On Windows, a window is transparent only if it is made while this is
-/// below 1, and it stays transparent until it closes, in fullscreen too: a
-/// reload that lowers it leaves the windows already open opaque, and a
-/// transparent window draws a value of 1 as an opaque one does.
+/// On Windows, a window is transparent if this is below 1 when it is made,
+/// in fullscreen too, and a reload that takes this across 1 turns the
+/// windows already open transparent or opaque. `toggle_background_opacity`
+/// draws a transparent window as an opaque one does without changing it.
 @"background-opacity": f64 = 1.0,
 
 /// Applies background opacity to cells with an explicit background color
