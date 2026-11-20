@@ -10912,6 +10912,7 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     window.tab().focused = a;
     const first = a.render_hwnd.?;
     try std.testing.expect(!a.presentsAlpha());
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(first, win32.WM_NCHITTEST, 0, 0));
     // Its renderer presents to it (`renderer.D3D11.init`).
     try std.testing.expect(a.takeRenderTarget().hwnd == first);
     Surface.test_render_wakes = 0;
@@ -10951,6 +10952,8 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     testPump();
     try std.testing.expect(!win32.IsWindow(first).toBool());
     try std.testing.expect(win32.IsWindow(second).toBool());
+    // Clicks over the new one go to the terminal under it.
+    try std.testing.expectEqual(win32.HTTRANSPARENT, win32.SendMessageW(second, win32.WM_NCHITTEST, 0, 0));
 
     // As another process could post it: no window, or one that is not
     // this terminal's render window. Nothing is destroyed.
