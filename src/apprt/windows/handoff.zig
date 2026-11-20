@@ -431,18 +431,28 @@ fn receive(
     };
 }
 
-/// Hand `entry` to the UI thread, unless no server runs.
-fn queue(entry: Entry) error{ NotServing, OutOfMemory }!void {
+/// Hand `entry` to the UI thread, unless no server runs or the UI thread
+/// cannot be told: an entry no post announces could wait for a console
+/// that never comes, while the refused console stays in conhost's window.
+/// The post is made under the lock, so the UI thread cannot take the entry
+/// before a failed post withdraws it.
+fn queue(entry: Entry) error{ NotServing, OutOfMemory, PostFailed }!void {
     shared.mutex.lockUncancelable(global.io());
     defer shared.mutex.unlock(global.io());
     const hwnd = shared.hwnd orelse return error.NotServing;
     try shared.entries.append(alloc, entry);
-    // Should the post fail, the entry waits for the next one, or is
-    // closed when the server stops.
-    if (!win32.PostMessageW(hwnd, shared.message, 0, 0).toBool()) {
+    const posted = !(builtin.is_test and test_post_fails) and
+        win32.PostMessageW(hwnd, shared.message, 0, 0).toBool();
+    if (!posted) {
         log.warn("cannot post a console handed off err={}", .{win32.GetLastError()});
+        _ = shared.entries.pop();
+        return error.PostFailed;
     }
 }
+
+/// For tests: the post to the UI thread fails, as with its queue full.
+pub var test_post_fails: if (builtin.is_test) bool else void =
+    if (builtin.is_test) false else {};
 
 fn duplicate(handle: HANDLE) !HANDLE {
     const current = std.os.windows.GetCurrentProcess();
@@ -608,6 +618,29 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
 
     // Closing the entry closes the copies, the last write ends.
     entry.handoff.deinit();
+    try caller.expectClosed();
+}
+
+test "win32: a console handed off is refused when the UI thread cannot be told" {
+    const testing = std.testing;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+    var server = try Server.start(hwnd, test_message);
+    defer server.stop();
+
+    test_post_fails = true;
+    defer test_post_fails = false;
+    var caller: TestCaller = .init(80, 24, false);
+    defer caller.deinit();
+    const thread = try std.Thread.spawn(.{}, TestCaller.run, .{&caller});
+    thread.join();
+    try testing.expectEqual(win32.E_FAIL, caller.hr);
+
+    // Nothing waits for a window, and the class's copies are closed, so
+    // the console stays with its own host.
+    var entries = take();
+    defer free(&entries);
+    try testing.expectEqual(0, entries.items.len);
     try caller.expectClosed();
 }
 
