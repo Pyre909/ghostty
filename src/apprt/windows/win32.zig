@@ -1058,6 +1058,7 @@ pub extern "dwmapi" fn DwmEnableBlurBehindWindow(hwnd: HWND, blur: *const DWM_BL
 // Registry
 pub const HKEY = w.HKEY;
 pub const HKEY_CURRENT_USER = w.HKEY_CURRENT_USER;
+pub const RRF_RT_REG_SZ: DWORD = 0x0000_0002;
 pub const RRF_RT_REG_DWORD: DWORD = 0x0000_0010;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-reggetvaluew
 pub extern "advapi32" fn RegGetValueW(
@@ -1096,6 +1097,8 @@ pub extern "advapi32" fn RegSetValueExW(
 ) callconv(.winapi) LONG;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletevaluew
 pub extern "advapi32" fn RegDeleteValueW(key: HKEY, name: ?LPCWSTR) callconv(.winapi) LONG;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletetreew
+pub extern "advapi32" fn RegDeleteTreeW(key: HKEY, subkey: ?LPCWSTR) callconv(.winapi) LONG;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regclosekey
 pub extern "advapi32" fn RegCloseKey(key: HKEY) callconv(.winapi) LONG;
 

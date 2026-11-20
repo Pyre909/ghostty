@@ -48,6 +48,44 @@ pub const clsid: GUID = GUID.parse("{73db5bf6-8dd9-4f9f-85f8-9a05893d71c7}");
 /// Terminal 1.22 and later.
 pub const iid_handoff3: GUID = GUID.parse("{6f23da90-15c5-4203-9db0-64e73f1b1b00}");
 
+/// Under HKEY_CURRENT_USER: the command COM runs, with `-Embedding` after
+/// it, to start a server of the class when none is running.
+pub const server_key = "Software\\Classes\\CLSID\\{73DB5BF6-8DD9-4F9F-85F8-9A05893D71C7}\\LocalServer32";
+
+/// Whether the user's class starts `exe`, the path of this process's
+/// image. Only then does an instance serve the class: one of another
+/// build, or another install, would take the consoles meant for the
+/// Ghostty the user chose, and with no class nothing would ask.
+pub fn registeredTo(exe: []const u16) bool {
+    return serverNames(win32.HKEY_CURRENT_USER, win32.L(server_key), exe);
+}
+
+fn serverNames(root: win32.HKEY, subkey: [*:0]const u16, exe: []const u16) bool {
+    // Room for any path Explorer can start a program from, and then some.
+    var buf: [2048]u16 = undefined;
+    var size: win32.DWORD = @sizeOf(@TypeOf(buf));
+    // RRF_RT_REG_SZ takes REG_EXPAND_SZ too, expanded.
+    const rc = win32.RegGetValueW(root, subkey, null, win32.RRF_RT_REG_SZ, null, &buf, &size);
+    if (rc != 0) return false;
+    return commandNames(std.mem.sliceTo(buf[0 .. size / 2], 0), exe);
+}
+
+/// Whether `command`, as COM reads LocalServer32, starts `exe`: its path
+/// quoted, or bare and followed by nothing or by arguments. Paths compare
+/// as Windows compares them, ignoring case.
+fn commandNames(command: []const u16, exe: []const u16) bool {
+    const rest = std.mem.trimStart(u16, command, &.{ ' ', '\t' });
+    const path = if (rest.len > 0 and rest[0] == '"') quoted: {
+        const end = std.mem.indexOfScalarPos(u16, rest, 1, '"') orelse return false;
+        break :quoted rest[1..end];
+    } else bare: {
+        if (rest.len < exe.len) return false;
+        if (rest.len > exe.len and rest[exe.len] != ' ' and rest[exe.len] != '\t') return false;
+        break :bare rest[0..exe.len];
+    };
+    return std.os.windows.eqlIgnoreCaseWtf16(path, exe);
+}
+
 /// TERMINAL_STARTUP_INFO: what the console's program asked of its window
 /// in its STARTUPINFO. Explorer's starts ask for nothing.
 pub const StartupInfo = extern struct {
@@ -598,4 +636,59 @@ test "win32: the console handoff's declarations have the IDL's layout" {
     try testing.expectEqual(2 * p + 4 * 6, @offsetOf(StartupInfo, "dwYCountChars"));
     try testing.expectEqual(2 * p + 4 * 9, @offsetOf(StartupInfo, "wShowWindow"));
     try testing.expectEqual(std.mem.alignForward(usize, 2 * p + 4 * 9 + 2, p), @sizeOf(StartupInfo));
+}
+
+test "win32: the class's server key names the class" {
+    const at = std.mem.indexOfScalar(u8, server_key, '{').?;
+    const named = GUID.parse(server_key[at..][0..38]);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&clsid), std.mem.asBytes(&named));
+}
+
+test "win32: a server command starts this executable only with its path" {
+    @setEvalBranchQuota(10_000);
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const exe = W("C:\\Program Files\\Ghostty\\ghostty.exe");
+    const yes = [_][:0]const u16{
+        W("\"C:\\Program Files\\Ghostty\\ghostty.exe\""),
+        W("  \"c:\\program files\\ghostty\\GHOSTTY.EXE\" --x"),
+        W("C:\\Program Files\\Ghostty\\ghostty.exe"),
+        W("C:\\Program Files\\Ghostty\\ghostty.exe -Embedding"),
+    };
+    for (yes) |command| try std.testing.expect(commandNames(command, exe));
+    const no = [_][:0]const u16{
+        W(""),
+        W("\"C:\\Program Files\\Ghostty\\ghostty.exe"),
+        W("\"C:\\Program Files\\Ghostty\\ghostty.exe.bak\""),
+        W("C:\\Program Files\\Ghostty\\ghostty.exe2"),
+        W("C:\\Program Files\\Ghostty"),
+        W("\"D:\\Ghostty\\ghostty.exe\""),
+    };
+    for (no) |command| try std.testing.expect(!commandNames(command, exe));
+}
+
+test "win32: the class's server is read from the user's classes" {
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const testing = std.testing;
+    // A key of the test's own, which it removes, not the user's class.
+    const root_z = W("Software\\GhosttyTest");
+    const sub_z = W("Software\\GhosttyTest\\LocalServer32");
+    defer _ = win32.RegDeleteTreeW(win32.HKEY_CURRENT_USER, root_z);
+    const exe = W("C:\\Ghostty\\ghostty.exe");
+
+    // No key, no server.
+    try testing.expect(!serverNames(win32.HKEY_CURRENT_USER, sub_z, exe));
+
+    var key: win32.HKEY = undefined;
+    try testing.expectEqual(0, win32.RegCreateKeyExW(win32.HKEY_CURRENT_USER, sub_z, 0, null, win32.REG_OPTION_NON_VOLATILE, win32.KEY_SET_VALUE, null, &key, null));
+    defer _ = win32.RegCloseKey(key);
+    const set = struct {
+        fn set(k: win32.HKEY, value: [:0]const u16) !void {
+            const bytes = std.mem.sliceAsBytes(value[0 .. value.len + 1]);
+            try std.testing.expectEqual(0, win32.RegSetValueExW(k, null, 0, win32.REG_SZ, bytes.ptr, @intCast(bytes.len)));
+        }
+    }.set;
+    try set(key, W("\"C:\\Ghostty\\ghostty.exe\""));
+    try testing.expect(serverNames(win32.HKEY_CURRENT_USER, sub_z, exe));
+    try set(key, W("\"C:\\Other\\ghostty.exe\""));
+    try testing.expect(!serverNames(win32.HKEY_CURRENT_USER, sub_z, exe));
 }

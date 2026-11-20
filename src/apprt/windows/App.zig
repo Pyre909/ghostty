@@ -122,6 +122,18 @@ pub const WM_GHOSTTY_HANDOFF: win32.UINT = win32.WM_APP + 9;
 /// window. Any non-zero value works; it only has to be unique per window.
 const quit_timer_id: win32.UINT_PTR = 1;
 
+/// Timer id, on the app's message-only window, for how long an instance
+/// COM started waits for its console (`awaiting_handoff`); unique among
+/// that window's timers (`quit_timer_id`, `Undo.timer_id`,
+/// `Updater.timer_id`).
+const handoff_wait_timer_id: win32.UINT_PTR = 6;
+
+/// How long an instance COM started waits for the console it was started
+/// for. OpenConsole hands it over as soon as the class is served, which
+/// `startUp` does first; one that never comes leaves the process with no
+/// window, and it quits.
+const handoff_wait_ms: win32.UINT = 10_000;
+
 pub const App = struct {
     core_app: *CoreApp,
 
@@ -440,6 +452,12 @@ pub const App = struct {
     /// (`Surface.ran_command`).
     command_launch: bool,
 
+    /// Whether this instance was started by COM (`-Embedding`) to serve
+    /// the console handoff class and has not had its console yet: it opens
+    /// no window of its own, and `run` does not quit for having none until
+    /// a console comes or `handoff_wait_ms` passes (`endHandoffWait`).
+    awaiting_handoff: bool,
+
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
     /// handled wherever this thread waits for one it sent, or for a COM
@@ -709,7 +727,9 @@ pub const App = struct {
     /// console then keeps the classic conhost. Not for an elevated
     /// instance: Windows never asks it, as it ignores the user's classes
     /// for an elevated caller, and it would show the consoles of the
-    /// user's other programs with its rights.
+    /// user's other programs with its rights. Nor for one whose image the
+    /// user's class does not start (`handoff.registeredTo`), unless COM
+    /// started it for the class.
     fn startHandoff(self: *App) void {
         const identity = IpcServer.Identity.ofProcess() catch |err| {
             log.warn("serving no consoles handed off, this process's token cannot be read err={}", .{err});
@@ -719,6 +739,22 @@ pub const App = struct {
             log.info("serving no consoles handed off, this instance is elevated", .{});
             return;
         }
+        if (!self.awaiting_handoff and !self.classIsOurs()) {
+            log.info("serving no consoles handed off, the default terminal class does not start this executable", .{});
+            return;
+        }
+        self.serveHandoff();
+    }
+
+    /// Whether the user's console handoff class starts this process's
+    /// image (`handoff.registeredTo`).
+    fn classIsOurs(self: *const App) bool {
+        const exe = IpcClient.imagePath(self.core_app.alloc) catch return false;
+        defer self.core_app.alloc.free(exe);
+        return handoff.registeredTo(exe);
+    }
+
+    fn serveHandoff(self: *App) void {
         self.handoff_server = handoff.Server.start(self.msg_hwnd, WM_GHOSTTY_HANDOFF) catch |err| {
             log.warn("serving no consoles handed off err={}", .{err});
             return;
@@ -732,6 +768,34 @@ pub const App = struct {
             server.stop();
             self.handoff_server = null;
         }
+    }
+
+    /// Whether COM started this process to serve the console handoff
+    /// class: its arguments are COM's alone, `-Embedding` after the
+    /// class's command, which names no argument (`handoff.server_key`).
+    /// With any other argument it is a launch of the user's, which the
+    /// configuration reads to the `-Embedding` and no further
+    /// (`Config.parseManuallyHook`).
+    fn startedByCom(arguments: []const [:0]const u8) bool {
+        return arguments.len == 1 and std.mem.eql(u8, arguments[0], "-Embedding");
+    }
+
+    /// Arm the wait for the console COM started this instance for
+    /// (`handoff_wait_ms`). If it cannot be armed the instance does not
+    /// wait, and quits as one with no window would.
+    fn waitForHandoff(self: *App) void {
+        if (win32.SetTimer(self.msg_hwnd, handoff_wait_timer_id, handoff_wait_ms, null) == 0) {
+            log.warn("cannot wait for a console handed off, quitting with no window", .{});
+            self.awaiting_handoff = false;
+        }
+    }
+
+    /// End the wait `waitForHandoff` armed, for a console that came or
+    /// one that did not in time; `run` then quits if no window is open.
+    fn endHandoffWait(self: *App) void {
+        if (!self.awaiting_handoff) return;
+        _ = win32.KillTimer(self.msg_hwnd, handoff_wait_timer_id);
+        self.awaiting_handoff = false;
     }
 
     /// Record the consoles handed off (WM_GHOSTTY_HANDOFF) for `run` to
@@ -781,6 +845,9 @@ pub const App = struct {
     /// program asked. Should the window fail, the console is closed.
     fn openHandoff(self: *App, request: *HandoffRequest) void {
         defer request.destroy(self.core_app.alloc);
+        // Its window, or its failure, ends the wait: a window that cannot
+        // open leaves none, and the instance quits as one would.
+        self.endHandoffWait();
         const overrides: Overrides = .{ .handoff = &request.handoff, .size = request.size };
         const window = self.newWindow(null, .normal, &overrides) catch |err| {
             log.warn("cannot open a window for a console handed off, closing it err={}", .{err});
@@ -1219,6 +1286,7 @@ pub const App = struct {
             .session = null,
             .session_ended = false,
             .command_launch = false,
+            .awaiting_handoff = false,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -1497,8 +1565,17 @@ pub const App = struct {
     /// opened (`Session.launch`).
     fn startUp(self: *App, arguments: []const [:0]const u8) !void {
         self.command_launch = Session.namesCommand(arguments);
+        self.awaiting_handoff = startedByCom(arguments);
         self.startIpc();
         self.startHandoff();
+
+        // Started by COM for the console handoff class: the console is the
+        // window, and saved ones stay for the user's next launch.
+        if (self.awaiting_handoff) {
+            self.waitForHandoff();
+            self.showConfigErrors();
+            return;
+        }
 
         // The windows a session's end closed come back in place of the
         // initial window, as macOS has them.
@@ -1625,7 +1702,7 @@ pub const App = struct {
             // Act on an expired quit timer here rather than where it expired
             // (see `quit_timer`): only here is it known both that the loop
             // has started and that no window is on screen.
-            if (self.quit_timer == .expired and self.surfaces.items.len == 0) {
+            if (self.quitsNow()) {
                 self.logQuitOverride();
                 self.quit = true;
                 break;
@@ -3438,6 +3515,15 @@ pub const App = struct {
                 return true;
             },
         }
+    }
+
+    /// Whether `run` quits now: the quit timer has expired, no window is
+    /// on screen, and no console COM started this instance for is still
+    /// to come (`awaiting_handoff`).
+    fn quitsNow(self: *const App) bool {
+        return self.quit_timer == .expired and
+            self.surfaces.items.len == 0 and
+            !self.awaiting_handoff;
     }
 
     /// Whether the app stays open with no window: the configuration says
@@ -5298,6 +5384,9 @@ pub const App = struct {
             } else if (wparam == Updater.timer_id) {
                 self.updater.timerFired(self.prompt_depth > 0 or self.quit or self.terminating);
                 return 0;
+            } else if (wparam == handoff_wait_timer_id) {
+                self.endHandoffWait();
+                return 0;
             },
 
             win32.WM_HOTKEY => {
@@ -5957,6 +6046,34 @@ test "win32: only an armed quit timer expires" {
     }
 }
 
+test "win32: an instance COM started waits for its console, and quits if none comes" {
+    try std.testing.expect(App.startedByCom(&.{"-Embedding"}));
+    try std.testing.expect(!App.startedByCom(&.{}));
+    try std.testing.expect(!App.startedByCom(&.{"--title=a"}));
+    try std.testing.expect(!App.startedByCom(&.{ "--title=a", "-Embedding" }));
+    try std.testing.expect(!App.startedByCom(&.{ "-Embedding", "--title=a" }));
+
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+
+    app.awaiting_handoff = true;
+    app.waitForHandoff();
+    try std.testing.expect(app.awaiting_handoff);
+    app.quit_timer = .expired;
+    try std.testing.expect(!app.quitsNow());
+    _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, handoff_wait_timer_id, 0);
+    try std.testing.expect(!app.awaiting_handoff);
+    try std.testing.expect(app.quitsNow());
+    // The timer fired once and is gone.
+    try std.testing.expect(!win32.KillTimer(app.msg_hwnd, handoff_wait_timer_id).toBool());
+    app.quit_timer = .off;
+}
+
 test "win32: a prompt disables the other windows until the outermost one ends and wakes run" {
     // MessageBoxW disables only its owner; the rest is beginPrompt's.
     // Hidden top-level windows stand in for the frames.
@@ -6207,6 +6324,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.session = null;
     app.session_ended = false;
     app.command_launch = false;
+    app.awaiting_handoff = false;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -35172,9 +35290,22 @@ fn testHandoffWindow() !void {
     app.config.@"window-inherit-font-size" = false;
     app.config.maximize = false;
 
+    // A launch of the user's, and the user's class does not start the
+    // test's executable: the class is not served.
     app.startHandoff();
+    try std.testing.expectEqual(null, app.handoff_server);
+
+    // COM's start serves it, opens no window, and `run` does not quit for
+    // having none while the console is to come.
+    try app.startUp(&.{"-Embedding"});
+    defer app.stopIpc();
     try std.testing.expect(app.handoff_server != null);
     defer app.stopHandoff();
+    try std.testing.expectEqual(0, app.windows.items.len);
+    try std.testing.expect(app.awaiting_handoff);
+    app.quit_timer = .expired;
+    try std.testing.expect(!app.quitsNow());
+    app.quit_timer = .off;
 
     // Read, it is recorded; `run` opens its window, maximized, its
     // terminal at the size asked, and the terminal has the console.
@@ -35185,8 +35316,12 @@ fn testHandoffWindow() !void {
         try IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_HANDOFF);
         try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_HANDOFF, 0, 0));
         try std.testing.expectEqual(0, app.windows.items.len);
+        try std.testing.expect(app.awaiting_handoff);
         app.createRequested();
         try std.testing.expectEqual(1, app.windows.items.len);
+        // The console came: the wait is over, its timer gone.
+        try std.testing.expect(!app.awaiting_handoff);
+        try std.testing.expect(!win32.KillTimer(app.msg_hwnd, handoff_wait_timer_id).toBool());
         try std.testing.expect(TestHandoff.taken != null);
         try std.testing.expectEqual(handoff.Size{ .cols = 120, .rows = 40 }, TestHandoff.size.?);
         try std.testing.expect(win32.IsZoomed(app.windows.items[0].hwnd).toBool());

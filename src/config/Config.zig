@@ -5131,6 +5131,14 @@ pub fn parseManuallyHook(
         return false;
     }
 
+    // COM starts a local server with `-Embedding` after the command its
+    // class registers (LocalServer32), so it comes last. The Windows app
+    // reads it from the process's arguments (apprt/windows/App.zig); for
+    // the configuration it ends the arguments.
+    if (comptime builtin.os.tag == .windows) {
+        if (std.mem.eql(u8, arg, "-Embedding")) return false;
+    }
+
     // Keep track of our input args for replay
     try self._replay_steps.append(
         alloc,
@@ -10846,6 +10854,18 @@ test "parse e: command and args" {
     try testing.expectEqualStrings(cmd.direct[0], "echo");
     try testing.expectEqualStrings(cmd.direct[1], "foo");
     try testing.expectEqualStrings(cmd.direct[2], "bar baz");
+}
+
+test "parse -Embedding: COM's argument ends the arguments on Windows" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+
+    var it: TestIterator = .{ .data = &.{ "--title=a", "-Embedding" } };
+    try cfg.loadIter(testing.allocator, &it);
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqualStrings("a", cfg.title.?);
 }
 
 test "clone default" {
