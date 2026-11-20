@@ -3532,11 +3532,23 @@ pub const App = struct {
 
     /// Whether `run` quits now: the quit timer has expired, no window is
     /// on screen, and no console COM started this instance for is still
-    /// to come (`awaiting_handoff`).
+    /// to come (`awaiting_handoff`) or recorded and not yet opened. The
+    /// wait can end with a console recorded: a modal loop, such as the
+    /// configuration errors' box, dispatches both its message and the
+    /// wait's timer before `run` opens its window.
     fn quitsNow(self: *const App) bool {
         return self.quit_timer == .expired and
             self.surfaces.items.len == 0 and
-            !self.awaiting_handoff;
+            !self.awaiting_handoff and
+            !self.handoffRecorded();
+    }
+
+    /// Whether a console handed off waits in `requests` for its window.
+    fn handoffRecorded(self: *const App) bool {
+        for (self.requests.items) |request| {
+            if (request == .handoff) return true;
+        }
+        return false;
     }
 
     /// Whether the app stays open with no window: the configuration says
@@ -35427,6 +35439,14 @@ fn testHandoffWindow() !void {
         try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_HANDOFF, 0, 0));
         try std.testing.expectEqual(0, app.windows.items.len);
         try std.testing.expect(app.awaiting_handoff);
+        // The wait's timer fires before `run` opens the window, as in the
+        // modal loop of a configuration errors' box: the console recorded
+        // still keeps the instance.
+        _ = App.wndProc(app.msg_hwnd, win32.WM_TIMER, handoff_wait_timer_id, 0);
+        try std.testing.expect(!app.awaiting_handoff);
+        app.quit_timer = .expired;
+        try std.testing.expect(!app.quitsNow());
+        app.quit_timer = .off;
         app.createRequested();
         try std.testing.expectEqual(1, app.windows.items.len);
         // The console came: the wait is over, its timer gone.
