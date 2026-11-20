@@ -198,13 +198,19 @@ fn writeClass(place: Place, exe: []const u16) Error!void {
 pub const Request = enum { status, enable, disable };
 
 /// `ghostty +default-terminal`: carry out `request` on the user's keys and
-/// say what came of it on `out`; the exit code.
-pub fn command(alloc: std.mem.Allocator, request: Request, out: *std.Io.Writer) std.Io.Writer.Error!u8 {
+/// say what came of it, on `out`, or on `err` for a failure; the exit
+/// code.
+pub fn command(
+    alloc: std.mem.Allocator,
+    request: Request,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) std.Io.Writer.Error!u8 {
     const place: Place = .user;
     switch (request) {
         .status => {
-            const is = isDefault(place) catch |err| {
-                try out.print("Cannot read the default terminal ({s}).\n", .{@errorName(err)});
+            const is = isDefault(place) catch |e| {
+                try err.print("Cannot read the default terminal ({s}).\n", .{@errorName(e)});
                 return 1;
             };
             if (is) {
@@ -219,14 +225,14 @@ pub fn command(alloc: std.mem.Allocator, request: Request, out: *std.Io.Writer) 
         },
         .enable => {
             const exe = IpcClient.imagePath(alloc) catch {
-                try out.writeAll("Out of memory.\n");
+                try err.writeAll("Out of memory.\n");
                 return 1;
             };
             defer alloc.free(exe);
-            enable(place, exe) catch |err| {
-                switch (err) {
-                    error.NoWindowsTerminal => try out.writeAll(unavailable),
-                    else => try out.print("Ghostty could not be made the default terminal ({s}).\n", .{@errorName(err)}),
+            enable(place, exe) catch |e| {
+                switch (e) {
+                    error.NoWindowsTerminal => try err.writeAll(unavailable),
+                    else => try err.print("Ghostty could not be made the default terminal ({s}).\n", .{@errorName(e)}),
                 }
                 return 1;
             };
@@ -236,8 +242,8 @@ pub fn command(alloc: std.mem.Allocator, request: Request, out: *std.Io.Writer) 
             return 0;
         },
         .disable => {
-            const result = disable(place) catch |err| {
-                try out.print("The previous default terminal could not be put back ({s}).\n", .{@errorName(err)});
+            const result = disable(place) catch |e| {
+                try err.print("The previous default terminal could not be put back ({s}).\n", .{@errorName(e)});
                 return 1;
             };
             try out.writeAll(switch (result) {

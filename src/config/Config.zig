@@ -5139,7 +5139,7 @@ pub fn parseManuallyHook(
     // class registers (LocalServer32), so it comes last. The Windows app
     // reads it from the process's arguments (apprt/windows/App.zig); for
     // the configuration it ends the arguments.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime builtin.target.os.tag == .windows) {
         if (std.mem.eql(u8, arg, "-Embedding")) return false;
     }
 
@@ -10861,7 +10861,7 @@ test "parse e: command and args" {
 }
 
 test "parse -Embedding: COM's argument ends the arguments on Windows" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     var cfg = try Config.default(testing.allocator);
     defer cfg.deinit();

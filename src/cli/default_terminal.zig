@@ -1,8 +1,8 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Action = @import("ghostty.zig").Action;
 const args = @import("args.zig");
+const build_config = @import("../build_config.zig");
 const global = @import("../global.zig");
 
 pub const Options = struct {
@@ -34,7 +34,7 @@ pub const Options = struct {
 /// The default Ghostty replaces is saved, and `--disable` puts it back,
 /// unless another default terminal was chosen since, which it keeps.
 ///
-/// Only supported on Windows.
+/// Only supported by the Windows app.
 ///
 /// Flags:
 ///
@@ -51,24 +51,32 @@ pub fn run(alloc: Allocator) !u8 {
         try args.parse(Options, alloc, &opts, &iter);
     }
 
-    var buffer: [1024]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(global.io(), &buffer);
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(global.io(), &stdout_buffer);
     const stdout = &stdout_writer.interface;
     defer stdout.flush() catch {};
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+    defer stderr.flush() catch {};
 
-    if (comptime builtin.os.tag != .windows) {
-        try stdout.writeAll("+default-terminal is only supported on Windows.\n");
+    // The Windows app's runtime serves the class the command names: any
+    // other build, libghostty's on Windows too, would point the user's
+    // consoles at an executable that never serves them.
+    if (comptime build_config.app_runtime != .windows) {
+        try stderr.writeAll("+default-terminal is only supported by the Windows app.\n");
         return 1;
     } else {
         if (opts.enable and opts.disable) {
-            try stdout.writeAll("Give --enable or --disable, not both.\n");
-            return 1;
+            try stderr.writeAll("Give --enable or --disable, not both.\n");
+            return 2;
         }
         const default_terminal = @import("../apprt/windows/default_terminal.zig");
         return default_terminal.command(
             alloc,
             if (opts.enable) .enable else if (opts.disable) .disable else .status,
             stdout,
+            stderr,
         );
     }
 }
