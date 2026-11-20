@@ -166,6 +166,13 @@ pub fn workingDirectory(self: *const Overrides, inherited: ?[]const u8) ?[]const
     return wd.value();
 }
 
+/// Whether the terminal shows something other than the configured shell:
+/// a command, or a console handed off, whose program a saved state could
+/// not start again (`Surface.ran_command`).
+pub fn replacesShell(self: *const Overrides) bool {
+    return self.command != null or self.handoff != null;
+}
+
 test "win32: IPC arguments are read as GTK reads them" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -295,4 +302,16 @@ test "win32: a handed-off console's size is the window's, at least the configura
     try (Overrides{ .size = .{ .cols = 3, .rows = 1 } }).apply(&config);
     try std.testing.expectEqual(10, config.@"window-width");
     try std.testing.expectEqual(4, config.@"window-height");
+}
+
+test "win32: a command or a console handed off replaces the shell" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    try std.testing.expect(!(try parse(alloc, &.{"--title=a"})).replacesShell());
+    try std.testing.expect((try parse(alloc, &.{ "-e", "a.exe" })).replacesShell());
+    try std.testing.expect((try parse(alloc, &.{"--command=b.exe"})).replacesShell());
+    // The slot counts, whether or not the terminal has taken it yet.
+    var slot: ?termio.Exec.Handoff = null;
+    try std.testing.expect((Overrides{ .handoff = &slot }).replacesShell());
 }

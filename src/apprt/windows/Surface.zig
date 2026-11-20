@@ -150,8 +150,9 @@ pub const Surface = struct {
 
     /// Whether the terminal was started with a command of its own, from
     /// `-e` or `--command` (`Overrides`) or as the first terminal under
-    /// `initial-command`, in place of the configured shell. Its tab is
-    /// then not one `window-save-state` can bring back (`Session`).
+    /// `initial-command`, or shows a console handed off, in place of the
+    /// configured shell. Its tab is then not one `window-save-state` can
+    /// bring back (`Session`).
     ran_command: bool,
 
     /// The client size the core asked for through `.initial_size`, or null
@@ -1013,7 +1014,7 @@ pub const Surface = struct {
         }
         // Before init, which clears `first`.
         self.ran_command = app.command_launch or
-            (if (opts.overrides) |o| o.command != null else false) or
+            (if (opts.overrides) |o| o.replacesShell() else false) or
             (app.core_app.first and config.@"initial-command" != null);
         // Before init as well. Without it a drop takes the
         // quoting for a shell Ghostty does not know, the most careful,
