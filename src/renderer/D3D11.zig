@@ -1067,6 +1067,13 @@ pub fn drawFrameUnlocked(self: *D3D11) void {
 pub fn followWindow(self: *D3D11) void {
     if (comptime RtSurface == void) return;
     const surface = self.rt_surface orelse return;
+    // The target is as it was at the last follow: keep the chain, one
+    // that fell back to an HWND chain too (`recoverDevice`). A
+    // composition chain made later on the window that chain presented
+    // to would show its last frame (RenderWindow.zig), so only a new
+    // target, which a turn to transparent makes on a new window, ends
+    // the fallback.
+    if (surface.render_changes.load(.acquire) == self.render_changes) return;
     const target = surface.takeRenderTarget();
     self.render_changes = target.changes;
     self.follow(target.hwnd, if (target.alpha) .composition else .hwnd);

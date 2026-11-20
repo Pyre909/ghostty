@@ -11098,6 +11098,57 @@ test "win32: a renderer follows its terminal to a transparent frame and hands th
     try std.testing.expect(win32.IsWindow(second).toBool());
 }
 
+test "win32: a renderer that fell back to an opaque chain keeps it until its terminal changes" {
+    // A composition chain it cannot make on the new render window, its
+    // target taken (as at init): it presents through an HWND chain there.
+    // A later config with the target unchanged must not rebuild it as a
+    // composition chain, which that window would show its last opaque
+    // frame under (RenderWindow.zig).
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(1);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+    var r = try renderer.D3D11.testInit(a);
+    defer r.deinit();
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    // The new window's composition target, taken by another renderer.
+    var holder = try renderer.D3D11.testInit(a);
+    try std.testing.expect(holder.presentsAlpha());
+
+    r.drawFrameStart();
+    r.drawFrameEnd();
+    try std.testing.expect(r.deviceLost());
+    try r.recoverDevice();
+    try std.testing.expect(!r.presentsAlpha());
+    holder.deinit();
+
+    // A config, then a frame, with the target as it was: kept.
+    r.followWindow();
+    r.drawFrameStart();
+    try std.testing.expect(!r.deviceLost());
+    try std.testing.expect(!r.presentsAlpha());
+}
+
 test "win32: a split turned transparent and back changes its chrome and backdrop, not its dim" {
     // The link preview is layered with the frame; the dim, layered for
     // its own alpha whatever the frame (`own_layering`), is not layered
