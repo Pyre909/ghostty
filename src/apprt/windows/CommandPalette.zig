@@ -2777,6 +2777,10 @@ test "win32: the palette offers to make Ghostty the default terminal, or to undo
         try testing.expectEqual(.title, match(e, "default term"));
         try testing.expectEqualStrings(e.description, e.tooltip().?);
         try testing.expect(sameEntry(e, e));
+        // The other direction is another entry, whatever its title: the
+        // listing rebuilt after a run must not keep the old one selected.
+        try testing.expect(!sameEntry(e, &.{ .title = e.title, .run = .{ .default_terminal = !want } }));
+        try testing.expect(!sameEntry(e, &.{ .title = e.title, .action_key = "ignore", .run = .{ .action = .ignore } }));
     }
 }
 
