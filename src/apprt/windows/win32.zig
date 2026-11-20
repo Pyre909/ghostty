@@ -1072,6 +1072,7 @@ pub extern "advapi32" fn RegGetValueW(
 ) callconv(.winapi) LONG;
 
 pub const REG_SZ: DWORD = 1;
+pub const REG_DWORD: DWORD = 4;
 pub const REG_OPTION_NON_VOLATILE: DWORD = 0;
 pub const KEY_SET_VALUE: DWORD = 0x0002;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regcreatekeyexw
@@ -1097,6 +1098,18 @@ pub extern "advapi32" fn RegSetValueExW(
 ) callconv(.winapi) LONG;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletevaluew
 pub extern "advapi32" fn RegDeleteValueW(key: HKEY, name: ?LPCWSTR) callconv(.winapi) LONG;
+pub const HKEY_CLASSES_ROOT = w.HKEY_CLASSES_ROOT;
+pub const KEY_QUERY_VALUE: DWORD = 0x0001;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regopenkeyexw
+pub extern "advapi32" fn RegOpenKeyExW(
+    key: HKEY,
+    subkey: ?LPCWSTR,
+    options: DWORD,
+    sam: DWORD,
+    result: *HKEY,
+) callconv(.winapi) LONG;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletekeyvaluew
+pub extern "advapi32" fn RegDeleteKeyValueW(key: HKEY, subkey: ?LPCWSTR, name: ?LPCWSTR) callconv(.winapi) LONG;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regdeletetreew
 pub extern "advapi32" fn RegDeleteTreeW(key: HKEY, subkey: ?LPCWSTR) callconv(.winapi) LONG;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regclosekey

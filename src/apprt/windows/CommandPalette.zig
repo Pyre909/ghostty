@@ -18,6 +18,7 @@ const unsafeCodepoint = @import("App.zig").unsafeCodepoint;
 
 const Binding = input.Binding;
 const i18n = @import("../../os/main.zig").i18n;
+const default_terminal = @import("default_terminal.zig");
 const uucode = @import("uucode");
 const unicode = @import("../../unicode/main.zig");
 const terminal = @import("../../terminal/main.zig");
@@ -170,6 +171,10 @@ pub const Entry = struct {
         action: Binding.Action,
         /// Focus this terminal, as GTK presents it.
         jump: *Surface,
+        /// Make Ghostty the default terminal (true), or put back the one
+        /// it replaced (false): Windows' own, as no binding action is
+        /// (`App.setDefaultTerminal`).
+        default_terminal: bool,
     };
 
     /// The second line: the description, as macOS's row shows it, else the
@@ -200,7 +205,7 @@ pub const Entry = struct {
     /// description the second line cuts short; null when there is none,
     /// or for a jump, whose working directory is all of its second line.
     pub fn tooltip(self: *const Entry) ?[]const u8 {
-        if (self.description.len == 0 or self.action_key.len == 0) return null;
+        if (self.description.len == 0 or self.run == .jump) return null;
         return self.description;
     }
 };
@@ -241,12 +246,13 @@ pub fn build(
     commands: []const input.Command,
     set: *const Binding.Set,
     jumps: []const Jump,
+    terminal_offer: ?bool,
 ) Allocator.Error!Entries {
     var arena: std.heap.ArenaAllocator = .init(alloc);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    var list: std.ArrayList(Entry) = try .initCapacity(a, commands.len + jumps.len);
+    var list: std.ArrayList(Entry) = try .initCapacity(a, commands.len + jumps.len + 1);
     for (commands) |command| {
         if (!supported(command.action)) continue;
         const cloned = try command.translated().clone(a);
@@ -274,6 +280,15 @@ pub fn build(
             .sort_key = i,
         }));
     }
+    if (terminal_offer) |enable| list.appendAssumeCapacity(try withFolded(a, if (enable) .{
+        .title = "Make Ghostty the Default Terminal",
+        .description = "Open the consoles Windows starts in Ghostty.",
+        .run = .{ .default_terminal = true },
+    } else .{
+        .title = "Restore the Previous Default Terminal",
+        .description = "Open the consoles Windows starts where they opened before Ghostty.",
+        .run = .{ .default_terminal = false },
+    }));
     // Stable, as GTK's sort is.
     std.mem.sort(Entry, list.items, {}, lessThan);
     return .{ .arena = arena, .items = list.items };
@@ -316,7 +331,15 @@ pub fn forApp(app: *App, skip: ?*const Surface) Allocator.Error!Entries {
         const pwd: ?[]const u8 = if (surface.liveCore()) |core| try core.pwd(s) else null;
         jumps.appendAssumeCapacity(.{ .surface = surface, .title = surface.effectiveTitle(), .pwd = pwd });
     }
-    return build(alloc, app.config.@"command-palette-entry".value.items, &app.config.keybind.set, jumps.items);
+    return build(alloc, app.config.@"command-palette-entry".value.items, &app.config.keybind.set, jumps.items, defaultTerminalOffer(app.default_terminal_place));
+}
+
+/// The default terminal entry `forApp` lists: to make Ghostty the
+/// default, where it can be, or to put back the one it replaced; none
+/// when the user's choice cannot be read.
+fn defaultTerminalOffer(where: default_terminal.Place) ?bool {
+    if (default_terminal.isDefault(where) catch return null) return false;
+    return if (default_terminal.available(where)) true else null;
 }
 
 /// GTK's order (`compareCommands`): by title, ignoring ASCII case, a ':'
@@ -963,7 +986,7 @@ pub const Pending = struct {
     pub fn jumpsTo(self: *const Pending, surface: *const Surface) bool {
         return switch (self.entry().run) {
             .jump => |s| s == surface,
-            .action => false,
+            .action, .default_terminal => false,
         };
     }
 
@@ -1419,6 +1442,7 @@ pub fn sameEntry(a: *const Entry, b: *const Entry) bool {
         .action => b.run == .action and
             std.mem.eql(u8, a.title, b.title) and
             std.mem.eql(u8, a.action_key, b.action_key),
+        .default_terminal => |enable| b.run == .default_terminal and b.run.default_terminal == enable,
     };
 }
 
@@ -1703,6 +1727,7 @@ fn runNow(surface: *Surface, run: Entry.Run) void {
             if (window != surface.window) _ = window.present();
             window.focusFromGoto(target);
         },
+        .default_terminal => |enable| surface.app.queueDefaultTerminal(enable),
     }
 }
 
@@ -2533,7 +2558,7 @@ test "win32: the palette's entries are the supported commands and a jump per ter
         .{ .surface = three, .title = "C:\\src - cmd", .pwd = "C:\\src" },
         .{ .surface = one, .title = "vim" },
     };
-    var entries = try build(alloc, commands, &config.keybind.set, &jumps);
+    var entries = try build(alloc, commands, &config.keybind.set, &jumps, null);
     defer entries.deinit();
 
     var commands_kept: usize = 0;
@@ -2582,6 +2607,8 @@ test "win32: the palette's entries are the supported commands and a jump per ter
             try testing.expect(!std.mem.eql(u8, e.action_key, "show_gtk_inspector"));
         },
         .jump => {},
+        // Not asked for.
+        .default_terminal => return error.TestUnexpectedResult,
     };
     try testing.expect(saw_split and saw_tab and saw_inspector and saw_updates);
 
@@ -2630,7 +2657,7 @@ test "win32: the palette's commands and jumps are in the user's language" {
     try i18n.windows.testUse(catalog);
     defer i18n.windows.testUse(null) catch unreachable;
 
-    var entries = try build(alloc, commands, &config.keybind.set, &jumps);
+    var entries = try build(alloc, commands, &config.keybind.set, &jumps, null);
     defer entries.deinit();
     var saw_split = false;
     var saw_tab = false;
@@ -2651,6 +2678,7 @@ test "win32: the palette's commands and jumps are in the user's language" {
             }
         },
         .jump => |surface| titles[@intFromPtr(surface) / 0x10000 - 1] = e.title,
+        .default_terminal => return error.TestUnexpectedResult,
     };
     try testing.expect(saw_split and saw_tab);
     try testing.expectEqualStrings("Fokus: Unbenannt", titles[0]);
@@ -2677,7 +2705,7 @@ test "win32: a jump's working directory cannot reorder or hide the palette's tex
         .{ .surface = @ptrFromInt(0x30000), .title = "c", .pwd = "C:\\caf\u{E9}" },
         .{ .surface = @ptrFromInt(0x40000), .title = "d", .pwd = "C:\\d\xff" },
     };
-    var entries = try build(alloc, &.{}, &config.keybind.set, &jumps);
+    var entries = try build(alloc, &.{}, &config.keybind.set, &jumps, null);
     defer entries.deinit();
     const want = [_][]const u8{ "C:\\aU+202Egpj.exe", "C:\\bU+200BU+2066cU+0085", "C:\\caf\u{E9}", "C:\\d\xff" };
     try testing.expectEqual(want.len, entries.items.len);
@@ -2713,7 +2741,7 @@ test "win32: a palette row's second line is its description, which a command's t
     var config: Config = try .default(alloc);
     defer config.deinit();
     const jumps = [_]Jump{.{ .surface = @ptrFromInt(0x10000), .title = "vim", .pwd = "C:\\src" }};
-    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &jumps);
+    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &jumps, null);
     defer entries.deinit();
     for (entries.items) |*e| switch (e.run) {
         .action => {
@@ -2721,7 +2749,35 @@ test "win32: a palette row's second line is its description, which a command's t
             try testing.expectEqualStrings(e.description, e.tooltip().?);
         },
         .jump => try testing.expect(e.tooltip() == null),
+        .default_terminal => return error.TestUnexpectedResult,
     };
+}
+
+test "win32: the palette offers to make Ghostty the default terminal, or to undo it" {
+    const alloc = testing.allocator;
+    var config = try Config.default(alloc);
+    defer config.deinit();
+    const jumps: [0]Jump = .{};
+    for ([_]?bool{ null, true, false }) |offer| {
+        var entries = try build(alloc, &.{}, &config.keybind.set, &jumps, offer);
+        defer entries.deinit();
+        var found: ?*const Entry = null;
+        for (entries.items) |*e| if (e.run == .default_terminal) {
+            try testing.expectEqual(null, found);
+            found = e;
+        };
+        const want = offer orelse {
+            try testing.expectEqual(null, found);
+            continue;
+        };
+        const e = found orelse return error.TestExpectedEntry;
+        try testing.expectEqual(want, e.run.default_terminal);
+        try testing.expectEqualStrings(if (want) "Make Ghostty the Default Terminal" else "Restore the Previous Default Terminal", e.title);
+        // Found as a command is, and its description is its tooltip.
+        try testing.expectEqual(.title, match(e, "default term"));
+        try testing.expectEqualStrings(e.description, e.tooltip().?);
+        try testing.expect(sameEntry(e, e));
+    }
 }
 
 test "win32: the palette shows the letters a query matched, by the code points they fold from" {
@@ -2949,7 +3005,7 @@ test "win32: the palette's filter narrows as the query grows, and keeps the orde
         .{ .surface = @ptrFromInt(0x30000), .title = "Обзор" },
         .{ .surface = @ptrFromInt(0x40000), .title = "Straße" },
     };
-    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &jumps);
+    var entries = try build(alloc, config.@"command-palette-entry".value.items, &config.keybind.set, &jumps, null);
     defer entries.deinit();
     const items = entries.items;
 

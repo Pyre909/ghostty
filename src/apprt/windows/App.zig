@@ -33,6 +33,7 @@ const Session = @import("Session.zig");
 const IpcClient = @import("IpcClient.zig");
 const jumplist = @import("jumplist.zig");
 const About = @import("About.zig");
+const default_terminal = @import("default_terminal.zig");
 const Updater = @import("Updater.zig");
 const http_testing = @import("http_testing.zig");
 const build_config = @import("../../build_config.zig");
@@ -457,6 +458,12 @@ pub const App = struct {
     /// no window of its own, and `run` does not quit for having none until
     /// a console comes or `handoff_wait_ms` passes (`endHandoffWait`).
     awaiting_handoff: bool,
+
+    /// Where the user's default terminal is chosen
+    /// (`default_terminal.Place.user`); a test's own keys in a test's
+    /// App, so that no test changes the terminal Windows opens consoles
+    /// in.
+    default_terminal_place: default_terminal.Place,
 
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
@@ -1100,6 +1107,12 @@ pub const App = struct {
         /// shown by `run` as About is. The request owns the job.
         update: *Updater.Job,
 
+        /// The palette's default terminal entry: make Ghostty the default
+        /// terminal (true) or put back the one it replaced (false), and
+        /// say what came of it (`setDefaultTerminal`), outside any core
+        /// frame, as About is shown.
+        default_terminal: bool,
+
         /// One of the above whose surface began to close first: it has
         /// nowhere to go.
         dropped,
@@ -1287,6 +1300,7 @@ pub const App = struct {
             .session_ended = false,
             .command_launch = false,
             .awaiting_handoff = false,
+            .default_terminal_place = .user,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -3633,6 +3647,42 @@ pub const App = struct {
     }
 
     /// `check_for_updates`: a check that reports whatever it finds.
+    /// Record the palette's default terminal entry for `run`
+    /// (`setDefaultTerminal`).
+    pub fn queueDefaultTerminal(self: *App, enable: bool) void {
+        self.requests.append(self.core_app.alloc, .{ .default_terminal = enable }) catch |err| {
+            log.warn("cannot record changing the default terminal err={}", .{err});
+        };
+    }
+
+    /// Make Ghostty the default terminal, or put back the one it replaced
+    /// (`default_terminal`), and say what came of it. Made the default,
+    /// this instance serves the class, as one started after it would.
+    fn setDefaultTerminal(self: *App, enable: bool) void {
+        const place = self.default_terminal_place;
+        const text: [*:0]const u16 = if (enable) text: {
+            const exe = IpcClient.imagePath(self.core_app.alloc) catch
+                break :text L("Ghostty could not be made the default terminal.");
+            defer self.core_app.alloc.free(exe);
+            default_terminal.enable(place, exe) catch |err| break :text switch (err) {
+                error.NoWindowsTerminal => L("Ghostty can be the default terminal only with Windows " ++
+                    "Terminal 1.22 or later installed: it uses Windows Terminal's console server."),
+                else => L("Ghostty could not be made the default terminal."),
+            };
+            if (self.handoff_server == null) self.startHandoff();
+            break :text L("Ghostty is now the default terminal. Consoles started as administrator " ++
+                "still open in the console host.");
+        } else switch (default_terminal.disable(place) catch {
+            notice(self, null, L("The previous default terminal could not be put back."));
+            return;
+        }) {
+            .restored => L("The previous default terminal is back."),
+            .kept => L("Another default terminal was chosen since Ghostty was; it is kept."),
+            .not_default => L("Ghostty is not the default terminal; nothing changed."),
+        };
+        notice(self, null, text);
+    }
+
     fn checkForUpdates(self: *App) bool {
         if (self.updater.start(true)) |job| self.tellUpdate(job);
         return true;
@@ -3924,7 +3974,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .handoff, .about, .update, .dropped => {},
+            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .handoff, .about, .update, .default_terminal, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -4650,6 +4700,12 @@ pub const App = struct {
                     self.requests.items[i] = .dropped;
                     defer Updater.release(job);
                     Updater.report(self, job);
+                },
+                // Dropped first, as `about` is: its notice's loop can add
+                // requests.
+                .default_terminal => |enable| {
+                    self.requests.items[i] = .dropped;
+                    self.setDefaultTerminal(enable);
                 },
                 .dropped => {},
             }
@@ -6325,6 +6381,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.session_ended = false;
     app.command_launch = false;
     app.awaiting_handoff = false;
+    app.default_terminal_place = default_terminal.test_place;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
@@ -27393,6 +27450,63 @@ test "win32: a Save dialog asked once the app quits is answered Cancel, unshown"
     try std.testing.expectEqual(0, app.prompt_depth);
 }
 
+test "win32: the palette's default terminal entry makes Ghostty the default terminal, and undoes it" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    // The notice finds its owner through the core's terminals.
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    defer testCleanup(&app);
+    default_terminal.testCleanup();
+    defer default_terminal.testCleanup();
+    const Said = struct {
+        var buf: [256]u16 = undefined;
+        var len: usize = 0;
+        fn box(_: ?win32.HWND, text: win32.LPCWSTR, _: win32.UINT) c_int {
+            const said = std.mem.span(text);
+            len = @min(said.len, buf.len);
+            @memcpy(buf[0..len], said[0..len]);
+            return win32.IDOK;
+        }
+        fn begins(comptime want: []const u8) !void {
+            const w = std.unicode.utf8ToUtf16LeStringLiteral(want);
+            try std.testing.expect(std.mem.startsWith(u16, buf[0..len], w));
+            len = 0;
+        }
+    };
+    @import("dialog.zig").test_message_box = &Said.box;
+    defer @import("dialog.zig").test_message_box = null;
+    const offered = struct {
+        fn offered(a: *App) !?bool {
+            var entries = try CommandPalette.forApp(a, null);
+            defer entries.deinit();
+            for (entries.items) |e| if (e.run == .default_terminal) return e.run.default_terminal;
+            return null;
+        }
+    }.offered;
+
+    // Without Windows Terminal's console server, no entry.
+    try std.testing.expectEqual(null, try offered(&app));
+
+    try default_terminal.testInstallTerminal();
+    try std.testing.expectEqual(true, try offered(&app));
+    app.queueDefaultTerminal(true);
+    app.createRequested();
+    try std.testing.expect(try default_terminal.isDefault(default_terminal.test_place));
+    try Said.begins("Ghostty is now the default terminal.");
+
+    try std.testing.expectEqual(false, try offered(&app));
+    app.queueDefaultTerminal(false);
+    app.createRequested();
+    try std.testing.expect(!try default_terminal.isDefault(default_terminal.test_place));
+    try Said.begins("The previous default terminal is back.");
+    try std.testing.expectEqual(true, try offered(&app));
+}
+
 test "win32: the command palette has a jump to each terminal that is not closing" {
     // GTK's and macOS's "Focus: <title>" entries, one per terminal of
     // every window, titled as each is shown (its title prompt's title over
@@ -27433,6 +27547,8 @@ test "win32: the command palette has a jump to each terminal that is not closing
             n += 1;
         },
         .action => commands += 1,
+        // The test's keys have no Windows Terminal.
+        .default_terminal => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqual(3, n);
     try std.testing.expect(commands > 50);

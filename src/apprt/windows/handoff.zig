@@ -48,9 +48,13 @@ pub const clsid: GUID = GUID.parse("{73db5bf6-8dd9-4f9f-85f8-9a05893d71c7}");
 /// Terminal 1.22 and later.
 pub const iid_handoff3: GUID = GUID.parse("{6f23da90-15c5-4203-9db0-64e73f1b1b00}");
 
+/// Under HKEY_CURRENT_USER: the class's key, which `default_terminal`
+/// writes.
+pub const class_key = "Software\\Classes\\CLSID\\{73DB5BF6-8DD9-4F9F-85F8-9A05893D71C7}";
+
 /// Under HKEY_CURRENT_USER: the command COM runs, with `-Embedding` after
 /// it, to start a server of the class when none is running.
-pub const server_key = "Software\\Classes\\CLSID\\{73DB5BF6-8DD9-4F9F-85F8-9A05893D71C7}\\LocalServer32";
+pub const server_key = class_key ++ "\\LocalServer32";
 
 /// Whether the user's class starts `exe`, the path of this process's
 /// image. Only then does an instance serve the class: one of another
@@ -60,7 +64,9 @@ pub fn registeredTo(exe: []const u16) bool {
     return serverNames(win32.HKEY_CURRENT_USER, win32.L(server_key), exe);
 }
 
-fn serverNames(root: win32.HKEY, subkey: [*:0]const u16, exe: []const u16) bool {
+/// Whether the class's server command under `root`'s `subkey` starts
+/// `exe` (`commandNames`).
+pub fn serverNames(root: win32.HKEY, subkey: [*:0]const u16, exe: []const u16) bool {
     // Room for any path Explorer can start a program from, and then some.
     var buf: [2048]u16 = undefined;
     var size: win32.DWORD = @sizeOf(@TypeOf(buf));

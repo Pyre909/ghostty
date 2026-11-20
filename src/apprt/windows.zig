@@ -450,6 +450,7 @@ test {
     _ = @import("windows/Window.zig");
     _ = @import("windows/clipboard.zig");
     _ = @import("windows/com_abi_test.zig");
+    _ = @import("windows/default_terminal.zig");
     _ = @import("windows/desktop_notifications.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/drop.zig");
