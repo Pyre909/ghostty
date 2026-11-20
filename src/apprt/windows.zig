@@ -467,6 +467,7 @@ test {
     _ = @import("windows/Overrides.zig");
     _ = @import("windows/key.zig");
     _ = @import("windows/overlay_keys.zig");
+    _ = @import("windows/registry.zig");
     _ = @import("windows/taskbar.zig");
     _ = @import("windows/toast.zig");
     _ = @import("windows/Updater.zig");

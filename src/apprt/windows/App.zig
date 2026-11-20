@@ -27482,6 +27482,8 @@ test "win32: the palette's default terminal entry makes Ghostty the default term
     var app: App = undefined;
     try testApp(&app, &core_app);
     defer testCleanup(&app);
+    const dt_lock = try default_terminal.testLock();
+    defer dt_lock.release();
     default_terminal.testCleanup();
     defer default_terminal.testCleanup();
     const Said = struct {

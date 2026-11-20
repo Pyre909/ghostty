@@ -20,6 +20,7 @@ const std = @import("std");
 
 const IpcClient = @import("IpcClient.zig");
 const handoff = @import("handoff.zig");
+const registry = @import("registry.zig");
 const win32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -34,7 +35,7 @@ const open_console = "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}";
 const handoff3 = "{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}";
 
 /// Ghostty's class (`handoff.clsid`), as Settings writes a class.
-const ghostty = handoff.class_key[handoff.class_key.len - 38 ..];
+const ghostty = handoff.clsid_text;
 
 const console_name = W("DelegationConsole");
 const terminal_name = W("DelegationTerminal");
@@ -133,10 +134,16 @@ pub fn enable(place: Place, exe: []const u16) Error!void {
         try put(place.root, place.saved, console_name, console);
         try put(place.root, place.saved, terminal_name, terminal);
     }
-    try write(place.root, place.startup, console_name, W(open_console));
+    // DelegationTerminal first: it alone makes Ghostty the default
+    // (`isDefault`), so a failure writing the console after it leaves
+    // Ghostty the default with the record saved, which `disable` puts
+    // back whole, rather than a pair naming another terminal's console
+    // and no record.
     try write(place.root, place.startup, terminal_name, W(ghostty));
+    try write(place.root, place.startup, console_name, W(open_console));
 }
 
+/// What `disable` did.
 pub const Disabled = enum {
     /// The values Ghostty replaced are back, or with none saved, Windows
     /// decides again.
@@ -172,7 +179,7 @@ pub fn disable(place: Place) Error!Disabled {
 }
 
 fn writeClass(place: Place, exe: []const u16) Error!void {
-    var buf: [2048]u16 = undefined;
+    var buf: [registry.command_units]u16 = undefined;
     if (exe.len + 3 > buf.len) return error.UnexpectedValue;
     buf[0] = '"';
     @memcpy(buf[1..][0..exe.len], exe);
@@ -182,6 +189,9 @@ fn writeClass(place: Place, exe: []const u16) Error!void {
     try write(place.root, place.server, null, buf[0 .. exe.len + 2 :0]);
 }
 
+/// What `ghostty +default-terminal` was asked: to say whether Ghostty is
+/// the default terminal, to make it the default, or to put the previous
+/// default back.
 pub const Request = enum { status, enable, disable };
 
 /// `ghostty +default-terminal`: carry out `request` on the user's keys and
@@ -253,20 +263,8 @@ const Value = struct {
 
 fn read(root: win32.HKEY, subkey: [*:0]const u16, name: [*:0]const u16) Error!Value {
     var value: Value = .{};
-    var size: win32.DWORD = @sizeOf(@TypeOf(value.buf));
-    const rc = win32.RegGetValueW(root, subkey, name, win32.RRF_RT_REG_SZ, null, &value.buf, &size);
-    switch (rc) {
-        0 => {
-            // RRF_RT_REG_SZ ends the string, counted in `size`.
-            const units = size / 2;
-            value.len = std.mem.indexOfScalar(u16, value.buf[0..units], 0) orelse return error.UnexpectedValue;
-        },
-        error_file_not_found => {},
-        else => {
-            log.warn("cannot read a default terminal value err={d}", .{rc});
-            return error.UnexpectedValue;
-        },
-    }
+    const text = try registry.readString(root, subkey, name, &value.buf);
+    value.len = if (text) |t| t.len else null;
     return value;
 }
 
@@ -277,19 +275,7 @@ fn put(root: win32.HKEY, subkey: [*:0]const u16, name: [*:0]const u16, value: Va
 }
 
 fn write(root: win32.HKEY, subkey: [*:0]const u16, name: ?[*:0]const u16, text: [:0]const u16) Error!void {
-    var key: win32.HKEY = undefined;
-    const created = win32.RegCreateKeyExW(root, subkey, 0, null, win32.REG_OPTION_NON_VOLATILE, win32.KEY_SET_VALUE, null, &key, null);
-    if (created != 0) {
-        log.warn("cannot open a default terminal key err={d}", .{created});
-        return error.RegistryFailed;
-    }
-    defer _ = win32.RegCloseKey(key);
-    const bytes = std.mem.sliceAsBytes(text[0 .. text.len + 1]);
-    const set = win32.RegSetValueExW(key, name, 0, win32.REG_SZ, bytes.ptr, @intCast(bytes.len));
-    if (set != 0) {
-        log.warn("cannot write a default terminal value err={d}", .{set});
-        return error.RegistryFailed;
-    }
+    return registry.writeString(root, subkey, name, text);
 }
 
 fn remove(root: win32.HKEY, subkey: [*:0]const u16, name: [*:0]const u16) Error!void {
@@ -325,9 +311,10 @@ fn exists(root: win32.HKEY, subkey: [*:0]const u16) bool {
     return true;
 }
 
-/// A place of the test's own under HKCU\Software\GhosttyTest, removed by
-/// `testCleanup`, never the user's %%Startup: every App a test makes has
-/// it (`App.default_terminal_place`).
+/// A place of the test's own under HKCU\Software\GhosttyTest\dt, removed
+/// by `testCleanup`, never the user's %%Startup: every App a test makes
+/// has it (`App.default_terminal_place`). A test that uses it holds
+/// `testLock`.
 const test_prefix = "Software\\GhosttyTest\\dt\\";
 pub const test_place: Place = .at(
     win32.HKEY_CURRENT_USER,
@@ -343,7 +330,32 @@ const wt_terminal = W("{E12CFF52-A866-4C77-9A90-F570A7AA2C6B}");
 const conhost = W("{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}");
 
 pub fn testCleanup() void {
-    _ = win32.RegDeleteTreeW(win32.HKEY_CURRENT_USER, W("Software\\GhosttyTest"));
+    _ = win32.RegDeleteTreeW(win32.HKEY_CURRENT_USER, W(test_prefix[0 .. test_prefix.len - 1]));
+}
+
+/// Held while a test uses `test_place`: every test process of this user
+/// shares it, as two test executables run at once would.
+pub const TestLock = struct {
+    mutex: win32.HANDLE,
+
+    pub fn release(self: TestLock) void {
+        _ = win32.ReleaseMutex(self.mutex);
+        _ = win32.CloseHandle(self.mutex);
+    }
+};
+
+pub fn testLock() !TestLock {
+    const mutex = win32.CreateMutexW(null, .FALSE, W("Local\\GhosttyTestDefaultTerminal")) orelse
+        return error.TestUnexpectedResult;
+    switch (win32.WaitForSingleObject(mutex, win32.INFINITE)) {
+        // Abandoned: a test process died holding it; the keys are
+        // cleaned up before use anyway.
+        win32.WAIT_OBJECT_0, win32.WAIT_ABANDONED => return .{ .mutex = mutex },
+        else => {
+            _ = win32.CloseHandle(mutex);
+            return error.TestUnexpectedResult;
+        },
+    }
 }
 
 /// Windows Terminal's console server, as installed, for `test_place`:
@@ -376,6 +388,8 @@ fn testExpect(console: ?[:0]const u16, terminal: ?[:0]const u16) !void {
 }
 
 test "win32: making Ghostty the default terminal and undoing it puts %%Startup back exactly" {
+    const lock = try testLock();
+    defer lock.release();
     defer testCleanup();
     const cases = [_]struct { ?[:0]const u16, ?[:0]const u16 }{
         // Let Windows decide: no values.
@@ -406,6 +420,8 @@ test "win32: making Ghostty the default terminal and undoing it puts %%Startup b
 }
 
 test "win32: making Ghostty the default terminal twice saves the values it first replaced" {
+    const lock = try testLock();
+    defer lock.release();
     defer testCleanup();
     testCleanup();
     try testInstallTerminal(.current);
@@ -420,6 +436,8 @@ test "win32: making Ghostty the default terminal twice saves the values it first
 }
 
 test "win32: a default terminal chosen after Ghostty is kept" {
+    const lock = try testLock();
+    defer lock.release();
     defer testCleanup();
     testCleanup();
     try testInstallTerminal(.current);
@@ -432,7 +450,39 @@ test "win32: a default terminal chosen after Ghostty is kept" {
     try std.testing.expect(!exists(test_place.root, test_place.saved));
 }
 
+test "win32: making Ghostty the default terminal again after a choice in Settings saves that choice" {
+    const lock = try testLock();
+    defer lock.release();
+    defer testCleanup();
+    testCleanup();
+    try testInstallTerminal(.current);
+    try testSet(conhost, conhost);
+    try enable(test_place, test_exe);
+    // Settings' choice of Windows Terminal, then Ghostty again: the
+    // record of the console host is stale.
+    try testSet(wt_console, wt_terminal);
+    try enable(test_place, test_exe);
+    try std.testing.expectEqual(.restored, try disable(test_place));
+    try testExpect(wt_console, wt_terminal);
+}
+
+test "win32: undoing Ghostty as the default terminal with its record gone lets Windows decide" {
+    const lock = try testLock();
+    defer lock.release();
+    defer testCleanup();
+    testCleanup();
+    try testInstallTerminal(.current);
+    try testSet(wt_console, wt_terminal);
+    try enable(test_place, test_exe);
+    try deleteTree(test_place.root, test_place.saved);
+    try std.testing.expectEqual(.restored, try disable(test_place));
+    try testExpect(null, null);
+    try std.testing.expect(!try isDefault(test_place));
+}
+
 test "win32: Ghostty is the default terminal only with Windows Terminal's console server, and only from values it can save" {
+    const lock = try testLock();
+    defer lock.release();
     defer testCleanup();
     testCleanup();
     try testSet(conhost, conhost);
