@@ -2634,13 +2634,20 @@ pub const App = struct {
         const want = Transparency.wanted(&self.config);
         for (self.windows.items) |window| {
             if (window.closing or !window.setTransparent(want)) continue;
-            for (self.surfaces.items) |surface| {
-                if (surface.window != window) continue;
-                const core = surface.liveCore() orelse continue;
-                self.giveSurface(core, &self.config) catch |err| {
-                    log.warn("cannot give a terminal its window's transparency err={}", .{err});
-                };
-            }
+            self.giveTransparency(window);
+        }
+    }
+
+    /// Give the terminals of `window`, which `Window.setTransparent` just
+    /// changed, the configuration again, at which their renderers follow.
+    /// From `run`, never inside a core frame.
+    pub fn giveTransparency(self: *App, window: *Window) void {
+        for (self.surfaces.items) |surface| {
+            if (surface.window != window) continue;
+            const core = surface.liveCore() orelse continue;
+            self.giveSurface(core, &self.config) catch |err| {
+                log.warn("cannot give a terminal its window's transparency err={}", .{err});
+            };
         }
     }
 
@@ -15410,6 +15417,56 @@ test "win32: a window parked while the background's opacity is toggled has its b
     try std.testing.expectEqualSlices(*Window, &.{ window, other }, app.windows.items);
     try std.testing.expectEqual(.default, window.backdrop);
     try std.testing.expectEqual(window.hwnd, TestClear.backdrop_frames[TestClear.backdrop_count - 1]);
+}
+
+test "win32: a window parked after a reload across 1 comes back as the reload asks" {
+    // A window closed while a reload waits, as under its config-errors
+    // prompt, is parked after the reload has passed it by
+    // (`followTransparency` skips a closing frame): undo turns it
+    // transparent or opaque as the configuration now asks
+    // (`Window.unpark`). The reload is stood for by the app's
+    // configuration changed while the window is parked.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer TestClear.stop();
+    Window.test_create_pane = &testCreatePane;
+    defer Window.test_create_pane = null;
+
+    var config: Config = try .default(alloc);
+    defer config.deinit();
+    try config.keybind.parseCLI(config._arena.?.allocator(), "ctrl+shift+z=undo");
+    config.@"window-inherit-font-size" = false;
+    config.@"window-inherit-working-directory" = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &config }));
+    // What the config queued (`.redecorate`), before anything is parked.
+    app.createRequested();
+    Undo.test_now = TestUndo.start;
+    TestClear.start(1);
+    const window = try app.newWindow(null, .normal, null);
+    _ = try app.newWindow(null, .normal, null);
+    try std.testing.expect(!window.transparent);
+    const a = window.tab().focused.?;
+    const first = a.render_hwnd.?;
+
+    _ = Window.wndProc(window.hwnd, win32.WM_CLOSE, 0, 0);
+    testPump();
+    try std.testing.expectEqual(1, app.undo.parkedWindows());
+    app.config.@"background-opacity" = 0.5;
+
+    try std.testing.expect(try app.performAction(.app, .undo, {}));
+    app.createRequested();
+    try std.testing.expectEqual(0, app.undo.parkedWindows());
+    // Only the window undo brought back is asked.
+    try std.testing.expectEqual(1, TestClear.asked);
+    try std.testing.expect(window.transparent);
+    try std.testing.expect(a.render_hwnd.? != first);
+    try std.testing.expect(a.renderTarget().alpha);
 }
 
 test "win32: the last window's close is not kept, and ends the windows parked before it" {
