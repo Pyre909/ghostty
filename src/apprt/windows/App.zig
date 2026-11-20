@@ -10952,6 +10952,14 @@ test "win32: a reload across an opacity of 1 turns a window transparent, and opa
     try std.testing.expect(!win32.IsWindow(first).toBool());
     try std.testing.expect(win32.IsWindow(second).toBool());
 
+    // As another process could post it: no window, or one that is not
+    // this terminal's render window. Nothing is destroyed.
+    _ = win32.SendMessageW(a.hwnd, WM_GHOSTTY_RENDER_LEFT, 0, 0);
+    _ = win32.SendMessageW(a.hwnd, WM_GHOSTTY_RENDER_LEFT, 0, @bitCast(@intFromPtr(window.hwnd)));
+    try std.testing.expect(win32.IsWindow(window.hwnd).toBool());
+    try std.testing.expect(win32.IsWindow(second).toBool());
+    try std.testing.expect(a.render_hwnd.? == second);
+
     // `run` again, and a reload that keeps it below 1: nothing changes.
     app.createRequested();
     changed.@"background-opacity" = 0.75;

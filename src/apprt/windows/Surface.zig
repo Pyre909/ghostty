@@ -2443,8 +2443,9 @@ pub const Surface = struct {
             WM_GHOSTTY_RENDER_LEFT => {
                 // Only a render window of this terminal's that the
                 // renderer left: a handle posted before a teardown may
-                // name a window gone since, or one made after.
-                const old: win32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
+                // name a window gone since, or one made after. Any
+                // process can post it, with no window at all.
+                const old: win32.HWND = @as(?win32.HWND, @ptrFromInt(@as(usize, @bitCast(lparam)))) orelse return 0;
                 if (old != self.render_hwnd and win32.IsWindow(old).toBool() and win32.GetAncestor(old, win32.GA_PARENT) == self.hwnd)
                     _ = win32.DestroyWindow(old);
                 return 0;
