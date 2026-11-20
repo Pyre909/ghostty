@@ -56,7 +56,9 @@ pub const Place = struct {
     root: win32.HKEY,
     /// Console\%%Startup.
     startup: [*:0]const u16,
+    /// The user's classes, which hold Ghostty's (`handoff.Watch`), and
     /// Ghostty's class (`handoff.class_key`) and its server command.
+    classes: [*:0]const u16,
     class: [*:0]const u16,
     server: [*:0]const u16,
     /// The %%Startup values Ghostty replaced, until it puts them back.
@@ -91,6 +93,7 @@ pub const Place = struct {
         return .{
             .root = root,
             .startup = W(prefix ++ "Console\\%%Startup"),
+            .classes = W(prefix ++ handoff.classes_key),
             .class = W(prefix ++ handoff.class_key),
             .server = W(prefix ++ handoff.server_key),
             .saved = W(prefix ++ "Software\\Ghostty\\DefaultTerminal"),

@@ -51,22 +51,14 @@ pub const clsid: GUID = GUID.parse(clsid_text);
 /// Terminal 1.22 and later.
 pub const iid_handoff3: GUID = GUID.parse("{6f23da90-15c5-4203-9db0-64e73f1b1b00}");
 
-/// Under HKEY_CURRENT_USER: the class's key, which `default_terminal`
-/// writes.
-pub const class_key = "Software\\Classes\\CLSID\\" ++ clsid_text;
+/// Under HKEY_CURRENT_USER: the user's classes, and the class's key,
+/// which `default_terminal` writes.
+pub const classes_key = "Software\\Classes\\CLSID";
+pub const class_key = classes_key ++ "\\" ++ clsid_text;
 
 /// Under HKEY_CURRENT_USER: the command COM runs, with `-Embedding` after
 /// it, to start a server of the class when none is running.
 pub const server_key = class_key ++ "\\LocalServer32";
-
-/// Whether the user's class starts `exe`, the path of this process's
-/// image. Only then does an instance serve the class: one of another
-/// build, or another install, would take the consoles meant for the
-/// Ghostty the user chose, and with no class nothing would ask. A server
-/// keeps checking (`Watch`).
-pub fn registeredTo(exe: []const u16) bool {
-    return serverNames(win32.HKEY_CURRENT_USER, win32.L(server_key), exe);
-}
 
 /// Whether the class's server command under `root`'s `subkey` starts
 /// `exe` (`commandNames`).
@@ -150,15 +142,6 @@ pub const Watch = struct {
     server: []const u16,
     /// This process's image.
     exe: []const u16,
-
-    /// The user's class, for an instance whose image is `exe`.
-    pub fn user(exe: []const u16) Watch {
-        return .{
-            .key = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Classes\\CLSID"),
-            .server = std.unicode.utf8ToUtf16LeStringLiteral(server_key),
-            .exe = exe,
-        };
-    }
 
     /// The server thread's own copies.
     const Owned = struct {

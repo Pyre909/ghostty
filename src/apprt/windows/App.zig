@@ -738,8 +738,8 @@ pub const App = struct {
     /// instance: Windows never asks it, as it ignores the user's classes
     /// for an elevated caller, and it would show the consoles of the
     /// user's other programs with its rights. Nor for one whose image the
-    /// user's class does not start (`handoff.registeredTo`), unless COM
-    /// started it for the class.
+    /// user's class does not start (`classIsOurs`), unless COM started it
+    /// for the class.
     fn startHandoff(self: *App) void {
         const identity = IpcServer.Identity.ofProcess() catch |err| {
             log.warn("serving no consoles handed off, this process's token cannot be read err={}", .{err});
@@ -756,12 +756,16 @@ pub const App = struct {
         self.serveHandoff();
     }
 
-    /// Whether the user's console handoff class starts this process's
-    /// image (`handoff.registeredTo`).
+    /// Whether the console handoff class (`default_terminal_place`)
+    /// starts this process's image. Only then does an instance serve the
+    /// class: one of another build, or another install, would take the
+    /// consoles meant for the Ghostty the user chose, and with no class
+    /// nothing would ask. A server keeps checking (`handoff.Watch`).
     fn classIsOurs(self: *const App) bool {
         const exe = IpcClient.imagePath(self.core_app.alloc) catch return false;
         defer self.core_app.alloc.free(exe);
-        return handoff.registeredTo(exe);
+        const place = self.default_terminal_place;
+        return handoff.serverNames(place.root, place.server, exe);
     }
 
     fn serveHandoff(self: *App) void {
@@ -771,7 +775,14 @@ pub const App = struct {
             break :none null;
         };
         defer if (exe) |e| self.core_app.alloc.free(e);
-        const watch: ?handoff.Watch = if (exe) |e| .user(e) else null;
+        const place = self.default_terminal_place;
+        // The watch's keys are the current user's, as the place's are.
+        std.debug.assert(place.root == win32.HKEY_CURRENT_USER);
+        const watch: ?handoff.Watch = if (exe) |e| .{
+            .key = std.mem.span(place.classes),
+            .server = std.mem.span(place.server),
+            .exe = e,
+        } else null;
         self.handoff_server = handoff.Server.start(
             self.core_app.alloc,
             self.msg_hwnd,
@@ -3674,7 +3685,6 @@ pub const App = struct {
         };
     }
 
-    /// `check_for_updates`: a check that reports whatever it finds.
     /// Record the palette's default terminal entry for `run`
     /// (`setDefaultTerminal`).
     pub fn queueDefaultTerminal(self: *App, enable: bool) void {
@@ -3714,6 +3724,7 @@ pub const App = struct {
         notice(self, null, text);
     }
 
+    /// `check_for_updates`: a check that reports whatever it finds.
     fn checkForUpdates(self: *App) bool {
         if (self.updater.start(true)) |job| self.tellUpdate(job);
         return true;
@@ -6656,6 +6667,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
 pub fn testCleanup(app: *App) void {
     const alloc = app.core_app.alloc;
     app.stopIpc();
+    app.stopHandoff();
     app.undo.endWindows(app);
     while (app.windows.getLastOrNull()) |window| {
         if (!win32.DestroyWindow(window.hwnd).toBool()) break;
@@ -27483,6 +27495,13 @@ test "win32: a Save dialog asked once the app quits is answered Cancel, unshown"
 }
 
 test "win32: the palette's default terminal entry makes Ghostty the default terminal, and undoes it" {
+    // On a desktop of its own, as it serves the class (testHandoffWindow).
+    try testOnOwnDesktop(testPaletteDefaultTerminal, .{});
+}
+
+fn testPaletteDefaultTerminal() !void {
+    // Without input methods, as the class is served (testHandoffWindow).
+    try std.testing.expect(win32.ImmDisableIME(0).toBool());
     const alloc = std.testing.allocator;
     var core_app: CoreApp = undefined;
     core_app.alloc = alloc;
@@ -27531,10 +27550,14 @@ test "win32: the palette's default terminal entry makes Ghostty the default term
 
     try default_terminal.testInstallTerminal(.current);
     try std.testing.expectEqual(true, try offered(&app));
+    try std.testing.expectEqual(null, app.handoff_server);
     app.queueDefaultTerminal(true);
     app.createRequested();
     try std.testing.expect(try default_terminal.isDefault(default_terminal.test_place));
     try Said.begins("Ghostty is now the default terminal.");
+    // The class starts this executable now: this instance serves it, as
+    // one started after it would.
+    try std.testing.expect(app.handoff_server != null);
 
     try std.testing.expectEqual(false, try offered(&app));
     app.queueDefaultTerminal(false);
@@ -35380,9 +35403,71 @@ test "win32: a console handed off opens a window, maximized as its program asked
     try testOnOwnDesktop(testHandoffWindow, .{});
 }
 
-/// A test terminal takes the console from its options, as the core does
-/// through `Surface.takeHandoff`, which a test's terminals, having no
-/// core, never reach.
+test "win32: quitting stops serving consoles handed off, and so does the session's end" {
+    // On a desktop of its own, as it serves the class (testHandoffWindow).
+    try testOnOwnDesktop(testHandoffQuit, .{});
+}
+
+fn testHandoffQuit() !void {
+    // Without input methods, as the class is served (testHandoffWindow).
+    try std.testing.expect(win32.ImmDisableIME(0).toBool());
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |session_end| {
+        var core_app: CoreApp = undefined;
+        core_app.alloc = alloc;
+        core_app.surfaces = .empty;
+        defer core_app.surfaces.deinit(alloc);
+        core_app.focused_surface = null;
+        var app: App = undefined;
+        try testApp(&app, &core_app);
+        app.quit_timer = .off;
+        try registerClasses(app.hinstance);
+        var terminated = false;
+        defer if (!terminated) {
+            testCleanup(&app);
+            unregisterClasses(app.hinstance);
+        };
+        defer _ = testTakeQuit();
+        _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+
+        app.serveHandoff();
+        try std.testing.expect(app.handoff_server != null);
+
+        // A console that comes once the instance is quitting is closed,
+        // which ends its program, rather than recorded for a window.
+        {
+            app.quit = true;
+            defer app.quit = false;
+            var caller: handoff.TestCaller = .init(false);
+            defer caller.deinit();
+            try caller.call();
+            try IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_HANDOFF);
+            try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_HANDOFF, 0, 0));
+            try std.testing.expectEqual(0, app.requests.items.len);
+            try caller.expectClosed();
+        }
+
+        if (session_end) {
+            const f = try testFrame(&app);
+            const a = try testPane(&app, f);
+            f.tab().tree = try .init(alloc, a);
+            f.tab().focused = a;
+            try std.testing.expectEqual(0, Window.wndProc(f.hwnd, win32.WM_ENDSESSION, 1, 0x1));
+            try std.testing.expectEqual(null, app.handoff_server);
+        }
+        terminated = true;
+        app.terminate();
+        try std.testing.expectEqual(null, app.handoff_server);
+        // Refused: the console stays the classic conhost's.
+        var caller: handoff.TestCaller = .init(false);
+        defer caller.deinit();
+        try std.testing.expectError(error.TestExpectedEqual, caller.call());
+    }
+}
+
+/// A test terminal takes the console from its options through
+/// `Surface.takeHandoff`, as the core does, lent the request's slot as
+/// `Surface.create` lends it: a test's terminals have no core to take it.
 const TestHandoff = struct {
     var taken: ?termio.Exec.Handoff = null;
     var fail = false;
@@ -35398,8 +35483,13 @@ const TestHandoff = struct {
         if (fail) return error.TestPaneFailed;
         const pane = try TestQuick.create(w, opts);
         if (opts.overrides) |o| if (o.handoff) |slot| {
-            taken = slot.*;
-            slot.* = null;
+            pane.handoff = slot;
+            defer pane.handoff = null;
+            taken = pane.takeHandoff();
+            // Emptied: the request has nothing left to close, and the
+            // console is taken once.
+            if (slot.* != null) return error.TestSlotNotEmptied;
+            if (pane.takeHandoff() != null) return error.TestTakenTwice;
         };
         return pane;
     }
@@ -35444,7 +35534,10 @@ fn testHandoffWindow() !void {
     try std.testing.expectEqual(null, app.handoff_server);
 
     // COM's start serves it, opens no window, and `run` does not quit for
-    // having none while the console is to come.
+    // having none while the console is to come. On a pipe of the test's
+    // own, never the user's instance's.
+    var ipc_buf: [64]u8 = undefined;
+    app.config.class = try testIpcBase(&ipc_buf);
     try app.startUp(&.{"-Embedding"});
     defer app.stopIpc();
     try std.testing.expect(app.handoff_server != null);
