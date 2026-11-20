@@ -453,6 +453,7 @@ test {
     _ = @import("windows/desktop_notifications.zig");
     _ = @import("windows/dialog.zig");
     _ = @import("windows/drop.zig");
+    _ = @import("windows/handoff.zig");
     _ = @import("windows/http.zig");
     _ = @import("windows/imgui.zig");
     _ = @import("windows/input_pane.zig");

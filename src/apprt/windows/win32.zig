@@ -946,6 +946,23 @@ pub extern "ole32" fn CoCreateInstance(
     iid: *const w.GUID,
     out: *?*anyopaque,
 ) callconv(.winapi) HRESULT;
+/// A class this process serves to others (handoff.zig): out of process,
+/// and one class object for every activation, which also serves this
+/// process's own in-process ones.
+pub const CLSCTX_LOCAL_SERVER: DWORD = 0x4;
+pub const REGCLS_MULTIPLEUSE: DWORD = 1;
+/// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-coregisterclassobject
+pub extern "ole32" fn CoRegisterClassObject(
+    clsid: *const w.GUID,
+    unknown: *anyopaque,
+    context: DWORD,
+    flags: DWORD,
+    cookie: *DWORD,
+) callconv(.winapi) HRESULT;
+/// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-corevokeclassobject
+pub extern "ole32" fn CoRevokeClassObject(cookie: DWORD) callconv(.winapi) HRESULT;
+pub const IID_IClassFactory: w.GUID = w.GUID.parse("{00000001-0000-0000-c000-000000000046}");
+pub const CLASS_E_NOAGGREGATION: HRESULT = @bitCast(@as(u32, 0x80040110));
 /// Frees what a COM method allocated for its caller, such as a string it
 /// returned (combaseapi.h).
 /// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cotaskmemfree
