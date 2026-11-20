@@ -622,8 +622,8 @@ const WindowsPty = struct {
     /// A pty for a console handed to us, and the host's ends of its pipes
     /// to return from EstablishPtyHandoff: the caller owns those two (COM
     /// closes them once it has copied them to the host). The pty owns
-    /// `handoff` from here on, if this fails too. The host learns the
-    /// size from the first `setSize`.
+    /// `handoff` once this succeeds; on a failure it is the caller's
+    /// still. The host learns the size from the first `setSize`.
     pub fn openHandoff(handoff: Handoff) OpenError!struct {
         pty: Pty,
         /// The host reads its program's input from it.
@@ -631,7 +631,6 @@ const WindowsPty = struct {
         /// The host writes its program's output to it.
         host_out: windows.HANDLE,
     } {
-        errdefer closeHandoff(handoff);
         const pipes = try openPipes();
         return .{
             .pty = .{

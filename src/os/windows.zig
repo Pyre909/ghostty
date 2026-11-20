@@ -49,6 +49,8 @@ pub const LPTOP_LEVEL_EXCEPTION_FILTER = *const fn (
 pub const SECURITY_ATTRIBUTES = windows.SECURITY_ATTRIBUTES;
 pub const STARTF_USESTDHANDLES = windows.STARTF_USESTDHANDLES;
 pub const STARTUPINFOW = windows.STARTUPINFOW;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winnt/nc-winnt-waitortimercallback
+pub const WAITORTIMERCALLBACK = *const fn (?*anyopaque, windows.BOOLEAN) callconv(.winapi) void;
 
 /// https://learn.microsoft.com/en-us/windows/win32/api/windef/ns-windef-rect
 pub const RECT = extern struct {
@@ -83,9 +85,6 @@ pub const STARTUPINFOEX = extern struct {
 
 // Well-known constant values
 pub const INFINITE = 4294967295;
-/// https://learn.microsoft.com/en-us/windows/win32/api/winnt/nc-winnt-waitortimercallback
-pub const WAITORTIMERCALLBACK = *const fn (?*anyopaque, windows.BOOLEAN) callconv(.winapi) void;
-pub const WT_EXECUTEONLYONCE: ULONG = 0x00000008;
 pub const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 pub const MAX_PATH = windows.MAX_PATH;
 pub const FALSE: windows.BOOL = .fromBool(false);
@@ -168,6 +167,8 @@ pub const VOLUME_NAME_DOS = 0x0;
 pub const WAIT_FAILED = 0xFFFFFFFF;
 pub const WAIT_OBJECT_0 = 0x00000000;
 pub const WAIT_TIMEOUT = 0x00000102;
+/// RegisterWaitForSingleObject dwFlags: the callback runs once.
+pub const WT_EXECUTEONLYONCE: ULONG = 0x00000008;
 
 /// IOCTL that fills the output buffer with bytes from the kernel CSPRNG
 /// behind `\Device\CNG` (what ProcessPrng and BCryptGenRandom draw from).
@@ -678,6 +679,23 @@ pub fn ProcThreadAttributeValue(
         (if (thread) PROC_THREAD_ATTRIBUTE_THREAD else 0) |
         (if (input) PROC_THREAD_ATTRIBUTE_INPUT else 0) |
         (if (additive) PROC_THREAD_ATTRIBUTE_ADDITIVE else 0);
+}
+
+/// A copy of `handle` for this process, with the same access, not
+/// inheritable.
+pub fn duplicateHandle(handle: HANDLE) error{Unexpected}!HANDLE {
+    const current = windows.GetCurrentProcess();
+    var copy: HANDLE = undefined;
+    if (exp.kernel32.DuplicateHandle(
+        current,
+        handle,
+        current,
+        &copy,
+        0,
+        FALSE,
+        DUPLICATE_SAME_ACCESS,
+    ) == FALSE) return unexpectedError(GetLastError());
+    return copy;
 }
 
 /// The environment variable ghostty.com (src/main_launcher.zig) sets to

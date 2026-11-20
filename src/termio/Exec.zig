@@ -90,27 +90,12 @@ const HandoffExit = if (builtin.target.os.tag == .windows) struct {
     fn create(alloc: Allocator, server: windows.HANDLE, client: windows.HANDLE) !*Self {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
-        const server_copy = try duplicateHandle(server);
+        const server_copy = try windows.duplicateHandle(server);
         errdefer _ = windows.exp.kernel32.CloseHandle(server_copy);
-        const process = try duplicateHandle(client);
+        const process = try windows.duplicateHandle(client);
         errdefer _ = windows.exp.kernel32.CloseHandle(process);
         self.* = .{ .notify = try xev.Async.init(), .server = server_copy, .process = process };
         return self;
-    }
-
-    fn duplicateHandle(handle: windows.HANDLE) !windows.HANDLE {
-        const current = std.os.windows.GetCurrentProcess();
-        var copy: windows.HANDLE = undefined;
-        if (windows.exp.kernel32.DuplicateHandle(
-            current,
-            handle,
-            current,
-            &copy,
-            0,
-            windows.FALSE,
-            windows.DUPLICATE_SAME_ACCESS,
-        ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
-        return copy;
     }
 
     /// The first program's exit code: 0 if it still runs, as Windows
@@ -3190,9 +3175,7 @@ test "Exec: stopping a handed-off console ends its program by closing it" {
     const pi = try testHandoffChild("findstr.exe x", server[0]);
     _ = k32.CloseHandle(server[0]);
     // Ours, to see the program after stop closed the terminal's.
-    const current = std.os.windows.GetCurrentProcess();
-    var client: windows.HANDLE = undefined;
-    try testing.expect(k32.DuplicateHandle(current, pi.hProcess, current, &client, 0, windows.FALSE, windows.DUPLICATE_SAME_ACCESS) != windows.FALSE);
+    const client = try windows.duplicateHandle(pi.hProcess);
     defer _ = k32.CloseHandle(client);
 
     const opened = try Pty.openHandoff(.{

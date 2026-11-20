@@ -19,9 +19,9 @@
 //! Windows ignores the user's classes for an elevated caller: an elevated
 //! console never comes here, and keeps the inbox conhost.
 //!
-//! The declarations below follow the IDL by hand. src/os/com_abi.zig does
-//! not check them: its headers are the mingw ones Zig ships, and the
-//! IDL's header is not one of them.
+//! ITerminalHandoff3 and TERMINAL_STARTUP_INFO below follow the IDL by
+//! hand, unchecked: no header Zig ships declares them. The class factory
+//! is IClassFactory, which com_abi_test.zig checks against the headers.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -29,6 +29,7 @@ const global = @import("../../global.zig");
 const internal_os = @import("../../os/main.zig");
 const Pty = @import("../../pty.zig").Pty;
 const termio = @import("../../termio.zig");
+const IpcServer = @import("IpcServer.zig");
 const registry = @import("registry.zig");
 const win32 = @import("win32.zig");
 
@@ -118,9 +119,6 @@ pub const Entry = struct {
     maximized: bool,
 };
 
-/// For the queue, which COM's threads and the UI thread share.
-const alloc = std.heap.smp_allocator;
-
 /// What the class shares with the UI thread. Process-wide, as the class
 /// object is: a call that comes in as the server stops finds it still
 /// there, and is refused.
@@ -128,6 +126,8 @@ var shared: struct {
     /// Set by the server's thread once it revoked the class (`Watch`).
     revoked: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
+    /// The server's (`Server.start`): the queue's, set with `hwnd`.
+    alloc: std.mem.Allocator = undefined,
     /// Where a call posts `message`; null while no server runs, when a
     /// call is refused.
     hwnd: ?win32.HWND = null,
@@ -166,7 +166,7 @@ pub const Watch = struct {
         server: [:0]u16,
         exe: []u16,
 
-        fn init(watch: Watch) !Owned {
+        fn init(alloc: std.mem.Allocator, watch: Watch) !Owned {
             const key = try alloc.dupeSentinel(u16, watch.key, 0);
             errdefer alloc.free(key);
             const server = try alloc.dupeSentinel(u16, watch.server, 0);
@@ -174,12 +174,28 @@ pub const Watch = struct {
             return .{ .key = key, .server = server, .exe = try alloc.dupe(u16, watch.exe) };
         }
 
-        fn deinit(self: Owned) void {
+        fn deinit(self: Owned, alloc: std.mem.Allocator) void {
             alloc.free(self.key);
             alloc.free(self.server);
             alloc.free(self.exe);
         }
     };
+};
+
+/// Which callers a server answers.
+pub const Context = enum {
+    /// Every process: the console servers of the user's consoles.
+    local_server,
+    /// This process alone, for tests: a test never takes a console of the
+    /// user's, whatever the user's default terminal.
+    in_process,
+
+    fn clsctx(self: Context) win32.DWORD {
+        return switch (self) {
+            .local_server => win32.CLSCTX_LOCAL_SERVER,
+            .in_process => win32.CLSCTX_INPROC_SERVER,
+        };
+    }
 };
 
 /// The thread the class object is registered from.
@@ -189,10 +205,17 @@ pub const Server = struct {
 
     pub const Error = std.Thread.SpawnError || error{ EventFailed, RegisterFailed, OutOfMemory };
 
-    /// Serve the class, posting `message` to `hwnd` as consoles come
-    /// (`take`), until stopped or, with `watch`, until the class names
-    /// another executable. One server at a time.
-    pub fn start(hwnd: win32.HWND, message: win32.UINT, watch: ?Watch) Error!Server {
+    /// Serve the class to the callers of `context`, posting `message` to
+    /// `hwnd` as consoles come (`take`), until stopped or, with `watch`,
+    /// until the class names another executable. The queue is allocated
+    /// with `alloc`. One server at a time.
+    pub fn start(
+        alloc: std.mem.Allocator,
+        hwnd: win32.HWND,
+        message: win32.UINT,
+        watch: ?Watch,
+        context: Context,
+    ) Error!Server {
         const ready = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.EventFailed;
         defer _ = win32.CloseHandle(ready);
         const stop_event = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.EventFailed;
@@ -205,15 +228,22 @@ pub const Server = struct {
             std.debug.assert(shared.hwnd == null);
             shared.hwnd = hwnd;
             shared.message = message;
+            shared.alloc = alloc;
         }
         errdefer refuse();
         shared.revoked.store(false, .release);
 
         // The thread's from a successful spawn on.
-        const owned: ?Watch.Owned = if (watch) |w| try .init(w) else null;
-        var registration: Registration = .{ .ready = ready, .stop_event = stop_event, .watch = owned };
+        const owned: ?Watch.Owned = if (watch) |w| try .init(alloc, w) else null;
+        var registration: Registration = .{
+            .alloc = alloc,
+            .ready = ready,
+            .stop_event = stop_event,
+            .watch = owned,
+            .context = context,
+        };
         const thread = std.Thread.spawn(.{}, serve, .{&registration}) catch |err| {
-            if (owned) |o| o.deinit();
+            if (owned) |o| o.deinit(alloc);
             return err;
         };
         _ = win32.WaitForSingleObject(ready, win32.INFINITE);
@@ -244,18 +274,21 @@ pub const Server = struct {
 
 /// How the thread tells `start` whether the class was registered.
 const Registration = struct {
+    alloc: std.mem.Allocator,
     ready: HANDLE,
     stop_event: HANDLE,
     /// The thread's, to free.
     watch: ?Watch.Owned,
+    context: Context,
     hr: HRESULT = win32.E_FAIL,
 };
 
 fn serve(registration: *Registration) void {
     // `registration` is `start`'s, gone once `ready` is set.
+    const alloc = registration.alloc;
     const stop_event = registration.stop_event;
     const watch = registration.watch;
-    defer if (watch) |w| w.deinit();
+    defer if (watch) |w| w.deinit(alloc);
     const init = win32.CoInitializeEx(null, win32.COINIT_MULTITHREADED);
     if (init < 0) {
         registration.hr = init;
@@ -267,7 +300,7 @@ fn serve(registration: *Registration) void {
     const hr = win32.CoRegisterClassObject(
         &clsid,
         @ptrCast(&factory),
-        win32.CLSCTX_LOCAL_SERVER,
+        registration.context.clsctx(),
         win32.REGCLS_MULTIPLEUSE,
         &cookie,
     );
@@ -277,6 +310,8 @@ fn serve(registration: *Registration) void {
     if (watch) |w| watchClass(w, stop_event) else {
         _ = win32.WaitForSingleObject(stop_event, win32.INFINITE);
     }
+    // Not checked: nothing can act on a failure here, and the deferred
+    // CoUninitialize revokes the class anyway.
     _ = win32.CoRevokeClassObject(cookie);
 }
 
@@ -321,31 +356,27 @@ fn watchClass(watch: Watch.Owned, stop_event: HANDLE) void {
 
 /// Refuse calls from now on, and close what was queued.
 fn refuse() void {
-    var left = left: {
+    var left, const alloc = left: {
         shared.mutex.lockUncancelable(global.io());
         defer shared.mutex.unlock(global.io());
         shared.hwnd = null;
         const entries = shared.entries;
         shared.entries = .empty;
-        break :left entries;
+        break :left .{ entries, shared.alloc };
     };
     for (left.items) |*entry| entry.handoff.deinit();
     left.deinit(alloc);
 }
 
 /// The consoles handed off since the last call, for the UI thread. Each
-/// entry's handoff is the caller's, to give to a terminal or close; then
-/// `free` the list.
+/// entry's handoff is the caller's, to give to a terminal or close; the
+/// list too, allocated with the server's allocator (`Server.start`).
 pub fn take() std.ArrayList(Entry) {
     shared.mutex.lockUncancelable(global.io());
     defer shared.mutex.unlock(global.io());
     const entries = shared.entries;
     shared.entries = .empty;
     return entries;
-}
-
-pub fn free(entries: *std.ArrayList(Entry)) void {
-    entries.deinit(alloc);
 }
 
 /// The class's one object: it holds nothing, so it is never freed and
@@ -397,10 +428,10 @@ var handoff: Handoff = .{ .vtable = &.{
 } };
 
 /// IClassFactory for `handoff`, static as it is.
-const Factory = extern struct {
+pub const Factory = extern struct {
     vtable: *const VTable,
 
-    const VTable = extern struct {
+    pub const VTable = extern struct {
         QueryInterface: *const fn (*Factory, *const GUID, *?*anyopaque) callconv(.winapi) HRESULT,
         AddRef: *const fn (*Factory) callconv(.winapi) ULONG,
         Release: *const fn (*Factory) callconv(.winapi) ULONG,
@@ -493,32 +524,25 @@ fn receive(
     client: HANDLE,
     info: *const StartupInfo,
 ) !struct { entry: Entry, host_in: HANDLE, host_out: HANDLE } {
-    const signal_copy = try duplicate(signal);
-    const reference_copy = duplicate(reference) catch |err| {
-        _ = win32.CloseHandle(signal_copy);
-        return err;
-    };
-    const server_copy = duplicate(server) catch |err| {
-        _ = win32.CloseHandle(signal_copy);
-        _ = win32.CloseHandle(reference_copy);
-        return err;
-    };
-    // Owns the three from here, failing or not.
+    // Each copy is closed should a later step fail; the pty owns three
+    // of them once it is opened, the last step that can.
+    const client_copy = try windows.duplicateHandle(client);
+    errdefer _ = win32.CloseHandle(client_copy);
+    const signal_copy = try windows.duplicateHandle(signal);
+    errdefer _ = win32.CloseHandle(signal_copy);
+    const reference_copy = try windows.duplicateHandle(reference);
+    errdefer _ = win32.CloseHandle(reference_copy);
+    const server_copy = try windows.duplicateHandle(server);
+    errdefer _ = win32.CloseHandle(server_copy);
     const opened = try Pty.openHandoff(.{
         .signal = signal_copy,
         .reference = reference_copy,
         .server = server_copy,
     });
-    var pty = opened.pty;
-    errdefer {
-        pty.deinit();
-        _ = win32.CloseHandle(opened.host_in);
-        _ = win32.CloseHandle(opened.host_out);
-    }
-    const client_copy = try duplicate(client);
+    errdefer comptime unreachable;
     return .{
         .entry = .{
-            .handoff = .{ .pty = pty, .client = client_copy },
+            .handoff = .{ .pty = opened.pty, .client = client_copy },
             // As Windows Terminal reads it (ConptyConnection.cpp), with no
             // flag: the host sends none (`StartupInfo`).
             .maximized = info.wShowWindow == @as(u16, @intCast(win32.SW_SHOWMAXIMIZED)),
@@ -537,7 +561,7 @@ fn queue(entry: Entry) error{ NotServing, OutOfMemory, PostFailed }!void {
     shared.mutex.lockUncancelable(global.io());
     defer shared.mutex.unlock(global.io());
     const hwnd = shared.hwnd orelse return error.NotServing;
-    try shared.entries.append(alloc, entry);
+    try shared.entries.append(shared.alloc, entry);
     const posted = !(builtin.is_test and test_post_fails) and
         win32.PostMessageW(hwnd, shared.message, 0, 0).toBool();
     if (!posted) {
@@ -551,43 +575,12 @@ fn queue(entry: Entry) error{ NotServing, OutOfMemory, PostFailed }!void {
 pub var test_post_fails: if (builtin.is_test) bool else void =
     if (builtin.is_test) false else {};
 
-fn duplicate(handle: HANDLE) !HANDLE {
-    const current = std.os.windows.GetCurrentProcess();
-    var copy: HANDLE = undefined;
-    if (windows.exp.kernel32.DuplicateHandle(
-        current,
-        handle,
-        current,
-        &copy,
-        0,
-        windows.FALSE,
-        windows.DUPLICATE_SAME_ACCESS,
-    ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
-    return copy;
-}
-
 const test_message: win32.UINT = win32.WM_APP + 0x50;
-
-/// A message-only window, standing in for the UI thread's.
-fn testWindow() !win32.HWND {
-    return win32.CreateWindowExW(0, win32.L("STATIC"), null, 0, 0, 0, 0, 0, win32.HWND_MESSAGE, null, null, null) orelse
-        error.TestUnexpectedResult;
-}
-
-/// Wait up to 5 s for a post to `hwnd`, as the UI thread gets it.
-fn testAwaitPost(hwnd: win32.HWND) !void {
-    const deadline = win32.GetTickCount64() + 5000;
-    var msg: win32.MSG = undefined;
-    while (!win32.PeekMessageW(&msg, hwnd, test_message, test_message, win32.PM_REMOVE).toBool()) {
-        if (win32.GetTickCount64() > deadline) return error.TestNoPost;
-        win32.Sleep(1);
-    }
-}
 
 /// For tests: a console's server, as OpenConsole is to the class. It gets
 /// the class's object through COM, on a thread of the multithreaded
-/// apartment, and hands it handles of its own, closed once the call
-/// returns, as COM closes a call's.
+/// apartment (`run`), and hands it handles of its own, closed once the
+/// call returns, as COM closes a call's (`establish`).
 pub const TestCaller = struct {
     /// The read ends of the signal, reference and server pipes, which show
     /// what the class's copies of the write ends sent, and when they
@@ -612,13 +605,12 @@ pub const TestCaller = struct {
         try std.testing.expectEqual(win32.S_OK, self.hr);
     }
 
-    /// That the class's copies of the console's handles are closed.
+    /// That the class's copies of the console's handles are closed, with
+    /// nothing left unread. A peek, not a read: a copy left open fails the
+    /// test rather than hanging it.
     pub fn expectClosed(self: *const TestCaller) !void {
-        const k32 = windows.exp.kernel32;
-        var buf: [32]u8 = undefined;
-        var got: windows.DWORD = 0;
         for (self.reads) |r| {
-            try std.testing.expect(k32.ReadFile(r.?, &buf, buf.len, &got, null) == windows.FALSE);
+            try std.testing.expect(windows.exp.kernel32.PeekNamedPipe(r.?, null, 0, null, null, null) == windows.FALSE);
             try std.testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
         }
     }
@@ -645,7 +637,11 @@ pub const TestCaller = struct {
         if (self.hr < 0) return;
         const h: *Handoff = @ptrCast(@alignCast(object.?));
         defer _ = h.vtable.Release(h);
+        self.establish(h);
+    }
 
+    /// Hand `h` a console on this thread.
+    fn establish(self: *TestCaller, h: *Handoff) void {
         const k32 = windows.exp.kernel32;
         var writes: [3]?HANDLE = .{ null, null, null };
         defer for (writes) |wr| if (wr) |x| {
@@ -661,7 +657,7 @@ pub const TestCaller = struct {
             r.* = read;
             wr.* = write;
         }
-        const client = duplicate(std.os.windows.GetCurrentProcess()) catch {
+        const client = windows.duplicateHandle(std.os.windows.GetCurrentProcess()) catch {
             self.hr = win32.E_FAIL;
             return;
         };
@@ -678,18 +674,18 @@ pub const TestCaller = struct {
 test "win32: a console handed off reaches the UI thread, with its handles kept past the call" {
     const testing = std.testing;
     const k32 = windows.exp.kernel32;
-    const hwnd = try testWindow();
+    const hwnd = try IpcServer.testWindow();
     defer _ = win32.DestroyWindow(hwnd);
-    var server = try Server.start(hwnd, test_message, null);
+    var server = try Server.start(testing.allocator, hwnd, test_message, null, .in_process);
     defer server.stop();
 
     var caller: TestCaller = .init(true);
     defer caller.deinit();
     try caller.call();
 
-    try testAwaitPost(hwnd);
+    try IpcServer.testAwaitPost(hwnd, test_message);
     var entries = take();
-    defer free(&entries);
+    defer entries.deinit(testing.allocator);
     try testing.expectEqual(1, entries.items.len);
     var entry = &entries.items[0];
     try testing.expect(entry.maximized);
@@ -741,13 +737,13 @@ test "win32: a server stops serving once the class names another executable" {
     }.set;
     try set(key, W("\"C:\\Ghostty\\ghostty.exe\""));
 
-    const hwnd = try testWindow();
+    const hwnd = try IpcServer.testWindow();
     defer _ = win32.DestroyWindow(hwnd);
-    var server = try Server.start(hwnd, test_message, .{
+    var server = try Server.start(talloc, hwnd, test_message, .{
         .key = root_z,
         .server = sub_z,
         .exe = W("C:\\Ghostty\\ghostty.exe"),
-    });
+    }, .in_process);
     defer server.stop();
 
     // A change that still names it keeps it serving.
@@ -758,9 +754,9 @@ test "win32: a server stops serving once the class names another executable" {
         var caller: TestCaller = .init(false);
         defer caller.deinit();
         try caller.call();
-        try testAwaitPost(hwnd);
+        try IpcServer.testAwaitPost(hwnd, test_message);
         var entries = take();
-        defer free(&entries);
+        defer entries.deinit(testing.allocator);
         for (entries.items) |*entry| entry.handoff.deinit();
         try testing.expectEqual(1, entries.items.len);
     }
@@ -782,9 +778,9 @@ test "win32: a server stops serving once the class names another executable" {
 
 test "win32: a console handed off is refused when the UI thread cannot be told" {
     const testing = std.testing;
-    const hwnd = try testWindow();
+    const hwnd = try IpcServer.testWindow();
     defer _ = win32.DestroyWindow(hwnd);
-    var server = try Server.start(hwnd, test_message, null);
+    var server = try Server.start(testing.allocator, hwnd, test_message, null, .in_process);
     defer server.stop();
 
     test_post_fails = true;
@@ -798,7 +794,7 @@ test "win32: a console handed off is refused when the UI thread cannot be told" 
     // Nothing waits for a window, and the class's copies are closed, so
     // the console stays with its own host.
     var entries = take();
-    defer free(&entries);
+    defer entries.deinit(testing.allocator);
     try testing.expectEqual(0, entries.items.len);
     try caller.expectClosed();
 }
@@ -819,6 +815,35 @@ test "win32: a console handed off with no server running is refused, and its han
     // The call's own write end still works.
     var got: windows.DWORD = 0;
     try testing.expect(k32.WriteFile(write, "x", 1, &got, null) != windows.FALSE);
+}
+
+test "win32: a console refused for want of a server has the class's copies of its handles closed" {
+    var caller: TestCaller = .init(false);
+    defer caller.deinit();
+    // Straight to the class, as COM would call it: with no server, COM
+    // itself refuses.
+    caller.establish(&handoff);
+    try std.testing.expectEqual(win32.E_FAIL, caller.hr);
+    try caller.expectClosed();
+}
+
+test "win32: stopping a server closes the consoles it queued and nobody took" {
+    const testing = std.testing;
+    const hwnd = try IpcServer.testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+    var server = try Server.start(testing.allocator, hwnd, test_message, null, .in_process);
+
+    var caller: TestCaller = .init(false);
+    defer caller.deinit();
+    try caller.call();
+    try IpcServer.testAwaitPost(hwnd, test_message);
+    server.stop();
+
+    // Ended, as closing its window would end it, and gone from the queue.
+    try caller.expectClosed();
+    var entries = take();
+    defer entries.deinit(testing.allocator);
+    try testing.expectEqual(0, entries.items.len);
 }
 
 test "win32: the console handoff's declarations have the IDL's layout" {

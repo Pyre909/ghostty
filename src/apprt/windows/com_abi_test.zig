@@ -7,6 +7,9 @@
 //!
 //!   - The Windows Runtime interfaces (toast.zig, and input_pane.zig's
 //!     IInputPane2): their headers are not among those Zig ships.
+//!   - handoff.zig's ITerminalHandoff3 and TERMINAL_STARTUP_INFO, from
+//!     Windows Terminal's IDL, which no header Zig ships declares: only
+//!     its class factory is checked.
 const builtin = @import("builtin");
 
 const com_abi = @import("../../os/com_abi.zig");
@@ -23,5 +26,7 @@ test "win32: COM declarations match the Windows headers" {
         &[_]com_abi.Entry{
             // The bell's own implementation of the engine's callback.
             .{ .zig = media.Notify, .c = "IMFMediaEngineNotify" },
+            // The console handoff class's factory.
+            .{ .zig = @import("handoff.zig").Factory, .c = "IClassFactory" },
         });
 }

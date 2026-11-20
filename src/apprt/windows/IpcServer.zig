@@ -788,8 +788,8 @@ fn testName(alloc: Allocator, identity: *const Identity) ![:0]u16 {
     return pipeName(alloc, try testBase(&buf), identity);
 }
 
-/// A message-only window, standing in for the UI thread's.
-fn testWindow() !win32.HWND {
+/// For tests: a message-only window, standing in for the UI thread's.
+pub fn testWindow() !win32.HWND {
     return win32.CreateWindowExW(
         0,
         win32.L("STATIC"),

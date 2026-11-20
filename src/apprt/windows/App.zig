@@ -464,6 +464,9 @@ pub const App = struct {
     /// App, so that no test changes the terminal Windows opens consoles
     /// in.
     default_terminal_place: default_terminal.Place,
+    /// Whom the console handoff class answers: every process, or in
+    /// tests this one alone (`handoff.Context`).
+    handoff_context: handoff.Context,
 
     /// The runtime's window procedures and `dispatch` calls on this
     /// thread's stack. A message another thread or process sends is
@@ -769,7 +772,13 @@ pub const App = struct {
         };
         defer if (exe) |e| self.core_app.alloc.free(e);
         const watch: ?handoff.Watch = if (exe) |e| .user(e) else null;
-        self.handoff_server = handoff.Server.start(self.msg_hwnd, WM_GHOSTTY_HANDOFF, watch) catch |err| {
+        self.handoff_server = handoff.Server.start(
+            self.core_app.alloc,
+            self.msg_hwnd,
+            WM_GHOSTTY_HANDOFF,
+            watch,
+            self.handoff_context,
+        ) catch |err| {
             log.warn("serving no consoles handed off err={}", .{err});
             return;
         };
@@ -820,7 +829,7 @@ pub const App = struct {
     fn handoffRequests(self: *App) void {
         const alloc = self.core_app.alloc;
         var entries = handoff.take();
-        defer handoff.free(&entries);
+        defer entries.deinit(alloc);
         for (entries.items) |*entry| {
             if (self.quit or self.terminating) {
                 entry.handoff.deinit();
@@ -1307,6 +1316,7 @@ pub const App = struct {
             .command_launch = false,
             .awaiting_handoff = false,
             .default_terminal_place = .user,
+            .handoff_context = .local_server,
         };
 
         // The app pointer has to be reachable from the message-only window's
@@ -6403,6 +6413,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.command_launch = false;
     app.awaiting_handoff = false;
     app.default_terminal_place = default_terminal.test_place;
+    app.handoff_context = .in_process;
     app.config = try .default(core_app.alloc);
     errdefer app.config.deinit();
     app.msg_hwnd = win32.CreateWindowExW(
