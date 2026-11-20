@@ -7044,15 +7044,25 @@ pub const Keybinds = struct {
                 .{ .key = .{ .unicode = 'e' }, .mods = .{ .ctrl = true, .shift = true } },
                 .{ .new_split = .down },
             );
+            // Windows keeps Ctrl+Win chords for itself (the window loses
+            // the keyboard while one is held), so Ctrl+Win+[ never reaches
+            // Ghostty there; Ctrl+Alt sits with the Ctrl+Alt+arrows below.
+            // A layout that types [ or ] with AltGr (German, French) keeps
+            // its brackets: a Ctrl+Alt chord that types a character is
+            // AltGr's, and the Windows apprt drops its Ctrl and Alt.
+            const goto_split_mods: inputpkg.Mods = if (comptime builtin.target.os.tag == .windows)
+                .{ .ctrl = true, .alt = true }
+            else
+                .{ .ctrl = true, .super = true };
             try self.set.putFlags(
                 alloc,
-                .{ .key = .{ .unicode = '[' }, .mods = .{ .ctrl = true, .super = true } },
+                .{ .key = .{ .unicode = '[' }, .mods = goto_split_mods },
                 .{ .goto_split = .previous },
                 .{ .performable = true },
             );
             try self.set.putFlags(
                 alloc,
-                .{ .key = .{ .unicode = ']' }, .mods = .{ .ctrl = true, .super = true } },
+                .{ .key = .{ .unicode = ']' }, .mods = goto_split_mods },
                 .{ .goto_split = .next },
                 .{ .performable = true },
             );
@@ -11486,6 +11496,40 @@ test "copy-on-select default uses the selection clipboard on Linux and macOS" {
         }),
         cfg.@"copy-on-select",
     );
+}
+
+test "the previous and next split keys are ones each platform delivers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    // Windows keeps Ctrl+Win chords for itself, so it takes Ctrl+Alt.
+    const mods: inputpkg.Mods = switch (builtin.target.os.tag) {
+        .windows => .{ .ctrl = true, .alt = true },
+        else => if (builtin.target.os.tag.isDarwin())
+            .{ .super = true }
+        else
+            .{ .ctrl = true, .super = true },
+    };
+    for ([_]struct { u21, inputpkg.SplitFocusDirection }{
+        .{ '[', .previous },
+        .{ ']', .next },
+    }) |want| {
+        const entry = cfg.keybind.set.get(.{ .key = .{ .unicode = want[0] }, .mods = mods }) orelse
+            return error.TestUnexpectedResult;
+        const value = entry.value_ptr.*;
+        try testing.expect(value == .leaf);
+        try testing.expect(value.leaf.action == .goto_split);
+        try testing.expectEqual(want[1], value.leaf.action.goto_split);
+    }
+    if (comptime builtin.target.os.tag == .windows) {
+        try testing.expect(cfg.keybind.set.get(.{
+            .key = .{ .unicode = '[' },
+            .mods = .{ .ctrl = true, .super = true },
+        }) == null);
+    }
 }
 
 test "compatibility: gtk-single-instance desktop" {
