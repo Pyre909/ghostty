@@ -59,7 +59,8 @@ pub const server_key = class_key ++ "\\LocalServer32";
 /// Whether the user's class starts `exe`, the path of this process's
 /// image. Only then does an instance serve the class: one of another
 /// build, or another install, would take the consoles meant for the
-/// Ghostty the user chose, and with no class nothing would ask.
+/// Ghostty the user chose, and with no class nothing would ask. A server
+/// keeps checking (`Watch`).
 pub fn registeredTo(exe: []const u16) bool {
     return serverNames(win32.HKEY_CURRENT_USER, win32.L(server_key), exe);
 }
@@ -126,6 +127,8 @@ const alloc = std.heap.smp_allocator;
 /// object is: a call that comes in as the server stops finds it still
 /// there, and is refused.
 var shared: struct {
+    /// Set by the server's thread once it revoked the class (`Watch`).
+    revoked: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
     /// Where a call posts `message`; null while no server runs, when a
     /// call is refused.
@@ -134,16 +137,64 @@ var shared: struct {
     entries: std.ArrayList(Entry) = .empty,
 } = .{};
 
+/// Where a server sees whether the class still starts its executable.
+/// COM gives a class object registered for every activation each console
+/// while it stays registered, whatever the class's key says, so once
+/// another executable's `+default-terminal --enable` points the key at
+/// itself, a server of the old one would keep taking its consoles: on
+/// the first change that leaves the key naming another executable, the
+/// server revokes the class.
+pub const Watch = struct {
+    /// Under HKEY_CURRENT_USER: a key that holds `server`, watched with
+    /// all its subkeys.
+    key: []const u16,
+    /// Under HKEY_CURRENT_USER: the class's server key (`serverNames`).
+    server: []const u16,
+    /// This process's image.
+    exe: []const u16,
+
+    /// The user's class, for an instance whose image is `exe`.
+    pub fn user(exe: []const u16) Watch {
+        return .{
+            .key = std.unicode.utf8ToUtf16LeStringLiteral("Software\\Classes\\CLSID"),
+            .server = std.unicode.utf8ToUtf16LeStringLiteral(server_key),
+            .exe = exe,
+        };
+    }
+
+    /// The server thread's own copies.
+    const Owned = struct {
+        key: [:0]u16,
+        server: [:0]u16,
+        exe: []u16,
+
+        fn init(watch: Watch) !Owned {
+            const key = try alloc.dupeSentinel(u16, watch.key, 0);
+            errdefer alloc.free(key);
+            const server = try alloc.dupeSentinel(u16, watch.server, 0);
+            errdefer alloc.free(server);
+            return .{ .key = key, .server = server, .exe = try alloc.dupe(u16, watch.exe) };
+        }
+
+        fn deinit(self: Owned) void {
+            alloc.free(self.key);
+            alloc.free(self.server);
+            alloc.free(self.exe);
+        }
+    };
+};
+
 /// The thread the class object is registered from.
 pub const Server = struct {
     thread: std.Thread,
     stop_event: HANDLE,
 
-    pub const Error = std.Thread.SpawnError || error{ EventFailed, RegisterFailed };
+    pub const Error = std.Thread.SpawnError || error{ EventFailed, RegisterFailed, OutOfMemory };
 
     /// Serve the class, posting `message` to `hwnd` as consoles come
-    /// (`take`). One server at a time.
-    pub fn start(hwnd: win32.HWND, message: win32.UINT) Error!Server {
+    /// (`take`), until stopped or, with `watch`, until the class names
+    /// another executable. One server at a time.
+    pub fn start(hwnd: win32.HWND, message: win32.UINT, watch: ?Watch) Error!Server {
         const ready = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.EventFailed;
         defer _ = win32.CloseHandle(ready);
         const stop_event = win32.CreateEventW(null, .TRUE, .FALSE, null) orelse return error.EventFailed;
@@ -158,9 +209,15 @@ pub const Server = struct {
             shared.message = message;
         }
         errdefer refuse();
+        shared.revoked.store(false, .release);
 
-        var registration: Registration = .{ .ready = ready, .stop_event = stop_event };
-        const thread = try std.Thread.spawn(.{}, serve, .{&registration});
+        // The thread's from a successful spawn on.
+        const owned: ?Watch.Owned = if (watch) |w| try .init(w) else null;
+        var registration: Registration = .{ .ready = ready, .stop_event = stop_event, .watch = owned };
+        const thread = std.Thread.spawn(.{}, serve, .{&registration}) catch |err| {
+            if (owned) |o| o.deinit();
+            return err;
+        };
         _ = win32.WaitForSingleObject(ready, win32.INFINITE);
         if (registration.hr < 0) {
             thread.join();
@@ -168,6 +225,13 @@ pub const Server = struct {
             return error.RegisterFailed;
         }
         return .{ .thread = thread, .stop_event = stop_event };
+    }
+
+    /// Whether the server revoked the class, as the class names another
+    /// executable (`Watch`): consoles go to that one from then on.
+    pub fn revoked(self: *const Server) bool {
+        _ = self;
+        return shared.revoked.load(.acquire);
     }
 
     /// Stop serving the class. A console queued and not taken is closed,
@@ -184,12 +248,16 @@ pub const Server = struct {
 const Registration = struct {
     ready: HANDLE,
     stop_event: HANDLE,
+    /// The thread's, to free.
+    watch: ?Watch.Owned,
     hr: HRESULT = win32.E_FAIL,
 };
 
 fn serve(registration: *Registration) void {
     // `registration` is `start`'s, gone once `ready` is set.
     const stop_event = registration.stop_event;
+    const watch = registration.watch;
+    defer if (watch) |w| w.deinit();
     const init = win32.CoInitializeEx(null, win32.COINIT_MULTITHREADED);
     if (init < 0) {
         registration.hr = init;
@@ -208,8 +276,49 @@ fn serve(registration: *Registration) void {
     registration.hr = hr;
     _ = win32.SetEvent(registration.ready);
     if (hr < 0) return;
-    _ = win32.WaitForSingleObject(stop_event, win32.INFINITE);
+    if (watch) |w| watchClass(w, stop_event) else {
+        _ = win32.WaitForSingleObject(stop_event, win32.INFINITE);
+    }
     _ = win32.CoRevokeClassObject(cookie);
+}
+
+/// Return once `stop_event` is set, or once a change to `watch.key` leaves
+/// the class naming another executable (`Watch`). Should the key not be
+/// watched, only the stop returns.
+fn watchClass(watch: Watch.Owned, stop_event: HANDLE) void {
+    const changed = win32.CreateEventW(null, .FALSE, .FALSE, null);
+    defer if (changed) |e| {
+        _ = win32.CloseHandle(e);
+    };
+    var key: ?win32.HKEY = null;
+    if (changed != null) {
+        var opened: win32.HKEY = undefined;
+        // Made if missing: a class written later then still shows.
+        const rc = win32.RegCreateKeyExW(win32.HKEY_CURRENT_USER, watch.key, 0, null, win32.REG_OPTION_NON_VOLATILE, win32.KEY_NOTIFY, null, &opened, null);
+        if (rc == 0) key = opened else log.warn("not watching the default terminal's class rc={}", .{rc});
+    }
+    defer if (key) |k| {
+        _ = win32.RegCloseKey(k);
+    };
+    while (true) {
+        if (key) |k| {
+            // Once per change: a notification ends with its event.
+            const rc = win32.RegNotifyChangeKeyValue(k, .TRUE, win32.REG_NOTIFY_CHANGE_NAME | win32.REG_NOTIFY_CHANGE_LAST_SET, changed, .TRUE);
+            if (rc != 0) {
+                log.warn("not watching the default terminal's class rc={}", .{rc});
+                _ = win32.RegCloseKey(k);
+                key = null;
+            }
+        }
+        const handles = [_]HANDLE{ stop_event, changed orelse stop_event };
+        const woke = win32.WaitForMultipleObjects(if (key != null) 2 else 1, &handles, .FALSE, win32.INFINITE);
+        if (woke != win32.WAIT_OBJECT_0 + 1) return;
+        if (!serverNames(win32.HKEY_CURRENT_USER, watch.server, watch.exe)) {
+            log.info("the default terminal's class names another executable, no longer serving it", .{});
+            shared.revoked.store(true, .release);
+            return;
+        }
+    }
 }
 
 /// Refuse calls from now on, and close what was queued.
@@ -573,7 +682,7 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
     const k32 = windows.exp.kernel32;
     const hwnd = try testWindow();
     defer _ = win32.DestroyWindow(hwnd);
-    var server = try Server.start(hwnd, test_message);
+    var server = try Server.start(hwnd, test_message, null);
     defer server.stop();
 
     var caller: TestCaller = .init(true);
@@ -608,11 +717,76 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
     try caller.expectClosed();
 }
 
+test "win32: a server stops serving once the class names another executable" {
+    const W = std.unicode.utf8ToUtf16LeStringLiteral;
+    const testing = std.testing;
+    const talloc = testing.allocator;
+    // Keys of the test's own process, which it removes, not the user's
+    // class: the watch is the same on either.
+    const root = try std.fmt.allocPrint(talloc, "Software\\GhosttyTest\\{d}\\hs", .{windows.GetCurrentProcessId()});
+    defer talloc.free(root);
+    const root_z = try std.unicode.utf8ToUtf16LeAllocZ(talloc, root);
+    defer talloc.free(root_z);
+    const sub = try std.fmt.allocPrint(talloc, "{s}\\LocalServer32", .{root});
+    defer talloc.free(sub);
+    const sub_z = try std.unicode.utf8ToUtf16LeAllocZ(talloc, sub);
+    defer talloc.free(sub_z);
+    defer _ = win32.RegDeleteTreeW(win32.HKEY_CURRENT_USER, root_z);
+    var key: win32.HKEY = undefined;
+    try testing.expectEqual(0, win32.RegCreateKeyExW(win32.HKEY_CURRENT_USER, sub_z, 0, null, win32.REG_OPTION_NON_VOLATILE, win32.KEY_SET_VALUE, null, &key, null));
+    defer _ = win32.RegCloseKey(key);
+    const set = struct {
+        fn set(k: win32.HKEY, value: [:0]const u16) !void {
+            const bytes = std.mem.sliceAsBytes(value[0 .. value.len + 1]);
+            try std.testing.expectEqual(0, win32.RegSetValueExW(k, null, 0, win32.REG_SZ, bytes.ptr, @intCast(bytes.len)));
+        }
+    }.set;
+    try set(key, W("\"C:\\Ghostty\\ghostty.exe\""));
+
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+    var server = try Server.start(hwnd, test_message, .{
+        .key = root_z,
+        .server = sub_z,
+        .exe = W("C:\\Ghostty\\ghostty.exe"),
+    });
+    defer server.stop();
+
+    // A change that still names it keeps it serving.
+    try set(key, W("C:\\Ghostty\\ghostty.exe -Embedding"));
+    try std.Io.sleep(testing.io, .fromMilliseconds(300), .awake);
+    try testing.expect(!server.revoked());
+    {
+        var caller: TestCaller = .init(false);
+        defer caller.deinit();
+        try caller.call();
+        try testAwaitPost(hwnd);
+        var entries = take();
+        defer free(&entries);
+        for (entries.items) |*entry| entry.handoff.deinit();
+        try testing.expectEqual(1, entries.items.len);
+    }
+
+    // Another install takes the class: the server revokes it, and a
+    // console is no longer this process's.
+    try set(key, W("\"D:\\Other\\ghostty.exe\""));
+    const deadline = win32.GetTickCount64() + 5000;
+    while (!server.revoked()) {
+        if (win32.GetTickCount64() > deadline) return error.TestNotRevoked;
+        win32.Sleep(1);
+    }
+    var caller: TestCaller = .init(false);
+    defer caller.deinit();
+    const thread = try std.Thread.spawn(.{}, TestCaller.run, .{&caller});
+    thread.join();
+    try testing.expect(caller.hr < 0);
+}
+
 test "win32: a console handed off is refused when the UI thread cannot be told" {
     const testing = std.testing;
     const hwnd = try testWindow();
     defer _ = win32.DestroyWindow(hwnd);
-    var server = try Server.start(hwnd, test_message);
+    var server = try Server.start(hwnd, test_message, null);
     defer server.stop();
 
     test_post_fails = true;

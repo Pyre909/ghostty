@@ -1114,6 +1114,17 @@ pub extern "advapi32" fn RegDeleteKeyValueW(key: HKEY, subkey: ?LPCWSTR, name: ?
 pub extern "advapi32" fn RegDeleteTreeW(key: HKEY, subkey: ?LPCWSTR) callconv(.winapi) LONG;
 /// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regclosekey
 pub extern "advapi32" fn RegCloseKey(key: HKEY) callconv(.winapi) LONG;
+pub const KEY_NOTIFY: DWORD = 0x0010;
+pub const REG_NOTIFY_CHANGE_NAME: DWORD = 0x0000_0001;
+pub const REG_NOTIFY_CHANGE_LAST_SET: DWORD = 0x0000_0004;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regnotifychangekeyvalue
+pub extern "advapi32" fn RegNotifyChangeKeyValue(
+    key: HKEY,
+    watch_subtree: BOOL,
+    filter: DWORD,
+    event: ?HANDLE,
+    asynchronous: BOOL,
+) callconv(.winapi) LONG;
 
 // COM, shared by the runtime's own interfaces (taskbar.zig, toast.zig).
 pub const S_OK: HRESULT = internal_os.windows.S_OK;

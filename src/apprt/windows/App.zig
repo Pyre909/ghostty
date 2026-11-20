@@ -762,7 +762,14 @@ pub const App = struct {
     }
 
     fn serveHandoff(self: *App) void {
-        self.handoff_server = handoff.Server.start(self.msg_hwnd, WM_GHOSTTY_HANDOFF) catch |err| {
+        // With no image path, the server serves until it stops.
+        const exe = IpcClient.imagePath(self.core_app.alloc) catch |err| none: {
+            log.warn("serving consoles handed off without watching the class err={}", .{err});
+            break :none null;
+        };
+        defer if (exe) |e| self.core_app.alloc.free(e);
+        const watch: ?handoff.Watch = if (exe) |e| .user(e) else null;
+        self.handoff_server = handoff.Server.start(self.msg_hwnd, WM_GHOSTTY_HANDOFF, watch) catch |err| {
             log.warn("serving no consoles handed off err={}", .{err});
             return;
         };
@@ -3680,6 +3687,9 @@ pub const App = struct {
                     "Terminal 1.22 or later installed: it uses Windows Terminal's console server."),
                 else => L("Ghostty could not be made the default terminal."),
             };
+            // A server that saw another executable take the class serves
+            // no more: this one has it again.
+            if (self.handoff_server) |*server| if (server.revoked()) self.stopHandoff();
             if (self.handoff_server == null) self.startHandoff();
             break :text L("Ghostty is now the default terminal. Consoles started as administrator " ++
                 "still open in the console host.");
