@@ -2952,6 +2952,12 @@ test "win32: two listings' entries are the same entry by jump target, or title a
     try testing.expect(!sameEntry(&command, &.{ .title = "Split", .action_key = "new_split:right", .run = .{ .action = .{ .new_split = .right } } }));
     try testing.expect(!sameEntry(&command, &.{ .title = "Split Right", .action_key = "new_split:left", .run = .{ .action = .{ .new_split = .left } } }));
     try testing.expect(!sameEntry(&command, &.{ .title = "Split Right", .run = .{ .jump = one } }));
+    // The default terminal's entry by which way it goes.
+    const enable: Entry = .{ .title = "Make Ghostty the Default Terminal", .run = .{ .default_terminal = true } };
+    try testing.expect(sameEntry(&enable, &.{ .title = "Make Ghostty the Default Terminal", .run = .{ .default_terminal = true } }));
+    try testing.expect(!sameEntry(&enable, &.{ .title = "Make Ghostty the Default Terminal", .run = .{ .default_terminal = false } }));
+    try testing.expect(!sameEntry(&enable, &command));
+    try testing.expect(!sameEntry(&enable, &jump));
 }
 
 test "win32: the palette's filter ignores case beyond ASCII, as GTK's folds it" {

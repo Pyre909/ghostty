@@ -71,9 +71,10 @@ current user only.
 
 --enable names the ghostty.exe it was run from: after moving the
 zip's folder, run it again from there. The installer names the
-installed one, and keeps naming it through upgrades. Uninstalling removes what names it: run --disable first to
-have the previous default back, or Windows opens consoles in the
-console host until another is chosen in Settings.
+installed one, and keeps naming it through upgrades. Uninstalling
+removes what names it: run --disable first to have the previous
+default back, or Windows opens consoles in the console host until
+another is chosen in Settings.
 
 
 Crash dumps
