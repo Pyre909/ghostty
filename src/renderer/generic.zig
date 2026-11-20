@@ -730,6 +730,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (!api.presentsAlpha()) config.background_opacity = 1;
         }
 
+        /// Adopt a config the apprt sent. It changes where the backend
+        /// presents before it sends the config that wants it (Direct3D
+        /// 11: a new render window when its frame turns transparent), so
+        /// the backend follows first, and draws there from the next
+        /// frame, and the config is judged by where it will present.
+        pub fn adoptTarget(api: *GraphicsAPI, config: *DerivedConfig) void {
+            if (comptime @hasDecl(GraphicsAPI, "followWindow")) api.followWindow();
+            opaqueUnlessPresentsAlpha(api, config);
+        }
+
+        /// Judge the adopted config again after a device recovery, since
+        /// the backend may have fallen back to a chain that composes no
+        /// alpha (Direct3D 11's `followWindow`). Whether the opacity
+        /// changed: the uniforms and cells built at the old one are then
+        /// stale.
+        pub fn readoptAfterRecovery(api: *const GraphicsAPI, config: *DerivedConfig) bool {
+            const opacity = config.background_opacity;
+            opaqueUnlessPresentsAlpha(api, config);
+            return config.background_opacity != opacity;
+        }
+
         pub fn init(alloc: Allocator, options: renderer.Options) !Self {
             // Initialize our graphics API wrapper, this will prepare the
             // surface provided by the apprt and set up any API- and surface-
@@ -1862,10 +1883,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.bg_image = null;
                     }
                     self.api.recoverDevice() catch return false;
-                    // The backend may have fallen back to a chain that
-                    // composes no alpha (Direct3D 11's `followWindow`).
-                    const opacity = self.config.background_opacity;
-                    opaqueUnlessPresentsAlpha(&self.api, &self.config);
+                    const stale = readoptAfterRecovery(&self.api, &self.config);
                     self.reinitialize_shaders = true;
                     try self.prepBackgroundImage();
                     // The uniforms and cells were built by `updateFrame`
@@ -1874,7 +1892,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // translucent. Built again by the next `updateFrame`
                     // instead, which the render thread is woken for, or
                     // an idle terminal would keep this frame.
-                    if (self.config.background_opacity != opacity) {
+                    if (stale) {
                         self.markDirty();
                         if (self.render_wakeup) |wakeup| wakeup.notify() catch |err| {
                             log.warn("error waking the render thread err={}", .{err});
@@ -2349,13 +2367,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.config.deinit();
             self.config = config.*;
-            // The apprt changes where the backend presents before it
-            // sends the config that wants it (Direct3D 11: a new render
-            // window when its frame turns transparent). The backend
-            // follows here, and draws there from the next frame, so the
-            // config is judged by where it will present.
-            if (comptime @hasDecl(GraphicsAPI, "followWindow")) self.api.followWindow();
-            opaqueUnlessPresentsAlpha(&self.api, &self.config);
+            adoptTarget(&self.api, &self.config);
 
             // If our background image path changed, prepare the new bg image.
             if (bg_image_changed) try self.prepBackgroundImage();

@@ -11104,6 +11104,12 @@ test "win32: a renderer follows its terminal to a transparent frame and hands th
     try r.recoverDevice();
     try std.testing.expect(r.presentsAlpha());
     try std.testing.expect(r.hwnd == second);
+    // A composition chain, as asked: the opacity stays.
+    const Renderer = renderer.GenericRenderer(renderer.D3D11);
+    var derived = try Renderer.DerivedConfig.init(alloc, &changed);
+    defer derived.deinit();
+    try std.testing.expect(!Renderer.readoptAfterRecovery(&r, &derived));
+    try std.testing.expectEqual(@as(f64, 0.5), derived.background_opacity);
     testPump();
     try std.testing.expect(!win32.IsWindow(first).toBool());
     try std.testing.expect(win32.IsWindow(second).toBool());
@@ -11146,15 +11152,31 @@ test "win32: a renderer that fell back to an opaque chain keeps it until its ter
     var holder = try renderer.D3D11.testInit(a);
     try std.testing.expect(holder.presentsAlpha());
 
+    // The config the reload sent is judged by where the renderer will
+    // present, a composition chain, so it keeps its opacity.
+    const Renderer = renderer.GenericRenderer(renderer.D3D11);
+    var derived = try Renderer.DerivedConfig.init(alloc, &changed);
+    defer derived.deinit();
+    Renderer.adoptTarget(&r, &derived);
+    try std.testing.expectEqual(@as(f64, 0.5), derived.background_opacity);
+
     r.drawFrameStart();
     r.drawFrameEnd();
     try std.testing.expect(r.deviceLost());
     try r.recoverDevice();
     try std.testing.expect(!r.presentsAlpha());
+    // The fallback composes no alpha: opaque, and what was built at 0.5
+    // is stale.
+    try std.testing.expect(Renderer.readoptAfterRecovery(&r, &derived));
+    try std.testing.expectEqual(@as(f64, 1), derived.background_opacity);
+    try std.testing.expect(!Renderer.readoptAfterRecovery(&r, &derived));
     holder.deinit();
 
     // A config, then a frame, with the target as it was: kept.
-    r.followWindow();
+    var again = try Renderer.DerivedConfig.init(alloc, &changed);
+    defer again.deinit();
+    Renderer.adoptTarget(&r, &again);
+    try std.testing.expectEqual(@as(f64, 1), again.background_opacity);
     r.drawFrameStart();
     try std.testing.expect(!r.deviceLost());
     try std.testing.expect(!r.presentsAlpha());
