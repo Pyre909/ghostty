@@ -6177,6 +6177,8 @@ const TestClear = struct {
     var backdrop_frames: [8]win32.HWND = undefined;
     var backdrop_count: usize = 0;
     var refuse_backdrop = false;
+    /// Whether DWM refuses to turn blur-behind off.
+    var refuse_undo = false;
 
     fn start(dwm_takes: usize) void {
         takes = dwm_takes;
@@ -6185,6 +6187,7 @@ const TestClear = struct {
         layered_count = 0;
         backdrop_count = 0;
         refuse_backdrop = false;
+        refuse_undo = false;
         Transparency.test_blur_behind = &blur;
         Transparency.test_set_alpha = &alpha;
         Transparency.test_backdrop = &backdrop;
@@ -6208,6 +6211,7 @@ const TestClear = struct {
 
     fn blur(_: win32.HWND, on: bool) bool {
         if (!on) {
+            if (refuse_undo) return false;
             undone += 1;
             return true;
         }
@@ -11248,6 +11252,70 @@ test "win32: a window DWM will not make transparent at a reload stays opaque" {
     try std.testing.expect(a.render_hwnd.? == first);
     try std.testing.expect(!a.renderTarget().alpha);
     try std.testing.expectEqual(0, TestGiven.count);
+}
+
+test "win32: a window DWM will not make opaque at a reload stays transparent" {
+    // The backdrop or blur-behind refused: the frame still composes with
+    // alpha, so it stays transparent, its chrome layered and its
+    // terminals presenting with alpha, given no config; the next reload
+    // asks again. The reload asks for the default backdrop first
+    // (`Transparency.applyBlur`): refused, the frame keeps acrylic.
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    TestClear.start(1);
+    defer TestClear.stop();
+    TestGiven.start();
+    defer TestGiven.stop();
+
+    const window = try testFrame(&app);
+    const a = try testPane(&app, window);
+    window.tab().tree = try .init(alloc, a);
+    window.tab().focused = a;
+
+    var changed: Config = try .default(alloc);
+    defer changed.deinit();
+    changed.@"background-blur" = .true;
+    changed.@"background-opacity" = 0.5;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    try std.testing.expect(window.transparent);
+    try std.testing.expect(window.backdrop == .acrylic);
+    const render = a.render_hwnd.?;
+    const given = TestGiven.count;
+
+    changed.@"background-opacity" = 1;
+    for ([_]bool{ false, true }) |undo| {
+        TestClear.refuse_undo = undo;
+        TestClear.refuse_backdrop = !undo;
+        try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+        a.core_state = .live;
+        app.followTransparency();
+        a.core_state = .none;
+        try std.testing.expect(window.transparent);
+        try std.testing.expectEqual(@as(Transparency.Backdrop, if (undo) .default else .acrylic), window.backdrop);
+        try std.testing.expect(a.render_hwnd.? == render);
+        try std.testing.expect(a.renderTarget().alpha);
+        try std.testing.expectEqual(given, TestGiven.count);
+        try std.testing.expectEqual(0, TestClear.undone);
+    }
+
+    TestClear.refuse_undo = false;
+    TestClear.refuse_backdrop = false;
+    try std.testing.expect(try app.performAction(.app, .config_change, .{ .config = &changed }));
+    a.core_state = .live;
+    app.followTransparency();
+    a.core_state = .none;
+    try std.testing.expect(!window.transparent);
+    try std.testing.expect(window.backdrop != .acrylic);
+    try std.testing.expect(!a.renderTarget().alpha);
 }
 
 test "win32: a render window that outlives its terminal paints without it" {

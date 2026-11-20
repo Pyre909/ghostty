@@ -84,9 +84,10 @@ pub fn frameMade(window: *Window) bool {
 }
 
 /// Make `window`'s frame, transparent until now, opaque again: no
-/// blur-behind. Buffered painting stays started, for Mica.
-pub fn frameOpaque(window: *Window) void {
-    _ = blurBehind(window.hwnd, false);
+/// blur-behind. Buffered painting stays started, for Mica. Whether DWM
+/// took it, logged if not: the frame then still composes with alpha.
+pub fn frameOpaque(window: *Window) bool {
+    return blurBehind(window.hwnd, false);
 }
 
 /// For tests: BufferedPaintInit in `frameMade` and BeginBufferedPaint in

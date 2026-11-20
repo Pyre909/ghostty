@@ -1352,7 +1352,7 @@ pub fn makeTransparent(self: *Window) void {
 /// follow (`Surface.setRenderTarget`), and follows at the latest with the
 /// config the caller gives next; the caller lays the window out after, which gives an opaque frame its Mica
 /// (`Mica.apply`). Whether the frame changed; one that cannot be made
-/// transparent, logged, stays opaque.
+/// transparent, or opaque, logged, stays as it was.
 pub fn setTransparent(self: *Window, on: bool) bool {
     if (on == self.transparent) return false;
     if (on) {
@@ -1361,11 +1361,20 @@ pub fn setTransparent(self: *Window, on: bool) bool {
         self.transparent = true;
         Transparency.applyBlur(self);
     } else {
-        Transparency.frameOpaque(self);
-        self.transparent = false;
         // Acrylic is a transparent frame's; Mica comes back with the
-        // layout below, where it is wanted.
-        if (self.backdrop != .default and Transparency.setBackdrop(self.hwnd, .default)) self.backdrop = .default;
+        // layout below, where it is wanted. If DWM refuses either step,
+        // logged, the frame stays transparent, as it still composes
+        // with alpha, rather than have its chrome drawn as an opaque
+        // frame's over it: its terminals draw opacity 1 opaque all the
+        // same, and the next reload asks again. The default backdrop is
+        // what a transparent frame at opacity 1 has too
+        // (`Transparency.applyBlur`, which the reload asked for first).
+        if (self.backdrop != .default) {
+            if (!Transparency.setBackdrop(self.hwnd, .default)) return false;
+            self.backdrop = .default;
+        }
+        if (!Transparency.frameOpaque(self)) return false;
+        self.transparent = false;
     }
 
     Transparency.chromeAgain(self, self.bar.hwnd);
