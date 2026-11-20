@@ -532,18 +532,21 @@ const WindowsPty = struct {
     /// The handles of a console that Windows handed to the default
     /// terminal through ITerminalHandoff3::EstablishPtyHandoff, all owned
     /// by the pty once `openHandoff` succeeds. The host is the console
-    /// server, an OpenConsole.exe, which ends with the console's last
-    /// program once both `signal` and `reference` are closed. Closing
-    /// them is also the only way to end that program: the handle to it
-    /// that comes with a handoff has no PROCESS_TERMINATE access.
+    /// server, an OpenConsole.exe. While `reference` is open the host
+    /// outlives every program of the console; once it is released (the
+    /// first `setSize` does, as Windows Terminal releases it after its
+    /// first resize) the host ends with the console's last program, as a
+    /// console window does. Closing `signal` ends the host at once, and
+    /// with it every program of the console: the only way to end them,
+    /// as the handle to the program that comes with a handoff has no
+    /// PROCESS_TERMINATE access.
     pub const Handoff = struct {
         /// The write end of the host's signal pipe: resize and the like,
         /// as ConptyResizePseudoConsole sends them.
         signal: windows.HANDLE,
-        /// A handle to the console's reference object, which keeps the
-        /// console alive while it is open.
-        reference: windows.HANDLE,
-        /// The console server process.
+        /// A handle to the console's reference object; null once released.
+        reference: ?windows.HANDLE,
+        /// The console server process, which ends with the console.
         server: windows.HANDLE,
     };
 
@@ -654,11 +657,20 @@ const WindowsPty = struct {
         }
     }
 
+    /// The console server of a handed-off console, which ends with the
+    /// console; null for any other pty, or once `endHandoff` closed it.
+    pub fn handoffServer(self: *const Pty) ?windows.HANDLE {
+        return switch (self.console) {
+            .handoff => |h| h.server,
+            .conpty, .ended => null,
+        };
+    }
+
     /// Close a handed-off console: the signal pipe and the reference
-    /// first, which ends the console and its program.
+    /// first, which ends the console and its programs.
     fn closeHandoff(handoff: Handoff) void {
         _ = windows.exp.kernel32.CloseHandle(handoff.signal);
-        _ = windows.exp.kernel32.CloseHandle(handoff.reference);
+        if (handoff.reference) |r| _ = windows.exp.kernel32.CloseHandle(r);
         _ = windows.exp.kernel32.CloseHandle(handoff.server);
     }
 
@@ -803,7 +815,7 @@ const WindowsPty = struct {
                 );
                 if (result != windows.S_OK) return error.ResizeFailed;
             },
-            .handoff => |h| {
+            .handoff => |*h| {
                 // The host's signal pipe is synchronous and it reads it on
                 // its own thread, so a message this small never waits.
                 const message = [3]u16{ signal_resize, size.ws_col, size.ws_row };
@@ -813,6 +825,14 @@ const WindowsPty = struct {
                 {
                     log.warn("handoff: resize not sent err={}", .{windows.GetLastError()});
                     return error.ResizeFailed;
+                }
+                // The host has our size: the console may now end with
+                // its last program, as Windows Terminal lets it
+                // (ConptyConnection::Start releases it after its first
+                // resize).
+                if (h.reference) |r| {
+                    _ = windows.exp.kernel32.CloseHandle(r);
+                    h.reference = null;
                 }
             },
             // No console left to tell.
@@ -987,12 +1007,17 @@ test "WindowsPty: a handed-off console resizes and ends through its handles" {
     try testing.expect(k32.ReadFile(ends[0][0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
     try testing.expectEqual(@as(windows.DWORD, 6), got);
     try testing.expectEqual([3]u16{ 8, 101, 31 }, message);
+    // With our size sent, the reference is released, as Windows
+    // Terminal releases it: the console may end with its last program.
+    var buf: [32]u8 = undefined;
+    try testing.expect(k32.ReadFile(ends[1][0], &buf, buf.len, &got, null) == windows.FALSE);
+    try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+    try testing.expectEqual(ends[2][1], pty.handoffServer().?);
 
     // What the host writes, the pty reads.
     const text = "handed off";
     try testing.expect(k32.WriteFile(opened.host_out, text, text.len, &got, null) != windows.FALSE);
     _ = k32.CloseHandle(opened.host_out);
-    var buf: [32]u8 = undefined;
     try testing.expect(k32.ReadFile(pty.out_pipe, &buf, buf.len, &got, null) != windows.FALSE);
     try testing.expectEqualStrings(text, buf[0..got]);
 

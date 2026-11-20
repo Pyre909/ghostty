@@ -19,6 +19,7 @@ pub const BOOL = windows.BOOL;
 pub const COORD = windows.COORD;
 pub const DWORD = windows.DWORD;
 pub const DWORD_PTR = windows.DWORD_PTR;
+pub const FILETIME = windows.FILETIME;
 pub const HANDLE = windows.HANDLE;
 pub const HINSTANCE = windows.HINSTANCE;
 pub const HMODULE = windows.HMODULE;
@@ -494,6 +495,18 @@ pub const exp = struct {
             bInheritHandle: BOOL,
             dwOptions: DWORD,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getprocesstimes
+        pub extern "kernel32" fn GetProcessTimes(
+            hProcess: HANDLE,
+            lpCreationTime: *FILETIME,
+            lpExitTime: *FILETIME,
+            lpKernelTime: *FILETIME,
+            lpUserTime: *FILETIME,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime
+        pub extern "kernel32" fn GetSystemTimePreciseAsFileTime(
+            lpSystemTimeAsFileTime: *FILETIME,
+        ) callconv(.winapi) void;
         /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-registerwaitforsingleobject
         pub extern "kernel32" fn RegisterWaitForSingleObject(
             phNewWaitObject: *?HANDLE,

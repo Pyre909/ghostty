@@ -42,11 +42,13 @@ const FlatpakHostCommand = if (!build_config.flatpak) struct {
 } else internal_os.FlatpakHostCommand;
 
 /// A console Windows handed to the default terminal (Windows only): the
-/// pty made for it (`Pty.openHandoff`) and the console's program. That
-/// program's handle carries SYNCHRONIZE and query access only (0x103610
-/// on Windows 11), so it can be waited for, but neither ended nor put in
-/// the job object libxev's process watcher needs: closing the console
-/// ends it (`Pty.endHandoff`), and `HandoffExit` waits for it.
+/// pty made for it (`Pty.openHandoff`) and the console's first program,
+/// whose exit code is the console's. That program's handle carries
+/// SYNCHRONIZE and query access only (0x103610 on Windows 11), so it can
+/// be waited for, but neither ended nor put in the job object libxev's
+/// process watcher needs: closing the console ends it (`Pty.endHandoff`).
+/// Other programs may share the console, so `HandoffExit` waits for its
+/// host, which ends with the last of them.
 pub const Handoff = if (builtin.target.os.tag == .windows) struct {
     pty: Pty,
     client: windows.HANDLE,
@@ -62,54 +64,97 @@ pub const Handoff = if (builtin.target.os.tag == .windows) struct {
 /// before we stop waiting for it: 30 ms measured on Windows 11.
 const handoff_end_ms = 2000;
 
-/// Reports the end of a handed-off console's program on the termio
-/// thread: a thread-pool wait on our own copy of its handle notifies an
-/// xev.Async, as libxev's process watcher cannot take that handle.
+/// Reports the end of a handed-off console on the termio thread: a
+/// thread-pool wait on our own copy of its host's handle notifies an
+/// xev.Async, as libxev's process watcher cannot take that handle. The
+/// host ends with the console's last program (`Pty.Handoff`), as Windows
+/// Terminal's session ends with its output; the exit code is the first
+/// program's, as Windows Terminal reports it.
 const HandoffExit = if (builtin.target.os.tag == .windows) struct {
     notify: xev.Async,
     c: xev.Completion = .{},
+    /// The console's host, waited for.
+    server: windows.HANDLE,
+    /// The console's first program, whose exit code is reported.
     process: windows.HANDLE,
+    /// The thread-pool wait on `server`, from `watch` until `detach`.
     wait: ?windows.HANDLE = null,
+    /// The terminal told of the end, from `arm` until `detach`. A
+    /// failed Termio.threadEnter tears the backend down without
+    /// ThreadData.deinit, and the ThreadData lives on its thread's
+    /// stack, so the callback must not reach it after threadExit.
+    td: ?*termio.Termio.ThreadData = null,
 
     const Self = @This();
 
-    fn create(alloc: Allocator, client: windows.HANDLE) !*Self {
+    fn create(alloc: Allocator, server: windows.HANDLE, client: windows.HANDLE) !*Self {
         const self = try alloc.create(Self);
         errdefer alloc.destroy(self);
+        const server_copy = try duplicateHandle(server);
+        errdefer _ = windows.exp.kernel32.CloseHandle(server_copy);
+        const process = try duplicateHandle(client);
+        errdefer _ = windows.exp.kernel32.CloseHandle(process);
+        self.* = .{ .notify = try xev.Async.init(), .server = server_copy, .process = process };
+        return self;
+    }
+
+    fn duplicateHandle(handle: windows.HANDLE) !windows.HANDLE {
         const current = std.os.windows.GetCurrentProcess();
-        var process: windows.HANDLE = undefined;
+        var copy: windows.HANDLE = undefined;
         if (windows.exp.kernel32.DuplicateHandle(
             current,
-            client,
+            handle,
             current,
-            &process,
+            &copy,
             0,
             windows.FALSE,
             windows.DUPLICATE_SAME_ACCESS,
         ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
-        errdefer _ = windows.exp.kernel32.CloseHandle(process);
-        self.* = .{ .notify = try xev.Async.init(), .process = process };
-        return self;
+        return copy;
     }
 
-    /// Start waiting: `cb` runs on `loop` once the program ends, at once
-    /// if it already has (`exited` for a terminal).
-    fn arm(
-        self: *Self,
-        loop: *xev.Loop,
-        comptime Userdata: type,
-        userdata: ?*Userdata,
-        comptime cb: *const fn (?*Userdata, *xev.Loop, *xev.Completion, xev.Async.WaitError!void) xev.CallbackAction,
-    ) !void {
-        self.notify.wait(loop, &self.c, Userdata, userdata, cb);
+    /// The first program's exit code: 0 if it still runs, as Windows
+    /// Terminal takes STILL_ACTIVE.
+    fn exitCode(self: *const Self) windows.DWORD {
+        var code: windows.DWORD = 0;
+        if (windows.exp.kernel32.GetExitCodeProcess(self.process, &code) == windows.FALSE) {
+            log.warn("handoff: no exit code err={}", .{windows.GetLastError()});
+            return 0;
+        }
+        return if (code == still_active) 0 else code;
+    }
+
+    /// GetExitCodeProcess's code for a process that has not ended.
+    const still_active: windows.DWORD = 259;
+
+    /// Start waiting for the console's end. The only step that can fail,
+    /// so it comes before anything is queued on a loop: `destroy` is then
+    /// safe on any error. A notify before `arm` is kept by the Async.
+    fn watch(self: *Self) !void {
         if (windows.exp.kernel32.RegisterWaitForSingleObject(
             &self.wait,
-            self.process,
+            self.server,
             ended,
             self,
             windows.INFINITE,
             windows.WT_EXECUTEONLYONCE,
         ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+    }
+
+    /// Report the end to `td` on `loop`: `exited` runs there once the
+    /// console ends, at once if it already has.
+    fn arm(self: *Self, loop: *xev.Loop, td: *termio.Termio.ThreadData) void {
+        self.td = td;
+        self.notify.wait(loop, &self.c, Self, self, exited);
+    }
+
+    /// Stop reporting to the terminal: returns once no wait callback runs
+    /// or can run, and wakes the queued completion so a loop drained
+    /// after this finishes it without touching the terminal.
+    fn detach(self: *Self) void {
+        self.unwatch();
+        self.td = null;
+        self.notify.notify() catch |err| log.warn("handoff: detach not woken err={}", .{err});
     }
 
     /// On a thread-pool thread.
@@ -119,29 +164,60 @@ const HandoffExit = if (builtin.target.os.tag == .windows) struct {
     }
 
     fn exited(
-        td_: ?*termio.Termio.ThreadData,
+        self_: ?*Self,
         _: *xev.Loop,
         _: *xev.Completion,
         r: xev.Async.WaitError!void,
     ) xev.CallbackAction {
-        const td = td_.?;
+        const self = self_.?;
+        const td = self.td orelse return .disarm;
         r catch |err| {
-            log.err("handoff: waiting for the program failed err={}", .{err});
+            log.err("handoff: waiting for the console failed err={}", .{err});
             return .disarm;
         };
-        const self = td.backend.exec.handoff_exit.?;
-        var code: windows.DWORD = 0;
-        if (windows.exp.kernel32.GetExitCodeProcess(self.process, &code) == windows.FALSE) {
-            log.warn("handoff: no exit code err={}", .{windows.GetLastError()});
-        }
-        processExitCommon(td, code);
+        processExitCommon(td, self.exitCode());
         return .disarm;
     }
 
+    /// When the console's first program started, on `clock`: the
+    /// terminal's runtime of a handed-off console counts from there, as
+    /// Windows started it before the terminal existed. Null if Windows
+    /// does not say.
+    fn started(self: *const Self, io: std.Io, clock: std.Io.Clock) ?std.Io.Timestamp {
+        var creation: windows.FILETIME = undefined;
+        var exit: windows.FILETIME = undefined;
+        var kernel: windows.FILETIME = undefined;
+        var user: windows.FILETIME = undefined;
+        if (windows.exp.kernel32.GetProcessTimes(self.process, &creation, &exit, &kernel, &user) == windows.FALSE) {
+            log.warn("handoff: no start time err={}", .{windows.GetLastError()});
+            return null;
+        }
+        var now: windows.FILETIME = undefined;
+        windows.exp.kernel32.GetSystemTimePreciseAsFileTime(&now);
+        // FILETIMEs count 100 ns units on the system clock; the age moves
+        // that start onto `clock`.
+        const age = @max(0, fileTime(now) - fileTime(creation)) * 100;
+        return std.Io.Timestamp.now(io, clock).subDuration(.fromNanoseconds(age));
+    }
+
+    fn fileTime(t: windows.FILETIME) i96 {
+        return @as(i96, t.dwHighDateTime) << 32 | t.dwLowDateTime;
+    }
+
     /// Returns once no wait callback runs or can run.
+    fn unwatch(self: *Self) void {
+        if (self.wait) |w| {
+            _ = windows.exp.kernel32.UnregisterWaitEx(w, windows.INVALID_HANDLE_VALUE);
+            self.wait = null;
+        }
+    }
+
+    /// No loop may run the queued completion after this: on the normal
+    /// path the loop is stopped, and a failed Exec.threadEnter never arms.
     fn destroy(self: *Self, alloc: Allocator) void {
-        if (self.wait) |w| _ = windows.exp.kernel32.UnregisterWaitEx(w, windows.INVALID_HANDLE_VALUE);
+        self.unwatch();
         self.notify.deinit();
+        _ = windows.exp.kernel32.CloseHandle(self.server);
         _ = windows.exp.kernel32.CloseHandle(self.process);
         alloc.destroy(self);
     }
@@ -251,14 +327,24 @@ pub fn threadEnter(
     } else return error.ProcessNotStarted;
     errdefer if (process) |*p| p.deinit();
 
+    // libxev's process watcher cannot take a handed-off console's
+    // program (see `Handoff`), so it is watched on the thread pool.
     const handoff_exit: ?*HandoffExit = if (comptime builtin.target.os.tag == .windows) switch (self.subprocess.process.?) {
-        .handoff => |client| try HandoffExit.create(alloc, client),
-        else => null,
+        .handoff => |client| try HandoffExit.create(alloc, self.subprocess.pty.?.handoffServer().?, client),
+        .fork_exec, .flatpak => null,
     } else null;
     errdefer if (handoff_exit) |h| h.destroy(alloc);
+    if (comptime builtin.target.os.tag == .windows) {
+        if (handoff_exit) |h| try h.watch();
+    }
 
     // Track our process start time for abnormal exits
-    const process_start: std.Io.Timestamp = .now(global.io(), .awake);
+    const process_start: std.Io.Timestamp = start: {
+        if (comptime builtin.target.os.tag == .windows) {
+            if (handoff_exit) |h| break :start h.started(global.io(), .awake) orelse .now(global.io(), .awake);
+        }
+        break :start .now(global.io(), .awake);
+    };
 
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
@@ -296,11 +382,10 @@ pub fn threadEnter(
         .handoff_exit = handoff_exit,
     } };
 
-    // ThreadData.deinit destroys it from here on, armed or not.
+    // Nothing can fail from here on: ThreadData.deinit destroys the
+    // watcher, and threadExit detaches it first.
     if (comptime builtin.target.os.tag == .windows) {
-        if (handoff_exit) |h| h.arm(td.loop, termio.Termio.ThreadData, td, HandoffExit.exited) catch |err| {
-            log.err("handoff: the program's end will not be seen err={}", .{err});
-        };
+        if (handoff_exit) |h| h.arm(td.loop, td);
     }
 
     // Start our process watcher. If we have an xev.Process use it.
@@ -344,6 +429,12 @@ pub fn threadEnter(
 pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     assert(td.backend == .exec);
     const exec = &td.backend.exec;
+
+    // Stopping ends the console, and the terminal must not hear of it:
+    // on a failed Termio.threadEnter this ThreadData is gone right after.
+    if (comptime builtin.target.os.tag == .windows) {
+        if (exec.handoff_exit) |h| h.detach();
+    }
 
     if (exec.exited) self.subprocess.externalExit();
     self.subprocess.stop();
@@ -2938,16 +3029,18 @@ fn testHandoffChild(comptime command_line: []const u8, stdin: ?windows.HANDLE) !
     return pi;
 }
 
-test "Exec: the end of a handed-off console's program is seen on the loop" {
+test "Exec: the end of a handed-off console is seen on the loop" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
     const alloc = testing.allocator;
 
+    // The program stands in for the console's host as well.
     const pi = try testHandoffChild("cmd.exe /d /c exit 3", null);
-    const watch = try HandoffExit.create(alloc, pi.hProcess);
+    const watch = try HandoffExit.create(alloc, pi.hProcess, pi.hProcess);
     defer watch.destroy(alloc);
-    // The watch keeps its own copy, as the terminal's is closed on stop.
+    // The watch keeps its own copies, as the terminal's are closed on stop.
     _ = windows.exp.kernel32.CloseHandle(pi.hProcess);
+    try watch.watch();
 
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
@@ -2957,16 +3050,123 @@ test "Exec: the end of a handed-off console's program is seen on the loop" {
 
         fn cb(ud: ?*@This(), _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
             r catch unreachable;
-            var code: windows.DWORD = 0;
-            _ = windows.exp.kernel32.GetExitCodeProcess(ud.?.watch.process, &code);
-            ud.?.code = code;
+            ud.?.code = ud.?.watch.exitCode();
             return .disarm;
         }
     };
     var seen: Seen = .{ .watch = watch };
-    try watch.arm(&loop, Seen, &seen, Seen.cb);
+    watch.notify.wait(&loop, &watch.c, Seen, &seen, Seen.cb);
     try loop.run(.until_done);
     try testing.expectEqual(@as(?windows.DWORD, 3), seen.code);
+}
+
+test "Exec: a handed-off console outlives its first program" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    // A host that runs until its input closes, and a first program that
+    // has already ended.
+    var host_stdin: [2]windows.HANDLE = undefined;
+    try testing.expect(k32.CreatePipe(&host_stdin[0], &host_stdin[1], null, 0) != windows.FALSE);
+    try testing.expect(k32.SetHandleInformation(host_stdin[0], windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT) != windows.FALSE);
+    const host = try testHandoffChild("findstr.exe x", host_stdin[0]);
+    _ = k32.CloseHandle(host_stdin[0]);
+    errdefer _ = k32.CloseHandle(host_stdin[1]);
+    defer _ = k32.CloseHandle(host.hProcess);
+    const first = try testHandoffChild("cmd.exe /d /c exit 0", null);
+    defer _ = k32.CloseHandle(first.hProcess);
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(first.hProcess, 10_000));
+
+    const watch = try HandoffExit.create(alloc, host.hProcess, first.hProcess);
+    defer watch.destroy(alloc);
+    try watch.watch();
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    const Seen = struct {
+        ended: bool = false,
+        fn cb(ud: ?*@This(), _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+            r catch unreachable;
+            ud.?.ended = true;
+            return .disarm;
+        }
+    };
+    var seen: Seen = .{};
+    watch.notify.wait(&loop, &watch.c, Seen, &seen, Seen.cb);
+
+    // The first program's end is not the console's.
+    try std.Io.sleep(testing.io, .fromMilliseconds(100), .awake);
+    try loop.run(.no_wait);
+    try testing.expect(!seen.ended);
+
+    _ = k32.CloseHandle(host_stdin[1]);
+    try loop.run(.until_done);
+    try testing.expect(seen.ended);
+}
+
+test "Exec: a detached handoff watch no longer reaches the terminal" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    var stdin: [2]windows.HANDLE = undefined;
+    try testing.expect(k32.CreatePipe(&stdin[0], &stdin[1], null, 0) != windows.FALSE);
+    try testing.expect(k32.SetHandleInformation(stdin[0], windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT) != windows.FALSE);
+    const pi = try testHandoffChild("findstr.exe x", stdin[0]);
+    _ = k32.CloseHandle(stdin[0]);
+    defer _ = k32.CloseHandle(pi.hProcess);
+
+    const watch = try HandoffExit.create(alloc, pi.hProcess, pi.hProcess);
+    defer watch.destroy(alloc);
+    try watch.watch();
+    errdefer _ = k32.CloseHandle(stdin[1]);
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+    // A terminal that is never touched: its address only.
+    var td: termio.Termio.ThreadData = undefined;
+    watch.td = &td;
+    const Seen = struct {
+        woken: bool = false,
+        fn cb(ud: ?*@This(), _: *xev.Loop, _: *xev.Completion, r: xev.Async.WaitError!void) xev.CallbackAction {
+            r catch unreachable;
+            ud.?.woken = true;
+            return .disarm;
+        }
+    };
+    var seen: Seen = .{};
+    watch.notify.wait(&loop, &watch.c, Seen, &seen, Seen.cb);
+
+    // threadExit detaches before it ends the console: the terminal is
+    // forgotten, and the queued completion is woken so that a loop
+    // drained after a failed threadEnter finishes it at once.
+    watch.detach();
+    try testing.expect(watch.wait == null);
+    try testing.expect(watch.td == null);
+    try loop.run(.no_wait);
+    try testing.expect(seen.woken);
+    _ = k32.CloseHandle(stdin[1]);
+}
+
+test "Exec: a handed-off console's runtime counts from its program's start" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    const pi = try testHandoffChild("cmd.exe /d /c exit 1", null);
+    defer _ = k32.CloseHandle(pi.hProcess);
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(pi.hProcess, 10_000));
+    // Older than the abnormal-exit threshold before the terminal sees it.
+    try std.Io.sleep(testing.io, .fromMilliseconds(400), .awake);
+
+    const watch = try HandoffExit.create(alloc, pi.hProcess, pi.hProcess);
+    defer watch.destroy(alloc);
+    const start = watch.started(testing.io, .awake).?;
+    const runtime = start.untilNow(testing.io, .awake).toMilliseconds();
+    try testing.expect(runtime >= 400);
+    try testing.expect(runtime < 60_000);
 }
 
 test "Exec: stopping a handed-off console ends its program by closing it" {
@@ -2975,20 +3175,20 @@ test "Exec: stopping a handed-off console ends its program by closing it" {
     const alloc = testing.allocator;
     const k32 = windows.exp.kernel32;
 
-    // The program reads the console's reference until it closes, as a
-    // real one lives until its console does; the signal pipe shows the
-    // size start sends.
+    // The program reads the server pipe until it closes, as a real one
+    // lives until its console's host does; the signal pipe shows the size
+    // start sends, after which the reference is released.
     var signal: [2]windows.HANDLE = undefined;
     var reference: [2]windows.HANDLE = undefined;
     var server: [2]windows.HANDLE = undefined;
     try testing.expect(k32.CreatePipe(&signal[0], &signal[1], null, 0) != windows.FALSE);
     defer _ = k32.CloseHandle(signal[0]);
     try testing.expect(k32.CreatePipe(&reference[0], &reference[1], null, 0) != windows.FALSE);
+    defer _ = k32.CloseHandle(reference[0]);
     try testing.expect(k32.CreatePipe(&server[0], &server[1], null, 0) != windows.FALSE);
-    defer _ = k32.CloseHandle(server[0]);
-    try testing.expect(k32.SetHandleInformation(reference[0], windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT) != windows.FALSE);
-    const pi = try testHandoffChild("findstr.exe x", reference[0]);
-    _ = k32.CloseHandle(reference[0]);
+    try testing.expect(k32.SetHandleInformation(server[0], windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT) != windows.FALSE);
+    const pi = try testHandoffChild("findstr.exe x", server[0]);
+    _ = k32.CloseHandle(server[0]);
     // Ours, to see the program after stop closed the terminal's.
     const current = std.os.windows.GetCurrentProcess();
     var client: windows.HANDLE = undefined;
@@ -3021,6 +3221,9 @@ test "Exec: stopping a handed-off console ends its program by closing it" {
     var got: windows.DWORD = 0;
     try testing.expect(k32.ReadFile(signal[0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
     try testing.expectEqual([3]u16{ 8, 90, 25 }, message);
+    var byte: [1]u8 = undefined;
+    try testing.expect(k32.ReadFile(reference[0], &byte, 1, &got, null) == windows.FALSE);
+    try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
 
     // Still running until the console closes.
     try testing.expectEqual(@as(windows.DWORD, windows.WAIT_TIMEOUT), k32.WaitForSingleObject(client, 0));
