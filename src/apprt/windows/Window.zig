@@ -1959,10 +1959,7 @@ fn quickRevealAll(self: *Window) void {
     if (win32.SetWindowRgn(self.hwnd, null, .TRUE) == 0) {
         log.warn("unable to show all of the quick terminal err={}", .{win32.GetLastError()});
     }
-    const style = win32.GetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE);
-    const layered: isize = win32.WS_EX_LAYERED;
-    if (style & layered == 0) return;
-    _ = win32.SetWindowLongPtrW(self.hwnd, win32.GWL_EXSTYLE, style & ~layered);
+    if (!Transparency.unlayer(self.hwnd)) return;
     const flags = win32.RDW_INVALIDATE | win32.RDW_ERASE | win32.RDW_FRAME | win32.RDW_ALLCHILDREN;
     _ = win32.RedrawWindow(self.hwnd, null, null, flags);
 }

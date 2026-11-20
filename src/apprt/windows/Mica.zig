@@ -79,7 +79,7 @@ pub fn apply(window: *Window) void {
 /// Mica again.
 pub fn leave(window: *Window) void {
     if (window.mica_top != 0 and extend(window.hwnd, 0)) window.mica_top = 0;
-    if (window.bar.editor.edit) |edit| Transparency.unlayer(edit);
+    if (window.bar.editor.edit) |edit| _ = Transparency.unlayer(edit);
 }
 
 /// Whether `refused` has said once that DWM refused.

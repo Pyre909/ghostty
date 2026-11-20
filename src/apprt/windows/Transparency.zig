@@ -273,16 +273,17 @@ pub fn chrome(window: *const Window, hwnd: win32.HWND) void {
 /// not any more.
 pub fn chromeAgain(window: *const Window, hwnd: ?win32.HWND) void {
     const h = hwnd orelse return;
-    if (window.transparent) _ = layer(h) else unlayer(h);
+    _ = if (window.transparent) layer(h) else unlayer(h);
 }
 
 /// Take `hwnd`'s layering (`layer`) off again: GDI draws it into the
-/// frame's surface, opaque.
-pub fn unlayer(hwnd: win32.HWND) void {
+/// frame's surface, opaque. Whether it was layered.
+pub fn unlayer(hwnd: win32.HWND) bool {
     const style = win32.GetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE);
     const layered: isize = win32.WS_EX_LAYERED;
-    if (style & layered == 0) return;
+    if (style & layered == 0) return false;
     _ = win32.SetWindowLongPtrW(hwnd, win32.GWL_EXSTYLE, style & ~layered);
+    return true;
 }
 
 /// For tests: answers in place of SetLayeredWindowAttributes in `layerAt`,
