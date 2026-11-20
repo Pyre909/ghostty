@@ -550,9 +550,10 @@ const WindowsPty = struct {
         server: windows.HANDLE,
     };
 
-    /// The signal pipe's resize message (PTY_SIGNAL_RESIZE_WINDOW in
-    /// Microsoft's terminal, src/host/PtySignalInputThread.hpp): a u16
-    /// code, then the width and height in characters.
+    /// The signal pipe's resize message, a private protocol between
+    /// ConPTY and its console host: a u16 code, then the width and height
+    /// in characters (PtySignal::ResizeWindow and ResizeWindowData).
+    /// Ref: https://github.com/microsoft/terminal/blob/d61c5f920adbc27ae2ee41bd02dd4d5f846818ed/src/host/PtySignalInputThread.hpp#L39-L51
     const signal_resize: u16 = 8;
 
     pub const OpenError = error{Unexpected};

@@ -3007,7 +3007,7 @@ fn testHandoffChild(comptime command_line: []const u8, stdin: ?windows.HANDLE) !
         si.hStdInput = h;
     }
     var pi: windows.PROCESS_INFORMATION = undefined;
-    if (k32.CreateProcessW(null, &line, null, null, if (stdin != null) windows.TRUE else windows.FALSE, 0x08000000, null, null, &si, &pi) == windows.FALSE) {
+    if (k32.CreateProcessW(null, &line, null, null, if (stdin != null) windows.TRUE else windows.FALSE, windows.CREATE_NO_WINDOW, null, null, &si, &pi) == windows.FALSE) {
         return windows.unexpectedError(windows.GetLastError());
     }
     _ = k32.CloseHandle(pi.hThread);

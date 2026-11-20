@@ -96,6 +96,9 @@ pub const ATTACH_PARENT_PROCESS: DWORD = 0xFFFFFFFF;
 pub const CP_UTF8 = 65001;
 /// CreateFileW dwCreationDisposition: fail if the file exists.
 pub const CREATE_NEW: DWORD = 1;
+/// CreateProcessW dwCreationFlags: a console program gets no console
+/// window.
+pub const CREATE_NO_WINDOW: DWORD = 0x08000000;
 pub const CREATE_UNICODE_ENVIRONMENT = 0x00000400;
 pub const CTRL_BREAK_EVENT = 1;
 pub const CTRL_C_EVENT = 0;
