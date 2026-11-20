@@ -27510,10 +27510,13 @@ test "win32: the palette's default terminal entry makes Ghostty the default term
         }
     }.offered;
 
-    // Without Windows Terminal's console server, no entry.
+    // Without Windows Terminal's console server, or with one before 1.22,
+    // no entry.
+    try std.testing.expectEqual(null, try offered(&app));
+    try default_terminal.testInstallTerminal(.old);
     try std.testing.expectEqual(null, try offered(&app));
 
-    try default_terminal.testInstallTerminal();
+    try default_terminal.testInstallTerminal(.current);
     try std.testing.expectEqual(true, try offered(&app));
     app.queueDefaultTerminal(true);
     app.createRequested();

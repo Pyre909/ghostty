@@ -5,8 +5,11 @@
 //! names the console server the inbox conhost hands a console to, and
 //! DelegationTerminal the terminal that server hands it on to. Only an
 //! OpenConsole hands one on, so Ghostty pairs itself with Windows
-//! Terminal's, whose package registers its class (PackagedCom\ClassIndex)
-//! and which calls ITerminalHandoff3 (Windows Terminal 1.22 and later).
+//! Terminal's, whose package registers its class (PackagedCom\ClassIndex).
+//! It must call ITerminalHandoff3, the only version Ghostty's class
+//! answers: Windows Terminal 1.22 and later, whose package registers that
+//! interface (PackagedCom\InterfaceIndex) where older ones registered
+//! ITerminalHandoff2 (microsoft/terminal#17575).
 //! Settings' "Default terminal application" lists packaged apps only, so
 //! Ghostty writes the two values itself, as Settings writes them, and
 //! saves those it replaces to put them back.
@@ -25,6 +28,10 @@ const W = std.unicode.utf8ToUtf16LeStringLiteral;
 
 /// Windows Terminal's OpenConsole: the console server Ghostty pairs with.
 const open_console = "{2EACA947-7F5F-4CFA-BA87-8F7FBEEFBE69}";
+
+/// ITerminalHandoff3 (`handoff.iid_handoff3`), as the package index names
+/// it.
+const handoff3 = "{6F23DA90-15C5-4203-9DB0-64E73F1B1B00}";
 
 /// Ghostty's class (`handoff.clsid`), as Settings writes a class.
 const ghostty = handoff.class_key[handoff.class_key.len - 38 ..];
@@ -55,24 +62,28 @@ pub const Place = struct {
     /// The key's presence is the record: a value absent from it was
     /// absent from %%Startup.
     saved: [*:0]const u16,
-    /// OpenConsole's packaged class, which says it is installed.
-    console_class_root: win32.HKEY,
+    /// Under `packaged_root`: OpenConsole's packaged class, which says it
+    /// is installed, and the packaged ITerminalHandoff3, which says it is
+    /// recent enough to hand a console to Ghostty.
+    packaged_root: win32.HKEY,
     console_class: [*:0]const u16,
+    console_interface: [*:0]const u16,
 
     pub const user = at(
         win32.HKEY_CURRENT_USER,
         "",
         win32.HKEY_CLASSES_ROOT,
-        "PackagedCom\\ClassIndex\\" ++ open_console,
+        "PackagedCom\\",
     );
 
-    /// Every key under `root`, `prefix` before its path; for tests, a key
-    /// of their own.
+    /// Every key under `root`, `prefix` before its path, and the packages'
+    /// index under `packaged_root`, `packaged` before its path; for tests,
+    /// keys of their own.
     pub fn at(
         root: win32.HKEY,
         comptime prefix: []const u8,
-        console_class_root: win32.HKEY,
-        comptime console_class: []const u8,
+        packaged_root: win32.HKEY,
+        comptime packaged: []const u8,
     ) Place {
         // The paths' UTF-16 forms are made at compile time.
         @setEvalBranchQuota(20_000);
@@ -82,8 +93,9 @@ pub const Place = struct {
             .class = W(prefix ++ handoff.class_key),
             .server = W(prefix ++ handoff.server_key),
             .saved = W(prefix ++ "Software\\Ghostty\\DefaultTerminal"),
-            .console_class_root = console_class_root,
-            .console_class = W(console_class),
+            .packaged_root = packaged_root,
+            .console_class = W(packaged ++ "ClassIndex\\" ++ open_console),
+            .console_interface = W(packaged ++ "InterfaceIndex\\" ++ handoff3),
         };
     }
 };
@@ -96,9 +108,10 @@ pub fn isDefault(place: Place) Error!bool {
 }
 
 /// Whether Ghostty can be the default terminal: Windows Terminal's
-/// console server is installed.
+/// console server is installed, one that calls ITerminalHandoff3.
 pub fn available(place: Place) bool {
-    return exists(place.console_class_root, place.console_class);
+    return exists(place.packaged_root, place.console_class) and
+        exists(place.packaged_root, place.console_interface);
 }
 
 /// Make Ghostty the default terminal, its class starting `exe` (this
@@ -320,7 +333,7 @@ pub const test_place: Place = .at(
     win32.HKEY_CURRENT_USER,
     test_prefix,
     win32.HKEY_CURRENT_USER,
-    test_prefix ++ "ClassIndex\\" ++ open_console,
+    test_prefix ++ "PackagedCom\\",
 );
 const test_exe = W("C:\\Program Files\\Ghostty\\ghostty.exe");
 /// Windows Terminal's pair, as Settings writes it.
@@ -333,9 +346,15 @@ pub fn testCleanup() void {
     _ = win32.RegDeleteTreeW(win32.HKEY_CURRENT_USER, W("Software\\GhosttyTest"));
 }
 
-/// Windows Terminal's console server, as installed, for `test_place`.
-pub fn testInstallTerminal() !void {
-    try createKey(test_place.console_class_root, test_place.console_class);
+/// Windows Terminal's console server, as installed, for `test_place`:
+/// 1.22 or later, or with `old`, an earlier one, which calls
+/// ITerminalHandoff2.
+pub fn testInstallTerminal(version: enum { current, old }) !void {
+    try createKey(test_place.packaged_root, test_place.console_class);
+    switch (version) {
+        .current => try createKey(test_place.packaged_root, test_place.console_interface),
+        .old => try deleteTree(test_place.packaged_root, test_place.console_interface),
+    }
 }
 
 /// %%Startup's two values: each a string, or null for absent.
@@ -368,7 +387,7 @@ test "win32: making Ghostty the default terminal and undoing it puts %%Startup b
     };
     for (cases) |case| {
         testCleanup();
-        try testInstallTerminal();
+        try testInstallTerminal(.current);
         try testSet(case[0], case[1]);
         try std.testing.expect(!try isDefault(test_place));
 
@@ -389,7 +408,7 @@ test "win32: making Ghostty the default terminal and undoing it puts %%Startup b
 test "win32: making Ghostty the default terminal twice saves the values it first replaced" {
     defer testCleanup();
     testCleanup();
-    try testInstallTerminal();
+    try testInstallTerminal(.current);
     try testSet(wt_console, wt_terminal);
     try enable(test_place, test_exe);
     try enable(test_place, test_exe);
@@ -403,7 +422,7 @@ test "win32: making Ghostty the default terminal twice saves the values it first
 test "win32: a default terminal chosen after Ghostty is kept" {
     defer testCleanup();
     testCleanup();
-    try testInstallTerminal();
+    try testInstallTerminal(.current);
     try testSet(null, null);
     try enable(test_place, test_exe);
     // Settings' choice of Windows Terminal.
@@ -422,8 +441,16 @@ test "win32: Ghostty is the default terminal only with Windows Terminal's consol
     try std.testing.expect(!exists(test_place.root, test_place.class));
     try std.testing.expect(!available(test_place));
 
+    // Nor with one before 1.22, whose console server asks for
+    // ITerminalHandoff2.
+    try testInstallTerminal(.old);
+    try std.testing.expect(!available(test_place));
+    try std.testing.expectError(error.NoWindowsTerminal, enable(test_place, test_exe));
+    try testExpect(conhost, conhost);
+    try std.testing.expect(!exists(test_place.root, test_place.class));
+
     // A value that is not a string cannot be put back as it was.
-    try testInstallTerminal();
+    try testInstallTerminal(.current);
     try std.testing.expect(available(test_place));
     var key: win32.HKEY = undefined;
     try std.testing.expectEqual(0, win32.RegCreateKeyExW(test_place.root, test_place.startup, 0, null, win32.REG_OPTION_NON_VOLATILE, win32.KEY_SET_VALUE, null, &key, null));
@@ -433,4 +460,8 @@ test "win32: Ghostty is the default terminal only with Windows Terminal's consol
     try std.testing.expectError(error.UnexpectedValue, enable(test_place, test_exe));
     try std.testing.expect(!exists(test_place.root, test_place.class));
     try std.testing.expect(!exists(test_place.root, test_place.saved));
+}
+
+test "win32: the interface the package index names is the one the class answers" {
+    try std.testing.expectEqual(handoff.iid_handoff3, std.os.windows.GUID.parse(handoff3));
 }
