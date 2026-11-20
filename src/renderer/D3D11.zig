@@ -252,6 +252,12 @@ render_changes: u32 = 0,
 /// tries again). Under the draw mutex.
 left: ?api.HWND = null,
 
+/// The window the live swap chain presents to: set by `adopt`, cleared
+/// once `releaseGpu` or `drawFrameUnlocked` released that chain. A
+/// window is never handed back while it is this one, since the terminal
+/// would destroy it under the chain. Under the draw mutex.
+chain_hwnd: ?api.HWND = null,
+
 /// Set by `followWindow` until `recoverDevice` makes the new chain. A
 /// composition chain that cannot be made for the new window then falls
 /// back to an HWND chain, as at init, rather than leaving the terminal
@@ -512,6 +518,7 @@ fn adopt(self: *D3D11, gpu: Gpu) void {
     self.software_factory = gpu.software_factory;
     self.composition = gpu.composition;
     self.released = false;
+    self.chain_hwnd = self.hwnd;
 }
 
 /// A device and its immediate context, from `createDevice`.
@@ -1002,6 +1009,7 @@ fn releaseGpu(self: *D3D11) void {
         self.fullscreen_chain = self.swap_chain;
     } else {
         api.release(self.swap_chain);
+        self.chain_hwnd = null;
     }
     api.release(self.context);
     if (self.info_queue) |q| api.release(q);
@@ -1051,6 +1059,7 @@ pub fn drawFrameUnlocked(self: *D3D11) void {
     }
     api.release(swap_chain);
     self.fullscreen_chain = null;
+    self.chain_hwnd = null;
 }
 
 /// Follow the terminal to the render window and kind of chain it now
@@ -1083,9 +1092,18 @@ pub fn followWindow(self: *D3D11) void {
 fn follow(self: *D3D11, hwnd: api.HWND, chain: Chain) void {
     if (hwnd == self.hwnd and chain == self.chain) return;
     if (hwnd != self.hwnd) {
+        // The window left holds the live chain while `left` still waits
+        // on a hand-back the terminal could not take: try that one again
+        // first, to free the slot.
+        if (self.left != null and self.chain_hwnd == self.hwnd) self.handBackLeft();
         if (self.left == null) {
             // The old chain is on this one until recovery releases it.
             self.left = self.hwnd;
+        } else if (self.chain_hwnd == self.hwnd) {
+            // Still taken, and handing this one back would have the
+            // terminal destroy it under the chain: kept by its terminal
+            // until it closes.
+            log.warn("a render window holding the chain stays until its terminal closes hwnd={x}", .{@intFromPtr(self.hwnd)});
         } else if (!self.handBack(self.hwnd)) {
             // Followed twice before a frame: this one, between the two,
             // never had a chain. Kept by its terminal until it closes if
@@ -1107,11 +1125,11 @@ fn follow(self: *D3D11, hwnd: api.HWND, chain: Chain) void {
 /// Give a render window this renderer left back to its terminal to
 /// destroy (`Surface.renderLeft`); whether the terminal was told. The
 /// tests' bare windows are recorded in `test_handed_back` instead, and
-/// refused while `test_hand_back_fails`.
+/// refused while `test_hand_back_fails`, or when `test_hand_back_refused`.
 fn handBack(self: *D3D11, old: api.HWND) bool {
     if (comptime RtSurface != void) if (self.rt_surface) |surface| return surface.renderLeft(old);
     if (builtin.is_test) {
-        if (test_hand_back_fails) return false;
+        if (test_hand_back_fails or test_hand_back_refused == old) return false;
         test_handed_back = old;
     }
     return true;
@@ -1119,6 +1137,7 @@ fn handBack(self: *D3D11, old: api.HWND) bool {
 
 var test_handed_back: ?api.HWND = null;
 var test_hand_back_fails = false;
+var test_hand_back_refused: ?api.HWND = null;
 
 /// Whether the device was lost since the last frame. The generic renderer
 /// asks at the start of every frame and, when so, releases everything it
@@ -1752,6 +1771,62 @@ test "d3d11: a renderer keeps a window the terminal cannot be told of until a la
     r.drawFrameEnd();
     try testing.expect(r.left == null);
     try testing.expect(test_handed_back == a);
+}
+
+test "d3d11: a renderer never hands back the window its chain is on" {
+    // Followed again while a window it left still waits to be handed
+    // back, the window it leaves now holds the live chain: the one
+    // waiting goes first, and the chain's window takes its place.
+    const testing = std.testing;
+    const a = try testWindow();
+    defer _ = win32.DestroyWindow(a);
+    const b = try testWindow();
+    defer _ = win32.DestroyWindow(b);
+    const c = try testWindow();
+    defer _ = win32.DestroyWindow(c);
+    const d = try testWindow();
+    defer _ = win32.DestroyWindow(d);
+    test_handed_back = null;
+    defer test_handed_back = null;
+    defer test_hand_back_fails = false;
+
+    var r = try initWindow(a, try loadCompiler(), true, .native, .hwnd);
+    defer r.deinit();
+    r.follow(b, .composition);
+    test_hand_back_fails = true;
+    try r.recoverDevice();
+    try testing.expect(r.chain_hwnd == b);
+    try testing.expect(r.left == a);
+
+    // The terminal can be told again.
+    test_hand_back_fails = false;
+    r.follow(c, .composition);
+    try testing.expect(test_handed_back == a);
+    try testing.expect(r.left == b);
+    try r.recoverDevice();
+    try testing.expect(r.chain_hwnd == c);
+    try testing.expect(test_handed_back == b);
+    try testing.expect(r.left == null);
+
+    // Only the one waiting is refused: the chain's window is not handed
+    // back in its place but stays with its terminal, and the one waiting
+    // keeps waiting.
+    test_handed_back = null;
+    test_hand_back_refused = c;
+    defer test_hand_back_refused = null;
+    r.follow(a, .composition);
+    try r.recoverDevice();
+    try testing.expect(r.left == c);
+    r.follow(d, .composition);
+    try testing.expect(test_handed_back == null);
+    try testing.expect(r.left == c);
+    try r.recoverDevice();
+    try testing.expect(r.chain_hwnd == d);
+    test_hand_back_refused = null;
+    r.drawFrameStart();
+    r.drawFrameEnd();
+    try testing.expect(test_handed_back == c);
+    try testing.expect(r.left == null);
 }
 
 test "d3d11: a renderer followed to a window whose composition target is taken presents opaque" {
