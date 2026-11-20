@@ -82,6 +82,9 @@ pub const STARTUPINFOEX = extern struct {
 
 // Well-known constant values
 pub const INFINITE = 4294967295;
+/// https://learn.microsoft.com/en-us/windows/win32/api/winnt/nc-winnt-waitortimercallback
+pub const WAITORTIMERCALLBACK = *const fn (?*anyopaque, windows.BOOLEAN) callconv(.winapi) void;
+pub const WT_EXECUTEONLYONCE: ULONG = 0x00000008;
 pub const INVALID_HANDLE_VALUE = windows.INVALID_HANDLE_VALUE;
 pub const MAX_PATH = windows.MAX_PATH;
 pub const FALSE: windows.BOOL = .fromBool(false);
@@ -490,6 +493,22 @@ pub const exp = struct {
             dwDesiredAccess: DWORD,
             bInheritHandle: BOOL,
             dwOptions: DWORD,
+        ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-registerwaitforsingleobject
+        pub extern "kernel32" fn RegisterWaitForSingleObject(
+            phNewWaitObject: *?HANDLE,
+            hObject: HANDLE,
+            Callback: WAITORTIMERCALLBACK,
+            Context: ?*anyopaque,
+            dwMilliseconds: DWORD,
+            dwFlags: ULONG,
+        ) callconv(.winapi) BOOL;
+        /// With `INVALID_HANDLE_VALUE` as `CompletionEvent`, returns only
+        /// once every callback of the wait has returned.
+        /// https://learn.microsoft.com/en-us/windows/win32/sync/unregisterwaitex
+        pub extern "kernel32" fn UnregisterWaitEx(
+            WaitHandle: HANDLE,
+            CompletionEvent: ?HANDLE,
         ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-createmutexw
         pub extern "kernel32" fn CreateMutexW(

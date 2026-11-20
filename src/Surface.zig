@@ -700,6 +700,13 @@ pub fn init(
             .term = config.term,
             .rt_pre_exec_info = .init(config),
             .rt_post_fork_info = .init(config),
+            // A console Windows handed to this terminal, if the apprt has
+            // one (src/apprt/windows): shown in place of `command`. Taken
+            // here, where nothing can fail before Exec.init owns it.
+            .handoff = if (comptime @hasDecl(apprt.runtime.Surface, "takeHandoff"))
+                rt_surface.takeHandoff()
+            else
+                null,
         });
         errdefer io_exec.deinit();
 

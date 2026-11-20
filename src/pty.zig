@@ -524,6 +524,9 @@ const WindowsPty = struct {
         },
         /// A console Windows handed to us (`openHandoff`).
         handoff: Handoff,
+        /// A handed-off console that `endHandoff` closed: only our ends
+        /// of the pipes are left.
+        ended,
     };
 
     /// The handles of a console that Windows handed to the default
@@ -637,6 +640,18 @@ const WindowsPty = struct {
             .host_in = pipes.in_pipe_pty,
             .host_out = pipes.out_pipe_pty,
         };
+    }
+
+    /// End a handed-off console now, and with it its program, keeping our
+    /// ends of the pipes until `deinit`. Nothing for a pseudoconsole.
+    pub fn endHandoff(self: *Pty) void {
+        switch (self.console) {
+            .handoff => |h| {
+                closeHandoff(h);
+                self.console = .ended;
+            },
+            .conpty, .ended => {},
+        }
     }
 
     /// Close a handed-off console: the signal pipe and the reference
@@ -760,8 +775,8 @@ const WindowsPty = struct {
                 }).close();
                 c.functions.close(c.pseudo_console);
             },
-            .handoff => |h| {
-                closeHandoff(h);
+            .handoff, .ended => {
+                self.endHandoff();
                 _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
                 _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
             },
@@ -800,6 +815,8 @@ const WindowsPty = struct {
                     return error.ResizeFailed;
                 }
             },
+            // No console left to tell.
+            .ended => {},
         }
         self.size = size;
     }
