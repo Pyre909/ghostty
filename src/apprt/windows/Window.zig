@@ -1352,9 +1352,10 @@ pub fn makeTransparent(self: *Window) void {
 /// own kept its opaque chain's last frame (RenderWindow.zig); one that
 /// cannot be made leaves that terminal opaque. Each renderer is woken to
 /// follow (`Surface.setRenderTarget`), and follows at the latest with the
-/// config the caller gives next; the caller lays the window out after, which gives an opaque frame its Mica
-/// (`Mica.apply`). Whether the frame changed; one that cannot be made
-/// transparent, or opaque, logged, stays as it was.
+/// config the caller gives next; the caller lays the window out after,
+/// which gives an opaque frame its Mica (`Mica.apply`). Whether the frame
+/// changed; one that cannot be made transparent, or opaque, logged, stays
+/// as it was.
 pub fn setTransparent(self: *Window, on: bool) bool {
     if (on == self.transparent) return false;
     if (on) {

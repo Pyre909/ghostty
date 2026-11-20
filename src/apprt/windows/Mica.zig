@@ -37,11 +37,11 @@ const log = std.log.scoped(.win32);
 /// backdrop is asked for as the frame first reaches over its bar, and then
 /// kept while the frame is opaque, with buffered painting for its bar
 /// (`Transparency.startBufferedPaint`): a frame that never does keeps the
-/// default. The extension follows the bar. A failed
-/// call leaves `Window.backdrop` and `Window.mica_top` as they were, so
-/// the next layout tries again, and is said once for the process: a DWM
-/// that refuses would refuse at every WM_SIZE of a resize. Called after
-/// every layout and theme change.
+/// default. The extension follows the bar. A failed call leaves
+/// `Window.backdrop` and `Window.mica_top` as they were, so the next
+/// layout tries again, and is said once for the process: a DWM that
+/// refuses would refuse at every WM_SIZE of a resize. Called after every
+/// layout and theme change.
 pub fn apply(window: *Window) void {
     if (window.transparent) return;
     // Only in tests that answer for DWM: the others' frames keep the
