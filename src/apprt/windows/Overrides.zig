@@ -141,6 +141,9 @@ pub fn apply(self: *const Overrides, config: *configpkg.Config) Allocator.Error!
     if (self.working_directory) |wd| if (wd == .inherit) {
         config.@"working-directory" = .inherit;
     };
+    // Input is for the configured command, which a console handed off
+    // does not run: its program was started by another.
+    if (self.handoff != null) config.input = .{};
 }
 
 /// The path a new terminal starts in, for one that would inherit
@@ -281,6 +284,18 @@ test "win32: IPC overrides give a new terminal's configuration its command and s
     try std.testing.expectEqual(.home, config.@"working-directory".?);
     try (try parse(alloc, &.{"--working-directory=inherit"})).apply(&config);
     try std.testing.expectEqual(.inherit, config.@"working-directory".?);
+}
+
+test "win32: a console handed off gets no configured input" {
+    var config = try configpkg.Config.default(std.testing.allocator);
+    defer config.deinit();
+    try config.input.parseCLI(config.arenaAlloc(), "raw:echo hi\\r");
+    // A terminal of the configured command keeps it.
+    try (Overrides{}).apply(&config);
+    try std.testing.expectEqual(1, config.input.list.items.len);
+    var slot: ?termio.Exec.Handoff = null;
+    try (Overrides{ .handoff = &slot }).apply(&config);
+    try std.testing.expectEqual(0, config.input.list.items.len);
 }
 
 test "win32: a command or a console handed off replaces the shell" {

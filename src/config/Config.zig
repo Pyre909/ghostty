@@ -1377,6 +1377,10 @@ env: RepeatableStringMap = .{},
 /// Changing this configuration at runtime will only affect new
 /// terminals.
 ///
+/// On Windows, a console Windows hands to Ghostty as the default terminal
+/// gets none of it: its program is not the configured `command`, and was
+/// started by whatever started the console.
+///
 /// Available since: 1.2.0
 input: RepeatableReadableIO = .{},
 
