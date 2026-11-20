@@ -1647,15 +1647,10 @@ pub const Surface = struct {
     /// (WM_GHOSTTY_RENDER_LEFT). Until then nothing presents to it.
     /// Whether it was posted; the renderer keeps it to post again if not.
     pub fn renderLeft(self: *const Surface, old: win32.HWND) bool {
-        if (builtin.is_test and test_render_left_fails) return false;
         if (win32.PostMessageW(self.hwnd, WM_GHOSTTY_RENDER_LEFT, 0, @bitCast(@intFromPtr(old))).toBool()) return true;
         log.warn("cannot hand a render window back hwnd={x} err={}", .{ @intFromPtr(old), win32.GetLastError() });
         return false;
     }
-
-    /// For tests: `renderLeft` cannot post.
-    pub var test_render_left_fails: if (builtin.is_test) bool else void =
-        if (builtin.is_test) false else {};
 
     /// The Direct3D 11 device has no options: each renderer creates its
     /// own device for this window.
