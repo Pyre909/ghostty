@@ -433,24 +433,59 @@ fn testAwaitPost(hwnd: win32.HWND) !void {
     }
 }
 
-/// A console's server, as OpenConsole is to the class: it gets the class's
-/// object through COM, on a thread of the multithreaded apartment, and
-/// hands it handles of its own, closed once the call returns, as COM
-/// closes a call's.
-const TestCaller = struct {
+/// For tests: a console's server, as OpenConsole is to the class. It gets
+/// the class's object through COM, on a thread of the multithreaded
+/// apartment, and hands it handles of its own, closed once the call
+/// returns, as COM closes a call's.
+pub const TestCaller = struct {
     /// The read ends of the signal, reference and server pipes, which show
     /// what the class's copies of the write ends sent, and when they
     /// closed.
-    reads: [3]HANDLE = undefined,
+    reads: [3]?HANDLE = .{ null, null, null },
     info: StartupInfo,
     hr: HRESULT = win32.E_FAIL,
     host_in: ?HANDLE = null,
     host_out: ?HANDLE = null,
+    /// A caller asking for `cols` x `rows`, maximized or not.
+    pub fn init(cols: u32, rows: u32, maximized: bool) TestCaller {
+        return .{ .info = std.mem.zeroInit(StartupInfo, .{
+            .dwXCountChars = cols,
+            .dwYCountChars = rows,
+            .dwFlags = STARTF_USECOUNTCHARS | STARTF_USESHOWWINDOW,
+            .wShowWindow = @as(u16, @intCast(if (maximized) win32.SW_SHOWMAXIMIZED else win32.SW_SHOWNORMAL)),
+        }) };
+    }
+
+    /// Hand the class a console, which it must take.
+    pub fn call(self: *TestCaller) !void {
+        const thread = try std.Thread.spawn(.{}, run, .{self});
+        thread.join();
+        try std.testing.expectEqual(win32.S_OK, self.hr);
+    }
+
+    /// That the class's copies of the console's handles are closed.
+    pub fn expectClosed(self: *const TestCaller) !void {
+        const k32 = windows.exp.kernel32;
+        var buf: [32]u8 = undefined;
+        var got: windows.DWORD = 0;
+        for (self.reads) |r| {
+            try std.testing.expect(k32.ReadFile(r.?, &buf, buf.len, &got, null) == windows.FALSE);
+            try std.testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+        }
+    }
+
+    pub fn deinit(self: *TestCaller) void {
+        for (self.reads) |r| if (r) |h| {
+            _ = win32.CloseHandle(h);
+        };
+        if (self.host_in) |h| _ = win32.CloseHandle(h);
+        if (self.host_out) |h| _ = win32.CloseHandle(h);
+    }
 
     fn run(self: *TestCaller) void {
-        const init = win32.CoInitializeEx(null, win32.COINIT_MULTITHREADED);
-        if (init < 0) {
-            self.hr = init;
+        const init_hr = win32.CoInitializeEx(null, win32.COINIT_MULTITHREADED);
+        if (init_hr < 0) {
+            self.hr = init_hr;
             return;
         }
         defer win32.CoUninitialize();
@@ -463,24 +498,28 @@ const TestCaller = struct {
         defer _ = h.vtable.Release(h);
 
         const k32 = windows.exp.kernel32;
-        var writes: [3]HANDLE = undefined;
+        var writes: [3]?HANDLE = .{ null, null, null };
+        defer for (writes) |wr| if (wr) |x| {
+            _ = win32.CloseHandle(x);
+        };
         for (&self.reads, &writes) |*r, *wr| {
-            if (k32.CreatePipe(r, wr, null, 0) == windows.FALSE) {
+            var read: HANDLE = undefined;
+            var write: HANDLE = undefined;
+            if (k32.CreatePipe(&read, &write, null, 0) == windows.FALSE) {
                 self.hr = win32.E_FAIL;
                 return;
             }
+            r.* = read;
+            wr.* = write;
         }
         const client = duplicate(std.os.windows.GetCurrentProcess()) catch {
             self.hr = win32.E_FAIL;
             return;
         };
-        defer {
-            for (writes) |wr| _ = win32.CloseHandle(wr);
-            _ = win32.CloseHandle(client);
-        }
+        defer _ = win32.CloseHandle(client);
         var in: HANDLE = undefined;
         var out: HANDLE = undefined;
-        self.hr = h.vtable.EstablishPtyHandoff(h, &in, &out, writes[0], writes[1], writes[2], client, &self.info);
+        self.hr = h.vtable.EstablishPtyHandoff(h, &in, &out, writes[0].?, writes[1].?, writes[2].?, client, &self.info);
         if (self.hr < 0) return;
         self.host_in = in;
         self.host_out = out;
@@ -495,19 +534,9 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
     var server = try Server.start(hwnd, test_message);
     defer server.stop();
 
-    var caller: TestCaller = .{ .info = std.mem.zeroInit(StartupInfo, .{
-        .dwXCountChars = 120,
-        .dwYCountChars = 40,
-        .dwFlags = STARTF_USECOUNTCHARS | STARTF_USESHOWWINDOW,
-        .wShowWindow = @as(u16, @intCast(win32.SW_SHOWMAXIMIZED)),
-    }) };
-    const thread = try std.Thread.spawn(.{}, TestCaller.run, .{&caller});
-    thread.join();
-    try testing.expectEqual(win32.S_OK, caller.hr);
-    defer for (caller.reads) |r| {
-        _ = win32.CloseHandle(r);
-    };
-    defer _ = win32.CloseHandle(caller.host_in.?);
+    var caller: TestCaller = .init(120, 40, true);
+    defer caller.deinit();
+    try caller.call();
 
     try testAwaitPost(hwnd);
     var entries = take();
@@ -522,24 +551,20 @@ test "win32: a console handed off reaches the UI thread, with its handles kept p
     try entry.handoff.pty.setSize(.{ .ws_row = 40, .ws_col = 120, .ws_xpixel = 0, .ws_ypixel = 0 });
     var message: [3]u16 = undefined;
     var got: windows.DWORD = 0;
-    try testing.expect(k32.ReadFile(caller.reads[0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
+    try testing.expect(k32.ReadFile(caller.reads[0].?, &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
     try testing.expectEqual([3]u16{ 8, 120, 40 }, message);
 
     // What the console's server writes on the end it got, the terminal
     // reads.
     const text = "handed off";
     try testing.expect(k32.WriteFile(caller.host_out.?, text, text.len, &got, null) != windows.FALSE);
-    _ = win32.CloseHandle(caller.host_out.?);
     var buf: [32]u8 = undefined;
     try testing.expect(k32.ReadFile(entry.handoff.pty.out_pipe, &buf, buf.len, &got, null) != windows.FALSE);
     try testing.expectEqualStrings(text, buf[0..got]);
 
     // Closing the entry closes the copies, the last write ends.
     entry.handoff.deinit();
-    for (caller.reads) |r| {
-        try testing.expect(k32.ReadFile(r, &buf, buf.len, &got, null) == windows.FALSE);
-        try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
-    }
+    try caller.expectClosed();
 }
 
 test "win32: a console handed off with no server running is refused, and its handles left alone" {

@@ -38,6 +38,8 @@ const http_testing = @import("http_testing.zig");
 const build_config = @import("../../build_config.zig");
 const IpcServer = @import("IpcServer.zig");
 const Overrides = @import("Overrides.zig");
+const handoff = @import("handoff.zig");
+const termio = @import("../../termio.zig");
 const ipc = @import("ipc.zig");
 const KeyState = @import("KeyState.zig");
 const ResizeOverlay = @import("ResizeOverlay.zig");
@@ -111,6 +113,10 @@ pub const WM_GHOSTTY_UPDATE: win32.UINT = win32.WM_APP + 7;
 /// to another render window; LPARAM is the one it left, which the handler
 /// destroys (`Surface.renderLeft`).
 pub const WM_GHOSTTY_RENDER_LEFT: win32.UINT = win32.WM_APP + 8;
+/// Posted to the message-only window by the console handoff class
+/// (`handoff`) for each console Windows hands this instance, which
+/// `handoffRequests` records.
+pub const WM_GHOSTTY_HANDOFF: win32.UINT = win32.WM_APP + 9;
 
 /// Timer id for the quit-after-last-window timer on the app's message-only
 /// window. Any non-zero value works; it only has to be unique per window.
@@ -411,6 +417,12 @@ pub const App = struct {
     /// `ipc_instance` is.
     ipc_class: ?[:0]u8,
 
+    /// The class that makes this instance the terminal of the consoles
+    /// Windows starts (`handoff`), from `run` until `terminate` or the
+    /// session's end. Null before and after, for an elevated instance,
+    /// and when it could not be had (`startHandoff`).
+    handoff_server: ?handoff.Server = null,
+
     /// Where this instance's kind keeps its saved windows
     /// (`window-save-state`), from `run` to `terminate`. Null where it
     /// could not be had, and then nothing is restored.
@@ -693,6 +705,94 @@ pub const App = struct {
         return !surface.closing and !surface.window.closing;
     }
 
+    /// Serve the console handoff class (`handoff`), or log why not: a
+    /// console then keeps the classic conhost. Not for an elevated
+    /// instance: Windows never asks it, as it ignores the user's classes
+    /// for an elevated caller, and it would show the consoles of the
+    /// user's other programs with its rights.
+    fn startHandoff(self: *App) void {
+        const identity = IpcServer.Identity.ofProcess() catch |err| {
+            log.warn("serving no consoles handed off, this process's token cannot be read err={}", .{err});
+            return;
+        };
+        if (identity.elevated) {
+            log.info("serving no consoles handed off, this instance is elevated", .{});
+            return;
+        }
+        self.handoff_server = handoff.Server.start(self.msg_hwnd, WM_GHOSTTY_HANDOFF) catch |err| {
+            log.warn("serving no consoles handed off err={}", .{err});
+            return;
+        };
+    }
+
+    /// Stop serving the console handoff class. A console it queued and
+    /// `handoffRequests` did not take is closed.
+    fn stopHandoff(self: *App) void {
+        if (self.handoff_server) |*server| {
+            server.stop();
+            self.handoff_server = null;
+        }
+    }
+
+    /// Record the consoles handed off (WM_GHOSTTY_HANDOFF) for `run` to
+    /// open a window for each (`openHandoff`), as `ipcRequests` records
+    /// IPC requests; once the instance is quitting, or when memory runs
+    /// out, close them instead. Nothing here calls into the core, so it
+    /// may run in any loop that dispatches messages.
+    fn handoffRequests(self: *App) void {
+        const alloc = self.core_app.alloc;
+        var entries = handoff.take();
+        defer handoff.free(&entries);
+        for (entries.items) |*entry| {
+            if (self.quit or self.terminating) {
+                entry.handoff.deinit();
+                continue;
+            }
+            const request = alloc.create(HandoffRequest) catch |err| {
+                log.warn("cannot record a console handed off, closing it err={}", .{err});
+                entry.handoff.deinit();
+                continue;
+            };
+            request.* = .{ .handoff = entry.handoff, .size = entry.size, .maximized = entry.maximized };
+            self.requests.append(alloc, .{ .handoff = request }) catch |err| {
+                log.warn("cannot record a console handed off, closing it err={}", .{err});
+                request.destroy(alloc);
+            };
+        }
+    }
+
+    /// A console handed off waiting in `requests`.
+    const HandoffRequest = struct {
+        /// Emptied by the terminal that takes it (`Surface.takeHandoff`).
+        handoff: ?termio.Exec.Handoff,
+        size: ?handoff.Size,
+        maximized: bool,
+
+        /// Closing a console not taken ends its program, as closing its
+        /// window would.
+        fn destroy(self: *HandoffRequest, alloc: Allocator) void {
+            if (self.handoff) |*h| h.deinit();
+            alloc.destroy(self);
+        }
+    };
+
+    /// Open a window for a console handed off, as `ipcAction` opens one
+    /// for `ghostty +new-window`, at the size and, maximized, as its
+    /// program asked. Should the window fail, the console is closed.
+    fn openHandoff(self: *App, request: *HandoffRequest) void {
+        defer request.destroy(self.core_app.alloc);
+        const overrides: Overrides = .{ .handoff = &request.handoff, .size = request.size };
+        const window = self.newWindow(null, .normal, &overrides) catch |err| {
+            log.warn("cannot open a window for a console handed off, closing it err={}", .{err});
+            return;
+        };
+        if (request.maximized and !win32.IsZoomed(window.hwnd).toBool()) {
+            _ = win32.ShowWindow(window.hwnd, win32.SW_MAXIMIZE);
+        }
+        _ = window.present();
+        self.undo.opened(self, window, null);
+    }
+
     /// Work the core asked for that `run` has not carried out yet
     /// (`requests`).
     pub const Request = union(enum) {
@@ -917,6 +1017,11 @@ pub const App = struct {
         /// out (`carryOutIpc`) or dropped (`freeRequest`).
         ipc: *IpcRequest,
 
+        /// A console Windows handed off (`handoffRequests`), for which
+        /// `run` opens a window (`openHandoff`). The request owns it,
+        /// freed when it is carried out or dropped (`freeRequest`).
+        handoff: *HandoffRequest,
+
         /// About Ghostty, chosen in this frame's window menu: `run` shows
         /// the dialog (`About.showQueued`), outside any core frame, so
         /// that its loop goes on ticking the core, as the Save dialog's
@@ -1140,6 +1245,7 @@ pub const App = struct {
         // First, so that no request is taken during the teardown, and a
         // client waiting for its answer is told the instance is quitting.
         self.stopIpc();
+        self.stopHandoff();
         // And no automatic update check starts in the teardown's message
         // loops, only to be cut off at exit.
         self.updater.disarm();
@@ -1225,6 +1331,7 @@ pub const App = struct {
         win32.PostQuitMessage(0);
         // Even inside a handler: it touches neither the core nor a window.
         self.stopIpc();
+        self.stopHandoff();
         // Here, before anything can close a window, and inside a handler
         // too, where the windows outlive this call and `terminate` would
         // find them: it only reads what this runtime keeps.
@@ -1368,6 +1475,9 @@ pub const App = struct {
             // answer ran out, that it was busy and would do it, which it
             // now never does.
             .ipc => |ipc_request| ipc_request.destroy(self.core_app.alloc),
+            // Closing the console ends its program, as closing its window
+            // would.
+            .handoff => |handoff_request| handoff_request.destroy(self.core_app.alloc),
             .export_io => |export_io| self.core_app.alloc.free(export_io.contents),
             .update => |job| Updater.release(job),
             else => {},
@@ -1388,6 +1498,7 @@ pub const App = struct {
     fn startUp(self: *App, arguments: []const [:0]const u8) !void {
         self.command_launch = Session.namesCommand(arguments);
         self.startIpc();
+        self.startHandoff();
 
         // The windows a session's end closed come back in place of the
         // initial window, as macOS has them.
@@ -1489,6 +1600,7 @@ pub const App = struct {
     /// busy with a request it never carries out; then the notice says why.
     fn failStart(self: *App, err: anyerror) void {
         self.stopIpc();
+        self.stopHandoff();
         fatalNotice(err);
     }
 
@@ -3726,7 +3838,7 @@ pub const App = struct {
             },
             // A new tab's terminal is found by its id once the request is
             // carried out (`ipcTabParent`).
-            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .about, .update, .dropped => {},
+            .quick_terminal, .visibility, .undo, .redo, .reload, .background_opacity, .redecorate, .ipc, .handoff, .about, .update, .dropped => {},
         };
         for (self.windows.items) |window| for (window.tabs.items) |t| {
             const surface = t.pending_focus orelse continue;
@@ -4436,6 +4548,11 @@ pub const App = struct {
                 .ipc => |request| {
                     self.requests.items[i] = .dropped;
                     self.carryOutIpc(request);
+                },
+                // Dropped first, as `ipc` is: freed there.
+                .handoff => |request| {
+                    self.requests.items[i] = .dropped;
+                    self.openHandoff(request);
                 },
                 // Dropped first, as `export_io` is: the dialog's loop can
                 // add requests.
@@ -5157,6 +5274,11 @@ pub const App = struct {
 
             WM_GHOSTTY_IPC => {
                 self.ipcRequests();
+                return 0;
+            },
+
+            WM_GHOSTTY_HANDOFF => {
+                self.handoffRequests();
                 return 0;
             },
 
@@ -6081,6 +6203,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
     app.ipc = null;
     app.ipc_instance = null;
     app.ipc_class = null;
+    app.handoff_server = null;
     app.session = null;
     app.session_ended = false;
     app.command_launch = false;
@@ -34978,6 +35101,123 @@ test "win32: quitting stops the app's IPC, and so does the session's end" {
         app.terminate();
         try std.testing.expect(try testIpcNameFree(name, &identity, hwnd));
         try std.testing.expect(try testIpcNameFree(own, &identity, hwnd));
+    }
+}
+
+test "win32: a console handed off opens a window, at the size and state its program asked, or is closed" {
+    // On a desktop of its own: its windows show (testOnOwnDesktop).
+    try testOnOwnDesktop(testHandoffWindow, .{});
+}
+
+/// A test terminal takes the console from its options, as the core does
+/// through `Surface.takeHandoff`, which a test's terminals, having no
+/// core, never reach.
+const TestHandoff = struct {
+    var taken: ?termio.Exec.Handoff = null;
+    var size: ?handoff.Size = null;
+    var fail = false;
+
+    fn start() void {
+        TestQuick.start();
+        Window.test_create_pane = &create;
+        taken = null;
+        size = null;
+        fail = false;
+    }
+
+    fn create(w: *Window, opts: Surface.Options) anyerror!*Surface {
+        if (fail) return error.TestPaneFailed;
+        const pane = try TestQuick.create(w, opts);
+        if (opts.overrides) |o| {
+            size = o.size;
+            if (o.handoff) |slot| {
+                taken = slot.*;
+                slot.* = null;
+            }
+        }
+        return pane;
+    }
+};
+
+/// The test of a console handed off, run by its test on a desktop of its
+/// own: through the class, as OpenConsole hands one over, to the message,
+/// the request and the window.
+fn testHandoffWindow() !void {
+    // Without input methods on this thread, made before its first window.
+    // With the class served, Windows' text services never finish starting
+    // for a thread that runs no message loop, as a test's does not
+    // (MSCTF's monitor thread waits in a COM activation), and destroying
+    // the last window then waits on them for ever: measured, with or
+    // without a console handed off. The app's UI thread runs its loop, and
+    // its window, made with the class served, closes.
+    try std.testing.expect(win32.ImmDisableIME(0).toBool());
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    core_app.surfaces = .empty;
+    defer core_app.surfaces.deinit(alloc);
+    core_app.focused_surface = null;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+    defer _ = testTakeQuit();
+    _ = win32.SetWindowLongPtrW(app.msg_hwnd, win32.GWLP_USERDATA, @bitCast(@intFromPtr(&app)));
+    TestHandoff.start();
+    defer TestQuick.stop();
+    defer if (TestHandoff.taken) |*h| h.deinit();
+    // A test's terminals have no core to inherit from (`inheritedOptions`).
+    app.config.@"window-inherit-working-directory" = false;
+    app.config.@"window-inherit-font-size" = false;
+    app.config.maximize = false;
+
+    app.startHandoff();
+    try std.testing.expect(app.handoff_server != null);
+    defer app.stopHandoff();
+
+    // Read, it is recorded; `run` opens its window, maximized, its
+    // terminal at the size asked, and the terminal has the console.
+    {
+        var caller: handoff.TestCaller = .init(120, 40, true);
+        defer caller.deinit();
+        try caller.call();
+        try IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_HANDOFF);
+        try std.testing.expectEqual(0, App.wndProc(app.msg_hwnd, WM_GHOSTTY_HANDOFF, 0, 0));
+        try std.testing.expectEqual(0, app.windows.items.len);
+        app.createRequested();
+        try std.testing.expectEqual(1, app.windows.items.len);
+        try std.testing.expect(TestHandoff.taken != null);
+        try std.testing.expectEqual(handoff.Size{ .cols = 120, .rows = 40 }, TestHandoff.size.?);
+        try std.testing.expect(win32.IsZoomed(app.windows.items[0].hwnd).toBool());
+        var taken = TestHandoff.taken.?;
+        TestHandoff.taken = null;
+        taken.deinit();
+        try caller.expectClosed();
+    }
+
+    // A window that cannot open closes its console, which ends its
+    // program as closing its window would.
+    {
+        TestHandoff.fail = true;
+        var caller: handoff.TestCaller = .init(0, 0, false);
+        defer caller.deinit();
+        try caller.call();
+        try IpcServer.testAwaitPost(app.msg_hwnd, WM_GHOSTTY_HANDOFF);
+        _ = App.wndProc(app.msg_hwnd, WM_GHOSTTY_HANDOFF, 0, 0);
+        app.createRequested();
+        try std.testing.expectEqual(1, app.windows.items.len);
+        try std.testing.expectEqual(null, TestHandoff.taken);
+        try caller.expectClosed();
+    }
+
+    // Once the server stops, a console is refused, and stays the
+    // classic conhost's.
+    app.stopHandoff();
+    {
+        var caller: handoff.TestCaller = .init(0, 0, false);
+        defer caller.deinit();
+        try std.testing.expectError(error.TestExpectedEqual, caller.call());
     }
 }
 

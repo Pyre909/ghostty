@@ -62,6 +62,7 @@ const Question = @import("dialog.zig").Question;
 const i18n = @import("../../os/main.zig").i18n;
 const drop = @import("drop.zig");
 const Shell = @import("../../termio/shell_integration.zig").Shell;
+const termio = @import("../../termio.zig");
 const notice = @import("dialog.zig").notice;
 
 const log = std.log.scoped(.win32);
@@ -273,6 +274,11 @@ pub const Surface = struct {
     /// (`controlInspector`). Only while the core is live: `stopCore`
     /// closes it first.
     inspector: ?*Inspector,
+
+    /// While `create` runs, the slot of a console Windows handed off for
+    /// the terminal to show (`Overrides.handoff`), which the core empties
+    /// through `takeHandoff`; null otherwise.
+    handoff: ?*?termio.Exec.Handoff,
 
     /// The lifecycle of `core_surface`.
     ///
@@ -937,7 +943,10 @@ pub const Surface = struct {
             .scroll_bar = .{},
             .shell = null,
             .inspector = null,
+            .handoff = if (opts.overrides) |o| o.handoff else null,
         };
+        // The slot is the caller's beyond `create`.
+        defer self.handoff = null;
 
         const hwnd = win32.CreateWindowExW(
             // Files dropped on it come as WM_DROPFILES (`dropFiles`).
@@ -1007,8 +1016,10 @@ pub const Surface = struct {
             (if (opts.overrides) |o| o.command != null else false) or
             (app.core_app.first and config.@"initial-command" != null);
         // Before init as well. Without it a drop takes the
-        // quoting for a shell Ghostty does not know, the most careful.
-        self.shell = drop.shellOf(alloc, &config, app.core_app.first) catch |err| shell: {
+        // quoting for a shell Ghostty does not know, the most careful,
+        // as for a handed-off console, whose program is not the
+        // configured command.
+        self.shell = if (self.handoff != null) null else drop.shellOf(alloc, &config, app.core_app.first) catch |err| shell: {
             log.warn("unable to tell the shell a file drop is quoted for err={}", .{err});
             break :shell null;
         };
@@ -2040,6 +2051,15 @@ pub const Surface = struct {
         // An error when nothing could be written: the core must not believe
         // a copy landed when it did not.
         try writeClipboard(self.app.core_app.alloc, self.hwnd, reps);
+    }
+
+    /// The console handed off for this terminal, if any: the core shows
+    /// it in place of starting the command (`termio.Exec.Config.handoff`),
+    /// and owns it from here.
+    pub fn takeHandoff(self: *Surface) ?termio.Exec.Handoff {
+        const slot = self.handoff orelse return null;
+        defer slot.* = null;
+        return slot.*;
     }
 
     /// The environment the child process starts from. The caller takes

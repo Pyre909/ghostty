@@ -1181,6 +1181,7 @@ pub fn primaryLangId(lgid: u16) u16 {
 }
 
 pub extern "imm32" fn ImmGetContext(hwnd: HWND) callconv(.winapi) ?HIMC;
+pub extern "imm32" fn ImmDisableIME(thread: DWORD) callconv(.winapi) BOOL;
 pub extern "imm32" fn ImmReleaseContext(hwnd: HWND, himc: HIMC) callconv(.winapi) BOOL;
 /// Sizes are in bytes, also for the W form; negative is an error.
 pub extern "imm32" fn ImmGetCompositionStringW(
