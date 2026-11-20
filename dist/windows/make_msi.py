@@ -37,6 +37,14 @@ The package:
     the old version, so with Ghostty's own alone a Ghostty left open
     through an upgrade (see below) would go on without one;
 
+    registers the COM class Windows hands a console to when Ghostty is
+    the default terminal, with the installed ghostty.exe as its server,
+    as `ghostty +default-terminal --enable` does itself
+    (src/apprt/windows/default_terminal.zig). It does not make Ghostty
+    the default: that is the user's choice. Uninstalling removes the
+    class, and Windows then opens consoles in its console host until
+    another default terminal is chosen;
+
     is listed among the installed apps as Ghostty, by Pyre909, with the
     version's first three numbers, all a package's version compares by,
     then a fork release's number: 1.4.1-win.3 is listed as 1.4.1.3, so
@@ -212,6 +220,29 @@ def explorer_rows(exe: str, component: str) -> list[tuple[str, str, str, str]]:
             if cls != r"Directory\Background":
                 rows.append((key, "MultiSelectModel", "Single", component))
     return sorted(rows)
+
+
+# The COM class Windows hands a console to when Ghostty is the default
+# terminal (src/apprt/windows/handoff.zig's `class_key`), which
+# `ghostty +default-terminal --enable` registers as well.
+CONSOLE_CLASS = "73DB5BF6-8DD9-4F9F-85F8-9A05893D71C7"
+CONSOLE_CLASS_KEY = rf"Software\Classes\CLSID\{{{CONSOLE_CLASS}}}"
+
+
+def console_class_rows(exe: str, component: str) -> list[tuple[str, str, str, str]]:
+    """Every Registry row of the console class, as `explorer_rows` gives
+    them: the values Ghostty writes itself when made the default terminal
+    (src/apprt/windows/default_terminal.zig's `writeClass`), so that an
+    upgrade leaves the class naming the installed ghostty.exe, and the "-"
+    row `additions` adds to delete the key on uninstall. A %%Startup left
+    naming the class then opens consoles in the console host."""
+    return sorted(
+        [
+            (CONSOLE_CLASS_KEY, "-", "", component),
+            (CONSOLE_CLASS_KEY, "", "Ghostty", component),
+            (rf"{CONSOLE_CLASS_KEY}\LocalServer32", "", f'"[#{exe}]"', component),
+        ]
+    )
 
 
 # Where the two actions that read the Environment table go in the install
@@ -497,9 +528,12 @@ def source(app: App, product_code: str) -> str:
             Type="string",
             Value=value,
         )
-    # Explorer's verbs, in the top folder's component too. The "-" rows,
-    # which delete their keys on uninstall, are added (`additions`).
-    for key, name, value, _ in explorer_rows(file_id[EXE], components[0].get("Id")):
+    # Explorer's verbs and the console class, in the top folder's
+    # component too. The "-" rows, which delete their keys on uninstall,
+    # are added (`additions`).
+    for key, name, value, _ in explorer_rows(
+        file_id[EXE], components[0].get("Id")
+    ) + console_class_rows(file_id[EXE], components[0].get("Id")):
         if name == "-":
             continue
         attrs = {"Name": name} if name else {}
@@ -628,6 +662,11 @@ def additions(app: App) -> list[str]:
             r for r in explorer_rows(exe, "cmp0") if r[1] == "-"
         )
     ]
+    # The console class's key, deleted on uninstall in the same way.
+    console = (
+        "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Component_`) "
+        f"VALUES ('regConsole', 1, '{CONSOLE_CLASS_KEY}', '-', 'cmp0')"
+    )
     # The Start menu shortcut's AppUserModelID: the table as Windows
     # Installer 5 defines it (msi.chm, MsiShortcutProperty), and its row.
     shortcut = [
@@ -639,7 +678,7 @@ def additions(app: App) -> list[str]:
         "(`MsiShortcutProperty`, `Shortcut_`, `PropertyKey`, `PropVariantValue`) "
         f"VALUES ('scAppId', 'StartMenu', '{SHORTCUT_KEY}', '{APP_ID}')",
     ]
-    return [path, *actions, key, *verbs, *shortcut]
+    return [path, *actions, key, *verbs, console, *shortcut]
 
 
 def finish(
@@ -778,9 +817,33 @@ def check(
         sorted(
             (r["Key"], r["Name"], r["Value"], r["Component_"])
             for r in registry
-            if r["Key"].startswith(r"Software\Classes") and r["Key"] != TOAST_KEY
+            if "\\shell\\" in r["Key"]
         ),
         explorer_rows(exe[0] if exe else "None", top),
+    )
+    want(
+        "the console class's rows",
+        sorted(
+            (r["Key"], r["Name"], r["Value"], r["Component_"])
+            for r in registry
+            if r["Key"].startswith(CONSOLE_CLASS_KEY)
+        ),
+        console_class_rows(exe[0] if exe else "None", top),
+    )
+    # And nothing else under the user's classes.
+    want(
+        "the other classes' keys",
+        sorted(
+            {
+                r["Key"]
+                for r in registry
+                if r["Key"].startswith(r"Software\Classes")
+                and r["Key"] != TOAST_KEY
+                and "\\shell\\" not in r["Key"]
+                and not r["Key"].startswith(CONSOLE_CLASS_KEY)
+            }
+        ),
+        [],
     )
     # wixl makes no MsiShortcutProperty table, and one missing is no rows.
     tables = run([tools["msiinfo"], "tables", str(msi)], msi.parent).split()

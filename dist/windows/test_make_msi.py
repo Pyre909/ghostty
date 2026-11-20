@@ -779,9 +779,16 @@ class TestPackage(unittest.TestCase):
         self.assertEqual({r["Root"] for r in rows}, {"1"}, "the user's hive only")
         own = sorted(r["Name"] for r in rows if r["Key"] == mm.KEY)
         self.assertEqual(own, sorted([*FOLDERS, "Start menu"]))
-        # Besides its own key, the notifications' and Explorer's verbs'
-        # (test_explorer_verbs).
-        others = [r for r in rows if r["Key"] != mm.KEY and "\\shell\\" not in r["Key"]]
+        # Besides its own key, the notifications', Explorer's verbs'
+        # (test_explorer_verbs) and the console class's
+        # (test_console_class).
+        others = [
+            r
+            for r in rows
+            if r["Key"] != mm.KEY
+            and "\\shell\\" not in r["Key"]
+            and "\\CLSID\\" not in r["Key"]
+        ]
         toast = {r["Name"]: r for r in others}
         self.assertEqual(
             {r["Key"] for r in others},
@@ -917,6 +924,43 @@ class TestPackage(unittest.TestCase):
                     expected[(key, "MultiSelectModel")] = "Single"
         self.assertEqual(got, expected)
 
+    def test_console_class(self) -> None:
+        # The class Windows hands a console to when Ghostty is the default
+        # terminal, served by the installed ghostty.exe (COM adds
+        # -Embedding), in the top folder's component, and deleted with
+        # what is in it on uninstall.
+        rows = self.table(self.x64, "Registry")
+        (exe,) = [
+            r["File"]
+            for r in self.table(self.x64, "File")
+            if r["FileName"].rpartition("|")[2] == "ghostty.exe"
+        ]
+        top = {
+            r["Directory_"]: r["Component"] for r in self.table(self.x64, "Component")
+        }
+        (ghostty,) = [
+            r["Directory"]
+            for r in self.table(self.x64, "Directory")
+            if r["DefaultDir"].rpartition("|")[2] == "Ghostty"
+        ]
+        key = r"Software\Classes\CLSID\{73DB5BF6-8DD9-4F9F-85F8-9A05893D71C7}"
+        got = {
+            (r["Key"], r["Name"]): (r["Value"], r["Component_"])
+            for r in rows
+            if "\\CLSID\\" in r["Key"]
+        }
+        self.assertEqual(
+            got,
+            {
+                (key, "-"): ("", top[ghostty]),
+                (key, ""): ("Ghostty", top[ghostty]),
+                (key + r"\LocalServer32", ""): (f'"[#{exe}]"', top[ghostty]),
+            },
+        )
+        # It does not make Ghostty the default terminal: nothing under
+        # the console's keys.
+        self.assertEqual([r for r in rows if r["Key"].startswith("Console")], [])
+
     def test_shortcut(self) -> None:
         (row,) = self.table(self.x64, "Shortcut")
         self.assertEqual(row["Directory_"], "ProgramMenuFolder")
@@ -949,6 +993,8 @@ class TestPackage(unittest.TestCase):
             "the notification key's rows is [('DisplayName', 'Ghostty', 'cmp0'), ('IconUri', ",
             # The verbs' values are in the source; their keys' removal not.
             "the Explorer verbs' rows is [(",
+            # And the class's values without its key's removal.
+            "the console class's rows is [(",
             # wixl makes no table for the shortcut's app ID.
             "the shortcut properties is [], not [(",
         ]:
@@ -1092,6 +1138,23 @@ class TestCheck(Temp):
                     f"DELETE FROM `Registry` WHERE `Registry` = '{registry[(drive_tab, 'MultiSelectModel')]}'",
                     "the Explorer verbs' rows is [",
                 ),
+                # The console class's key made, not deleted; its server
+                # another program; a class of another's.
+                (
+                    "UPDATE `Registry` SET `Name` = '+' WHERE `Registry` = 'regConsole'",
+                    "the console class's rows is [",
+                ),
+                (
+                    f"UPDATE `Registry` SET `Value` = 'conhost.exe' WHERE `Registry` = '{registry[(mm.CONSOLE_CLASS_KEY + chr(92) + 'LocalServer32', '')]}'",
+                    "'conhost.exe', 'cmp0')",
+                ),
+                (
+                    (
+                        "INSERT INTO `Registry` (`Registry`, `Root`, `Key`, `Name`, `Value`, `Component_`) "
+                        "VALUES ('regOther', 1, 'Software\\Classes\\CLSID\\{0}', '', 'x', 'cmp0')"
+                    ),
+                    "the other classes' keys is ['Software\\\\Classes\\\\CLSID\\\\{0}'], not []",
+                ),
                 # The shortcut's app ID: another one, or on no shortcut.
                 (
                     "UPDATE `MsiShortcutProperty` SET `PropVariantValue` = 'com.mitchellh.ghostty-debug'",
@@ -1227,6 +1290,23 @@ class TestRepository(unittest.TestCase):
             "share" + under_share.replace("\\\\", "/") + f"/{bundle_id}.png",
         )
 
+    def test_console_class_is_ghosttys(self) -> None:
+        # The class handoff.zig serves, and the two values
+        # default_terminal.zig's writeClass gives it.
+        handoff = (REPO / "src/apprt/windows/handoff.zig").read_text("utf-8")
+        (key,) = re.findall(
+            r'^pub const class_key = "([^"]+)";$', handoff, re.MULTILINE
+        )
+        self.assertEqual(mm.CONSOLE_CLASS_KEY, key.replace("\\\\", "\\"))
+        terminal = (REPO / "src/apprt/windows/default_terminal.zig").read_text("utf-8")
+        write = terminal[terminal.index("\nfn writeClass(") :]
+        write = write[: write.index("\n}\n")]
+        self.assertIn('write(place.root, place.class, null, W("Ghostty"))', write)
+        # The server: the program's path in quotes, and nothing after.
+        self.assertIn("buf[0] = '\"';", write)
+        self.assertIn("buf[exe.len + 1] = '\"';", write)
+        self.assertIn("buf[0 .. exe.len + 2 :0]", write)
+
     def test_icon(self) -> None:
         self.assertEqual(mm.ICON.read_bytes()[:4], b"\0\0\1\0", "an .ico file")
 
@@ -1241,6 +1321,8 @@ class TestRepository(unittest.TestCase):
         # bin on the PATH, and the zip does not.
         self.assertIn("\nghostty +crash-report lists them", readme)
         self.assertIn(r"bin\ghostty +crash-report", readme)
+        self.assertIn("\nDefault terminal\n", readme)
+        self.assertIn("ghostty +default-terminal --enable", readme)
 
 
 if __name__ == "__main__":

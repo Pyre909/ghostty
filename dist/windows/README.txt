@@ -47,6 +47,35 @@ installs or removes around the open Ghostty, which goes on as the
 version it was until it is closed.
 
 
+Default terminal
+----------------
+
+Ghostty can be the terminal Windows opens command prompts, PowerShell
+and other console programs in, as Windows Terminal can. It needs
+Windows Terminal 1.22 or later installed, whose console server passes
+each console on to Ghostty. In a command prompt:
+
+    ghostty +default-terminal            says whether Ghostty is the default
+    ghostty +default-terminal --enable   makes Ghostty the default
+    ghostty +default-terminal --disable  puts the previous default back
+
+The command palette offers the same. Each console opens as a window
+of the running Ghostty, or of a Ghostty started for it, and closing
+its window ends the program in it. Consoles started as administrator
+still open in the console host.
+
+--disable puts back what was the default before --enable, unless
+another terminal has been chosen since under Settings > System > For
+developers > Terminal, which it then leaves. The setting is for the
+current user only.
+
+--enable names the ghostty.exe it was run from: after moving the
+zip's folder, run it again from there. The installer names the
+installed one, and keeps naming it through upgrades. Uninstalling removes what names it: run --disable first to
+have the previous default back, or Windows opens consoles in the
+console host until another is chosen in Settings.
+
+
 Crash dumps
 -----------
 
