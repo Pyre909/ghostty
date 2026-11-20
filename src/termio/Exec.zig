@@ -1188,7 +1188,7 @@ const Subprocess = struct {
                 .handle = pty.slave,
                 .flags = .{ .nonblocking = false },
             },
-            .pseudo_console = if (builtin.target.os.tag == .windows) pty.pseudo_console else {},
+            .pseudo_console = if (builtin.target.os.tag == .windows) pty.console.conpty.pseudo_console else {},
             .os_pre_exec = switch (comptime builtin.target.os.tag) {
                 .windows => null,
                 else => f: {

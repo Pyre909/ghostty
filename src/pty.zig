@@ -505,19 +505,150 @@ const WindowsPty = struct {
         }
     };
 
+    /// Ours: what the console's program writes, read here.
     out_pipe: windows.HANDLE,
+    /// Ours: what is written here, the console's program reads.
     in_pipe: windows.HANDLE,
-    out_pipe_pty: windows.HANDLE,
-    in_pipe_pty: windows.HANDLE,
-    pseudo_console: windows.HPCON,
-    conpty: ConPty,
+    console: Console,
     size: winsize,
+
+    /// The console host on the other side of the pipes.
+    pub const Console = union(enum) {
+        /// A pseudoconsole we made, which keeps the host's ends of the
+        /// pipes until it is closed.
+        conpty: struct {
+            pseudo_console: windows.HPCON,
+            functions: ConPty,
+            out_pipe_pty: windows.HANDLE,
+            in_pipe_pty: windows.HANDLE,
+        },
+        /// A console Windows handed to us (`openHandoff`).
+        handoff: Handoff,
+    };
+
+    /// The handles of a console that Windows handed to the default
+    /// terminal through ITerminalHandoff3::EstablishPtyHandoff, all owned
+    /// by the pty once `openHandoff` succeeds. The host is the console
+    /// server, an OpenConsole.exe, which ends with the console's last
+    /// program once both `signal` and `reference` are closed. Closing
+    /// them is also the only way to end that program: the handle to it
+    /// that comes with a handoff has no PROCESS_TERMINATE access.
+    pub const Handoff = struct {
+        /// The write end of the host's signal pipe: resize and the like,
+        /// as ConptyResizePseudoConsole sends them.
+        signal: windows.HANDLE,
+        /// A handle to the console's reference object, which keeps the
+        /// console alive while it is open.
+        reference: windows.HANDLE,
+        /// The console server process.
+        server: windows.HANDLE,
+    };
+
+    /// The signal pipe's resize message (PTY_SIGNAL_RESIZE_WINDOW in
+    /// Microsoft's terminal, src/host/PtySignalInputThread.hpp): a u16
+    /// code, then the width and height in characters.
+    const signal_resize: u16 = 8;
 
     pub const OpenError = error{Unexpected};
 
+    /// The two pipes of a pty, both ends.
+    const Pipes = struct {
+        out_pipe: windows.HANDLE,
+        in_pipe: windows.HANDLE,
+        out_pipe_pty: windows.HANDLE,
+        in_pipe_pty: windows.HANDLE,
+
+        fn close(self: Pipes) void {
+            _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+            _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
+            _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+        }
+    };
+
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize, opts: OpenOptions) OpenError!Pty {
-        var pty: Pty = undefined;
+        const pipes = try openPipes();
+        errdefer pipes.close();
+
+        var conpty: ConPty = .init();
+        var pseudo_console: windows.HPCON = undefined;
+        const coord: windows.COORD = .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) };
+        // The package's host is told how the terminal measures text, so
+        // that its cursor stays with ours: as graphemes under
+        // grapheme-width-method = unicode, by each codepoint's wcwidth
+        // under legacy. Each agreed with us on every cluster tried, where
+        // the package's other settings did not. A program that switches
+        // mode 2027 changes our measurement but not the host's, which is
+        // fixed here. kernel32's get none: conhost.exe measured the same
+        // with and without the graphemes flag, and the others are not
+        // measured there.
+        const flags: windows.DWORD = if (conpty.source != .package) 0 else if (opts.grapheme_cluster)
+            windows.PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES
+        else
+            windows.PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH;
+        var result = conpty.create(coord, pipes.in_pipe_pty, pipes.out_pipe_pty, flags, &pseudo_console);
+        // Where the package's create fails, kernel32's may still work: the
+        // files were there, but its OpenConsole.exe may not start.
+        if (result != windows.S_OK and conpty.source == .package) {
+            ConPty.note(.create_failed, .warn, "conpty: using the system's, the package's pseudoconsole failed err=0x{x}", .{@as(u32, @bitCast(result))});
+            conpty = .{ .source = .create_failed };
+            result = conpty.create(coord, pipes.in_pipe_pty, pipes.out_pipe_pty, 0, &pseudo_console);
+        }
+        if (result != windows.S_OK) {
+            log.err("conpty: no pseudoconsole err=0x{x}", .{@as(u32, @bitCast(result))});
+            return error.Unexpected;
+        }
+
+        return .{
+            .out_pipe = pipes.out_pipe,
+            .in_pipe = pipes.in_pipe,
+            .console = .{ .conpty = .{
+                .pseudo_console = pseudo_console,
+                .functions = conpty,
+                .out_pipe_pty = pipes.out_pipe_pty,
+                .in_pipe_pty = pipes.in_pipe_pty,
+            } },
+            .size = size,
+        };
+    }
+
+    /// A pty for a console handed to us, and the host's ends of its pipes
+    /// to return from EstablishPtyHandoff: the caller owns those two (COM
+    /// closes them once it has copied them to the host). The pty owns
+    /// `handoff` from here on, if this fails too. The host learns the
+    /// size from the first `setSize`.
+    pub fn openHandoff(handoff: Handoff) OpenError!struct {
+        pty: Pty,
+        /// The host reads its program's input from it.
+        host_in: windows.HANDLE,
+        /// The host writes its program's output to it.
+        host_out: windows.HANDLE,
+    } {
+        errdefer closeHandoff(handoff);
+        const pipes = try openPipes();
+        return .{
+            .pty = .{
+                .out_pipe = pipes.out_pipe,
+                .in_pipe = pipes.in_pipe,
+                .console = .{ .handoff = handoff },
+                .size = .{ .ws_row = 0, .ws_col = 0, .ws_xpixel = 0, .ws_ypixel = 0 },
+            },
+            .host_in = pipes.in_pipe_pty,
+            .host_out = pipes.out_pipe_pty,
+        };
+    }
+
+    /// Close a handed-off console: the signal pipe and the reference
+    /// first, which ends the console and its program.
+    fn closeHandoff(handoff: Handoff) void {
+        _ = windows.exp.kernel32.CloseHandle(handoff.signal);
+        _ = windows.exp.kernel32.CloseHandle(handoff.reference);
+        _ = windows.exp.kernel32.CloseHandle(handoff.server);
+    }
+
+    fn openPipes() OpenError!Pipes {
+        var pty: Pipes = undefined;
 
         var pipe_path_buf: [128]u8 = undefined;
         var pipe_path_buf_w: [128]u16 = undefined;
@@ -615,45 +746,26 @@ const WindowsPty = struct {
         try SetHandleInformation.f(pty.in_pipe_pty);
         try SetHandleInformation.f(pty.out_pipe);
         try SetHandleInformation.f(pty.out_pipe_pty);
-
-        pty.conpty = .init();
-        const coord: windows.COORD = .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) };
-        // The package's host is told how the terminal measures text, so
-        // that its cursor stays with ours: as graphemes under
-        // grapheme-width-method = unicode, by each codepoint's wcwidth
-        // under legacy. Each agreed with us on every cluster tried, where
-        // the package's other settings did not. A program that switches
-        // mode 2027 changes our measurement but not the host's, which is
-        // fixed here. kernel32's get none: conhost.exe measured the same
-        // with and without the graphemes flag, and the others are not
-        // measured there.
-        const flags: windows.DWORD = if (pty.conpty.source != .package) 0 else if (opts.grapheme_cluster)
-            windows.PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES
-        else
-            windows.PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH;
-        var result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, flags, &pty.pseudo_console);
-        // Where the package's create fails, kernel32's may still work: the
-        // files were there, but its OpenConsole.exe may not start.
-        if (result != windows.S_OK and pty.conpty.source == .package) {
-            ConPty.note(.create_failed, .warn, "conpty: using the system's, the package's pseudoconsole failed err=0x{x}", .{@as(u32, @bitCast(result))});
-            pty.conpty = .{ .source = .create_failed };
-            result = pty.conpty.create(coord, pty.in_pipe_pty, pty.out_pipe_pty, 0, &pty.pseudo_console);
-        }
-        if (result != windows.S_OK) {
-            log.err("conpty: no pseudoconsole err=0x{x}", .{@as(u32, @bitCast(result))});
-            return error.Unexpected;
-        }
-
-        pty.size = size;
         return pty;
     }
 
     pub fn deinit(self: *Pty) void {
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe_pty);
-        _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe_pty);
-        _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
-        self.conpty.close(self.pseudo_console);
+        switch (self.console) {
+            .conpty => |c| {
+                (Pipes{
+                    .out_pipe = self.out_pipe,
+                    .in_pipe = self.in_pipe,
+                    .out_pipe_pty = c.out_pipe_pty,
+                    .in_pipe_pty = c.in_pipe_pty,
+                }).close();
+                c.functions.close(c.pseudo_console);
+            },
+            .handoff => |h| {
+                closeHandoff(h);
+                _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
+                _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
+            },
+        }
         self.* = undefined;
     }
 
@@ -668,12 +780,27 @@ const WindowsPty = struct {
 
     /// Set the size of the pty.
     pub fn setSize(self: *Pty, size: winsize) SetSizeError!void {
-        const result = self.conpty.resize(
-            self.pseudo_console,
-            .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
-        );
-
-        if (result != windows.S_OK) return error.ResizeFailed;
+        switch (self.console) {
+            .conpty => |c| {
+                const result = c.functions.resize(
+                    c.pseudo_console,
+                    .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+                );
+                if (result != windows.S_OK) return error.ResizeFailed;
+            },
+            .handoff => |h| {
+                // The host's signal pipe is synchronous and it reads it on
+                // its own thread, so a message this small never waits.
+                const message = [3]u16{ signal_resize, size.ws_col, size.ws_row };
+                var put: windows.DWORD = 0;
+                if (windows.exp.kernel32.WriteFile(h.signal, &message, @sizeOf(@TypeOf(message)), &put, null) == windows.FALSE or
+                    put != @sizeOf(@TypeOf(message)))
+                {
+                    log.warn("handoff: resize not sent err={}", .{windows.GetLastError()});
+                    return error.ResizeFailed;
+                }
+            },
+        }
         self.size = size;
     }
 
@@ -810,4 +937,53 @@ test "WindowsPty: the console host is logged once while it stays the same" {
     try testing.expect(!ConPty.quiet(.no_dll));
     try testing.expect(ConPty.quiet(.no_dll));
     try testing.expect(!ConPty.quiet(.package));
+}
+
+test "WindowsPty: a handed-off console resizes and ends through its handles" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const k32 = windows.exp.kernel32;
+
+    // Stand-ins for the host: a pipe each for the signal, the reference
+    // and the server, whose read ends show what the pty sent and when it
+    // closed its ends.
+    var ends: [3][2]windows.HANDLE = undefined;
+    for (&ends) |*e| try testing.expect(k32.CreatePipe(&e[0], &e[1], null, 0) != windows.FALSE);
+    defer for (ends) |e| {
+        _ = k32.CloseHandle(e[0]);
+    };
+
+    const opened = try WindowsPty.openHandoff(.{
+        .signal = ends[0][1],
+        .reference = ends[1][1],
+        .server = ends[2][1],
+    });
+    var pty = opened.pty;
+    defer _ = k32.CloseHandle(opened.host_in);
+
+    // A resize is the host's resize message on the signal pipe.
+    const size: winsize = .{ .ws_row = 31, .ws_col = 101, .ws_xpixel = 0, .ws_ypixel = 0 };
+    try pty.setSize(size);
+    try testing.expectEqual(size, try pty.getSize());
+    var message: [3]u16 = undefined;
+    var got: windows.DWORD = 0;
+    try testing.expect(k32.ReadFile(ends[0][0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
+    try testing.expectEqual(@as(windows.DWORD, 6), got);
+    try testing.expectEqual([3]u16{ 8, 101, 31 }, message);
+
+    // What the host writes, the pty reads.
+    const text = "handed off";
+    try testing.expect(k32.WriteFile(opened.host_out, text, text.len, &got, null) != windows.FALSE);
+    _ = k32.CloseHandle(opened.host_out);
+    var buf: [32]u8 = undefined;
+    try testing.expect(k32.ReadFile(pty.out_pipe, &buf, buf.len, &got, null) != windows.FALSE);
+    try testing.expectEqualStrings(text, buf[0..got]);
+
+    // Closing the pty closes every handle of the console, which is what
+    // ends the host and its program.
+    pty.deinit();
+    for (ends) |e| {
+        try testing.expect(k32.ReadFile(e[0], &buf, buf.len, &got, null) == windows.FALSE);
+        try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+    }
 }
