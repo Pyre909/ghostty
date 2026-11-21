@@ -839,6 +839,7 @@ test "Command: windows never starts a bare program from the current directory" {
         .rt_post_fork_info = undefined,
     };
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expectEqual(@as(u32, 0), exit.Exited);
@@ -883,7 +884,7 @@ test "Command: windows releases the process and thread handles" {
         fn handles() !windows.DWORD {
             var n: windows.DWORD = 0;
             if (windows.exp.kernel32.GetProcessHandleCount(std.os.windows.GetCurrentProcess(), &n) == windows.FALSE)
-                return error.HandleCount;
+                return windows.unexpectedError(windows.GetLastError());
             return n;
         }
 
@@ -965,6 +966,7 @@ test "Command: os pre exec 1" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -990,6 +992,7 @@ test "Command: os pre exec 2" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -1015,6 +1018,7 @@ test "Command: rt pre exec 1" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -1040,6 +1044,7 @@ test "Command: rt pre exec 2" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -1122,6 +1127,7 @@ test "Command: redirect stdout to file" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -1172,6 +1178,7 @@ test "Command: custom env vars" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -1223,6 +1230,7 @@ test "Command: custom working directory" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);
@@ -1278,6 +1286,7 @@ test "Command: posix fork handles execveZ failure" {
     };
 
     try cmd.testingStart();
+    defer cmd.deinit();
     try testing.expect(cmd.pid != null);
     const exit = try cmd.wait(true);
     try testing.expect(exit == .Exited);

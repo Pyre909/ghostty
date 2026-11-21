@@ -3222,3 +3222,61 @@ test "Exec: stopping a handed-off console ends its program by closing it" {
     try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(client, 0));
     try testing.expect(sub.process == null);
 }
+
+test "Exec: a closed terminal keeps none of its command's handles" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    const S = struct {
+        fn handles() !windows.DWORD {
+            var n: windows.DWORD = 0;
+            if (k32.GetProcessHandleCount(std.os.windows.GetCurrentProcess(), &n) == windows.FALSE)
+                return windows.unexpectedError(windows.GetLastError());
+            return n;
+        }
+
+        /// One terminal from init to deinit. `exits`: the command ends on
+        /// its own and the terminal is told so (externalExit, as threadExit
+        /// does), else the terminal stops a command still running.
+        fn run(a: Allocator, exits: bool) !void {
+            const args: []const [:0]const u8 = if (exits)
+                &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/c", "exit 0" }
+            else
+                &.{ "C:\\Windows\\System32\\findstr.exe", "x" };
+            var sub = try Subprocess.init(a, .{
+                .command = .{ .direct = args },
+                .env = .init(a),
+                .shell_integration = .none,
+                .resources_dir = null,
+                .term = "xterm-ghostty",
+                .rt_pre_exec_info = .{},
+                .rt_post_fork_info = .{},
+            });
+            defer sub.deinit();
+            try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
+            _ = try sub.start(a);
+            if (exits) {
+                const pid = sub.process.?.fork_exec.pid.?;
+                try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(pid, 10_000));
+                sub.externalExit();
+                try testing.expect(sub.process == null);
+            }
+            sub.stop();
+            try testing.expect(sub.process == null);
+        }
+    };
+
+    for ([_]bool{ false, true }) |exits| {
+        // The first terminal loads what ConPTY and process creation need
+        // and keeps it.
+        try S.run(alloc, exits);
+        const before = try S.handles();
+        for (0..8) |_| try S.run(alloc, exits);
+        const after = try S.handles();
+        // A leaked process and thread handle is two per terminal, 16
+        // here; a little slack for handles the process opens on its own.
+        try testing.expect(after <= before + 2);
+    }
+}
