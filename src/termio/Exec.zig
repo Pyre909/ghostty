@@ -46,7 +46,7 @@ const FlatpakHostCommand = if (!build_config.flatpak) struct {
 /// whose exit code is the console's. That program's handle carries
 /// SYNCHRONIZE and query access only (0x103610 on Windows 11), so it can
 /// be waited for, but neither ended nor put in the job object libxev's
-/// process watcher needs: closing the console ends it (`Pty.endHandoff`).
+/// process watcher needs: closing the console ends it (`Pty.endConsole`).
 /// Other programs may share the console, so `HandoffExit` waits for its
 /// host, which ends with the last of them.
 pub const Handoff = if (builtin.target.os.tag == .windows) struct {
@@ -60,9 +60,15 @@ pub const Handoff = if (builtin.target.os.tag == .windows) struct {
     }
 } else void;
 
-/// How long closing a handed-off console may take to end its program
-/// before we stop waiting for it: 30 ms measured on Windows 11.
-const handoff_end_ms = 2000;
+/// How long closing a console may take to end its program before we stop
+/// waiting for it and terminate it (Windows only). A handed-off console's
+/// program ended in 30 ms on Windows 11; a pseudoconsole's gets
+/// CTRL_CLOSE_EVENT and runs its handler first (a shell saving its
+/// history), which the console host itself ends after about 5 s (a 10 s
+/// handler ended at 5.0-5.1 s, here and in Windows Terminal). This is
+/// longer, so the host's bound is the one that ends a slow handler; ours
+/// is for a program that never ends, as one closed mid-startup can.
+const console_end_ms = 6000;
 
 /// Reports the end of a handed-off console on the termio thread: a
 /// thread-pool wait on our own copy of its host's handle notifies an
@@ -1460,7 +1466,7 @@ const Subprocess = struct {
             }
         };
         errdefer {
-            killCommand(&cmd) catch |err| {
+            killCommand(&cmd, 0) catch |err| {
                 log.warn("error killing command during cleanup err={}", .{err});
             };
             cmd.deinit();
@@ -1526,9 +1532,18 @@ const Subprocess = struct {
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
+                // On Windows the console closes first, as when a console
+                // window closes: the command gets CTRL_CLOSE_EVENT, where
+                // posix sends SIGHUP, and is given console_end_ms to end.
+                const grace_ms: u32 = if (comptime builtin.target.os.tag == .windows) grace: {
+                    const pty = &(self.pty orelse break :grace 0);
+                    pty.endConsole();
+                    break :grace console_end_ms;
+                } else 0;
+
                 // Note: this will also wait for the command to exit, so
                 // DO NOT call cmd.wait
-                killCommand(cmd) catch |err|
+                killCommand(cmd, grace_ms) catch |err|
                     log.err("error sending SIGHUP to command, may hang: {}", .{err});
                 cmd.deinit();
             },
@@ -1543,9 +1558,9 @@ const Subprocess = struct {
             // Its handle cannot end it (see `Handoff`): closing its
             // console does, as closing a console window would.
             .handoff => |client| if (comptime builtin.target.os.tag == .windows) {
-                if (self.pty) |*pty| pty.endHandoff();
+                if (self.pty) |*pty| pty.endConsole();
                 const k32 = windows.exp.kernel32;
-                if (k32.WaitForSingleObject(client, handoff_end_ms) != windows.WAIT_OBJECT_0) {
+                if (k32.WaitForSingleObject(client, console_end_ms) != windows.WAIT_OBJECT_0) {
                     log.warn("handoff: the program did not end with its console", .{});
                 }
                 _ = k32.CloseHandle(client);
@@ -1580,13 +1595,18 @@ const Subprocess = struct {
 
     /// Kill the underlying subprocess. This sends a SIGHUP to the child
     /// process. This also waits for the command to exit and will return the
-    /// exit code.
-    fn killCommand(command: *Command) !void {
+    /// exit code. On Windows the command is first given `grace_ms` to end
+    /// on its own (its console closed), and is terminated only after.
+    fn killCommand(command: *Command, grace_ms: u32) !void {
         if (command.pid) |pid| {
             switch (builtin.target.os.tag) {
                 .windows => {
-                    if (windows.exp.kernel32.TerminateProcess(pid, 0) == windows.FALSE) {
-                        return windows.unexpectedError(windows.GetLastError());
+                    const k32 = windows.exp.kernel32;
+                    if (k32.WaitForSingleObject(pid, grace_ms) != windows.WAIT_OBJECT_0) {
+                        if (grace_ms > 0) log.warn("the command did not end with its console, terminating it", .{});
+                        if (k32.TerminateProcess(pid, 0) == windows.FALSE) {
+                            return windows.unexpectedError(windows.GetLastError());
+                        }
                     }
 
                     _ = try command.wait(false);
@@ -3000,6 +3020,31 @@ test "read thread windows: closing the quit pipe ends the reader" {
     try testing.expect(ReadThread.quitRequestedWindows(pipe[0]));
 }
 
+/// Wait until the console's program has written `marker` to `read`, our
+/// end of its output pipe: it is then running and attached to its
+/// console. A console closed before that ends a program still starting
+/// in its DLL initialization, or leaves it hung until stop's fallback.
+fn testWaitOutput(read: windows.HANDLE, marker: []const u8) !void {
+    const k32 = windows.exp.kernel32;
+    var buf: [64 * 1024]u8 = undefined;
+    var len: usize = 0;
+    for (0..1000) |_| {
+        var avail: windows.DWORD = 0;
+        if (k32.PeekNamedPipe(read, null, 0, null, &avail, null) == windows.FALSE)
+            return windows.unexpectedError(windows.GetLastError());
+        if (avail > 0) {
+            if (len == buf.len) return error.NoMarker;
+            var got: windows.DWORD = 0;
+            const want: windows.DWORD = @intCast(@min(avail, buf.len - len));
+            if (k32.ReadFile(read, buf[len..].ptr, want, &got, null) == windows.FALSE)
+                return windows.unexpectedError(windows.GetLastError());
+            len += got;
+            if (std.mem.indexOf(u8, buf[0..len], marker) != null) return;
+        } else try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    return error.NoMarker;
+}
+
 /// A child for the handoff tests, as a handed-off console's program would
 /// be: `stdin` its standard input, if given.
 fn testHandoffChild(comptime command_line: []const u8, stdin: ?windows.HANDLE) !windows.PROCESS_INFORMATION {
@@ -3220,6 +3265,40 @@ test "Exec: stopping a handed-off console ends its program by closing it" {
     try testing.expect(sub.process == null);
 }
 
+test "Exec: stopping a terminal closes its console before ending its command" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    var sub = try Subprocess.init(alloc, .{
+        .command = .{ .direct = &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/k", "echo", "b2-ready" } },
+        .env = .init(alloc),
+        .shell_integration = .none,
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .{},
+        .rt_post_fork_info = .{},
+    });
+    defer sub.deinit();
+    try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
+    const fds = try sub.start(alloc);
+    try testWaitOutput(fds.read, "b2-ready");
+    // Ours, to read the exit code once stop closed the terminal's.
+    const command = try windows.duplicateHandle(sub.process.?.fork_exec.pid.?);
+    defer _ = k32.CloseHandle(command);
+
+    sub.stop();
+    try testing.expect(sub.process == null);
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(command, 0));
+
+    // The console's CTRL_CLOSE_EVENT ends cmd.exe with STATUS_CONTROL_C_EXIT
+    // (0xC000013A, measured); TerminateProcess(pid, 0) would leave 0.
+    var code: windows.DWORD = 0;
+    try testing.expect(k32.GetExitCodeProcess(command, &code) != windows.FALSE);
+    try testing.expectEqual(@as(windows.DWORD, 0xC000013A), code);
+}
+
 test "Exec: a closed terminal keeps none of its command's handles" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
@@ -3241,7 +3320,7 @@ test "Exec: a closed terminal keeps none of its command's handles" {
             const args: []const [:0]const u8 = if (exits)
                 &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/c", "exit 0" }
             else
-                &.{ "C:\\Windows\\System32\\findstr.exe", "x" };
+                &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/k", "echo", "b2-ready" };
             var sub = try Subprocess.init(a, .{
                 .command = .{ .direct = args },
                 .env = .init(a),
@@ -3253,7 +3332,8 @@ test "Exec: a closed terminal keeps none of its command's handles" {
             });
             defer sub.deinit();
             try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
-            _ = try sub.start(a);
+            const fds = try sub.start(a);
+            if (!exits) try testWaitOutput(fds.read, "b2-ready");
             if (exits) {
                 const pid = sub.process.?.fork_exec.pid.?;
                 try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(pid, 10_000));

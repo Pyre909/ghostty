@@ -524,8 +524,8 @@ const WindowsPty = struct {
         },
         /// A console Windows handed to us (`openHandoff`).
         handoff: Handoff,
-        /// A handed-off console that `endHandoff` closed: only our ends
-        /// of the pipes are left.
+        /// A console that `endConsole` closed: only our ends of the
+        /// pipes are left.
         ended,
     };
 
@@ -645,20 +645,26 @@ const WindowsPty = struct {
         };
     }
 
-    /// End a handed-off console now, and with it its program, keeping our
-    /// ends of the pipes until `deinit`. Nothing for a pseudoconsole.
-    pub fn endHandoff(self: *Pty) void {
+    /// End the console now, as closing a console window does: its
+    /// programs get CTRL_CLOSE_EVENT and end after their handlers (a
+    /// handed-off console's end at once). Our ends of the pipes stay
+    /// until `deinit`, so a reader still drains what the host writes on
+    /// its way out, and ClosePseudoConsole cannot block on a full pipe.
+    pub fn endConsole(self: *Pty) void {
         switch (self.console) {
-            .handoff => |h| {
-                closeHandoff(h);
-                self.console = .ended;
+            .conpty => |c| {
+                _ = windows.exp.kernel32.CloseHandle(c.in_pipe_pty);
+                _ = windows.exp.kernel32.CloseHandle(c.out_pipe_pty);
+                c.functions.close(c.pseudo_console);
             },
-            .conpty, .ended => {},
+            .handoff => |h| closeHandoff(h),
+            .ended => return,
         }
+        self.console = .ended;
     }
 
     /// The console server of a handed-off console, which ends with the
-    /// console; null for any other pty, or once `endHandoff` closed it.
+    /// console; null for any other pty, or once `endConsole` closed it.
     pub fn handoffServer(self: *const Pty) ?windows.HANDLE {
         return switch (self.console) {
             .handoff => |h| h.server,
@@ -788,7 +794,7 @@ const WindowsPty = struct {
                 c.functions.close(c.pseudo_console);
             },
             .handoff, .ended => {
-                self.endHandoff();
+                self.endConsole();
                 _ = windows.exp.kernel32.CloseHandle(self.in_pipe);
                 _ = windows.exp.kernel32.CloseHandle(self.out_pipe);
             },
