@@ -3372,13 +3372,30 @@ test "Exec: a windowed command gets no console grace" {
     const k32 = windows.exp.kernel32;
 
     // A GUI-subsystem program is never attached to the pseudoconsole, so
-    // closing it sends nothing and the grace would only delay stop: the
-    // Remote Desktop client stayed running and stop took 6034 ms before.
-    // (charmap.exe ends on its own at once in the test VM, so it cannot
-    // show the wait.)
+    // closing it sends nothing and the grace would only delay stop (6034
+    // ms for the Remote Desktop client before). The program here is the
+    // windowed script host running a sleep: it needs no desktop, where
+    // mstsc.exe ended at once in a full suite run and charmap.exe always.
+    const file = @import("../os/file.zig");
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    try td.dir.writeFile(testing.io, .{ .sub_path = "sleep.js", .data = "WScript.Sleep(60000);" });
+    const tmp = try file.allocTmpDir(alloc, global.environ());
+    defer file.freeTmpDir(alloc, tmp);
+    const script = try std.fs.path.joinZ(alloc, &.{ tmp, td.name(), "sleep.js" });
+    defer alloc.free(script);
+    const args = [_][:0]const u8{ "C:\\Windows\\System32\\wscript.exe", "//B", "//Nologo", script };
+    // The script host ends at once with code 1 in an empty environment.
+    // The Subprocess owns it from init on, a failed init included.
+    var env: EnvMap = .init(alloc);
+    env.put("SystemRoot", "C:\\Windows") catch |err| {
+        env.deinit();
+        return err;
+    };
+
     var sub = try Subprocess.init(alloc, .{
-        .command = .{ .direct = &.{"C:\\Windows\\System32\\mstsc.exe"} },
-        .env = .init(alloc),
+        .command = .{ .direct = &args },
+        .env = env,
         .shell_integration = .none,
         .resources_dir = null,
         .term = "xterm-ghostty",
