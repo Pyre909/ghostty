@@ -3365,6 +3365,64 @@ test "Exec: a stop with no reader terminates the command at once" {
     try testing.expectEqual(@as(windows.DWORD, 0), code);
 }
 
+test "Exec: a refused terminate is an error only if the command lives on" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    const S = struct {
+        /// A handle to the same process without PROCESS_TERMINATE
+        /// (SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION), so that
+        /// TerminateProcess through it fails as it does for a process
+        /// already ending: killCommand never looks at the error code.
+        fn limited(pid: windows.HANDLE) !windows.HANDLE {
+            const current = std.os.windows.GetCurrentProcess();
+            var copy: windows.HANDLE = undefined;
+            if (k32.DuplicateHandle(current, pid, current, &copy, 0x0010_0000 | 0x1000, windows.FALSE, 0) == windows.FALSE)
+                return windows.unexpectedError(windows.GetLastError());
+            return copy;
+        }
+
+        /// Ends the process 200 ms from now, inside killCommand's second
+        /// wait: the first (grace 0) has already timed out by then.
+        fn endLater(pid: windows.HANDLE) void {
+            _ = k32.WaitForSingleObject(pid, 200);
+            _ = k32.TerminateProcess(pid, 0);
+        }
+    };
+
+    for ([_]bool{ false, true }) |ends| {
+        var sub = try Subprocess.init(alloc, .{
+            .command = .{ .direct = &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/k", "echo", "b2-ready" } },
+            .env = .init(alloc),
+            .shell_integration = .none,
+            .resources_dir = null,
+            .term = "xterm-ghostty",
+            .rt_pre_exec_info = .{},
+            .rt_post_fork_info = .{},
+        });
+        defer sub.deinit();
+        try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
+        const fds = try sub.start(alloc);
+        try testWaitOutput(fds.read, "b2-ready");
+
+        const pid = sub.process.?.fork_exec.pid.?;
+        var cmd = sub.process.?.fork_exec;
+        cmd.pid = try S.limited(pid);
+        defer _ = k32.CloseHandle(cmd.pid.?);
+        if (ends) {
+            const thread = try std.Thread.spawn(.{}, S.endLater, .{pid});
+            defer thread.join();
+            try Subprocess.killCommand(&cmd, 0);
+            try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(pid, 0));
+        } else {
+            try testing.expectError(error.Unexpected, Subprocess.killCommand(&cmd, 0));
+            try testing.expectEqual(@as(windows.DWORD, windows.WAIT_TIMEOUT), k32.WaitForSingleObject(pid, 0));
+        }
+    }
+}
+
 test "Exec: a closed terminal keeps none of its command's handles" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
