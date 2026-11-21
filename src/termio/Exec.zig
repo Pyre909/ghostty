@@ -299,7 +299,9 @@ pub fn threadEnter(
         // The Command will output some additional information.
         std.process.exit(1);
     };
-    errdefer self.subprocess.stop();
+    // No reader drains the command's output until the read thread below
+    // starts, so a failure before then must not wait on its console.
+    errdefer self.subprocess.stop(.terminate);
 
     // Watcher to detect subprocess exit
     var process: ?xev.Process = if (self.subprocess.process) |v| switch (v) {
@@ -428,7 +430,8 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     if (exec.exited) self.subprocess.externalExit();
-    self.subprocess.stop();
+    // The read thread is still draining the command's output here.
+    self.subprocess.stop(.close_console);
 
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
@@ -477,9 +480,11 @@ fn closeQuitPipeEnd(fd: posix.fd_t) void {
 ///
 ///   - If the reader is between reads (inside `processOutput` or
 ///     `yieldToDemand`) the cancel finds nothing (ERROR_NOT_FOUND) and
-///     the next `ReadFile` blocks. `subprocess.stop()` killed the child
-///     but the pseudoconsole stays open until `pty.deinit`, which runs
-///     after this join, so no more output may ever arrive to wake it.
+///     the next `ReadFile` blocks. `subprocess.stop` ended the child, but
+///     a pipe the console host still holds open never breaks: a command
+///     stopped with `.terminate` keeps its pseudoconsole until
+///     `pty.deinit`, which runs after this join, so no more output may
+///     ever arrive to wake it.
 ///   - The reader checks the quit pipe before every `ReadFile`, but the
 ///     quit byte can land between that check and the read.
 ///
@@ -1272,7 +1277,9 @@ const Subprocess = struct {
 
     /// Clean up the subprocess. This will stop the subprocess if it is started.
     pub fn deinit(self: *Subprocess) void {
-        self.stop();
+        // threadExit stopped a started command while its reader ran; any
+        // left now has no reader.
+        self.stop(.terminate);
         if (comptime builtin.target.os.tag == .windows) {
             if (self.handoff) |*h| h.deinit();
         }
@@ -1525,17 +1532,33 @@ const Subprocess = struct {
         self.process = null;
     }
 
+    /// How `stop` ends a started command on Windows. Posix sends SIGHUP
+    /// either way, and a handed-off console's program is always ended by
+    /// closing its console (its handle cannot terminate it).
+    pub const Ending = enum {
+        /// Close its console first, as closing a console window does, so
+        /// the command gets CTRL_CLOSE_EVENT and console_end_ms to end.
+        /// Only while a reader drains its output pipe: ClosePseudoConsole
+        /// can wait for the console host's pending write to it (kernel32's,
+        /// before Windows 11 24H2), and nothing else would end that write.
+        close_console,
+        /// Terminate it at once. The console closes in Pty.deinit, after
+        /// our pipe ends, which breaks any write the host has pending.
+        terminate,
+    };
+
     /// Stop the subprocess. This is safe to call anytime. This will wait
     /// for the subprocess to register that it has been signalled, but not
     /// for it to terminate, so it will not block.
     /// This does not close the pty.
-    pub fn stop(self: *Subprocess) void {
+    pub fn stop(self: *Subprocess, ending: Ending) void {
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
                 // On Windows the console closes first, as when a console
                 // window closes: the command gets CTRL_CLOSE_EVENT, where
                 // posix sends SIGHUP, and is given console_end_ms to end.
                 const grace_ms: u32 = if (comptime builtin.target.os.tag == .windows) grace: {
+                    if (ending == .terminate) break :grace 0;
                     const pty = &(self.pty orelse break :grace 0);
                     pty.endConsole();
                     break :grace console_end_ms;
@@ -3266,7 +3289,7 @@ test "Exec: stopping a handed-off console ends its program by closing it" {
 
     // Still running until the console closes.
     try testing.expectEqual(@as(windows.DWORD, windows.WAIT_TIMEOUT), k32.WaitForSingleObject(client, 0));
-    sub.stop();
+    sub.stop(.close_console);
     try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(client, 0));
     try testing.expect(sub.process == null);
 }
@@ -3294,7 +3317,7 @@ test "Exec: stopping a terminal closes its console before ending its command" {
     const command = try windows.duplicateHandle(sub.process.?.fork_exec.pid.?);
     defer _ = k32.CloseHandle(command);
 
-    sub.stop();
+    sub.stop(.close_console);
     try testing.expect(sub.process == null);
     try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(command, 0));
 
@@ -3303,6 +3326,39 @@ test "Exec: stopping a terminal closes its console before ending its command" {
     var code: windows.DWORD = 0;
     try testing.expect(k32.GetExitCodeProcess(command, &code) != windows.FALSE);
     try testing.expectEqual(@as(windows.DWORD, 0xC000013A), code);
+}
+
+test "Exec: a stop with no reader terminates the command at once" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    var sub = try Subprocess.init(alloc, .{
+        .command = .{ .direct = &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/k", "echo", "b2-ready" } },
+        .env = .init(alloc),
+        .shell_integration = .none,
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .{},
+        .rt_post_fork_info = .{},
+    });
+    defer sub.deinit();
+    try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
+    const fds = try sub.start(alloc);
+    try testWaitOutput(fds.read, "b2-ready");
+    const command = try windows.duplicateHandle(sub.process.?.fork_exec.pid.?);
+    defer _ = k32.CloseHandle(command);
+
+    sub.stop(.terminate);
+    try testing.expect(sub.process == null);
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(command, 0));
+
+    // TerminateProcess(pid, 0): a closed console would have ended it with
+    // STATUS_CONTROL_C_EXIT instead.
+    var code: windows.DWORD = 1;
+    try testing.expect(k32.GetExitCodeProcess(command, &code) != windows.FALSE);
+    try testing.expectEqual(@as(windows.DWORD, 0), code);
 }
 
 test "Exec: a closed terminal keeps none of its command's handles" {
@@ -3346,7 +3402,7 @@ test "Exec: a closed terminal keeps none of its command's handles" {
                 sub.externalExit();
                 try testing.expect(sub.process == null);
             }
-            sub.stop();
+            sub.stop(.close_console);
             try testing.expect(sub.process == null);
         }
     };
