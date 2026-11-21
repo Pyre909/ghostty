@@ -3324,10 +3324,10 @@ test "Exec: stopping a terminal closes its console before ending its command" {
     try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(command, 0));
 
     // The console's CTRL_CLOSE_EVENT ends cmd.exe with STATUS_CONTROL_C_EXIT
-    // (0xC000013A, measured); TerminateProcess(pid, 0) would leave 0.
+    // (measured); TerminateProcess(pid, 0) would leave 0.
     var code: windows.DWORD = 0;
     try testing.expect(k32.GetExitCodeProcess(command, &code) != windows.FALSE);
-    try testing.expectEqual(@as(windows.DWORD, 0xC000013A), code);
+    try testing.expectEqual(@backingInt(std.os.windows.NTSTATUS.CONTROL_C_EXIT), code);
 }
 
 test "Exec: a stop with no reader terminates the command at once" {
