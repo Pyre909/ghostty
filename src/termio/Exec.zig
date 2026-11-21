@@ -64,10 +64,12 @@ pub const Handoff = if (builtin.target.os.tag == .windows) struct {
 /// waiting for it and terminate it (Windows only). A handed-off console's
 /// program ended in 30 ms on Windows 11; a pseudoconsole's gets
 /// CTRL_CLOSE_EVENT and runs its handler first (a shell saving its
-/// history), which the console host itself ends after about 5 s (a 10 s
-/// handler ended at 5.0-5.1 s, here and in Windows Terminal). This is
-/// longer, so the host's bound is the one that ends a slow handler; ours
-/// is for a program that never ends, as one closed mid-startup can.
+/// history), which the system ends after SPI_GETHUNGAPPTIMEOUT, 5000 ms by
+/// default (a 10 s handler ended at 5.0-5.1 s, here and in Windows
+/// Terminal). This is longer, so the system's bound is the one that ends a
+/// slow handler unless that setting was raised; ours is for a program
+/// that never ends, as one closed mid-startup can.
+/// Ref: https://learn.microsoft.com/en-us/windows/console/handlerroutine#timeouts
 const console_end_ms = 6000;
 
 /// Reports the end of a handed-off console on the termio thread: a
