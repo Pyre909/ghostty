@@ -1509,15 +1509,12 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
-        if (comptime builtin.target.os.tag == .windows) {
-            if (self.process) |p| switch (p) {
-                .handoff => |client| _ = windows.exp.kernel32.CloseHandle(client),
-                .fork_exec, .flatpak => {},
-            };
-        }
         if (self.process) |*p| switch (p.*) {
             .fork_exec => |*cmd| cmd.deinit(),
-            .handoff, .flatpak => {},
+            .handoff => |client| if (comptime builtin.target.os.tag == .windows) {
+                _ = windows.exp.kernel32.CloseHandle(client);
+            },
+            .flatpak => {},
         };
         self.process = null;
     }
