@@ -1547,10 +1547,12 @@ const Subprocess = struct {
         terminate,
     };
 
-    /// Stop the subprocess. This is safe to call anytime. This will wait
-    /// for the subprocess to register that it has been signalled, but not
-    /// for it to terminate, so it will not block.
-    /// This does not close the pty.
+    /// Stop the subprocess. This is safe to call anytime. It waits for the
+    /// command to end: on posix until the SIGHUP has ended it, on Windows
+    /// with `.close_console` for up to console_end_ms and, if it is then
+    /// terminated, up to a second more (a handed-off console's program
+    /// is given console_end_ms either way). The caller's thread blocks
+    /// for that long. This does not close the pty.
     pub fn stop(self: *Subprocess, ending: Ending) void {
         switch (self.process orelse return) {
             .fork_exec => |*cmd| {
