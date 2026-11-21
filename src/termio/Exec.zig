@@ -1605,7 +1605,13 @@ const Subprocess = struct {
                     if (k32.WaitForSingleObject(pid, grace_ms) != windows.WAIT_OBJECT_0) {
                         if (grace_ms > 0) log.warn("the command did not end with its console, terminating it", .{});
                         if (k32.TerminateProcess(pid, 0) == windows.FALSE) {
-                            return windows.unexpectedError(windows.GetLastError());
+                            // A process already on its way out (its console
+                            // host ending it as our wait ran out) refuses
+                            // with ACCESS_DENIED: that is the end we wanted.
+                            const err = windows.GetLastError();
+                            if (k32.WaitForSingleObject(pid, 1000) != windows.WAIT_OBJECT_0) {
+                                return windows.unexpectedError(err);
+                            }
                         }
                     }
 
