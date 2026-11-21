@@ -1565,6 +1565,9 @@ const Subprocess = struct {
                     if (ending == .terminate) break :grace 0;
                     const pty = &(self.pty orelse break :grace 0);
                     pty.endConsole();
+                    // A windowed program is never attached to its console,
+                    // so closing it sent nothing to wait for.
+                    if (windowedProgram(cmd.pid orelse break :grace 0)) break :grace 0;
                     break :grace console_end_ms;
                 } else 0;
 
@@ -1618,6 +1621,36 @@ const Subprocess = struct {
                 .ws_ypixel = std.math.cast(u16, screen_size.height) orelse std.math.maxInt(u16),
             });
         }
+    }
+
+    /// Whether a started process runs a GUI-subsystem image (Windows), read
+    /// from the Subsystem field of its file's PE optional header. Such a
+    /// program never attaches to the console it was started with. Any
+    /// failure answers false, which keeps the console grace.
+    /// Ref: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#windows-subsystem
+    fn windowedProgram(process: windows.HANDLE) bool {
+        if (comptime builtin.target.os.tag != .windows) return false;
+        const io = global.io();
+
+        // Paths longer than this keep the grace.
+        var wide: [2048]u16 = undefined;
+        var len: windows.DWORD = wide.len;
+        if (windows.exp.kernel32.QueryFullProcessImageNameW(process, 0, &wide, &len) == windows.FALSE) return false;
+        var path: [wide.len * 3]u8 = undefined;
+        const path_len = std.unicode.wtf16LeToWtf8(&path, wide[0..len]);
+
+        const file = std.Io.Dir.openFileAbsolute(io, path[0..path_len], .{}) catch return false;
+        defer file.close(io);
+        // e_lfanew, at 0x3C of the DOS header, locates the "PE\0\0"
+        // signature; the 20-byte COFF header follows it, and Subsystem is
+        // at offset 68 of the optional header in PE32 and PE32+ alike.
+        var lfanew: [4]u8 = undefined;
+        if ((file.readPositionalAll(io, &lfanew, 0x3C) catch return false) != 4) return false;
+        const subsystem_at = @as(u64, std.mem.readInt(u32, &lfanew, .little)) + 4 + 20 + 68;
+        var subsystem: [2]u8 = undefined;
+        if ((file.readPositionalAll(io, &subsystem, subsystem_at) catch return false) != 2) return false;
+        const IMAGE_SUBSYSTEM_WINDOWS_GUI = 2;
+        return std.mem.readInt(u16, &subsystem, .little) == IMAGE_SUBSYSTEM_WINDOWS_GUI;
     }
 
     /// Kill the underlying subprocess. This sends a SIGHUP to the child
@@ -3330,6 +3363,42 @@ test "Exec: stopping a terminal closes its console before ending its command" {
     var code: windows.DWORD = 0;
     try testing.expect(k32.GetExitCodeProcess(command, &code) != windows.FALSE);
     try testing.expectEqual(@backingInt(std.os.windows.NTSTATUS.CONTROL_C_EXIT), code);
+}
+
+test "Exec: a windowed command gets no console grace" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    // A GUI-subsystem program is never attached to the pseudoconsole, so
+    // closing it sends nothing and the grace would only delay stop: the
+    // Remote Desktop client stayed running and stop took 6034 ms before.
+    // (charmap.exe ends on its own at once in the test VM, so it cannot
+    // show the wait.)
+    var sub = try Subprocess.init(alloc, .{
+        .command = .{ .direct = &.{"C:\\Windows\\System32\\mstsc.exe"} },
+        .env = .init(alloc),
+        .shell_integration = .none,
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .{},
+        .rt_post_fork_info = .{},
+    });
+    defer sub.deinit();
+    try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
+    _ = try sub.start(alloc);
+    const command = try windows.duplicateHandle(sub.process.?.fork_exec.pid.?);
+    defer _ = k32.CloseHandle(command);
+    // Still running a second in, so stop is what ends it.
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_TIMEOUT), k32.WaitForSingleObject(command, 1000));
+
+    const start: std.Io.Timestamp = .now(testing.io, .awake);
+    sub.stop(.close_console);
+    const ms = start.untilNow(testing.io, .awake).toMilliseconds();
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_OBJECT_0), k32.WaitForSingleObject(command, 0));
+    // Well under console_end_ms; terminating it took under 50 ms.
+    try testing.expect(ms < console_end_ms / 4);
 }
 
 test "Exec: a stop with no reader terminates the command at once" {

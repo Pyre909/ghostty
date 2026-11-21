@@ -301,6 +301,14 @@ pub const exp = struct {
             nBufferLength: DWORD,
             lpBuffer: LPWSTR,
         ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew
+        pub extern "kernel32" fn QueryFullProcessImageNameW(
+            hProcess: HANDLE,
+            dwFlags: DWORD,
+            // Written, not read: no terminator needed on the way in.
+            lpExeName: [*]u16,
+            lpdwSize: *DWORD,
+        ) callconv(.winapi) BOOL;
         /// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileattributesw
         pub extern "kernel32" fn GetFileAttributesW(
             lpFileName: LPCWSTR,
