@@ -1459,9 +1459,12 @@ const Subprocess = struct {
                 else => return err,
             }
         };
-        errdefer killCommand(&cmd) catch |err| {
-            log.warn("error killing command during cleanup err={}", .{err});
-        };
+        errdefer {
+            killCommand(&cmd) catch |err| {
+                log.warn("error killing command during cleanup err={}", .{err});
+            };
+            cmd.deinit();
+        }
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
 
         self.process = .{ .fork_exec = cmd };
@@ -1512,6 +1515,10 @@ const Subprocess = struct {
                 .fork_exec, .flatpak => {},
             };
         }
+        if (self.process) |*p| switch (p.*) {
+            .fork_exec => |*cmd| cmd.deinit(),
+            .handoff, .flatpak => {},
+        };
         self.process = null;
     }
 
@@ -1526,6 +1533,7 @@ const Subprocess = struct {
                 // DO NOT call cmd.wait
                 killCommand(cmd) catch |err|
                     log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                cmd.deinit();
             },
 
             .flatpak => |*cmd| if (comptime build_config.flatpak) {

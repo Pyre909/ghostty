@@ -360,6 +360,10 @@ pub const exp = struct {
             hProcess: HANDLE,
             uExitCode: UINT,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn GetProcessHandleCount(
+            hProcess: HANDLE,
+            pdwHandleCount: *DWORD,
+        ) callconv(.winapi) BOOL;
         pub extern "kernel32" fn CancelIoEx(
             hFile: HANDLE,
             lpOverlapped: ?*OVERLAPPED,

@@ -441,7 +441,21 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         &process_information,
     ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
+    // Nothing uses the primary thread's handle; the process handle is
+    // kept as `pid` until deinit.
+    _ = windows.exp.kernel32.CloseHandle(process_information.hThread);
     self.pid = process_information.hProcess;
+}
+
+/// Release what a started command holds. On Windows `pid` is a process
+/// handle, which keeps the exited process object alive until it is
+/// closed; posix has nothing to release (waitpid reaps the child). Call
+/// it once the command is no longer waited on.
+pub fn deinit(self: *Command) void {
+    if (comptime builtin.target.os.tag == .windows) {
+        if (self.pid) |pid| _ = windows.exp.kernel32.CloseHandle(pid);
+    }
+    self.pid = null;
 }
 
 fn setupFd(src: File.Handle, target: i32) !void {
@@ -860,6 +874,44 @@ test "Command: windows finds an app execution alias" {
     try testing.expect(std.ascii.endsWithIgnoreCase(found, ".exe"));
     try testing.expect(!windowsIsFile(apps));
     try testing.expect(!windowsIsFile(try std.fmt.allocPrint(alloc, "{s}\\no-such-program.exe", .{apps})));
+}
+
+test "Command: windows releases the process and thread handles" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const S = struct {
+        fn handles() !windows.DWORD {
+            var n: windows.DWORD = 0;
+            if (windows.exp.kernel32.GetProcessHandleCount(std.os.windows.GetCurrentProcess(), &n) == windows.FALSE)
+                return error.HandleCount;
+            return n;
+        }
+
+        fn run() !void {
+            var cmd: Command = .{
+                .path = "C:\\Windows\\System32\\whoami.exe",
+                .args = &.{"C:\\Windows\\System32\\whoami.exe"},
+                .os_pre_exec = null,
+                .rt_pre_exec = null,
+                .rt_post_fork = null,
+                .rt_pre_exec_info = undefined,
+                .rt_post_fork_info = undefined,
+            };
+            try cmd.testingStart();
+            defer cmd.deinit();
+            _ = try cmd.wait(true);
+        }
+    };
+
+    // The first start loads what process creation needs and keeps it.
+    try S.run();
+    const before = try S.handles();
+    for (0..8) |_| try S.run();
+    const after = try S.handles();
+
+    // A leak keeps two per command (process and thread), 16 here; a
+    // little slack for handles the process opens on its own.
+    try testing.expect(after <= before + 2);
 }
 
 test "createNullDelimitedEnvMap" {
