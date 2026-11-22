@@ -333,20 +333,31 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         // path = "\Device\Null"
         const path = [_]u16{ '\\', 'D', 'e', 'v', 'i', 'c', 'e', '\\', 'N', 'u', 'l', 'l' };
         var path_unicode_string: windows.UNICODE_STRING = .init(&path);
-        var attrs: windows.OBJECT_ATTRIBUTES = .{ .ObjectName = &path_unicode_string };
+        // Inheritable, or the command could not be given it: it is the
+        // only handle here that the caller did not make so. It is closed
+        // once the command started.
+        var attrs: windows.OBJECT_ATTRIBUTES = .{
+            .ObjectName = &path_unicode_string,
+            .Attributes = .{ .INHERIT = true },
+        };
 
         var fd: windows.HANDLE = undefined;
         var io_status: windows.IO_STATUS_BLOCK = undefined; // unused
         const result = windows.exp.ntdll.NtCreateFile(
             &fd,
-            .{ .GENERIC = .{ .READ = true }, .STANDARD = .{ .SYNCHRONIZE = true } },
+            // Written to as well: it stands in for standard output and
+            // error too.
+            .{ .GENERIC = .{ .READ = true, .WRITE = true }, .STANDARD = .{ .SYNCHRONIZE = true } },
             &attrs,
             &io_status,
             null,
             windows.FILE_ATTRIBUTE_NORMAL,
-            windows.FILE_SHARE_READ,
+            windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE,
             windows.OPEN_EXISTING,
-            windows.FILE_NON_DIRECTORY_FILE,
+            // Synchronous, as a program expects of a standard handle: a
+            // plain WriteFile to an asynchronous one fails (cmd.exe exits
+            // at its first echo; measured).
+            windows.FILE_NON_DIRECTORY_FILE | windows.FILE_SYNCHRONOUS_IO_NONALERT,
             null,
             0,
         );
@@ -913,6 +924,26 @@ test "Command: windows releases the process and thread handles" {
     // A leak keeps two per command (process and thread), 16 here; a
     // little slack for handles the process opens on its own.
     try testing.expect(after <= before + 2);
+}
+
+test "Command: windows gives a command the null device for a missing handle" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    // The echo fails, and the exit is skipped, if standard output is not
+    // a handle the command can write to.
+    var cmd: Command = .{
+        .path = "C:\\Windows\\System32\\cmd.exe",
+        .args = &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/c", "echo b3 && exit 7" },
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try cmd.testingStart();
+    defer cmd.deinit();
+    const exit = try cmd.wait(true);
+    try testing.expectEqual(@as(u32, 7), exit.Exited);
 }
 
 test "createNullDelimitedEnvMap" {
