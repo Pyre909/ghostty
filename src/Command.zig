@@ -418,12 +418,13 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         const stdout = if (self.stdout) |f| f.handle else null_fd.?;
         const stderr = if (self.stderr) |f| f.handle else null_fd.?;
 
-        // Each handle once (the null device can stand in for several).
-        // The list must live as long as the attribute list does.
+        // Each handle once: the null device can stand in for several,
+        // and CreateProcessW refuses a list with a repeat (measured). The
+        // list must live as long as the attribute list does.
         const handles = try arena.alloc(windows.HANDLE, 3);
         var n: usize = 0;
         for ([_]windows.HANDLE{ stdin, stdout, stderr }) |h| {
-            if (std.mem.indexOfScalar(windows.HANDLE, handles[0..n], h) != null) continue;
+            if (std.mem.findScalar(windows.HANDLE, handles[0..n], h) != null) continue;
             handles[n] = h;
             n += 1;
         }
