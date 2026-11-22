@@ -573,13 +573,18 @@ const WindowsPty = struct {
         }
     };
 
-    /// The console's size for `size`. A console measures in SHORTs, half
-    /// the range of a winsize's fields, so a larger size is clamped to
-    /// the largest a console can have rather than cast (which is
+    /// The most columns or rows a console can have: it measures in
+    /// SHORTs, half the range of a winsize's fields.
+    const max_console = std.math.maxInt(@FieldType(windows.COORD, "X"));
+
+    /// The console's size for `size`: a size past a console's range is
+    /// clamped to the largest it can have rather than cast (which is
     /// illegal behavior from 32768 up).
     fn consoleSize(size: winsize) windows.COORD {
-        const max = std.math.maxInt(@FieldType(windows.COORD, "X"));
-        return .{ .X = @min(size.ws_col, max), .Y = @min(size.ws_row, max) };
+        return .{
+            .X = @min(size.ws_col, max_console),
+            .Y = @min(size.ws_row, max_console),
+        };
     }
 
     /// Open a new PTY with the given initial size.
@@ -833,8 +838,11 @@ const WindowsPty = struct {
             .handoff => |*h| {
                 // The host's signal pipe is synchronous and it reads it on
                 // its own thread, so a message this small never waits.
-                const coord = consoleSize(size);
-                const message = [3]u16{ signal_resize, @intCast(coord.X), @intCast(coord.Y) };
+                const message = [3]u16{
+                    signal_resize,
+                    @min(size.ws_col, max_console),
+                    @min(size.ws_row, max_console),
+                };
                 var put: windows.DWORD = 0;
                 if (windows.exp.kernel32.WriteFile(h.signal, &message, @sizeOf(@TypeOf(message)), &put, null) == windows.FALSE or
                     put != @sizeOf(@TypeOf(message)))
