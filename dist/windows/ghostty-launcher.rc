@@ -1,0 +1,11 @@
+// ghostty.com, the console launcher: the app's icon and version
+// information. It has no manifest of its own.
+
+// LANG_NEUTRAL(0), SUBLANG_NEUTRAL(0)
+LANGUAGE 0, 0
+
+#define ID_ICON_GHOSTTY 1
+ID_ICON_GHOSTTY ICON "ghostty.ico"
+
+#define GHOSTTY_ORIGINAL_FILENAME "ghostty.com"
+#include "version.rc"

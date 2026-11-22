@@ -62,9 +62,27 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 },
             };
 
+            // What dist/windows/version.rc is compiled with, for both
+            // programs. The version resource holds four 16-bit numbers,
+            // so only major, minor and patch go there; the strings carry
+            // the whole version. The quotes reach the resource compiler
+            // as written: no shell reads these.
+            var rc_flags: std.ArrayList([]const u8) = .empty;
+            try rc_flags.appendSlice(b.allocator, &.{
+                b.fmt("/dGHOSTTY_VERSION_MAJOR={d}", .{cfg.version.major}),
+                b.fmt("/dGHOSTTY_VERSION_MINOR={d}", .{cfg.version.minor}),
+                b.fmt("/dGHOSTTY_VERSION_PATCH={d}", .{cfg.version.patch}),
+                b.fmt("/dGHOSTTY_VERSION_STRING=\"{f}\"", .{cfg.version}),
+            });
+            if (cfg.version.pre != null) try rc_flags.append(
+                b.allocator,
+                "/dGHOSTTY_PRERELEASE",
+            );
+
             exe.subsystem = .windows;
             exe.root_module.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
+                .flags = rc_flags.items,
             });
 
             // A console program needs no app dependencies. It imports the
@@ -82,6 +100,10 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 .use_llvm = true,
             });
             launcher.subsystem = .console;
+            launcher.root_module.addWin32ResourceFile(.{
+                .file = b.path("dist/windows/ghostty-launcher.rc"),
+                .flags = rc_flags.items,
+            });
             launcher_install_step = b.addInstallArtifact(launcher, .{
                 .dest_sub_path = "ghostty.com",
             });

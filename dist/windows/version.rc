@@ -1,0 +1,54 @@
+// The version information of a Ghostty program: what Explorer's
+// Properties, Task Manager and installers read. Included by each
+// program's resource file, which first defines GHOSTTY_ORIGINAL_FILENAME.
+// The build (src/build/GhosttyExe.zig) defines the rest:
+//   GHOSTTY_VERSION_MAJOR, _MINOR, _PATCH   numbers
+//   GHOSTTY_VERSION_STRING                  the quoted semantic version
+//   GHOSTTY_PRERELEASE                      only for a pre-release
+//
+// The resource is ID 1 (VS_VERSION_INFO in winver.h): Windows reads no
+// other, and a name the preprocessor does not know becomes a string
+// name. The other constants are winver.h's too, written as numbers so
+// that no Windows SDK header is needed.
+
+#ifdef _DEBUG
+#define GHOSTTY_FF_DEBUG 0x1L
+#else
+#define GHOSTTY_FF_DEBUG 0x0L
+#endif
+#ifdef GHOSTTY_PRERELEASE
+#define GHOSTTY_FF_PRERELEASE 0x2L
+#else
+#define GHOSTTY_FF_PRERELEASE 0x0L
+#endif
+
+1 VERSIONINFO
+FILEVERSION     GHOSTTY_VERSION_MAJOR,GHOSTTY_VERSION_MINOR,GHOSTTY_VERSION_PATCH,0
+PRODUCTVERSION  GHOSTTY_VERSION_MAJOR,GHOSTTY_VERSION_MINOR,GHOSTTY_VERSION_PATCH,0
+// VS_FFI_FILEFLAGSMASK; VS_FF_DEBUG is 1 and VS_FF_PRERELEASE 2.
+FILEFLAGSMASK   0x3FL
+FILEFLAGS       (GHOSTTY_FF_DEBUG | GHOSTTY_FF_PRERELEASE)
+// VOS_NT_WINDOWS32, VFT_APP, VFT2_UNKNOWN
+FILEOS          0x40004L
+FILETYPE        0x1L
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // U.S. English, Unicode: the pair VarFileInfo names below.
+        BLOCK "040904b0"
+        BEGIN
+        VALUE "CompanyName",      "Pyre909"
+        VALUE "FileDescription",  "Ghostty"
+        VALUE "FileVersion",      GHOSTTY_VERSION_STRING
+        VALUE "LegalCopyright",   "Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors"
+        VALUE "OriginalFilename", GHOSTTY_ORIGINAL_FILENAME
+        VALUE "ProductName",      "Ghostty"
+        VALUE "ProductVersion",   GHOSTTY_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
