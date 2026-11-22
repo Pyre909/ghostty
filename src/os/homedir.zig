@@ -271,10 +271,13 @@ test "home: windows asks the shell when the environment names none" {
     defer empty.deinit();
 
     // The profile folder is where this process's USERPROFILE points,
-    // so the two ways to it must agree.
+    // so the two ways to it must agree. That holds for a variable
+    // Windows set: one the runner's parent removed gives nothing to
+    // compare with.
+    const expected = ours.get("USERPROFILE") orelse return error.SkipZigTest;
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const result = (try home(testing.io, &empty, &buf)).?;
-    try testing.expectEqualStrings(ours.get("USERPROFILE").?, result);
+    try testing.expectEqualStrings(expected, result);
 
     var small: [2]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, home(testing.io, &empty, &small));
@@ -296,6 +299,13 @@ test "hasHomePrefix" {
     try testing.expect(hasHomePrefix(.windows, "~\\a"));
     try testing.expect(!hasHomePrefix(.windows, "~abc\\"));
     try testing.expect(!hasHomePrefix(.posix, "~\\a"));
+
+    // And the host's own rule is the one a caller gets.
+    try testing.expect(isHomeRelative("~/a"));
+    try testing.expectEqual(
+        builtin.target.os.tag == .windows,
+        isHomeRelative("~\\a"),
+    );
 }
 
 test "expandHome: windows" {
