@@ -48,6 +48,20 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     var launcher_install_step: ?*std.Build.Step.InstallArtifact = null;
     switch (cfg.target.result.os.tag) {
         .windows => {
+            // The Windows app is for x64 and Arm64. A 32-bit build has
+            // never compiled, and Windows 11 has no 32-bit edition: fail
+            // with that, not partway through the build.
+            if (cfg.app_runtime != .none and cfg.emit_exe) switch (cfg.target.result.cpu.arch) {
+                .x86_64, .aarch64 => {},
+                else => |arch| {
+                    std.log.err(
+                        "the Windows app is built for x86_64 and aarch64 only, not {t}",
+                        .{arch},
+                    );
+                    return error.UnsupportedTarget;
+                },
+            };
+
             exe.subsystem = .windows;
             exe.root_module.addWin32ResourceFile(.{
                 .file = b.path("dist/windows/ghostty.rc"),
