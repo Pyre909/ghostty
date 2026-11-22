@@ -573,6 +573,15 @@ const WindowsPty = struct {
         }
     };
 
+    /// The console's size for `size`. A console measures in SHORTs, half
+    /// the range of a winsize's fields, so a larger size is clamped to
+    /// the largest a console can have rather than cast (which is
+    /// illegal behavior from 32768 up).
+    fn consoleSize(size: winsize) windows.COORD {
+        const max = std.math.maxInt(@FieldType(windows.COORD, "X"));
+        return .{ .X = @min(size.ws_col, max), .Y = @min(size.ws_row, max) };
+    }
+
     /// Open a new PTY with the given initial size.
     pub fn open(size: winsize, opts: OpenOptions) OpenError!Pty {
         const pipes = try openPipes();
@@ -580,7 +589,7 @@ const WindowsPty = struct {
 
         var conpty: ConPty = .init();
         var pseudo_console: windows.HPCON = undefined;
-        const coord: windows.COORD = .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) };
+        const coord = consoleSize(size);
         // The package's host is told how the terminal measures text, so
         // that its cursor stays with ours: as graphemes under
         // grapheme-width-method = unicode, by each codepoint's wcwidth
@@ -817,14 +826,15 @@ const WindowsPty = struct {
             .conpty => |c| {
                 const result = c.functions.resize(
                     c.pseudo_console,
-                    .{ .X = @intCast(size.ws_col), .Y = @intCast(size.ws_row) },
+                    consoleSize(size),
                 );
                 if (result != windows.S_OK) return error.ResizeFailed;
             },
             .handoff => |*h| {
                 // The host's signal pipe is synchronous and it reads it on
                 // its own thread, so a message this small never waits.
-                const message = [3]u16{ signal_resize, size.ws_col, size.ws_row };
+                const coord = consoleSize(size);
+                const message = [3]u16{ signal_resize, @intCast(coord.X), @intCast(coord.Y) };
                 var put: windows.DWORD = 0;
                 if (windows.exp.kernel32.WriteFile(h.signal, &message, @sizeOf(@TypeOf(message)), &put, null) == windows.FALSE or
                     put != @sizeOf(@TypeOf(message)))
@@ -966,6 +976,21 @@ test "WindowsPty: ConPTY package only with conpty.dll and OpenConsole.exe" {
     try tmp.dir.deleteFile(testing.io, "conpty.dll");
 }
 
+test "WindowsPty: a size past a console's range is clamped" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 }, .{});
+    defer pty.deinit();
+
+    // 40000 columns do not fit a COORD's SHORT: cast, they are illegal
+    // behavior; clamped, the console takes them (measured: 32767
+    // columns resize without error).
+    const wide: winsize = .{ .ws_row = 24, .ws_col = 40000, .ws_xpixel = 0, .ws_ypixel = 0 };
+    try pty.setSize(wide);
+    try testing.expectEqual(wide, try pty.getSize());
+}
+
 test "WindowsPty: the console host is logged once while it stays the same" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
@@ -1013,6 +1038,10 @@ test "WindowsPty: a handed-off console resizes and ends through its handles" {
     try testing.expect(k32.ReadFile(ends[0][0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
     try testing.expectEqual(@as(windows.DWORD, 6), got);
     try testing.expectEqual([3]u16{ 8, 101, 31 }, message);
+    // A size past a console's range is sent as the largest it has.
+    try pty.setSize(.{ .ws_row = 40000, .ws_col = 32768, .ws_xpixel = 0, .ws_ypixel = 0 });
+    try testing.expect(k32.ReadFile(ends[0][0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
+    try testing.expectEqual([3]u16{ 8, 32767, 32767 }, message);
     // With our size sent, the reference is released, as Windows
     // Terminal releases it: the console may end with its last program.
     var buf: [32]u8 = undefined;
