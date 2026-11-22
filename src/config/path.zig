@@ -158,12 +158,10 @@ pub const Path = union(enum) {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
         // Check if the path starts with a tilde and expand it to the
-        // home directory on Linux/macOS. We explicitly look for "~/"
-        // because we don't support alternate users such as "~alice/"
-        if (std.mem.startsWith(u8, path, "~/")) expand: {
-            // Windows isn't supported yet
-            if (comptime builtin.target.os.tag == .windows) break :expand;
-
+        // home directory. We explicitly look for "~/" (and "~\" on
+        // Windows) because we don't support alternate users such as
+        // "~alice/"
+        if (internal_os.isHomeRelative(path)) {
             var environ_map = try global.environMap();
             defer environ_map.deinit();
 
@@ -238,6 +236,33 @@ pub const Path = union(enum) {
 
         switch (self.*) {
             .optional, .required => |*p| p.* = try arena_alloc.dupeSentinel(u8, abs, 0),
+        }
+    }
+
+    test "expand: a path under the home directory" {
+        const testing = std.testing;
+        var arena = ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var environ_map = try testing.environ.createMap(alloc);
+        const base = if (builtin.target.os.tag == .windows) "C:\\base" else "/base";
+
+        var home_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const home = (try internal_os.home(testing.io, &environ_map, &home_buf)).?;
+
+        var diags: cli.DiagnosticList = .{};
+        var path: Path = .{ .required = "~/shaders/a.glsl" };
+        try path.expand(alloc, base, &diags);
+        try testing.expect(diags.empty());
+        try testing.expect(std.mem.startsWith(u8, path.required, home));
+        try testing.expectEqualStrings("/shaders/a.glsl", path.required[home.len..]);
+
+        if (builtin.target.os.tag == .windows) {
+            path = .{ .optional = "~\\shaders\\a.glsl" };
+            try path.expand(alloc, base, &diags);
+            try testing.expect(diags.empty());
+            try testing.expect(std.mem.startsWith(u8, path.optional, home));
+            try testing.expectEqualStrings("\\shaders\\a.glsl", path.optional[home.len..]);
         }
     }
 

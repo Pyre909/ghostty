@@ -129,6 +129,18 @@ pub const ExpandError = error{
     BufferTooSmall,
 };
 
+/// True if a path starts at the current user's home directory: with
+/// "~/", or on Windows with "~\" as well, since either separates there.
+/// Another user's home ("~alice/") isn't supported.
+pub fn isHomeRelative(path: []const u8) bool {
+    return hasHomePrefix(builtin.target.os.tag, path);
+}
+
+fn hasHomePrefix(os_tag: std.Target.Os.Tag, path: []const u8) bool {
+    if (path.len < 2 or path[0] != '~') return false;
+    return path[1] == '/' or (os_tag == .windows and path[1] == '\\');
+}
+
 /// Expands a path that starts with a tilde (~) to the home directory of
 /// the current user.
 ///
@@ -141,10 +153,7 @@ pub fn expandHome(
     buf: []u8,
 ) ExpandError![]const u8 {
     return switch (builtin.target.os.tag) {
-        .linux, .freebsd, .macos => try expandHomeUnix(io, environ_map, path, buf),
-
-        // `~/` is not an idiom generally used on Windows
-        .windows => return path,
+        .linux, .freebsd, .macos, .windows => try expandHomeTilde(io, environ_map, path, buf),
 
         // iOS doesn't have a user-writable home directory
         .ios => return path,
@@ -153,13 +162,13 @@ pub fn expandHome(
     };
 }
 
-fn expandHomeUnix(
+fn expandHomeTilde(
     io: std.Io,
     environ_map: *const std.process.Environ.Map,
     path: []const u8,
     buf: []u8,
 ) ExpandError![]const u8 {
-    if (!std.mem.startsWith(u8, path, "~/")) return path;
+    if (!isHomeRelative(path)) return path;
     const home_dir: []const u8 = if (home(io, environ_map, buf)) |home_|
         home_ orelse return error.HomeDetectionFailed
     else |_|
@@ -182,26 +191,26 @@ test "expandHomeUnix" {
     var environ_map = try testing.environ.createMap(testing.allocator);
     defer environ_map.deinit();
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const home_dir = try expandHomeUnix(io, &environ_map, "~/", &buf);
+    const home_dir = try expandHomeTilde(io, &environ_map, "~/", &buf);
     // Joining the home directory `~` with the path `/`
     // the result should end with a separator here. (e.g. `/home/user/`)
     try testing.expect(home_dir[home_dir.len - 1] == std.fs.path.sep);
 
-    const downloads = try expandHomeUnix(io, &environ_map, "~/Downloads/shader.glsl", &buf);
+    const downloads = try expandHomeTilde(io, &environ_map, "~/Downloads/shader.glsl", &buf);
     const expected_downloads = try std.mem.concat(allocator, u8, &[_][]const u8{ home_dir, "Downloads/shader.glsl" });
     defer allocator.free(expected_downloads);
     try testing.expectEqualStrings(expected_downloads, downloads);
 
-    try testing.expectEqualStrings("~", try expandHomeUnix(io, &environ_map, "~", &buf));
-    try testing.expectEqualStrings("~abc/", try expandHomeUnix(io, &environ_map, "~abc/", &buf));
-    try testing.expectEqualStrings("/home/user", try expandHomeUnix(io, &environ_map, "/home/user", &buf));
-    try testing.expectEqualStrings("", try expandHomeUnix(io, &environ_map, "", &buf));
+    try testing.expectEqualStrings("~", try expandHomeTilde(io, &environ_map, "~", &buf));
+    try testing.expectEqualStrings("~abc/", try expandHomeTilde(io, &environ_map, "~abc/", &buf));
+    try testing.expectEqualStrings("/home/user", try expandHomeTilde(io, &environ_map, "/home/user", &buf));
+    try testing.expectEqualStrings("", try expandHomeTilde(io, &environ_map, "", &buf));
 
     // Expect an error if the buffer is large enough to hold the home directory,
     // but not the expanded path
     var small_buf = try allocator.alloc(u8, home_dir.len);
     defer allocator.free(small_buf);
-    try testing.expectError(error.BufferTooSmall, expandHomeUnix(
+    try testing.expectError(error.BufferTooSmall, expandHomeTilde(
         io,
         &environ_map,
         "~/Downloads",
@@ -267,4 +276,51 @@ test "home: windows asks the shell when the environment names none" {
 
     var small: [2]u8 = undefined;
     try testing.expectError(error.BufferTooSmall, home(testing.io, &empty, &small));
+}
+
+test "hasHomePrefix" {
+    const testing = std.testing;
+    for ([_]std.Target.Os.Tag{ .linux, .macos, .windows }) |os_tag| {
+        try testing.expect(hasHomePrefix(os_tag, "~/"));
+        try testing.expect(hasHomePrefix(os_tag, "~/a"));
+        try testing.expect(!hasHomePrefix(os_tag, ""));
+        try testing.expect(!hasHomePrefix(os_tag, "~"));
+        try testing.expect(!hasHomePrefix(os_tag, "~abc/"));
+        try testing.expect(!hasHomePrefix(os_tag, "a~/"));
+    }
+
+    // A backslash separates on Windows only: elsewhere it can be part
+    // of a file's name.
+    try testing.expect(hasHomePrefix(.windows, "~\\a"));
+    try testing.expect(!hasHomePrefix(.windows, "~abc\\"));
+    try testing.expect(!hasHomePrefix(.linux, "~\\a"));
+    try testing.expect(!hasHomePrefix(.macos, "~\\a"));
+}
+
+test "expandHome: windows" {
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const io = testing.io;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    try env.put("USERPROFILE", "C:\\Users\\me");
+    var buf: [64]u8 = undefined;
+
+    // The rest of the path is kept as written: either separator works.
+    try testing.expectEqualStrings(
+        "C:\\Users\\me/shaders/a.glsl",
+        try expandHome(io, &env, "~/shaders/a.glsl", &buf),
+    );
+    try testing.expectEqualStrings(
+        "C:\\Users\\me\\shaders\\a.glsl",
+        try expandHome(io, &env, "~\\shaders\\a.glsl", &buf),
+    );
+
+    try testing.expectEqualStrings("~", try expandHome(io, &env, "~", &buf));
+    try testing.expectEqualStrings("~abc\\", try expandHome(io, &env, "~abc\\", &buf));
+    try testing.expectEqualStrings("C:\\a", try expandHome(io, &env, "C:\\a", &buf));
+
+    var small: [12]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, expandHome(io, &env, "~\\ab", &small));
 }

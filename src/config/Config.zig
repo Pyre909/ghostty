@@ -4758,7 +4758,7 @@ fn expandPaths(self: *Config, base: []const u8) !void {
 /// Expand tilde paths to absolute paths to the user's home directory.
 /// If expansion fails, an error is logged and the original path is returned.
 fn expandHome(path: []const u8, buf: []u8) []const u8 {
-    if (!std.mem.startsWith(u8, path, "~/"))
+    if (!internal_os.isHomeRelative(path))
         return path;
 
     var environ_map = global.environMap() catch |err| {
