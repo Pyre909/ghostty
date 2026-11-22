@@ -988,14 +988,21 @@ test "WindowsPty: a size past a console's range is clamped" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
 
-    var pty = try Pty.open(.{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 }, .{});
-    defer pty.deinit();
-
-    // 40000 columns do not fit a COORD's SHORT: cast, they are illegal
-    // behavior; clamped, the console takes them (measured: 32767
-    // columns resize without error).
+    const fits: winsize = .{ .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
     const wide: winsize = .{ .ws_row = 24, .ws_col = 40000, .ws_xpixel = 0, .ws_ypixel = 0 };
+    const tall: winsize = .{ .ws_row = 40000, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+    try testing.expectEqual(windows.COORD{ .X = 80, .Y = 24 }, WindowsPty.consoleSize(fits));
+    try testing.expectEqual(windows.COORD{ .X = 32767, .Y = 24 }, WindowsPty.consoleSize(wide));
+    try testing.expectEqual(windows.COORD{ .X = 80, .Y = 32767 }, WindowsPty.consoleSize(tall));
+
+    // A console takes the clamped size, when it is made and when it is
+    // resized (measured: 32767 columns, without error). Unclamped, the
+    // cast of 40000 columns to a SHORT is checked illegal behavior.
+    var pty = try Pty.open(wide, .{});
+    defer pty.deinit();
+    try pty.setSize(fits);
     try pty.setSize(wide);
+    // The pty reports the size it was given, not the console's.
     try testing.expectEqual(wide, try pty.getSize());
 }
 
