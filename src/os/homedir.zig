@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const passwd = @import("passwd.zig");
 const objc = @import("objc");
+const windows = @import("windows.zig");
 
 const Error = error{
     /// The buffer used for output is not large enough to store the value.
@@ -13,7 +14,7 @@ const Error = error{
 pub inline fn home(io: std.Io, environ_map: *const std.process.Environ.Map, buf: []u8) !?[]const u8 {
     return switch (builtin.target.os.tag) {
         .linux, .freebsd, .macos => try homeUnix(io, environ_map, buf),
-        .windows => homeWindows(environ_map, buf) catch return error.BufferTooSmall,
+        .windows => try homeWindows(environ_map, buf),
 
         // iOS doesn't have a user-writable home directory
         .ios => null,
@@ -76,11 +77,47 @@ fn homeUnix(io: std.Io, environ_map: *const std.process.Environ.Map, buf: []u8) 
     return null;
 }
 
-fn homeWindows(environ_map: *const std.process.Environ.Map, buf: []u8) !?[]const u8 {
+/// The environment is asked first, as $HOME is elsewhere, and the shell
+/// only when the environment names no home.
+fn homeWindows(environ_map: *const std.process.Environ.Map, buf: []u8) Error!?[]const u8 {
+    if (try homeWindowsEnv(environ_map, buf)) |result| return result;
+
+    // The profile folder as the shell knows it.
+    var wide: ?[*:0]u16 = null;
+    defer windows.exp.ole32.CoTaskMemFree(wide);
+    if (windows.exp.shell32.SHGetKnownFolderPath(
+        &windows.FOLDERID_Profile,
+        0,
+        null,
+        &wide,
+    ) < 0) return null;
+    const result = std.mem.span(wide orelse return null);
+    if (std.unicode.calcWtf8Len(result) > buf.len) return Error.BufferTooSmall;
+    return buf[0..std.unicode.wtf16LeToWtf8(buf, result)];
+}
+
+/// The home directory the environment names. USERPROFILE comes before
+/// HOMEDRIVE and HOMEPATH because those two can name somewhere else:
+/// a domain account with a home folder has them name its network
+/// share, and the profile (the documents, the configuration, where a
+/// shell starts) is still the folder USERPROFILE names.
+fn homeWindowsEnv(environ_map: *const std.process.Environ.Map, buf: []u8) Error!?[]const u8 {
     var writer: std.Io.Writer = .fixed(buf);
-    _ = try writer.write(environ_map.get("HOMEDRIVE") orelse return null);
-    _ = try writer.write(environ_map.get("HOMEPATH") orelse return null);
+    if (nonEmpty(environ_map.get("USERPROFILE"))) |profile| {
+        writer.writeAll(profile) catch return Error.BufferTooSmall;
+        return writer.buffered();
+    }
+
+    writer.writeAll(nonEmpty(environ_map.get("HOMEDRIVE")) orelse
+        return null) catch return Error.BufferTooSmall;
+    writer.writeAll(nonEmpty(environ_map.get("HOMEPATH")) orelse
+        return null) catch return Error.BufferTooSmall;
     return writer.buffered();
+}
+
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    const v = value orelse return null;
+    return if (v.len > 0) v else null;
 }
 
 fn trimSpace(input: []const u8) []const u8 {
@@ -182,4 +219,52 @@ test {
     const result = try home(io, &environ_map, &buf);
     try testing.expect(result != null);
     try testing.expect(result.?.len > 0);
+}
+
+test "homeWindowsEnv: the profile comes before the home drive" {
+    const testing = std.testing;
+    var env: std.process.Environ.Map = .init(testing.allocator);
+    defer env.deinit();
+    var buf: [64]u8 = undefined;
+
+    // An environment that names no home.
+    try testing.expect(try homeWindowsEnv(&env, &buf) == null);
+
+    // Half of the older pair names none either.
+    try env.put("HOMEDRIVE", "H:");
+    try testing.expect(try homeWindowsEnv(&env, &buf) == null);
+
+    try env.put("HOMEPATH", "\\");
+    try testing.expectEqualStrings("H:\\", (try homeWindowsEnv(&env, &buf)).?);
+    var two: [2]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, homeWindowsEnv(&env, &two));
+
+    // An empty variable is as good as none.
+    try env.put("USERPROFILE", "");
+    try testing.expectEqualStrings("H:\\", (try homeWindowsEnv(&env, &buf)).?);
+
+    // The profile wins over a home drive, which here is a share.
+    try env.put("USERPROFILE", "C:\\Users\\me");
+    try testing.expectEqualStrings("C:\\Users\\me", (try homeWindowsEnv(&env, &buf)).?);
+    var ten: [10]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, homeWindowsEnv(&env, &ten));
+}
+
+test "home: windows asks the shell when the environment names none" {
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var ours = try testing.environ.createMap(testing.allocator);
+    defer ours.deinit();
+    var empty: std.process.Environ.Map = .init(testing.allocator);
+    defer empty.deinit();
+
+    // The profile folder is where this process's USERPROFILE points,
+    // so the two ways to it must agree.
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const result = (try home(testing.io, &empty, &buf)).?;
+    try testing.expectEqualStrings(ours.get("USERPROFILE").?, result);
+
+    var small: [2]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, home(testing.io, &empty, &small));
 }

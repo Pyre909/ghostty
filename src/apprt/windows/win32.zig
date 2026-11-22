@@ -963,10 +963,7 @@ pub extern "ole32" fn CoRegisterClassObject(
 pub extern "ole32" fn CoRevokeClassObject(cookie: DWORD) callconv(.winapi) HRESULT;
 pub const IID_IClassFactory: w.GUID = w.GUID.parse("{00000001-0000-0000-c000-000000000046}");
 pub const CLASS_E_NOAGGREGATION: HRESULT = @bitCast(@as(u32, 0x80040110));
-/// Frees what a COM method allocated for its caller, such as a string it
-/// returned (combaseapi.h).
-/// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cotaskmemfree
-pub extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+pub const CoTaskMemFree = internal_os.windows.exp.ole32.CoTaskMemFree;
 
 // The common item dialog (SaveDialog.zig).
 
@@ -2098,14 +2095,7 @@ pub const WIN32_FIND_DATAW = extern struct {
     cFileName: [MAX_PATH]WCHAR,
     cAlternateFileName: [14]WCHAR,
 };
-/// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
-/// The path is the caller's to free with CoTaskMemFree.
-pub extern "shell32" fn SHGetKnownFolderPath(
-    id: *const w.GUID,
-    flags: DWORD,
-    token: ?HANDLE,
-    path: *?[*:0]u16,
-) callconv(.winapi) HRESULT;
+pub const SHGetKnownFolderPath = internal_os.windows.exp.shell32.SHGetKnownFolderPath;
 /// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
 pub const FOLDERID_LocalAppData: w.GUID = w.GUID.parse("{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}");
 /// https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew

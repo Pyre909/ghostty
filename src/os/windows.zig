@@ -603,6 +603,23 @@ pub const exp = struct {
         /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getdoubleclicktime
         pub extern "user32" fn GetDoubleClickTime() callconv(.winapi) UINT;
     };
+    pub const shell32 = struct {
+        /// The path is the caller's to free with CoTaskMemFree, whether
+        /// or not the call succeeds.
+        /// https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shgetknownfolderpath
+        pub extern "shell32" fn SHGetKnownFolderPath(
+            rfid: *const windows.GUID,
+            dwFlags: DWORD,
+            hToken: ?HANDLE,
+            ppszPath: *?[*:0]u16,
+        ) callconv(.winapi) HRESULT;
+    };
+    pub const ole32 = struct {
+        /// Frees what a COM method allocated for its caller, such as a
+        /// string it returned (combaseapi.h).
+        /// https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-cotaskmemfree
+        pub extern "ole32" fn CoTaskMemFree(pv: ?*anyopaque) callconv(.winapi) void;
+    };
     pub const ntdll = struct {
         pub extern "ntdll" fn NtCreateFile(
             FileHandle: *HANDLE,
@@ -686,6 +703,10 @@ pub const exp = struct {
         pub extern "ntdll" fn RtlWakeAddressAll(Address: *const anyopaque) callconv(.winapi) void;
     };
 };
+
+/// The user's profile folder (C:\Users\name).
+/// https://learn.microsoft.com/en-us/windows/win32/shell/knownfolderid
+pub const FOLDERID_Profile: windows.GUID = .parse("{5E6C858F-0E22-4760-9AFE-EA3317B67173}");
 
 pub const ProcThreadAttributeNumber = enum(DWORD) {
     ProcThreadAttributeHandleList = 2,
