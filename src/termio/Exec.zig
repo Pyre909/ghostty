@@ -3544,6 +3544,8 @@ test "Exec: a command inherits none of the terminal's handles" {
     try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
     const fds = try sub.start(alloc);
     try testWaitOutput(fds.read, "b3-ready");
+    const command = try windows.duplicateHandle(sub.process.?.fork_exec.pid.?);
+    defer _ = k32.CloseHandle(command);
 
     // With our end closed the pipe has a writer only if the command (or
     // its console host) got a copy of it.
@@ -3552,6 +3554,8 @@ test "Exec: a command inherits none of the terminal's handles" {
     var avail: windows.DWORD = 0;
     try testing.expect(k32.PeekNamedPipe(read, null, 0, null, &avail, null) == windows.FALSE);
     try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+    // Still running, so a copy it held would have kept the pipe open.
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_TIMEOUT), k32.WaitForSingleObject(command, 0));
     sub.stop(.terminate);
 }
 
