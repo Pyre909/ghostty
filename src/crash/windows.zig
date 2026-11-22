@@ -195,7 +195,9 @@ const context_all: u32 = switch (builtin.cpu.arch) {
 const ThreadListStream = 3;
 const ModuleListStream = 4;
 const ExceptionStream = 6;
+const Memory64ListStream = 9;
 const HandleDataStream = 12;
+const MemoryInfoListStream = 16;
 const ThreadInfoListStream = 17;
 /// Text a debugger shows with the dump (cdb prints it as "Comment:").
 const CommentStreamA = 10;
@@ -328,7 +330,10 @@ pub const Dumper = struct {
         self.stopping.store(true, .release);
         _ = kernel32.SetEvent(self.request);
         // A dump that never ends would make this join wait for ever, and
-        // a test run with it, with nothing to say why.
+        // a test run with it, with nothing to say why. This cannot end
+        // every such run: a dump of the live process that waits on a
+        // suspended thread's lock has suspended the thread running this
+        // too, and only whatever runs the tests can end that.
         if (kernel32.WaitForSingleObject(self.thread.getHandle(), stop_timeout_ms) !=
             os_windows.WAIT_OBJECT_0) @panic("the crash dumper did not stop: a dump is stuck");
         self.thread.join();
@@ -847,6 +852,14 @@ fn testException(dump: TestDump) !struct { u32, u32 } {
 }
 
 test "win32: a panic's crash dump holds its code, thread and message" {
+    try testPanicDump(small_type);
+}
+
+test "win32: a full crash dump holds the process's memory too" {
+    try testPanicDump(full_type);
+}
+
+fn testPanicDump(dump_type: u32) !void {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -854,7 +867,7 @@ test "win32: a panic's crash dump holds its code, thread and message" {
     defer alloc.free(dir);
 
     var d: Dumper = undefined;
-    try d.start(testing.io, dir, small_type);
+    try d.start(testing.io, dir, dump_type);
     defer d.stop();
 
     var name_buf: [std.Thread.max_name_len:0]u8 = undefined;
@@ -893,6 +906,11 @@ test "win32: a panic's crash dump holds its code, thread and message" {
     const comment = dump.stream(CommentStreamA) orelse return error.NoComment;
     try testing.expect(std.mem.indexOf(u8, comment, "thread=io panic: the message") != null);
     try testing.expect(std.mem.indexOf(u8, comment, build_config.version_string) != null);
+
+    // All of the memory and what each region of it is, when asked for.
+    const full = dump_type == full_type;
+    try testing.expectEqual(full, dump.stream(Memory64ListStream) != null);
+    try testing.expectEqual(full, dump.stream(MemoryInfoListStream) != null);
 }
 
 test "win32: a dump is of a snapshot of the process" {
@@ -961,17 +979,13 @@ test "win32: without a snapshot the process itself is dumped" {
 /// Threads that allocate from the process heap for as long as a test
 /// takes dumps: the heap is what a dump of the live process waits on.
 const HeapChurn = struct {
-    extern "kernel32" fn GetProcessHeap() callconv(.winapi) ?windows.HANDLE;
-    extern "kernel32" fn HeapAlloc(heap: ?windows.HANDLE, flags: u32, bytes: usize) callconv(.winapi) ?*anyopaque;
-    extern "kernel32" fn HeapFree(heap: ?windows.HANDLE, flags: u32, mem: ?*anyopaque) callconv(.winapi) windows.BOOL;
-
     stopping: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *HeapChurn) void {
-        const heap = GetProcessHeap();
+        const heap = windows.GetProcessHeap().?;
         var n: usize = 16;
         while (!self.stopping.load(.acquire)) {
-            _ = HeapFree(heap, 0, HeapAlloc(heap, 0, n));
+            _ = windows.ntdll.RtlFreeHeap(heap, .{}, windows.ntdll.RtlAllocateHeap(heap, .{}, n));
             n = (n * 7 + 13) % 70_000 + 1;
         }
     }
@@ -993,6 +1007,8 @@ test "win32: a dump is written while other threads are inside the heap" {
 
     // A dump of the live process stopped at the first of these (measured,
     // 2026-11-22): its thread waited on a suspended thread's heap lock.
+    // This thread was suspended with the rest, so the test does not fail
+    // then: it never returns, and what runs the tests has to end it.
     for (0..50) |_| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
