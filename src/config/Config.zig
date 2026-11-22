@@ -5808,6 +5808,17 @@ pub const WorkingDirectory = union(enum) {
             ) catch "~/projects/ghostty";
             try testing.expectEqualStrings(expected, wd.value().?);
         }
+
+        // On Windows a backslash after the tilde starts at home too.
+        if (comptime builtin.target.os.tag == .windows) {
+            var wd: Self = .{ .path = "~\\projects\\ghostty" };
+            try wd.finalize(alloc);
+
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const home = (try internal_os.home(testing.io, &environ_map, &buf)).?;
+            try testing.expect(std.mem.startsWith(u8, wd.value().?, home));
+            try testing.expectEqualStrings("\\projects\\ghostty", wd.value().?[home.len..]);
+        }
     }
 };
 
