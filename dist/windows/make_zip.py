@@ -576,7 +576,72 @@ def pe_machine(path: Path) -> int | None:
     return int.from_bytes(sig[4:6], "little")
 
 
-def check_tree(top: Path, arch: str) -> None:
+def pe_version(path: Path) -> tuple[tuple[int, int, int, int], bytes] | None:
+    """A PE file's version resource: its file version and the whole
+    resource, whose strings are UTF-16. None for a file without one that
+    Windows would read, which is the version resource with ID 1: one with
+    a name instead shows as no version at all."""
+    data = path.read_bytes()
+    try:
+        (pe,) = struct.unpack_from("<I", data, 0x3C)
+        if data[:2] != b"MZ" or data[pe : pe + 4] != b"PE\0\0":
+            return None
+        (sections,) = struct.unpack_from("<H", data, pe + 6)
+        (optional_size,) = struct.unpack_from("<H", data, pe + 20)
+        optional = pe + 24
+        (magic,) = struct.unpack_from("<H", data, optional)
+        # The data directories follow a header whose size the format sets.
+        dirs = optional + {0x10B: 96, 0x20B: 112}[magic]
+        if dirs + 8 * 3 > optional + optional_size:
+            return None
+        # IMAGE_DIRECTORY_ENTRY_RESOURCE
+        (root_rva,) = struct.unpack_from("<I", data, dirs + 8 * 2)
+        if root_rva == 0:
+            return None
+
+        def at(rva: int) -> int:
+            for i in range(sections):
+                size, start, raw_size, raw = struct.unpack_from(
+                    "<4I", data, optional + optional_size + 40 * i + 8
+                )
+                if start <= rva < start + max(size, raw_size):
+                    return raw + rva - start
+            raise KeyError(rva)
+
+        root = at(root_rva)
+
+        def child(table: int, want: int | None) -> int:
+            """The entry of `table` with the ID `want` (or the first):
+            where it points, from the start of the resources."""
+            named, ids = struct.unpack_from("<HH", data, table + 12)
+            for i in range(named + ids):
+                # A named entry's first word has the top bit set, so it
+                # is no ID.
+                name, to = struct.unpack_from("<II", data, table + 16 + 8 * i)
+                if want is None or name == want:
+                    return to
+            raise KeyError(want)
+
+        # Three levels: type (RT_VERSION is 16), name, language.
+        directory = 0x8000_0000
+        by_name = child(root, 16)
+        by_language = child(root + (by_name ^ directory), 1)
+        entry = child(root + (by_language ^ directory), None)
+        if entry & directory or not (by_name & by_language & directory):
+            return None
+        rva, size = struct.unpack_from("<II", data, root + entry)
+        block = data[at(rva) : at(rva) + size]
+        # VS_VERSIONINFO: three words, the key "VS_VERSION_INFO" and its
+        # NUL, padding to four bytes, then VS_FIXEDFILEINFO.
+        signature, _, ms, ls = struct.unpack_from("<4I", block, 40)
+        if signature != 0xFEEF04BD:
+            return None
+        return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF), block
+    except (struct.error, KeyError):
+        return None
+
+
+def check_tree(top: Path, arch: str, version: str) -> None:
     """Fails unless the installed app is what the zip should hold."""
     problems = []
     for dirpath, dirnames, filenames in os.walk(top):
@@ -597,6 +662,23 @@ def check_tree(top: Path, arch: str) -> None:
                 if machine != ARCHES[arch]:
                     got = "not a PE file" if machine is None else f"{machine:#06x}"
                     problems.append(f"bin/{name} is {got}, not {arch}")
+        # Ghostty's own programs say which build they are: Properties,
+        # Task Manager and installers read it from the file.
+        numbers = (*(int(n) for n in SEMVER.fullmatch(version).groups()[:3]), 0)
+        for name in sorted(names & {"ghostty.exe", "ghostty.com"}):
+            found = pe_version(top / "bin" / name)
+            if found is None:
+                problems.append(f"bin/{name} has no version resource")
+                continue
+            got_numbers, block = found
+            if got_numbers != numbers:
+                problems.append(
+                    f"bin/{name} is version {'.'.join(map(str, got_numbers))}"
+                    f", not {'.'.join(map(str, numbers))}"
+                )
+            for text in (version, name):
+                if (text + "\0").encode("utf-16-le") not in block:
+                    problems.append(f"bin/{name}'s version resource lacks {text!r}")
     share = top / "share"
     if share.is_dir():
         names = set()
@@ -850,7 +932,7 @@ def make(args: argparse.Namespace) -> None:
         zig_build(zig, [*report, *flags], stage / "report")
         top = stage / name
         zig_build(zig, flags, top)
-        check_tree(top, args.arch)
+        check_tree(top, args.arch, args.version)
 
         components = collect(
             REPO,

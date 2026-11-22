@@ -66,11 +66,74 @@ def package(
     }
 
 
-def pe(machine: int) -> bytes:
+VERSION = "1.4.1-win.2+abc"
+
+
+def pe(
+    machine: int,
+    version: tuple[int, int, int, int] | None = None,
+    strings: tuple[str, ...] = (),
+    resource: int | str = 1,
+) -> bytes:
+    """A PE file of `machine`. With `version`, one section holds a version
+    resource of those numbers, with `strings` after them, under the ID or
+    the name `resource`."""
     head = bytearray(64)
     head[:2] = b"MZ"
     head[0x3C:0x40] = (64).to_bytes(4, "little")
-    return bytes(head) + b"PE\0\0" + machine.to_bytes(2, "little") + bytes(18)
+    if version is None:
+        return bytes(head) + b"PE\0\0" + machine.to_bytes(2, "little") + bytes(18)
+
+    a, b, c, d = version
+    fixed = struct.pack("<4I", 0xFEEF04BD, 0x10000, a << 16 | b, c << 16 | d)
+    block = (
+        struct.pack("<3H", 0, 52, 0)
+        + "VS_VERSION_INFO\0".encode("utf-16-le")
+        + bytes(2)
+        + fixed
+        + bytes(52 - len(fixed))
+        + "".join(s + "\0" for s in strings).encode("utf-16-le")
+    )
+    # Three tables of one entry each (type, name, language), the data
+    # entry, the resource, then the resource's name when it has one.
+    directory = 0x8000_0000
+    by_id, named = (1, 0), (0, 1)
+    name_at = 88 + len(block)
+    is_named = isinstance(resource, str)
+    rva = 0x1000
+    rsrc = (
+        struct.pack("<12xHH", *by_id[::-1])
+        + struct.pack("<II", 16, 24 | directory)
+        + struct.pack("<12xHH", *(named if is_named else by_id)[::-1])
+        + struct.pack(
+            "<II", name_at | directory if is_named else resource, 48 | directory
+        )
+        + struct.pack("<12xHH", *by_id[::-1])
+        + struct.pack("<II", 0, 72)
+        + struct.pack("<4I", rva + 88, len(block), 0, 0)
+        + block
+    )
+    if is_named:
+        rsrc += struct.pack("<H", len(resource)) + resource.encode("utf-16-le")
+    optional = bytearray(240)
+    optional[0:2] = (0x20B).to_bytes(2, "little")
+    optional[112 + 16 : 112 + 24] = struct.pack("<II", rva, len(rsrc))
+    coff = struct.pack("<HH12xHH", machine, 1, len(optional), 0)
+    raw = 64 + 4 + len(coff) + len(optional) + 40
+    section = struct.pack("<8s4I16x", b".rsrc", len(rsrc), rva, len(rsrc), raw)
+    return bytes(head) + b"PE\0\0" + coff + bytes(optional) + section + rsrc
+
+
+def own(name: str, **changes: Any) -> bytes:
+    """One of Ghostty's own programs as a build of VERSION installs it."""
+    return pe(
+        **{
+            "machine": 0x8664,
+            "version": (1, 4, 1, 0),
+            "strings": ("ProductVersion", VERSION, "OriginalFilename", name),
+            **changes,
+        }
+    )
 
 
 def font(*records: tuple[int, int, int, int, str]) -> bytes:
@@ -791,10 +854,13 @@ class TestRepository(unittest.TestCase):
 class TestTree(unittest.TestCase):
     def make_tree(self, top: Path) -> None:
         for name in mz.BIN:
-            write(
-                top / "bin" / name,
-                pe(0x8664) if name.endswith((".exe", ".com", ".dll")) else "x",
-            )
+            if name in ("ghostty.exe", "ghostty.com"):
+                content: str | bytes = own(name)
+            elif name.endswith((".exe", ".dll")):
+                content = pe(0x8664)
+            else:
+                content = "x"
+            write(top / "bin" / name, content)
         write(top / "share/terminfo/ghostty.terminfo", "ghostty|Ghostty,\n")
         write(top / "share/ghostty/shell-integration/bash/ghostty.bash", "#\n")
         write(top / "share/ghostty/themes/Dark", "#\n")
@@ -824,6 +890,22 @@ class TestTree(unittest.TestCase):
         def not_pe(t: Path) -> None:
             write(t / "bin/ghostty.com", "MZ")
 
+        def no_version(t: Path) -> None:
+            write(t / "bin/ghostty.exe", pe(0x8664))
+
+        def named_version(t: Path) -> None:
+            write(t / "bin/ghostty.exe", own("ghostty.exe", resource="VS_VERSION_INFO"))
+
+        def other_version(t: Path) -> None:
+            write(t / "bin/ghostty.com", own("ghostty.com", version=(1, 4, 2, 0)))
+
+        def other_string(t: Path) -> None:
+            strings = ("ProductVersion", "1.4.1-win.2+abcd", "ghostty.exe")
+            write(t / "bin/ghostty.exe", own("ghostty.exe", strings=strings))
+
+        def other_name(t: Path) -> None:
+            write(t / "bin/ghostty.com", own("ghostty.exe"))
+
         def empty(t: Path) -> None:
             (t / "share/ghostty/themes/Dark").unlink()
 
@@ -848,7 +930,7 @@ class TestTree(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             self.make_tree(Path(tmp))
-            mz.check_tree(Path(tmp), "x86_64")
+            mz.check_tree(Path(tmp), "x86_64", VERSION)
 
         cases = [
             (stray_top, r"the top holds \['README', 'bin', 'share'\]"),
@@ -857,6 +939,14 @@ class TestTree(unittest.TestCase):
             (link, "share/ghostty/themes/Link is a symbolic link"),
             (arm, "bin/OpenConsole.exe is 0xaa64, not x86_64"),
             (not_pe, "bin/ghostty.com is not a PE file"),
+            (no_version, "bin/ghostty.exe has no version resource"),
+            (named_version, "bin/ghostty.exe has no version resource"),
+            (other_version, r"bin/ghostty.com is version 1\.4\.2\.0, not 1\.4\.1\.0"),
+            (
+                other_string,
+                r"bin/ghostty.exe's version resource lacks '1\.4\.1-win\.2\+abc'",
+            ),
+            (other_name, "bin/ghostty.com's version resource lacks 'ghostty.com'"),
             (empty, "share/ghostty/themes is missing or empty"),
             (terminfo, "share/terminfo/ghostty.terminfo is missing"),
             (man, "share/man/man1 is not expected"),
@@ -874,7 +964,27 @@ class TestTree(unittest.TestCase):
                 self.make_tree(top)
                 change(top)
                 with self.assertRaisesRegex(mz.Error, error):
-                    mz.check_tree(top, "x86_64")
+                    mz.check_tree(top, "x86_64", VERSION)
+
+    def test_pe_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp, "f")
+            for content, want in [
+                (
+                    own("ghostty.exe", version=(1, 25, 2609, 30003)),
+                    (1, 25, 2609, 30003),
+                ),
+                (own("ghostty.exe", resource=2), None),
+                (own("ghostty.exe", resource="VS_VERSION_INFO"), None),
+                (pe(0x8664), None),
+                (own("ghostty.exe").replace(b"\xbd\x04\xef\xfe", bytes(4)), None),
+                (own("ghostty.exe")[:-700], None),
+                (b"MZ", None),
+                (b"", None),
+            ]:
+                f.write_bytes(content)
+                got = mz.pe_version(f)
+                self.assertEqual(got and got[0], want)
 
     def test_arch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -882,7 +992,7 @@ class TestTree(unittest.TestCase):
             with self.assertRaisesRegex(
                 mz.Error, "bin/ghostty.exe is 0x8664, not aarch64"
             ):
-                mz.check_tree(Path(tmp), "aarch64")
+                mz.check_tree(Path(tmp), "aarch64", VERSION)
 
 
 class TestZip(unittest.TestCase):
