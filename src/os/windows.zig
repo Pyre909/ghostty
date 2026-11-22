@@ -26,9 +26,6 @@ pub const HMODULE = windows.HMODULE;
 pub const HWND = windows.HWND;
 pub const HPCON = windows.LPVOID;
 pub const HRESULT = c_long;
-
-/// A process snapshot (processsnapshot.h).
-pub const HPSS = *opaque {};
 pub const LARGE_INTEGER = windows.LARGE_INTEGER;
 pub const LONG = windows.LONG;
 pub const LPCVOID = windows.LPCVOID;
@@ -45,6 +42,8 @@ pub const UNICODE_STRING = windows.UNICODE_STRING;
 
 // Structs and opaque types
 pub const LPPROC_THREAD_ATTRIBUTE_LIST = ?*anyopaque;
+/// A process snapshot (processsnapshot.h).
+pub const HPSS = *opaque {};
 /// A top-level exception filter, as SetUnhandledExceptionFilter takes it.
 pub const LPTOP_LEVEL_EXCEPTION_FILTER = *const fn (
     ExceptionInfo: *windows.EXCEPTION_POINTERS,
@@ -160,6 +159,7 @@ pub const PROC_THREAD_ATTRIBUTE_THREAD = 0x00010000;
 pub const PSEUDOCONSOLE_GLYPH_WIDTH_GRAPHEMES = 0x08;
 pub const PSEUDOCONSOLE_GLYPH_WIDTH_WCSWIDTH = 0x10;
 pub const S_OK = 0;
+pub const S_FALSE = 1;
 /// SetThreadErrorMode dwNewMode: the system shows no critical-error message
 /// box, such as the loader's for a DLL that is no image, and the call that
 /// met the error fails instead.

@@ -160,7 +160,6 @@ const MiniDumpWithThreadInfo = 0x1000;
 // MINIDUMP_CALLBACK_TYPE: is the process handle a snapshot's? S_FALSE
 // says that it is.
 const IsProcessSnapshotCallback = 16;
-const S_FALSE: os_windows.HRESULT = 1;
 
 // PSS_CAPTURE_FLAGS (processsnapshot.h).
 const PSS_CAPTURE_VA_CLONE = 0x1;
@@ -184,10 +183,12 @@ const snapshot_flags: u32 = PSS_CAPTURE_VA_CLONE |
     PSS_CAPTURE_THREAD_CONTEXT;
 
 /// CONTEXT_ALL (winnt.h): the registers a snapshot keeps for each thread.
-const context_all: u32 = switch (builtin.cpu.arch) {
+/// Null where the value is not known here: no snapshot is taken then.
+/// The app is built for these two only (src/build/GhosttyExe.zig).
+const context_all: ?u32 = switch (builtin.target.cpu.arch) {
     .aarch64 => 0x0040_001F,
     .x86_64 => 0x0010_001F,
-    else => @compileError("CONTEXT_ALL is not defined for this architecture"),
+    else => null,
 };
 
 // MINIDUMP_STREAM_TYPE. The dumper writes the comment itself; the tests
@@ -434,7 +435,9 @@ pub const Dumper = struct {
         // itself is dumped, which is better than no attempt.
         const process = windows.GetCurrentProcess();
         var snapshot: ?os_windows.HPSS = null;
-        if (self.capture(process, snapshot_flags, context_all, &snapshot) != 0) snapshot = null;
+        if (context_all) |context_flags| {
+            if (self.capture(process, snapshot_flags, context_flags, &snapshot) != 0) snapshot = null;
+        }
         defer if (snapshot) |s| {
             _ = kernel32.PssFreeSnapshot(process, s);
         };
@@ -465,8 +468,6 @@ pub const Dumper = struct {
         return .{ .written = name[self.dir_len..] };
     }
 
-    /// Sets or clears the file's delete disposition. While it is set,
-    /// closing the last handle to the file deletes it.
     /// Tells MiniDumpWriteDump that its process handle is a snapshot's.
     /// Every other question keeps the answer it came with.
     fn snapshotCallback(
@@ -474,10 +475,12 @@ pub const Dumper = struct {
         input: *const MINIDUMP_CALLBACK_INPUT,
         output: *MINIDUMP_CALLBACK_OUTPUT,
     ) callconv(.winapi) windows.BOOL {
-        if (input.CallbackType == IsProcessSnapshotCallback) output.Status = S_FALSE;
+        if (input.CallbackType == IsProcessSnapshotCallback) output.Status = os_windows.S_FALSE;
         return .TRUE;
     }
 
+    /// Sets or clears the file's delete disposition. While it is set,
+    /// closing the last handle to the file deletes it.
     fn deleteOnClose(file: windows.HANDLE, delete: bool) bool {
         var info: os_windows.FILE_DISPOSITION_INFORMATION = .{
             .DeleteFile = if (delete) .TRUE else .FALSE,
@@ -938,7 +941,7 @@ test "win32: a dump is of a snapshot of the process" {
     // S_OK is what the answer starts as.
     var output: MINIDUMP_CALLBACK_OUTPUT = .{ .Status = 0 };
     try testing.expect(callback(null, &input, &output) != .FALSE);
-    try testing.expectEqual(S_FALSE, output.Status);
+    try testing.expectEqual(os_windows.S_FALSE, output.Status);
 
     // Any other question is left as it was asked.
     input.CallbackType = IsProcessSnapshotCallback - 1;
