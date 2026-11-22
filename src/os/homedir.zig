@@ -133,12 +133,14 @@ pub const ExpandError = error{
 /// "~/", or on Windows with "~\" as well, since either separates there.
 /// Another user's home ("~alice/") isn't supported.
 pub fn isHomeRelative(path: []const u8) bool {
-    return hasHomePrefix(builtin.target.os.tag, path);
+    return hasHomePrefix(
+        if (builtin.target.os.tag == .windows) .windows else .posix,
+        path,
+    );
 }
 
-fn hasHomePrefix(os_tag: std.Target.Os.Tag, path: []const u8) bool {
-    if (path.len < 2 or path[0] != '~') return false;
-    return path[1] == '/' or (os_tag == .windows and path[1] == '\\');
+fn hasHomePrefix(comptime path_type: std.fs.path.PathType, path: []const u8) bool {
+    return path.len >= 2 and path[0] == '~' and path_type.isSep(u8, path[1]);
 }
 
 /// Expands a path that starts with a tilde (~) to the home directory of
@@ -280,21 +282,20 @@ test "home: windows asks the shell when the environment names none" {
 
 test "hasHomePrefix" {
     const testing = std.testing;
-    for ([_]std.Target.Os.Tag{ .linux, .macos, .windows }) |os_tag| {
-        try testing.expect(hasHomePrefix(os_tag, "~/"));
-        try testing.expect(hasHomePrefix(os_tag, "~/a"));
-        try testing.expect(!hasHomePrefix(os_tag, ""));
-        try testing.expect(!hasHomePrefix(os_tag, "~"));
-        try testing.expect(!hasHomePrefix(os_tag, "~abc/"));
-        try testing.expect(!hasHomePrefix(os_tag, "a~/"));
+    inline for (.{ .posix, .windows }) |path_type| {
+        try testing.expect(hasHomePrefix(path_type, "~/"));
+        try testing.expect(hasHomePrefix(path_type, "~/a"));
+        try testing.expect(!hasHomePrefix(path_type, ""));
+        try testing.expect(!hasHomePrefix(path_type, "~"));
+        try testing.expect(!hasHomePrefix(path_type, "~abc/"));
+        try testing.expect(!hasHomePrefix(path_type, "a~/"));
     }
 
     // A backslash separates on Windows only: elsewhere it can be part
     // of a file's name.
     try testing.expect(hasHomePrefix(.windows, "~\\a"));
     try testing.expect(!hasHomePrefix(.windows, "~abc\\"));
-    try testing.expect(!hasHomePrefix(.linux, "~\\a"));
-    try testing.expect(!hasHomePrefix(.macos, "~\\a"));
+    try testing.expect(!hasHomePrefix(.posix, "~\\a"));
 }
 
 test "expandHome: windows" {
