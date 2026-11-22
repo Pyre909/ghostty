@@ -3509,6 +3509,52 @@ test "Exec: a refused terminate is an error only if the command lives on" {
     }
 }
 
+test "Exec: a command inherits none of the terminal's handles" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const k32 = windows.exp.kernel32;
+
+    // An inheritable pipe, as a program that captures our output hands
+    // us.
+    var sa: windows.SECURITY_ATTRIBUTES = .{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = null,
+        .bInheritHandle = windows.TRUE,
+    };
+    var read: windows.HANDLE = undefined;
+    var write: windows.HANDLE = undefined;
+    try testing.expect(k32.CreatePipe(&read, &write, &sa, 0) != windows.FALSE);
+    defer _ = k32.CloseHandle(read);
+    var write_open = true;
+    defer if (write_open) {
+        _ = k32.CloseHandle(write);
+    };
+
+    var sub = try Subprocess.init(alloc, .{
+        .command = .{ .direct = &.{ "C:\\Windows\\System32\\cmd.exe", "/d", "/k", "echo", "b3-ready" } },
+        .env = .init(alloc),
+        .shell_integration = .none,
+        .resources_dir = null,
+        .term = "xterm-ghostty",
+        .rt_pre_exec_info = .{},
+        .rt_post_fork_info = .{},
+    });
+    defer sub.deinit();
+    try sub.resize(.{ .columns = 80, .rows = 24 }, .{ .width = 800, .height = 480 });
+    const fds = try sub.start(alloc);
+    try testWaitOutput(fds.read, "b3-ready");
+
+    // With our end closed the pipe has a writer only if the command (or
+    // its console host) got a copy of it.
+    _ = k32.CloseHandle(write);
+    write_open = false;
+    var avail: windows.DWORD = 0;
+    try testing.expect(k32.PeekNamedPipe(read, null, 0, null, &avail, null) == windows.FALSE);
+    try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+    sub.stop(.terminate);
+}
+
 test "Exec: a closed terminal keeps none of its command's handles" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;

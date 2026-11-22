@@ -372,27 +372,36 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         if (null_fd) |fd| _ = windows.exp.kernel32.CloseHandle(fd);
     }
 
-    // TODO: In the case of having FDs instead of pty, need to set up
-    // attributes such that the child process only inherits these handles,
-    // then set bInheritsHandles below.
-
-    const attribute_list, const stdin, const stdout, const stderr = if (self.pseudo_console) |pseudo_console| b: {
-        var attribute_list_size: usize = undefined;
+    // The command inherits only what it needs, whatever else this
+    // process holds that is inheritable (the handles of a program that
+    // captures our output, say, which a shell would keep open long after
+    // we closed ours). With a pseudoconsole that is nothing: the console
+    // is passed as an attribute. Without one it is the standard handles,
+    // named in a handle list, which limits what bInheritHandles passes
+    // on. The caller must have made its handles inheritable.
+    //
+    // Ref: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
+    const attribute_list_buf = attribute_list: {
+        var size: usize = undefined;
         _ = windows.exp.kernel32.InitializeProcThreadAttributeList(
             null,
             1,
             0,
-            &attribute_list_size,
+            &size,
         );
 
-        const attribute_list_buf = try arena.alloc(u8, attribute_list_size);
+        const buf = try arena.alloc(u8, size);
         if (windows.exp.kernel32.InitializeProcThreadAttributeList(
-            attribute_list_buf.ptr,
+            buf.ptr,
             1,
             0,
-            &attribute_list_size,
+            &size,
         ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+        break :attribute_list buf;
+    };
+    defer windows.exp.kernel32.DeleteProcThreadAttributeList(attribute_list_buf.ptr);
 
+    const stdin, const stdout, const stderr = if (self.pseudo_console) |pseudo_console| b: {
         if (windows.exp.kernel32.UpdateProcThreadAttribute(
             attribute_list_buf.ptr,
             0,
@@ -403,17 +412,37 @@ fn startWindows(self: *Command, arena: Allocator) !void {
             null,
         ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
 
-        break :b .{ attribute_list_buf.ptr, null, null, null };
+        break :b .{ null, null, null };
     } else b: {
         const stdin = if (self.stdin) |f| f.handle else null_fd.?;
         const stdout = if (self.stdout) |f| f.handle else null_fd.?;
         const stderr = if (self.stderr) |f| f.handle else null_fd.?;
-        break :b .{ null, stdin, stdout, stderr };
+
+        // Each handle once (the null device can stand in for several).
+        // The list must live as long as the attribute list does.
+        const handles = try arena.alloc(windows.HANDLE, 3);
+        var n: usize = 0;
+        for ([_]windows.HANDLE{ stdin, stdout, stderr }) |h| {
+            if (std.mem.indexOfScalar(windows.HANDLE, handles[0..n], h) != null) continue;
+            handles[n] = h;
+            n += 1;
+        }
+        if (windows.exp.kernel32.UpdateProcThreadAttribute(
+            attribute_list_buf.ptr,
+            0,
+            windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            @ptrCast(handles.ptr),
+            n * @sizeOf(windows.HANDLE),
+            null,
+            null,
+        ) == windows.FALSE) return windows.unexpectedError(windows.GetLastError());
+
+        break :b .{ stdin, stdout, stderr };
     };
 
     var startup_info_ex = windows.STARTUPINFOEX{
         .StartupInfo = .{
-            .cb = if (attribute_list != null) @sizeOf(windows.STARTUPINFOEX) else @sizeOf(windows.STARTUPINFOW),
+            .cb = @sizeOf(windows.STARTUPINFOEX),
             .hStdError = stderr,
             .hStdOutput = stdout,
             .hStdInput = stdin,
@@ -432,11 +461,11 @@ fn startWindows(self: *Command, arena: Allocator) !void {
             .cbReserved2 = 0,
             .lpReserved2 = null,
         },
-        .lpAttributeList = attribute_list,
+        .lpAttributeList = attribute_list_buf.ptr,
     };
 
-    var flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT;
-    if (attribute_list != null) flags |= windows.EXTENDED_STARTUPINFO_PRESENT;
+    const flags: windows.DWORD = windows.CREATE_UNICODE_ENVIRONMENT |
+        windows.EXTENDED_STARTUPINFO_PRESENT;
 
     var process_information: windows.PROCESS_INFORMATION = undefined;
     if (windows.exp.kernel32.CreateProcessW(
@@ -444,7 +473,7 @@ fn startWindows(self: *Command, arena: Allocator) !void {
         command_line_w.ptr,
         null,
         null,
-        windows.TRUE,
+        if (self.pseudo_console == null) windows.TRUE else windows.FALSE,
         flags,
         if (env_w) |w| w.ptr else null,
         if (cwd_w) |w| w.ptr else null,
@@ -924,6 +953,62 @@ test "Command: windows releases the process and thread handles" {
     // A leak keeps two per command (process and thread), 16 here; a
     // little slack for handles the process opens on its own.
     try testing.expect(after <= before + 2);
+}
+
+/// A pipe both of whose handles a child would inherit, as a program that
+/// captures our output hands us.
+fn createTestInheritablePipe() ![2]windows.HANDLE {
+    var sa: windows.SECURITY_ATTRIBUTES = .{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = null,
+        .bInheritHandle = windows.TRUE,
+    };
+    var read: windows.HANDLE = undefined;
+    var write: windows.HANDLE = undefined;
+    if (windows.exp.kernel32.CreatePipe(&read, &write, &sa, 0) == windows.FALSE)
+        return windows.unexpectedError(windows.GetLastError());
+    return .{ read, write };
+}
+
+test "Command: windows gives a command only its standard handles" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const k32 = windows.exp.kernel32;
+
+    const pipe = try createTestInheritablePipe();
+    defer _ = k32.CloseHandle(pipe[0]);
+    var write_open = true;
+    defer if (write_open) {
+        _ = k32.CloseHandle(pipe[1]);
+    };
+
+    var td = try TempDir.init();
+    defer td.deinit();
+    var stdout = try createTestStdout(testing.io, td.dir);
+    defer stdout.close(testing.io);
+
+    // Long enough to outlive the check below; ended by hand.
+    var cmd: Command = .{
+        .path = "C:\\Windows\\System32\\ping.exe",
+        .args = &.{ "C:\\Windows\\System32\\ping.exe", "-n", "60", "127.0.0.1" },
+        .stdout = stdout,
+        .os_pre_exec = null,
+        .rt_pre_exec = null,
+        .rt_post_fork = null,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try cmd.testingStart();
+    defer cmd.deinit();
+    defer _ = k32.TerminateProcess(cmd.pid.?, 0);
+
+    // With our end closed the pipe has a writer only if the command got
+    // a copy of it.
+    _ = k32.CloseHandle(pipe[1]);
+    write_open = false;
+    try testing.expectEqual(@as(windows.DWORD, windows.WAIT_TIMEOUT), k32.WaitForSingleObject(cmd.pid.?, 0));
+    var avail: windows.DWORD = 0;
+    try testing.expect(k32.PeekNamedPipe(pipe[0], null, 0, null, &avail, null) == windows.FALSE);
+    try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
 }
 
 test "Command: windows gives a command the null device for a missing handle" {

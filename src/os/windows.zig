@@ -177,6 +177,12 @@ pub const WT_EXECUTEONLYONCE: ULONG = 0x00000008;
 /// behind `\Device\CNG` (what ProcessPrng and BCryptGenRandom draw from).
 pub const IOCTL_KSEC_GEN_RANDOM: CTL_CODE = windows.IOCTL.KSEC.GEN_RANDOM;
 
+pub const PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(
+    .ProcThreadAttributeHandleList,
+    false,
+    true,
+    false,
+);
 pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = ProcThreadAttributeValue(
     .ProcThreadAttributePseudoConsole,
     false,
@@ -257,6 +263,9 @@ pub const exp = struct {
             lpPreviousValue: ?PVOID,
             lpReturnSize: ?*SIZE_T,
         ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn DeleteProcThreadAttributeList(
+            lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST,
+        ) callconv(.winapi) void;
         pub extern "kernel32" fn PeekNamedPipe(
             hNamedPipe: HANDLE,
             lpBuffer: ?LPVOID,
@@ -679,6 +688,7 @@ pub const exp = struct {
 };
 
 pub const ProcThreadAttributeNumber = enum(DWORD) {
+    ProcThreadAttributeHandleList = 2,
     ProcThreadAttributePseudoConsole = 22,
     _,
 };
