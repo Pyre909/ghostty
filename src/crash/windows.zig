@@ -207,6 +207,9 @@ pub const Dumper = struct {
 
     const thread_name = "crash-dump";
 
+    /// How long `stop` waits for the thread: longer than any dump takes.
+    const stop_timeout_ms = 60_000;
+
     /// `dir` is the crash directory, which must exist and be absolute.
     /// The dumper is not movable once started: its thread holds a pointer
     /// to it.
@@ -254,6 +257,10 @@ pub const Dumper = struct {
     pub fn stop(self: *Dumper) void {
         self.stopping.store(true, .release);
         _ = kernel32.SetEvent(self.request);
+        // A dump that never ends would make this join wait for ever, and
+        // a test run with it, with nothing to say why.
+        if (kernel32.WaitForSingleObject(self.thread.getHandle(), stop_timeout_ms) !=
+            os_windows.WAIT_OBJECT_0) @panic("the crash dumper did not stop: a dump is stuck");
         self.thread.join();
         _ = kernel32.CloseHandle(self.request);
         _ = kernel32.CloseHandle(self.done);
