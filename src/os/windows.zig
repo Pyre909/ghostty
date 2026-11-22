@@ -26,6 +26,9 @@ pub const HMODULE = windows.HMODULE;
 pub const HWND = windows.HWND;
 pub const HPCON = windows.LPVOID;
 pub const HRESULT = c_long;
+
+/// A process snapshot (processsnapshot.h).
+pub const HPSS = *opaque {};
 pub const LARGE_INTEGER = windows.LARGE_INTEGER;
 pub const LONG = windows.LONG;
 pub const LPCVOID = windows.LPCVOID;
@@ -368,6 +371,17 @@ pub const exp = struct {
         pub extern "kernel32" fn WaitForSingleObject(
             hHandle: HANDLE,
             dwMilliseconds: DWORD,
+        ) callconv(.winapi) DWORD;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/nf-processsnapshot-psscapturesnapshot
+        pub extern "kernel32" fn PssCaptureSnapshot(
+            ProcessHandle: HANDLE,
+            CaptureFlags: DWORD,
+            ThreadContextFlags: DWORD,
+            SnapshotHandle: *?HPSS,
+        ) callconv(.winapi) DWORD;
+        pub extern "kernel32" fn PssFreeSnapshot(
+            ProcessHandle: HANDLE,
+            SnapshotHandle: HPSS,
         ) callconv(.winapi) DWORD;
         pub extern "kernel32" fn GetExitCodeProcess(
             hProcess: HANDLE,

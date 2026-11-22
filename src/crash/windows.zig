@@ -112,8 +112,35 @@ const MINIDUMP_USER_STREAM_INFORMATION = extern struct {
     UserStreamArray: [*]const MINIDUMP_USER_STREAM align(4),
 };
 
+/// What MiniDumpWriteDump calls back with, as far as the snapshot answer
+/// reads it: a union of per-type inputs follows `CallbackType`, and
+/// `Status` is one member of a union of outputs.
+const MINIDUMP_CALLBACK_INPUT = extern struct {
+    ProcessId: u32,
+    ProcessHandle: windows.HANDLE align(4),
+    CallbackType: u32,
+};
+
+const MINIDUMP_CALLBACK_OUTPUT = extern struct {
+    Status: os_windows.HRESULT,
+};
+
+const MiniDumpCallback = fn (
+    param: ?*anyopaque,
+    input: *const MINIDUMP_CALLBACK_INPUT,
+    output: *MINIDUMP_CALLBACK_OUTPUT,
+) callconv(.winapi) windows.BOOL;
+
+const MINIDUMP_CALLBACK_INFORMATION = extern struct {
+    CallbackRoutine: *const MiniDumpCallback align(4),
+    CallbackParam: ?*anyopaque align(4),
+};
+
 comptime {
     if (@sizeOf(usize) == 8) {
+        assert(@offsetOf(MINIDUMP_CALLBACK_INPUT, "ProcessHandle") == 4);
+        assert(@offsetOf(MINIDUMP_CALLBACK_INPUT, "CallbackType") == 12);
+        assert(@sizeOf(MINIDUMP_CALLBACK_INFORMATION) == 16);
         assert(@offsetOf(MINIDUMP_EXCEPTION_INFORMATION, "ExceptionPointers") == 4);
         assert(@sizeOf(MINIDUMP_EXCEPTION_INFORMATION) == 16);
         assert(@offsetOf(MINIDUMP_USER_STREAM, "Buffer") == 8);
@@ -130,11 +157,46 @@ const MiniDumpWithUnloadedModules = 0x20;
 const MiniDumpWithFullMemoryInfo = 0x800;
 const MiniDumpWithThreadInfo = 0x1000;
 
+// MINIDUMP_CALLBACK_TYPE: is the process handle a snapshot's? S_FALSE
+// says that it is.
+const IsProcessSnapshotCallback = 16;
+const S_FALSE: os_windows.HRESULT = 1;
+
+// PSS_CAPTURE_FLAGS (processsnapshot.h).
+const PSS_CAPTURE_VA_CLONE = 0x1;
+const PSS_CAPTURE_HANDLES = 0x4;
+const PSS_CAPTURE_HANDLE_NAME_INFORMATION = 0x8;
+const PSS_CAPTURE_HANDLE_BASIC_INFORMATION = 0x10;
+const PSS_CAPTURE_HANDLE_TYPE_SPECIFIC_INFORMATION = 0x20;
+const PSS_CAPTURE_THREADS = 0x80;
+const PSS_CAPTURE_THREAD_CONTEXT = 0x100;
+
+/// What a snapshot holds: the memory (a copy-on-write clone), every
+/// thread with its registers, and the handles. Without the handle flags
+/// a dump of the snapshot has no handle stream (measured), which
+/// MiniDumpWithHandleData asks for.
+const snapshot_flags: u32 = PSS_CAPTURE_VA_CLONE |
+    PSS_CAPTURE_HANDLES |
+    PSS_CAPTURE_HANDLE_NAME_INFORMATION |
+    PSS_CAPTURE_HANDLE_BASIC_INFORMATION |
+    PSS_CAPTURE_HANDLE_TYPE_SPECIFIC_INFORMATION |
+    PSS_CAPTURE_THREADS |
+    PSS_CAPTURE_THREAD_CONTEXT;
+
+/// CONTEXT_ALL (winnt.h): the registers a snapshot keeps for each thread.
+const context_all: u32 = switch (builtin.cpu.arch) {
+    .aarch64 => 0x0040_001F,
+    .x86_64 => 0x0010_001F,
+    else => @compileError("CONTEXT_ALL is not defined for this architecture"),
+};
+
 // MINIDUMP_STREAM_TYPE. The dumper writes the comment itself; the tests
 // read the others.
 const ThreadListStream = 3;
 const ModuleListStream = 4;
 const ExceptionStream = 6;
+const HandleDataStream = 12;
+const ThreadInfoListStream = 17;
 /// Text a debugger shows with the dump (cdb prints it as "Comment:").
 const CommentStreamA = 10;
 
@@ -145,8 +207,15 @@ const MiniDumpWriteDumpFn = *const fn (
     dump_type: u32,
     exception: ?*const MINIDUMP_EXCEPTION_INFORMATION,
     user_streams: ?*const MINIDUMP_USER_STREAM_INFORMATION,
-    callback: ?*const anyopaque,
+    callback: ?*const MINIDUMP_CALLBACK_INFORMATION,
 ) callconv(.winapi) windows.BOOL;
+
+const PssCaptureSnapshotFn = *const fn (
+    process: windows.HANDLE,
+    capture_flags: u32,
+    thread_context_flags: u32,
+    snapshot: *?os_windows.HPSS,
+) callconv(.winapi) u32;
 
 // --- The dumper ----------------------------------------------------------
 
@@ -157,6 +226,7 @@ pub const Kind = enum { exception, panic };
 /// formats on the crashing thread.
 pub const Dumper = struct {
     write: MiniDumpWriteDumpFn,
+    capture: PssCaptureSnapshotFn = kernel32.PssCaptureSnapshot,
     dump_type: u32,
 
     /// How long a crashing thread waits for its dump before dying anyway.
@@ -349,14 +419,32 @@ pub const Dumper = struct {
             .UserStreamCount = 1,
             .UserStreamArray = @ptrCast(&stream),
         };
+
+        // The dump is of a snapshot of the process, not of the process.
+        // For a live process MiniDumpWriteDump suspends every other
+        // thread and then allocates from the process heap: when one of
+        // them was suspended inside the heap, it waits on that thread's
+        // lock for ever, and the crash leaves no dump. Nothing is
+        // suspended for a snapshot. Where none can be made the process
+        // itself is dumped, which is better than no attempt.
+        const process = windows.GetCurrentProcess();
+        var snapshot: ?os_windows.HPSS = null;
+        if (self.capture(process, snapshot_flags, context_all, &snapshot) != 0) snapshot = null;
+        defer if (snapshot) |s| {
+            _ = kernel32.PssFreeSnapshot(process, s);
+        };
+        const callback: MINIDUMP_CALLBACK_INFORMATION = .{
+            .CallbackRoutine = snapshotCallback,
+            .CallbackParam = null,
+        };
         var ok = self.write(
-            windows.GetCurrentProcess(),
+            if (snapshot) |s| @ptrCast(s) else process,
             windows.GetCurrentProcessId(),
             file,
             self.dump_type,
             &info,
             &streams,
-            null,
+            if (snapshot != null) &callback else null,
         ) != .FALSE;
         var err = windows.GetLastError();
         if (ok and marked and !deleteOnClose(file, false)) {
@@ -374,6 +462,17 @@ pub const Dumper = struct {
 
     /// Sets or clears the file's delete disposition. While it is set,
     /// closing the last handle to the file deletes it.
+    /// Tells MiniDumpWriteDump that its process handle is a snapshot's.
+    /// Every other question keeps the answer it came with.
+    fn snapshotCallback(
+        _: ?*anyopaque,
+        input: *const MINIDUMP_CALLBACK_INPUT,
+        output: *MINIDUMP_CALLBACK_OUTPUT,
+    ) callconv(.winapi) windows.BOOL {
+        if (input.CallbackType == IsProcessSnapshotCallback) output.Status = S_FALSE;
+        return .TRUE;
+    }
+
     fn deleteOnClose(file: windows.HANDLE, delete: bool) bool {
         var info: os_windows.FILE_DISPOSITION_INFORMATION = .{
             .DeleteFile = if (delete) .TRUE else .FALSE,
@@ -645,6 +744,9 @@ const TestWrite = struct {
     var release: ?windows.HANDLE = null;
     /// The exception code the write was given.
     var code: u32 = 0;
+    /// The process handle and callback the write was given.
+    var process: ?windows.HANDLE = null;
+    var callback: ?*const MiniDumpCallback = null;
 
     fn reset() void {
         succeed = true;
@@ -652,17 +754,21 @@ const TestWrite = struct {
         started = null;
         release = null;
         code = 0;
+        process = null;
+        callback = null;
     }
 
     fn write(
-        _: windows.HANDLE,
+        process_handle: windows.HANDLE,
         _: u32,
         file: windows.HANDLE,
         _: u32,
         exception: ?*const MINIDUMP_EXCEPTION_INFORMATION,
         _: ?*const MINIDUMP_USER_STREAM_INFORMATION,
-        _: ?*const anyopaque,
+        callback_info: ?*const MINIDUMP_CALLBACK_INFORMATION,
     ) callconv(.winapi) windows.BOOL {
+        process = process_handle;
+        callback = if (callback_info) |info| info.CallbackRoutine else null;
         var io_status: windows.IO_STATUS_BLOCK = undefined;
         var info: os_windows.FILE_STANDARD_INFORMATION = undefined;
         delete_pending = os_windows.exp.ntdll.NtQueryInformationFile(
@@ -779,9 +885,128 @@ test "win32: a panic's crash dump holds its code, thread and message" {
     const modules = dump.stream(ModuleListStream) orelse return error.NoModuleList;
     try testing.expect(std.mem.readInt(u32, modules[0..4], .little) >= 1);
 
+    // What the dump type asks for beyond those: each thread's times and
+    // the handles.
+    try testing.expect(dump.stream(ThreadInfoListStream) != null);
+    try testing.expect(dump.stream(HandleDataStream) != null);
+
     const comment = dump.stream(CommentStreamA) orelse return error.NoComment;
     try testing.expect(std.mem.indexOf(u8, comment, "thread=io panic: the message") != null);
     try testing.expect(std.mem.indexOf(u8, comment, build_config.version_string) != null);
+}
+
+test "win32: a dump is of a snapshot of the process" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    var d: Dumper = undefined;
+    try d.start(testing.io, dir, small_type);
+    defer d.stop();
+    TestWrite.reset();
+    d.write = TestWrite.write;
+    try testing.expect(dumpHere(&d, panic_code, "", @returnAddress()) == .written);
+
+    // Not the process's own handle, and a callback that says so.
+    try testing.expect(TestWrite.process.? != windows.GetCurrentProcess());
+    const callback = TestWrite.callback orelse return error.NoCallback;
+    var input: MINIDUMP_CALLBACK_INPUT = .{
+        .ProcessId = windows.GetCurrentProcessId(),
+        .ProcessHandle = TestWrite.process.?,
+        .CallbackType = IsProcessSnapshotCallback,
+    };
+    // S_OK is what the answer starts as.
+    var output: MINIDUMP_CALLBACK_OUTPUT = .{ .Status = 0 };
+    try testing.expect(callback(null, &input, &output) != .FALSE);
+    try testing.expectEqual(S_FALSE, output.Status);
+
+    // Any other question is left as it was asked.
+    input.CallbackType = IsProcessSnapshotCallback - 1;
+    output.Status = 0;
+    try testing.expect(callback(null, &input, &output) != .FALSE);
+    try testing.expectEqual(0, output.Status);
+}
+
+test "win32: without a snapshot the process itself is dumped" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir);
+
+    const NoSnapshot = struct {
+        fn capture(
+            _: windows.HANDLE,
+            _: u32,
+            _: u32,
+            _: *?os_windows.HPSS,
+        ) callconv(.winapi) u32 {
+            return @backingInt(windows.Win32Error.NOT_SUPPORTED);
+        }
+    };
+
+    var d: Dumper = undefined;
+    try d.start(testing.io, dir, small_type);
+    defer d.stop();
+    TestWrite.reset();
+    d.write = TestWrite.write;
+    d.capture = NoSnapshot.capture;
+    try testing.expect(dumpHere(&d, panic_code, "", @returnAddress()) == .written);
+    try testing.expectEqual(windows.GetCurrentProcess(), TestWrite.process.?);
+    try testing.expect(TestWrite.callback == null);
+}
+
+/// Threads that allocate from the process heap for as long as a test
+/// takes dumps: the heap is what a dump of the live process waits on.
+const HeapChurn = struct {
+    extern "kernel32" fn GetProcessHeap() callconv(.winapi) ?windows.HANDLE;
+    extern "kernel32" fn HeapAlloc(heap: ?windows.HANDLE, flags: u32, bytes: usize) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn HeapFree(heap: ?windows.HANDLE, flags: u32, mem: ?*anyopaque) callconv(.winapi) windows.BOOL;
+
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    fn run(self: *HeapChurn) void {
+        const heap = GetProcessHeap();
+        var n: usize = 16;
+        while (!self.stopping.load(.acquire)) {
+            _ = HeapFree(heap, 0, HeapAlloc(heap, 0, n));
+            n = (n * 7 + 13) % 70_000 + 1;
+        }
+    }
+};
+
+test "win32: a dump is written while other threads are inside the heap" {
+    const alloc = testing.allocator;
+    var churn: HeapChurn = .{};
+    var threads: [4]std.Thread = undefined;
+    var started: usize = 0;
+    defer {
+        churn.stopping.store(true, .release);
+        for (threads[0..started]) |t| t.join();
+    }
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, HeapChurn.run, .{&churn});
+        started += 1;
+    }
+
+    // A dump of the live process stopped at the first of these (measured,
+    // 2026-11-22): its thread waited on a suspended thread's heap lock.
+    for (0..50) |_| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+        defer alloc.free(dir);
+
+        var d: Dumper = undefined;
+        try d.start(testing.io, dir, small_type);
+        defer d.stop();
+        var context: windows.CONTEXT = undefined;
+        var record: ExceptionRecord = undefined;
+        const pointers = testPointers(&context, &record);
+        try testing.expect(d.dump(&pointers, .exception, "") == .written);
+    }
 }
 
 test "win32: a crash directory longer than MAX_PATH takes a dump" {
