@@ -89,10 +89,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from xml.etree import ElementTree
 
 REPO = Path(__file__).resolve().parents[2]
 OVERRIDES = REPO / "dist" / "windows" / "third-party.json"
+# The manifest the build embeds in ghostty.exe.
+MANIFEST = REPO / "dist" / "windows" / "ghostty.manifest"
 
 # The PE machine type of each architecture's programs.
 ARCHES = {"x86_64": 0x8664, "aarch64": 0xAA64}
@@ -637,25 +638,6 @@ def pe_resource(path: Path, kind: int) -> bytes | None:
         return None
 
 
-def pe_manifest(path: Path) -> dict[str, str] | None:
-    """The settings a program's manifest asks Windows for (the children
-    of its windowsSettings), by name. None for a file with no manifest
-    Windows would read, or one that is not XML."""
-    block = pe_resource(path, 24)
-    if block is None:
-        return None
-    try:
-        root = ElementTree.fromstring(block)
-    except ElementTree.ParseError:
-        return None
-    return {
-        setting.tag.rpartition("}")[2]: setting.text or ""
-        for element in root.iter()
-        if element.tag.rpartition("}")[2] == "windowsSettings"
-        for setting in element
-    }
-
-
 def pe_version(
     path: Path,
 ) -> tuple[tuple[int, int, int, int], dict[str, str]] | None:
@@ -714,17 +696,6 @@ def pe_version(
         return None
 
 
-# What ghostty.exe's manifest asks Windows for. The build embeds
-# dist/windows/ghostty.manifest; this is read back from the program, so
-# a build that kept an older manifest fails.
-MANIFEST = {
-    "dpiAware": "true/pm",
-    "dpiAwareness": "PerMonitorV2",
-    "longPathAware": "true",
-    "activeCodePage": "UTF-8",
-}
-
-
 def check_tree(top: Path, arch: str, version: str) -> None:
     """Fails unless the installed app is what the zip should hold."""
     problems = []
@@ -769,17 +740,16 @@ def check_tree(top: Path, arch: str, version: str) -> None:
                     problems.append(
                         f"bin/{name}'s {key} is {strings.get(key)!r}, not {want!r}"
                     )
+        # The manifest in the program is the checkout's, byte for byte:
+        # a build that kept an earlier one fails here.
         if "ghostty.exe" in names:
-            settings = pe_manifest(top / "bin" / "ghostty.exe")
-            if settings is None:
+            embedded = pe_resource(top / "bin" / "ghostty.exe", 24)
+            if embedded is None:
                 problems.append("bin/ghostty.exe has no manifest")
-            else:
-                for key in sorted(MANIFEST.keys() | settings.keys()):
-                    got, want = settings.get(key), MANIFEST.get(key)
-                    if got != want:
-                        problems.append(
-                            f"bin/ghostty.exe's manifest has {key} {got!r}, not {want!r}"
-                        )
+            elif embedded != MANIFEST.read_bytes():
+                problems.append(
+                    "bin/ghostty.exe's manifest is not dist/windows/ghostty.manifest"
+                )
     share = top / "share"
     if share.is_dir():
         names = set()
