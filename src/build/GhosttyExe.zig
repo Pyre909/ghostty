@@ -98,9 +98,30 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 "/dGHOSTTY_DEBUG",
             );
 
+            // The resource files are compiled from a copy whose folder is
+            // named by their contents. Zig's cache of a whole build learns
+            // which files a resource file includes only in a build that
+            // compiles it; a build that takes the compiled resources from
+            // the cache forgets them, and the builds after it miss a
+            // change to the manifest, the icon or version.rc (a release
+            // build kept the old manifest). A change to any of them now
+            // changes the path of the file that is compiled.
+            const resources = b.addWriteFiles();
+            for ([_][]const u8{
+                "ghostty.manifest",
+                "ghostty.ico",
+                "version.rc",
+            }) |name| _ = resources.addCopyFile(
+                b.path(b.pathJoin(&.{ "dist/windows", name })),
+                name,
+            );
+
             exe.subsystem = .windows;
             exe.root_module.addWin32ResourceFile(.{
-                .file = b.path("dist/windows/ghostty.rc"),
+                .file = resources.addCopyFile(
+                    b.path("dist/windows/ghostty.rc"),
+                    "ghostty.rc",
+                ),
                 .flags = rc_flags.items,
             });
 
@@ -120,7 +141,10 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             });
             launcher.subsystem = .console;
             launcher.root_module.addWin32ResourceFile(.{
-                .file = b.path("dist/windows/ghostty-launcher.rc"),
+                .file = resources.addCopyFile(
+                    b.path("dist/windows/ghostty-launcher.rc"),
+                    "ghostty-launcher.rc",
+                ),
                 .flags = rc_flags.items,
             });
             launcher_install_step = b.addInstallArtifact(launcher, .{
