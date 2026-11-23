@@ -576,11 +576,14 @@ def pe_machine(path: Path) -> int | None:
     return int.from_bytes(sig[4:6], "little")
 
 
-def pe_version(path: Path) -> tuple[tuple[int, int, int, int], bytes] | None:
-    """A PE file's version resource: its file version and the whole
-    resource, whose strings are UTF-16. None for a file without one that
-    Windows would read, which is the version resource with ID 1: one with
-    a name instead shows as no version at all."""
+def pe_version(
+    path: Path,
+) -> tuple[tuple[int, int, int, int], dict[str, str]] | None:
+    """A PE file's version resource: its file version and its strings
+    (FileVersion, OriginalFilename and so on) by name. None for a file
+    without one that Windows would read, which is the version resource
+    with ID 1: one with a name instead shows as no version at all. None
+    too for one that is cut short or not laid out as a version resource."""
     data = path.read_bytes()
     try:
         (pe,) = struct.unpack_from("<I", data, 0x3C)
@@ -627,17 +630,53 @@ def pe_version(path: Path) -> tuple[tuple[int, int, int, int], bytes] | None:
         by_name = child(root, 16)
         by_language = child(root + (by_name ^ directory), 1)
         entry = child(root + (by_language ^ directory), None)
-        if entry & directory or not (by_name & by_language & directory):
-            return None
+        # An entry of the wrong kind (a resource where a table should be,
+        # or the reverse) gives an offset far outside the file.
         rva, size = struct.unpack_from("<II", data, root + entry)
         block = data[at(rva) : at(rva) + size]
-        # VS_VERSIONINFO: three words, the key "VS_VERSION_INFO" and its
-        # NUL, padding to four bytes, then VS_FIXEDFILEINFO.
-        signature, _, ms, ls = struct.unpack_from("<4I", block, 40)
+
+        def node(start: int, end: int) -> tuple[str, int, int, int]:
+            """One block of the resource, which is a tree of them: its
+            key, where its value starts, the value's length as the block
+            gives it, and where the block ends."""
+            length, value_length, _ = struct.unpack_from("<3H", block, start)
+            stop = start + length
+            if length < 6 or stop > end:
+                raise KeyError(start)
+            key_end = start + 6
+            while block[key_end : key_end + 2] != b"\0\0":
+                key_end += 2
+                if key_end >= stop:
+                    raise KeyError(start)
+            key = block[start + 6 : key_end].decode("utf-16-le")
+            # The value and each child start on a 32-bit boundary.
+            return key, (key_end + 2 + 3) & ~3, value_length, stop
+
+        def children(first: int, end: int) -> list[tuple[str, int, int, int]]:
+            out = []
+            start = (first + 3) & ~3
+            while start + 6 <= end:
+                out.append(node(start, end))
+                start = (out[-1][3] + 3) & ~3
+            return out
+
+        # VS_VERSIONINFO: its value is VS_FIXEDFILEINFO, and its children
+        # StringFileInfo, whose children are one table of strings for
+        # each language, and VarFileInfo.
+        _, value, value_length, end = node(0, len(block))
+        signature, _, ms, ls = struct.unpack_from("<4I", block, value)
         if signature != 0xFEEF04BD:
             return None
-        return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF), block
-    except (struct.error, KeyError):
+        strings: dict[str, str] = {}
+        for key, value, _, info_end in children(value + value_length, end):
+            if key != "StringFileInfo":
+                continue
+            for _, value, _, table_end in children(value, info_end):
+                for key, value, _, stop in children(value, table_end):
+                    text = block[value:stop].decode("utf-16-le", "replace")
+                    strings.setdefault(key, text.split("\0")[0])
+        return (ms >> 16, ms & 0xFFFF, ls >> 16, ls & 0xFFFF), strings
+    except (struct.error, KeyError, UnicodeDecodeError):
         return None
 
 
@@ -670,15 +709,21 @@ def check_tree(top: Path, arch: str, version: str) -> None:
             if found is None:
                 problems.append(f"bin/{name} has no version resource")
                 continue
-            got_numbers, block = found
+            got_numbers, strings = found
             if got_numbers != numbers:
                 problems.append(
                     f"bin/{name} is version {'.'.join(map(str, got_numbers))}"
                     f", not {'.'.join(map(str, numbers))}"
                 )
-            for text in (version, name):
-                if (text + "\0").encode("utf-16-le") not in block:
-                    problems.append(f"bin/{name}'s version resource lacks {text!r}")
+            for key, want in (
+                ("FileVersion", version),
+                ("ProductVersion", version),
+                ("OriginalFilename", name),
+            ):
+                if strings.get(key) != want:
+                    problems.append(
+                        f"bin/{name}'s {key} is {strings.get(key)!r}, not {want!r}"
+                    )
     share = top / "share"
     if share.is_dir():
         names = set()

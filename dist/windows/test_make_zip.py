@@ -69,48 +69,95 @@ def package(
 VERSION = "1.4.1-win.2+abc"
 
 
+def version_block(
+    version: tuple[int, int, int, int], strings: dict[str, str], signature: int
+) -> bytes:
+    """A version resource as the resource compiler lays one out."""
+
+    def node(
+        key: str, value: bytes = b"", text: bool = False, inside: bytes = b""
+    ) -> bytes:
+        head = bytes(6) + (key + "\0").encode("utf-16-le")
+        body = head + bytes(-len(head) % 4) + value
+        if inside:
+            body += bytes(-len(body) % 4) + inside
+        # A string's length is in characters, and the last block of a
+        # parent is not padded.
+        count = len(value) // 2 if text else len(value)
+        return struct.pack("<3H", len(body), count, int(text)) + body[6:]
+
+    def each(nodes: list[bytes]) -> bytes:
+        return b"".join(n + bytes(-len(n) % 4) for n in nodes[:-1]) + nodes[-1]
+
+    a, b, c, d = version
+    fixed = struct.pack("<4I", signature, 0x10000, a << 16 | b, c << 16 | d)
+    table = each(
+        [node(k, (v + "\0").encode("utf-16-le"), text=True) for k, v in strings.items()]
+    )
+    return node(
+        "VS_VERSION_INFO",
+        fixed + bytes(52 - len(fixed)),
+        inside=each(
+            [
+                node("StringFileInfo", inside=node("040904b0", inside=table)),
+                node(
+                    "VarFileInfo",
+                    inside=node("Translation", struct.pack("<HH", 0x409, 1200)),
+                ),
+            ]
+        ),
+    )
+
+
 def pe(
     machine: int,
     version: tuple[int, int, int, int] | None = None,
-    strings: tuple[str, ...] = (),
+    strings: dict[str, str] | None = None,
     resource: int | str = 1,
+    signature: int = 0xFEEF04BD,
+    flat: bool = False,
 ) -> bytes:
-    """A PE file of `machine`. With `version`, one section holds a version
-    resource of those numbers, with `strings` after them, under the ID or
-    the name `resource`."""
+    """A PE file of `machine`. With `version`, one section holds two
+    resources: an icon, first, and a version resource of those numbers
+    and `strings`, under the ID or the name `resource`. `flat` leaves the
+    version resource's name table out, which no resource compiler does."""
     head = bytearray(64)
     head[:2] = b"MZ"
     head[0x3C:0x40] = (64).to_bytes(4, "little")
     if version is None:
         return bytes(head) + b"PE\0\0" + machine.to_bytes(2, "little") + bytes(18)
 
-    a, b, c, d = version
-    fixed = struct.pack("<4I", 0xFEEF04BD, 0x10000, a << 16 | b, c << 16 | d)
-    block = (
-        struct.pack("<3H", 0, 52, 0)
-        + "VS_VERSION_INFO\0".encode("utf-16-le")
-        + bytes(2)
-        + fixed
-        + bytes(52 - len(fixed))
-        + "".join(s + "\0" for s in strings).encode("utf-16-le")
-    )
-    # Three tables of one entry each (type, name, language), the data
-    # entry, the resource, then the resource's name when it has one.
+    block = version_block(version, strings or {"Comments": ""}, signature)
+    icon = b"icon"
+    # The type table, then for each type a name table and a language
+    # table of one entry each, the two data entries, the resources, and
+    # the version resource's name when it has one.
     directory = 0x8000_0000
-    by_id, named = (1, 0), (0, 1)
-    name_at = 88 + len(block)
+    one_id = struct.pack("<12xHH", 0, 1)
     is_named = isinstance(resource, str)
     rva = 0x1000
+    icon_name, icon_lang, name, lang = 32, 56, 80, 104
+    icon_entry, entry = 128, 144
+    icon_at = 160
+    block_at = icon_at + len(icon)
+    name_at = block_at + len(block)
     rsrc = (
-        struct.pack("<12xHH", *by_id[::-1])
-        + struct.pack("<II", 16, 24 | directory)
-        + struct.pack("<12xHH", *(named if is_named else by_id)[::-1])
+        struct.pack("<12xHH", 0, 2)
+        + struct.pack("<II", 3, icon_name | directory)
+        + struct.pack("<II", 16, entry if flat else name | directory)
+        + one_id
+        + struct.pack("<II", 1, icon_lang | directory)
+        + one_id
+        + struct.pack("<II", 0, icon_entry)
+        + (struct.pack("<12xHH", 1, 0) if is_named else one_id)
         + struct.pack(
-            "<II", name_at | directory if is_named else resource, 48 | directory
+            "<II", name_at | directory if is_named else resource, lang | directory
         )
-        + struct.pack("<12xHH", *by_id[::-1])
-        + struct.pack("<II", 0, 72)
-        + struct.pack("<4I", rva + 88, len(block), 0, 0)
+        + one_id
+        + struct.pack("<II", 0, entry)
+        + struct.pack("<4I", rva + icon_at, len(icon), 0, 0)
+        + struct.pack("<4I", rva + block_at, len(block), 0, 0)
+        + icon
         + block
     )
     if is_named:
@@ -125,12 +172,19 @@ def pe(
 
 
 def own(name: str, **changes: Any) -> bytes:
-    """One of Ghostty's own programs as a build of VERSION installs it."""
+    """One of Ghostty's own programs as a build of VERSION installs it.
+    `strings` changes or, with None, drops single ones."""
+    strings = {
+        "FileVersion": VERSION,
+        "OriginalFilename": name,
+        "ProductVersion": VERSION,
+        **changes.pop("strings", {}),
+    }
     return pe(
         **{
             "machine": 0x8664,
             "version": (1, 4, 1, 0),
-            "strings": ("ProductVersion", VERSION, "OriginalFilename", name),
+            "strings": {k: v for k, v in strings.items() if v is not None},
             **changes,
         }
     )
@@ -900,8 +954,17 @@ class TestTree(unittest.TestCase):
             write(t / "bin/ghostty.com", own("ghostty.com", version=(1, 4, 2, 0)))
 
         def other_string(t: Path) -> None:
-            strings = ("ProductVersion", "1.4.1-win.2+abcd", "ghostty.exe")
+            # The right text, but under another key.
+            strings = {"FileVersion": "0.0.0", "Comments": VERSION}
             write(t / "bin/ghostty.exe", own("ghostty.exe", strings=strings))
+
+        def longer_string(t: Path) -> None:
+            strings = {"ProductVersion": "1.4.1-a." + VERSION}
+            write(t / "bin/ghostty.exe", own("ghostty.exe", strings=strings))
+
+        def no_string(t: Path) -> None:
+            strings = {"ProductVersion": None}
+            write(t / "bin/ghostty.com", own("ghostty.com", strings=strings))
 
         def other_name(t: Path) -> None:
             write(t / "bin/ghostty.com", own("ghostty.exe"))
@@ -942,11 +1005,13 @@ class TestTree(unittest.TestCase):
             (no_version, "bin/ghostty.exe has no version resource"),
             (named_version, "bin/ghostty.exe has no version resource"),
             (other_version, r"bin/ghostty.com is version 1\.4\.2\.0, not 1\.4\.1\.0"),
+            (other_string, "bin/ghostty.exe's FileVersion is '0.0.0', not "),
+            (longer_string, "bin/ghostty.exe's ProductVersion is '1.4.1-a.1.4.1-win"),
+            (no_string, "bin/ghostty.com's ProductVersion is None, not "),
             (
-                other_string,
-                r"bin/ghostty.exe's version resource lacks '1\.4\.1-win\.2\+abc'",
+                other_name,
+                "bin/ghostty.com's OriginalFilename is 'ghostty.exe', not 'ghostty.com'",
             ),
-            (other_name, "bin/ghostty.com's version resource lacks 'ghostty.com'"),
             (empty, "share/ghostty/themes is missing or empty"),
             (terminfo, "share/terminfo/ghostty.terminfo is missing"),
             (man, "share/man/man1 is not expected"),
@@ -967,24 +1032,36 @@ class TestTree(unittest.TestCase):
                     mz.check_tree(top, "x86_64", VERSION)
 
     def test_pe_version(self) -> None:
+        whole = own("ghostty.exe", version=(1, 25, 2609, 30003))
+        strings = {
+            "FileVersion": VERSION,
+            "OriginalFilename": "ghostty.exe",
+            "ProductVersion": VERSION,
+        }
         with tempfile.TemporaryDirectory() as tmp:
             f = Path(tmp, "f")
-            for content, want in [
-                (
-                    own("ghostty.exe", version=(1, 25, 2609, 30003)),
-                    (1, 25, 2609, 30003),
-                ),
-                (own("ghostty.exe", resource=2), None),
-                (own("ghostty.exe", resource="VS_VERSION_INFO"), None),
-                (pe(0x8664), None),
-                (own("ghostty.exe").replace(b"\xbd\x04\xef\xfe", bytes(4)), None),
-                (own("ghostty.exe")[:-700], None),
-                (b"MZ", None),
-                (b"", None),
+            f.write_bytes(whole)
+            self.assertEqual(mz.pe_version(f), ((1, 25, 2609, 30003), strings))
+            f.write_bytes(own("ghostty.exe", strings={"A": "", "FileVersion": "é ü"}))
+            got = mz.pe_version(f)
+            assert got is not None
+            self.assertEqual(got[1], {**strings, "A": "", "FileVersion": "é ü"})
+
+            for what, content in [
+                ("another ID", own("ghostty.exe", resource=2)),
+                ("a name", own("ghostty.exe", resource="VS_VERSION_INFO")),
+                ("no name table", own("ghostty.exe", flat=True)),
+                ("a bad signature", own("ghostty.exe", signature=0)),
+                ("no resources", pe(0x8664)),
+                ("not a PE file", b"MZ"),
+                ("empty", b""),
+                # Cut inside the last string, the string table, the fixed
+                # part and the resource directory.
+                *((f"cut by {n}", whole[:-n]) for n in (1, 2, 40, 300, 420, 600)),
             ]:
-                f.write_bytes(content)
-                got = mz.pe_version(f)
-                self.assertEqual(got and got[0], want)
+                with self.subTest(what=what):
+                    f.write_bytes(content)
+                    self.assertIsNone(mz.pe_version(f))
 
     def test_arch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
