@@ -417,43 +417,49 @@ pub const Recovery = struct {
 /// Every frame presented that way while output pours in costs
 /// throughput, though (the same guest drew 2000 to 3000 frames a second
 /// with `window-vsync = false`, and 100 MiB of text took 1.4 times as
-/// long). So only a short burst goes without waiting: enough for a key
-/// and its echo, earned back at about one frame per refresh. The rest
-/// wait as before, which is what paces a busy terminal.
+/// long). So only a short burst goes without waiting, enough for a key
+/// and its echo, and only after a pause in which nothing was presented.
+/// A busy terminal draws its next frame as soon as the last is
+/// presented, so it never pauses: its frames wait as before, which is
+/// what paces it.
 pub const PresentPacing = struct {
-    /// Frames that may be presented now without waiting.
+    /// Frames that may still be presented without waiting.
     ready: u8 = burst,
 
-    /// When `ready` was last counted up.
-    counted_at: ?std.Io.Timestamp = null,
+    /// When the last Present returned; null before the first.
+    presented_at: ?std.Io.Timestamp = null,
 
     /// A key press draws two frames: one for the key, one for its echo.
     pub const burst = 2;
 
-    /// The time that earns one frame back, about a refresh at 60 Hz.
-    /// A key held down repeats every 33 ms at the fastest, which earns
-    /// back both of its frames.
-    pub const earn_ns = 16 * std.time.ns_per_ms;
+    /// The pause after a Present that makes the burst ready again: a
+    /// refresh at 60 Hz, after which a frame queued at that rate or a
+    /// faster one has been shown. A key held down repeats every 33 ms
+    /// at the fastest, so every repeat has both of its frames.
+    ///
+    /// It is counted from when Present returned, not from when it was
+    /// called. A Present that waits takes most of a refresh (a median of
+    /// 14 ms in the guest above), so from one call to the next is about
+    /// a refresh even when frames follow each other at once, and a busy
+    /// terminal would look paused.
+    pub const pause_ns = std.time.ns_per_s / 60;
 
     /// The sync interval for a frame presented at `now`.
     pub fn interval(self: *PresentPacing, now: std.Io.Timestamp) api.UINT {
-        const since = if (self.counted_at) |at| at.durationTo(now).nanoseconds else 0;
-        if (self.counted_at == null or since < 0) self.counted_at = now;
-        if (since >= earn_ns) {
-            const earned = @divFloor(since, earn_ns);
-            if (earned >= burst - self.ready) {
-                // Full: time beyond that earns nothing more.
-                self.ready = burst;
-                self.counted_at = now;
-            } else {
-                self.ready += @intCast(earned);
-                self.counted_at = self.counted_at.?.addDuration(.fromNanoseconds(earned * earn_ns));
-            }
-        }
+        const paused = if (self.presented_at) |at|
+            at.durationTo(now).nanoseconds >= pause_ns
+        else
+            true;
+        if (paused) self.ready = burst;
 
         if (self.ready == 0) return 1;
         self.ready -= 1;
         return 0;
+    }
+
+    /// Present returned at `now`.
+    pub fn presented(self: *PresentPacing, now: std.Io.Timestamp) void {
+        self.presented_at = now;
     }
 };
 
@@ -1456,6 +1462,9 @@ pub fn present(self: *D3D11, target: Target) PresentError!void {
     else
         self.pacing.interval(.now(global.io(), .awake));
     const hr = self.swap_chain.present(interval, self.present_flags);
+    // The pause that readies the next burst starts here, after any wait
+    // inside Present.
+    if (self.sync_interval != 0) self.pacing.presented(.now(global.io(), .awake));
     self.drainDebugMessages();
     self.present_count += 1;
     if (self.present_count == 1) {
@@ -2082,50 +2091,63 @@ test "d3d11: a key and its echo are presented without waiting" {
     // frame in the same refresh waits.
     var pacing: PresentPacing = .{};
     try testing.expectEqual(0, pacing.interval(at(1_000 * ms)));
+    pacing.presented(at(1_000 * ms + 50_000));
     try testing.expectEqual(0, pacing.interval(at(1_000 * ms + 150_000)));
+    pacing.presented(at(1_000 * ms + 200_000));
     try testing.expectEqual(1, pacing.interval(at(1_000 * ms + 300_000)));
+    pacing.presented(at(1_017 * ms));
 
     // A held key repeats every 33 ms at the fastest: every repeat has
     // both of its frames again.
     for (1..50) |i| {
-        const t: i96 = (1_000 + 33 * @as(i96, @intCast(i))) * ms;
+        const t: i96 = (1_100 + 33 * @as(i96, @intCast(i))) * ms;
         try testing.expectEqual(0, pacing.interval(at(t)));
+        pacing.presented(at(t + 50_000));
         try testing.expectEqual(0, pacing.interval(at(t + 150_000)));
+        pacing.presented(at(t + 200_000));
     }
 }
 
-test "d3d11: a busy terminal's frames wait for the display" {
+test "d3d11: a busy terminal's frames all wait for the display" {
     const testing = std.testing;
     const ms = std.time.ns_per_ms;
 
-    // Frames one millisecond apart for a second: after the burst, one
-    // frame is earned back every 16 ms and the rest wait.
-    var pacing: PresentPacing = .{};
-    var free: usize = 0;
-    for (0..1000) |i| {
-        const t: i96 = (5_000 + @as(i96, @intCast(i))) * ms;
-        if (pacing.interval(.fromNanoseconds(t)) == 0) free += 1;
+    // A thousand frames, each ready `draw` after the last was presented.
+    // A Present that waits returns at the display's next refresh, one
+    // that does not returns at once. Returns how many did not wait.
+    const unpaced = struct {
+        fn unpaced(hz: i96, draw: i96) usize {
+            const refresh = @divFloor(std.time.ns_per_s, hz);
+            var pacing: PresentPacing = .{};
+            var now: i96 = 5_000 * ms;
+            var count: usize = 0;
+            for (0..1000) |_| {
+                if (pacing.interval(.fromNanoseconds(now)) == 0) {
+                    count += 1;
+                } else {
+                    now = (@divFloor(now, refresh) + 1) * refresh;
+                }
+                pacing.presented(.fromNanoseconds(now));
+                now += draw;
+            }
+            return count;
+        }
+    }.unpaced;
+
+    // Frames that follow each other in less than a refresh at 60 Hz:
+    // after the first burst every one waits, whatever the display's
+    // rate, and however long the wait in Present makes it from one
+    // call to the next.
+    for ([_]i96{ 30, 50, 60, 144 }) |hz| {
+        for ([_]i96{ ms / 4, 3 * ms, 10 * ms, 16 * ms }) |draw| {
+            try testing.expectEqual(PresentPacing.burst, unpaced(hz, draw));
+        }
     }
-    try testing.expectEqual(PresentPacing.burst + 999 / 16, free);
 
-    // Time is counted from when a frame was earned, not from the frame
-    // that used it: frames every 10 ms earn five in every 80 ms.
-    pacing = .{};
-    free = 0;
-    for (0..800) |i| {
-        const t: i96 = (9_000 + 10 * @as(i96, @intCast(i))) * ms;
-        if (pacing.interval(.fromNanoseconds(t)) == 0) free += 1;
-    }
-    try testing.expectEqual(PresentPacing.burst + 7990 / 16, free);
-
-    // A long pause earns the burst and no more.
-    try testing.expectEqual(0, pacing.interval(.fromNanoseconds(100_000 * ms)));
-    try testing.expectEqual(0, pacing.interval(.fromNanoseconds(100_000 * ms)));
-    try testing.expectEqual(1, pacing.interval(.fromNanoseconds(100_000 * ms)));
-
-    // A clock that steps back earns nothing and breaks nothing.
-    try testing.expectEqual(1, pacing.interval(.fromNanoseconds(99_000 * ms)));
-    try testing.expectEqual(0, pacing.interval(.fromNanoseconds(99_016 * ms)));
+    // Frames a refresh or more apart have nothing queued ahead of them:
+    // none waits.
+    try testing.expectEqual(1000, unpaced(60, 17 * ms));
+    try testing.expectEqual(1000, unpaced(60, 600 * ms));
 }
 
 test "d3d11: only the Basic Render Driver is a software adapter" {
