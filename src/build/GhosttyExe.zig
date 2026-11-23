@@ -99,13 +99,18 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             );
 
             // The resource files are compiled from a copy whose folder is
-            // named by their contents. Zig's cache of a whole build learns
-            // which files a resource file includes only in a build that
-            // compiles it; a build that takes the compiled resources from
-            // the cache forgets them, and the builds after it miss a
-            // change to the manifest, the icon or version.rc (a release
-            // build kept the old manifest). A change to any of them now
-            // changes the path of the file that is compiled.
+            // named by their contents, so a change to any of them changes
+            // the path of the file that is compiled.
+            //
+            // This is a workaround for the toolchain (seen with Zig
+            // 0.17.1). The cache of a whole build learns which files a
+            // resource file includes only from a build that compiles it.
+            // After a build that changed Zig code alone, and so took the
+            // compiled resources from their own cache, a change to the
+            // manifest, the icon or version.rc alone is not seen: a
+            // release build kept the old manifest, where a debug build
+            // took the new one. Remove the copy when Zig's cache keeps
+            // the files a cached resource file includes.
             const resources = b.addWriteFiles();
             for ([_][]const u8{
                 "ghostty.manifest",
