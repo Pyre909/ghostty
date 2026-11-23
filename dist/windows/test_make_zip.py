@@ -116,11 +116,13 @@ def pe(
     resource: int | str = 1,
     signature: int = 0xFEEF04BD,
     flat: bool = False,
+    other: tuple[int, bytes] = (3, b"icon"),
 ) -> bytes:
     """A PE file of `machine`. With `version`, one section holds two
-    resources: an icon, first, and a version resource of those numbers
-    and `strings`, under the ID or the name `resource`. `flat` leaves the
-    version resource's name table out, which no resource compiler does."""
+    resources: `other`, a type and its bytes (an icon, unless given), and
+    a version resource of those numbers and `strings`, under the ID or
+    the name `resource`. `flat` leaves the version resource's name table
+    out, which no resource compiler does."""
     head = bytearray(64)
     head[:2] = b"MZ"
     head[0x3C:0x40] = (64).to_bytes(4, "little")
@@ -128,7 +130,7 @@ def pe(
         return bytes(head) + b"PE\0\0" + machine.to_bytes(2, "little") + bytes(18)
 
     block = version_block(version, strings or {"Comments": ""}, signature)
-    icon = b"icon"
+    other_type, icon = other
     # The type table, then for each type a name table and a language
     # table of one entry each, the two data entries, the resources, and
     # the version resource's name when it has one.
@@ -143,8 +145,17 @@ def pe(
     name_at = block_at + len(block)
     rsrc = (
         struct.pack("<12xHH", 0, 2)
-        + struct.pack("<II", 3, icon_name | directory)
-        + struct.pack("<II", 16, entry if flat else name | directory)
+        # In the order of the types' numbers, as a resource compiler
+        # writes them.
+        + b"".join(
+            sorted(
+                [
+                    struct.pack("<II", other_type, icon_name | directory),
+                    struct.pack("<II", 16, entry if flat else name | directory),
+                ],
+                key=lambda e: e[:4][::-1],
+            )
+        )
         + one_id
         + struct.pack("<II", 1, icon_lang | directory)
         + one_id
@@ -171,9 +182,34 @@ def pe(
     return bytes(head) + b"PE\0\0" + coff + bytes(optional) + section + rsrc
 
 
+def manifest(**changes: str | None) -> bytes:
+    """A program's manifest with the settings ghostty.exe's has;
+    `changes` sets, adds or, with None, drops single ones."""
+    settings = {**mz.MANIFEST, **changes}
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+        '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0"'
+        ' xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">\r\n'
+        "  <asmv3:application>\r\n    <asmv3:windowsSettings>\r\n"
+        + "".join(
+            f'      <{k} xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">'
+            f"{v}</{k}>\r\n"
+            for k, v in settings.items()
+            if v is not None
+        )
+        + "    </asmv3:windowsSettings>\r\n  </asmv3:application>\r\n"
+        '  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">\r\n'
+        '    <application><supportedOS Id="{8e0f7a12}"/></application>\r\n'
+        "  </compatibility>\r\n</assembly>\r\n"
+    ).encode()
+
+
 def own(name: str, **changes: Any) -> bytes:
-    """One of Ghostty's own programs as a build of VERSION installs it.
-    `strings` changes or, with None, drops single ones."""
+    """One of Ghostty's own programs as a build of VERSION installs it:
+    ghostty.exe with its manifest, ghostty.com with its icon. `strings`
+    changes or, with None, drops single ones."""
+    if name == "ghostty.exe":
+        changes.setdefault("other", (24, manifest()))
     strings = {
         "FileVersion": VERSION,
         "OriginalFilename": name,
@@ -969,6 +1005,25 @@ class TestTree(unittest.TestCase):
         def other_name(t: Path) -> None:
             write(t / "bin/ghostty.com", own("ghostty.exe"))
 
+        def no_manifest(t: Path) -> None:
+            write(t / "bin/ghostty.exe", own("ghostty.exe", other=(3, b"icon")))
+
+        def bad_manifest(t: Path) -> None:
+            write(t / "bin/ghostty.exe", own("ghostty.exe", other=(24, b"<assembly")))
+
+        def old_manifest(t: Path) -> None:
+            # What a build that kept an earlier manifest holds.
+            xml = manifest(longPathAware=None, activeCodePage=None)
+            write(t / "bin/ghostty.exe", own("ghostty.exe", other=(24, xml)))
+
+        def other_setting(t: Path) -> None:
+            xml = manifest(activeCodePage="Legacy")
+            write(t / "bin/ghostty.exe", own("ghostty.exe", other=(24, xml)))
+
+        def more_settings(t: Path) -> None:
+            xml = manifest(heapType="SegmentHeap")
+            write(t / "bin/ghostty.exe", own("ghostty.exe", other=(24, xml)))
+
         def empty(t: Path) -> None:
             (t / "share/ghostty/themes/Dark").unlink()
 
@@ -1012,6 +1067,12 @@ class TestTree(unittest.TestCase):
                 other_name,
                 "bin/ghostty.com's OriginalFilename is 'ghostty.exe', not 'ghostty.com'",
             ),
+            (no_manifest, "bin/ghostty.exe has no manifest"),
+            (bad_manifest, "bin/ghostty.exe has no manifest"),
+            (old_manifest, "manifest has activeCodePage None, not 'UTF-8'"),
+            (old_manifest, "manifest has longPathAware None, not 'true'"),
+            (other_setting, "manifest has activeCodePage 'Legacy', not 'UTF-8'"),
+            (more_settings, "manifest has heapType 'SegmentHeap', not None"),
             (empty, "share/ghostty/themes is missing or empty"),
             (terminfo, "share/terminfo/ghostty.terminfo is missing"),
             (man, "share/man/man1 is not expected"),
@@ -1062,6 +1123,28 @@ class TestTree(unittest.TestCase):
                 with self.subTest(what=what):
                     f.write_bytes(content)
                     self.assertIsNone(mz.pe_version(f))
+
+    def test_pe_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp, "f")
+            f.write_bytes(own("ghostty.exe"))
+            self.assertEqual(mz.pe_manifest(f), mz.MANIFEST)
+            # The version resource is still read beside it.
+            self.assertIsNotNone(mz.pe_version(f))
+            bom = (24, b"\xef\xbb\xbf" + manifest(dpiAware=None))
+            f.write_bytes(own("ghostty.exe", other=bom))
+            self.assertNotIn("dpiAware", mz.pe_manifest(f) or {"dpiAware": ""})
+            f.write_bytes(own("ghostty.exe", other=(24, b"<assembly/>")))
+            self.assertEqual(mz.pe_manifest(f), {})
+            for what, content in [
+                ("an icon only", own("ghostty.com")),
+                ("not XML", own("ghostty.exe", other=(24, b"\0\1"))),
+                ("no resources", pe(0x8664)),
+                ("cut short", own("ghostty.exe")[:-600]),
+            ]:
+                with self.subTest(what=what):
+                    f.write_bytes(content)
+                    self.assertIsNone(mz.pe_manifest(f))
 
     def test_arch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
