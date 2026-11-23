@@ -4,18 +4,23 @@
     <asmv3:windowsSettings>
       <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
       <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
-      <!-- longPathAware: on a machine whose LongPathsEnabled policy is on,
-           the Windows calls that stop at 260 characters take longer
-           paths: opening a file does, and setting the current directory.
-           Starting a program in such a directory still fails, with or
-           without this. activeCodePage: the process's code page is UTF-8, so a
-           library that opens files by their narrow names (FreeType opens
-           fonts so) reads the UTF-8 paths it is given. Neither reaches the
-           programs Ghostty starts: a shell keeps its console's code page.
-           The segment heap (heapType) was measured and changed neither
-           speed nor memory, so it is not asked for. -->
+      <!-- On a machine whose LongPathsEnabled policy is on, the Windows
+           calls that stop at 260 characters take longer paths: opening a
+           file does, and setting the current directory. Starting a program
+           in such a directory still fails, with or without this. On other
+           machines it changes nothing.
+           https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests#longpathaware
+           https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation -->
       <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!-- The process's code page is UTF-8, from Windows 10 1903 on (before
+           that the process keeps the system's). A library that opens files
+           by their narrow names (FreeType opens fonts so) then reads the
+           UTF-8 paths it is given. The programs Ghostty starts are not
+           affected: a shell keeps its console's code page.
+           https://learn.microsoft.com/en-us/windows/apps/design/globalizing/use-utf8-code-page -->
       <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <!-- No heapType: with the segment heap, start-up, throughput and
+           memory measured the same as without it. -->
     </asmv3:windowsSettings>
   </asmv3:application>
   <!-- The Windows versions Ghostty is written for: Windows 10 and 11. The exe
