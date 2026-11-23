@@ -65,8 +65,20 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             // What dist/windows/version.rc is compiled with, for both
             // programs. The version resource holds four 16-bit numbers,
             // so only major, minor and patch go there; the strings carry
-            // the whole version. The quotes reach the resource compiler
-            // as written: no shell reads these.
+            // the whole version. The resource compiler keeps the low 16
+            // bits of a larger number and says nothing, so that fails
+            // here. The quotes reach it as written: no shell reads these.
+            for ([_]usize{
+                cfg.version.major,
+                cfg.version.minor,
+                cfg.version.patch,
+            }) |part| if (part > std.math.maxInt(u16)) {
+                std.log.err(
+                    "a Windows version resource holds no number above 65535: {f}",
+                    .{cfg.version},
+                );
+                return error.UnsupportedVersion;
+            };
             var rc_flags: std.ArrayList([]const u8) = .empty;
             try rc_flags.appendSlice(b.allocator, &.{
                 b.fmt("/dGHOSTTY_VERSION_MAJOR={d}", .{cfg.version.major}),
@@ -74,9 +86,16 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
                 b.fmt("/dGHOSTTY_VERSION_PATCH={d}", .{cfg.version.patch}),
                 b.fmt("/dGHOSTTY_VERSION_STRING=\"{f}\"", .{cfg.version}),
             });
-            if (cfg.version.pre != null) try rc_flags.append(
+            // By the channel, not the version: a stable respin
+            // (1.4.1-win.3) has a pre-release part too.
+            if (cfg.releaseChannel() != .stable) try rc_flags.append(
                 b.allocator,
                 "/dGHOSTTY_PRERELEASE",
+            );
+            // Zig's resource compiler defines no _DEBUG.
+            if (cfg.optimize == .debug) try rc_flags.append(
+                b.allocator,
+                "/dGHOSTTY_DEBUG",
             );
 
             exe.subsystem = .windows;

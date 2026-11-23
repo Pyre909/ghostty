@@ -4,14 +4,15 @@
 // The build (src/build/GhosttyExe.zig) defines the rest:
 //   GHOSTTY_VERSION_MAJOR, _MINOR, _PATCH   numbers
 //   GHOSTTY_VERSION_STRING                  the quoted semantic version
-//   GHOSTTY_PRERELEASE                      only for a pre-release
+//   GHOSTTY_PRERELEASE                      only for a build off the stable channel
+//   GHOSTTY_DEBUG                           only for a debug build
 //
 // The resource is ID 1 (VS_VERSION_INFO in winver.h): Windows reads no
 // other, and a name the preprocessor does not know becomes a string
 // name. The other constants are winver.h's too, written as numbers so
 // that no Windows SDK header is needed.
 
-#ifdef _DEBUG
+#ifdef GHOSTTY_DEBUG
 #define GHOSTTY_FF_DEBUG 0x1L
 #else
 #define GHOSTTY_FF_DEBUG 0x0L
@@ -41,6 +42,7 @@ BEGIN
         VALUE "CompanyName",      "Pyre909"
         VALUE "FileDescription",  "Ghostty"
         VALUE "FileVersion",      GHOSTTY_VERSION_STRING
+        VALUE "InternalName",     "ghostty"
         VALUE "LegalCopyright",   "Copyright (c) 2024 Mitchell Hashimoto, Ghostty contributors"
         VALUE "OriginalFilename", GHOSTTY_ORIGINAL_FILENAME
         VALUE "ProductName",      "Ghostty"

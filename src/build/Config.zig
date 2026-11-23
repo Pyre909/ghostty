@@ -941,12 +941,18 @@ pub fn addOptions(self: *const Config, step: *std.Build.Step.Options) !void {
     step.addOption(
         ReleaseChannel,
         "release_channel",
-        self.release_channel orelse channel: {
-            const pre = self.version.pre orelse break :channel .stable;
-            if (pre.len == 0) break :channel .stable;
-            break :channel .tip;
-        },
+        self.releaseChannel(),
     );
+}
+
+/// The channel this build belongs to: the one it was told
+/// (`-Drelease-channel`), or else tip for a pre-release version.
+pub fn releaseChannel(self: *const Config) ReleaseChannel {
+    return self.release_channel orelse channel: {
+        const pre = self.version.pre orelse break :channel .stable;
+        if (pre.len == 0) break :channel .stable;
+        break :channel .tip;
+    };
 }
 
 /// Returns the build options for the terminal module. This assumes a
