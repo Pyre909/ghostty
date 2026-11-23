@@ -2150,6 +2150,33 @@ test "d3d11: a busy terminal's frames all wait for the display" {
     try testing.expectEqual(1000, unpaced(60, 600 * ms));
 }
 
+test "d3d11: present paces a chain that waits for the display, and no other" {
+    const testing = std.testing;
+
+    for ([_]Chain{ .hwnd, .composition }) |chain| {
+        for ([_]bool{ true, false }) |vsync| {
+            const hwnd = try testWindow();
+            defer _ = win32.DestroyWindow(hwnd);
+            var r = try initWindow(hwnd, try loadCompiler(), vsync, .native, chain);
+            defer r.deinit();
+            try testing.expectEqual(chain, r.chain);
+            try expectPresents(&r, if (chain == .composition) .PREMULTIPLIED else .IGNORE);
+
+            if (vsync) {
+                // The frame took one of the burst, and the time Present
+                // returned is what the next pause is counted from.
+                try testing.expectEqual(PresentPacing.burst - 1, r.pacing.ready);
+                try testing.expect(r.pacing.presented_at != null);
+            } else {
+                // `window-vsync = false`: no frame waits, so there is
+                // nothing to pace.
+                try testing.expectEqual(PresentPacing.burst, r.pacing.ready);
+                try testing.expect(r.pacing.presented_at == null);
+            }
+        }
+    }
+}
+
 test "d3d11: only the Basic Render Driver is a software adapter" {
     const testing = std.testing;
     var desc = std.mem.zeroes(api.DXGI_ADAPTER_DESC);
