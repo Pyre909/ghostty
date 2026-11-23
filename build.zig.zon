@@ -27,8 +27,8 @@
             // mitchellh/libxev 819ffa18 plus the AsyncIOCP copy fix and an
             // exact IOCP loop clock (Pyre909/libxev fix/iocp-exact-clock),
             // until they land upstream.
-            .url = "https://github.com/Pyre909/libxev/archive/3628a181329b9655d5977ea80a22522ba74960b0.tar.gz",
-            .hash = "libxev-0.0.0-86vtc2ofFABajqaIHkgCeaOwhQuakEIDM1ajbBhOyMLU",
+            .url = "https://github.com/Pyre909/libxev/archive/685ac7e1a4860594e0cb358bbd3d1f8d4aa44be2.tar.gz",
+            .hash = "libxev-0.0.0-86vtc2sfFABv926D9QzPWmlwpcLoSDVExeCgTjhzj60o",
             .lazy = true,
         },
         .vaxis = .{

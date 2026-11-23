@@ -103,9 +103,9 @@
   },
   {
     "type": "archive",
-    "url": "https://github.com/Pyre909/libxev/archive/3628a181329b9655d5977ea80a22522ba74960b0.tar.gz",
-    "dest": "vendor/p/libxev-0.0.0-86vtc2ofFABajqaIHkgCeaOwhQuakEIDM1ajbBhOyMLU",
-    "sha256": "a348d70aeee60e52beb7004658d7542be3e0833396afbc90c54fc3a2cc19a183"
+    "url": "https://github.com/Pyre909/libxev/archive/685ac7e1a4860594e0cb358bbd3d1f8d4aa44be2.tar.gz",
+    "dest": "vendor/p/libxev-0.0.0-86vtc2sfFABv926D9QzPWmlwpcLoSDVExeCgTjhzj60o",
+    "sha256": "94c37b0a9fff8c75699c8c38c4186a63bdfacc5615b6f77b11780282227772bf"
   },
   {
     "type": "archive",
