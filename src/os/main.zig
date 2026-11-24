@@ -63,13 +63,21 @@ pub const getConfigEditCommand = edit.getConfigEditCommand;
 /// How the threads we start are configured.
 ///
 /// On Windows, Zig hands `stack_size` to NtCreateThreadEx as the stack's
-/// initial commit and leaves the reserve to the executable's header, so
-/// the default of 16 MiB charges every thread 16 MiB of commit that it
-/// never touches (five threads a terminal). This asks for the smallest
-/// commit Zig passes on; the stack still grows to the header's reserve
-/// on demand. Elsewhere the size is a reservation that costs nothing
-/// until used, so the default stays.
-pub const thread_config: std.Thread.SpawnConfig = if (builtin.target.os.tag == .windows)
+/// initial commit and leaves the reserve to the header of the process's
+/// executable, so the default of 16 MiB charges every thread 16 MiB of
+/// commit that it never touches. In our own executable this asks for the
+/// smallest commit Zig passes on: its header reserves 16 MiB, and the
+/// stack still grows to that on demand.
+///
+/// A library build keeps the default. There the reserve is the host
+/// executable's, often 1 MiB, and Windows raises a thread's reserve to
+/// its commit when the commit is the larger: the 16 MiB commit is what
+/// gives our threads the stack they need in a host we did not link.
+///
+/// Elsewhere the size is a reservation that costs nothing until used,
+/// so the default stays.
+pub const thread_config: std.Thread.SpawnConfig = if (builtin.target.os.tag == .windows and
+    builtin.output_mode == .Exe)
     .{ .stack_size = 64 * 1024 }
 else
     .{};
@@ -103,9 +111,10 @@ test "win32: thread_config commits little stack" {
     thread.join();
 
     // The commit includes the guard pages; the default commits all 16 MiB.
+    // The reserve is the test executable's, which Zig links like ours.
     try std.testing.expect(commit > 0);
     try std.testing.expect(commit <= 256 * 1024);
-    try std.testing.expect(reserve >= 4 * commit);
+    try std.testing.expect(reserve >= 16 * 1024 * 1024);
 }
 
 test {
