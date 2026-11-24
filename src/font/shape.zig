@@ -98,6 +98,7 @@ pub const RunOptions = struct {
 test {
     _ = Cache;
     _ = Shaper;
+    _ = run;
 
     // Always test noop
     _ = noop;
