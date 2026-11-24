@@ -35,7 +35,16 @@ const native_freestanding = builtin.target.os.tag == .freestanding and
 /// The number of pages we preheat the page pool with. For operating systems
 /// that support it, pages are demand-paged (see PagePool) so this only
 /// costs us address space. For other operating systems, we don't preheat.
-const page_preheat = 4;
+///
+/// Windows is one of the others: the page allocator commits a page when
+/// it allocates it, so a preheated page is charged to the process whether
+/// or not it is ever touched. Only the page every screen starts with is
+/// made ahead there.
+const page_preheat = if (builtin.target.os.tag == .windows) 1 else 4;
+
+/// The number of zeroed pages a pool keeps for reuse when pages are
+/// destroyed; the rest go back to the OS.
+const page_free_max = 4;
 
 /// The number of nodes we preheat the node pool with. Unlike pages, nodes
 /// are ordinary heap memory so every idle preheated node costs real
@@ -5877,7 +5886,7 @@ fn destroyNodeExt(
             reuse: {
                 // The wasm pool has no way to give an item back.
                 if (comptime !wasm_page_pool) {
-                    if (pool.pages.freeCount() >= page_preheat) {
+                    if (pool.pages.freeCount() >= page_free_max) {
                         pool.pages.release(item);
                         break :reuse;
                     }
@@ -9817,11 +9826,14 @@ test "PageList memory usage" {
     );
     try testing.expect(before.resident_bytes <= before.virtual_bytes);
 
-    // Compression changes residency but not address space.
+    // Compression changes residency but not address space, except that
+    // its scratch buffer is a pool item: a pool with no free item makes
+    // one and keeps it.
+    const scratch_bytes: usize = if (s.pool.pages.freeCount() == 0) PagePool.item_size else 0;
     _ = s.compress(.full);
     const compressed = s.memoryUsage();
     try testing.expectEqual(before.pages, compressed.pages);
-    try testing.expectEqual(before.virtual_bytes, compressed.virtual_bytes);
+    try testing.expectEqual(before.virtual_bytes + scratch_bytes, compressed.virtual_bytes);
     try testing.expect(compressed.resident_bytes < before.resident_bytes);
     try testing.expectEqual(@as(usize, 2), compressed.compressed_pages);
     try testing.expect(compressed.compressed_bytes > 0);
@@ -9838,14 +9850,14 @@ test "PageList memory usage" {
     const restored = s.memoryUsage();
     try testing.expectEqual(@as(usize, 1), restored.compressed_pages);
     try testing.expect(restored.resident_bytes > compressed.resident_bytes);
-    try testing.expectEqual(before.virtual_bytes, restored.virtual_bytes);
+    try testing.expectEqual(before.virtual_bytes + scratch_bytes, restored.virtual_bytes);
 
     // Destroyed pages go back to the pool: the address space is kept but
     // the memory is no longer resident.
     s.eraseRows(.{ .history = .{} }, null);
     const erased = s.memoryUsage();
     try testing.expect(erased.pages < restored.pages);
-    try testing.expectEqual(before.virtual_bytes, erased.virtual_bytes);
+    try testing.expectEqual(before.virtual_bytes + scratch_bytes, erased.virtual_bytes);
     try testing.expect(erased.resident_bytes < restored.resident_bytes);
 }
 
@@ -20501,7 +20513,7 @@ test "PageList reset invalidates stale untracked refs even if node memory is reu
     var s = try init(alloc, .{ .cols = 80, .rows = 24 });
     defer s.deinit();
 
-    var stale_nodes: [page_preheat * 4]*List.Node = undefined;
+    var stale_nodes: [page_free_max * 4]*List.Node = undefined;
     var stale_serials: [stale_nodes.len]u64 = undefined;
     var stale_len: usize = 0;
     var reused: ?struct { *List.Node, u64 } = null;
@@ -20789,9 +20801,8 @@ test "PageList grow reuses non-standard page without leak" {
     // Verify last page is full (so grow will need to allocate/reuse)
     try testing.expect(s.pages.last.?.page().size.rows == s.pages.last.?.capacity().rows);
 
-    // Remember the first page memory pointer before the reuse attempt
+    // Remember the first page before the reuse attempt
     const first_page_ptr = s.pages.first.?;
-    const first_page_mem_ptr = s.pages.first.?.page().memory.ptr;
 
     // Create a tracked pin pointing to the non-standard first page
     const tracked_pin = try s.trackPin(.{ .node = first_page_ptr, .x = 0, .y = 0 });
@@ -20809,8 +20820,10 @@ test "PageList grow reuses non-standard page without leak" {
     try testing.expect(s.pages.first.? != first_page_ptr);
 
     // If the non-standard page was properly destroyed and not reused,
-    // the last page should not have the same memory pointer
-    try testing.expect(s.pages.last.?.page().memory.ptr != first_page_mem_ptr);
+    // the last page is a standard one. Its address says nothing: with no
+    // free pool item the new page is a fresh allocation, which the
+    // allocator may place where the destroyed page was.
+    try testing.expectEqual(std_size, s.pages.last.?.page().memory.len);
 
     // The tracked pin should have been moved to the new first page and marked as garbage
     try testing.expectEqual(s.pages.first.?, tracked_pin.node);
@@ -21019,9 +21032,9 @@ test "PageList grow carry-over respects byte limit" {
 
     // The first page was destroyed instead of reused, and three more
     // were pruned after it, so four pool items went back to the pool,
-    // which keeps at most `page_preheat` of them.
+    // which keeps at most `page_free_max` of them.
     try testing.expectEqual(5, s.totalPages());
-    try testing.expectEqual(@min(free + 4, page_preheat), s.pool.pages.freeCount());
+    try testing.expectEqual(@min(free + 4, page_free_max), s.pool.pages.freeCount());
 }
 
 test "PageList grow trims rows only while 90% of rows per byte remain" {
@@ -22467,6 +22480,19 @@ test "PageList resize trimmed rows have default state" {
         try testing.expectEqual(.none, rac.row.semantic_prompt);
         try testing.expect(rac.cell.isZero());
     }
+}
+
+test "win32: PageList preheats only the page a screen starts with" {
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    var s = try init(testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // Every pool item is committed memory on Windows, so none sits idle.
+    try testing.expectEqual(1, s.totalPages());
+    try testing.expectEqual(0, s.pool.pages.freeCount());
+    try testing.expectEqual(PagePool.item_size, s.memoryUsage().virtual_bytes);
 }
 
 test "PageList memory pool never touches idle page memory" {
