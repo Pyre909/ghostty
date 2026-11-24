@@ -36,10 +36,9 @@ const native_freestanding = builtin.target.os.tag == .freestanding and
 /// that support it, pages are demand-paged (see PagePool) so this only
 /// costs us address space. For other operating systems, we don't preheat.
 ///
-/// Windows is one of the others: the page allocator commits a page when
-/// it allocates it, so a preheated page is charged to the process whether
-/// or not it is ever touched. Only the page every screen starts with is
-/// made ahead there.
+/// Windows is an exception: its page allocator reserves and commits in
+/// one call, so every preheated page is charged to the process even if
+/// it is never touched. Preheat only the page each screen starts with.
 const page_preheat = if (builtin.target.os.tag == .windows) 1 else 4;
 
 /// The number of zeroed pages a pool keeps for reuse when pages are
@@ -9418,9 +9417,12 @@ test "PageList incremental compression advances after allocation failure" {
     const first = s.pages.first.?;
     const second = first.next.?;
 
-    // Pool preheating supplies compression scratch. Failing the allocator's
+    // Compression scratch comes from a free pool item, or from page memory
+    // whose free-list slot is already reserved. Failing the allocator's
     // next request therefore rejects the exact encoded allocation while the
     // source page and pass remain valid.
+    try testing.expect(s.pool.pages.freeCount() > 0 or
+        s.pool.pages.free.capacity > s.pool.pages.live);
     failing.fail_index = failing.alloc_index;
     const failed = s.compress(.incremental);
     try testing.expect(failing.has_induced_failure);
@@ -20801,12 +20803,14 @@ test "PageList grow reuses non-standard page without leak" {
     // Verify last page is full (so grow will need to allocate/reuse)
     try testing.expect(s.pages.last.?.page().size.rows == s.pages.last.?.capacity().rows);
 
-    // Remember the first page before the reuse attempt
+    // Remember the first page and its memory before the reuse attempt
     const first_page_ptr = s.pages.first.?;
+    const first_page_mem_ptr = s.pages.first.?.page().memory.ptr;
 
     // Create a tracked pin pointing to the non-standard first page
     const tracked_pin = try s.trackPin(.{ .node = first_page_ptr, .x = 0, .y = 0 });
     defer s.untrackPin(tracked_pin);
+    const had_free_item = s.pool.pages.freeCount() > 0;
 
     // Now grow one more time to trigger the reuse path. Since the first page
     // is non-standard, it should be destroyed (not reused). The testing
@@ -20820,10 +20824,17 @@ test "PageList grow reuses non-standard page without leak" {
     try testing.expect(s.pages.first.? != first_page_ptr);
 
     // If the non-standard page was properly destroyed and not reused,
-    // the last page is a standard one. Its address says nothing: with no
-    // free pool item the new page is a fresh allocation, which the
-    // allocator may place where the destroyed page was.
-    try testing.expectEqual(std_size, s.pages.last.?.page().memory.len);
+    // the last page's memory belongs to the pool; a reused node would
+    // still own its memory on the heap.
+    try testing.expectEqual(.pool, s.pages.last.?.owned);
+
+    // It also should not have the same memory pointer. That says something
+    // only when the pool had a free item: without one the new page is a
+    // fresh allocation, which the allocator may place where the destroyed
+    // page was.
+    if (had_free_item) {
+        try testing.expect(s.pages.last.?.page().memory.ptr != first_page_mem_ptr);
+    }
 
     // The tracked pin should have been moved to the new first page and marked as garbage
     try testing.expectEqual(s.pages.first.?, tracked_pin.node);
