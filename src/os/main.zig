@@ -78,30 +78,21 @@ test "win32: thread_config commits little stack" {
     if (builtin.target.os.tag != .windows) return error.SkipZigTest;
 
     const S = struct {
-        const MBI = extern struct {
-            base: usize,
-            alloc_base: usize,
-            alloc_protect: u32,
-            partition: u16,
-            size: usize,
-            state: u32,
-            protect: u32,
-            type: u32,
-        };
-        extern "kernel32" fn VirtualQuery(addr: ?*const anyopaque, info: *MBI, len: usize) callconv(.winapi) usize;
+        const MBI = windows.MEMORY_BASIC_INFORMATION;
+        const VirtualQuery = windows.exp.kernel32.VirtualQuery;
 
         /// The reserve and the commit of the calling thread's stack.
         fn measure(reserve: *usize, commit: *usize) void {
             var local: u8 = 0;
             var info: MBI = undefined;
             if (VirtualQuery(&local, &info, @sizeOf(MBI)) == 0) return;
-            const stack = info.alloc_base;
+            const stack = info.AllocationBase;
             var addr = stack;
             while (VirtualQuery(@ptrFromInt(addr), &info, @sizeOf(MBI)) != 0 and
-                info.alloc_base == stack) : (addr += info.size)
+                info.AllocationBase == stack) : (addr += info.RegionSize)
             {
-                reserve.* += info.size;
-                if (info.state == 0x1000) commit.* += info.size; // MEM_COMMIT
+                reserve.* += info.RegionSize;
+                if (info.State == windows.MEM_COMMIT) commit.* += info.RegionSize;
             }
         }
     };

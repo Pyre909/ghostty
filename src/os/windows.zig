@@ -142,6 +142,22 @@ pub const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100;
 /// its dependencies, never the standard search path.
 pub const LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
 pub const MEM_COMMIT = 0x1000;
+
+/// https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-memory_basic_information
+///
+/// The two addresses are integers because callers walk a range with
+/// them. This is the layout of 64-bit Windows, the only kind we build for.
+pub const MEMORY_BASIC_INFORMATION = extern struct {
+    BaseAddress: usize,
+    AllocationBase: usize,
+    AllocationProtect: DWORD,
+    PartitionId: u16,
+    RegionSize: SIZE_T,
+    State: DWORD,
+    Protect: DWORD,
+    Type: DWORD,
+};
+
 pub const MEM_RELEASE = 0x8000;
 pub const MEM_RESERVE = 0x2000;
 pub const OPEN_EXISTING = 3; // Known as FILE_OPEN in Windows docs
@@ -363,6 +379,12 @@ pub const exp = struct {
             dwSize: SIZE_T,
             dwFreeType: DWORD,
         ) callconv(.winapi) BOOL;
+        /// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualquery
+        pub extern "kernel32" fn VirtualQuery(
+            lpAddress: ?LPCVOID,
+            lpBuffer: *MEMORY_BASIC_INFORMATION,
+            dwLength: SIZE_T,
+        ) callconv(.winapi) SIZE_T;
         /// https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-discardvirtualmemory
         pub extern "kernel32" fn DiscardVirtualMemory(
             VirtualAddress: PVOID,
