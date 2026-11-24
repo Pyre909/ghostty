@@ -2,6 +2,7 @@
 //! system. These aren't restricted to syscalls or low-level operations, butos/main.zig
 //! also OS-specific features and conventions.
 
+const std = @import("std");
 const builtin = @import("builtin");
 
 const dbus = @import("dbus.zig");
@@ -58,6 +59,63 @@ pub const ResourcesDir = resourcesdir.ResourcesDir;
 pub const ShellEscapeWriter = shell.ShellEscapeWriter;
 pub const getKernelInfo = kernel_info.getKernelInfo;
 pub const getConfigEditCommand = edit.getConfigEditCommand;
+
+/// How the threads we start are configured.
+///
+/// On Windows, Zig hands `stack_size` to NtCreateThreadEx as the stack's
+/// initial commit and leaves the reserve to the executable's header, so
+/// the default of 16 MiB charges every thread 16 MiB of commit that it
+/// never touches (five threads a terminal). This asks for the smallest
+/// commit Zig passes on; the stack still grows to the header's reserve
+/// on demand. Elsewhere the size is a reservation that costs nothing
+/// until used, so the default stays.
+pub const thread_config: std.Thread.SpawnConfig = if (builtin.target.os.tag == .windows)
+    .{ .stack_size = 64 * 1024 }
+else
+    .{};
+
+test "win32: thread_config commits little stack" {
+    if (builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const S = struct {
+        const MBI = extern struct {
+            base: usize,
+            alloc_base: usize,
+            alloc_protect: u32,
+            partition: u16,
+            size: usize,
+            state: u32,
+            protect: u32,
+            type: u32,
+        };
+        extern "kernel32" fn VirtualQuery(addr: ?*const anyopaque, info: *MBI, len: usize) callconv(.winapi) usize;
+
+        /// The reserve and the commit of the calling thread's stack.
+        fn measure(reserve: *usize, commit: *usize) void {
+            var local: u8 = 0;
+            var info: MBI = undefined;
+            if (VirtualQuery(&local, &info, @sizeOf(MBI)) == 0) return;
+            const stack = info.alloc_base;
+            var addr = stack;
+            while (VirtualQuery(@ptrFromInt(addr), &info, @sizeOf(MBI)) != 0 and
+                info.alloc_base == stack) : (addr += info.size)
+            {
+                reserve.* += info.size;
+                if (info.state == 0x1000) commit.* += info.size; // MEM_COMMIT
+            }
+        }
+    };
+
+    var reserve: usize = 0;
+    var commit: usize = 0;
+    const thread = try std.Thread.spawn(thread_config, S.measure, .{ &reserve, &commit });
+    thread.join();
+
+    // The commit includes the guard pages; the default commits all 16 MiB.
+    try std.testing.expect(commit > 0);
+    try std.testing.expect(commit <= 256 * 1024);
+    try std.testing.expect(reserve >= 4 * commit);
+}
 
 test {
     _ = @import("com_abi.zig");

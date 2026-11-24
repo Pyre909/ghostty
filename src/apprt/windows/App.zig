@@ -5828,7 +5828,7 @@ pub fn openLink(kind: apprt.action.OpenUrl.Kind, url: []const u8) bool {
         log.warn("cannot convert the {t} link to open url={f} err={}", .{ kind, std.zig.fmtString(url), err });
         return false;
     };
-    const thread = std.Thread.spawn(.{}, openUrlThread, .{ wide, kind == .text }) catch |err| {
+    const thread = std.Thread.spawn(internal_os.thread_config, openUrlThread, .{ wide, kind == .text }) catch |err| {
         open_url_alloc.free(wide);
         log.warn("cannot start the opener thread for a {t} link url={f} err={}", .{ kind, std.zig.fmtString(url), err });
         return false;

@@ -20,6 +20,7 @@ const windows = std.os.windows;
 const Allocator = std.mem.Allocator;
 
 const build_config = @import("../../build_config.zig");
+const internal_os = @import("../../os/main.zig");
 const win32 = @import("win32.zig");
 const wideFromUtf8 = @import("clipboard.zig").wideFromUtf8;
 
@@ -730,7 +731,7 @@ pub const Toasts = struct {
         const self: *Toasts = @ptrCast(@alignCast(ptr));
         // The thread reads `app_id`, which lives until `deinit`, and
         // `groups`, which the caller keeps until the join.
-        const thread = std.Thread.spawn(.{}, removeGroupsWith, .{ self.app_id.handle, groups }) catch |err| {
+        const thread = std.Thread.spawn(internal_os.thread_config, removeGroupsWith, .{ self.app_id.handle, groups }) catch |err| {
             log.warn("toast: no thread to remove toasts from err={}", .{err});
             return .{};
         };

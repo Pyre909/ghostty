@@ -82,7 +82,7 @@ pub fn open(
         // Non-snap releases don't need to alter the env.
         try std.process.spawn(global.io(), spawn_opts);
 
-    const thread = try std.Thread.spawn(.{}, openThread, .{ global.io(), exe });
+    const thread = try std.Thread.spawn(@import("main.zig").thread_config, openThread, .{ global.io(), exe });
     thread.detach();
 }
 

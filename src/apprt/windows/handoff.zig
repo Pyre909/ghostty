@@ -225,7 +225,7 @@ pub const Server = struct {
             .watch = owned,
             .context = context,
         };
-        const thread = std.Thread.spawn(.{}, serve, .{&registration}) catch |err| {
+        const thread = std.Thread.spawn(internal_os.thread_config, serve, .{&registration}) catch |err| {
             if (owned) |o| o.deinit(alloc);
             return err;
         };

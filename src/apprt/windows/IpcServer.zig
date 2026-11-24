@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const global = @import("../../global.zig");
+const internal_os = @import("../../os/main.zig");
 const ipc = @import("ipc.zig");
 const win32 = @import("win32.zig");
 
@@ -384,7 +385,7 @@ pub fn start(
         .thread = undefined,
     };
     if (builtin.is_test and test_spawn_fails) return error.SystemResources;
-    self.thread = std.Thread.spawn(.{}, serve, .{self}) catch |err| {
+    self.thread = std.Thread.spawn(internal_os.thread_config, serve, .{self}) catch |err| {
         log.warn("cannot start the IPC thread err={}", .{err});
         return error.SystemResources;
     };

@@ -489,7 +489,7 @@ fn spawn(self: *Updater, manual: bool, install: ?Install) !void {
         .install = owned,
     };
     moved = true;
-    job.thread = std.Thread.spawn(.{}, Job.run, .{job}) catch |err| {
+    job.thread = std.Thread.spawn(internal_os.thread_config, Job.run, .{job}) catch |err| {
         release(job);
         return err;
     };

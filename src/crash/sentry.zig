@@ -84,7 +84,7 @@ pub fn init(gpa: Allocator, environ_map: std.process.Environ.Map) !void {
     // so it is safe against concurrent mutations of the process environment
     // (e.g. ensureLocale on the main thread).
     const thr = std.Thread.spawn(
-        .{},
+        internal_os.thread_config,
         initThread,
         .{ gpa, environ_map },
     ) catch |err| {
