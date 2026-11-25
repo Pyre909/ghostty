@@ -74,6 +74,15 @@ pub const progress_timer_id: win32.UINT_PTR = 1;
 /// beside `progress_timer_id` and the others its WM_TIMER tells apart.
 pub const touch_hold_timer_id: win32.UINT_PTR = 5;
 
+/// The WM_TIMER that shows the progress reports held back since the
+/// last one shown (`reportProgress`), beside the others.
+pub const progress_show_timer_id: win32.UINT_PTR = 6;
+
+/// The least time between two progress reports shown, in milliseconds:
+/// the time between two of a program's title changes shown
+/// (`Window.title_interval_ms`).
+pub const progress_interval_ms = Window.title_interval_ms;
+
 /// How long a finger stays still before it opens the context menu:
 /// picked by hand, not read from the system's press and hold setting.
 const touch_hold_ms: win32.UINT = 700;
@@ -232,6 +241,9 @@ pub const Surface = struct {
     /// When `progress` lapses with no newer report, in GetTickCount64's
     /// milliseconds (`progressTimer`).
     progress_expires: u64,
+
+    /// What of `progress` is shown, and when (`reportProgress`).
+    progress_shown: ProgressShown,
 
     /// The terminal's toasts (`notify`).
     notifications: DesktopNotifications,
@@ -935,6 +947,7 @@ pub const Surface = struct {
             .mouse = .init(),
             .progress = .{},
             .progress_expires = 0,
+            .progress_shown = .{},
             .notifications = .{},
             .notify_next_command = false,
             .bell_ringing = false,
@@ -2085,34 +2098,122 @@ pub const Surface = struct {
     // Win32 message handling
     // ---------------------------------------------------------------------
 
+    /// What `showProgress` has to know beside `progress`.
+    pub const ProgressShown = struct {
+        /// Whether the report that left `progress` gave a value.
+        valued: bool = false,
+
+        /// When a report was last shown, in `progressNow`'s milliseconds,
+        /// or null for none yet.
+        at: ?u64 = null,
+
+        /// Whether reports wait for `progress_show_timer_id`.
+        pending: bool = false,
+    };
+
+    /// For tests: the time progress reports are paced with
+    /// (`progressNow`), in place of GetTickCount64's. While it is null a
+    /// test's reports are not paced at all, so that the tests of where
+    /// progress shows need no clock.
+    pub var test_progress_now: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
+    /// For tests: the timer a held-back report waits for cannot be set.
+    pub var test_progress_timer_fails: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
+    /// For tests: how often `showProgress` ran.
+    pub var test_progress_shows: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
     /// `.progress_report`: take the program's report, and show it on the
     /// terminal's progress bar (`ProgressBar`), and on the window's taskbar
     /// button if this terminal has the window's focus. As on GTK, a report
     /// with no newer one lapses after 15 seconds, for a program that
     /// stalls or exits without removing it, and with
     /// `progress-style = false` a report removes what was shown instead.
+    ///
+    /// The report shows now if none has shown for `progress_interval_ms`,
+    /// and otherwise when that time is up, as the latest of those that
+    /// followed. A program can report as fast as it can print, and
+    /// showing a report places the terminal's overlays, sets a timer and
+    /// calls the taskbar, a quarter of a millisecond in all: 2 MiB of
+    /// reports took 46 seconds to get through. A single report still
+    /// shows at once.
     pub fn reportProgress(self: *Surface, report: terminal.osc.Command.ProgressReport) void {
         const style = self.app.config.@"progress-style";
         self.progress.update(if (style) report else .{ .state = .remove });
+        self.progress_shown.valued = style and report.progress != null;
 
+        const now = progressNow();
+        if (self.progress.state != .none) {
+            self.progress_expires = (now orelse win32.GetTickCount64()) + progress_timeout_ms;
+        }
+        if (self.progress_shown.pending) return;
+        if (now) |t| {
+            if (self.progress_shown.at) |at| {
+                const since = t -| at;
+                // Without a timer the report shows now, rather than
+                // never.
+                const fails = if (builtin.is_test) test_progress_timer_fails else false;
+                if (since < progress_interval_ms and !fails and win32.SetTimer(
+                    self.hwnd,
+                    progress_show_timer_id,
+                    @intCast(progress_interval_ms - since),
+                    null,
+                ) != 0) {
+                    self.progress_shown.pending = true;
+                    return;
+                }
+            }
+        }
+        self.showProgress(now);
+    }
+
+    /// The time progress reports are paced with, in milliseconds, or null
+    /// for no pacing (`test_progress_now`).
+    fn progressNow() ?u64 {
+        if (builtin.is_test) return test_progress_now;
+        return win32.GetTickCount64();
+    }
+
+    /// `progress_show_timer_id` fired: show the progress as the reports
+    /// since the last one shown left it.
+    fn progressShowTimer(self: *Surface) void {
+        _ = win32.KillTimer(self.hwnd, progress_show_timer_id);
+        if (!self.progress_shown.pending) return;
+        self.progress_shown.pending = false;
+        self.showProgress(progressNow());
+    }
+
+    /// Show `progress` where it shows, and set the timer it lapses at.
+    fn showProgress(self: *Surface, now: ?u64) void {
+        if (builtin.is_test) test_progress_shows += 1;
+        self.progress_shown.at = now;
         if (self.progress.state == .none) {
             _ = win32.KillTimer(self.hwnd, progress_timer_id);
         } else {
-            self.progress_expires = win32.GetTickCount64() + progress_timeout_ms;
-            // Replaces the timer a previous report set.
-            if (win32.SetTimer(self.hwnd, progress_timer_id, progress_timeout_ms, null) == 0) {
+            // Replaces the timer a previous report set. Reports held
+            // back since moved `progress_expires` on, which
+            // `progressTimer` then waits out.
+            const left = self.progress_expires -| (now orelse win32.GetTickCount64());
+            if (win32.SetTimer(self.hwnd, progress_timer_id, @intCast(@max(left, 1)), null) == 0) {
                 log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
             }
         }
-        ProgressBar.set(self, style and report.progress != null);
+        ProgressBar.set(self, self.progress_shown.valued);
         if (self.window.tab().focused == self) self.window.showProgress();
     }
 
     /// The progress timer's WM_TIMER. One already queued can arrive after
-    /// a newer report set the timer again, so only progress that has
-    /// lapsed is removed.
+    /// a newer report set the timer again, and reports held back do not
+    /// set it, so only progress that has lapsed is removed, and the
+    /// timer otherwise waits for the time that is left.
     fn progressTimer(self: *Surface) void {
-        if (win32.GetTickCount64() < self.progress_expires) return;
+        const now = progressNow() orelse win32.GetTickCount64();
+        if (now < self.progress_expires) {
+            if (win32.SetTimer(self.hwnd, progress_timer_id, @intCast(self.progress_expires - now), null) == 0) {
+                log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
+            }
+            return;
+        }
         self.reportProgress(.{ .state = .remove });
     }
 
@@ -2525,6 +2626,10 @@ pub const Surface = struct {
                 },
                 ProgressBar.timer_id => {
                     ProgressBar.timer(self);
+                    return 0;
+                },
+                progress_show_timer_id => {
+                    self.progressShowTimer();
                     return 0;
                 },
                 touch_hold_timer_id => {

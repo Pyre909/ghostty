@@ -6679,6 +6679,7 @@ fn testPane(app: *App, window: *Window) !*Surface {
     surface.mouse = .init();
     surface.progress = .{};
     surface.progress_expires = 0;
+    surface.progress_shown = .{};
     surface.notifications = .{ .id = @intFromPtr(surface) };
     surface.notify_next_command = false;
     surface.bell_ringing = false;
@@ -21678,6 +21679,94 @@ test "win32: progress_report shows the focused terminal's progress on the taskba
     app.config.@"progress-style" = false;
     try report(&app, left, .{ .state = .set, .progress = 50 });
     try std.testing.expectEqual(.none, fake.state);
+}
+
+test "win32: progress reports that follow one shown show together" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    var fake: TestTaskbar = .{};
+    app.taskbar_list = &fake.list;
+    app.taskbar_created = win32.WM_APP + 0x100;
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+    _ = win32.SendMessageW(window.hwnd, app.taskbar_created, 0, 0);
+
+    const S = @import("Surface.zig");
+    const interval = S.progress_interval_ms;
+    const show = S.progress_show_timer_id;
+    const lapse = S.progress_timer_id;
+    defer Surface.test_progress_now = null;
+    const shows = Surface.test_progress_shows;
+
+    // The first shows at once.
+    Surface.test_progress_now = 1000;
+    pane.reportProgress(.{ .state = .set, .progress = 10 });
+    try std.testing.expectEqual(10, fake.value.?);
+    try std.testing.expectEqual(shows + 1, Surface.test_progress_shows);
+
+    // Those that follow inside the interval wait for the timer, which
+    // shows what the last of them left; each is kept as it comes.
+    Surface.test_progress_now = 1010;
+    pane.reportProgress(.{ .state = .set, .progress = 20 });
+    pane.reportProgress(.{ .state = .set, .progress = 30 });
+    try std.testing.expectEqual(30, pane.progress.value.?);
+    try std.testing.expectEqual(10, fake.value.?);
+    try std.testing.expectEqual(shows + 1, Surface.test_progress_shows);
+    Surface.test_progress_now = 1000 + interval;
+    _ = Surface.wndProc(pane.hwnd, win32.WM_TIMER, show, 0);
+    try std.testing.expectEqual(30, fake.value.?);
+    try std.testing.expectEqual(shows + 2, Surface.test_progress_shows);
+    // The timer ran once: it is gone.
+    try std.testing.expect(!win32.KillTimer(pane.hwnd, show).toBool());
+
+    // The 15 seconds count from the last report, not from the last one
+    // shown: the timer set at the showing waits out the rest.
+    Surface.test_progress_now = 1000 + interval + 1;
+    pane.reportProgress(.{ .state = .set, .progress = 40 });
+    try std.testing.expectEqual(1000 + interval + 1 + 15_000, pane.progress_expires);
+    Surface.test_progress_now = 1000 + 2 * interval;
+    _ = Surface.wndProc(pane.hwnd, win32.WM_TIMER, show, 0);
+    try std.testing.expectEqual(40, fake.value.?);
+    Surface.test_progress_now = pane.progress_expires - 1;
+    _ = Surface.wndProc(pane.hwnd, win32.WM_TIMER, lapse, 0);
+    try std.testing.expectEqual(.normal, fake.state);
+    try std.testing.expect(win32.KillTimer(pane.hwnd, lapse).toBool());
+
+    // A removal inside the interval waits as any report does, and
+    // leaves no timer to lapse at.
+    Surface.test_progress_now = 100_000;
+    pane.reportProgress(.{ .state = .set, .progress = 50 });
+    try std.testing.expectEqual(50, fake.value.?);
+    Surface.test_progress_now = 100_001;
+    pane.reportProgress(.{ .state = .remove });
+    try std.testing.expectEqual(.normal, fake.state);
+    _ = Surface.wndProc(pane.hwnd, win32.WM_TIMER, show, 0);
+    try std.testing.expectEqual(.none, fake.state);
+    try std.testing.expect(!win32.KillTimer(pane.hwnd, lapse).toBool());
+
+    // After a quiet interval a report shows at once again.
+    Surface.test_progress_now = 200_000;
+    pane.reportProgress(.{ .state = .set, .progress = 60 });
+    try std.testing.expectEqual(60, fake.value.?);
+
+    // Without a timer to wait for, one inside the interval shows at
+    // once too.
+    Surface.test_progress_timer_fails = true;
+    defer Surface.test_progress_timer_fails = false;
+    Surface.test_progress_now = 200_001;
+    pane.reportProgress(.{ .state = .set, .progress = 70 });
+    try std.testing.expectEqual(70, fake.value.?);
+    try std.testing.expect(!win32.KillTimer(pane.hwnd, show).toBool());
 }
 
 /// For tests: `surface`'s progress bar shows in `window` along the top of
