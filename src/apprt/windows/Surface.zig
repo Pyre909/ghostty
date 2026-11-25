@@ -2243,7 +2243,7 @@ pub const Surface = struct {
         };
         if (self.title) |old| alloc.free(old);
         self.title = copy;
-        return self.showTitleChange();
+        return self.showTitleChange(.program);
     }
 
     /// `.pwd`: the working directory the shell reported, copied since the
@@ -2274,21 +2274,30 @@ pub const Surface = struct {
         };
         if (self.title_override) |old| alloc.free(old);
         self.title_override = copy;
-        return self.showTitleChange();
+        return self.showTitleChange(.user);
     }
 
     /// Show the terminal's title (`effectiveTitle`) where it changed: its
     /// tab's label, if it is the focused terminal of its tab, and its
     /// window's caption, if it is the focused terminal of the tab shown.
-    fn showTitleChange(self: *Surface) bool {
-        // A tab's label shows its focused terminal's title, unless the tab
-        // has one of its own; any other title changes no label, as on GTK,
-        // whose tab binds only its active surface's title.
-        if (self.window.tabOf(self)) |t| {
-            if (t.focused == self and t.title_override == null) self.window.bar.invalidate();
-        }
-        if (self.window.tab().focused != self) return true;
-        return self.window.showTitle();
+    /// The user's own change shows at once; a program's no more often
+    /// than `Window.titleChanged` allows.
+    fn showTitleChange(self: *Surface, from: enum { program, user }) bool {
+        const change: Window.TitleChange = .{
+            // A tab's label shows its focused terminal's title, unless
+            // the tab has one of its own; any other title changes no
+            // label, as on GTK, whose tab binds only its active
+            // surface's title.
+            .label = if (self.window.tabOf(self)) |t|
+                t.focused == self and t.title_override == null
+            else
+                false,
+            .caption = self.window.tab().focused == self,
+        };
+        return switch (from) {
+            .program => self.window.titleChanged(change),
+            .user => self.window.showTitleChange(change),
+        };
     }
 
     /// WM_CLOSE sent to this window: it closes alone. Windows sends the

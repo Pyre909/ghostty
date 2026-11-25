@@ -114,6 +114,14 @@ selected: usize,
 /// (`setTitleOverride` in src/apprt/gtk/class/window.zig).
 title_override: ?[:0]u8,
 
+/// What a program's title changes have yet to show, while
+/// `title_timer_id` runs (`titleChanged`); nothing otherwise.
+title_pending: TitleChange = .{},
+
+/// When a program's title change was last shown (`titleNow`), or null
+/// if none has been.
+title_shown_at: ?u64 = null,
+
 /// The tab bar over the terminals, shown as `window-show-tab-bar` asks
 /// (`barShown`).
 bar: TabBar.Bar,
@@ -1765,7 +1773,7 @@ const QuickAnimation = struct {
 };
 
 /// The frame's timer that steps the quick terminal's animation
-/// (`QuickAnimation`), its only timer. Asked for at USER_TIMER_MINIMUM;
+/// (`QuickAnimation`). Asked for at USER_TIMER_MINIMUM;
 /// it fires with the system tick, every 15.3 to 17.8 ms as measured in
 /// the Windows 11 VM.
 pub const quick_timer_id: win32.UINT_PTR = 1;
@@ -2346,6 +2354,9 @@ fn handleMessage(
         // The quick terminal's animation steps (`quickStep`).
         win32.WM_TIMER => if (wparam == quick_timer_id) {
             if (self.quick) self.quickStep();
+            return 0;
+        } else if (wparam == title_timer_id) {
+            self.titleTimer();
             return 0;
         },
 
@@ -3312,6 +3323,94 @@ pub fn showProgress(self: *Window) void {
     const list = self.app.taskbar_list orelse return;
     const surface = self.tab().focused orelse return;
     list.show(self.hwnd, surface.progress);
+}
+
+/// Where a terminal's title change shows: its tab's label, the window's
+/// caption, both or neither.
+pub const TitleChange = packed struct {
+    label: bool = false,
+    caption: bool = false,
+
+    fn any(self: TitleChange) bool {
+        return self.label or self.caption;
+    }
+};
+
+/// The frame's timer that shows what `title_pending` holds.
+pub const title_timer_id: win32.UINT_PTR = 2;
+
+/// The least time between two of a program's title changes shown, in
+/// milliseconds: the time the macOS app waits for a title to settle
+/// (`setTitle` in SurfaceView_AppKit.swift).
+pub const title_interval_ms = 75;
+
+/// For tests: the time title changes are paced with (`titleNow`), in
+/// place of GetTickCount64's. While it is null a test's title changes
+/// are not paced at all, so that the tests of where a title shows need
+/// no clock.
+pub var test_title_now: if (builtin.is_test) ?u64 else void = if (builtin.is_test) null else {};
+
+/// The time title changes are paced with, in milliseconds, or null for
+/// no pacing (`test_title_now`).
+fn titleNow() ?u64 {
+    if (builtin.is_test) return test_title_now;
+    return win32.GetTickCount64();
+}
+
+/// A program changed the title of one of the window's terminals. The
+/// change shows now if none has shown for `title_interval_ms`, and
+/// otherwise when that time is up, together with any that follow it.
+///
+/// A program can set the title as fast as it can print, and showing
+/// each one costs a repaint of the tab bar and a caption change, which
+/// Windows also sends to the taskbar: 66,000 changes a second kept the
+/// app thread from its messages for as long as they came, and stopped
+/// the taskbar's clock. A single change, as a shell makes at a prompt,
+/// still shows at once. Returns false if a change shown now could not
+/// be shown.
+pub fn titleChanged(self: *Window, change: TitleChange) bool {
+    if (!change.any()) return true;
+    const now = titleNow() orelse return self.showTitleChange(change);
+    if (self.title_pending.any()) {
+        self.title_pending.label = self.title_pending.label or change.label;
+        self.title_pending.caption = self.title_pending.caption or change.caption;
+        return true;
+    }
+
+    if (self.title_shown_at) |at| {
+        const since = now -| at;
+        // Without a timer the change shows now: late is the one thing
+        // a title must not be.
+        if (since < title_interval_ms and win32.SetTimer(
+            self.hwnd,
+            title_timer_id,
+            @intCast(title_interval_ms - since),
+            null,
+        ) != 0) {
+            self.title_pending = change;
+            return true;
+        }
+    }
+    self.title_shown_at = now;
+    return self.showTitleChange(change);
+}
+
+/// `title_timer_id` fired: show what the title changes since the last
+/// one shown asked for. The titles are read now, so what shows is the
+/// latest of each.
+fn titleTimer(self: *Window) void {
+    _ = win32.KillTimer(self.hwnd, title_timer_id);
+    const change = self.title_pending;
+    self.title_pending = .{};
+    if (!change.any()) return;
+    self.title_shown_at = titleNow();
+    _ = self.showTitleChange(change);
+}
+
+/// Show a terminal's title change now. Returns whether it is shown.
+pub fn showTitleChange(self: *Window, change: TitleChange) bool {
+    if (change.label) self.bar.invalidate();
+    return if (change.caption) self.showTitle() else true;
 }
 
 /// Show the window's own title (`title_override`), else its shown tab's

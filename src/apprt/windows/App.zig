@@ -9018,6 +9018,63 @@ test "win32: a window is titled after its focused terminal" {
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("right"), caption(window, &buf));
 }
 
+test "win32: a program's title changes show no more often than the interval" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    const window = try testFrame(&app);
+    const pane = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{pane});
+    window.tab().focused = pane;
+
+    const caption = testCaption;
+    const text = std.unicode.utf8ToUtf16LeStringLiteral;
+    var buf: [64]u16 = undefined;
+    const interval = Window.title_interval_ms;
+    defer Window.test_title_now = null;
+
+    // The first shows at once, as a shell's does at its prompt.
+    Window.test_title_now = 1000;
+    try std.testing.expect(pane.setTitle("one"));
+    try std.testing.expectEqualSlices(u16, text("one"), caption(window, &buf));
+
+    // Those that follow inside the interval wait for the timer, which
+    // shows the last of them.
+    Window.test_title_now = 1010;
+    try std.testing.expect(pane.setTitle("two"));
+    try std.testing.expect(pane.setTitle("three"));
+    try std.testing.expectEqualSlices(u16, text("one"), caption(window, &buf));
+    Window.test_title_now = 1000 + interval;
+    _ = Window.wndProc(window.hwnd, win32.WM_TIMER, Window.title_timer_id, 0);
+    try std.testing.expectEqualSlices(u16, text("three"), caption(window, &buf));
+    // The timer ran once: it is gone.
+    try std.testing.expect(!win32.KillTimer(window.hwnd, Window.title_timer_id).toBool());
+
+    // The interval counts from what the timer showed.
+    Window.test_title_now = 1000 + 2 * interval - 1;
+    try std.testing.expect(pane.setTitle("four"));
+    try std.testing.expectEqualSlices(u16, text("three"), caption(window, &buf));
+    try std.testing.expect(win32.KillTimer(window.hwnd, Window.title_timer_id).toBool());
+    _ = Window.wndProc(window.hwnd, win32.WM_TIMER, Window.title_timer_id, 0);
+    try std.testing.expectEqualSlices(u16, text("four"), caption(window, &buf));
+
+    // After a quiet interval a change shows at once again.
+    Window.test_title_now = 1000 + 4 * interval;
+    try std.testing.expect(pane.setTitle("five"));
+    try std.testing.expectEqualSlices(u16, text("five"), caption(window, &buf));
+
+    // The user's own title is never held back.
+    Window.test_title_now = 1000 + 4 * interval + 1;
+    try std.testing.expect(pane.setTitleOverride("mine"));
+    try std.testing.expectEqualSlices(u16, text("mine"), caption(window, &buf));
+}
+
 test "win32: a burst of wakeups posts one message until it is taken" {
     var app: App = undefined;
     app.msg_hwnd = win32.CreateWindowExW(
