@@ -3096,11 +3096,14 @@ test "read thread windows: one read takes a whole burst of output" {
     const testing = std.testing;
     const k32 = windows.exp.kernel32;
 
-    // A pipe that holds the burst, so that writing it cannot block.
+    // The burst is a number of its own, not the reader's constant, so
+    // that a smaller batch fails here. The pipe is asked to hold twice
+    // as much: its size is only a hint to Windows, and a write that
+    // did not fit would block this thread, the only one, for good.
     const burst = 64 * 1024;
     var read_end: windows.HANDLE = undefined;
     var write_end: windows.HANDLE = undefined;
-    try testing.expect(k32.CreatePipe(&read_end, &write_end, null, burst) != windows.FALSE);
+    try testing.expect(k32.CreatePipe(&read_end, &write_end, null, 2 * burst) != windows.FALSE);
     defer _ = k32.CloseHandle(read_end);
     defer _ = k32.CloseHandle(write_end);
 
