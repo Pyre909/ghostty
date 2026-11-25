@@ -270,8 +270,20 @@ pub fn needsConfirmQuit(self: *const App) bool {
     return false;
 }
 
-/// Drain the mailbox.
+/// The most messages one drain handles before it hands the thread back
+/// to the apprt: as many as the mailbox holds.
+const drain_max = Mailbox.capacity;
+
+/// Drain the mailbox, up to drain_max messages of it.
+///
+/// A producer can refill the mailbox as fast as this empties it (a
+/// program setting the terminal's title in a loop sends one message
+/// per title), and a drain that ran until the mailbox was empty would
+/// then hold the app thread, and the user's input with it, for as long
+/// as that went on. So a drain that reaches its limit asks the apprt to
+/// tick again and returns.
 fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
+    var handled: usize = 0;
     while (self.mailbox.pop(global.io())) |message| {
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
@@ -302,6 +314,12 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
                 try self.performAction(rt_app, .quit);
                 return;
             },
+        }
+
+        handled += 1;
+        if (handled == drain_max) {
+            rt_app.wakeup();
+            return;
         }
     }
 }
@@ -596,8 +614,11 @@ pub const Message = union(enum) {
 
 /// Mailbox is the way that other threads send the app thread messages.
 pub const Mailbox = struct {
+    /// How many messages the mailbox holds.
+    pub const capacity = 64;
+
     /// The type used for sending messages to the app thread.
-    pub const Queue = BlockingQueue(Message, 64);
+    pub const Queue = BlockingQueue(Message, capacity);
 
     rt_app: *apprt.App,
     mailbox: *Queue,

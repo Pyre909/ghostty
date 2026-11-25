@@ -9054,6 +9054,66 @@ test "win32: a burst of wakeups posts one message until it is taken" {
     try std.testing.expect(!app.wake_pending.load(.acquire));
 }
 
+test "win32: a tick handles one mailbox of messages and asks for the next" {
+    // Only what this tick touches: the mailbox, and the surface list that
+    // `.close` is checked against (empty, so every message is a no-op).
+    var core_app: CoreApp = undefined;
+    core_app.mailbox = .{};
+    core_app.surfaces = .empty;
+    var app: App = undefined;
+    app.core_app = &core_app;
+    app.ticking = false;
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    app.wake_pending = .init(false);
+    defer _ = win32.DestroyWindow(app.msg_hwnd);
+
+    // Never dereferenced; static so it costs no stack.
+    const gone = struct {
+        var surface: CoreSurface = undefined;
+    };
+    const fill = struct {
+        fn f(mailbox: *CoreApp.Mailbox.Queue, n: usize) !void {
+            for (0..n) |_| try std.testing.expect(mailbox.push(
+                global.io(),
+                .{ .close = &gone.surface },
+                .instant,
+            ) != 0);
+        }
+    }.f;
+
+    // A full mailbox: all of it is handled, and since more may have
+    // come meanwhile, the loop is woken for another tick.
+    while (core_app.mailbox.push(global.io(), .{ .close = &gone.surface }, .instant) != 0) {}
+    try app.tick();
+    try std.testing.expect(app.testTakeWakeup());
+
+    // One short of full: handled to the end, with no wakeup.
+    try fill(&core_app.mailbox, CoreApp.Mailbox.capacity - 1);
+    try app.tick();
+    try std.testing.expect(!app.testTakeWakeup());
+    try std.testing.expect(core_app.mailbox.pop(global.io()) == null);
+
+    // The limit is the whole mailbox and no less: after the first tick
+    // of a full one, nothing is left.
+    try fill(&core_app.mailbox, CoreApp.Mailbox.capacity);
+    try app.tick();
+    try std.testing.expect(core_app.mailbox.pop(global.io()) == null);
+    try std.testing.expect(app.testTakeWakeup());
+}
+
 test "win32: a terminal keeps the directory its shell reports" {
     // The core frees what it reports once the action returns, so the
     // terminal's copy must be its own.
