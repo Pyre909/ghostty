@@ -6037,6 +6037,23 @@ test "win32: waiting for a thread drains a full mailbox without input" {
     app.core_app = &core_app;
     app.ticking = false;
     app.prompt_depth = 0;
+    // A drain that stops at its limit wakes the loop (`wakeup`).
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    defer _ = win32.DestroyWindow(app.msg_hwnd);
+    app.wake_pending = .init(false);
     // No title prompt to offer a pumped message to (`dispatch`).
     app.windows = .empty;
 
