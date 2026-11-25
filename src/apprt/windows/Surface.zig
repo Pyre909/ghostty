@@ -5264,7 +5264,7 @@ test "win32: losing focus mid-drag wakes the app loop" {
 
     var app: App = undefined;
     app.msg_hwnd = hwnd;
-    app.wake_pending = .init(false);
+    app.wake_pending = .init(.idle);
 
     // Only what the focus handler reads, with no core surface. Static
     // because the struct embeds a whole CoreSurface.
