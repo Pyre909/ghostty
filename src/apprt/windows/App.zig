@@ -9094,10 +9094,83 @@ test "win32: a program's title changes show no more often than the interval" {
     try std.testing.expect(pane.setTitle("five"));
     try std.testing.expectEqualSlices(u16, text("five"), caption(window, &buf));
 
-    // The user's own title is never held back.
+    // Without a timer to wait for, a change inside the interval shows
+    // at once too.
+    Window.test_title_timer_fails = true;
+    defer Window.test_title_timer_fails = false;
     Window.test_title_now = 1000 + 4 * interval + 1;
+    try std.testing.expect(pane.setTitle("six"));
+    try std.testing.expectEqualSlices(u16, text("six"), caption(window, &buf));
+    try std.testing.expect(!win32.KillTimer(window.hwnd, Window.title_timer_id).toBool());
+    Window.test_title_timer_fails = false;
+
+    // The user's own title is never held back.
+    Window.test_title_now = 1000 + 4 * interval + 2;
     try std.testing.expect(pane.setTitleOverride("mine"));
     try std.testing.expectEqualSlices(u16, text("mine"), caption(window, &buf));
+}
+
+test "win32: title changes held back together show together" {
+    const alloc = std.testing.allocator;
+    var core_app: CoreApp = undefined;
+    core_app.alloc = alloc;
+    var app: App = undefined;
+    try testApp(&app, &core_app);
+    try registerClasses(app.hinstance);
+    defer unregisterClasses(app.hinstance);
+    defer testCleanup(&app);
+
+    // The shown tab has a title of its own, so its terminal's title
+    // changes the caption's part and no label; the hidden tab's changes
+    // its label and no caption.
+    const window = try testFrame(&app);
+    testResize(window, 800, 300);
+    const a = try testPane(&app, window);
+    window.tab().tree = try testRow(alloc, &.{a});
+    window.tab().focused = a;
+    const c = try testTab(&app, window);
+    _ = win32.ShowWindow(window.hwnd, win32.SW_SHOWNOACTIVATE);
+    window.relayout();
+    try std.testing.expect(window.tab().focused == a);
+    try std.testing.expect(window.setTabTitle(a, "own"));
+    const bar = window.bar.hwnd.?;
+    const repaints = struct {
+        fn f(hwnd: win32.HWND) bool {
+            return win32.GetUpdateRect(hwnd, null, .FALSE).toBool();
+        }
+    }.f;
+    const interval = Window.title_interval_ms;
+    defer Window.test_title_now = null;
+
+    Window.test_title_now = 1000;
+    try std.testing.expect(a.setTitle("one"));
+
+    // A label's change, then a caption's: both wait, and the timer
+    // shows both.
+    Window.test_title_now = 1010;
+    _ = win32.UpdateWindow(bar);
+    try std.testing.expect(c.setTitle("hidden"));
+    try std.testing.expect(a.setTitle("two"));
+    try std.testing.expect(window.title_pending.label);
+    try std.testing.expect(window.title_pending.caption);
+    try std.testing.expect(!repaints(bar));
+    Window.test_title_now = 1000 + interval;
+    _ = Window.wndProc(window.hwnd, win32.WM_TIMER, Window.title_timer_id, 0);
+    try std.testing.expect(!window.title_pending.any());
+    try std.testing.expect(repaints(bar));
+
+    // And a caption's, then a label's.
+    Window.test_title_now = 1000 + interval + 10;
+    _ = win32.UpdateWindow(bar);
+    try std.testing.expect(a.setTitle("three"));
+    try std.testing.expect(!window.title_pending.label);
+    try std.testing.expect(c.setTitle("hidden still"));
+    try std.testing.expect(window.title_pending.label);
+    try std.testing.expect(window.title_pending.caption);
+    try std.testing.expect(!repaints(bar));
+    Window.test_title_now = 1000 + 2 * interval;
+    _ = Window.wndProc(window.hwnd, win32.WM_TIMER, Window.title_timer_id, 0);
+    try std.testing.expect(repaints(bar));
 }
 
 test "win32: a burst of wakeups posts one message until it is taken" {

@@ -3331,7 +3331,7 @@ pub const TitleChange = packed struct {
     label: bool = false,
     caption: bool = false,
 
-    fn any(self: TitleChange) bool {
+    pub fn any(self: TitleChange) bool {
         return self.label or self.caption;
     }
 };
@@ -3352,6 +3352,10 @@ pub var test_title_now: if (builtin.is_test) ?u64 else void = if (builtin.is_tes
 
 /// The time title changes are paced with, in milliseconds, or null for
 /// no pacing (`test_title_now`).
+/// For tests: the timer a held-back title change waits for cannot be
+/// set.
+pub var test_title_timer_fails: if (builtin.is_test) bool else void = if (builtin.is_test) false else {};
+
 fn titleNow() ?u64 {
     if (builtin.is_test) return test_title_now;
     return win32.GetTickCount64();
@@ -3381,7 +3385,8 @@ pub fn titleChanged(self: *Window, change: TitleChange) bool {
         const since = now -| at;
         // Without a timer the change shows now: late is the one thing
         // a title must not be.
-        if (since < title_interval_ms and win32.SetTimer(
+        const fails = if (builtin.is_test) test_title_timer_fails else false;
+        if (since < title_interval_ms and !fails and win32.SetTimer(
             self.hwnd,
             title_timer_id,
             @intCast(title_interval_ms - since),
