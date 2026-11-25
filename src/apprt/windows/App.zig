@@ -234,6 +234,10 @@ pub const App = struct {
     /// lost exactly when the mailbox needs draining.
     msg_hwnd: win32.HWND,
 
+    /// A wakeup is posted to `msg_hwnd` and `wndProc` has not yet taken
+    /// it: `wakeup` posts no second one meanwhile.
+    wake_pending: std.atomic.Value(bool),
+
     /// The terminals this runtime owns. See `surfaceDestroyed` for the
     /// ownership invariant. Each one whose `CoreSurface` is initialized is
     /// also registered with `CoreApp.addSurface`, which is what drives the
@@ -1293,6 +1297,7 @@ pub const App = struct {
             .reported_scheme = null,
             .window_theme_override = .config,
             .msg_hwnd = msg_hwnd,
+            .wake_pending = .init(false),
             .surfaces = .empty,
             .windows = .empty,
             .quick = null,
@@ -2339,8 +2344,35 @@ pub const App = struct {
 
     /// Called from the renderer and IO threads via `CoreApp.Mailbox.push`, so
     /// this must be thread-safe and must not block. PostMessageW is both.
+    ///
+    /// One message wakes the loop however many asked for it, so only the
+    /// first of a burst is posted: `wndProc` clears `wake_pending` before
+    /// the tick the message stands for, and a wakeup after that posts
+    /// again. Posting each one cost a system call here and a dispatch
+    /// there for every message a terminal sent the app, 660,000 of each
+    /// for 10 MiB of title changes.
     pub fn wakeup(self: *App) void {
-        _ = win32.PostMessageW(self.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
+        if (self.wake_pending.swap(true, .acq_rel)) return;
+        // Not posted (the queue is full or going away): the next one
+        // tries again.
+        if (!win32.PostMessageW(self.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0).toBool()) {
+            self.wake_pending.store(false, .release);
+        }
+    }
+
+    /// For tests: take the posted wakeup off the queue as `wndProc`
+    /// would, without the tick. Returns whether there was one.
+    pub fn testTakeWakeup(self: *App) bool {
+        var msg: win32.MSG = undefined;
+        const posted = win32.PeekMessageW(
+            &msg,
+            self.msg_hwnd,
+            WM_GHOSTTY_WAKEUP,
+            WM_GHOSTTY_WAKEUP,
+            win32.PM_REMOVE,
+        ).toBool();
+        if (posted) self.wake_pending.store(false, .release);
+        return posted;
     }
 
     /// `main` in main_ghostty.zig calls this before `run` because a freshly
@@ -5443,6 +5475,9 @@ pub const App = struct {
             // So is an unframed prompt's loop, which has none beneath it
             // either (`beginUnframedPrompt`).
             WM_GHOSTTY_WAKEUP => {
+                // Before the tick, so that a wakeup for something the
+                // tick does not reach posts another.
+                self.wake_pending.store(false, .release);
                 if (self.modal_loop_depth > 0) {
                     self.tickFromHandler();
                 } else if (self.promptMayTick()) {
@@ -6124,6 +6159,7 @@ test "win32: only an armed quit timer expires" {
 
     var app: App = undefined;
     app.msg_hwnd = hwnd;
+    app.wake_pending = .init(false);
     _ = win32.SetWindowLongPtrW(
         hwnd,
         win32.GWLP_USERDATA,
@@ -6238,13 +6274,8 @@ test "win32: a prompt disables the other windows until the outermost one ends an
         null,
         null,
     ) orelse return error.TestUnexpectedResult;
+    app.wake_pending = .init(false);
     defer _ = win32.DestroyWindow(app.msg_hwnd);
-    const woken = struct {
-        fn f(hwnd: win32.HWND) bool {
-            var msg: win32.MSG = undefined;
-            return win32.PeekMessageW(&msg, hwnd, WM_GHOSTTY_WAKEUP, WM_GHOSTTY_WAKEUP, win32.PM_REMOVE).toBool();
-        }
-    }.f;
 
     app.beginPrompt(owner);
     try std.testing.expect(win32.IsWindowEnabled(owner).toBool());
@@ -6256,7 +6287,7 @@ test "win32: a prompt disables the other windows until the outermost one ends an
     try std.testing.expect(win32.IsWindowEnabled(owner).toBool());
     app.endPrompt();
     try std.testing.expect(!win32.IsWindowEnabled(other).toBool());
-    try std.testing.expect(!woken(app.msg_hwnd));
+    try std.testing.expect(!app.testTakeWakeup());
 
     // The outermost one's end wakes `run`, whose tick the prompt's own
     // message loop could not make.
@@ -6264,7 +6295,7 @@ test "win32: a prompt disables the other windows until the outermost one ends an
     try std.testing.expectEqual(0, app.prompt_depth);
     try std.testing.expect(win32.IsWindowEnabled(other).toBool());
     try std.testing.expect(!win32.IsWindowEnabled(off).toBool());
-    try std.testing.expect(woken(app.msg_hwnd));
+    try std.testing.expect(app.testTakeWakeup());
 }
 
 test "win32: a prompt belongs to a top-level window" {
@@ -6441,6 +6472,7 @@ pub fn testApp(app: *App, core_app: *CoreApp) !void {
         null,
         null,
     ) orelse return error.TestUnexpectedResult;
+    app.wake_pending = .init(false);
     // No test reaches the network: a check is refused on the discard
     // port unless the test points it at its own server.
     app.updater = .{ .hwnd = app.msg_hwnd, .msg = WM_GHOSTTY_UPDATE, .source = Updater.test_source };
@@ -8984,6 +9016,42 @@ test "win32: a window is titled after its focused terminal" {
 
     _ = Surface.wndProc(right.hwnd, win32.WM_SETFOCUS, 0, 0);
     try std.testing.expectEqualSlices(u16, std.unicode.utf8ToUtf16LeStringLiteral("right"), caption(window, &buf));
+}
+
+test "win32: a burst of wakeups posts one message until it is taken" {
+    var app: App = undefined;
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    app.wake_pending = .init(false);
+
+    app.wakeup();
+    app.wakeup();
+    app.wakeup();
+    try std.testing.expect(app.testTakeWakeup());
+    try std.testing.expect(!app.testTakeWakeup());
+
+    // Taken, so the next one posts again.
+    app.wakeup();
+    try std.testing.expect(app.testTakeWakeup());
+
+    // One that could not be posted is not counted as pending: the next
+    // one, to a window that takes it, is posted.
+    const live = app.msg_hwnd;
+    try std.testing.expect(win32.DestroyWindow(live).toBool());
+    app.wakeup();
+    try std.testing.expect(!app.wake_pending.load(.acquire));
 }
 
 test "win32: a terminal keeps the directory its shell reports" {
@@ -16307,14 +16375,7 @@ test "win32: the core is told the color scheme when it changes" {
     try std.testing.expect(app.config.title.?.ptr != before);
     try std.testing.expectEqual(1, app.requests.items.len);
     try std.testing.expect(app.requests.items[0] == .redecorate);
-    var msg: win32.MSG = undefined;
-    try std.testing.expect(win32.PeekMessageW(
-        &msg,
-        app.msg_hwnd,
-        WM_GHOSTTY_WAKEUP,
-        WM_GHOSTTY_WAKEUP,
-        win32.PM_REMOVE,
-    ).toBool());
+    try std.testing.expect(app.testTakeWakeup());
 
     // Told once. The core ignores a repeat by itself, so it is made to have
     // lost the scheme: told again, it would take it back and reload.
@@ -16358,14 +16419,7 @@ test "win32: a change of the system's app mode reaches every title bar" {
     try std.testing.expectEqual(now == .dark, window.dark_frame);
 
     // The message was sent, so `run` is woken to tell the core.
-    var msg: win32.MSG = undefined;
-    try std.testing.expect(win32.PeekMessageW(
-        &msg,
-        app.msg_hwnd,
-        WM_GHOSTTY_WAKEUP,
-        WM_GHOSTTY_WAKEUP,
-        win32.PM_REMOVE,
-    ).toBool());
+    try std.testing.expect(app.testTakeWakeup());
 }
 
 test "win32: a new configuration re-themes every title bar" {
@@ -16412,14 +16466,7 @@ test "win32: set_window_theme themes every title bar for the session" {
     // At once, and `run` is woken to tell the core.
     try std.testing.expect(try app.performAction(.app, .set_window_theme, .dark));
     try std.testing.expect(window.dark_frame);
-    var msg: win32.MSG = undefined;
-    try std.testing.expect(win32.PeekMessageW(
-        &msg,
-        app.msg_hwnd,
-        WM_GHOSTTY_WAKEUP,
-        WM_GHOSTTY_WAKEUP,
-        win32.PM_REMOVE,
-    ).toBool());
+    try std.testing.expect(app.testTakeWakeup());
 
     // A reload keeps it, even one whose `window-theme` is light.
     var changed: Config = try .default(alloc);

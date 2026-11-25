@@ -12,7 +12,6 @@ const CoreSurface = @import("../../Surface.zig");
 const win32 = @import("win32.zig");
 const L = win32.L;
 const surface_class_name = @import("App.zig").surface_class_name;
-const WM_GHOSTTY_WAKEUP = @import("App.zig").WM_GHOSTTY_WAKEUP;
 const WM_GHOSTTY_DESTROY = @import("App.zig").WM_GHOSTTY_DESTROY;
 const WM_GHOSTTY_LINK_REFUSED = @import("App.zig").WM_GHOSTTY_LINK_REFUSED;
 const WM_GHOSTTY_RENDER_LEFT = @import("App.zig").WM_GHOSTTY_RENDER_LEFT;
@@ -5151,6 +5150,7 @@ test "win32: losing focus mid-drag wakes the app loop" {
 
     var app: App = undefined;
     app.msg_hwnd = hwnd;
+    app.wake_pending = .init(false);
 
     // Only what the focus handler reads, with no core surface. Static
     // because the struct embeds a whole CoreSurface.
@@ -5177,14 +5177,7 @@ test "win32: losing focus mid-drag wakes the app loop" {
         surface.mouse.held = c.held;
         _ = surface.handleMessage(hwnd, win32.WM_KILLFOCUS, 0, 0);
 
-        var msg: win32.MSG = undefined;
-        const woken = win32.PeekMessageW(
-            &msg,
-            hwnd,
-            WM_GHOSTTY_WAKEUP,
-            WM_GHOSTTY_WAKEUP,
-            win32.PM_REMOVE,
-        ).toBool();
+        const woken = app.testTakeWakeup();
         try std.testing.expectEqual(c.want, woken);
     }
 }
