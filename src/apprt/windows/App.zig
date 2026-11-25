@@ -21819,9 +21819,14 @@ test "win32: progress reports that follow one shown show together" {
     Surface.test_progress_now = 1000 + 2 * interval;
     _ = Surface.wndProc(pane.hwnd, win32.WM_TIMER, show, 0);
     try std.testing.expectEqual(40, fake.value.?);
-    Surface.test_progress_now = pane.progress_expires - 1;
+    try std.testing.expectEqual(15_000 - (interval - 1), Surface.test_progress_lapse_ms.?);
+    // A timer that fires before then removes nothing, and is set
+    // again for what is left.
+    try std.testing.expect(win32.KillTimer(pane.hwnd, lapse).toBool());
+    Surface.test_progress_now = pane.progress_expires - 7;
     _ = Surface.wndProc(pane.hwnd, win32.WM_TIMER, lapse, 0);
     try std.testing.expectEqual(.normal, fake.state);
+    try std.testing.expectEqual(7, Surface.test_progress_lapse_ms.?);
     try std.testing.expect(win32.KillTimer(pane.hwnd, lapse).toBool());
 
     // A removal inside the interval waits as any report does, and

@@ -2123,6 +2123,10 @@ pub const Surface = struct {
     /// For tests: how often `showProgress` ran.
     pub var test_progress_shows: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
+    /// For tests: the time the lapse timer was last set for
+    /// (`setLapseTimer`), in milliseconds.
+    pub var test_progress_lapse_ms: if (builtin.is_test) ?u32 else void = if (builtin.is_test) null else {};
+
     /// `.progress_report`: take the program's report, and show it on the
     /// terminal's progress bar (`ProgressBar`), and on the window's taskbar
     /// button if this terminal has the window's focus. As on GTK, a report
@@ -2193,10 +2197,7 @@ pub const Surface = struct {
             // Replaces the timer a previous report set. Reports held
             // back since moved `progress_expires` on, which
             // `progressTimer` then waits out.
-            const left = self.progress_expires -| (now orelse win32.GetTickCount64());
-            if (win32.SetTimer(self.hwnd, progress_timer_id, @intCast(@max(left, 1)), null) == 0) {
-                log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
-            }
+            self.setLapseTimer(now orelse win32.GetTickCount64());
         }
         ProgressBar.set(self, self.progress_shown.valued);
         if (self.window.tab().focused == self) self.window.showProgress();
@@ -2208,13 +2209,18 @@ pub const Surface = struct {
     /// timer otherwise waits for the time that is left.
     fn progressTimer(self: *Surface) void {
         const now = progressNow() orelse win32.GetTickCount64();
-        if (now < self.progress_expires) {
-            if (win32.SetTimer(self.hwnd, progress_timer_id, @intCast(self.progress_expires - now), null) == 0) {
-                log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
-            }
-            return;
-        }
+        if (now < self.progress_expires) return self.setLapseTimer(now);
         self.reportProgress(.{ .state = .remove });
+    }
+
+    /// Set the progress timer for what is left at `now` until
+    /// `progress_expires`, in place of what it was set for.
+    fn setLapseTimer(self: *Surface, now: u64) void {
+        const left: u32 = @intCast(@max(self.progress_expires -| now, 1));
+        if (builtin.is_test) test_progress_lapse_ms = left;
+        if (win32.SetTimer(self.hwnd, progress_timer_id, left, null) == 0) {
+            log.warn("SetTimer failed, progress will not lapse err={}", .{win32.GetLastError()});
+        }
     }
 
     /// `.desktop_notification`: a toast for this terminal, with its title in
