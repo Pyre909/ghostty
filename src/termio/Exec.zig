@@ -1783,7 +1783,8 @@ const Subprocess = struct {
 ///   io-reader:  hand each filled buffer to processOutput (terminal
 ///               lock, VT parse, state update, render scheduling).
 ///
-/// This used to be a single serial loop (and still is on Windows):
+/// This used to be a single serial loop (and still is on Windows,
+/// where it reads a whole batch at a time, see threadMainWindows):
 ///
 ///   while (true) { blocking_read(); exit_if_eof(); process(); }
 ///
@@ -2299,7 +2300,15 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
-        var buf: [1024]u8 = undefined;
+        // One batch per read, the same unit of work per terminal lock
+        // as threadMainPosix. With a 1 KiB buffer the system calls of
+        // each pass (this read, the quit check, the renderer wake)
+        // cost more than the parsing: 100 MiB of ASCII took 1139 ms,
+        // and takes 344 ms with this size. No gather stage is needed
+        // for it: unlike the macOS tty queue, a pipe hands one read
+        // everything the pseudoconsole has written, and a read still
+        // returns as soon as there is any output at all.
+        var buf: [buffer_capacity]u8 = undefined;
         while (true) {
             // Check for the quit signal before EVERY read, not only after
             // a cancelled one. A cancel that arrives while this thread is
@@ -2314,7 +2323,7 @@ pub const ReadThread = struct {
             }
 
             var n: windows.DWORD = 0;
-            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == windows.FALSE) {
+            if (readBatchWindows(fd, &buf, &n) == windows.FALSE) {
                 const err = windows.GetLastError();
                 switch (err) {
                     // Cancelled by threadExit: go back to the quit check.
@@ -2343,6 +2352,16 @@ pub const ReadThread = struct {
             // would otherwise starve it under heavy output.
             io.renderer_state.yieldToDemand(global.io());
         }
+    }
+
+    /// One blocking read of the pty output: everything that is ready,
+    /// up to one batch. The buffer's type fixes the size asked for.
+    fn readBatchWindows(
+        fd: posix.fd_t,
+        buf: *[buffer_capacity]u8,
+        n: *windows.DWORD,
+    ) windows.BOOL {
+        return windows.exp.kernel32.ReadFile(fd, buf, buf.len, n, null);
     }
 
     /// Returns true if threadExit has written to the quit pipe.
@@ -3070,6 +3089,34 @@ test "read thread windows: quit byte reaches the reader" {
     try testing.expect(!ReadThread.quitRequestedWindows(pipe[0]));
     writeQuitByteWindows(pipe[1]);
     try testing.expect(ReadThread.quitRequestedWindows(pipe[0]));
+}
+
+test "read thread windows: one read takes a whole burst of output" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    const k32 = windows.exp.kernel32;
+
+    // A pipe that holds the burst, so that writing it cannot block.
+    const burst = 64 * 1024;
+    var read_end: windows.HANDLE = undefined;
+    var write_end: windows.HANDLE = undefined;
+    try testing.expect(k32.CreatePipe(&read_end, &write_end, null, burst) != windows.FALSE);
+    defer _ = k32.CloseHandle(read_end);
+    defer _ = k32.CloseHandle(write_end);
+
+    const sent = try testing.allocator.alloc(u8, burst);
+    defer testing.allocator.free(sent);
+    for (sent, 0..) |*b, i| b.* = @truncate(i *% 31);
+    var n: windows.DWORD = 0;
+    try testing.expect(k32.WriteFile(write_end, sent.ptr, burst, &n, null) != windows.FALSE);
+    try testing.expectEqual(@as(windows.DWORD, burst), n);
+
+    const got = try testing.allocator.create([ReadThread.buffer_capacity]u8);
+    defer testing.allocator.destroy(got);
+    n = 0;
+    try testing.expect(ReadThread.readBatchWindows(read_end, got, &n) != windows.FALSE);
+    try testing.expectEqual(@as(windows.DWORD, burst), n);
+    try testing.expectEqualSlices(u8, sent, got[0..n]);
 }
 
 test "read thread windows: closing the quit pipe ends the reader" {
