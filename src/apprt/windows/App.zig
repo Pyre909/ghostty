@@ -1873,6 +1873,11 @@ pub const App = struct {
         if (self.ticking) return;
         self.ticking = true;
         defer self.ticking = false;
+        // Before the drain, so that a message pushed from here on posts
+        // a wakeup of its own. `wndProc` cleared it already for a tick a
+        // wakeup asked for; this is for one that was not posted, or that
+        // a loop took without ticking (`wakeup`).
+        self.wake_pending.store(false, .release);
         if (builtin.is_test) if (test_tick) |seen| return seen(self);
         try self.core_app.tick(self);
     }
@@ -2347,17 +2352,20 @@ pub const App = struct {
     ///
     /// One message wakes the loop however many asked for it, so only the
     /// first of a burst is posted: `wndProc` clears `wake_pending` before
-    /// the tick the message stands for, and a wakeup after that posts
-    /// again. Posting each one cost a system call here and a dispatch
+    /// the tick the message stands for, as does `tick` itself, and a
+    /// wakeup after that posts again. Posting each one cost a system call here and a dispatch
     /// there for every message a terminal sent the app, 660,000 of each
     /// for 10 MiB of title changes.
     pub fn wakeup(self: *App) void {
         if (self.wake_pending.swap(true, .acq_rel)) return;
-        // Not posted (the queue is full or going away): the next one
-        // tries again.
-        if (!win32.PostMessageW(self.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0).toBool()) {
-            self.wake_pending.store(false, .release);
-        }
+        // A post that fails leaves `wake_pending` set. Clearing it here
+        // could come after another thread's wakeup had found it set and
+        // posted nothing, and that thread's message would then wait with
+        // no tick due. The post fails when the thread's queue is full,
+        // and then the loop has messages to take and ticks after them,
+        // which clears it (`tick`); or when the window is gone as the
+        // app ends, and nothing ticks after that.
+        _ = win32.PostMessageW(self.msg_hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
     }
 
     /// For tests: take the posted wakeup off the queue as `wndProc`
@@ -9109,6 +9117,10 @@ test "win32: a burst of wakeups posts one message until it is taken" {
         null,
     ) orelse return error.TestUnexpectedResult;
     app.wake_pending = .init(false);
+    var gone = false;
+    defer if (!gone) {
+        _ = win32.DestroyWindow(app.msg_hwnd);
+    };
 
     app.wakeup();
     app.wakeup();
@@ -9120,12 +9132,39 @@ test "win32: a burst of wakeups posts one message until it is taken" {
     app.wakeup();
     try std.testing.expect(app.testTakeWakeup());
 
-    // One that could not be posted is not counted as pending: the next
-    // one, to a window that takes it, is posted.
-    const live = app.msg_hwnd;
-    try std.testing.expect(win32.DestroyWindow(live).toBool());
+    // One that could not be posted stays pending, so that a wakeup
+    // from another thread that found it pending is not lost with it.
+    try std.testing.expect(win32.DestroyWindow(app.msg_hwnd).toBool());
+    gone = true;
     app.wakeup();
+    try std.testing.expect(app.wake_pending.load(.acquire));
+
+    // The next tick clears it, and a wakeup after that is posted.
+    const Seen = struct {
+        fn tick(_: *App) void {}
+    };
+    App.test_tick = &Seen.tick;
+    defer App.test_tick = null;
+    app.ticking = false;
+    try app.tick();
     try std.testing.expect(!app.wake_pending.load(.acquire));
+    app.msg_hwnd = win32.CreateWindowExW(
+        0,
+        L("STATIC"),
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        win32.HWND_MESSAGE,
+        null,
+        null,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    gone = false;
+    app.wakeup();
+    try std.testing.expect(app.testTakeWakeup());
 }
 
 test "win32: a tick handles one mailbox of messages and asks for the next" {
