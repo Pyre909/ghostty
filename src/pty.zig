@@ -1022,6 +1022,30 @@ test "WindowsPty: the console host is logged once while it stays the same" {
     try testing.expect(!ConPty.quiet(.package));
 }
 
+/// The resize message waiting on a handoff's signal pipe. Peeks before
+/// it reads, so that a message that was not sent fails the test rather
+/// than hanging it.
+fn testSignalMessage(read: windows.HANDLE) ![3]u16 {
+    const k32 = windows.exp.kernel32;
+    var message: [3]u16 = undefined;
+    var avail: windows.DWORD = 0;
+    try std.testing.expect(k32.PeekNamedPipe(read, null, 0, null, &avail, null) != windows.FALSE);
+    try std.testing.expect(avail >= @sizeOf(@TypeOf(message)));
+    var got: windows.DWORD = 0;
+    try std.testing.expect(k32.ReadFile(read, &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
+    try std.testing.expectEqual(@sizeOf(@TypeOf(message)), got);
+    return message;
+}
+
+/// Every write end of the pipe is closed and nothing is left in it. A
+/// peek, not a read, so that an open end fails the test rather than
+/// hanging it.
+fn testPipeClosed(read: windows.HANDLE) !void {
+    const k32 = windows.exp.kernel32;
+    try std.testing.expect(k32.PeekNamedPipe(read, null, 0, null, null, null) == windows.FALSE);
+    try std.testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+}
+
 test "WindowsPty: a handed-off console resizes and ends through its handles" {
     if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
     const testing = std.testing;
@@ -1048,21 +1072,16 @@ test "WindowsPty: a handed-off console resizes and ends through its handles" {
     const size: winsize = .{ .ws_row = 31, .ws_col = 101, .ws_xpixel = 0, .ws_ypixel = 0 };
     try pty.setSize(size);
     try testing.expectEqual(size, try pty.getSize());
-    var message: [3]u16 = undefined;
-    var got: windows.DWORD = 0;
-    try testing.expect(k32.ReadFile(ends[0][0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
-    try testing.expectEqual(@as(windows.DWORD, 6), got);
-    try testing.expectEqual([3]u16{ 8, 101, 31 }, message);
+    try testing.expectEqual([3]u16{ 8, 101, 31 }, try testSignalMessage(ends[0][0]));
     // A size past a console's range is sent as the largest it has.
     try pty.setSize(.{ .ws_row = 40000, .ws_col = 32768, .ws_xpixel = 0, .ws_ypixel = 0 });
-    try testing.expect(k32.ReadFile(ends[0][0], &message, @sizeOf(@TypeOf(message)), &got, null) != windows.FALSE);
-    try testing.expectEqual([3]u16{ 8, 32767, 32767 }, message);
+    try testing.expectEqual([3]u16{ 8, 32767, 32767 }, try testSignalMessage(ends[0][0]));
     // With our size sent, the reference is released, as Windows
     // Terminal releases it: the console may end with its last program.
-    var buf: [32]u8 = undefined;
-    try testing.expect(k32.ReadFile(ends[1][0], &buf, buf.len, &got, null) == windows.FALSE);
-    try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
+    try testPipeClosed(ends[1][0]);
     try testing.expectEqual(ends[2][1], pty.handoffServer().?);
+    var buf: [32]u8 = undefined;
+    var got: windows.DWORD = 0;
 
     // What the host writes, the pty reads.
     const text = "handed off";
@@ -1074,8 +1093,5 @@ test "WindowsPty: a handed-off console resizes and ends through its handles" {
     // Closing the pty closes every handle of the console, which is what
     // ends the host and its program.
     pty.deinit();
-    for (ends) |e| {
-        try testing.expect(k32.ReadFile(e[0], &buf, buf.len, &got, null) == windows.FALSE);
-        try testing.expectEqual(std.os.windows.Win32Error.BROKEN_PIPE, windows.GetLastError());
-    }
+    for (ends) |e| try testPipeClosed(e[0]);
 }
