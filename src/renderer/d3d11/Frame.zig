@@ -64,7 +64,10 @@ pub inline fn renderPass(
 pub fn complete(self: *Self, sync: bool) void {
     _ = sync;
 
-    const health: Health = if (self.renderer.api.present(self.target.*)) .healthy else |err| switch (err) {
+    // The colour this frame cleared to: the terminal's background as the
+    // generic renderer last took it, under the draw mutex this runs in.
+    const bg = self.renderer.uniforms.bg_color;
+    const health: Health = if (self.renderer.api.present(self.target.*, .{ bg[0], bg[1], bg[2] })) .healthy else |err| switch (err) {
         error.DeviceLost => .unhealthy,
         error.PresentFailed => .healthy,
     };

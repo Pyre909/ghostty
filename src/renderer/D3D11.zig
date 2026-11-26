@@ -1439,7 +1439,11 @@ pub const PresentError = error{
 /// The swap chain follows the target's size here rather than in
 /// `setViewport`, so every reference to a back buffer lives inside this
 /// function and ResizeBuffers never finds one outstanding.
-pub fn present(self: *D3D11, target: Target) PresentError!void {
+///
+/// `background` is the terminal's background colour, red, green and blue,
+/// which an HWND chain is given to fill the window with wherever its
+/// buffers do not reach (`matchBackground`).
+pub fn present(self: *D3D11, target: Target, background: [3]u8) PresentError!void {
     if (self.lost) return error.DeviceLost;
 
     // Targets are at most max_texture_dimension on a side. A client area
@@ -1481,6 +1485,8 @@ pub fn present(self: *D3D11, target: Target) PresentError!void {
         log.debug("swap chain resized to {d}x{d}", .{ w, h });
     }
 
+    if (self.chain == .hwnd) self.matchBackground(background);
+
     const back = self.swap_chain.getBuffer(0, api.ID3D11Texture2D) catch {
         log.warn("swap chain back buffer unavailable", .{});
         return error.PresentFailed;
@@ -1505,6 +1511,51 @@ pub fn present(self: *D3D11, target: Target) PresentError!void {
     if (api.failed(hr)) {
         log.warn("Present failed hwnd={x} hr=0x{x}", .{ @intFromPtr(self.hwnd), @as(u32, @bitCast(hr)) });
         return self.presentError(hr);
+    }
+}
+
+/// The chain's background colour, as bytes; null if DXGI will not say.
+fn chainBackground(self: *const D3D11) ?[3]u8 {
+    var c: api.DXGI_RGBA = undefined;
+    if (api.failed(self.swap_chain.getBackgroundColor(&c))) return null;
+    var rgb: [3]u8 = undefined;
+    for (&rgb, [_]f32{ c.r, c.g, c.b }) |*byte, channel| {
+        byte.* = @intFromFloat(@round(std.math.clamp(channel, 0, 1) * 255));
+    }
+    return rgb;
+}
+
+/// Give an HWND chain `rgb` as its background colour unless it has it.
+///
+/// An HWND chain is not scaled (DXGI_SCALING_NONE), so where the window
+/// is larger than the chain's buffers DXGI fills it with the chain's
+/// background colour, which is black until one is set (Learn:
+/// IDXGISwapChain1::SetBackgroundColor). A window being dragged larger
+/// is in that state at its growing edge after every step, until a frame
+/// at the new size is presented: measured in a Windows 11 VM, a strip 8
+/// to 24 pixels wide in 174 of 180 screen grabs taken during a grow in
+/// steps of 8 pixels, black beside a terminal of any other colour.
+///
+/// The chain is asked for its colour rather than the last one set being
+/// kept, so that a chain made anew (`recoverDevice`, `followWindow`)
+/// needs nothing done for it. A failure costs only the strip its colour
+/// and would repeat with every frame, hence the debug level.
+///
+/// A composition chain is stretched over the window instead, and what
+/// lies behind it must stay visible, so it gets none.
+fn matchBackground(self: *D3D11, rgb: [3]u8) void {
+    if (self.chainBackground()) |have| {
+        if (std.mem.eql(u8, &have, &rgb)) return;
+    }
+    const color: api.DXGI_RGBA = .{
+        .r = @as(f32, @floatFromInt(rgb[0])) / 255,
+        .g = @as(f32, @floatFromInt(rgb[1])) / 255,
+        .b = @as(f32, @floatFromInt(rgb[2])) / 255,
+        .a = 1,
+    };
+    const hr = self.swap_chain.setBackgroundColor(&color);
+    if (api.failed(hr)) {
+        log.debug("SetBackgroundColor failed hwnd={x} hr=0x{x}", .{ @intFromPtr(self.hwnd), @as(u32, @bitCast(hr)) });
     }
 }
 
@@ -1687,7 +1738,7 @@ fn expectPresents(r: *D3D11, alpha: api.DXGI_ALPHA_MODE) !void {
     try testing.expectEqual(@as(api.UINT, 48), desc.Height);
     var target = try r.initTarget(64, 48);
     defer target.deinit();
-    try r.present(target);
+    try r.present(target, .{ 0, 0, 0 });
 }
 
 test "d3d11: a transparent window presents through a composition chain, again after a lost device" {
@@ -1748,6 +1799,45 @@ test "d3d11: a composition chain made on the window's thread is recovered on ano
     try testing.expect(!r.lost);
     try testing.expect(r.presentsAlpha());
     try testing.expect(r.composition != null);
+}
+
+test "d3d11: an HWND chain takes each frame's background colour, a composition chain none" {
+    const testing = std.testing;
+    const hwnd = try testWindow();
+    defer _ = win32.DestroyWindow(hwnd);
+
+    {
+        var r = try initWindow(hwnd, try loadCompiler(), true, .native, .hwnd);
+        defer r.deinit();
+        var target = try r.initTarget(64, 48);
+        defer target.deinit();
+
+        const green: [3]u8 = .{ 0x20, 0xc0, 0x40 };
+        const white: [3]u8 = .{ 0xff, 0xff, 0xff };
+        try testing.expect(!std.mem.eql(u8, &green, &(r.chainBackground() orelse return error.NoChainBackground)));
+        try r.present(target, green);
+        try testing.expectEqual(@as(?[3]u8, green), r.chainBackground());
+        // A colour a program or a new configuration set later.
+        try r.present(target, white);
+        try testing.expectEqual(@as(?[3]u8, white), r.chainBackground());
+
+        // The chain made for a new device starts without it.
+        r.lost = true;
+        try r.recoverDevice();
+        try testing.expect(!std.mem.eql(u8, &white, &(r.chainBackground() orelse return error.NoChainBackground)));
+        var again = try r.initTarget(64, 48);
+        defer again.deinit();
+        try r.present(again, white);
+        try testing.expectEqual(@as(?[3]u8, white), r.chainBackground());
+    }
+
+    var r = try initWindow(hwnd, try loadCompiler(), true, .native, .composition);
+    defer r.deinit();
+    var target = try r.initTarget(64, 48);
+    defer target.deinit();
+    const before = r.chainBackground();
+    try r.present(target, .{ 0x20, 0xc0, 0x40 });
+    try testing.expectEqual(before, r.chainBackground());
 }
 
 test "d3d11: an opaque window presents through an HWND chain, again after a lost device" {

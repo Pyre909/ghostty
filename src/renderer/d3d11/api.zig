@@ -303,6 +303,14 @@ pub const DXGI_SAMPLE_DESC = extern struct {
     Quality: UINT,
 };
 
+/// D3DCOLORVALUE under its DXGI name: each channel from 0 to 1.
+pub const DXGI_RGBA = extern struct {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+};
+
 pub const DXGI_SWAP_CHAIN_DESC1 = extern struct {
     Width: UINT,
     Height: UINT,
@@ -764,8 +772,8 @@ pub const IDXGISwapChain1 = extern struct {
         Present1: Slot,
         IsTemporaryMonoSupported: Slot,
         GetRestrictToOutput: Slot,
-        SetBackgroundColor: Slot,
-        GetBackgroundColor: Slot,
+        SetBackgroundColor: *const fn (*IDXGISwapChain1, *const DXGI_RGBA) callconv(cc) HRESULT,
+        GetBackgroundColor: *const fn (*IDXGISwapChain1, *DXGI_RGBA) callconv(cc) HRESULT,
         SetRotation: Slot,
         GetRotation: Slot,
     };
@@ -797,6 +805,14 @@ pub const IDXGISwapChain1 = extern struct {
 
     pub fn getDesc1(self: *IDXGISwapChain1, desc: *DXGI_SWAP_CHAIN_DESC1) HRESULT {
         return self.vtable.GetDesc1(self, desc);
+    }
+
+    pub fn setBackgroundColor(self: *IDXGISwapChain1, color: *const DXGI_RGBA) HRESULT {
+        return self.vtable.SetBackgroundColor(self, color);
+    }
+
+    pub fn getBackgroundColor(self: *IDXGISwapChain1, color: *DXGI_RGBA) HRESULT {
+        return self.vtable.GetBackgroundColor(self, color);
     }
 };
 
@@ -1351,6 +1367,8 @@ test "d3d11 api: typed slot indices" {
     try testing.expectEqual(11 * p, @offsetOf(IDXGISwapChain.VTable, "GetFullscreenState"));
     try testing.expectEqual(13 * p, @offsetOf(IDXGISwapChain.VTable, "ResizeBuffers"));
     try testing.expectEqual(18 * p, @offsetOf(IDXGISwapChain1.VTable, "GetDesc1"));
+    try testing.expectEqual(25 * p, @offsetOf(IDXGISwapChain1.VTable, "SetBackgroundColor"));
+    try testing.expectEqual(26 * p, @offsetOf(IDXGISwapChain1.VTable, "GetBackgroundColor"));
     try testing.expectEqual(15 * p, @offsetOf(IDXGIFactory2.VTable, "CreateSwapChainForHwnd"));
     try testing.expectEqual(24 * p, @offsetOf(IDXGIFactory2.VTable, "CreateSwapChainForComposition"));
     try testing.expectEqual(3 * p, @offsetOf(IDCompositionDevice.VTable, "Commit"));
