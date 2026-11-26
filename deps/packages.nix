@@ -60,10 +60,10 @@
       url = "https://deps.files.ghostty.org/N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ.tar.xz";
       hash = "sha256-fAe2C2MdhrVb12K8LBaUPU/OyWpulHpMsnarkuLHWS4=";
     };
-    "N-V-__8AAKfbpwAXnUJ6TJEaqZGWgp6F_8OhiLErejRxQ7Y5" = fetchzip {
+    "N-V-__8AAH-MrwAf0TyUzzZD5HQjeEj7gW-BmhiGMR0yAzrJ" = fetchzip {
       name = "freetype";
-      url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz";
-      hash = "sha256-4l90lDtpgm5xlh2m7ifrqNy373DTRTULRkAzicrM93c=";
+      url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-15-0.tar.gz";
+      hash = "sha256-Mcmb67mYYs6c8yQv39iIq5gxUGBZmWQXkMGSOw6jt14=";
     };
     "N-V-__8AADcZkgn4cMhTUpIz6mShCKyqqB-NBtf_S2bHaTC-" = fetchzip {
       name = "gettext";

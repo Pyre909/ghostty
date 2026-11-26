@@ -1,13 +1,13 @@
 .{
     .name = .freetype,
-    .version = "2.13.3",
+    .version = "2.15.0",
     .fingerprint = 0xac2059b6f7bbfe0a,
     .paths = .{""},
     .dependencies = .{
         // freetype/freetype
         .freetype = .{
-            .url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz",
-            .hash = "N-V-__8AAKfbpwAXnUJ6TJEaqZGWgp6F_8OhiLErejRxQ7Y5",
+            .url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-15-0.tar.gz",
+            .hash = "N-V-__8AAH-MrwAf0TyUzzZD5HQjeEj7gW-BmhiGMR0yAzrJ",
             .lazy = true,
         },
 

@@ -39,4 +39,4 @@ https://deps.files.ghostty.org/zigimg-c701c9f99779d7ddf594dcc6da8f858fd277d61f.t
 https://deps.files.ghostty.org/zlib-1220fed0c74e1019b3ee29edae2051788b080cd96e90d56836eea857b0b966742efb.tar.gz
 https://github.com/Pyre909/ghostty/releases/download/conpty-1.25.260930003/microsoft.windows.console.conpty.1.25.260930003.zip
 https://github.com/Pyre909/libxev/archive/685ac7e1a4860594e0cb358bbd3d1f8d4aa44be2.tar.gz
-https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz
+https://github.com/freetype/freetype/archive/refs/tags/VER-2-15-0.tar.gz

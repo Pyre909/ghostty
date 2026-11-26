@@ -31,9 +31,9 @@
   },
   {
     "type": "archive",
-    "url": "https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.tar.gz",
-    "dest": "vendor/p/N-V-__8AAKfbpwAXnUJ6TJEaqZGWgp6F_8OhiLErejRxQ7Y5",
-    "sha256": "bc5c898e4756d373e0d991bab053036c5eb2aa7c0d5c67e8662ddc6da40c4103"
+    "url": "https://github.com/freetype/freetype/archive/refs/tags/VER-2-15-0.tar.gz",
+    "dest": "vendor/p/N-V-__8AAH-MrwAf0TyUzzZD5HQjeEj7gW-BmhiGMR0yAzrJ",
+    "sha256": "87c7f1f8699b91e89f773f7dcfa505b044e1dae67f62a55d4e29c3afdcac4fb8"
   },
   {
     "type": "archive",
